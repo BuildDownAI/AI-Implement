@@ -1,0 +1,175 @@
+name: Sync workflow to target repo
+
+# Syncs the AI-Implement workflow templates (claude-implement.yml,
+# claude-plan.yml, comment-trigger.yml) into a target repo, opening a PR.
+# WORKFLOW.md and PLANNING.md are seeded once and never overwritten.
+#
+# This workflow runs on demand (workflow_dispatch) — provide the target
+# repo each time. The orchestrator can also call this dispatch via the
+# GitHub API as part of repo onboarding.
+#
+# Required secrets in this repo:
+#   AI_IMPLEMENT_APP_ID      — GitHub App numeric ID
+#   AI_IMPLEMENT_PRIVATE_KEY — GitHub App private key (PEM)
+# The App must be installed on the target repo's owner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: 'Target repo as owner/name (e.g. acme-corp/api)'
+        required: true
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse target repo
+        id: target
+        run: |
+          REPO="${{ inputs.target_repo }}"
+          OWNER="${REPO%%/*}"
+          if [ "$OWNER" = "$REPO" ] || [ -z "$OWNER" ]; then
+            echo "::error::target_repo must be in 'owner/name' form (got: $REPO)"
+            exit 1
+          fi
+          echo "repo=$REPO"   >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+
+      # Generate a token scoped to the target org so all API calls are attributed to the bot
+      - uses: actions/create-github-app-token@v2
+        id: sync-token
+        with:
+          app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
+          private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+
+      - name: Sync files to ${{ steps.target.outputs.repo }} via PR
+        env:
+          GH_TOKEN: ${{ steps.sync-token.outputs.token }}
+          REPO: ${{ steps.target.outputs.repo }}
+        run: |
+          SYNC_BRANCH="sync/ai-implement"
+          CHANGES_MADE=false
+
+          # Get default branch name and its HEAD SHA
+          DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq '.default_branch')
+          BASE_SHA=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')
+
+          # Create or reset the sync branch to the current default branch tip
+          if gh api "repos/$REPO/git/ref/heads/$SYNC_BRANCH" --silent 2>/dev/null; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$SYNC_BRANCH" \
+              -f sha="$BASE_SHA" -F force=true
+          else
+            gh api -X POST "repos/$REPO/git/refs" \
+              -f ref="refs/heads/$SYNC_BRANCH" \
+              -f sha="$BASE_SHA"
+          fi
+
+          # sync_file LOCAL REMOTE COMMIT_MSG
+          # Writes LOCAL to REMOTE on the sync branch only if content differs (git blob SHA comparison)
+          sync_file() {
+            local LOCAL="$1"
+            local REMOTE="$2"
+            local MSG="$3"
+
+            local LOCAL_SHA
+            LOCAL_SHA=$(git hash-object "$LOCAL")
+
+            local REMOTE_SHA
+            REMOTE_SHA=$(gh api "repos/$REPO/contents/$REMOTE?ref=$SYNC_BRANCH" \
+              --jq '.sha' 2>/dev/null || echo "")
+
+            if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+              echo "  No changes: $REMOTE"
+              return
+            fi
+
+            local CONTENT
+            CONTENT=$(base64 -w 0 < "$LOCAL")
+
+            if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "null" ]; then
+              gh api -X PUT "repos/$REPO/contents/$REMOTE" \
+                -f message="$MSG" \
+                -f content="$CONTENT" \
+                -f sha="$REMOTE_SHA" \
+                -f branch="$SYNC_BRANCH"
+            else
+              gh api -X PUT "repos/$REPO/contents/$REMOTE" \
+                -f message="$MSG" \
+                -f content="$CONTENT" \
+                -f branch="$SYNC_BRANCH"
+            fi
+
+            echo "  Synced: $REMOTE"
+            CHANGES_MADE=true
+          }
+
+          echo "==> $REPO"
+
+          # 1. claude-implement.yml — always sync
+          sync_file \
+            "workflows/claude-implement.yml" \
+            ".github/workflows/claude-implement.yml" \
+            "Sync claude-implement.yml from ai-implement"
+
+          # 2. comment-trigger.yml — always sync
+          sync_file \
+            "workflows/comment-trigger.yml" \
+            ".github/workflows/comment-trigger.yml" \
+            "Sync comment-trigger.yml from ai-implement"
+
+          # 3. claude-plan.yml — always sync
+          sync_file \
+            "workflows/claude-plan.yml" \
+            ".github/workflows/claude-plan.yml" \
+            "Sync claude-plan.yml from ai-implement"
+
+          # 4. WORKFLOW.md — seed once only; never overwrite (each repo owns its own prompt template)
+          if [ -f "workflows/WORKFLOW.md" ]; then
+            if ! gh api "repos/$REPO/contents/WORKFLOW.md?ref=$DEFAULT_BRANCH" > /dev/null 2>&1; then
+              sync_file \
+                "workflows/WORKFLOW.md" \
+                "WORKFLOW.md" \
+                "Add WORKFLOW.md prompt template (customise for this repo)"
+            else
+              echo "  Skipping WORKFLOW.md (already exists in $REPO)"
+            fi
+          fi
+
+          # 5. PLANNING.md — seed once only; never overwrite (each repo owns its own planning template)
+          if [ -f "workflows/PLANNING.md" ]; then
+            if ! gh api "repos/$REPO/contents/PLANNING.md?ref=$DEFAULT_BRANCH" > /dev/null 2>&1; then
+              sync_file \
+                "workflows/PLANNING.md" \
+                "PLANNING.md" \
+                "Add PLANNING.md planning template (customise for this repo)"
+            else
+              echo "  Skipping PLANNING.md (already exists in $REPO)"
+            fi
+          fi
+
+          if [ "$CHANGES_MADE" = "false" ]; then
+            echo "  No changes, skipping PR"
+            exit 0
+          fi
+
+          # Open a PR if one isn't already open for the sync branch
+          EXISTING_PR=$(gh api "repos/$REPO/pulls?state=open" \
+            --jq "[.[] | select(.head.ref == \"$SYNC_BRANCH\")] | .[0].number" \
+            2>/dev/null || echo "")
+
+          if [ -z "$EXISTING_PR" ] || [ "$EXISTING_PR" = "null" ]; then
+            PR_BODY=$(printf 'Auto-synced from ai-implement.\n\n**Always updated:**\n- `.github/workflows/claude-implement.yml`\n- `.github/workflows/comment-trigger.yml`\n- `.github/workflows/claude-plan.yml`\n\n**Added once (never overwritten):**\n- `WORKFLOW.md` — Claude implementation prompt template; customise this for your repo\n- `PLANNING.md` — Claude planning prompt template; customise this for your repo')
+            gh api -X POST "repos/$REPO/pulls" \
+              -f title="Sync AI implementation workflow files" \
+              -f head="$SYNC_BRANCH" \
+              -f base="$DEFAULT_BRANCH" \
+              -f body="$PR_BODY"
+            echo "  Opened PR in $REPO"
+          else
+            echo "  PR #$EXISTING_PR already open in $REPO"
+          fi

@@ -1,0 +1,40 @@
+# Client configuration for the multi-client deploy matrix.
+#
+# Each file in this directory represents one deployed Fly.io app.
+# File name = client slug (used for FLY_API_TOKEN_<SLUG> secret lookup).
+#
+# Copy this file to `<client-slug>.toml` and fill in the values.
+# Then:
+#   1. Create the Fly app:  fly apps create <app_name> --org <org>
+#   2. Add the volume:      fly volumes create dedup_data --size 1 --region <region> --app <app_name>
+#   3. Set secrets:         fly secrets set LINEAR_API_KEY=... GITHUB_APP_ID=... ... --app <app_name>
+#   4. Add a GitHub secret: FLY_API_TOKEN_<SLUG_UPPERCASE>=<fly-deploy-token>
+#   5. Commit and push — the deploy-clients.yml workflow will pick it up automatically.
+#
+# Or run scripts/provision-client.sh <client-slug> to be guided through all of this.
+#
+# Session machines run Claude Code in ephemeral Fly containers.
+# The [sessions] org can differ from [fly] org for cost isolation —
+# e.g. orchestrator in your org, session machines in the client's org.
+
+[client]
+# Unique slug — must match the filename (without .toml) and the GitHub secret suffix.
+# Allowed chars: a-z, 0-9, hyphens. Hyphens become underscores in the secret name.
+# Example: "acme-corp" → FLY_API_TOKEN_ACME_CORP
+slug = "example-client"
+
+[fly]
+# Name of the Fly.io app (fly apps create <app_name>)
+app_name = "ai-implement-example"
+# Fly.io organization slug (fly orgs list)
+org = "personal"
+# Primary region (fly platform regions)
+region = "iad"
+
+[sessions]
+# Name of the Fly.io app for session machines
+app_name = "ai-implement-sessions-example"
+# Fly.io org for session machines (can differ from [fly].org for cost isolation)
+org = "personal"
+# Region for session machines
+region = "iad"

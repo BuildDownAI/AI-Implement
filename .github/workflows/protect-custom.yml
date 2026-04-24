@@ -1,0 +1,34 @@
+# Advisory-only while extension points are still in flux and there are no
+# downstream consumers. Restore hard fail when AII-91 is picked up.
+name: Protect custom/
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: custom/ upstream guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Flag custom/ changes beyond README.md and .gitkeep files
+        run: |
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}" \
+            | grep '^custom/' \
+            | grep -v -E '^custom/(README\.md|([^/]+/)+\.gitkeep)$' \
+            || true)
+
+          if [ -n "$CHANGED" ]; then
+            echo "::warning::PR touches custom/ outside README.md / .gitkeep. Advisory only while we're still building out extension points; revisit once there are downstream consumers."
+            echo ""
+            echo "Touched files:"
+            echo "$CHANGED"
+          else
+            echo "custom/ check passed — no upstream modifications to client customization space"
+          fi

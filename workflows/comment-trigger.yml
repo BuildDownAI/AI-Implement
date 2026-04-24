@@ -1,0 +1,129 @@
+# Copy this file to .github/workflows/comment-trigger.yml in each target repo.
+# This is managed by the ai-implement sync workflow — do not edit directly in target repos.
+#
+# Triggers claude-implement.yml when a user with write access comments /ai-implement on a PR.
+#
+# Required secrets (same as claude-implement.yml):
+#   AI_IMPLEMENT_APP_ID, AI_IMPLEMENT_PRIVATE_KEY
+#
+# Optional repository variables (Bedrock-enabled repos only):
+#   AI_IMPLEMENT_PROVIDER    - Set to "bedrock" to route comment-triggered gap-fill
+#                              runs through AWS Bedrock. Defaults to "anthropic".
+#   AI_IMPLEMENT_AWS_REGION  - AWS region for Bedrock (required when provider=bedrock).
+# Set these at Settings → Secrets and variables → Actions → Variables. They must
+# match the mapping's provider/awsRegion in the orchestrator admin UI; otherwise
+# the orchestrator-initiated runs and the comment-triggered runs will route to
+# different auth paths.
+#
+# The app token is used for all GitHub operations — no PAT required.
+# The app needs: actions:write, contents:write, pull-requests:write, issues:write
+
+name: AI Implement Comment Trigger
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    # Only run on PR comments (not issue comments) with the trigger phrase
+    if: github.event.issue.pull_request != null && contains(github.event.comment.body, '/ai-implement')
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
+          private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
+
+      - name: Check commenter has write access
+        id: check-access
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          PERMISSION=$(gh api repos/$REPO/collaborators/$COMMENTER/permission --jq '.permission' 2>/dev/null || echo "none")
+          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "maintain" && "$PERMISSION" != "write" ]]; then
+            echo "User $COMMENTER does not have write access (permission: $PERMISSION), skipping"
+            exit 0
+          fi
+          echo "has_access=true" >> "$GITHUB_OUTPUT"
+
+      - name: Parse metadata and dispatch
+        id: dispatch
+        if: steps.check-access.outputs.has_access == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          # Repo-variable-driven provider override. Empty default routes to
+          # anthropic, matching the claude-implement.yml workflow_dispatch default.
+          PROVIDER: ${{ vars.AI_IMPLEMENT_PROVIDER }}
+          AWS_REGION: ${{ vars.AI_IMPLEMENT_AWS_REGION }}
+        run: |
+          # Only trigger on comments that are exactly /ai-implement
+          TRIMMED=$(echo "$COMMENT_BODY" | tr -d '[:space:]')
+          if [ "$TRIMMED" != "/ai-implement" ]; then
+            echo "Comment is not exactly /ai-implement, skipping"
+            exit 0
+          fi
+
+          PR_BODY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq '.body')
+
+          # Extract metadata from the <!-- ai-implement-meta ... --> block
+          META_BLOCK=$(echo "$PR_BODY" | sed -n '/<!-- ai-implement-meta/,/-->/p')
+          ISSUE_ID=$(echo "$META_BLOCK" | grep 'issue_id:' | head -1 | sed 's/^issue_id: //' | tr -d '\r')
+          ISSUE_IDENTIFIER=$(echo "$META_BLOCK" | grep 'issue_identifier:' | head -1 | sed 's/^issue_identifier: //' | tr -d '\r')
+          ISSUE_TITLE=$(echo "$META_BLOCK" | grep 'issue_title:' | head -1 | sed 's/^issue_title: //' | tr -d '\r')
+          DESC_B64=$(echo "$META_BLOCK" | grep 'issue_description_b64:' | head -1 | sed 's/^issue_description_b64: //' | tr -d '\r')
+          ISSUE_DESCRIPTION=$(echo "$DESC_B64" | base64 -d)
+
+          if [ -z "$ISSUE_ID" ] || [ -z "$ISSUE_IDENTIFIER" ]; then
+            echo "Could not find ai-implement-meta block in PR body."
+            GH_TOKEN="$APP_TOKEN" gh pr comment "$PR_NUMBER" --repo "$REPO" --body "⚠️ Could not find implementation metadata in this PR body. The \`/ai-implement\` trigger only works on PRs created by the Claude AI Implementation workflow."
+            exit 1
+          fi
+
+          # Provider-specific dispatch fields. Only add provider/aws_region when
+          # the repo is configured for bedrock; anthropic repos dispatch with
+          # the original set of inputs so nothing changes for them.
+          PROVIDER_ARGS=()
+          if [ "$PROVIDER" = "bedrock" ]; then
+            if [ -z "$AWS_REGION" ]; then
+              echo "AI_IMPLEMENT_PROVIDER=bedrock but AI_IMPLEMENT_AWS_REGION repo variable is not set."
+              GH_TOKEN="$APP_TOKEN" gh pr comment "$PR_NUMBER" --repo "$REPO" --body "⚠️ This repo is configured for Bedrock (\`AI_IMPLEMENT_PROVIDER=bedrock\`) but \`AI_IMPLEMENT_AWS_REGION\` is not set. Set it at Settings → Secrets and variables → Actions → Variables, then re-comment \`/ai-implement\`."
+              exit 1
+            fi
+            PROVIDER_ARGS+=(--field "provider=bedrock" --field "aws_region=$AWS_REGION")
+          elif [ -n "$PROVIDER" ] && [ "$PROVIDER" != "anthropic" ]; then
+            echo "AI_IMPLEMENT_PROVIDER=$PROVIDER is not recognised; falling back to anthropic."
+          fi
+
+          echo "Dispatching claude-implement.yml for $ISSUE_IDENTIFIER (PR #$PR_NUMBER, provider=${PROVIDER:-anthropic})"
+          gh workflow run claude-implement.yml \
+            --repo "$REPO" \
+            --field issue_id="$ISSUE_ID" \
+            --field issue_identifier="$ISSUE_IDENTIFIER" \
+            --field issue_title="$ISSUE_TITLE" \
+            --field issue_description="$ISSUE_DESCRIPTION" \
+            --field pr_number="$PR_NUMBER" \
+            "${PROVIDER_ARGS[@]}"
+          echo "dispatched=true" >> "$GITHUB_OUTPUT"
+
+      - name: React to comment
+        if: steps.dispatch.outputs.dispatched == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api repos/$REPO/issues/comments/$COMMENT_ID/reactions \
+            --method POST \
+            -f content='+1'

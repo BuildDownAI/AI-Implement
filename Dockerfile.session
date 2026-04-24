@@ -1,0 +1,87 @@
+FROM node:22-bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pinned versions for reproducibility.
+ARG YQ_VERSION=v4.53.2
+ARG AST_GREP_VERSION=0.42.1
+ARG CLAUDE_CODE_VERSION=2.1.114
+
+# System dependencies — base tools + power tools for the agent.
+# dbus + libsecret-1-0 are required so Claude Code's startup keychain read
+# fails fast instead of hanging. See session/entrypoint.sh (dbus-run-session).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git \
+      git-lfs \
+      curl \
+      jq \
+      openssl \
+      ca-certificates \
+      openssh-client \
+      python3 \
+      python3-pip \
+      gettext-base \
+      perl \
+      dbus \
+      libsecret-1-0 \
+      build-essential \
+      make \
+      pkg-config \
+      less \
+      tree \
+      ripgrep \
+      fd-find \
+      sqlite3 \
+      unzip \
+      zip \
+      xz-utils \
+      shellcheck \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && git lfs install --system \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ensure TOML parsing support is present at build time. Prefer stdlib tomllib;
+# install tomli only if the base image's python3 does not provide it.
+RUN python3 - <<'PY'
+import importlib.util
+import subprocess
+import sys
+
+if importlib.util.find_spec("tomllib") is None:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "tomli"])
+PY
+
+# yq (mikefarah, single binary) — Debian's yq is a Python impl with a different CLI, so install upstream.
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH}" \
+         -o /usr/local/bin/yq \
+    && chmod +x /usr/local/bin/yq
+
+# gh CLI — official GitHub method
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Claude Code CLI and ast-grep (structural search/rewrite)
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@ast-grep/cli@${AST_GREP_VERSION}" \
+    && corepack enable
+
+# Create non-root user for Claude Code (refuses --dangerously-skip-permissions as root)
+RUN useradd -m -s /bin/bash coder \
+    && mkdir -p /workspace \
+    && chown coder:coder /workspace
+
+# Tool manifest for the agent
+RUN mkdir -p /etc/ai-implement
+COPY session/tools.md /etc/ai-implement/tools.md
+
+# Session scripts
+COPY session/ /opt/ai-implement/
+RUN chmod +x /opt/ai-implement/*.sh
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/opt/ai-implement/entrypoint.sh"]

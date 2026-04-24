@@ -1,0 +1,13 @@
+id: autonomous-loop
+steps:
+  - id: clone
+    type: clone
+  - id: install
+    type: install
+  - id: feedback-loop
+    type: custom
+    moduleId: feedback-loop
+  - id: preflight
+    type: preflight
+  - id: push
+    type: push
