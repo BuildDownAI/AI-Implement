@@ -79,8 +79,18 @@ custom/               Fork-local step/provider/pipeline overrides (see custom/RE
 scripts/              provision-client.sh (interactive onboarding for multi-tenant operators)
 session/              Entrypoint scripts for the Fly Machines runner image
 docs/                 Design notes, ADRs
-.github/workflows/    deploy-clients.yml, sync-workflow.yml, build-runner.yml
+.github/workflows/    deploy-clients.yml, sync-workflow.yml, build-runner.yml,
+                      claude-review.yml
 ```
+
+## PR reviews
+
+Claude reviews PRs automatically via `.github/workflows/claude-review.yml`:
+
+- **Same-repo PRs**: review runs once when the PR is opened or marked ready for review. To re-run after pushing changes, comment `/claude-review` on the PR.
+- **Fork PRs**: a maintainer (owner, member, or collaborator) must comment `/claude-review` to trigger a review. GitHub's "Require approval for outside collaborators" setting (Settings → Actions → General → Fork pull request workflows) gates the workflow run on top of that.
+
+The workflow checks out the PR head with `persist-credentials: false` and never executes PR-supplied scripts — only the diff is read. Authenticate by setting either `CLAUDE_CODE_OAUTH_TOKEN` (preferred) or `ANTHROPIC_API_KEY` as a repo secret; the workflow is a no-op without one of them.
 
 ## Status
 

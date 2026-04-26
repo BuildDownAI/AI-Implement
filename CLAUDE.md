@@ -50,6 +50,8 @@ scripts/
 .github/workflows/
   deploy-clients.yml — matrix deploy to all clients on push to main
   sync-workflow.yml  — sync workflow templates to target repos
+  claude-review.yml  — Claude reviews PRs (auto for same-repo, /claude-review for forks)
+  build-runner.yml   — build and push the session runner image to GHCR
 ```
 
 ## Running locally
