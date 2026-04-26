@@ -79,8 +79,7 @@ custom/               Fork-local step/provider/pipeline overrides (see custom/RE
 scripts/              provision-client.sh (interactive onboarding for multi-tenant operators)
 session/              Entrypoint scripts for the Fly Machines runner image
 docs/                 Design notes, ADRs
-.github/workflows/    deploy-clients.yml, sync-workflow.yml, build-runner.yml,
-                      build-session-image.yml
+.github/workflows/    deploy-clients.yml, sync-workflow.yml, build-runner.yml
 ```
 
 ## Status
