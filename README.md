@@ -90,7 +90,7 @@ Claude reviews PRs automatically via `.github/workflows/claude-review.yml`:
 - **Same-repo PRs**: review runs once when the PR is opened or marked ready for review. To re-run after pushing changes, comment `/claude-review` on the PR.
 - **Fork PRs**: a maintainer (owner, member, or collaborator) must comment `/claude-review` to trigger a review. GitHub's "Require approval for outside collaborators" setting (Settings → Actions → General → Fork pull request workflows) gates the workflow run on top of that.
 
-The workflow checks out the PR head with `persist-credentials: false` and never executes PR-supplied scripts — only the diff is read. Set the `ANTHROPIC_API_KEY` repo secret to enable it; the workflow is a no-op without it.
+The workflow checks out the PR head with `persist-credentials: false` and never executes PR-supplied scripts — only the diff is read. Set the `CLAUDE_CODE_OAUTH_TOKEN` repo secret to enable it; the workflow is a no-op without it.
 
 ## Status
 
