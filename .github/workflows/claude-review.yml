@@ -59,7 +59,11 @@ jobs:
       - name: Run Claude review
         uses: anthropics/claude-code-action@v1
         with:
+          # Pass both — the action picks whichever is non-empty. Missing
+          # secrets resolve to empty strings, so this works whether the repo
+          # has CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, or both set.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "/claude-review"
           track_progress: true
           prompt: |
