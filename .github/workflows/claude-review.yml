@@ -1,0 +1,81 @@
+name: Claude PR review
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  review:
+    # Auto-run on same-repo PRs (opened/ready_for_review only — not synchronize,
+    # to control cost during iterative pushes). For fork PRs and re-runs, a
+    # maintainer must post `/claude-review` as a comment.
+    if: |
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '/claude-review') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR head SHA
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.eventName === 'pull_request_target') {
+              core.setOutput('sha', context.payload.pull_request.head.sha);
+              core.setOutput('number', context.payload.pull_request.number);
+              return;
+            }
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.issue.number,
+            });
+            core.setOutput('sha', pr.data.head.sha);
+            core.setOutput('number', pr.data.number);
+
+      # Checkout PR head WITHOUT credentials so any malicious post-checkout
+      # script can't exfiltrate the GITHUB_TOKEN. We never run install/build/test
+      # steps on this checkout — Claude only reads the diff.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run Claude review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          trigger_phrase: "/claude-review"
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ steps.pr.outputs.number }}
+
+            Review the diff for this PR. Focus on:
+            - Correctness, edge cases, and likely bugs
+            - Security issues (especially around the GitHub Actions / secrets surface,
+              SQLite usage, GraphQL inputs, and shell escaping)
+            - Style consistency with the rest of the codebase (see CLAUDE.md)
+            - Test coverage gaps
+
+            Post a single sticky top-level comment with your review. Use inline
+            comments only for specific code-line issues. Be concise — skip praise
+            unless something is genuinely well-done. If the diff looks fine, say so
+            briefly.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
