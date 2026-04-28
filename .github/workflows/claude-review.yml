@@ -1,5 +1,12 @@
 name: Claude PR review
 
+# This workflow is a convenience for this repo's own development — it is NOT
+# part of the AI-Implement product surface that gets synced to target repos.
+# It auths via CLAUDE_CODE_OAUTH_TOKEN only. If you fork this repo and want to
+# wire up a different auth path (Anthropic API key, Bedrock, Vertex), see
+# https://github.com/anthropics/claude-code-action and customise this file —
+# upstream won't try to keep a one-size-fits-all auth matrix working here.
+
 on:
   pull_request_target:
     types: [opened, ready_for_review]
@@ -59,11 +66,7 @@ jobs:
       - name: Run Claude review
         uses: anthropics/claude-code-action@v1
         with:
-          # Pass both — the action picks whichever is non-empty. Missing
-          # secrets resolve to empty strings, so this works whether the repo
-          # has CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, or both set.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "/claude-review"
           track_progress: true
           prompt: |

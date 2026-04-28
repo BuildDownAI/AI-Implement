@@ -117,11 +117,6 @@ Read CLAUDE.md if it exists for repo-specific context and conventions.
 
 ---
 
-If `${PR_NUMBER}` is set (value: "${PR_NUMBER}"), skip to the **Gap-fill instructions**
-section below and ignore New implementation.
-
----
-
 ## New implementation
 
 Create a branch named `${ISSUE_IDENTIFIER}/short-description`, implement the
