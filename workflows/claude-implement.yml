@@ -112,32 +112,6 @@ jobs:
           # corepack toggles on bundled yarn/pnpm without extra installs.
           sudo corepack enable
 
-          # Tool manifest — adapted from session/tools.md for the GitHub Actions
-          # environment. Intentional differences vs the Fly runner manifest:
-          #   - omits `git-lfs` (not preinstalled and not required in this path)
-          #   - omits `@anthropic-ai/claude-code` (CLI is run by the action, not invoked by the agent)
-          # If you edit session/tools.md, mirror substantive changes here by hand.
-          mkdir -p /tmp/ai-implement
-          cat > /tmp/ai-implement/tools.md <<'MANIFEST'
-          # Power tools available in this environment
-
-          Beyond the usual POSIX toolbox, this runner ships with:
-
-          - `rg` (ripgrep) — fast regex search across files. Prefer over `grep -r`.
-          - `fd` — fast file finder. Prefer over `find` for simple name/type searches.
-          - `sg` (ast-grep) — structural (AST) search and rewrite. Use for refactors that
-            regex would botch (e.g. renaming a method only in call sites, not strings).
-          - `yq` — YAML query/mutate (Mike Farah's Go build, not the Python one). jq-like syntax.
-          - `jq` — JSON query/mutate.
-          - `tree` — directory tree view; `tree -L 2` for a quick overview.
-          - `sqlite3` — SQLite CLI.
-          - `shellcheck` — lint bash; use to self-verify shell scripts you write.
-          - `gh` — GitHub CLI; authenticated for the current repo.
-          - `corepack` — enables `yarn` and `pnpm` on demand without extra installs.
-
-          Standard runtimes present: Node.js, Python 3, build-essential toolchain.
-          MANIFEST
-
           # Quick smoke check — fail the job if any tool isn't on PATH.
           for tool in rg fd sg yq jq tree sqlite3 shellcheck gh node python3 corepack; do
             command -v "$tool" >/dev/null || { echo "Missing: $tool"; exit 1; }
@@ -380,15 +354,13 @@ jobs:
           echo "AI_VERIFY_SCRIPT=$AI_VERIFY_SCRIPT" >> "$GITHUB_ENV"
           echo "AI_TEARDOWN_SCRIPT=$AI_TEARDOWN_SCRIPT" >> "$GITHUB_ENV"
 
-          # Prepend the tool-manifest pointer so Claude knows about the power tools.
-          if [ -f /tmp/ai-implement/tools.md ]; then
-            {
-              echo "Power tools available in this environment: see /tmp/ai-implement/tools.md"
-              echo
-              cat /tmp/claude-prompt.md
-            } > /tmp/claude-prompt.md.new
-            mv /tmp/claude-prompt.md.new /tmp/claude-prompt.md
-          fi
+          # Nudge Claude toward the power tools that ship in this runner.
+          {
+            echo "Power tools: \`rg\` (ripgrep) and \`fd\` are installed — prefer them over \`grep\`/\`find\` on large repos."
+            echo
+            cat /tmp/claude-prompt.md
+          } > /tmp/claude-prompt.md.new
+          mv /tmp/claude-prompt.md.new /tmp/claude-prompt.md
 
           {
             echo 'prompt<<CLAUDE_PROMPT_EOF'
@@ -454,11 +426,26 @@ jobs:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
 
+      - name: Install Claude Code
+        # Install once at job level so the per-step claude-code-action
+        # invocations (one for implementation, three for the gap-analysis
+        # auth variants) reuse the same binary instead of reinstalling.
+        # Version pinned to whatever anthropics/claude-code-action@v1's
+        # base-action installs by default — bump in lockstep with the
+        # action upgrade. The binary lands at ~/.local/bin/claude.
+        env:
+          CLAUDE_CODE_VERSION: 2.1.119
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Run Claude (Bedrock)
         if: steps.auth-check.outputs.auth_method == 'bedrock'
         uses: anthropics/claude-code-action@v1
         with:
           use_bedrock: "true"
+          path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "ai-implement-bot"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 100 --allowedTools 'Bash(*)' --allowedTools 'Write' --allowedTools 'Edit' --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'WebFetch' --allowedTools 'Agent'"
@@ -469,6 +456,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "ai-implement-bot"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 100 --allowedTools 'Bash(*)' --allowedTools 'Write' --allowedTools 'Edit' --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'WebFetch' --allowedTools 'Agent'"
@@ -479,6 +467,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "ai-implement-bot"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 100 --allowedTools 'Bash(*)' --allowedTools 'Write' --allowedTools 'Edit' --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'WebFetch' --allowedTools 'Agent'"
@@ -534,6 +523,7 @@ jobs:
           ISSUE_ID: ${{ inputs.issue_id }}
           ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
         run: |
+          set -euo pipefail
           BRANCH=$(git branch --show-current)
           PR_URL=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url') || true
           if [ -z "$PR_URL" ]; then
@@ -577,13 +567,18 @@ jobs:
             | jq '[.data.issue.labels.nodes[].id]')
           UPDATED_LABELS=$(echo "$CURRENT_LABELS" | jq --arg id "$LABEL_ID" '. + [$id] | unique')
 
-          curl -s --max-time 30 -X POST https://api.linear.app/graphql \
+          UPDATE_RESPONSE=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
             -H "Content-Type: application/json" \
             -H "Authorization: $LINEAR_API_KEY" \
             --data-raw "$(jq -n \
               --argjson ids "$UPDATED_LABELS" \
               --arg issueId "$ISSUE_ID" \
-              '{query: "mutation($id: String!, $labelIds: [ID!]!) { issueUpdate(id: $id, input: { labelIds: $labelIds }) { success } }", variables: {id: $issueId, labelIds: $ids}}')"
+              '{query: "mutation($id: String!, $labelIds: [String!]!) { issueUpdate(id: $id, input: { labelIds: $labelIds }) { success } }", variables: {id: $issueId, labelIds: $ids}}')")
+          if echo "$UPDATE_RESPONSE" | jq -e '(.errors // empty) | length > 0' >/dev/null; then
+            echo "::error::Linear GraphQL returned errors when adding 'Ready for Review' label:"
+            echo "$UPDATE_RESPONSE" | jq '.errors'
+            exit 1
+          fi
           echo "Added 'Ready for Review' label to $ISSUE_IDENTIFIER"
 
       - name: Refresh AWS credentials (Bedrock, gap analysis)
@@ -598,6 +593,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           use_bedrock: "true"
+          path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "ai-implement-bot"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.gap_analysis_model }} --max-turns 20 --allowedTools 'Bash(gh *)'"
@@ -650,6 +646,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "ai-implement-bot"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.gap_analysis_model }} --max-turns 20 --allowedTools 'Bash(gh *)'"
@@ -702,6 +699,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "ai-implement-bot"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.gap_analysis_model }} --max-turns 20 --allowedTools 'Bash(gh *)'"
@@ -755,6 +753,7 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           ISSUE_ID: ${{ inputs.issue_id }}
         run: |
+          set -euo pipefail
           RESPONSE=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
             -H "Content-Type: application/json" \
             -H "Authorization: $LINEAR_API_KEY" \
@@ -762,12 +761,17 @@ jobs:
 
           REMAINING_IDS=$(echo "$RESPONSE" | jq -c '[.data.issue.labels.nodes[] | select(.name != "AI-Working") | .id]')
 
-          curl -s --max-time 30 -X POST https://api.linear.app/graphql \
+          UPDATE_RESPONSE=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
             -H "Content-Type: application/json" \
             -H "Authorization: $LINEAR_API_KEY" \
             --data-raw "$(jq -n \
               --argjson ids "$REMAINING_IDS" \
               --arg issueId "$ISSUE_ID" \
-              '{query: "mutation($id: String!, $labelIds: [String!]!) { issueUpdate(id: $id, input: { labelIds: $labelIds }) { success } }", variables: {id: $issueId, labelIds: $ids}}')"
+              '{query: "mutation($id: String!, $labelIds: [String!]!) { issueUpdate(id: $id, input: { labelIds: $labelIds }) { success } }", variables: {id: $issueId, labelIds: $ids}}')")
+          if echo "$UPDATE_RESPONSE" | jq -e '(.errors // empty) | length > 0' >/dev/null; then
+            echo "::error::Linear GraphQL returned errors when removing AI-Working label:"
+            echo "$UPDATE_RESPONSE" | jq '.errors'
+            exit 1
+          fi
           echo "Removed AI-Working label from $ISSUE_ID"
 
