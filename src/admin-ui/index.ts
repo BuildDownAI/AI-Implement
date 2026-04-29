@@ -10,6 +10,7 @@ import { pipelinesHtml, pipelinesScript } from "./pages/pipelines.js";
 import { reaperHtml, reaperScript } from "./pages/reaper.js";
 import { sessionsHtml, sessionsScript } from "./pages/sessions.js";
 import { auditHtml, auditScript } from "./pages/audit.js";
+import { stubsHtml } from "./pages/stubs.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -32,7 +33,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${reaperHtml}
     ${sessionsHtml}
     ${auditHtml}
-    <!-- pages injected in later tasks -->
+    ${stubsHtml}
   </main>
 </div>`;
 
