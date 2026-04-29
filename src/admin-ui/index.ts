@@ -1,5 +1,8 @@
 import { tokensCss } from "./tokens.js";
 import { componentsCss } from "./components.js";
+import { sidebarHtml } from "./sidebar.js";
+import { themeJs } from "./theme.js";
+import { routerJs } from "./router.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -13,6 +16,13 @@ const head = `<!DOCTYPE html>
 <style>${tokensCss}${componentsCss}</style>
 </head>`;
 
+const shell = `<div id="admin-page" class="app-shell hidden">
+  <aside class="sidebar">${sidebarHtml()}</aside>
+  <main class="main">
+    <!-- pages injected in later tasks -->
+  </main>
+</div>`;
+
 const body = `<body>
 <div id="login-page" class="login-wrap">
   <div class="login-box card">
@@ -22,11 +32,8 @@ const body = `<body>
     <div id="login-error" class="error hidden"></div>
   </div>
 </div>
-<div id="admin-page" class="app-shell hidden">
-  <aside class="sidebar"></aside>
-  <main class="main"></main>
-</div>
-<script>/* placeholder — replaced in Task 6 */</script>
+${shell}
+<script>${themeJs}${routerJs}/* TODO: page scripts in Tasks 7-13 */</script>
 </body></html>`;
 
 export const adminHtml = head + body;
