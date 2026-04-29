@@ -4,6 +4,7 @@ import { sidebarHtml } from "./sidebar.js";
 import { themeJs } from "./theme.js";
 import { routerJs } from "./router.js";
 import { authJs } from "./auth.js";
+import { overviewHtml, overviewScript } from "./pages/overview.js";
 import { settingsHtml, settingsScript } from "./pages/settings.js";
 import { projectsHtml, projectsScript } from "./pages/projects.js";
 import { pipelinesHtml, pipelinesScript } from "./pages/pipelines.js";
@@ -27,6 +28,7 @@ const head = `<!DOCTYPE html>
 const shell = `<div id="admin-page" class="app-shell hidden">
   <aside class="sidebar">${sidebarHtml()}</aside>
   <main class="main">
+    ${overviewHtml}
     ${settingsHtml}
     ${projectsHtml}
     ${pipelinesHtml}
@@ -47,7 +49,7 @@ const body = `<body>
   </div>
 </div>
 ${shell}
-<script>${themeJs}${authJs}${routerJs}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}</script>
+<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}</script>
 </body></html>`;
 
 export const adminHtml = head + body;
