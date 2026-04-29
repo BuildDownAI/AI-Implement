@@ -144,45 +144,23 @@ export const adminHtml = `<!DOCTYPE html>
   </section>
 
   <section data-tab="activity" id="tab-activity">
-  <div class="card" id="status-block">
-    <h2>Status<span id="lu-runner" class="last-updated"></span></h2>
-    <div class="status-block">
-      <div>
-        <span style="color:#888;font-size:0.85em;text-transform:uppercase;font-weight:500;">Runner Mode</span><br>
-        <span id="runner-mode-badge" class="badge" style="margin-top:4px;font-size:0.9em"></span>
-        <span id="runner-mode-source" style="color:#aaa;font-size:0.8em;margin-left:6px"></span>
-      </div>
-      <div class="runner-btns" id="runner-mode-controls">
+    <div id="runner-mode-strip" style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:10px 14px;background:#fff;border:1px solid #eee;border-radius:6px;margin-bottom:20px;font-size:0.9em">
+      <span style="color:#888;text-transform:uppercase;font-size:0.78em;font-weight:500">Runner Mode</span>
+      <span id="runner-mode-badge" class="badge"></span>
+      <span id="runner-mode-source" style="color:#aaa;font-size:0.8em"></span>
+      <span class="runner-btns" id="runner-mode-controls">
         <button class="sm" id="btn-mode-default" onclick="setRunnerMode('default')">Default</button>
         <button class="sm" id="btn-mode-gha" onclick="setRunnerMode('gha')">GHA</button>
         <button class="sm" id="btn-mode-fly" onclick="setRunnerMode('fly')">Fly</button>
         <button class="sm" id="btn-mode-shadow" onclick="setRunnerMode('shadow')">Shadow</button>
-      </div>
+      </span>
+      <span style="flex:1"></span>
+      <span id="reaper-status-line" style="color:#555">Reaper: loading&hellip;</span>
+      <span id="lu-runner" class="last-updated"></span>
     </div>
-    <div style="color:#888;font-size:0.8em;margin-top:6px">
-      <b>Default</b>: each team uses its own Execution Mode setting below.
-      <b>GHA</b> / <b>Fly</b>: global override — ignores per-team setting.
-      <b>Shadow</b>: dispatch both runners for parity testing.
-    </div>
-    <div id="runner-mode-env-warning" class="error hidden" style="margin-top:8px">
+    <div id="runner-mode-env-warning" class="error hidden" style="margin:-12px 0 12px">
       &#9888; RUNNER_MODE env var is set &mdash; UI toggle has no effect until it is unset.
     </div>
-    <div style="margin-top:12px;padding-top:12px;border-top:1px solid #eee;color:#555;font-size:0.9em">
-      <span id="reaper-status-line">Reaper: loading&hellip;</span>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Reaper<span id="lu-reaper" class="last-updated"></span></h2>
-    <div id="reaper-summary-block" style="margin-bottom:12px"></div>
-    <table>
-      <thead>
-        <tr><th>Time</th><th>Rule</th><th>Machine</th><th>Tenant</th><th>Issue</th><th>Age (s)</th><th>Mode</th></tr>
-      </thead>
-      <tbody id="reaper-body"></tbody>
-    </table>
-    <div id="reaper-empty" class="hidden" style="color:#888;padding:10px 0;">No reaper actions recorded</div>
-  </div>
 
   <div class="card">
     <h2>Active Fly Sessions<span id="lu-sessions" class="last-updated"></span></h2>
@@ -204,6 +182,18 @@ export const adminHtml = `<!DOCTYPE html>
       <tbody id="log-body"></tbody>
     </table>
     <div id="log-empty" class="hidden" style="color:#888; padding:10px 0;">No dispatches yet</div>
+  </div>
+
+  <div class="card">
+    <h2>Reaper<span id="lu-reaper" class="last-updated"></span></h2>
+    <div id="reaper-summary-block" style="margin-bottom:12px"></div>
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Rule</th><th>Machine</th><th>Tenant</th><th>Issue</th><th>Age (s)</th><th>Mode</th></tr>
+      </thead>
+      <tbody id="reaper-body"></tbody>
+    </table>
+    <div id="reaper-empty" class="hidden" style="color:#888;padding:10px 0;">No reaper actions recorded</div>
   </div>
 
   <div class="card">
