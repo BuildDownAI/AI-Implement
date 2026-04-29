@@ -7,6 +7,7 @@ import { authJs } from "./auth.js";
 import { settingsHtml, settingsScript } from "./pages/settings.js";
 import { projectsHtml, projectsScript } from "./pages/projects.js";
 import { pipelinesHtml, pipelinesScript } from "./pages/pipelines.js";
+import { reaperHtml, reaperScript } from "./pages/reaper.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -26,6 +27,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${settingsHtml}
     ${projectsHtml}
     ${pipelinesHtml}
+    ${reaperHtml}
     <!-- pages injected in later tasks -->
   </main>
 </div>`;
@@ -40,7 +42,7 @@ const body = `<body>
   </div>
 </div>
 ${shell}
-<script>${themeJs}${authJs}${routerJs}${settingsScript}${projectsScript}${pipelinesScript}/* TODO: page scripts in Tasks 10-13 */</script>
+<script>${themeJs}${authJs}${routerJs}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}/* TODO: page scripts in Tasks 11-13 */</script>
 </body></html>`;
 
 export const adminHtml = head + body;
