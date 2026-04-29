@@ -3,6 +3,8 @@ import { componentsCss } from "./components.js";
 import { sidebarHtml } from "./sidebar.js";
 import { themeJs } from "./theme.js";
 import { routerJs } from "./router.js";
+import { authJs } from "./auth.js";
+import { settingsHtml, settingsScript } from "./pages/settings.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -19,7 +21,7 @@ const head = `<!DOCTYPE html>
 const shell = `<div id="admin-page" class="app-shell hidden">
   <aside class="sidebar">${sidebarHtml()}</aside>
   <main class="main">
-    <!-- pages injected in later tasks -->
+    ${settingsHtml}
   </main>
 </div>`;
 
@@ -33,7 +35,7 @@ const body = `<body>
   </div>
 </div>
 ${shell}
-<script>${themeJs}${routerJs}/* TODO: page scripts in Tasks 7-13 */</script>
+<script>${themeJs}${authJs}${routerJs}${settingsScript}/* TODO: page scripts in Tasks 8-13 */</script>
 </body></html>`;
 
 export const adminHtml = head + body;
