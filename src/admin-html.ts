@@ -43,6 +43,11 @@ export const adminHtml = `<!DOCTYPE html>
   .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 20px; }
   .warning { background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 8px 12px; font-size: 0.85em; color: #856404; margin-bottom: 12px; }
   .last-updated { color: #aaa; font-size: 0.75em; font-weight: normal; margin-left: 8px; }
+  .tab-bar { display: flex; gap: 24px; border-bottom: 1px solid #ddd; margin-bottom: 20px; }
+  .tab-bar a { padding: 10px 2px; color: #888; text-decoration: none; font-size: 0.9em; border-bottom: 2px solid transparent; margin-bottom: -1px; cursor: pointer; }
+  .tab-bar a:hover { color: #555; }
+  .tab-bar a.active { color: #333; border-bottom-color: #4a90d9; font-weight: 500; }
+  .tab-hidden { display: none !important; }
   dialog { border: none; border-radius: 8px; padding: 0; width: 700px; max-width: 95vw; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
   dialog::backdrop { background: rgba(0,0,0,0.4); }
   .md-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #eee; font-weight: 600; }
@@ -74,6 +79,12 @@ export const adminHtml = `<!DOCTYPE html>
     <h1 style="margin-bottom: 0;">AI-Implement Admin</h1>
     <button class="secondary" onclick="logout()">Log Out</button>
   </div>
+
+  <nav class="tab-bar" id="tab-bar">
+    <a id="tab-link-activity" data-tab="activity" onclick="setActiveTab('activity')">Activity</a>
+    <a id="tab-link-mappings" data-tab="mappings" onclick="setActiveTab('mappings')">Mappings</a>
+    <a id="tab-link-settings" data-tab="settings" onclick="setActiveTab('settings')">Settings</a>
+  </nav>
 
   <div class="card">
     <h2>Settings</h2>
@@ -384,6 +395,10 @@ async function login() {
 }
 
 document.getElementById('access-code').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+
+function setActiveTab(name) {
+  // wired up in a later task
+}
 
 function showLogin() {
   document.getElementById('login-page').classList.remove('hidden');
