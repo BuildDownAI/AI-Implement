@@ -86,6 +86,7 @@ export const adminHtml = `<!DOCTYPE html>
     <a id="tab-link-settings" data-tab="settings" onclick="setActiveTab('settings')">Settings</a>
   </nav>
 
+  <section data-tab="settings" id="tab-settings">
   <div class="card">
     <h2>Settings</h2>
     <div id="settings-env-warning" class="warning hidden">
@@ -140,7 +141,9 @@ export const adminHtml = `<!DOCTYPE html>
       <div id="gs-error" class="error hidden" style="margin-top:6px"></div>
     </fieldset>
   </div>
+  </section>
 
+  <section data-tab="activity" id="tab-activity">
   <div class="card" id="status-block">
     <h2>Status<span id="lu-runner" class="last-updated"></span></h2>
     <div class="status-block">
@@ -182,6 +185,41 @@ export const adminHtml = `<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>Active Fly Sessions<span id="lu-sessions" class="last-updated"></span></h2>
+    <table>
+      <thead>
+        <tr><th>Issue</th><th>Team</th><th>Repo</th><th>Machine</th><th>State</th><th>Duration</th><th></th></tr>
+      </thead>
+      <tbody id="sessions-body"></tbody>
+    </table>
+    <div id="sessions-empty" class="hidden" style="color:#888; padding:10px 0;">No active sessions</div>
+  </div>
+
+  <div class="card">
+    <h2>Jobs<span id="lu-log" class="last-updated"></span></h2>
+    <table>
+      <thead>
+        <tr><th>Time</th><th>#</th><th>Issue</th><th>State</th><th>Team</th><th>Repo</th><th>Runner</th><th>Image</th><th>Status</th><th>PR</th></tr>
+      </thead>
+      <tbody id="log-body"></tbody>
+    </table>
+    <div id="log-empty" class="hidden" style="color:#888; padding:10px 0;">No dispatches yet</div>
+  </div>
+
+  <div class="card">
+    <h2>Dedup Entries<span id="lu-dedup" class="last-updated"></span></h2>
+    <table>
+      <thead>
+        <tr><th>Issue</th><th>Dispatched At</th><th></th></tr>
+      </thead>
+      <tbody id="dedup-body"></tbody>
+    </table>
+    <div id="dedup-empty" class="hidden" style="color:#888; padding:10px 0;">No entries</div>
+  </div>
+  </section>
+
+  <section data-tab="mappings" id="tab-mappings">
+  <div class="card">
     <h2>Team &rarr; Repo Mappings</h2>
     <div style="margin-bottom:10px"><button onclick="openMappingDialog(null)">+ Add Mapping</button></div>
     <table>
@@ -191,6 +229,25 @@ export const adminHtml = `<!DOCTYPE html>
       <tbody id="mappings-body"></tbody>
     </table>
   </div>
+
+  <div class="card hidden" id="secrets-panel">
+    <h2>Secrets &mdash; <span id="secrets-team-key" class="mono"></span><button class="sm secondary" style="float:right" onclick="document.getElementById('secrets-panel').classList.add('hidden')">&#215;</button></h2>
+    <div class="warning">&#9888; Secrets are shared across all machines for this team. Values are write-only and cannot be read back through the API.</div>
+    <table>
+      <thead>
+        <tr><th>Name (suffix)</th><th>Status</th><th></th></tr>
+      </thead>
+      <tbody id="secrets-body"></tbody>
+    </table>
+    <div id="secrets-empty" class="hidden" style="color:#888; padding:10px 0;">No secrets set for this team</div>
+    <div class="form-row" style="margin-top:12px">
+      <input id="s-name" placeholder="Name (e.g. DATABASE_URL)" style="text-transform:uppercase">
+      <input id="s-value" type="password" placeholder="Value">
+      <button id="btn-add-secret" onclick="addSecret()">Set Secret</button>
+    </div>
+    <div id="secrets-error" class="error hidden" style="margin-top:6px"></div>
+  </div>
+  </section>
 
   <dialog id="mapping-dialog">
     <div class="md-header">
@@ -272,57 +329,6 @@ export const adminHtml = `<!DOCTYPE html>
       </div>
     </div>
   </dialog>
-
-  <div class="card hidden" id="secrets-panel">
-    <h2>Secrets &mdash; <span id="secrets-team-key" class="mono"></span><button class="sm secondary" style="float:right" onclick="document.getElementById('secrets-panel').classList.add('hidden')">&#215;</button></h2>
-    <div class="warning">&#9888; Secrets are shared across all machines for this team. Values are write-only and cannot be read back through the API.</div>
-    <table>
-      <thead>
-        <tr><th>Name (suffix)</th><th>Status</th><th></th></tr>
-      </thead>
-      <tbody id="secrets-body"></tbody>
-    </table>
-    <div id="secrets-empty" class="hidden" style="color:#888; padding:10px 0;">No secrets set for this team</div>
-    <div class="form-row" style="margin-top:12px">
-      <input id="s-name" placeholder="Name (e.g. DATABASE_URL)" style="text-transform:uppercase">
-      <input id="s-value" type="password" placeholder="Value">
-      <button id="btn-add-secret" onclick="addSecret()">Set Secret</button>
-    </div>
-    <div id="secrets-error" class="error hidden" style="margin-top:6px"></div>
-  </div>
-
-  <div class="card">
-    <h2>Active Fly Sessions<span id="lu-sessions" class="last-updated"></span></h2>
-    <table>
-      <thead>
-        <tr><th>Issue</th><th>Team</th><th>Repo</th><th>Machine</th><th>State</th><th>Duration</th><th></th></tr>
-      </thead>
-      <tbody id="sessions-body"></tbody>
-    </table>
-    <div id="sessions-empty" class="hidden" style="color:#888; padding:10px 0;">No active sessions</div>
-  </div>
-
-  <div class="card">
-    <h2>Jobs<span id="lu-log" class="last-updated"></span></h2>
-    <table>
-      <thead>
-        <tr><th>Time</th><th>#</th><th>Issue</th><th>State</th><th>Team</th><th>Repo</th><th>Runner</th><th>Image</th><th>Status</th><th>PR</th></tr>
-      </thead>
-      <tbody id="log-body"></tbody>
-    </table>
-    <div id="log-empty" class="hidden" style="color:#888; padding:10px 0;">No dispatches yet</div>
-  </div>
-
-  <div class="card">
-    <h2>Dedup Entries<span id="lu-dedup" class="last-updated"></span></h2>
-    <table>
-      <thead>
-        <tr><th>Issue</th><th>Dispatched At</th><th></th></tr>
-      </thead>
-      <tbody id="dedup-body"></tbody>
-    </table>
-    <div id="dedup-empty" class="hidden" style="color:#888; padding:10px 0;">No entries</div>
-  </div>
 </div>
 
 <script>
