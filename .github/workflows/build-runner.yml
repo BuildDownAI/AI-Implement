@@ -1,3 +1,12 @@
+# The pushed package (ghcr.io/<owner>/ai-implement-runner) MUST be public on
+# GHCR — Fly Machines pulls it anonymously when launching session VMs and a
+# 401 here surfaces as "failed to get manifest ... unauthorized" in the
+# orchestrator logs. New GHCR packages default to Private. To flip:
+#   1. Org → Settings → Packages: ensure "Public" is allowed under container
+#      package visibility (org admins gate this).
+#   2. Package → Settings → Change visibility → Public.
+# This is a one-time setting per package; subsequent pushes preserve it.
+
 name: Build runner image
 
 on:

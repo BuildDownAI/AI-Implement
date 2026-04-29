@@ -197,6 +197,8 @@ image: ghcr.io/your-org/your-runner:v1
 
 The image must be publicly pullable. The customer owns building and publishing it. If the file is absent, malformed, or points at an unreachable reference, the orchestrator falls back to the default runner (`SESSION_IMAGE` env var, or `ghcr.io/builddownai/ai-implement-runner:latest`).
 
+The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
+
 Typical use: your repo needs a language runtime or tool that isn't in the base image (e.g. terraform, ruby, go). Build an image `FROM` the published base `ghcr.io/builddownai/ai-implement-runner:latest`, add your tools, push, and point `image.yml` at it.
 
 ## Multi-client deploy
