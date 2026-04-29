@@ -43,6 +43,12 @@ export const adminHtml = `<!DOCTYPE html>
   .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 20px; }
   .warning { background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 8px 12px; font-size: 0.85em; color: #856404; margin-bottom: 12px; }
   .last-updated { color: #aaa; font-size: 0.75em; font-weight: normal; margin-left: 8px; }
+  .tab-bar { display: flex; gap: 24px; border-bottom: 1px solid #ddd; margin-bottom: 20px; }
+  .tab-bar a { padding: 10px 2px; color: #888; text-decoration: none; font-size: 0.9em; border-bottom: 2px solid transparent; margin-bottom: -1px; cursor: pointer; }
+  .tab-bar a:hover { color: #555; }
+  .tab-bar a.active { color: #333; border-bottom-color: #4a90d9; font-weight: 500; }
+  .tab-hidden { display: none !important; }
+  details[open] > summary > span:first-child { transform: rotate(90deg); display:inline-block; }
   dialog { border: none; border-radius: 8px; padding: 0; width: 700px; max-width: 95vw; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
   dialog::backdrop { background: rgba(0,0,0,0.4); }
   .md-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #eee; font-weight: 600; }
@@ -75,6 +81,13 @@ export const adminHtml = `<!DOCTYPE html>
     <button class="secondary" onclick="logout()">Log Out</button>
   </div>
 
+  <nav class="tab-bar" id="tab-bar">
+    <a id="tab-link-activity" data-tab="activity" onclick="setActiveTab('activity')">Activity</a>
+    <a id="tab-link-mappings" data-tab="mappings" onclick="setActiveTab('mappings')">Mappings</a>
+    <a id="tab-link-settings" data-tab="settings" onclick="setActiveTab('settings')">Settings</a>
+  </nav>
+
+  <section data-tab="settings" id="tab-settings">
   <div class="card">
     <h2>Settings</h2>
     <div id="settings-env-warning" class="warning hidden">
@@ -129,47 +142,86 @@ export const adminHtml = `<!DOCTYPE html>
       <div id="gs-error" class="error hidden" style="margin-top:6px"></div>
     </fieldset>
   </div>
+  </section>
 
-  <div class="card" id="status-block">
-    <h2>Status<span id="lu-runner" class="last-updated"></span></h2>
-    <div class="status-block">
-      <div>
-        <span style="color:#888;font-size:0.85em;text-transform:uppercase;font-weight:500;">Runner Mode</span><br>
-        <span id="runner-mode-badge" class="badge" style="margin-top:4px;font-size:0.9em"></span>
-        <span id="runner-mode-source" style="color:#aaa;font-size:0.8em;margin-left:6px"></span>
-      </div>
-      <div class="runner-btns" id="runner-mode-controls">
+  <section data-tab="activity" id="tab-activity">
+    <div id="runner-mode-strip" style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:10px 14px;background:#fff;border:1px solid #eee;border-radius:6px;margin-bottom:20px;font-size:0.9em">
+      <span style="color:#888;text-transform:uppercase;font-size:0.78em;font-weight:500">Runner Mode</span>
+      <span id="runner-mode-badge" class="badge"></span>
+      <span id="runner-mode-source" style="color:#aaa;font-size:0.8em"></span>
+      <span class="runner-btns" id="runner-mode-controls">
         <button class="sm" id="btn-mode-default" onclick="setRunnerMode('default')">Default</button>
         <button class="sm" id="btn-mode-gha" onclick="setRunnerMode('gha')">GHA</button>
         <button class="sm" id="btn-mode-fly" onclick="setRunnerMode('fly')">Fly</button>
         <button class="sm" id="btn-mode-shadow" onclick="setRunnerMode('shadow')">Shadow</button>
-      </div>
+      </span>
+      <span style="flex:1"></span>
+      <span id="reaper-status-line" style="color:#555">Reaper: loading&hellip;</span>
+      <span id="lu-runner" class="last-updated"></span>
     </div>
-    <div style="color:#888;font-size:0.8em;margin-top:6px">
-      <b>Default</b>: each team uses its own Execution Mode setting below.
-      <b>GHA</b> / <b>Fly</b>: global override — ignores per-team setting.
-      <b>Shadow</b>: dispatch both runners for parity testing.
-    </div>
-    <div id="runner-mode-env-warning" class="error hidden" style="margin-top:8px">
+    <div id="runner-mode-env-warning" class="error hidden" style="margin:-12px 0 12px">
       &#9888; RUNNER_MODE env var is set &mdash; UI toggle has no effect until it is unset.
     </div>
-    <div style="margin-top:12px;padding-top:12px;border-top:1px solid #eee;color:#555;font-size:0.9em">
-      <span id="reaper-status-line">Reaper: loading&hellip;</span>
-    </div>
+
+  <div class="card">
+    <h2>Active Fly Sessions<span id="lu-sessions" class="last-updated"></span></h2>
+    <table>
+      <thead>
+        <tr><th>Issue</th><th>Team</th><th>Repo</th><th>Machine</th><th>State</th><th>Duration</th><th></th></tr>
+      </thead>
+      <tbody id="sessions-body"></tbody>
+    </table>
+    <div id="sessions-empty" class="hidden" style="color:#888; padding:10px 0;">No active sessions</div>
   </div>
 
   <div class="card">
-    <h2>Reaper<span id="lu-reaper" class="last-updated"></span></h2>
-    <div id="reaper-summary-block" style="margin-bottom:12px"></div>
+    <h2>Jobs<span id="lu-log" class="last-updated"></span></h2>
     <table>
       <thead>
-        <tr><th>Time</th><th>Rule</th><th>Machine</th><th>Tenant</th><th>Issue</th><th>Age (s)</th><th>Mode</th></tr>
+        <tr><th>Time</th><th>#</th><th>Issue</th><th>State</th><th>Team</th><th>Repo</th><th>Runner</th><th>Image</th><th>Status</th><th>PR</th></tr>
       </thead>
-      <tbody id="reaper-body"></tbody>
+      <tbody id="log-body"></tbody>
     </table>
-    <div id="reaper-empty" class="hidden" style="color:#888;padding:10px 0;">No reaper actions recorded</div>
+    <div id="log-empty" class="hidden" style="color:#888; padding:10px 0;">No dispatches yet</div>
   </div>
 
+    <details class="card" id="reaper-details">
+      <summary style="cursor:pointer;font-size:1.1em;font-weight:500;color:#555;list-style:none">
+        <span style="display:inline-block;width:1em">&#9656;</span>
+        Reaper actions <span id="reaper-count" style="color:#888;font-weight:normal;font-size:0.85em">(&hellip;)</span>
+        <span id="lu-reaper" class="last-updated"></span>
+      </summary>
+      <div style="margin-top:12px">
+        <div id="reaper-summary-block" style="margin-bottom:12px"></div>
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Rule</th><th>Machine</th><th>Tenant</th><th>Issue</th><th>Age (s)</th><th>Mode</th></tr>
+          </thead>
+          <tbody id="reaper-body"></tbody>
+        </table>
+        <div id="reaper-empty" class="hidden" style="color:#888;padding:10px 0;">No reaper actions recorded</div>
+      </div>
+    </details>
+
+    <details class="card" id="dedup-details">
+      <summary style="cursor:pointer;font-size:1.1em;font-weight:500;color:#555;list-style:none">
+        <span style="display:inline-block;width:1em">&#9656;</span>
+        Dedup entries <span id="dedup-count" style="color:#888;font-weight:normal;font-size:0.85em">(&hellip;)</span>
+        <span id="lu-dedup" class="last-updated"></span>
+      </summary>
+      <div style="margin-top:12px">
+        <table>
+          <thead>
+            <tr><th>Issue</th><th>Dispatched At</th><th></th></tr>
+          </thead>
+          <tbody id="dedup-body"></tbody>
+        </table>
+        <div id="dedup-empty" class="hidden" style="color:#888; padding:10px 0;">No entries</div>
+      </div>
+    </details>
+  </section>
+
+  <section data-tab="mappings" id="tab-mappings">
   <div class="card">
     <h2>Team &rarr; Repo Mappings</h2>
     <div style="margin-bottom:10px"><button onclick="openMappingDialog(null)">+ Add Mapping</button></div>
@@ -180,6 +232,25 @@ export const adminHtml = `<!DOCTYPE html>
       <tbody id="mappings-body"></tbody>
     </table>
   </div>
+
+  <div class="card hidden" id="secrets-panel">
+    <h2>Secrets &mdash; <span id="secrets-team-key" class="mono"></span><button class="sm secondary" style="float:right" onclick="document.getElementById('secrets-panel').classList.add('hidden')">&#215;</button></h2>
+    <div class="warning">&#9888; Secrets are shared across all machines for this team. Values are write-only and cannot be read back through the API.</div>
+    <table>
+      <thead>
+        <tr><th>Name (suffix)</th><th>Status</th><th></th></tr>
+      </thead>
+      <tbody id="secrets-body"></tbody>
+    </table>
+    <div id="secrets-empty" class="hidden" style="color:#888; padding:10px 0;">No secrets set for this team</div>
+    <div class="form-row" style="margin-top:12px">
+      <input id="s-name" placeholder="Name (e.g. DATABASE_URL)" style="text-transform:uppercase">
+      <input id="s-value" type="password" placeholder="Value">
+      <button id="btn-add-secret" onclick="addSecret()">Set Secret</button>
+    </div>
+    <div id="secrets-error" class="error hidden" style="margin-top:6px"></div>
+  </div>
+  </section>
 
   <dialog id="mapping-dialog">
     <div class="md-header">
@@ -261,57 +332,6 @@ export const adminHtml = `<!DOCTYPE html>
       </div>
     </div>
   </dialog>
-
-  <div class="card hidden" id="secrets-panel">
-    <h2>Secrets &mdash; <span id="secrets-team-key" class="mono"></span><button class="sm secondary" style="float:right" onclick="document.getElementById('secrets-panel').classList.add('hidden')">&#215;</button></h2>
-    <div class="warning">&#9888; Secrets are shared across all machines for this team. Values are write-only and cannot be read back through the API.</div>
-    <table>
-      <thead>
-        <tr><th>Name (suffix)</th><th>Status</th><th></th></tr>
-      </thead>
-      <tbody id="secrets-body"></tbody>
-    </table>
-    <div id="secrets-empty" class="hidden" style="color:#888; padding:10px 0;">No secrets set for this team</div>
-    <div class="form-row" style="margin-top:12px">
-      <input id="s-name" placeholder="Name (e.g. DATABASE_URL)" style="text-transform:uppercase">
-      <input id="s-value" type="password" placeholder="Value">
-      <button id="btn-add-secret" onclick="addSecret()">Set Secret</button>
-    </div>
-    <div id="secrets-error" class="error hidden" style="margin-top:6px"></div>
-  </div>
-
-  <div class="card">
-    <h2>Active Fly Sessions<span id="lu-sessions" class="last-updated"></span></h2>
-    <table>
-      <thead>
-        <tr><th>Issue</th><th>Team</th><th>Repo</th><th>Machine</th><th>State</th><th>Duration</th><th></th></tr>
-      </thead>
-      <tbody id="sessions-body"></tbody>
-    </table>
-    <div id="sessions-empty" class="hidden" style="color:#888; padding:10px 0;">No active sessions</div>
-  </div>
-
-  <div class="card">
-    <h2>Jobs<span id="lu-log" class="last-updated"></span></h2>
-    <table>
-      <thead>
-        <tr><th>Time</th><th>#</th><th>Issue</th><th>State</th><th>Team</th><th>Repo</th><th>Runner</th><th>Image</th><th>Status</th><th>PR</th></tr>
-      </thead>
-      <tbody id="log-body"></tbody>
-    </table>
-    <div id="log-empty" class="hidden" style="color:#888; padding:10px 0;">No dispatches yet</div>
-  </div>
-
-  <div class="card">
-    <h2>Dedup Entries<span id="lu-dedup" class="last-updated"></span></h2>
-    <table>
-      <thead>
-        <tr><th>Issue</th><th>Dispatched At</th><th></th></tr>
-      </thead>
-      <tbody id="dedup-body"></tbody>
-    </table>
-    <div id="dedup-empty" class="hidden" style="color:#888; padding:10px 0;">No entries</div>
-  </div>
 </div>
 
 <script>
@@ -332,12 +352,43 @@ function stopAllPolling() {
   });
 }
 
-function startAllPolling() {
+function startActivityPolling() {
   startPolling(loadLog, 10000, 'log');
-  startPolling(loadDedup, 15000, 'dedup');
   startPolling(loadSessions, 30000, 'sessions');
   startPolling(loadRunnerMode, 30000, 'runner');
-  startPolling(loadReaper, 15000, 'reaper');
+  // Reaper and Dedup pollers are gated by their <details> open state — see startReaperPolling / startDedupPolling.
+  if (document.getElementById('reaper-details') && document.getElementById('reaper-details').open) {
+    startPolling(loadReaper, 15000, 'reaper');
+  }
+  if (document.getElementById('dedup-details') && document.getElementById('dedup-details').open) {
+    startPolling(loadDedup, 15000, 'dedup');
+  }
+}
+
+function startMappingsPolling() {
+  // Mappings is fetched on tab entry; no recurring poll today.
+}
+
+function startSettingsPolling() {
+  // Settings + global secrets are one-shot on tab entry; no recurring poll today.
+}
+
+function startActiveTabPolling(name) {
+  if (name === 'activity') return startActivityPolling();
+  if (name === 'mappings') return startMappingsPolling();
+  if (name === 'settings') return startSettingsPolling();
+}
+
+async function loadActiveTabData(name) {
+  if (name === 'activity') {
+    await Promise.all([loadLog(), loadSessions(), loadRunnerMode()]).catch(function(err){ console.error('activity load failed:', err); });
+    if (document.getElementById('reaper-details') && document.getElementById('reaper-details').open) loadReaper();
+    if (document.getElementById('dedup-details') && document.getElementById('dedup-details').open) loadDedup();
+  } else if (name === 'mappings') {
+    await loadMappings().catch(function(err){ console.error('mappings load failed:', err); });
+  } else if (name === 'settings') {
+    await Promise.all([loadSettings(), loadGlobalSecrets()]).catch(function(err){ console.error('settings load failed:', err); });
+  }
 }
 
 function setLastUpdated(id) {
@@ -349,8 +400,9 @@ document.addEventListener('visibilitychange', function() {
   if (document.visibilityState === 'hidden') {
     stopAllPolling();
   } else if (token) {
-    Promise.all([loadLog(), loadDedup(), loadSessions(), loadRunnerMode(), loadReaper()]).catch(function(err) { console.error('refresh on visibility failed:', err); });
-    startAllPolling();
+    const active = localStorage.getItem('admin_active_tab') || 'activity';
+    loadActiveTabData(active);
+    startActiveTabPolling(active);
   }
 });
 
@@ -385,6 +437,57 @@ async function login() {
 
 document.getElementById('access-code').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
 
+const TABS = ['activity', 'mappings', 'settings'];
+
+function getInitialTab() {
+  const fromHash = (location.hash || '').replace(/^#/, '');
+  if (TABS.includes(fromHash)) return fromHash;
+  const stored = localStorage.getItem('admin_active_tab');
+  if (TABS.includes(stored)) return stored;
+  return 'activity';
+}
+
+function setActiveTab(name) {
+  if (!TABS.includes(name)) name = 'activity';
+  for (const t of TABS) {
+    const section = document.getElementById('tab-' + t);
+    const link = document.getElementById('tab-link-' + t);
+    if (section) section.classList.toggle('tab-hidden', t !== name);
+    if (link) link.classList.toggle('active', t === name);
+  }
+  localStorage.setItem('admin_active_tab', name);
+  if (location.hash !== '#' + name) {
+    history.replaceState(null, '', '#' + name);
+  }
+  stopAllPolling();
+  loadActiveTabData(name);
+  startActiveTabPolling(name);
+}
+
+function wireDetailsPoller(detailsId, intervalMs, key, loadFn) {
+  const el = document.getElementById(detailsId);
+  if (!el) return;
+  el.addEventListener('toggle', function() {
+    if (el.open) {
+      loadFn();
+      startPolling(loadFn, intervalMs, key);
+    } else {
+      if (window.__intervals[key]) {
+        clearInterval(window.__intervals[key]);
+        delete window.__intervals[key];
+      }
+    }
+  });
+}
+
+wireDetailsPoller('reaper-details', 15000, 'reaper', loadReaper);
+wireDetailsPoller('dedup-details', 15000, 'dedup', loadDedup);
+
+window.addEventListener('hashchange', function() {
+  const fromHash = (location.hash || '').replace(/^#/, '');
+  if (TABS.includes(fromHash)) setActiveTab(fromHash);
+});
+
 function showLogin() {
   document.getElementById('login-page').classList.remove('hidden');
   document.getElementById('admin-page').classList.add('hidden');
@@ -400,8 +503,7 @@ function logout() {
 async function showAdmin() {
   document.getElementById('login-page').classList.add('hidden');
   document.getElementById('admin-page').classList.remove('hidden');
-  await Promise.all([loadLog(), loadMappings(), loadDedup(), loadSessions(), loadRunnerMode(), loadReaper(), loadSettings(), loadGlobalSecrets()]);
-  startAllPolling();
+  setActiveTab(getInitialTab());
 }
 
 async function loadRunnerMode() {
@@ -846,6 +948,8 @@ async function loadDedup() {
   try {
     const res = await api('/api/dedup');
     const data = await res.json();
+    const countEl = document.getElementById('dedup-count');
+    if (countEl) countEl.textContent = '(' + (Array.isArray(data) ? data.length : 0) + ')';
     const tbody = document.getElementById('dedup-body');
     const empty = document.getElementById('dedup-empty');
     tbody.innerHTML = '';
@@ -1057,6 +1161,8 @@ async function loadReaper() {
     const summary = await summaryRes.json();
     const recent = await recentRes.json();
     renderReaper(summary, recent);
+    const countEl = document.getElementById('reaper-count');
+    if (countEl) countEl.textContent = '(' + (Array.isArray(recent) ? recent.length : 0) + ')';
   } catch (err) {
     console.error('loadReaper failed:', err);
   }
