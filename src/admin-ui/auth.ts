@@ -36,6 +36,10 @@ export const authJs = `
   function showAdmin() {
     document.getElementById('login-page').classList.add('hidden');
     document.getElementById('admin-page').classList.remove('hidden');
+    // Re-fire the router so the correct page section is shown and its init runs.
+    // The router's DOMContentLoaded listener already ran by the time login completes,
+    // so it needs an explicit nudge.
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
   }
   window.showAdmin = showAdmin;
 
