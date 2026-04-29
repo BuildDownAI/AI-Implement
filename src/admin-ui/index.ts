@@ -6,6 +6,7 @@ import { routerJs } from "./router.js";
 import { authJs } from "./auth.js";
 import { settingsHtml, settingsScript } from "./pages/settings.js";
 import { projectsHtml, projectsScript } from "./pages/projects.js";
+import { pipelinesHtml, pipelinesScript } from "./pages/pipelines.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -24,6 +25,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
   <main class="main">
     ${settingsHtml}
     ${projectsHtml}
+    ${pipelinesHtml}
     <!-- pages injected in later tasks -->
   </main>
 </div>`;
@@ -38,7 +40,7 @@ const body = `<body>
   </div>
 </div>
 ${shell}
-<script>${themeJs}${authJs}${routerJs}${settingsScript}${projectsScript}/* TODO: page scripts in Tasks 9-13 */</script>
+<script>${themeJs}${authJs}${routerJs}${settingsScript}${projectsScript}${pipelinesScript}/* TODO: page scripts in Tasks 10-13 */</script>
 </body></html>`;
 
 export const adminHtml = head + body;
