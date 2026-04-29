@@ -352,12 +352,43 @@ function stopAllPolling() {
   });
 }
 
-function startAllPolling() {
+function startActivityPolling() {
   startPolling(loadLog, 10000, 'log');
-  startPolling(loadDedup, 15000, 'dedup');
   startPolling(loadSessions, 30000, 'sessions');
   startPolling(loadRunnerMode, 30000, 'runner');
-  startPolling(loadReaper, 15000, 'reaper');
+  // Reaper and Dedup pollers are gated by their <details> open state — see startReaperPolling / startDedupPolling.
+  if (document.getElementById('reaper-details') && document.getElementById('reaper-details').open) {
+    startPolling(loadReaper, 15000, 'reaper');
+  }
+  if (document.getElementById('dedup-details') && document.getElementById('dedup-details').open) {
+    startPolling(loadDedup, 15000, 'dedup');
+  }
+}
+
+function startMappingsPolling() {
+  // Mappings is fetched on tab entry; no recurring poll today.
+}
+
+function startSettingsPolling() {
+  // Settings + global secrets are one-shot on tab entry; no recurring poll today.
+}
+
+function startActiveTabPolling(name) {
+  if (name === 'activity') return startActivityPolling();
+  if (name === 'mappings') return startMappingsPolling();
+  if (name === 'settings') return startSettingsPolling();
+}
+
+async function loadActiveTabData(name) {
+  if (name === 'activity') {
+    await Promise.all([loadLog(), loadSessions(), loadRunnerMode()]).catch(function(err){ console.error('activity load failed:', err); });
+    if (document.getElementById('reaper-details') && document.getElementById('reaper-details').open) loadReaper();
+    if (document.getElementById('dedup-details') && document.getElementById('dedup-details').open) loadDedup();
+  } else if (name === 'mappings') {
+    await loadMappings().catch(function(err){ console.error('mappings load failed:', err); });
+  } else if (name === 'settings') {
+    await Promise.all([loadSettings(), loadGlobalSecrets()]).catch(function(err){ console.error('settings load failed:', err); });
+  }
 }
 
 function setLastUpdated(id) {
@@ -369,8 +400,9 @@ document.addEventListener('visibilitychange', function() {
   if (document.visibilityState === 'hidden') {
     stopAllPolling();
   } else if (token) {
-    Promise.all([loadLog(), loadDedup(), loadSessions(), loadRunnerMode(), loadReaper()]).catch(function(err) { console.error('refresh on visibility failed:', err); });
-    startAllPolling();
+    const active = localStorage.getItem('admin_active_tab') || 'activity';
+    loadActiveTabData(active);
+    startActiveTabPolling(active);
   }
 });
 
@@ -427,7 +459,29 @@ function setActiveTab(name) {
   if (location.hash !== '#' + name) {
     history.replaceState(null, '', '#' + name);
   }
+  stopAllPolling();
+  loadActiveTabData(name);
+  startActiveTabPolling(name);
 }
+
+function wireDetailsPoller(detailsId, intervalMs, key, loadFn) {
+  const el = document.getElementById(detailsId);
+  if (!el) return;
+  el.addEventListener('toggle', function() {
+    if (el.open) {
+      loadFn();
+      startPolling(loadFn, intervalMs, key);
+    } else {
+      if (window.__intervals[key]) {
+        clearInterval(window.__intervals[key]);
+        delete window.__intervals[key];
+      }
+    }
+  });
+}
+
+wireDetailsPoller('reaper-details', 15000, 'reaper', loadReaper);
+wireDetailsPoller('dedup-details', 15000, 'dedup', loadDedup);
 
 window.addEventListener('hashchange', function() {
   const fromHash = (location.hash || '').replace(/^#/, '');
@@ -450,8 +504,6 @@ async function showAdmin() {
   document.getElementById('login-page').classList.add('hidden');
   document.getElementById('admin-page').classList.remove('hidden');
   setActiveTab(getInitialTab());
-  await Promise.all([loadLog(), loadMappings(), loadDedup(), loadSessions(), loadRunnerMode(), loadReaper(), loadSettings(), loadGlobalSecrets()]);
-  startAllPolling();
 }
 
 async function loadRunnerMode() {
