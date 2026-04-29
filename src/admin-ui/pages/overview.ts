@@ -84,7 +84,7 @@ export const overviewHtml = `
       </div>
       <div class="card-body tight">
         <table class="tbl">
-          <thead><tr><th>Issue</th><th>Failed at</th><th>Summary</th><th style="text-align:right">When</th></tr></thead>
+          <thead><tr><th>Issue</th><th>Failed at</th><th style="text-align:right">When</th></tr></thead>
           <tbody id="overview-failures-body"></tbody>
         </table>
         <div id="overview-failures-empty" class="hidden text-tertiary" style="padding:12px">No failures in the last 24h</div>
@@ -152,7 +152,7 @@ export const overviewScript = `
 
   function capacityMeter(used, max) {
     const pct = max > 0 ? Math.round((used / max) * 100) : 0;
-    const color = pct >= 100 ? 'var(--red)' : pct >= 75 ? 'var(--yellow)' : 'var(--green, var(--accent))';
+    const color = pct >= 100 ? 'var(--st-fail-dot)' : pct >= 75 ? 'var(--st-warn-dot)' : 'var(--accent)';
     return '<div style="display:flex;align-items:center;gap:8px">'
       + '<div style="flex:1;height:6px;background:var(--border-subtle);border-radius:3px;overflow:hidden">'
       + '<div style="width:' + Math.min(pct, 100) + '%;height:100%;background:' + color + ';border-radius:3px"></div>'
@@ -168,6 +168,7 @@ export const overviewScript = `
   }
 
   function dispatch24hBuckets(log) {
+    if (!log || log.length === 0) return [];
     const now = Date.now();
     const buckets = new Array(24).fill(0);
     for (const e of log) {
@@ -206,7 +207,7 @@ export const overviewScript = `
       return cnt >= cap;
     }).length;
 
-    const teams = new Set(running.map(function (r) { return r.teamKey; }));
+    const teams = new Set(running.filter(function (r) { return r.teamKey; }).map(function (r) { return r.teamKey; }));
 
     const rv = document.getElementById('kpi-running-value');
     if (rv) rv.textContent = String(running.length);
@@ -310,10 +311,9 @@ export const overviewScript = `
       const issueLabel = e.issueIdentifier || e.issueId || '—';
       const failedAt = e.dispatchedAt ? new Date(e.dispatchedAt).toLocaleString() : '—';
       const when = e.dispatchedAt ? fmtAgo(e.dispatchedAt) : '—';
-      tr.innerHTML = '<td><span class="mono text-secondary">' + window.esc(issueLabel) + '</span>'
-        + (e.issueTitle ? ' <span class="text-secondary">' + window.esc(e.issueTitle) + '</span>' : '') + '</td>'
+      tr.innerHTML = '<td class="col-grow"><span class="mono text-secondary">' + window.esc(issueLabel) + '</span>'
+        + (e.issueTitle ? ' <span>' + window.esc(e.issueTitle) + '</span>' : '') + '</td>'
         + '<td class="mono text-tertiary" style="white-space:nowrap">' + failedAt + '</td>'
-        + '<td class="text-secondary col-grow">' + (e.issueTitle ? window.esc(e.issueTitle) : '&mdash;') + '</td>'
         + '<td style="text-align:right" class="mono text-tertiary">' + when + '</td>';
       tbody.appendChild(tr);
     });
