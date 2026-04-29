@@ -47,7 +47,7 @@ const body = `<body>
   </div>
 </div>
 ${shell}
-<script>${themeJs}${authJs}${routerJs}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}/* TODO: page scripts in Task 13 */</script>
+<script>${themeJs}${authJs}${routerJs}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}</script>
 </body></html>`;
 
 export const adminHtml = head + body;

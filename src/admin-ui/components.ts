@@ -872,4 +872,88 @@ deck-stage, .dc-artboard { background: var(--bg-app); }
   padding: 8px 12px;
   font-size: 12.5px;
 }
+
+/* ── Native <dialog> for legacy mapping form ─────────────────────────── */
+dialog {
+  border: none;
+  border-radius: var(--r-md);
+  padding: 0;
+  width: 700px;
+  max-width: 95vw;
+  background: var(--bg-elev);
+  color: var(--fg-primary);
+  box-shadow: var(--shadow-lg);
+}
+dialog::backdrop { background: rgba(0,0,0,0.5); }
+.md-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-weight: 600;
+  font-size: 14px;
+}
+.md-body {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.md-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.md-footer {
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.md-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 8px;
+}
+.md-field:last-child { margin-bottom: 0; }
+.md-field label {
+  font-size: 11px;
+  color: var(--fg-secondary);
+  font-weight: 500;
+}
+.md-field input,
+.md-field select,
+.md-field textarea {
+  width: 100%;
+}
+.md-field textarea {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  resize: vertical;
+}
+
+/* ── Legacy button class aliases (preserved during ported-page migration) */
+button.sm,
+.btn.sm {
+  padding: 3px 10px;
+  font-size: 11.5px;
+  border-radius: var(--r-sm);
+}
+button.danger,
+.btn.danger {
+  background: var(--st-fail-bg);
+  color: var(--st-fail-fg);
+  border-color: var(--st-fail-fg);
+}
+button.secondary,
+.btn.secondary {
+  background: var(--bg-sunken);
+  color: var(--fg-secondary);
+  border-color: var(--border-default);
+}
 `;

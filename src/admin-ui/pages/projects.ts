@@ -348,7 +348,7 @@ export const projectsScript = `
       for (const s of data) {
         const tr = document.createElement('tr');
         tr.innerHTML = '<td class="mono">' + window.esc(s.name) + '</td>'
-          + '<td><span class="badge active">Set</span></td>'
+          + '<td><span class="badge success">Set</span></td>'
           + '<td><button class="sm danger" data-name="' + window.esc(s.name) + '" onclick="delSecret(this.dataset.name)">Delete</button></td>';
         tbody.appendChild(tr);
       }
