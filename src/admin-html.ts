@@ -336,6 +336,7 @@ export const adminHtml = `<!DOCTYPE html>
 
 <script>
 const API = '';
+const TABS = ['activity', 'mappings', 'settings'];
 let token = localStorage.getItem('admin_token');
 let mappingsData = {};
 window.__intervals = {};
@@ -400,7 +401,7 @@ document.addEventListener('visibilitychange', function() {
   if (document.visibilityState === 'hidden') {
     stopAllPolling();
   } else if (token) {
-    const active = localStorage.getItem('admin_active_tab') || 'activity';
+    const active = getInitialTab();
     loadActiveTabData(active);
     startActiveTabPolling(active);
   }
@@ -437,13 +438,9 @@ async function login() {
 
 document.getElementById('access-code').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
 
-const TABS = ['activity', 'mappings', 'settings'];
-
 function getInitialTab() {
   const fromHash = (location.hash || '').replace(/^#/, '');
   if (TABS.includes(fromHash)) return fromHash;
-  const stored = localStorage.getItem('admin_active_tab');
-  if (TABS.includes(stored)) return stored;
   return 'activity';
 }
 
@@ -455,7 +452,6 @@ function setActiveTab(name) {
     if (section) section.classList.toggle('tab-hidden', t !== name);
     if (link) link.classList.toggle('active', t === name);
   }
-  localStorage.setItem('admin_active_tab', name);
   if (location.hash !== '#' + name) {
     history.replaceState(null, '', '#' + name);
   }
