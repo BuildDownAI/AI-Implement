@@ -48,6 +48,7 @@ export const adminHtml = `<!DOCTYPE html>
   .tab-bar a:hover { color: #555; }
   .tab-bar a.active { color: #333; border-bottom-color: #4a90d9; font-weight: 500; }
   .tab-hidden { display: none !important; }
+  details[open] > summary > span:first-child { transform: rotate(90deg); display:inline-block; }
   dialog { border: none; border-radius: 8px; padding: 0; width: 700px; max-width: 95vw; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
   dialog::backdrop { background: rgba(0,0,0,0.4); }
   .md-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid #eee; font-weight: 600; }
@@ -184,28 +185,40 @@ export const adminHtml = `<!DOCTYPE html>
     <div id="log-empty" class="hidden" style="color:#888; padding:10px 0;">No dispatches yet</div>
   </div>
 
-  <div class="card">
-    <h2>Reaper<span id="lu-reaper" class="last-updated"></span></h2>
-    <div id="reaper-summary-block" style="margin-bottom:12px"></div>
-    <table>
-      <thead>
-        <tr><th>Time</th><th>Rule</th><th>Machine</th><th>Tenant</th><th>Issue</th><th>Age (s)</th><th>Mode</th></tr>
-      </thead>
-      <tbody id="reaper-body"></tbody>
-    </table>
-    <div id="reaper-empty" class="hidden" style="color:#888;padding:10px 0;">No reaper actions recorded</div>
-  </div>
+    <details class="card" id="reaper-details">
+      <summary style="cursor:pointer;font-size:1.1em;font-weight:500;color:#555;list-style:none">
+        <span style="display:inline-block;width:1em">&#9656;</span>
+        Reaper actions <span id="reaper-count" style="color:#888;font-weight:normal;font-size:0.85em">(&hellip;)</span>
+        <span id="lu-reaper" class="last-updated"></span>
+      </summary>
+      <div style="margin-top:12px">
+        <div id="reaper-summary-block" style="margin-bottom:12px"></div>
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Rule</th><th>Machine</th><th>Tenant</th><th>Issue</th><th>Age (s)</th><th>Mode</th></tr>
+          </thead>
+          <tbody id="reaper-body"></tbody>
+        </table>
+        <div id="reaper-empty" class="hidden" style="color:#888;padding:10px 0;">No reaper actions recorded</div>
+      </div>
+    </details>
 
-  <div class="card">
-    <h2>Dedup Entries<span id="lu-dedup" class="last-updated"></span></h2>
-    <table>
-      <thead>
-        <tr><th>Issue</th><th>Dispatched At</th><th></th></tr>
-      </thead>
-      <tbody id="dedup-body"></tbody>
-    </table>
-    <div id="dedup-empty" class="hidden" style="color:#888; padding:10px 0;">No entries</div>
-  </div>
+    <details class="card" id="dedup-details">
+      <summary style="cursor:pointer;font-size:1.1em;font-weight:500;color:#555;list-style:none">
+        <span style="display:inline-block;width:1em">&#9656;</span>
+        Dedup entries <span id="dedup-count" style="color:#888;font-weight:normal;font-size:0.85em">(&hellip;)</span>
+        <span id="lu-dedup" class="last-updated"></span>
+      </summary>
+      <div style="margin-top:12px">
+        <table>
+          <thead>
+            <tr><th>Issue</th><th>Dispatched At</th><th></th></tr>
+          </thead>
+          <tbody id="dedup-body"></tbody>
+        </table>
+        <div id="dedup-empty" class="hidden" style="color:#888; padding:10px 0;">No entries</div>
+      </div>
+    </details>
   </section>
 
   <section data-tab="mappings" id="tab-mappings">
@@ -883,6 +896,8 @@ async function loadDedup() {
   try {
     const res = await api('/api/dedup');
     const data = await res.json();
+    const countEl = document.getElementById('dedup-count');
+    if (countEl) countEl.textContent = '(' + (Array.isArray(data) ? data.length : 0) + ')';
     const tbody = document.getElementById('dedup-body');
     const empty = document.getElementById('dedup-empty');
     tbody.innerHTML = '';
@@ -1094,6 +1109,8 @@ async function loadReaper() {
     const summary = await summaryRes.json();
     const recent = await recentRes.json();
     renderReaper(summary, recent);
+    const countEl = document.getElementById('reaper-count');
+    if (countEl) countEl.textContent = '(' + (Array.isArray(recent) ? recent.length : 0) + ')';
   } catch (err) {
     console.error('loadReaper failed:', err);
   }
