@@ -402,9 +402,34 @@ async function login() {
 
 document.getElementById('access-code').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
 
-function setActiveTab(name) {
-  // wired up in a later task
+const TABS = ['activity', 'mappings', 'settings'];
+
+function getInitialTab() {
+  const fromHash = (location.hash || '').replace(/^#/, '');
+  if (TABS.includes(fromHash)) return fromHash;
+  const stored = localStorage.getItem('admin_active_tab');
+  if (TABS.includes(stored)) return stored;
+  return 'activity';
 }
+
+function setActiveTab(name) {
+  if (!TABS.includes(name)) name = 'activity';
+  for (const t of TABS) {
+    const section = document.getElementById('tab-' + t);
+    const link = document.getElementById('tab-link-' + t);
+    if (section) section.classList.toggle('tab-hidden', t !== name);
+    if (link) link.classList.toggle('active', t === name);
+  }
+  localStorage.setItem('admin_active_tab', name);
+  if (location.hash !== '#' + name) {
+    history.replaceState(null, '', '#' + name);
+  }
+}
+
+window.addEventListener('hashchange', function() {
+  const fromHash = (location.hash || '').replace(/^#/, '');
+  if (TABS.includes(fromHash)) setActiveTab(fromHash);
+});
 
 function showLogin() {
   document.getElementById('login-page').classList.remove('hidden');
@@ -421,6 +446,7 @@ function logout() {
 async function showAdmin() {
   document.getElementById('login-page').classList.add('hidden');
   document.getElementById('admin-page').classList.remove('hidden');
+  setActiveTab(getInitialTab());
   await Promise.all([loadLog(), loadMappings(), loadDedup(), loadSessions(), loadRunnerMode(), loadReaper(), loadSettings(), loadGlobalSecrets()]);
   startAllPolling();
 }
