@@ -9,6 +9,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as StepLogModule from "../step-log.js";
+import type * as LinearModuleType from "../linear.js";
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -53,11 +54,13 @@ let dedup: typeof DedupModule;
 let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let stepLog: typeof StepLogModule;
+let linear: typeof LinearModuleType;
 
 beforeEach(async () => {
   vi.resetModules();
   dbPath = path.join(os.tmpdir(), `admin-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   process.env.DEDUP_DB_PATH = dbPath;
+  linear = await import("../linear.js");
   admin = await import("../admin.js");
   config = await import("../config.js");
   dedup = await import("../dedup.js");
@@ -952,5 +955,63 @@ describe("admin dedup", () => {
     const del = await request("/api/dedup/issue-del", "DELETE", "secret", undefined, token);
     expect(del.statusCode).toBe(200);
     expect(dedup.isAlreadyDispatched("issue-del")).toBe(false);
+  });
+});
+
+describe("admin linear issues endpoint", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/linear/issues", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 502 on Linear failure", async () => {
+    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockRejectedValueOnce(
+      new Error("Linear API error: 401"),
+    );
+    const token = await login("secret");
+    const res = await request("/api/linear/issues", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(502);
+    expect(JSON.parse(res.body).error).toContain("Linear API error");
+  });
+
+  it("returns 200 with shaped issues on success", async () => {
+    const stubSnapshot = {
+      readyForImplementation: [
+        {
+          id: "issue-1",
+          identifier: "CORE-100",
+          title: "Implement feature X",
+          team: { id: "team-1", key: "CORE" },
+          state: { id: "state-1", name: "Todo", type: "unstarted" },
+        },
+      ],
+      needsPlanning: [
+        {
+          id: "issue-2",
+          identifier: "CORE-50",
+          title: "Plan something",
+          team: { id: "team-1", key: "CORE" },
+          state: { id: "state-2", name: "Backlog", type: "backlog" },
+        },
+      ],
+      inProgressCountsByTeam: { CORE: 2 },
+    };
+    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockResolvedValueOnce(stubSnapshot);
+    const token = await login("secret");
+    const res = await request("/api/linear/issues", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Array.isArray(body.issues)).toBe(true);
+    expect(body.issues).toHaveLength(2);
+    expect(body.inProgressCountsByTeam).toEqual({ CORE: 2 });
+    // Sorted by identifier (localeCompare): "CORE-100" < "CORE-50" lexicographically
+    expect(body.issues[0].identifier).toBe("CORE-100");
+    expect(body.issues[0].bucket).toBe("ready");
+    expect(body.issues[1].identifier).toBe("CORE-50");
+    expect(body.issues[1].bucket).toBe("needs-planning");
   });
 });

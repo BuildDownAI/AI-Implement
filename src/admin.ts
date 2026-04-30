@@ -28,7 +28,7 @@ import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, updateJobStatus, getJobById } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
-import { removeAIWorkingLabel } from "./linear.js";
+import { removeAIWorkingLabel, fetchAIImplementIssueSnapshot, type LinearIssue } from "./linear.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 
@@ -67,6 +67,18 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
+}
+
+function shapeIssue(i: LinearIssue, bucket: "ready" | "needs-planning") {
+  return {
+    id: i.id,
+    identifier: i.identifier,
+    title: i.title,
+    teamKey: i.team.key,
+    stateName: i.state.name,
+    stateType: i.state.type,
+    bucket,
+  };
 }
 
 function getToken(req: http.IncomingMessage): string | undefined {
@@ -171,6 +183,11 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/linear/issues" && method === "GET") {
+      handleListLinearIssues(res, config);
+      return true;
+    }
+
     if (url === "/api/reaper/summary" && method === "GET") {
       const summary = getReaperSummary();
       json(res, 200, { ...summary, lastSweepAt: getLastSweepAt() });
@@ -251,6 +268,25 @@ export function handleAdminRequest(
   }
 
   return false;
+}
+
+async function handleListLinearIssues(
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  try {
+    const snapshot = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const issues = [
+      ...snapshot.readyForImplementation.map((i) => shapeIssue(i, "ready")),
+      ...snapshot.needsPlanning.map((i) => shapeIssue(i, "needs-planning")),
+    ].sort((a, b) => a.identifier.localeCompare(b.identifier));
+    json(res, 200, {
+      issues,
+      inProgressCountsByTeam: snapshot.inProgressCountsByTeam,
+    });
+  } catch (err) {
+    json(res, 502, { error: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 async function handleSetRunnerMode(
