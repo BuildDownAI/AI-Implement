@@ -33,6 +33,7 @@ import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { listCustomizations } from "./customizations.js";
+import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -277,6 +278,11 @@ export function handleAdminRequest(
 
     if (url === "/api/customizations" && method === "GET") {
       json(res, 200, listCustomizations());
+      return true;
+    }
+
+    if (url === "/api/pipelines-steps" && method === "GET") {
+      json(res, 200, inspectPipelinesAndSteps());
       return true;
     }
 
