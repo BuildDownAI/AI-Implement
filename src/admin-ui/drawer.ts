@@ -133,7 +133,7 @@ export const drawerScript = `
       { label: 'Queued', detail: 'queued in Linear' },
       { label: 'Planning', detail: 'claude-plan.yml' },
       { label: 'Implementing', detail: job.executionMode ? window.esc(job.executionMode) + ' run' : 'implementation run' },
-      { label: 'Review', detail: job.prUrl ? 'PR opened: #' + (job.prUrl.split('/').pop() || '') : 'awaiting PR' },
+      { label: 'Review', detail: job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR' },
       { label: 'Done', detail: 'merged' }
     ];
 
@@ -318,11 +318,13 @@ export const drawerScript = `
       }
       if (!res.ok) {
         console.error('Failed to load job:', res.status);
+        document.getElementById('drawer-title').textContent = 'Failed to load job';
         return;
       }
       json = await res.json();
     } catch (err) {
       console.error('Failed to fetch job steps:', err);
+      document.getElementById('drawer-title').textContent = 'Failed to load job';
       return;
     }
 
