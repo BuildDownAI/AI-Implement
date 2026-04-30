@@ -15,6 +15,7 @@ import { issuesHtml, issuesScript } from "./pages/issues.js";
 import { pullsHtml, pullsScript } from "./pages/pulls.js";
 import { blockersHtml, blockersScript } from "./pages/blockers.js";
 import { customizationsHtml, customizationsScript } from "./pages/customizations.js";
+import { pipelinesAndStepsHtml, pipelinesAndStepsScript } from "./pages/pipelines-and-steps.js";
 import { stubsHtml } from "./pages/stubs.js";
 import { drawerHtml, drawerScript } from "./drawer.js";
 import { stepperHtml, stepperScript } from "./stepper.js";
@@ -45,6 +46,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${pullsHtml}
     ${blockersHtml}
     ${customizationsHtml}
+    ${pipelinesAndStepsHtml}
     ${stubsHtml}
   </main>
 </div>`;
@@ -61,7 +63,7 @@ const body = `<body>
 ${shell}
 ${drawerHtml}
 ${stepperHtml}
-<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${issuesScript}${pullsScript}${blockersScript}${customizationsScript}${drawerScript}${stepperScript}</script>
+<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${issuesScript}${pullsScript}${blockersScript}${customizationsScript}${pipelinesAndStepsScript}${drawerScript}${stepperScript}</script>
 </body></html>`;
 
 export const adminHtml = head + body;

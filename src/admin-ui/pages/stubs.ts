@@ -19,7 +19,6 @@ function stubPage(route: string, title: string, subtitle: string, phase: string,
 }
 
 export const stubsHtml = [
-  stubPage("pipelines", "Pipelines & steps", "Composable step library + pipeline definitions", "Plan 5", "List + edit pipeline YAMLs, step modules registered in src/pipeline/."),
   stubPage("models", "Models & providers", "Per-step models, provider failover, runner profiles", "Plan 5", "Configure provider chains and per-step model IDs."),
   stubPage("channels", "Triggers & channels", "Input triggers + output notifications", "Plan 5", "Linear, webhook, MCP triggers; Slack, Teams, GitHub PR comment channels."),
   stubPage("policies", "Policies & risk", "Auto-merge thresholds, risk rubric, CI gates", "Plan 5", "Edge vs stable channels, risk dimensions."),
