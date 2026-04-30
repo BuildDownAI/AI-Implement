@@ -294,6 +294,17 @@ function mapRows(rows: RawRow[]): Job[] {
   }));
 }
 
+/** Returns the job with the given id, or null if not found. */
+export function getJobById(id: number): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE id = ?",
+    )
+    .get(id) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
 /** Finds the most recent job for a given Fly machine ID. Returns null if not found. */
 export function getJobByMachineId(machineId: string): Job | null {
   const row = getDb()

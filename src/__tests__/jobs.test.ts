@@ -305,3 +305,25 @@ describe("schema migration", () => {
     expect(jobs.find((j) => j.issueId === "legacy")?.runnerMode).toBeNull();
   });
 });
+
+describe("getJobById", () => {
+  it("returns the inserted row by id", () => {
+    const id = log.appendLog({
+      issueId: "issue-by-id",
+      issueIdentifier: "ENG-42",
+      issueTitle: "Get by ID test",
+      teamKey: "eng",
+      repo: "org/repo",
+    });
+    const job = log.getJobById(id);
+    expect(job).not.toBeNull();
+    expect(job!.id).toBe(id);
+    expect(job!.issueId).toBe("issue-by-id");
+    expect(job!.issueIdentifier).toBe("ENG-42");
+    expect(job!.status).toBe("dispatched");
+  });
+
+  it("returns null for unknown id", () => {
+    expect(log.getJobById(99999999)).toBeNull();
+  });
+});
