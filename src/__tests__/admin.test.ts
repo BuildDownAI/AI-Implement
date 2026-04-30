@@ -1060,3 +1060,51 @@ describe("admin pulls endpoint", () => {
     expect(body.pulls[0].prNumber).toBe(55);
   });
 });
+
+describe("admin blockers endpoint", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/blockers", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 502 on Linear failure", async () => {
+    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockRejectedValueOnce(
+      new Error("boom"),
+    );
+    const token = await login("secret");
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(502);
+    expect(JSON.parse(res.body).error).toContain("boom");
+  });
+
+  it("returns 200 with shape — no-mapping blocker when issue team has no mapping", async () => {
+    const stubSnapshot = {
+      readyForImplementation: [
+        {
+          id: "issue-1",
+          identifier: "CORE-100",
+          title: "Implement feature X",
+          team: { id: "team-1", key: "CORE" },
+          state: { id: "state-1", name: "Todo", type: "unstarted" },
+        },
+      ],
+      needsPlanning: [],
+      inProgressCountsByTeam: {},
+    };
+    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockResolvedValueOnce(stubSnapshot);
+    const token = await login("secret");
+    // No mapping for CORE team → should produce a no-mapping blocker
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Array.isArray(body.blockers)).toBe(true);
+    expect(body.blockers).toHaveLength(1);
+    expect(body.blockers[0].reason).toBe("no-mapping");
+    expect(body.totals.byReason["no-mapping"]).toBe(1);
+    expect(body.totals.issues).toBe(1);
+  });
+});
