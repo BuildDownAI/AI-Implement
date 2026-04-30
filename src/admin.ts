@@ -23,12 +23,13 @@ import {
   isRunnerMode,
   setFlySecretsMinVersion,
 } from "./runner-mode.js";
-import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions } from "./dedup.js";
+import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import { removeAIWorkingLabel, fetchAIImplementIssueSnapshot, type LinearIssue } from "./linear.js";
+import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 
@@ -193,6 +194,11 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/blockers" && method === "GET") {
+      handleListBlockers(res, config);
+      return true;
+    }
+
     if (url === "/api/reaper/summary" && method === "GET") {
       const summary = getReaperSummary();
       json(res, 200, { ...summary, lastSweepAt: getLastSweepAt() });
@@ -273,6 +279,33 @@ export function handleAdminRequest(
   }
 
   return false;
+}
+
+async function handleListBlockers(
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  try {
+    const snapshot = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
+    const teamRepoMap = getMappings();
+    const dispatchedSet = new Set(getDispatchedIds());
+    const blockers = selectBlockers(
+      allIssues,
+      teamRepoMap,
+      snapshot.inProgressCountsByTeam,
+      (id) => dispatchedSet.has(id),
+    );
+    const teams = new Set(blockers.map((b) => b.teamKey));
+    const byReason: Record<string, number> = {};
+    for (const b of blockers) byReason[b.reason] = (byReason[b.reason] ?? 0) + 1;
+    json(res, 200, {
+      blockers,
+      totals: { teams: teams.size, issues: blockers.length, byReason },
+    });
+  } catch (err) {
+    json(res, 502, { error: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 async function handleListLinearIssues(
