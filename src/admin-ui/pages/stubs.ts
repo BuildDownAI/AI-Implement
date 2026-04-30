@@ -19,7 +19,6 @@ function stubPage(route: string, title: string, subtitle: string, phase: string,
 }
 
 export const stubsHtml = [
-  stubPage("issues", "Issues", "Linear issue inbox", "Plan 4", "Matched issues, plan state, dispatchable. Backed by /api/linear/issues (new endpoint)."),
   stubPage("pulls", "Pull requests", "PRs opened by the bot", "Plan 4", "Risk-scored, awaiting CI/review. Backed by /api/github/pulls (new endpoint)."),
   stubPage("blockers", "Blockers", "Why each issue isn't running", "Plan 4", "Surfaces concurrency cap, missing secrets, dedup, Linear deps, Bedrock region, Fly config — derived from poll-selection.ts."),
   stubPage("pipelines", "Pipelines & steps", "Composable step library + pipeline definitions", "Plan 5", "List + edit pipeline YAMLs, step modules registered in src/pipeline/."),
