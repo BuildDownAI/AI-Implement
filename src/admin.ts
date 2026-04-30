@@ -25,7 +25,8 @@ import {
 } from "./runner-mode.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions } from "./dedup.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, updateJobStatus } from "./log.js";
+import { listLog, getInFlightJobs, updateJobStatus, getJobById } from "./log.js";
+import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import { removeAIWorkingLabel } from "./linear.js";
 import { adminHtml } from "./admin-html.js";
@@ -158,6 +159,15 @@ export function handleAdminRequest(
 
     if (url === "/api/log" && method === "GET") {
       json(res, 200, listLog());
+      return true;
+    }
+
+    const jobStepsMatch = url.match(/^\/api\/jobs\/(\d+)\/steps$/);
+    if (jobStepsMatch && method === "GET") {
+      const jobId = Number.parseInt(jobStepsMatch[1], 10);
+      const job = getJobById(jobId);
+      if (!job) { json(res, 404, { error: "job not found" }); return true; }
+      json(res, 200, { job, steps: getStepsByJobId(jobId) });
       return true;
     }
 

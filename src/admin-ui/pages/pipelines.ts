@@ -102,6 +102,7 @@ export const pipelinesScript = `
 
       for (const item of grouped) {
         const tr = document.createElement('tr');
+        tr.setAttribute('data-job-id', String(item.type === 'group' ? item.impl.id : item.entry.id));
         if (item.type === 'group') {
           const plan = item.plan;
           const impl = item.impl;
@@ -156,6 +157,7 @@ export const pipelinesScript = `
         }
         tbody.appendChild(tr);
       }
+      wireRowClicks();
       setLastUpdated('lu-log');
     } catch (err) {
       console.error('loadLog failed:', err);
@@ -163,8 +165,22 @@ export const pipelinesScript = `
   }
   window.loadLog = loadLog;
 
+  function wireRowClicks() {
+    const tbody = document.getElementById('log-body');
+    if (!tbody || tbody.dataset.drawerWired) return;
+    tbody.addEventListener('click', function (e) {
+      const target = e.target;
+      if (target.closest('a')) return;
+      const tr = target.closest('tr');
+      const id = tr && tr.getAttribute('data-job-id');
+      if (id && window.openJobDrawer) window.openJobDrawer(Number(id));
+    });
+    tbody.dataset.drawerWired = '1';
+  }
+
   window.registerPage('jobs', function () {
     loadLog();
+    wireRowClicks();
     setInterval(function () { loadLog(); }, 15000);
   });
 })();

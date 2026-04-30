@@ -395,6 +395,8 @@ export const componentsCss = `
 .text-secondary { color: var(--fg-secondary); }
 .text-tertiary { color: var(--fg-tertiary); }
 .text-quaternary { color: var(--fg-quaternary); }
+.text-accent { color: var(--accent); }
+.text-accent:hover { color: var(--accent-hover); }
 
 /* ── Phase pipeline ────────────────────────────────────────── */
 .phase-pipe {
