@@ -70,7 +70,7 @@ export const issuesScript = `
         : '<span class="badge info"><span class="dot"></span>Plan pending</span>';
       tr.innerHTML = '<td><span class="mono">' + window.esc(issue.identifier) + '</span> ' + window.esc(issue.title) + '</td>'
         + '<td><span class="mono">' + window.esc(issue.teamKey) + '</span></td>'
-        + '<td><span class="badge ' + stateKind + '">' + window.esc(issue.stateName) + '</span></td>'
+        + '<td><span class="badge ' + stateKind + '"><span class="dot"></span>' + window.esc(issue.stateName) + '</span></td>'
         + '<td>' + planBadge + '</td>'
         + '<td><a class="text-accent" href="https://linear.app/issue/' + window.esc(issue.identifier) + '" target="_blank">Open ↗</a></td>';
       tbody.appendChild(tr);
@@ -120,6 +120,8 @@ export const issuesScript = `
       errorEl.hidden = false;
       document.getElementById('issues-body').innerHTML = '';
       document.getElementById('issues-progress-body').innerHTML = '';
+      document.getElementById('issues-empty').classList.add('hidden');
+      document.getElementById('issues-progress-empty').classList.add('hidden');
       document.getElementById('issues-count').textContent = '—';
       document.getElementById('issues-subtitle').textContent = '—';
       return;
