@@ -121,7 +121,14 @@ export function inspectPipelinesAndSteps(opts?: { cwd?: string }): {
         STEP_EXTS.map((e) => `custom/steps/${id}${e}`).find((p) =>
           fs.existsSync(path.join(cwd, p)),
         ) ?? null;
-      return { id, builtinPath, customPath, hasCustomOverride: customPath !== null };
+      return {
+        id,
+        builtinPath,
+        customPath,
+        // Override = custom shadows a built-in. A custom-only file is additive,
+        // not an override.
+        hasCustomOverride: customPath !== null && builtinPath !== null,
+      };
     });
 
   return { pipelines, steps: stepEntries };

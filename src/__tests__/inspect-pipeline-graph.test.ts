@@ -77,6 +77,16 @@ describe("inspectPipelinesAndSteps", () => {
     expect(step!.hasCustomOverride).toBe(true);
   });
 
+  it("additive step (only custom, no built-in) has hasCustomOverride: false", () => {
+    writeFile("custom/steps/extra.ts", "export default {}");
+    const result = inspectPipelinesAndSteps({ cwd: tmpDir });
+    const step = result.steps.find((s) => s.id === "extra");
+    expect(step).toBeDefined();
+    expect(step!.builtinPath).toBeNull();
+    expect(step!.customPath).toBe("custom/steps/extra.ts");
+    expect(step!.hasCustomOverride).toBe(false);
+  });
+
   it("pipeline step hasCustomOverride cross-references custom steps", () => {
     writeFile("custom/steps/bar.ts", "export default {}");
     writeFile(
