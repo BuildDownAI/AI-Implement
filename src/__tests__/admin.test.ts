@@ -1124,3 +1124,19 @@ describe("admin customizations endpoint", () => {
     expect(Array.isArray(body.customizations)).toBe(true);
   });
 });
+
+describe("admin pipelines-steps endpoint", () => {
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/pipelines-steps", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 200 with pipelines and steps arrays", async () => {
+    const token = await login("secret");
+    const res = await request("/api/pipelines-steps", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Array.isArray(body.pipelines)).toBe(true);
+    expect(Array.isArray(body.steps)).toBe(true);
+  });
+});
