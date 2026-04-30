@@ -1108,3 +1108,19 @@ describe("admin blockers endpoint", () => {
     expect(body.totals.issues).toBe(1);
   });
 });
+
+describe("admin customizations endpoint", () => {
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/customizations", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 200 with shape", async () => {
+    const token = await login("secret");
+    const res = await request("/api/customizations", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(typeof body.customRoot).toBe("string");
+    expect(Array.isArray(body.customizations)).toBe(true);
+  });
+});
