@@ -27,6 +27,5 @@ export const stubsHtml = [
   stubPage("secrets", "Secrets", "Encrypted store, scoped per project", "Plan 5", "Rotation tracking; complements global secrets on Settings."),
   stubPage("mcp", "MCP server", "Claude as the primary interface", "Plan 5", "Phase 1 read-only → Phase 3 orchestration."),
   stubPage("webhooks", "Webhooks", "Inbound endpoints + outbound delivery log", "Plan 5", "Signed payloads, retry counters."),
-  stubPage("customizations", "Customizations", "Files in custom/ that override or extend upstream", "Plan 5", "Show what's overridden, last edit, drift from upstream."),
   stubPage("updates", "Updates", "Tracks upstream releases, opens upgrade PRs", "Plan 5", "Operationalizes the §3.14 automated upgrade PR model."),
 ].join("");

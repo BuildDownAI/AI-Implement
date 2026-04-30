@@ -32,6 +32,7 @@ import { removeAIWorkingLabel, fetchAIImplementIssueSnapshot, type LinearIssue }
 import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
+import { listCustomizations } from "./customizations.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -271,6 +272,11 @@ export function handleAdminRequest(
     if (globalSecretDeleteMatch && method === "DELETE") {
       const secretName = decodeURIComponent(globalSecretDeleteMatch[1]);
       handleUnsetGlobalSecret(req, res, config, secretName);
+      return true;
+    }
+
+    if (url === "/api/customizations" && method === "GET") {
+      json(res, 200, listCustomizations());
       return true;
     }
 
