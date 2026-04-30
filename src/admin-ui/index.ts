@@ -13,6 +13,7 @@ import { sessionsHtml, sessionsScript } from "./pages/sessions.js";
 import { auditHtml, auditScript } from "./pages/audit.js";
 import { stubsHtml } from "./pages/stubs.js";
 import { drawerHtml, drawerScript } from "./drawer.js";
+import { stepperHtml, stepperScript } from "./stepper.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -51,7 +52,8 @@ const body = `<body>
 </div>
 ${shell}
 ${drawerHtml}
-<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${drawerScript}</script>
+${stepperHtml}
+<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${drawerScript}${stepperScript}</script>
 </body></html>`;
 
 export const adminHtml = head + body;

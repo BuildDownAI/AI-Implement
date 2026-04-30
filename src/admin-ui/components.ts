@@ -958,4 +958,34 @@ button.secondary,
   color: var(--fg-secondary);
   border-color: var(--border-default);
 }
+
+/* ── New-project stepper cards & review ──────────────────────── */
+.runner-card {
+  border: 1px solid var(--border-default);
+  background: var(--bg-elev);
+  border-radius: 8px;
+  padding: 14px;
+  cursor: pointer;
+  transition: border-color 80ms, background 80ms, box-shadow 80ms;
+}
+.runner-card:hover { border-color: var(--border-strong); }
+.runner-card.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-fg);
+  box-shadow: var(--shadow-focus);
+}
+
+.np-review-row {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12.5px;
+}
+.np-review-row .np-review-label {
+  color: var(--fg-tertiary);
+  font-weight: 500;
+}
 `;
