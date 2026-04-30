@@ -556,8 +556,8 @@ export const stepperScript = `
     for (const s of validSecrets) {
       try {
         const sr = await window.api(
-          '/api/mappings/' + encodeURIComponent(data.teamKey) + '/secrets/' + encodeURIComponent(s.name),
-          { method: 'POST', body: JSON.stringify({ value: s.value }) }
+          '/api/mappings/' + encodeURIComponent(data.teamKey) + '/secrets',
+          { method: 'POST', body: JSON.stringify({ name: s.name, value: s.value }) }
         );
         if (!sr.ok) secretFailures++;
       } catch (_) {

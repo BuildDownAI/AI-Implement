@@ -594,6 +594,12 @@ export const componentsCss = `
   z-index: 200;
   padding: 40px;
 }
+.modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+}
+.modal-card { position: relative; z-index: 1; }
 .modal-card {
   background: var(--bg-elev);
   border: 1px solid var(--border-default);
