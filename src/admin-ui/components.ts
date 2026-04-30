@@ -594,6 +594,7 @@ export const componentsCss = `
   z-index: 200;
   padding: 40px;
 }
+.modal[hidden] { display: none; }
 .modal-backdrop {
   position: absolute; inset: 0;
   background: rgba(0, 0, 0, 0.45);
