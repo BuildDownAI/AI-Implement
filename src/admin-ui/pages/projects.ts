@@ -6,7 +6,7 @@ export const projectsHtml = `
       <div class="page-subtitle">Linear team &rarr; GitHub repo mappings, with provider, runner, and planning settings</div>
     </div>
     <div class="page-header-actions">
-      <button class="btn btn-accent btn-sm" onclick="openMappingDialog(null)">+ New project</button>
+      <button class="btn btn-accent btn-sm" onclick="openNewProjectStepper()">+ New project</button>
     </div>
   </header>
   <div class="page-body">
