@@ -12,6 +12,7 @@ import { reaperHtml, reaperScript } from "./pages/reaper.js";
 import { sessionsHtml, sessionsScript } from "./pages/sessions.js";
 import { auditHtml, auditScript } from "./pages/audit.js";
 import { stubsHtml } from "./pages/stubs.js";
+import { drawerHtml, drawerScript } from "./drawer.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -49,7 +50,8 @@ const body = `<body>
   </div>
 </div>
 ${shell}
-<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}</script>
+${drawerHtml}
+<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${drawerScript}</script>
 </body></html>`;
 
 export const adminHtml = head + body;
