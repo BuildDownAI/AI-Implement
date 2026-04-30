@@ -8,6 +8,7 @@ import type * as ConfigModule from "../config.js";
 import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
+import type * as StepLogModule from "../step-log.js";
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -51,6 +52,7 @@ let config: typeof ConfigModule;
 let dedup: typeof DedupModule;
 let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
+let stepLog: typeof StepLogModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -61,8 +63,10 @@ beforeEach(async () => {
   dedup = await import("../dedup.js");
   runnerMode = await import("../runner-mode.js");
   log = await import("../log.js");
+  stepLog = await import("../step-log.js");
   config.initMappingsTable();
   log.initLogTable();
+  stepLog.initStepLogTable();
   runnerMode.initSettingsTable();
 });
 
@@ -898,6 +902,36 @@ describe("admin sessions", () => {
     const token = await login("secret");
     const res = await request("/api/sessions/machine-abc", "DELETE", "secret", undefined, token);
     expect(res.statusCode).toBe(503);
+  });
+});
+
+describe("admin job-detail endpoint", () => {
+  it("returns 401 without auth", async () => {
+    const res = await request("/api/jobs/1/steps", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 404 for unknown job id", async () => {
+    const token = await login("secret");
+    const res = await request("/api/jobs/99999/steps", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body).error).toBe("job not found");
+  });
+
+  it("returns 200 with job and steps for a known job", async () => {
+    const token = await login("secret");
+    const id = log.appendLog({
+      issueId: "issue-detail",
+      issueIdentifier: "ENG-99",
+      issueTitle: "Detail test",
+      teamKey: "eng",
+      repo: "org/repo",
+    });
+    const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.job.id).toBe(id);
+    expect(Array.isArray(body.steps)).toBe(true);
   });
 });
 
