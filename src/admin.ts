@@ -25,7 +25,7 @@ import {
 } from "./runner-mode.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions } from "./dedup.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, updateJobStatus, getJobById } from "./log.js";
+import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import { removeAIWorkingLabel, fetchAIImplementIssueSnapshot, type LinearIssue } from "./linear.js";
@@ -171,6 +171,11 @@ export function handleAdminRequest(
 
     if (url === "/api/log" && method === "GET") {
       json(res, 200, listLog());
+      return true;
+    }
+
+    if (url === "/api/pulls" && method === "GET") {
+      json(res, 200, { pulls: getPulls() });
       return true;
     }
 

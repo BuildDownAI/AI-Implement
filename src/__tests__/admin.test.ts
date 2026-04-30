@@ -1015,3 +1015,48 @@ describe("admin linear issues endpoint", () => {
     expect(body.issues[1].bucket).toBe("needs-planning");
   });
 });
+
+describe("admin pulls endpoint", () => {
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/pulls", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 200 with empty array on a fresh DB", async () => {
+    const token = await login("secret");
+    const res = await request("/api/pulls", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Array.isArray(body.pulls)).toBe(true);
+    expect(body.pulls).toHaveLength(0);
+  });
+
+  it("returns 200 with deduped entries — same prUrl yields one pull", async () => {
+    const token = await login("secret");
+
+    const id1 = log.appendLog({
+      issueId: "issue-pull-1",
+      issueIdentifier: "ENG-1",
+      repo: "org/repo",
+      teamKey: "ENG",
+      dispatchNumber: 1,
+    });
+    log.updateJobStatus(id1, "completed", "success", "https://github.com/org/repo/pull/55");
+
+    const id2 = log.appendLog({
+      issueId: "issue-pull-1",
+      issueIdentifier: "ENG-1",
+      repo: "org/repo",
+      teamKey: "ENG",
+      dispatchNumber: 2,
+    });
+    log.updateJobStatus(id2, "completed", "success", "https://github.com/org/repo/pull/55");
+
+    const res = await request("/api/pulls", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.pulls).toHaveLength(1);
+    expect(body.pulls[0].prUrl).toBe("https://github.com/org/repo/pull/55");
+    expect(body.pulls[0].prNumber).toBe(55);
+  });
+});
