@@ -58,7 +58,7 @@ export const projectsHtml = `
   <dialog id="mapping-dialog">
     <div class="md-header">
       <span id="md-title">Add Mapping</span>
-      <button class="secondary sm" onclick="closeMappingDialog()">&#215;</button>
+      <button class="btn btn-ghost btn-icon" onclick="closeMappingDialog()">&#215;</button>
     </div>
     <input type="hidden" id="md-team-key-orig">
     <div class="md-body">
@@ -130,8 +130,8 @@ export const projectsHtml = `
     <div class="md-footer">
       <div id="md-error" class="error hidden" style="margin-bottom:8px"></div>
       <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button class="secondary" onclick="closeMappingDialog()">Cancel</button>
-        <button onclick="saveMappingDialog()">Save Mapping</button>
+        <button class="btn btn-ghost" onclick="closeMappingDialog()">Cancel</button>
+        <button class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
       </div>
     </div>
   </dialog>
@@ -159,14 +159,14 @@ export const projectsScript = `
       const tr = document.createElement('tr');
       const ek = window.esc(key);
       const execBadge = m.executionMode === 'fly-machines'
-        ? '<span class="badge" style="background:#9b59b6;color:#fff">fly</span>'
-        : '<span class="badge" style="background:#27ae60;color:#fff">gha</span>';
+        ? '<span class="badge info">fly</span>'
+        : '<span class="badge neutral">gha</span>';
       const planBadge = m.planningEnabled
-        ? '<span class="badge" style="background:#3498db;color:#fff">on</span>'
-        : '<span style="color:#aaa">off</span>';
+        ? '<span class="badge success">on</span>'
+        : '<span class="text-tertiary">off</span>';
       const providerBadge = m.provider === 'bedrock'
-        ? '<span class="badge" style="background:#e67e22;color:#fff">bedrock</span>'
-        : '<span style="color:#888;font-size:0.85em">anthropic</span>';
+        ? '<span class="badge warn">bedrock</span>'
+        : '<span class="text-tertiary" style="font-size:0.85em">anthropic</span>';
       tr.innerHTML = '<td class="mono">' + ek + '</td>'
         + '<td class="mono">' + window.esc(m.owner) + '/' + window.esc(m.repo) + '</td>'
         + '<td>' + execBadge + '</td>'
@@ -175,9 +175,9 @@ export const projectsScript = `
         + '<td>' + planBadge + '</td>'
         + '<td>' + providerBadge + '</td>'
         + '<td style="white-space:nowrap">'
-          + '<button class="sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
-          + '<button class="sm danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
-          + '<button class="sm secondary" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
+          + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
+          + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
+          + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
         + '</td>';
       tbody.appendChild(tr);
     }
@@ -349,7 +349,7 @@ export const projectsScript = `
         const tr = document.createElement('tr');
         tr.innerHTML = '<td class="mono">' + window.esc(s.name) + '</td>'
           + '<td><span class="badge success">Set</span></td>'
-          + '<td><button class="sm danger" data-name="' + window.esc(s.name) + '" onclick="delSecret(this.dataset.name)">Delete</button></td>';
+          + '<td><button class="btn btn-sm btn-danger" data-name="' + window.esc(s.name) + '" onclick="delSecret(this.dataset.name)">Delete</button></td>';
         tbody.appendChild(tr);
       }
     } catch (err) {

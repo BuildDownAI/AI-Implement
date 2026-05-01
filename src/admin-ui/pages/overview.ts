@@ -63,12 +63,13 @@ export const overviewHtml = `
         <div class="card-header">
           <div>
             <h2 class="card-title">Why isn&rsquo;t this running?</h2>
-            <div class="card-subtitle">Full blocker taxonomy on Plan 4 &mdash; Blockers page</div>
+            <div class="card-subtitle" id="overview-atcap-subtitle">Teams at concurrency cap</div>
           </div>
+          <button class="btn btn-ghost btn-sm" onclick="window.navigate('blockers')">View blockers</button>
         </div>
         <div class="card-body">
           <div id="overview-atcap-body" style="display:flex;flex-direction:column;gap:8px"></div>
-          <div id="overview-atcap-empty" class="hidden text-tertiary" style="padding:4px 0">All projects have available capacity.</div>
+          <div id="overview-atcap-empty" class="hidden text-tertiary" style="padding:4px 0">All projects have available capacity. <a href="#blockers" onclick="window.navigate('blockers');return false" style="color:var(--accent)">View blockers page</a> for more details.</div>
         </div>
       </div>
     </div>
@@ -264,6 +265,7 @@ export const overviewScript = `
   function renderAtCapacity(running, mappings) {
     const body = document.getElementById('overview-atcap-body');
     const empty = document.getElementById('overview-atcap-empty');
+    const subtitle = document.getElementById('overview-atcap-subtitle');
     if (!body || !empty) return;
     body.innerHTML = '';
     const atCap = Object.entries(mappings).filter(function (pair) {
@@ -273,6 +275,7 @@ export const overviewScript = `
       const cnt = running.filter(function (r) { return r.teamKey === key; }).length;
       return cnt >= cap;
     });
+    if (subtitle) subtitle.textContent = atCap.length + ' team' + (atCap.length === 1 ? '' : 's') + ' at cap';
     if (atCap.length === 0) {
       empty.classList.remove('hidden');
       return;

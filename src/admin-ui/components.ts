@@ -93,6 +93,11 @@ export const componentsCss = `
   font-family: var(--font-mono);
 }
 
+.theme-icon-sun  { display: none; }
+.theme-icon-moon { display: inline-flex; }
+[data-theme="dark"] .theme-icon-sun  { display: inline-flex; }
+[data-theme="dark"] .theme-icon-moon { display: none; }
+
 .sidebar-footer {
   margin-top: auto;
   padding: var(--sp-2) var(--sp-2) 0;
@@ -386,6 +391,8 @@ export const componentsCss = `
 .tbl tbody tr.active { background: var(--bg-active); }
 .tbl tbody tr.failed-row td { background: rgba(220, 38, 38, 0.025); }
 .tbl tbody tr.failed-row:hover td { background: rgba(220, 38, 38, 0.05); }
+.tbl tbody tr.redispatch-row td { background: var(--st-warn-bg); }
+.tbl tbody tr.redispatch-row:hover td { background: var(--bg-hover); }
 
 .mono {
   font-family: var(--font-mono);
@@ -939,6 +946,20 @@ dialog::backdrop { background: rgba(0,0,0,0.5); }
 .md-field select,
 .md-field textarea {
   width: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-sm);
+  padding: 7px 10px;
+  font-size: 12.5px;
+  color: var(--fg-primary);
+  transition: border-color 80ms ease, box-shadow 80ms ease;
+}
+.md-field input:focus,
+.md-field select:focus,
+.md-field textarea:focus {
+  outline: none;
+  border-color: var(--border-focus);
+  box-shadow: var(--shadow-focus);
 }
 .md-field textarea {
   font-family: var(--font-mono);
