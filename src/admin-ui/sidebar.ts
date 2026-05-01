@@ -60,6 +60,10 @@ export function sidebarHtml(): string {
           <div class="user-name">Admin</div>
           <div class="user-email">signed in</div>
         </div>
+        <button class="btn btn-ghost btn-icon" onclick="window.toggleTheme()" title="Toggle theme">
+          <span class="theme-icon-sun">${icon("sun", 14)}</span>
+          <span class="theme-icon-moon">${icon("moon", 14)}</span>
+        </button>
         <button class="btn btn-ghost btn-icon" onclick="logout()" title="Log out">${icon("x", 12)}</button>
       </div>
     </div>
