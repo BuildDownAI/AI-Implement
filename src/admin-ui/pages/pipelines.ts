@@ -50,26 +50,26 @@ export const pipelinesScript = `
       }
       empty.classList.add('hidden');
 
-      const statusColors = {
-        unknown: '#bdc3c7',
-        dispatched: '#95a5a6',
-        running: '#3498db',
-        completed: '#2ecc71',
-        failed: '#e74c3c',
-        timed_out: '#f39c12'
+      const statusClass = {
+        unknown: 'neutral',
+        dispatched: 'neutral',
+        running: 'running',
+        completed: 'success',
+        failed: 'fail',
+        timed_out: 'warn'
       };
-      const execColors = { gha: '#27ae60', fly: '#8e44ad', plan: '#2980b9' };
 
-      function makeBadge(color, text) {
-        return '<span class="badge" style="background:' + color + ';color:#fff">' + window.esc(text) + '</span>';
+      function makeBadge(cls, text) {
+        return '<span class="badge tight ' + cls + '">' + window.esc(text) + '</span>';
       }
       function statusBadge(status) {
-        return makeBadge(statusColors[status] || '#95a5a6', status || 'dispatched');
+        return makeBadge(statusClass[status] || 'neutral', status || 'dispatched');
       }
       function execBadge(mode, runnerMode) {
         const short = mode === 'fly-machines' ? 'fly' : mode === 'planning' ? 'plan' : 'gha';
-        return makeBadge(execColors[short] || '#7f8c8d', short)
-          + (short !== 'plan' && runnerMode ? ' <span style="color:#888;font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
+        const cls = short === 'fly' ? 'info' : 'neutral';
+        return makeBadge(cls, short)
+          + (short !== 'plan' && runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
       }
 
       // Group planning + implement phases that belong to the same job:
@@ -110,7 +110,7 @@ export const pipelinesScript = `
           const issueLabel = (impl.issueIdentifier || impl.issueId) + (impl.issueTitle ? ': ' + window.esc(impl.issueTitle) : '');
           const dn2 = plan.dispatchNumber || 1;
           const isRedispatch = dn2 > 1;
-          if (isRedispatch) tr.style.backgroundColor = '#fff3cd';
+          if (isRedispatch) tr.classList.add('redispatch-row');
           const dnBadge = isRedispatch
             ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn2 + '</span>'
             : '' + dn2;
@@ -136,7 +136,7 @@ export const pipelinesScript = `
           const issueLabel = (entry.issueIdentifier || entry.issueId) + (entry.issueTitle ? ': ' + window.esc(entry.issueTitle) : '');
           const dn3 = entry.dispatchNumber || 1;
           const isRedispatch = dn3 > 1;
-          if (isRedispatch) tr.style.backgroundColor = '#fff3cd';
+          if (isRedispatch) tr.classList.add('redispatch-row');
           const dnBadge = isRedispatch
             ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn3 + '</span>'
             : '' + dn3;
