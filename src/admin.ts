@@ -23,13 +23,17 @@ import {
   isRunnerMode,
   setFlySecretsMinVersion,
 } from "./runner-mode.js";
-import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions } from "./dedup.js";
+import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, updateJobStatus } from "./log.js";
+import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
+import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
-import { removeAIWorkingLabel } from "./linear.js";
+import { removeAIWorkingLabel, fetchAIImplementIssueSnapshot, type LinearIssue } from "./linear.js";
+import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
+import { listCustomizations } from "./customizations.js";
+import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -66,6 +70,18 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
+}
+
+function shapeIssue(i: LinearIssue, bucket: "ready" | "needs-planning") {
+  return {
+    id: i.id,
+    identifier: i.identifier,
+    title: i.title,
+    teamKey: i.team.key,
+    stateName: i.state.name,
+    stateType: i.state.type,
+    bucket,
+  };
 }
 
 function getToken(req: http.IncomingMessage): string | undefined {
@@ -161,6 +177,30 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/pulls" && method === "GET") {
+      json(res, 200, { pulls: getPulls() });
+      return true;
+    }
+
+    const jobStepsMatch = url.match(/^\/api\/jobs\/(\d+)\/steps$/);
+    if (jobStepsMatch && method === "GET") {
+      const jobId = Number.parseInt(jobStepsMatch[1], 10);
+      const job = getJobById(jobId);
+      if (!job) { json(res, 404, { error: "job not found" }); return true; }
+      json(res, 200, { job, steps: getStepsByJobId(jobId) });
+      return true;
+    }
+
+    if (url === "/api/linear/issues" && method === "GET") {
+      handleListLinearIssues(res, config);
+      return true;
+    }
+
+    if (url === "/api/blockers" && method === "GET") {
+      handleListBlockers(res, config);
+      return true;
+    }
+
     if (url === "/api/reaper/summary" && method === "GET") {
       const summary = getReaperSummary();
       json(res, 200, { ...summary, lastSweepAt: getLastSweepAt() });
@@ -236,11 +276,67 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/customizations" && method === "GET") {
+      json(res, 200, listCustomizations());
+      return true;
+    }
+
+    if (url === "/api/pipelines-steps" && method === "GET") {
+      json(res, 200, inspectPipelinesAndSteps());
+      return true;
+    }
+
     json(res, 404, { error: "Not found" });
     return true;
   }
 
   return false;
+}
+
+async function handleListBlockers(
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  try {
+    const snapshot = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
+    const teamRepoMap = getMappings();
+    const dispatchedSet = new Set(getDispatchedIds());
+    const blockers = selectBlockers(
+      allIssues,
+      teamRepoMap,
+      snapshot.inProgressCountsByTeam,
+      (id) => dispatchedSet.has(id),
+    );
+    const teams = new Set(blockers.map((b) => b.teamKey));
+    const byReason: Record<string, number> = {};
+    for (const b of blockers) byReason[b.reason] = (byReason[b.reason] ?? 0) + 1;
+    json(res, 200, {
+      blockers,
+      totals: { teams: teams.size, issues: blockers.length, byReason },
+    });
+  } catch (err) {
+    json(res, 502, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleListLinearIssues(
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  try {
+    const snapshot = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const issues = [
+      ...snapshot.readyForImplementation.map((i) => shapeIssue(i, "ready")),
+      ...snapshot.needsPlanning.map((i) => shapeIssue(i, "needs-planning")),
+    ].sort((a, b) => a.identifier.localeCompare(b.identifier));
+    json(res, 200, {
+      issues,
+      inProgressCountsByTeam: snapshot.inProgressCountsByTeam,
+    });
+  } catch (err) {
+    json(res, 502, { error: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 async function handleSetRunnerMode(

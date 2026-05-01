@@ -305,3 +305,74 @@ describe("schema migration", () => {
     expect(jobs.find((j) => j.issueId === "legacy")?.runnerMode).toBeNull();
   });
 });
+
+describe("getJobById", () => {
+  it("returns the inserted row by id", () => {
+    const id = log.appendLog({
+      issueId: "issue-by-id",
+      issueIdentifier: "ENG-42",
+      issueTitle: "Get by ID test",
+      teamKey: "eng",
+      repo: "org/repo",
+    });
+    const job = log.getJobById(id);
+    expect(job).not.toBeNull();
+    expect(job!.id).toBe(id);
+    expect(job!.issueId).toBe("issue-by-id");
+    expect(job!.issueIdentifier).toBe("ENG-42");
+    expect(job!.status).toBe("dispatched");
+  });
+
+  it("returns null for unknown id", () => {
+    expect(log.getJobById(99999999)).toBeNull();
+  });
+});
+
+describe("getPulls", () => {
+  it("returns one entry per unique prUrl, latest wins", () => {
+    const id1 = log.appendLog({
+      issueId: "issue-pr-1",
+      issueIdentifier: "ENG-10",
+      repo: "org/repo",
+      teamKey: "ENG",
+      dispatchNumber: 1,
+    });
+    log.updateJobStatus(id1, "completed", "success", "https://github.com/org/repo/pull/100");
+
+    // Insert a second row with the same prUrl but later timestamp (by manipulating dispatched_at directly)
+    const db = dedup.getDb();
+    db.prepare(
+      "INSERT INTO dispatch_log (issue_id, issue_identifier, repo, team_key, dispatched_at, dispatch_number, status, pr_url) VALUES (?, ?, ?, ?, ?, ?, 'completed', ?)",
+    ).run("issue-pr-1", "ENG-10", "org/repo", "ENG", Date.now() + 5000, 2, "https://github.com/org/repo/pull/100");
+
+    const pulls = log.getPulls();
+    expect(pulls.length).toBe(1);
+    expect(pulls[0].dispatchNumber).toBe(2);
+  });
+
+  it("filters out null prUrl", () => {
+    log.appendLog({
+      issueId: "issue-no-pr",
+      issueIdentifier: "ENG-20",
+      repo: "org/repo",
+      teamKey: "ENG",
+    });
+    // No prUrl set — should not appear in getPulls
+    const pulls = log.getPulls();
+    expect(pulls.length).toBe(0);
+  });
+
+  it("prNumber parsing extracts the numeric segment from the prUrl", () => {
+    const id = log.appendLog({
+      issueId: "issue-pr-num",
+      issueIdentifier: "ENG-30",
+      repo: "org/repo",
+      teamKey: "ENG",
+    });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/acme/repo/pull/123");
+
+    const pulls = log.getPulls();
+    expect(pulls.length).toBe(1);
+    expect(pulls[0].prNumber).toBe(123);
+  });
+});

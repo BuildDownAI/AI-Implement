@@ -31,7 +31,8 @@ src/
   poll-selection.ts — per-team capacity selection logic
   log.ts            — dispatch audit log (SQLite)
   admin.ts          — admin HTTP API (auth + CRUD)
-  admin-html.ts     — admin UI single-page HTML/JS
+  admin-html.ts     — re-exports the assembled admin HTML from admin-ui/index.ts
+  admin-ui/         — string-composed admin SPA (see "admin-ui" section below)
   __tests__/        — Vitest unit tests
 
 workflows/          — templates synced to target repos
@@ -107,6 +108,27 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 4. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
 5. Install the GitHub App on the target repo
 6. Add the team→repo mapping in the admin UI at `/admin`
+
+## admin-ui
+
+The admin SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/`. `src/admin-html.ts` is a thin re-export of `src/admin-ui/index.ts`. There is **no client-side build step** — all client JS is concatenated into a single inline `<script>` block at module load time.
+
+| Module | Owns |
+|---|---|
+| `tokens.ts` | CSS custom properties (light + dark + accent + spacing + type + radius + shadow) |
+| `components.ts` | All component classes (`.card`, `.tbl`, `.btn`, `.badge`, `.kpi`, `.alert`, `.drawer`, `.modal-card`, etc.) |
+| `icons.ts` | SVG icon registry + `icon(name, size)` helper |
+| `sidebar.ts` | Sidebar render + `SIDEBAR_ROUTES` |
+| `router.ts` | Hash-based router; `window.registerPage(key, init)` runs an init once on first show |
+| `theme.ts` | Reads/writes `data-theme` from localStorage; default `dark` |
+| `auth.ts` | Shared auth: `window.api()`, `window.esc()`, `window.login()`, `window.logout()`, token storage |
+| `pages/<name>.ts` | One per sidebar item — exports `<name>Html` and `<name>Script` strings |
+
+Page conventions: each `<name>.ts` exports two strings. The HTML uses `data-page="<route>"` matching the sidebar's `data-route`. The script is an IIFE that defines page-specific functions, exposes any `onclick=`-referenced ones on `window`, and ends with `window.registerPage('<route>', () => { /* init */ });`. Page scripts call `window.api()` and `window.esc()` rather than referencing them as bare globals.
+
+When adding a new page: create the page module, append both strings to the lists in `src/admin-ui/index.ts`, and add the route to `sidebar.ts`. When adding a new design token: extend `tokens.ts` and the `tokens.test.ts` spot-check. When adding a new icon: drop the SVG inner markup into `iconRegistry`.
+
+The 14 not-yet-implemented routes (`overview`, `issues`, `pulls`, `blockers`, `pipelines`, `models`, `channels`, `policies`, `runners`, `secrets`, `mcp`, `webhooks`, `customizations`, `updates`) are stubbed in `src/admin-ui/pages/stubs.ts` with `RoadmapNote`-style placeholders pointing to the plan that ships them.
 
 ## Notification adapter
 

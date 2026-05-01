@@ -294,6 +294,56 @@ function mapRows(rows: RawRow[]): Job[] {
   }));
 }
 
+export interface PullSummary {
+  prUrl: string;
+  prNumber: number | null;
+  repo: string | null;
+  teamKey: string | null;
+  issueIdentifier: string | null;
+  issueTitle: string | null;
+  jobStatus: string;
+  dispatchNumber: number;
+  lastDispatchedAt: number;
+  jobId: number;
+}
+
+export function getPulls(): PullSummary[] {
+  const rows = listLog(500).filter((j) => j.prUrl);
+  const byUrl = new Map<string, PullSummary>();
+  for (const j of rows) {
+    const ts = j.dispatchedAt;
+    const prUrl = j.prUrl as string;
+    const existing = byUrl.get(prUrl);
+    if (existing && existing.lastDispatchedAt >= ts) continue;
+    const tail = prUrl.split("/").pop() ?? "";
+    const prNumber = /^\d+$/.test(tail) ? Number.parseInt(tail, 10) : null;
+    byUrl.set(prUrl, {
+      prUrl,
+      prNumber,
+      repo: j.repo ?? null,
+      teamKey: j.teamKey ?? null,
+      issueIdentifier: j.issueIdentifier ?? null,
+      issueTitle: j.issueTitle ?? null,
+      jobStatus: j.status ?? "unknown",
+      dispatchNumber: j.dispatchNumber ?? 1,
+      lastDispatchedAt: ts,
+      jobId: j.id,
+    });
+  }
+  return Array.from(byUrl.values()).sort((a, b) => b.lastDispatchedAt - a.lastDispatchedAt);
+}
+
+/** Returns the job with the given id, or null if not found. */
+export function getJobById(id: number): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE id = ?",
+    )
+    .get(id) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
 /** Finds the most recent job for a given Fly machine ID. Returns null if not found. */
 export function getJobByMachineId(machineId: string): Job | null {
   const row = getDb()

@@ -8,6 +8,8 @@ import type * as ConfigModule from "../config.js";
 import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
+import type * as StepLogModule from "../step-log.js";
+import type * as LinearModuleType from "../linear.js";
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -51,18 +53,23 @@ let config: typeof ConfigModule;
 let dedup: typeof DedupModule;
 let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
+let stepLog: typeof StepLogModule;
+let linear: typeof LinearModuleType;
 
 beforeEach(async () => {
   vi.resetModules();
   dbPath = path.join(os.tmpdir(), `admin-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   process.env.DEDUP_DB_PATH = dbPath;
+  linear = await import("../linear.js");
   admin = await import("../admin.js");
   config = await import("../config.js");
   dedup = await import("../dedup.js");
   runnerMode = await import("../runner-mode.js");
   log = await import("../log.js");
+  stepLog = await import("../step-log.js");
   config.initMappingsTable();
   log.initLogTable();
+  stepLog.initStepLogTable();
   runnerMode.initSettingsTable();
 });
 
@@ -901,6 +908,36 @@ describe("admin sessions", () => {
   });
 });
 
+describe("admin job-detail endpoint", () => {
+  it("returns 401 without auth", async () => {
+    const res = await request("/api/jobs/1/steps", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 404 for unknown job id", async () => {
+    const token = await login("secret");
+    const res = await request("/api/jobs/99999/steps", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body).error).toBe("job not found");
+  });
+
+  it("returns 200 with job and steps for a known job", async () => {
+    const token = await login("secret");
+    const id = log.appendLog({
+      issueId: "issue-detail",
+      issueIdentifier: "ENG-99",
+      issueTitle: "Detail test",
+      teamKey: "eng",
+      repo: "org/repo",
+    });
+    const res = await request(`/api/jobs/${id}/steps`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.job.id).toBe(id);
+    expect(Array.isArray(body.steps)).toBe(true);
+  });
+});
+
 describe("admin dedup", () => {
   it("lists dedup entries", async () => {
     const token = await login("secret");
@@ -918,5 +955,188 @@ describe("admin dedup", () => {
     const del = await request("/api/dedup/issue-del", "DELETE", "secret", undefined, token);
     expect(del.statusCode).toBe(200);
     expect(dedup.isAlreadyDispatched("issue-del")).toBe(false);
+  });
+});
+
+describe("admin linear issues endpoint", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/linear/issues", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 502 on Linear failure", async () => {
+    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockRejectedValueOnce(
+      new Error("Linear API error: 401"),
+    );
+    const token = await login("secret");
+    const res = await request("/api/linear/issues", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(502);
+    expect(JSON.parse(res.body).error).toContain("Linear API error");
+  });
+
+  it("returns 200 with shaped issues on success", async () => {
+    const stubSnapshot = {
+      readyForImplementation: [
+        {
+          id: "issue-1",
+          identifier: "CORE-100",
+          title: "Implement feature X",
+          team: { id: "team-1", key: "CORE" },
+          state: { id: "state-1", name: "Todo", type: "unstarted" },
+        },
+      ],
+      needsPlanning: [
+        {
+          id: "issue-2",
+          identifier: "CORE-50",
+          title: "Plan something",
+          team: { id: "team-1", key: "CORE" },
+          state: { id: "state-2", name: "Backlog", type: "backlog" },
+        },
+      ],
+      inProgressCountsByTeam: { CORE: 2 },
+    };
+    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockResolvedValueOnce(stubSnapshot);
+    const token = await login("secret");
+    const res = await request("/api/linear/issues", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Array.isArray(body.issues)).toBe(true);
+    expect(body.issues).toHaveLength(2);
+    expect(body.inProgressCountsByTeam).toEqual({ CORE: 2 });
+    // Sorted by identifier (localeCompare): "CORE-100" < "CORE-50" lexicographically
+    expect(body.issues[0].identifier).toBe("CORE-100");
+    expect(body.issues[0].bucket).toBe("ready");
+    expect(body.issues[1].identifier).toBe("CORE-50");
+    expect(body.issues[1].bucket).toBe("needs-planning");
+  });
+});
+
+describe("admin pulls endpoint", () => {
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/pulls", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 200 with empty array on a fresh DB", async () => {
+    const token = await login("secret");
+    const res = await request("/api/pulls", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Array.isArray(body.pulls)).toBe(true);
+    expect(body.pulls).toHaveLength(0);
+  });
+
+  it("returns 200 with deduped entries — same prUrl yields one pull", async () => {
+    const token = await login("secret");
+
+    const id1 = log.appendLog({
+      issueId: "issue-pull-1",
+      issueIdentifier: "ENG-1",
+      repo: "org/repo",
+      teamKey: "ENG",
+      dispatchNumber: 1,
+    });
+    log.updateJobStatus(id1, "completed", "success", "https://github.com/org/repo/pull/55");
+
+    const id2 = log.appendLog({
+      issueId: "issue-pull-1",
+      issueIdentifier: "ENG-1",
+      repo: "org/repo",
+      teamKey: "ENG",
+      dispatchNumber: 2,
+    });
+    log.updateJobStatus(id2, "completed", "success", "https://github.com/org/repo/pull/55");
+
+    const res = await request("/api/pulls", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.pulls).toHaveLength(1);
+    expect(body.pulls[0].prUrl).toBe("https://github.com/org/repo/pull/55");
+    expect(body.pulls[0].prNumber).toBe(55);
+  });
+});
+
+describe("admin blockers endpoint", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/blockers", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 502 on Linear failure", async () => {
+    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockRejectedValueOnce(
+      new Error("boom"),
+    );
+    const token = await login("secret");
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(502);
+    expect(JSON.parse(res.body).error).toContain("boom");
+  });
+
+  it("returns 200 with shape — no-mapping blocker when issue team has no mapping", async () => {
+    const stubSnapshot = {
+      readyForImplementation: [
+        {
+          id: "issue-1",
+          identifier: "CORE-100",
+          title: "Implement feature X",
+          team: { id: "team-1", key: "CORE" },
+          state: { id: "state-1", name: "Todo", type: "unstarted" },
+        },
+      ],
+      needsPlanning: [],
+      inProgressCountsByTeam: {},
+    };
+    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockResolvedValueOnce(stubSnapshot);
+    const token = await login("secret");
+    // No mapping for CORE team → should produce a no-mapping blocker
+    const res = await request("/api/blockers", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Array.isArray(body.blockers)).toBe(true);
+    expect(body.blockers).toHaveLength(1);
+    expect(body.blockers[0].reason).toBe("no-mapping");
+    expect(body.totals.byReason["no-mapping"]).toBe(1);
+    expect(body.totals.issues).toBe(1);
+  });
+});
+
+describe("admin customizations endpoint", () => {
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/customizations", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 200 with shape", async () => {
+    const token = await login("secret");
+    const res = await request("/api/customizations", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(typeof body.customRoot).toBe("string");
+    expect(Array.isArray(body.customizations)).toBe(true);
+  });
+});
+
+describe("admin pipelines-steps endpoint", () => {
+  it("returns 401 without auth token", async () => {
+    const res = await request("/api/pipelines-steps", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 200 with pipelines and steps arrays", async () => {
+    const token = await login("secret");
+    const res = await request("/api/pipelines-steps", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(Array.isArray(body.pipelines)).toBe(true);
+    expect(Array.isArray(body.steps)).toBe(true);
   });
 });
