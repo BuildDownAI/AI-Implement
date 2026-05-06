@@ -74,13 +74,13 @@ TOML
 fi
 
 # Read values from config (section-aware parsing)
-APP_NAME=$(awk '/^\[fly\]/,/^\[/' "$CONFIG_FILE" | grep 'app_name' | head -1 | sed 's/.*= *//' | tr -d '"')
-FLY_ORG=$(awk '/^\[fly\]/,/^\[/' "$CONFIG_FILE" | grep 'org ' | head -1 | sed 's/.*= *//' | tr -d '"')
-REGION=$(awk '/^\[fly\]/,/^\[/' "$CONFIG_FILE" | grep 'region' | head -1 | sed 's/.*= *//' | tr -d '"')
+APP_NAME=$(awk '/^\[fly\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'app_name' | head -1 | sed 's/.*= *//' | tr -d '"')
+FLY_ORG=$(awk '/^\[fly\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'org ' | head -1 | sed 's/.*= *//' | tr -d '"')
+REGION=$(awk '/^\[fly\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'region' | head -1 | sed 's/.*= *//' | tr -d '"')
 
-SESSIONS_APP=$(awk '/^\[sessions\]/,/^\[/' "$CONFIG_FILE" | grep 'app_name' | head -1 | sed 's/.*= *//' | tr -d '"')
-SESSIONS_ORG=$(awk '/^\[sessions\]/,/^\[/' "$CONFIG_FILE" | grep 'org ' | head -1 | sed 's/.*= *//' | tr -d '"')
-SESSIONS_REGION=$(awk '/^\[sessions\]/,/^\[/' "$CONFIG_FILE" | grep 'region' | head -1 | sed 's/.*= *//' | tr -d '"')
+SESSIONS_APP=$(awk '/^\[sessions\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'app_name' | head -1 | sed 's/.*= *//' | tr -d '"')
+SESSIONS_ORG=$(awk '/^\[sessions\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'org ' | head -1 | sed 's/.*= *//' | tr -d '"')
+SESSIONS_REGION=$(awk '/^\[sessions\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'region' | head -1 | sed 's/.*= *//' | tr -d '"')
 
 # Fallback defaults if [sessions] section is missing
 SESSIONS_APP="${SESSIONS_APP:-ai-implement-sessions-${SLUG}}"
