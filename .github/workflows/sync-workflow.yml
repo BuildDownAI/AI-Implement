@@ -152,6 +152,21 @@ jobs:
             fi
           fi
 
+          # 6. .claude/settings.recommended.json — seed once only; never overwrite.
+          # Suffix is .recommended.json (NOT .json) so we never clobber a real
+          # .claude/settings.json the team may already maintain. Onboarders merge
+          # the contents into their project settings to skip Linear MCP prompts.
+          if [ -f "templates/.claude/settings.recommended.json" ]; then
+            if ! gh api "repos/$REPO/contents/.claude/settings.recommended.json?ref=$DEFAULT_BRANCH" > /dev/null 2>&1; then
+              sync_file \
+                "templates/.claude/settings.recommended.json" \
+                ".claude/settings.recommended.json" \
+                "Add Claude Code permissions template (merge into .claude/settings.json)"
+            else
+              echo "  Skipping .claude/settings.recommended.json (already exists in $REPO)"
+            fi
+          fi
+
           if [ "$CHANGES_MADE" = "false" ]; then
             echo "  No changes, skipping PR"
             exit 0
@@ -163,7 +178,7 @@ jobs:
             2>/dev/null || echo "")
 
           if [ -z "$EXISTING_PR" ] || [ "$EXISTING_PR" = "null" ]; then
-            PR_BODY=$(printf 'Auto-synced from ai-implement.\n\n**Always updated:**\n- `.github/workflows/claude-implement.yml`\n- `.github/workflows/comment-trigger.yml`\n- `.github/workflows/claude-plan.yml`\n\n**Added once (never overwritten):**\n- `WORKFLOW.md` — Claude implementation prompt template; customise this for your repo\n- `PLANNING.md` — Claude planning prompt template; customise this for your repo')
+            PR_BODY=$(printf 'Auto-synced from ai-implement.\n\n**Always updated:**\n- `.github/workflows/claude-implement.yml`\n- `.github/workflows/comment-trigger.yml`\n- `.github/workflows/claude-plan.yml`\n\n**Added once (never overwritten):**\n- `WORKFLOW.md` — Claude implementation prompt template; customise this for your repo\n- `PLANNING.md` — Claude planning prompt template; customise this for your repo\n- `.claude/settings.recommended.json` — Linear MCP allow-list; merge into `.claude/settings.json` to skip per-call permission prompts')
             gh api -X POST "repos/$REPO/pulls" \
               -f title="Sync AI implementation workflow files" \
               -f head="$SYNC_BRANCH" \

@@ -8,6 +8,8 @@ dist/
 *.pem
 *.pem.txt
 .claude/
+!templates/.claude/
+!templates/.claude/**
 .conductor/
 .wrangler/
 .worktrees/

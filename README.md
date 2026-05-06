@@ -73,6 +73,8 @@ The full architecture, env-var reference, SQLite schema, multi-client deploy mod
 src/                  Polling loop, HTTP + admin server, Linear/GitHub clients, Fly Machines runner
 workflows/            Templates synced to target repos (claude-implement.yml, claude-plan.yml,
                       comment-trigger.yml, WORKFLOW.md, PLANNING.md)
+templates/            Other templates dropped into target repos (.claude/settings.recommended.json
+                      — Linear MCP allow-list; team merges into their .claude/settings.json)
 clients/              One <slug>.toml per deployed Fly app (multi-tenant deploy)
 custom/               Fork-local step/provider/pipeline overrides (see custom/README.md
                       and docs/adr/001-custom-path-precedence.md)

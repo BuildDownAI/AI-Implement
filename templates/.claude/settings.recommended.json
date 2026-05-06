@@ -1,0 +1,22 @@
+{
+  "_comment": "Recommended Claude Code permissions for any repo onboarded to AI-Implement. Pre-approves Linear MCP read/write surfaces that the build-up / build-down / summit-push skills + the orchestrator workflow hit repeatedly. Destructive surfaces (delete) and rare surfaces (milestones, attachments, documents) are intentionally left to prompt. Merge into your project's .claude/settings.json — do NOT replace it (this template doesn't include any other permissions your repo may need).",
+  "permissions": {
+    "allow": [
+      "mcp__linear-server__list_teams",
+      "mcp__linear-server__list_issues",
+      "mcp__linear-server__get_issue",
+      "mcp__linear-server__save_issue",
+      "mcp__linear-server__list_comments",
+      "mcp__linear-server__save_comment",
+      "mcp__linear-server__list_issue_labels",
+      "mcp__linear-server__create_issue_label",
+      "mcp__linear-server__list_issue_statuses",
+      "mcp__linear-server__get_issue_status",
+      "mcp__linear-server__list_projects",
+      "mcp__linear-server__get_project",
+      "mcp__linear-server__save_project",
+      "mcp__linear-server__list_users",
+      "mcp__linear-server__get_user"
+    ]
+  }
+}
