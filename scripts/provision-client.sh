@@ -216,62 +216,31 @@ echo "FLY_SESSIONS_TOKEN: Fly API token for the '${SESSIONS_ORG}' org."
 echo "  Generate one with: fly tokens create org --org ${SESSIONS_ORG}"
 read_secret "FLY_SESSIONS_TOKEN" "FLY_SESSIONS_TOKEN (Fly API token for ${SESSIONS_ORG} org)" "true"
 
-# ---------- 5. Link GitHub repos ----------
-
-SYNC_WORKFLOW=".github/workflows/sync-workflow.yml"
+# ---------- 5. Collect target repos (printed in next-steps) ----------
 
 echo ""
-echo "=== Link GitHub repos ==="
-echo "Add target repos so the workflow templates (claude-implement.yml, etc.)"
-echo "are synced to them. Enter repos as owner/repo (e.g. acme/my-app)."
-echo "Press Enter with no input when done."
+echo "=== Target repos ==="
+echo "Target repos receive the synced workflow templates via sync-workflow.yml,"
+echo "dispatched per-repo. Enter repos as owner/repo (e.g. acme/api)."
+echo "Press Enter when done. (You can also dispatch sync later with no entries here.)"
 echo ""
 
-REPOS_ADDED=false
+TARGET_REPOS=()
 while true; do
-  read -rp "GitHub repo to link (owner/repo, or Enter to skip): " REPO_INPUT
+  read -rp "Target repo (owner/repo, or Enter to skip): " REPO_INPUT
   [ -z "$REPO_INPUT" ] && break
 
-  # Validate format
   if ! echo "$REPO_INPUT" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
-    echo "  Invalid format. Use owner/repo (e.g. acme/my-app)"
+    echo "  Invalid format. Use owner/repo (e.g. acme/api)."
     continue
   fi
 
-  REPO_OWNER=$(echo "$REPO_INPUT" | cut -d/ -f1)
-
-  # Check if already in sync workflow
-  if grep -qF "$REPO_INPUT" "$SYNC_WORKFLOW" 2>/dev/null; then
-    echo "  $REPO_INPUT is already in sync-workflow.yml, skipping."
-    continue
-  fi
-
-  # Add to the matrix — insert before the closing "steps:" line
-  # Find the last matrix entry and append after it
-  sed -i.bak "/^    steps:$/i\\
-          - repo: ${REPO_INPUT}\\
-            owner: ${REPO_OWNER}" "$SYNC_WORKFLOW"
-  rm -f "${SYNC_WORKFLOW}.bak"
-
-  echo "  Added $REPO_INPUT to sync-workflow.yml"
-  REPOS_ADDED=true
+  TARGET_REPOS+=("$REPO_INPUT")
+  echo "  Added: $REPO_INPUT"
 done
 
-if [ "$REPOS_ADDED" = "true" ]; then
-  echo ""
-  echo "New repos added to sync-workflow.yml."
-  read -rp "Commit and push to trigger the sync workflow? [Y/n]: " PUSH_CONFIRM
-  PUSH_CONFIRM="${PUSH_CONFIRM:-Y}"
-  if [[ "$PUSH_CONFIRM" =~ ^[Yy] ]]; then
-    git add "$SYNC_WORKFLOW"
-    git commit -m "Add repos to workflow sync matrix for client: $SLUG"
-    git push
-    echo "  Pushed. The sync workflow will run automatically."
-    echo "  Check progress: gh run list --workflow=sync-workflow.yml --limit 1"
-  else
-    echo "  Skipped. Remember to commit and push $SYNC_WORKFLOW to trigger the sync."
-  fi
-fi
+# Detect this repo's owner/name for printing dispatch commands.
+ORCH_REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo "")
 
 # ---------- 6. Done ----------
 
@@ -285,11 +254,26 @@ echo ""
 echo "  Next steps:"
 echo "    1. Commit clients/${SLUG}.toml and push to main to deploy:"
 echo "       git add clients/${SLUG}.toml && git commit -m 'Add client: $SLUG' && git push"
-echo "    2. Merge the sync PR in each target repo (opens automatically)"
-echo "    3. Enable 'Allow GitHub Actions to create and approve pull requests'"
+echo "    2. Set GitHub Actions secrets on the orchestrator + target repos:"
+if [ "${#TARGET_REPOS[@]}" -gt 0 ] && [ -n "$ORCH_REPO" ]; then
+  echo "       ./scripts/set-github-secrets.sh $ORCH_REPO ${TARGET_REPOS[*]}"
+elif [ -n "$ORCH_REPO" ]; then
+  echo "       ./scripts/set-github-secrets.sh $ORCH_REPO <target-repo> [<target-repo>...]"
+else
+  echo "       ./scripts/set-github-secrets.sh <orchestrator-repo> <target-repo> [<target-repo>...]"
+fi
+echo "    3. Install the GitHub App on each target repo"
+echo "    4. Enable 'Allow GitHub Actions to create and approve pull requests'"
 echo "       in each target repo: Settings → Actions → General"
-echo "    4. Install the GitHub App on each target repo"
-echo "    5. Add team→repo mappings via the admin UI at /admin"
+echo "    5. Dispatch sync-workflow.yml per target repo:"
+if [ "${#TARGET_REPOS[@]}" -gt 0 ] && [ -n "$ORCH_REPO" ]; then
+  for repo in "${TARGET_REPOS[@]}"; do
+    echo "       gh workflow run sync-workflow.yml --repo $ORCH_REPO -f target_repo=$repo"
+  done
+else
+  echo "       gh workflow run sync-workflow.yml --repo <orchestrator-repo> -f target_repo=<target-repo>"
+fi
+echo "    6. Add team→repo mappings via the admin UI at /admin"
 echo ""
 echo "  To re-run this script (update secrets, add more repos):"
 echo "    ./scripts/provision-client.sh $SLUG"
