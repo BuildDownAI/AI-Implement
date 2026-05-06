@@ -4,6 +4,18 @@ name: Sync workflow to target repo
 # claude-plan.yml, comment-trigger.yml) into a target repo, opening a PR.
 # WORKFLOW.md and PLANNING.md are seeded once and never overwritten.
 #
+# Branch base:
+#   - Defaults to the target repo's default branch.
+#   - Override with the `target_base` workflow input (e.g. for repos that
+#     merge into `testing` rather than `main`).
+#
+# Sync-branch policy:
+#   - If sync/ai-implement doesn't exist → create from base tip.
+#   - If it exists with zero commits ahead of base → reset to base tip.
+#   - If it exists with commits ahead of base → preserve them. Target-side
+#     customisations (e.g. edits to WORKFLOW.md after first sync) belong
+#     to the target repo and must survive subsequent sync runs.
+#
 # This workflow runs on demand (workflow_dispatch) — provide the target
 # repo each time. The orchestrator can also call this dispatch via the
 # GitHub API as part of repo onboarding.
@@ -20,6 +32,11 @@ on:
         description: 'Target repo as owner/name (e.g. acme-corp/api)'
         required: true
         type: string
+      target_base:
+        description: 'Branch to base the sync PR on (default: target repo default branch)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   sync:
@@ -51,18 +68,37 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.sync-token.outputs.token }}
           REPO: ${{ steps.target.outputs.repo }}
+          TARGET_BASE_INPUT: ${{ inputs.target_base }}
         run: |
           SYNC_BRANCH="sync/ai-implement"
           CHANGES_MADE=false
 
-          # Get default branch name and its HEAD SHA
-          DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq '.default_branch')
-          BASE_SHA=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT_BRANCH" --jq '.object.sha')
+          # Resolve target base: explicit input wins, otherwise the repo's default branch.
+          if [ -n "$TARGET_BASE_INPUT" ]; then
+            TARGET_BASE="$TARGET_BASE_INPUT"
+          else
+            TARGET_BASE=$(gh api "repos/$REPO" --jq '.default_branch')
+          fi
+          echo "  Base branch: $TARGET_BASE"
+          BASE_SHA=$(gh api "repos/$REPO/git/ref/heads/$TARGET_BASE" --jq '.object.sha')
 
-          # Create or reset the sync branch to the current default branch tip
+          # Manage the sync branch.
+          # - Doesn't exist → create from base tip.
+          # - Exists with zero commits ahead of base → safe to reset to current base tip.
+          # - Exists with commits ahead of base → preserve them. Target-side customisation
+          #   commits (e.g. edits to WORKFLOW.md after the first sync) belong to the target
+          #   repo and must survive subsequent sync runs. The sync_file PUT calls below
+          #   commit on top of whatever the branch contains.
           if gh api "repos/$REPO/git/ref/heads/$SYNC_BRANCH" --silent 2>/dev/null; then
-            gh api -X PATCH "repos/$REPO/git/refs/heads/$SYNC_BRANCH" \
-              -f sha="$BASE_SHA" -F force=true
+            AHEAD_BY=$(gh api "repos/$REPO/compare/$TARGET_BASE...$SYNC_BRANCH" \
+              --jq '.ahead_by' 2>/dev/null || echo "0")
+            if [ "${AHEAD_BY:-0}" -eq 0 ]; then
+              echo "  Sync branch exists, no commits ahead of $TARGET_BASE → resetting to base tip"
+              gh api -X PATCH "repos/$REPO/git/refs/heads/$SYNC_BRANCH" \
+                -f sha="$BASE_SHA" -F force=true
+            else
+              echo "  Sync branch ahead of $TARGET_BASE by $AHEAD_BY commit(s) → preserving customisations"
+            fi
           else
             gh api -X POST "repos/$REPO/git/refs" \
               -f ref="refs/heads/$SYNC_BRANCH" \
@@ -130,7 +166,7 @@ jobs:
 
           # 4. WORKFLOW.md — seed once only; never overwrite (each repo owns its own prompt template)
           if [ -f "workflows/WORKFLOW.md" ]; then
-            if ! gh api "repos/$REPO/contents/WORKFLOW.md?ref=$DEFAULT_BRANCH" > /dev/null 2>&1; then
+            if ! gh api "repos/$REPO/contents/WORKFLOW.md?ref=$TARGET_BASE" > /dev/null 2>&1; then
               sync_file \
                 "workflows/WORKFLOW.md" \
                 "WORKFLOW.md" \
@@ -142,7 +178,7 @@ jobs:
 
           # 5. PLANNING.md — seed once only; never overwrite (each repo owns its own planning template)
           if [ -f "workflows/PLANNING.md" ]; then
-            if ! gh api "repos/$REPO/contents/PLANNING.md?ref=$DEFAULT_BRANCH" > /dev/null 2>&1; then
+            if ! gh api "repos/$REPO/contents/PLANNING.md?ref=$TARGET_BASE" > /dev/null 2>&1; then
               sync_file \
                 "workflows/PLANNING.md" \
                 "PLANNING.md" \
@@ -167,7 +203,7 @@ jobs:
             gh api -X POST "repos/$REPO/pulls" \
               -f title="Sync AI implementation workflow files" \
               -f head="$SYNC_BRANCH" \
-              -f base="$DEFAULT_BRANCH" \
+              -f base="$TARGET_BASE" \
               -f body="$PR_BODY"
             echo "  Opened PR in $REPO"
           else
