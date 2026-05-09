@@ -76,17 +76,20 @@ function createAppJwt(appId: string, privateKey: string): string {
 }
 
 /**
- * Returns a cached installation access token for the given org.
+ * Returns a cached installation access token for the given owner.
  * Tokens are valid for 1 hour; we cache for 50 minutes.
  *
- * The GitHub App must be installed on the target org.
+ * The GitHub App must be installed on the target owner. The owner can be
+ * either an organisation or a personal user account; GitHub uses separate
+ * REST endpoints for each, so we try the org endpoint first and fall back
+ * to the user endpoint on 404.
  */
 export async function getInstallationToken(
   appId: string,
   privateKey: string,
-  org: string,
+  owner: string,
 ): Promise<string> {
-  const cached = tokenCache.get(org);
+  const cached = tokenCache.get(owner);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.token;
   }
@@ -102,11 +105,16 @@ export async function getInstallationToken(
     "User-Agent": "ai-implement",
   };
 
-  // Resolve installation ID for the org
-  const installRes = await fetch(`https://api.github.com/orgs/${org}/installation`, { headers });
+  // Resolve installation ID for the owner (org or user account).
+  // GitHub's `/orgs/{org}/installation` endpoint 404s on user accounts and
+  // vice versa; try org first since that's the more common deployment shape.
+  let installRes = await fetch(`https://api.github.com/orgs/${owner}/installation`, { headers });
+  if (installRes.status === 404) {
+    installRes = await fetch(`https://api.github.com/users/${owner}/installation`, { headers });
+  }
   if (!installRes.ok) {
     const body = await installRes.text();
-    throw new Error(`GitHub App not installed on org "${org}" (${installRes.status}): ${body}`);
+    throw new Error(`GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`);
   }
   const install = await installRes.json() as { id: number };
 
@@ -117,11 +125,11 @@ export async function getInstallationToken(
   );
   if (!tokenRes.ok) {
     const body = await tokenRes.text();
-    throw new Error(`Failed to get installation token for org "${org}" (${tokenRes.status}): ${body}`);
+    throw new Error(`Failed to get installation token for owner "${owner}" (${tokenRes.status}): ${body}`);
   }
   const tokenData = await tokenRes.json() as { token: string; expires_at: string };
 
-  tokenCache.set(org, { token: tokenData.token, expiresAt: Date.now() + 50 * 60 * 1000 });
+  tokenCache.set(owner, { token: tokenData.token, expiresAt: Date.now() + 50 * 60 * 1000 });
   return tokenData.token;
 }
 
