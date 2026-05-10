@@ -16,7 +16,7 @@ const VALID_STEP_TYPES = new Set<StepType>([
   "test-plan",
   "work-unit-decomposition",
   "cross-story-context",
-  "post-to-linear",
+  "post-to-ticketing",
   "custom",
 ]);
 

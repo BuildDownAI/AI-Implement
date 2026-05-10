@@ -1,18 +1,18 @@
 import { listMachines, destroyMachine } from "./fly-machines.js";
 import { getJobByMachineId, updateJobStatus, invalidateNonce } from "./log.js";
-import { fetchIssueStates } from "./linear.js";
+import type { TicketingProvider, IssueLifecycleState } from "./providers/types.js";
 import { recordReaperAction } from "./dedup.js";
 import { notifyReaperBurst } from "./notify.js";
 import type { Job } from "./log.js";
 
 export const SWEEP_MACHINE_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
-const TERMINAL_STATE_TYPES = new Set(["completed", "canceled"]);
+const TERMINAL_LIFECYCLE_STATES = new Set<IssueLifecycleState>(["completed", "cancelled"]);
 
 export interface ReaperConfig {
   flySessionsToken: string | null;
   flySessionsApp: string | null;
   flyOrchestratorApp: string | null;
-  linearApiKey: string;
+  provider: TicketingProvider;
   reaperDryRun: boolean;
   notifyType?: string;
   notifyWebhookUrl?: string | null;
@@ -20,8 +20,8 @@ export interface ReaperConfig {
 }
 
 export interface ReaperHelpers {
-  resetLinearIssue: (job: Job) => Promise<void>;
-  postSessionLogsToLinear: (job: Job, context: string) => Promise<void>;
+  resetTicket: (job: Job) => Promise<void>;
+  postSessionLogs: (job: Job, context: string) => Promise<void>;
   findPrForIssue: (repo: string | null, issueIdentifier: string | null) => Promise<string | null>;
 }
 
@@ -108,10 +108,10 @@ export async function sweepOrphanedMachines(
     }
   }
 
-  let issueStateMap = new Map<string, string>();
+  let issueStateMap = new Map<string, IssueLifecycleState>();
   if (issueIds.size > 0) {
     try {
-      issueStateMap = await fetchIssueStates(config.linearApiKey, [...issueIds]);
+      issueStateMap = await config.provider.fetchLifecycleStates([...issueIds]);
     } catch (err) {
       console.error("[sweep] Failed to fetch Linear issue states:", err);
       // Continue — age and orphan checks still work without Linear state
@@ -181,7 +181,7 @@ export async function sweepOrphanedMachines(
         // been processed by the monitor loop yet.
         const sweepPrUrl = await helpers.findPrForIssue(job.repo, job.issueIdentifier);
         if (!sweepPrUrl && job.runnerMode !== "shadow") {
-          await helpers.postSessionLogsToLinear(job, "max_age_sweep");
+          await helpers.postSessionLogs(job, "max_age_sweep");
         }
       }
       recordReaperAction({
@@ -201,7 +201,7 @@ export async function sweepOrphanedMachines(
         destroyedCount++;
         updateJobStatus(job.id, "timed_out", "machine_max_age_sweep");
         invalidateNonce(job.id);
-        await helpers.resetLinearIssue(job);
+        await helpers.resetTicket(job);
       }
       continue;
     }
@@ -210,9 +210,9 @@ export async function sweepOrphanedMachines(
 
     // TODO(interactive): PR-closed rule
 
-    // In-flight job: check whether the Linear issue is already terminal
-    const stateType = issueStateMap.get(job.issueId ?? "");
-    if (stateType !== undefined && TERMINAL_STATE_TYPES.has(stateType)) {
+    // In-flight job: check whether the ticket has reached a terminal lifecycle state
+    const lifecycle = issueStateMap.get(job.issueId ?? "");
+    if (lifecycle !== undefined && TERMINAL_LIFECYCLE_STATES.has(lifecycle)) {
       recordReaperAction({
         ruleMatched: "issue-terminal",
         machineId: machine.id,
@@ -230,7 +230,7 @@ export async function sweepOrphanedMachines(
         destroyedCount++;
         updateJobStatus(job.id, "timed_out", "issue_completed_sweep");
         invalidateNonce(job.id);
-        await helpers.resetLinearIssue(job);
+        await helpers.resetTicket(job);
       }
     }
   }

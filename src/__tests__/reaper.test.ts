@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { safeDestroyMachine, sweepOrphanedMachines, getLastSweepAt } from "../reaper.js";
 import type { ReaperConfig, ReaperHelpers } from "../reaper.js";
+import { FakeProvider } from "./providers/fake.js";
 
 vi.mock("../fly-machines.js", () => ({
   listMachines: vi.fn(),
@@ -11,10 +12,6 @@ vi.mock("../log.js", () => ({
   getJobByMachineId: vi.fn(),
   updateJobStatus: vi.fn(),
   invalidateNonce: vi.fn(),
-}));
-
-vi.mock("../linear.js", () => ({
-  fetchIssueStates: vi.fn(() => Promise.resolve(new Map())),
 }));
 
 vi.mock("../dedup.js", () => ({
@@ -38,7 +35,7 @@ function makeConfig(reaperDryRun: boolean, overrides?: Partial<ReaperConfig>): R
     flySessionsToken: TOKEN,
     flySessionsApp: APP,
     flyOrchestratorApp: "my-orchestrator",
-    linearApiKey: "lin_test",
+    provider: new FakeProvider(),
     reaperDryRun,
     ...overrides,
   };
@@ -46,8 +43,8 @@ function makeConfig(reaperDryRun: boolean, overrides?: Partial<ReaperConfig>): R
 
 function makeHelpers(): ReaperHelpers {
   return {
-    resetLinearIssue: vi.fn(() => Promise.resolve()),
-    postSessionLogsToLinear: vi.fn(() => Promise.resolve()),
+    resetTicket: vi.fn(() => Promise.resolve()),
+    postSessionLogs: vi.fn(() => Promise.resolve()),
     findPrForIssue: vi.fn(() => Promise.resolve(null)),
   };
 }
@@ -316,7 +313,7 @@ describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
 
     expect(updateJobStatus).not.toHaveBeenCalled();
     expect(invalidateNonce).not.toHaveBeenCalled();
-    expect(helpers.resetLinearIssue).not.toHaveBeenCalled();
+    expect(helpers.resetTicket).not.toHaveBeenCalled();
   });
 
   it("calls updateJobStatus and invalidateNonce in live mode for max-age rule", async () => {
@@ -332,7 +329,7 @@ describe("sweepOrphanedMachines — side effects skipped in dry-run", () => {
 
     expect(updateJobStatus).toHaveBeenCalledWith(inflight.id, "timed_out", "machine_max_age_sweep");
     expect(invalidateNonce).toHaveBeenCalledWith(inflight.id);
-    expect(helpers.resetLinearIssue).toHaveBeenCalledWith(inflight);
+    expect(helpers.resetTicket).toHaveBeenCalledWith(inflight);
   });
 });
 

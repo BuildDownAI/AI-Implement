@@ -28,7 +28,7 @@ import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
-import { removeAIWorkingLabel, fetchAIImplementIssueSnapshot, type LinearIssue } from "./linear.js";
+import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
@@ -72,16 +72,22 @@ function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.end(JSON.stringify(data));
 }
 
-function shapeIssue(i: LinearIssue, bucket: "ready" | "needs-planning") {
+function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
   return {
     id: i.id,
     identifier: i.identifier,
     title: i.title,
-    teamKey: i.team.key,
-    stateName: i.state.name,
-    stateType: i.state.type,
+    teamKey: i.scopeKey,
+    stateName: i.nativeStatus,
+    stateType: "",
     bucket,
   };
+}
+
+function validateTicketingProvider(value: unknown): "linear" | "jira" {
+  if (value === undefined || value === null) return "linear";
+  if (value === "linear" || value === "jira") return value;
+  throw new Error(`Invalid ticketingProvider: expected "linear" or "jira", got ${JSON.stringify(value)}`);
 }
 
 function getToken(req: http.IncomingMessage): string | undefined {
@@ -104,6 +110,7 @@ export function handleAdminRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   config: AdminConfig,
+  provider: TicketingProvider,
 ): boolean {
   const url = req.url || "/";
   const method = req.method || "GET";
@@ -191,13 +198,13 @@ export function handleAdminRequest(
       return true;
     }
 
-    if (url === "/api/linear/issues" && method === "GET") {
-      handleListLinearIssues(res, config);
+    if (url === "/api/issues" && method === "GET") {
+      handleListIssues(res, provider);
       return true;
     }
 
     if (url === "/api/blockers" && method === "GET") {
-      handleListBlockers(res, config);
+      handleListBlockers(res, provider);
       return true;
     }
 
@@ -245,7 +252,7 @@ export function handleAdminRequest(
 
     if (url.startsWith("/api/sessions/") && method === "DELETE") {
       const machineId = decodeURIComponent(url.slice("/api/sessions/".length));
-      handleDestroySession(req, res, config, machineId);
+      handleDestroySession(req, res, config, provider, machineId);
       return true;
     }
 
@@ -295,17 +302,17 @@ export function handleAdminRequest(
 
 async function handleListBlockers(
   res: http.ServerResponse,
-  config: AdminConfig,
+  provider: TicketingProvider,
 ): Promise<void> {
   try {
-    const snapshot = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const snapshot = await provider.fetchAIImplementSnapshot();
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
     const blockers = selectBlockers(
       allIssues,
       teamRepoMap,
-      snapshot.inProgressCountsByTeam,
+      snapshot.inProgressCountsByScope,
       (id) => dispatchedSet.has(id),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
@@ -320,19 +327,19 @@ async function handleListBlockers(
   }
 }
 
-async function handleListLinearIssues(
+async function handleListIssues(
   res: http.ServerResponse,
-  config: AdminConfig,
+  provider: TicketingProvider,
 ): Promise<void> {
   try {
-    const snapshot = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const snapshot = await provider.fetchAIImplementSnapshot();
     const issues = [
       ...snapshot.readyForImplementation.map((i) => shapeIssue(i, "ready")),
       ...snapshot.needsPlanning.map((i) => shapeIssue(i, "needs-planning")),
     ].sort((a, b) => a.identifier.localeCompare(b.identifier));
     json(res, 200, {
       issues,
-      inProgressCountsByTeam: snapshot.inProgressCountsByTeam,
+      inProgressCountsByTeam: snapshot.inProgressCountsByScope,
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });
@@ -416,6 +423,7 @@ async function handleDestroySession(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   config: AdminConfig,
+  provider: TicketingProvider,
   machineId: string,
 ): Promise<void> {
   if (!config.flySessionsToken || !config.flySessionsApp) {
@@ -441,10 +449,10 @@ async function handleDestroySession(
     updateJobStatus(job.id, "failed", "destroyed-by-admin");
     if (job.issueId) {
       try {
-        await removeAIWorkingLabel(config.linearApiKey, job.issueId);
+        await provider.clearWorkingState(job.issueId);
         deleteDispatched(job.issueId);
       } catch (err) {
-        console.error(`[admin] Failed to reset Linear issue ${job.issueIdentifier}:`, err);
+        console.error(`[admin] Failed to reset issue ${job.issueIdentifier}:`, err);
       }
     }
   }
@@ -812,6 +820,7 @@ async function handleUpsertMapping(
       extraEnv?: Record<string, string>;
       provider?: string;
       awsRegion?: string | null;
+      ticketingProvider?: string;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -909,6 +918,7 @@ async function handleUpsertMapping(
       autoApprovePlans,
       extraEnv,
       provider,
+      ticketingProvider: validateTicketingProvider(body.ticketingProvider),
       awsRegion,
     };
 

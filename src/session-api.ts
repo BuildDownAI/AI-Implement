@@ -2,6 +2,7 @@ import http from "node:http";
 import { getJobByNonce } from "./log.js";
 import { postStatusComment } from "./status-events.js";
 import type { StatusEvent } from "./status-events.js";
+import type { TicketingProvider } from "./providers/types.js";
 import { upsertStepRecord } from "./step-log.js";
 import type { Step } from "./pipeline/types.js";
 
@@ -88,7 +89,7 @@ export async function handleStepReport(
 export async function handleStatusUpdate(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  linearApiKey: string,
+  provider: TicketingProvider,
   flyAppName?: string,
 ): Promise<void> {
   try {
@@ -146,7 +147,7 @@ export async function handleStatusUpdate(
       statusEvent = { type: "error", reason };
     }
 
-    await postStatusComment(linearApiKey, job.issueId, statusEvent, machineLogsUrl);
+    await postStatusComment(provider, job.issueId, statusEvent, machineLogsUrl);
     json(res, 200, { ok: true });
   } catch (err) {
     console.error("[session-api] Error handling status update:", err);

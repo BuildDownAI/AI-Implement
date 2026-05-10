@@ -9,7 +9,8 @@ import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as StepLogModule from "../step-log.js";
-import type * as LinearModuleType from "../linear.js";
+import { FakeProvider } from "./providers/fake.js";
+import type { TicketIssue } from "../providers/types.js";
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -54,13 +55,13 @@ let dedup: typeof DedupModule;
 let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let stepLog: typeof StepLogModule;
-let linear: typeof LinearModuleType;
+let provider: FakeProvider;
 
 beforeEach(async () => {
   vi.resetModules();
   dbPath = path.join(os.tmpdir(), `admin-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   process.env.DEDUP_DB_PATH = dbPath;
-  linear = await import("../linear.js");
+  provider = new FakeProvider();
   admin = await import("../admin.js");
   config = await import("../config.js");
   dedup = await import("../dedup.js");
@@ -93,7 +94,7 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
 async function request(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
-  admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode));
+  admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), provider);
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -143,7 +144,7 @@ describe("admin auth", () => {
       linearApiKey: "test",
       githubAppId: "test",
       githubAppPrivateKey: "test",
-    });
+    }, provider);
     await res.done;
     expect(res.statusCode).toBe(200);
   });
@@ -490,7 +491,7 @@ describe("admin secrets", () => {
   async function requestFly(url: string, method: string, token: string, body?: unknown): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body !== undefined ? JSON.stringify(body) : undefined);
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, secretsConfig());
+    admin.handleAdminRequest(req as never, res as never, secretsConfig(), provider);
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
@@ -658,7 +659,7 @@ describe("admin secrets", () => {
 
     const req = new MockRequest("/api/mappings/ENG/secrets", "POST", { authorization: `Bearer ${token}` }, "not-json{{{");
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, secretsConfig());
+    admin.handleAdminRequest(req as never, res as never, secretsConfig(), provider);
     await res.done;
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("Invalid");
@@ -728,7 +729,7 @@ describe("admin settings", () => {
     for (const body of ["null", '"a string"', "42", "[]"]) {
       const req = new MockRequest("/api/settings", "POST", { authorization: `Bearer ${token}` }, body);
       const res = new MockResponse();
-      admin.handleAdminRequest(req as never, res as never, adminConfig());
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), provider);
       await res.done;
       expect(res.statusCode).toBe(400);
     }
@@ -754,7 +755,7 @@ describe("admin global secrets", () => {
   async function requestFlyGlobal(url: string, method: string, token: string, body?: unknown): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body !== undefined ? JSON.stringify(body) : undefined);
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, globalSecretsConfig());
+    admin.handleAdminRequest(req as never, res as never, globalSecretsConfig(), provider);
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
@@ -878,7 +879,7 @@ describe("admin global secrets", () => {
     for (const body of ["null", '"a string"', "42", "[]"]) {
       const req = new MockRequest("/api/global-secrets", "POST", { authorization: `Bearer ${token}` }, body);
       const res = new MockResponse();
-      admin.handleAdminRequest(req as never, res as never, globalSecretsConfig());
+      admin.handleAdminRequest(req as never, res as never, globalSecretsConfig(), provider);
       await res.done;
       expect(res.statusCode).toBe(400);
     }
@@ -958,51 +959,50 @@ describe("admin dedup", () => {
   });
 });
 
-describe("admin linear issues endpoint", () => {
+describe("admin issues endpoint", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
   it("returns 401 without auth token", async () => {
-    const res = await request("/api/linear/issues", "GET", "secret");
+    const res = await request("/api/issues", "GET", "secret");
     expect(res.statusCode).toBe(401);
   });
 
-  it("returns 502 on Linear failure", async () => {
-    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockRejectedValueOnce(
+  it("returns 502 on provider failure", async () => {
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockRejectedValueOnce(
       new Error("Linear API error: 401"),
     );
     const token = await login("secret");
-    const res = await request("/api/linear/issues", "GET", "secret", undefined, token);
+    const res = await request("/api/issues", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(502);
     expect(JSON.parse(res.body).error).toContain("Linear API error");
   });
 
   it("returns 200 with shaped issues on success", async () => {
-    const stubSnapshot = {
-      readyForImplementation: [
-        {
-          id: "issue-1",
-          identifier: "CORE-100",
-          title: "Implement feature X",
-          team: { id: "team-1", key: "CORE" },
-          state: { id: "state-1", name: "Todo", type: "unstarted" },
-        },
-      ],
-      needsPlanning: [
-        {
-          id: "issue-2",
-          identifier: "CORE-50",
-          title: "Plan something",
-          team: { id: "team-1", key: "CORE" },
-          state: { id: "state-2", name: "Backlog", type: "backlog" },
-        },
-      ],
-      inProgressCountsByTeam: { CORE: 2 },
+    const ready: TicketIssue = {
+      id: "issue-1",
+      identifier: "CORE-100",
+      title: "Implement feature X",
+      description: null,
+      scopeKey: "CORE",
+      nativeStatus: "Todo (unstarted)",
     };
-    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockResolvedValueOnce(stubSnapshot);
+    const needsPlan: TicketIssue = {
+      id: "issue-2",
+      identifier: "CORE-50",
+      title: "Plan something",
+      description: null,
+      scopeKey: "CORE",
+      nativeStatus: "Backlog (backlog)",
+    };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [ready],
+      needsPlanning: [needsPlan],
+      inProgressCountsByScope: { CORE: 2 },
+    });
     const token = await login("secret");
-    const res = await request("/api/linear/issues", "GET", "secret", undefined, token);
+    const res = await request("/api/issues", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
     expect(Array.isArray(body.issues)).toBe(true);
@@ -1011,6 +1011,8 @@ describe("admin linear issues endpoint", () => {
     // Sorted by identifier (localeCompare): "CORE-100" < "CORE-50" lexicographically
     expect(body.issues[0].identifier).toBe("CORE-100");
     expect(body.issues[0].bucket).toBe("ready");
+    expect(body.issues[0].teamKey).toBe("CORE");
+    expect(body.issues[0].stateName).toBe("Todo (unstarted)");
     expect(body.issues[1].identifier).toBe("CORE-50");
     expect(body.issues[1].bucket).toBe("needs-planning");
   });
@@ -1071,8 +1073,8 @@ describe("admin blockers endpoint", () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it("returns 502 on Linear failure", async () => {
-    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockRejectedValueOnce(
+  it("returns 502 on provider failure", async () => {
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockRejectedValueOnce(
       new Error("boom"),
     );
     const token = await login("secret");
@@ -1082,20 +1084,19 @@ describe("admin blockers endpoint", () => {
   });
 
   it("returns 200 with shape — no-mapping blocker when issue team has no mapping", async () => {
-    const stubSnapshot = {
-      readyForImplementation: [
-        {
-          id: "issue-1",
-          identifier: "CORE-100",
-          title: "Implement feature X",
-          team: { id: "team-1", key: "CORE" },
-          state: { id: "state-1", name: "Todo", type: "unstarted" },
-        },
-      ],
-      needsPlanning: [],
-      inProgressCountsByTeam: {},
+    const issue: TicketIssue = {
+      id: "issue-1",
+      identifier: "CORE-100",
+      title: "Implement feature X",
+      description: null,
+      scopeKey: "CORE",
+      nativeStatus: "Todo (unstarted)",
     };
-    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockResolvedValueOnce(stubSnapshot);
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [issue],
+      needsPlanning: [],
+      inProgressCountsByScope: {},
+    });
     const token = await login("secret");
     // No mapping for CORE team → should produce a no-mapping blocker
     const res = await request("/api/blockers", "GET", "secret", undefined, token);

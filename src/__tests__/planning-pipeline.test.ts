@@ -14,6 +14,7 @@ function makeContext(overrides: Partial<PipelineContextData> = {}): DefaultPipel
     issueDescription: "Define a planning pipeline using composable steps.",
     nonce: "test-nonce",
     orchestratorUrl: "http://localhost:8080",
+    ticketingProvider: "linear",
     ...overrides,
   });
 }
@@ -36,7 +37,7 @@ describe("PLANNING_PIPELINE definition", () => {
       "test-plan",
       "work-unit-decomposition",
       "cross-story-context",
-      "post-to-linear",
+      "post-to-ticketing",
     ]);
   });
 
@@ -92,7 +93,7 @@ describe("planning pipeline execution", () => {
   let testPlanMod: StepModule;
   let workUnitsMod: StepModule;
   let crossStoryMod: StepModule;
-  let postLinearMod: StepModule;
+  let postTicketingMod: StepModule;
   let runner: PipelineRunner;
 
   beforeEach(() => {
@@ -102,7 +103,7 @@ describe("planning pipeline execution", () => {
     testPlanMod = makeModule({ testPlanMarkdown: "## 🧪 AI Planning: Test Plan\n..." });
     workUnitsMod = makeModule({ workUnitsMarkdown: "## 🔧 AI Planning: Work Units\n..." });
     crossStoryMod = makeModule({ crossStoryMarkdown: "## 🔗 AI Planning: Cross-Story Context\n..." });
-    postLinearMod = makeModule({ commentCount: 3 });
+    postTicketingMod = makeModule({ commentCount: 3 });
 
     runner = new PipelineRunner()
       .register("clone", cloneMod)
@@ -111,7 +112,7 @@ describe("planning pipeline execution", () => {
       .register("test-plan", testPlanMod)
       .register("work-unit-decomposition", workUnitsMod)
       .register("cross-story-context", crossStoryMod)
-      .register("post-to-linear", postLinearMod);
+      .register("post-to-ticketing", postTicketingMod);
   });
 
   it("runs all steps when no related issues exist (cross-story-context skipped)", async () => {
@@ -124,7 +125,7 @@ describe("planning pipeline execution", () => {
     expect(testPlanMod.run).toHaveBeenCalledOnce();
     expect(workUnitsMod.run).toHaveBeenCalledOnce();
     expect(crossStoryMod.run).not.toHaveBeenCalled();
-    expect(postLinearMod.run).toHaveBeenCalledOnce();
+    expect(postTicketingMod.run).toHaveBeenCalledOnce();
   });
 
   it("runs cross-story-context when parent is set", async () => {
@@ -150,17 +151,17 @@ describe("planning pipeline execution", () => {
       .register("test-plan", testPlanMod)
       .register("work-unit-decomposition", workUnitsMod)
       .register("cross-story-context", crossStoryMod)
-      .register("post-to-linear", postLinearMod);
+      .register("post-to-ticketing", postTicketingMod);
 
     await runner.run(PLANNING_PIPELINE, ctx, new NoopStepReporter());
 
     expect(capturedAnalysisInputs.codebaseMap).toBe("## Codebase\n- src/: source files");
   });
 
-  it("flows analysisMarkdown and testPlanMarkdown into post-to-linear", async () => {
+  it("flows analysisMarkdown and testPlanMarkdown into post-to-ticketing", async () => {
     const ctx = makeContext();
     let capturedPostInputs: Record<string, unknown> = {};
-    postLinearMod = {
+    postTicketingMod = {
       run: vi.fn(async (_ctx, inputs) => {
         capturedPostInputs = inputs;
         return { commentCount: 3 };
@@ -173,7 +174,7 @@ describe("planning pipeline execution", () => {
       .register("test-plan", testPlanMod)
       .register("work-unit-decomposition", workUnitsMod)
       .register("cross-story-context", crossStoryMod)
-      .register("post-to-linear", postLinearMod);
+      .register("post-to-ticketing", postTicketingMod);
 
     await runner.run(PLANNING_PIPELINE, ctx, new NoopStepReporter());
 
@@ -185,7 +186,7 @@ describe("planning pipeline execution", () => {
   it("passes empty string for crossStoryMarkdown when step is skipped", async () => {
     const ctx = makeContext();
     let capturedPostInputs: Record<string, unknown> = {};
-    postLinearMod = {
+    postTicketingMod = {
       run: vi.fn(async (_ctx, inputs) => {
         capturedPostInputs = inputs;
         return { commentCount: 3 };
@@ -198,7 +199,7 @@ describe("planning pipeline execution", () => {
       .register("test-plan", testPlanMod)
       .register("work-unit-decomposition", workUnitsMod)
       .register("cross-story-context", crossStoryMod)
-      .register("post-to-linear", postLinearMod);
+      .register("post-to-ticketing", postTicketingMod);
 
     await runner.run(PLANNING_PIPELINE, ctx, new NoopStepReporter());
 

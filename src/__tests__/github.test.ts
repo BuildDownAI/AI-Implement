@@ -18,6 +18,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     autoApprovePlans: true,
     extraEnv: {},
     provider: "anthropic",
+    ticketingProvider: "linear",
     awsRegion: null,
     ...overrides,
   };

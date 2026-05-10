@@ -109,7 +109,7 @@ export const issuesScript = `
   async function loadIssues() {
     const errorEl = document.getElementById('issues-error');
     errorEl.hidden = true;
-    const res = await window.api('/api/linear/issues');
+    const res = await window.api('/api/issues');
     if (!res.ok) {
       let errorMsg = 'Unknown error';
       try {

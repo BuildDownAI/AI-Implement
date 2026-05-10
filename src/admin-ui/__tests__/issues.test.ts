@@ -13,8 +13,8 @@ describe("issues page", () => {
     expect(issuesScript).toContain("window.loadIssues = loadIssues");
   });
 
-  it("calls /api/linear/issues", () => {
-    expect(issuesScript).toContain("/api/linear/issues");
+  it("calls /api/issues", () => {
+    expect(issuesScript).toContain("/api/issues");
   });
 
   it("uses window.api/window.esc only", () => {

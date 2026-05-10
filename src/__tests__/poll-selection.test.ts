@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { selectIssuesToDispatch, selectBlockers } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
-import type { LinearIssue } from "../linear.js";
+import type { TicketIssue } from "../providers/types.js";
 
-function makeIssue(id: string, identifier: string, teamKey: string): LinearIssue {
+function makeIssue(id: string, identifier: string, teamKey: string): TicketIssue {
   return {
     id,
     identifier,
     title: identifier,
     description: null,
-    team: { id: `${teamKey}-id`, key: teamKey },
-    state: { id: `${id}-state`, name: "Todo", type: "unstarted" },
+    scopeKey: teamKey,
+    nativeStatus: "Todo (unstarted)",
   };
 }
 
@@ -27,6 +27,11 @@ function makeMapping(maxInProgressAiIssues = 3): RepoMapping {
     machineMemoryMb: 4096,
     planningEnabled: false,
     planningWorkflowFile: "",
+    autoApprovePlans: true,
+    extraEnv: {},
+    provider: "anthropic",
+    ticketingProvider: "linear",
+    awsRegion: null,
   };
 }
 

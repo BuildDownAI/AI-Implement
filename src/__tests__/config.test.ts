@@ -26,6 +26,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     autoApprovePlans: true,
     extraEnv: {},
     provider: "anthropic",
+    ticketingProvider: "linear",
     awsRegion: null,
     ...overrides,
   };
@@ -241,6 +242,57 @@ describe("config", () => {
     const m = config.getMappings().PRE;
     expect(m.provider).toBe("anthropic");
     expect(m.awsRegion).toBeNull();
+  });
+
+  it("adds ticketing_provider column with default 'linear' on upgrade", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        max_in_progress_ai_issues INTEGER NOT NULL DEFAULT 3,
+        execution_mode TEXT NOT NULL DEFAULT 'github-actions',
+        session_mode TEXT NOT NULL DEFAULT 'autonomous',
+        machine_cpus INTEGER NOT NULL DEFAULT 2,
+        machine_memory_mb INTEGER NOT NULL DEFAULT 4096,
+        planning_enabled INTEGER NOT NULL DEFAULT 0,
+        planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
+        auto_approve_plans INTEGER NOT NULL DEFAULT 1,
+        extra_env TEXT,
+        provider TEXT NOT NULL DEFAULT 'anthropic',
+        aws_region TEXT
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy-repo", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    const m = config.getMappings().LEG;
+    expect(m.ticketingProvider).toBe("linear");
+
+    // Verify the column exists in the schema.
+    const reopened = new Database(dbPath);
+    const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
+    reopened.close();
+    expect(info.map((c) => c.name)).toContain("ticketing_provider");
+  });
+
+  it("round-trips a custom ticketingProvider", () => {
+    config.initMappingsTable();
+    config.upsertMapping("JIR", mapping({ owner: "org", repo: "repo", ticketingProvider: "jira" }));
+    const m = config.getMappings().JIR;
+    expect(m.ticketingProvider).toBe("jira");
+  });
+
+  it("defaults to ticketingProvider='linear' when not specified", () => {
+    config.initMappingsTable();
+    config.upsertMapping("LIN", mapping({ owner: "org", repo: "repo" }));
+    const m = config.getMappings().LIN;
+    expect(m.ticketingProvider).toBe("linear");
   });
 
   it("getMappings falls back to {} when extra_env contains invalid JSON", () => {

@@ -6,7 +6,7 @@ import { architectureAnalysisStep } from "./steps/architecture-analysis.js";
 import { testPlanStep } from "./steps/test-plan.js";
 import { workUnitDecompositionStep } from "./steps/work-unit-decomposition.js";
 import { crossStoryContextStep } from "./steps/cross-story-context.js";
-import { postToLinearStep } from "./steps/post-to-linear.js";
+import { postToTicketingStep } from "./steps/post-to-ticketing.js";
 
 function hasRelatedIssues(ctx: PipelineContext): boolean {
   const { parent, siblings, dependencies } = ctx.data;
@@ -16,11 +16,11 @@ function hasRelatedIssues(ctx: PipelineContext): boolean {
 
 /**
  * Planning pipeline: clone → explore-codebase → architecture-analysis → test-plan →
- * work-unit-decomposition → cross-story-context (conditional) → post-to-linear.
+ * work-unit-decomposition → cross-story-context (conditional) → post-to-ticketing.
  *
  * All Claude invocations run with read-only tool constraints (Read, Glob, Grep, Bash(curl *)).
  * cross-story-context is skipped when the issue has no parent, siblings, or dependencies.
- * Requires LINEAR_API_KEY env var for the post-to-linear step.
+ * Requires LINEAR_API_KEY env var for the post-to-ticketing step (when ticketingProvider="linear").
  */
 export const PLANNING_PIPELINE: PipelineDefinition = {
   id: "planning",
@@ -89,8 +89,8 @@ export const PLANNING_PIPELINE: PipelineDefinition = {
       skip: (ctx: PipelineContext) => !hasRelatedIssues(ctx),
     },
     {
-      id: "post-to-linear",
-      type: "post-to-linear",
+      id: "post-to-ticketing",
+      type: "post-to-ticketing",
       inputs: (ctx: PipelineContext) => ({
         analysisMarkdown: ctx.getOutputs("architecture-analysis").analysisMarkdown,
         testPlanMarkdown: ctx.getOutputs("test-plan").testPlanMarkdown,
@@ -110,5 +110,5 @@ export function createPlanningRunner(): PipelineRunner {
     .register("test-plan", testPlanStep)
     .register("work-unit-decomposition", workUnitDecompositionStep)
     .register("cross-story-context", crossStoryContextStep)
-    .register("post-to-linear", postToLinearStep);
+    .register("post-to-ticketing", postToTicketingStep);
 }

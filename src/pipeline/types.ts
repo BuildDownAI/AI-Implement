@@ -1,3 +1,5 @@
+import type { ProviderId } from "../providers/types.js";
+
 export type StepStatus = "running" | "passed" | "failed" | "skipped" | "cancelled";
 
 export type StepType =
@@ -13,7 +15,7 @@ export type StepType =
   | "test-plan"
   | "work-unit-decomposition"
   | "cross-story-context"
-  | "post-to-linear"
+  | "post-to-ticketing"
   | "custom";
 
 export interface Step {
@@ -36,6 +38,8 @@ export interface PipelineContextData {
   issueDescription: string;
   nonce: string;
   orchestratorUrl: string;
+  /** Ticketing provider for the runner to use when posting comments. */
+  ticketingProvider: ProviderId;
   /** Planning pipeline: parent issue as "- IDENTIFIER: Title" or "None" */
   parent?: string;
   /** Planning pipeline: sibling stories, newline-separated or "None" */
