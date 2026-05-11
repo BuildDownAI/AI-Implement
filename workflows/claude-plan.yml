@@ -314,7 +314,7 @@ jobs:
         with:
           use_bedrock: "true"
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'Bash(curl*api.linear.app/graphql*)'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 
@@ -327,7 +327,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'Bash(curl*api.linear.app/graphql*)'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 
@@ -340,7 +340,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'Bash(curl*api.linear.app/graphql*)'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 

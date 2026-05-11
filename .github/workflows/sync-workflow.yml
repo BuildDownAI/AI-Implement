@@ -20,12 +20,37 @@ on:
         description: 'Target repo as owner/name (e.g. acme-corp/api)'
         required: true
         type: string
+      bot_username:
+        description: 'GitHub App bot username for allowed_bots (e.g. ai-implement-acme-corp). Leave blank to allow any bot ("*").'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Stamp the operator's bot username into allowed_bots placeholders before
+      # the sync_file calls below read these files. Empty input falls back to
+      # "*" (allow any bot) to preserve single-tenant deployments that don't
+      # care to narrow the allow-list.
+      - name: Substitute __AI_IMPLEMENT_BOT_USERNAME__ in source templates
+        env:
+          BOT_USERNAME: ${{ inputs.bot_username }}
+        run: |
+          BOT_VALUE="${BOT_USERNAME:-*}"
+          echo "Stamping allowed_bots = $BOT_VALUE"
+          sed -i "s/__AI_IMPLEMENT_BOT_USERNAME__/${BOT_VALUE}/g" \
+            workflows/claude-plan.yml \
+            workflows/claude-implement.yml
+          # Sanity-check: fail fast if any placeholder slipped past
+          if grep -q "__AI_IMPLEMENT_BOT_USERNAME__" \
+               workflows/claude-plan.yml workflows/claude-implement.yml; then
+            echo "::error::__AI_IMPLEMENT_BOT_USERNAME__ placeholder still present after substitution"
+            exit 1
+          fi
 
       - name: Parse target repo
         id: target

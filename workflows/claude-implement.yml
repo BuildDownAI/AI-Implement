@@ -447,7 +447,7 @@ jobs:
           use_bedrock: "true"
           path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 100 --allowedTools 'Bash(*)' --allowedTools 'Write' --allowedTools 'Edit' --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'WebFetch' --allowedTools 'Agent'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 
@@ -458,7 +458,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 100 --allowedTools 'Bash(*)' --allowedTools 'Write' --allowedTools 'Edit' --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'WebFetch' --allowedTools 'Agent'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 
@@ -469,7 +469,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 100 --allowedTools 'Bash(*)' --allowedTools 'Write' --allowedTools 'Edit' --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'WebFetch' --allowedTools 'Agent'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 
@@ -595,7 +595,7 @@ jobs:
           use_bedrock: "true"
           path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.gap_analysis_model }} --max-turns 20 --allowedTools 'Bash(gh *)'"
           prompt: |
             You are doing a gap analysis on an AI-generated PR. Do NOT make any code changes. Complete this in exactly 4 tool calls — no exploring, no follow-up lookups.
@@ -648,7 +648,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.gap_analysis_model }} --max-turns 20 --allowedTools 'Bash(gh *)'"
           prompt: |
             You are doing a gap analysis on an AI-generated PR. Do NOT make any code changes. Complete this in exactly 4 tool calls — no exploring, no follow-up lookups.
@@ -701,7 +701,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           path_to_claude_code_executable: /home/runner/.local/bin/claude
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
+          allowed_bots: "__AI_IMPLEMENT_BOT_USERNAME__"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.gap_analysis_model }} --max-turns 20 --allowedTools 'Bash(gh *)'"
           prompt: |
             You are doing a gap analysis on an AI-generated PR. Do NOT make any code changes. Complete this in exactly 4 tool calls — no exploring, no follow-up lookups.
