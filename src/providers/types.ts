@@ -44,12 +44,22 @@ export interface TicketingProvider {
 
   // Communication
   postComment(issueId: string, body: string): Promise<void>;
+
+  /** Stable user-facing URL for the issue. */
+  issueUrl(issue: TicketIssue): string;
+
+  /** Look up an issue by its human-readable identifier (e.g. "ENG-123", "PROJ-456").
+   *  Returns null if not found. */
+  findByKey(key: string): Promise<TicketIssue | null>;
 }
 
 /** Configuration handed to provider factories. */
 export interface ProviderConfig {
   linearApiKey?: string;
-  // Phase 2 adds: jiraToken, jiraCloudId, jiraSiteUrl
+  linearWorkspaceUrl?: string;
+  jiraToken?: string;
+  jiraCloudId?: string;
+  jiraSiteUrl?: string;
 }
 
 /** Factory shape for provider modules (used by resolveProvider). */

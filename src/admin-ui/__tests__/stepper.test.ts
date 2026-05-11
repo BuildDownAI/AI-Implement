@@ -2,8 +2,31 @@ import { describe, expect, it } from "vitest";
 import { stepperHtml, stepperScript } from "../stepper.js";
 
 describe("new-project stepper", () => {
-  it("declares all six step blocks", () => {
-    for (let i = 0; i < 6; i++) expect(stepperHtml).toContain(`data-step="${i}"`);
+  it("declares all eight step blocks", () => {
+    for (let i = 0; i < 8; i++) expect(stepperHtml).toContain(`data-step="${i}"`);
+  });
+
+  it("splits Ticketing into a system-select step and a provider-specific config step", () => {
+    expect(stepperHtml).toContain('id="np-ticketing-provider"');
+    expect(stepperHtml).toContain('id="np-linear-config"');
+    expect(stepperHtml).toContain('id="np-jira-config"');
+    expect(stepperHtml).toContain('id="np-jira-jql"');
+    expect(stepperHtml).toContain('id="np-jira-repo-value"');
+  });
+
+  it("moves the Linear Team Key out of the Source step into the Ticketing Config step", () => {
+    // np-teamKey lives inside np-linear-config (data-step="1"), not data-step="2".
+    const linearCfgIdx = stepperHtml.indexOf('id="np-linear-config"');
+    const teamKeyIdx = stepperHtml.indexOf('id="np-teamKey"');
+    const ownerIdx = stepperHtml.indexOf('id="np-owner"');
+    expect(linearCfgIdx).toBeGreaterThan(-1);
+    expect(teamKeyIdx).toBeGreaterThan(linearCfgIdx);
+    expect(teamKeyIdx).toBeLessThan(ownerIdx);
+  });
+
+  it("posts ticketingProvider and ticketingConfig", () => {
+    expect(stepperScript).toContain("ticketingProvider:");
+    expect(stepperScript).toContain("ticketingConfig:");
   });
 
   it("declares the input ids the script reads", () => {

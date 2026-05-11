@@ -1,6 +1,7 @@
 import type {
   AIImplementSnapshot,
   IssueLifecycleState,
+  TicketIssue,
   TicketingProvider,
   ProviderConfig,
 } from "./types.js";
@@ -15,6 +16,7 @@ export class LinearProvider implements TicketingProvider {
   readonly id = "linear";
   private static readonly MOVABLE_STATE_TYPES = new Set(["triage", "backlog", "unstarted"]);
   private readonly apiKey: string;
+  private readonly workspaceUrl: string;
 
   // Caches keyed by team key (the scopeKey passed through the interface).
   private aiPlanningLabelCache = new Map<string, string>();
@@ -29,6 +31,40 @@ export class LinearProvider implements TicketingProvider {
       throw new MissingProviderConfigError("linear", "linearApiKey");
     }
     this.apiKey = config.linearApiKey;
+    this.workspaceUrl = config.linearWorkspaceUrl ?? "https://linear.app";
+  }
+
+  issueUrl(issue: TicketIssue): string {
+    return `${this.workspaceUrl}/issue/${issue.identifier}`;
+  }
+
+  async findByKey(key: string): Promise<TicketIssue | null> {
+    const match = /^([A-Z][A-Z0-9_]*)-(\d+)$/.exec(key);
+    if (!match) return null;
+    const [, teamKey, numberStr] = match;
+    const number = parseInt(numberStr, 10);
+    const data = await this.linearMutation<{ issues: { nodes: Array<{
+      id: string; identifier: string; title: string; description: string | null;
+      team: { key: string };
+      state: { name: string; type: string };
+    }> } }>(
+      `query($teamKey: String!, $number: Float!) {
+        issues(filter: { team: { key: { eq: $teamKey } }, number: { eq: $number } }, first: 1) {
+          nodes { id identifier title description team { key } state { name type } }
+        }
+      }`,
+      { teamKey, number },
+    );
+    const node = data.issues.nodes[0];
+    if (!node) return null;
+    return {
+      id: node.id,
+      identifier: node.identifier,
+      title: node.title,
+      description: node.description,
+      scopeKey: node.team.key,
+      nativeStatus: `${node.state.name} (${node.state.type})`,
+    };
   }
 
   private async linearMutation<T>(

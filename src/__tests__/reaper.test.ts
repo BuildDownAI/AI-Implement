@@ -2,6 +2,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { safeDestroyMachine, sweepOrphanedMachines, getLastSweepAt } from "../reaper.js";
 import type { ReaperConfig, ReaperHelpers } from "../reaper.js";
 import { FakeProvider } from "./providers/fake.js";
+import type { ProviderRegistry } from "../providers/registry.js";
+
+function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
+  return {
+    forMapping: async () => provider,
+    forAllMappings: async () => [provider],
+    invalidate: () => {},
+  } as unknown as ProviderRegistry;
+}
 
 vi.mock("../fly-machines.js", () => ({
   listMachines: vi.fn(),
@@ -35,7 +44,8 @@ function makeConfig(reaperDryRun: boolean, overrides?: Partial<ReaperConfig>): R
     flySessionsToken: TOKEN,
     flySessionsApp: APP,
     flyOrchestratorApp: "my-orchestrator",
-    provider: new FakeProvider(),
+    registry: makeFakeRegistry(new FakeProvider()),
+    getMappings: () => ({}),
     reaperDryRun,
     ...overrides,
   };

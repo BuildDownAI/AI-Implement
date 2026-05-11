@@ -11,6 +11,15 @@ import type * as LogModule from "../log.js";
 import type * as StepLogModule from "../step-log.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketIssue } from "../providers/types.js";
+import type { ProviderRegistry } from "../providers/registry.js";
+
+function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
+  return {
+    forMapping: async () => provider,
+    forAllMappings: async () => [provider],
+    invalidate: () => {},
+  } as unknown as ProviderRegistry;
+}
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -94,7 +103,7 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
 async function request(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
-  admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), provider);
+  admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -144,7 +153,7 @@ describe("admin auth", () => {
       linearApiKey: "test",
       githubAppId: "test",
       githubAppPrivateKey: "test",
-    }, provider);
+    }, makeFakeRegistry(provider));
     await res.done;
     expect(res.statusCode).toBe(200);
   });
@@ -412,6 +421,43 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toMatch(/bedrock.*fly-machines/);
   });
+
+  it("upsertMapping accepts a Jira ticketingProvider with valid config", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "JIRA1", owner: "org", repo: "jira-app",
+      ticketingProvider: "jira",
+      ticketingConfig: {
+        kind: "jira",
+        jql: "project = ACME",
+        repoFieldValue: "org/jira-app",
+      },
+    }, token);
+    expect(create.statusCode).toBe(200);
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(list.statusCode).toBe(200);
+    const entry = JSON.parse(list.body).JIRA1;
+    expect(entry).toBeDefined();
+    expect(entry.ticketingProvider).toBe("jira");
+    expect(entry.ticketingConfig).toEqual({
+      kind: "jira",
+      jql: "project = ACME",
+      repoFieldValue: "org/jira-app",
+      statusFieldOverride: null,
+      repoFieldOverride: null,
+    });
+  });
+
+  it("upsertMapping rejects Jira ticketingProvider with linear ticketingConfig", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad",
+      ticketingProvider: "jira",
+      ticketingConfig: { kind: "linear" },
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/kind/);
+  });
 });
 
 describe("admin runner-mode", () => {
@@ -491,7 +537,7 @@ describe("admin secrets", () => {
   async function requestFly(url: string, method: string, token: string, body?: unknown): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body !== undefined ? JSON.stringify(body) : undefined);
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, secretsConfig(), provider);
+    admin.handleAdminRequest(req as never, res as never, secretsConfig(), makeFakeRegistry(provider));
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
@@ -659,7 +705,7 @@ describe("admin secrets", () => {
 
     const req = new MockRequest("/api/mappings/ENG/secrets", "POST", { authorization: `Bearer ${token}` }, "not-json{{{");
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, secretsConfig(), provider);
+    admin.handleAdminRequest(req as never, res as never, secretsConfig(), makeFakeRegistry(provider));
     await res.done;
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("Invalid");
@@ -729,7 +775,7 @@ describe("admin settings", () => {
     for (const body of ["null", '"a string"', "42", "[]"]) {
       const req = new MockRequest("/api/settings", "POST", { authorization: `Bearer ${token}` }, body);
       const res = new MockResponse();
-      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), provider);
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
       await res.done;
       expect(res.statusCode).toBe(400);
     }
@@ -755,7 +801,7 @@ describe("admin global secrets", () => {
   async function requestFlyGlobal(url: string, method: string, token: string, body?: unknown): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body !== undefined ? JSON.stringify(body) : undefined);
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, globalSecretsConfig(), provider);
+    admin.handleAdminRequest(req as never, res as never, globalSecretsConfig(), makeFakeRegistry(provider));
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
@@ -879,7 +925,7 @@ describe("admin global secrets", () => {
     for (const body of ["null", '"a string"', "42", "[]"]) {
       const req = new MockRequest("/api/global-secrets", "POST", { authorization: `Bearer ${token}` }, body);
       const res = new MockResponse();
-      admin.handleAdminRequest(req as never, res as never, globalSecretsConfig(), provider);
+      admin.handleAdminRequest(req as never, res as never, globalSecretsConfig(), makeFakeRegistry(provider));
       await res.done;
       expect(res.statusCode).toBe(400);
     }

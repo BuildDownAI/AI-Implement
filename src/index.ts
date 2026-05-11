@@ -6,8 +6,8 @@ import {
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields } from "./github.js";
-import { resolveProvider, providerConfigFromEnv } from "./providers/index.js";
-import type { TicketingProvider } from "./providers/types.js";
+import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
+import type { TicketingProvider, IssueLifecycleState } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion } from "./notify.js";
@@ -116,7 +116,7 @@ let pollInProgress = false;
 
 type DispatchableIssue = TicketIssue;
 
-async function poll(config: AppConfig, provider: TicketingProvider): Promise<void> {
+async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   if (pollInProgress) {
     console.log(`[poll] Skipping poll cycle — previous poll still running`);
     return;
@@ -125,16 +125,36 @@ async function poll(config: AppConfig, provider: TicketingProvider): Promise<voi
   try {
   console.log(`[poll] Starting poll cycle #${++pollCount}`);
 
+  const allMappings = Object.values(getMappings());
+  const providers = await registry.forAllMappings(allMappings);
+
   // Reconcile dedup table: clear entries only for issues that are completed/cancelled/not found.
+  // Each provider only knows its own issues; we ask all providers and clear an
+  // entry only when no provider claims it as still-active.
   const dispatchedIds = getDispatchedIds();
-  if (dispatchedIds.length > 0) {
+  if (dispatchedIds.length > 0 && providers.length > 0) {
     try {
-      const stateMap = await provider.fetchLifecycleStates(dispatchedIds);
+      const allStateMaps = await Promise.all(
+        providers.map((p) => p.fetchLifecycleStates(dispatchedIds).catch((err) => {
+          console.error("[reconcile] Provider fetchLifecycleStates failed:", err);
+          return new Map<string, IssueLifecycleState>();
+        })),
+      );
       for (const id of dispatchedIds) {
-        const lifecycle = stateMap.get(id);
-        if (lifecycle === undefined || lifecycle === "completed" || lifecycle === "cancelled") {
+        let observedActive = false;
+        let observedTerminal = false;
+        for (const m of allStateMaps) {
+          const state = m.get(id);
+          if (state === undefined) continue;
+          if (state === "active") { observedActive = true; break; }
+          if (state === "completed" || state === "cancelled") observedTerminal = true;
+        }
+        if (observedActive) continue;
+        // Clear dedup if any provider reports terminal, or no provider knows about it.
+        if (observedTerminal || allStateMaps.every((m) => m.get(id) === undefined)) {
           deleteDispatched(id);
-          console.log(`[reconcile] Cleared dedup for ${id} (state: ${lifecycle ?? "not found"})`);
+          const reason = observedTerminal ? "terminal" : "not found";
+          console.log(`[reconcile] Cleared dedup for ${id} (state: ${reason})`);
         }
       }
     } catch (err) {
@@ -143,7 +163,18 @@ async function poll(config: AppConfig, provider: TicketingProvider): Promise<voi
   }
 
   try {
-    const { needsPlanning, readyForImplementation, inProgressCountsByScope } = await provider.fetchAIImplementSnapshot();
+    const snapshots = providers.length === 0
+      ? []
+      : await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
+
+    const needsPlanning = snapshots.flatMap((s) => s.needsPlanning);
+    const readyForImplementation = snapshots.flatMap((s) => s.readyForImplementation);
+    const inProgressCountsByScope = snapshots.reduce<Record<string, number>>((acc, s) => {
+      for (const [k, v] of Object.entries(s.inProgressCountsByScope)) {
+        acc[k] = (acc[k] ?? 0) + v;
+      }
+      return acc;
+    }, {});
     const inProgressCountsByTeam = inProgressCountsByScope;
     console.log(`[poll] Found ${needsPlanning.length} needing planning, ${readyForImplementation.length} ready for implementation`);
 
@@ -169,10 +200,11 @@ async function poll(config: AppConfig, provider: TicketingProvider): Promise<voi
     for (const issue of toProcess) {
       try {
         const mapping = teamRepoMap[issue.scopeKey]!;
+        const issueProvider = await registry.forMapping(mapping);
         const isPlanning = needsPlanningIds.has(issue.id) && mapping.planningEnabled;
 
         if (isPlanning) {
-          await dispatchPlanning(config, provider, issue, mapping);
+          await dispatchPlanning(config, issueProvider, issue, mapping);
         } else {
           const prior = countPriorDispatches(issue.id);
 
@@ -191,13 +223,13 @@ async function poll(config: AppConfig, provider: TicketingProvider): Promise<voi
           const { mode: runnerMode } = getRunnerMode();
           const execPath = resolveExecutionPath(runnerMode, mapping.executionMode);
           if (execPath === "both") {
-            // Shadow: GHA is primary (controls Linear state and dedup); Fly is secondary
-            await dispatchGitHubActions(config, provider, issue, mapping, prior, runnerMode);
-            await dispatchFlyMachine(config, provider, issue, mapping, prior, runnerMode, true);
+            // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, true);
           } else if (execPath === "fly-machines") {
-            await dispatchFlyMachine(config, provider, issue, mapping, prior, runnerMode);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode);
           } else {
-            await dispatchGitHubActions(config, provider, issue, mapping, prior, runnerMode);
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
           }
         }
       } catch (err) {
@@ -210,12 +242,18 @@ async function poll(config: AppConfig, provider: TicketingProvider): Promise<voi
   }
 
   // Monitor in-flight jobs and send completion notifications
-  await monitorJobs(config, provider);
+  await monitorJobs(config, registry);
 
   // Sweep for orphaned/stale/aged-out Fly machines
-  await sweepOrphanedMachines(reaperConfig(config, provider), {
-    resetTicket: (job) => resetTicket(provider, job),
-    postSessionLogs: (job, context) => postSessionLogs(config, provider, job, context),
+  await sweepOrphanedMachines(reaperConfig(config, registry), {
+    resetTicket: async (job) => {
+      const provider = await providerForJob(registry, job);
+      if (provider) await resetTicket(provider, job);
+    },
+    postSessionLogs: async (job, context) => {
+      const provider = await providerForJob(registry, job);
+      if (provider) await postSessionLogs(config, provider, job, context);
+    },
     findPrForIssue: (repo, issueIdentifier) => findPrForIssue(config, repo, issueIdentifier),
   });
 
@@ -324,7 +362,7 @@ async function dispatchPlanning(
     notify(config.notifyType, config.notifyWebhookUrl, {
       issueIdentifier: issue.identifier,
       issueTitle: issue.title,
-      issueUrl: `https://linear.app/issue/${issue.identifier}`,
+      issueUrl: provider.issueUrl(issue),
       repoFullName: `${mapping.owner}/${mapping.repo}`,
     }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
   }
@@ -492,7 +530,7 @@ async function postDispatch(
     notify(config.notifyType, config.notifyWebhookUrl, {
       issueIdentifier: issue.identifier,
       issueTitle: issue.title,
-      issueUrl: `https://linear.app/issue/${issue.identifier}`,
+      issueUrl: provider.issueUrl(issue),
       repoFullName: `${mapping.owner}/${mapping.repo}`,
     }).catch((err) => console.error(`[poll] Notification failed:`, err));
   }
@@ -572,7 +610,22 @@ async function postSessionLogs(
   }
 }
 
-async function monitorJobs(config: AppConfig, provider: TicketingProvider): Promise<void> {
+/**
+ * Resolve the TicketingProvider for a job using its teamKey to look up the
+ * mapping. Returns null if no mapping is found (orphaned job after a mapping
+ * was deleted).
+ */
+async function providerForJob(
+  registry: ProviderRegistry,
+  job: Job,
+): Promise<TicketingProvider | null> {
+  if (!job.teamKey) return null;
+  const mapping = getMappings()[job.teamKey];
+  if (!mapping) return null;
+  return registry.forMapping(mapping);
+}
+
+async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
   if (inFlightJobs.length === 0 && getUnnotifiedTerminalJobs().length === 0) return;
 
@@ -584,6 +637,11 @@ async function monitorJobs(config: AppConfig, provider: TicketingProvider): Prom
   for (const job of inFlightJobs) {
     try {
       if (job.executionMode === "fly-machines") {
+        const provider = await providerForJob(registry, job);
+        if (!provider) {
+          console.warn(`[monitor] No mapping for job ${job.id} (teamKey=${job.teamKey ?? "<none>"}); skipping`);
+          continue;
+        }
         await monitorFlyMachineJob(config, provider, job);
       } else {
         await monitorGitHubActionsJob(config, job, teamRepoMap, claimedRunIds);
@@ -594,7 +652,7 @@ async function monitorJobs(config: AppConfig, provider: TicketingProvider): Prom
   }
 
   // Send notifications for newly terminal jobs
-  await sendCompletionNotifications(config);
+  await sendCompletionNotifications(config, registry);
 }
 
 async function monitorGitHubActionsJob(
@@ -882,10 +940,11 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
 
 // ---------- Completion notifications ----------
 
-async function sendCompletionNotifications(config: AppConfig): Promise<void> {
+async function sendCompletionNotifications(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   if (!config.notifyWebhookUrl) return;
 
   const terminalJobs = getUnnotifiedTerminalJobs();
+  const mappings = getMappings();
   for (const job of terminalJobs) {
     try {
       const repoFullName = job.repo || "unknown";
@@ -902,10 +961,32 @@ async function sendCompletionNotifications(config: AppConfig): Promise<void> {
       const durationMs =
         job.completedAt != null ? job.completedAt - job.dispatchedAt : null;
 
+      // Resolve provider via the job's teamKey -> mapping so the URL matches
+      // the issue's ticketing system. Fall back to the legacy Linear URL if
+      // the mapping is gone (orphaned job).
+      const identifier = job.issueIdentifier || job.issueId;
+      let issueUrl = `https://linear.app/issue/${identifier}`;
+      const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
+      if (mapping) {
+        try {
+          const provider = await registry.forMapping(mapping);
+          issueUrl = provider.issueUrl({
+            id: job.issueId,
+            identifier,
+            title: job.issueTitle || "",
+            description: null,
+            scopeKey: job.teamKey ?? "",
+            nativeStatus: "",
+          });
+        } catch (err) {
+          console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
+        }
+      }
+
       await notifyCompletion(config.notifyType, config.notifyWebhookUrl, {
-        issueIdentifier: job.issueIdentifier || job.issueId,
+        issueIdentifier: identifier,
         issueTitle: job.issueTitle || "Unknown",
-        issueUrl: `https://linear.app/issue/${job.issueIdentifier || job.issueId}`,
+        issueUrl,
         repoFullName,
         status: job.status as "completed" | "failed" | "timed_out",
         conclusion: job.conclusion,
@@ -929,12 +1010,13 @@ async function sendCompletionNotifications(config: AppConfig): Promise<void> {
  * against the dispatch log.  Orphans and stale machines are destroyed
  * immediately; valid in-progress machines are left for the normal monitor.
  */
-function reaperConfig(config: AppConfig, provider: TicketingProvider) {
+function reaperConfig(config: AppConfig, registry: ProviderRegistry) {
   return {
     flySessionsToken: config.flySessionsToken,
     flySessionsApp: config.flySessionsApp,
     flyOrchestratorApp: config.flyOrchestratorApp,
-    provider,
+    registry,
+    getMappings,
     reaperDryRun: config.reaperDryRun,
     notifyType: config.notifyType,
     notifyWebhookUrl: config.notifyWebhookUrl,
@@ -942,7 +1024,7 @@ function reaperConfig(config: AppConfig, provider: TicketingProvider) {
   };
 }
 
-async function startupReconciliation(config: AppConfig, provider: TicketingProvider): Promise<void> {
+async function startupReconciliation(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   if (!config.flySessionsToken || !config.flySessionsApp) return;
 
   console.log("[startup] Running machine reconciliation...");
@@ -978,7 +1060,7 @@ async function startupReconciliation(config: AppConfig, provider: TicketingProvi
 
     if (!job) {
       // No dispatch log entry — orphan
-      await safeDestroyMachine(reaperConfig(config, provider), machine.id, "startup-orphan");
+      await safeDestroyMachine(reaperConfig(config, registry), machine.id, "startup-orphan");
       if (!config.reaperDryRun) destroyed++;
       continue;
     }
@@ -987,7 +1069,7 @@ async function startupReconciliation(config: AppConfig, provider: TicketingProvi
       job.status === "completed" || job.status === "failed" || job.status === "timed_out";
     if (isTerminal) {
       // Job is done but machine was left running (e.g. service crashed mid-cleanup)
-      await safeDestroyMachine(reaperConfig(config, provider), machine.id, "startup-stale-terminal");
+      await safeDestroyMachine(reaperConfig(config, registry), machine.id, "startup-stale-terminal");
       if (!config.reaperDryRun) {
         invalidateNonce(job.id);
         destroyed++;
@@ -1070,7 +1152,7 @@ async function processReconciliations(config: AppConfig): Promise<void> {
 
 // ---------- HTTP server ----------
 
-function startServer(config: AppConfig, provider: TicketingProvider): http.Server {
+function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
   const server = http.createServer((req, res) => {
     const url = req.url || "/";
 
@@ -1089,7 +1171,7 @@ function startServer(config: AppConfig, provider: TicketingProvider): http.Serve
 
     // Status events from session machines — no admin auth, nonce-validated
     if (url === "/api/status" && req.method === "POST") {
-      handleStatusUpdate(req, res, provider, config.flySessionsApp ?? undefined).catch((err) => {
+      handleStatusUpdate(req, res, registry, getMappings, config.flySessionsApp ?? undefined).catch((err) => {
         console.error("[session-api] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -1145,7 +1227,7 @@ function startServer(config: AppConfig, provider: TicketingProvider): http.Serve
         linearApiKey: config.linearApiKey,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-      }, provider)) return;
+      }, registry)) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -1174,15 +1256,11 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
-  // Phase 1: orchestrator polls/updates via a single Linear provider regardless
-  // of mapping.ticketingProvider. The post-to-ticketing pipeline step honors
-  // per-mapping ticketingProvider in the runner. This asymmetry is intentional
-  // for Phase 1 (Jira isn't a registered provider yet) and resolved in Phase 2,
-  // where this site becomes per-mapping resolution. If a mapping is upserted
-  // with ticketing_provider='jira' before Phase 2 ships, the orchestrator will
-  // still poll Linear for it (a no-op) while the runner would attempt Jira and
-  // fail at resolveProvider — which is the desired loud failure.
-  const provider = await resolveProvider("linear", providerConfigFromEnv());
+  // Phase 2: per-mapping provider resolution. The registry caches one
+  // TicketingProvider per provider id (linear, jira) and resolves on demand
+  // for each mapping. Snapshot polling iterates unique providers; verb calls
+  // (markPlanningStarted, markImplementing, …) resolve at the call site.
+  const registry = new ProviderRegistry(providerConfigFromEnv(), () => getMappings());
 
   const teamRepoMap = getMappings();
 
@@ -1210,17 +1288,17 @@ async function main(): Promise<void> {
     }
   }
 
-  const server = startServer(config, provider);
+  const server = startServer(config, registry);
 
   // Reconcile machines from any previous run before starting the poll loop
-  await startupReconciliation(config, provider);
+  await startupReconciliation(config, registry);
 
   // Run first poll immediately
-  await poll(config, provider);
+  await poll(config, registry);
 
   // Schedule subsequent polls
   const interval = setInterval(() => {
-    poll(config, provider);
+    poll(config, registry);
   }, config.pollIntervalMs);
 
   // Graceful shutdown

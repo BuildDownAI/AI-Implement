@@ -1,5 +1,9 @@
 import { getDb } from "./dedup.js";
 import type { ProviderId } from "./providers/types.js";
+import {
+  type TicketingMappingConfig,
+  validateTicketingConfig,
+} from "./providers/ticketing-config.js";
 
 export const DEFAULT_MAX_IN_PROGRESS_AI_ISSUES = 3;
 export const DEFAULT_EXECUTION_MODE = "github-actions" as const;
@@ -39,6 +43,8 @@ export interface RepoMapping {
   provider: ClaudeProvider;
   /** Ticketing provider this mapping uses (Linear or Jira). Default 'linear'. */
   ticketingProvider: ProviderId;
+  /** Per-mapping ticketing config (Linear is trivial; Jira carries jql, repoFieldValue, optional overrides). */
+  ticketingConfig: TicketingMappingConfig;
   /** AWS region for Bedrock. Required when provider='bedrock'. */
   awsRegion: string | null;
 }
@@ -94,6 +100,9 @@ function ensureMappingsColumns(): void {
   if (!names.has("ticketing_provider")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN ticketing_provider TEXT NOT NULL DEFAULT '${DEFAULT_TICKETING_PROVIDER}'`);
   }
+  if (!names.has("ticketing_config")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN ticketing_config TEXT NOT NULL DEFAULT '{"kind":"linear"}'`);
+  }
   if (!names.has("aws_region")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN aws_region TEXT`);
   }
@@ -119,6 +128,7 @@ export function initMappingsTable(): void {
       extra_env TEXT,
       provider TEXT NOT NULL DEFAULT '${DEFAULT_PROVIDER}',
       ticketing_provider TEXT NOT NULL DEFAULT '${DEFAULT_TICKETING_PROVIDER}',
+      ticketing_config TEXT NOT NULL DEFAULT '{"kind":"linear"}',
       aws_region TEXT
     )
   `);
@@ -128,10 +138,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, aws_region) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, m.awsRegion);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -140,7 +150,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, aws_region FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -159,11 +169,22 @@ export function getMappings(): Record<string, RepoMapping> {
       extra_env: string | null;
       provider: string | null;
       ticketing_provider: string | null;
+      ticketing_config: string;
       aws_region: string | null;
     }>;
 
   const result: Record<string, RepoMapping> = {};
   for (const row of rows) {
+    const providerId = (row.ticketing_provider as string) ?? DEFAULT_TICKETING_PROVIDER;
+    let ticketingConfig: TicketingMappingConfig;
+    try {
+      ticketingConfig = parseTicketingConfig(providerId, row.ticketing_config);
+    } catch (err) {
+      console.warn(
+        `[config] Dropping mapping team_key=${row.team_key} from getMappings(): bad ticketing_config (${(err as Error).message})`,
+      );
+      continue;
+    }
     result[row.team_key] = {
       owner: row.owner,
       repo: row.repo,
@@ -180,6 +201,7 @@ export function getMappings(): Record<string, RepoMapping> {
       extraEnv: (() => { try { return row.extra_env ? JSON.parse(row.extra_env) as Record<string, string> : {}; } catch { return {}; } })(),
       provider: (row.provider as ClaudeProvider) ?? DEFAULT_PROVIDER,
       ticketingProvider: (row.ticketing_provider as ProviderId) ?? DEFAULT_TICKETING_PROVIDER,
+      ticketingConfig,
       awsRegion: row.aws_region,
     };
   }
@@ -189,7 +211,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, aws_region) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -208,8 +230,16 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       Object.keys(mapping.extraEnv).length > 0 ? JSON.stringify(mapping.extraEnv) : null,
       mapping.provider,
       mapping.ticketingProvider,
+      JSON.stringify(mapping.ticketingConfig),
       mapping.awsRegion,
     );
+}
+
+function parseTicketingConfig(provider: string, raw: string): TicketingMappingConfig {
+  // Throws on malformed JSON or schema mismatch — getMappings() catches and
+  // drops the corrupted row rather than degrading to a mismatched config
+  // (e.g. {provider:"jira", config:{kind:"linear"}} would crash JiraProvider).
+  return validateTicketingConfig(provider, JSON.parse(raw));
 }
 
 export function updateMappingCap(teamKey: string, maxInProgressAiIssues: number): boolean {

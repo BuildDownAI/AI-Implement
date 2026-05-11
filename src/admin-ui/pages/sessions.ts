@@ -93,7 +93,7 @@ export const sessionsScript = `
   }
 
   async function destroySession(machineId) {
-    if (!confirm('Destroy machine ' + machineId + '? This will also reset the Linear issue.')) return;
+    if (!confirm('Destroy machine ' + machineId + '? This will also reset the ticket.')) return;
 
     destroyedMachineIds.set(machineId, Date.now());
 

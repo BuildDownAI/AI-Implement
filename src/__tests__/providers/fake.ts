@@ -123,6 +123,18 @@ export class FakeProvider implements TicketingProvider {
     this.appendComment(issueId, body);
   }
 
+  issueUrl(issue: TicketIssue): string {
+    return `https://fake/issue/${issue.identifier}`;
+  }
+
+  async findByKey(key: string): Promise<TicketIssue | null> {
+    await this.tick("findByKey", [key]);
+    for (const { issue } of this.issues.values()) {
+      if (issue.identifier === key) return issue;
+    }
+    return null;
+  }
+
   // ---- internals ----
   private appendComment(issueId: string, body: string): void {
     const arr = this.comments.get(issueId) ?? [];

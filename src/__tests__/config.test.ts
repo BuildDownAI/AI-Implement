@@ -27,6 +27,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     extraEnv: {},
     provider: "anthropic",
     ticketingProvider: "linear",
+    ticketingConfig: { kind: "linear" },
     awsRegion: null,
     ...overrides,
   };
@@ -283,7 +284,15 @@ describe("config", () => {
 
   it("round-trips a custom ticketingProvider", () => {
     config.initMappingsTable();
-    config.upsertMapping("JIR", mapping({ owner: "org", repo: "repo", ticketingProvider: "jira" }));
+    config.upsertMapping(
+      "JIR",
+      mapping({
+        owner: "org",
+        repo: "repo",
+        ticketingProvider: "jira",
+        ticketingConfig: { kind: "jira", jql: "project = T", repoFieldValue: "org/repo" },
+      }),
+    );
     const m = config.getMappings().JIR;
     expect(m.ticketingProvider).toBe("jira");
   });
@@ -293,6 +302,115 @@ describe("config", () => {
     config.upsertMapping("LIN", mapping({ owner: "org", repo: "repo" }));
     const m = config.getMappings().LIN;
     expect(m.ticketingProvider).toBe("linear");
+  });
+
+  describe("mappings ticketing_config migration", () => {
+    it("adds ticketing_config column with linear default on upgrade", () => {
+      const db = new Database(dbPath);
+      db.exec(`
+        CREATE TABLE mappings (
+          team_key TEXT PRIMARY KEY,
+          owner TEXT NOT NULL,
+          repo TEXT NOT NULL,
+          workflow_file TEXT NOT NULL,
+          default_branch TEXT NOT NULL,
+          max_in_progress_ai_issues INTEGER NOT NULL DEFAULT 3,
+          execution_mode TEXT NOT NULL DEFAULT 'github-actions',
+          session_mode TEXT NOT NULL DEFAULT 'autonomous',
+          machine_cpus INTEGER NOT NULL DEFAULT 2,
+          machine_memory_mb INTEGER NOT NULL DEFAULT 4096,
+          planning_enabled INTEGER NOT NULL DEFAULT 0,
+          planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
+          auto_approve_plans INTEGER NOT NULL DEFAULT 1,
+          extra_env TEXT,
+          provider TEXT NOT NULL DEFAULT 'anthropic',
+          ticketing_provider TEXT NOT NULL DEFAULT 'linear',
+          aws_region TEXT
+        )
+      `);
+      db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+        .run("LEG", "org", "legacy-repo", "claude-implement.yml", "main");
+      db.close();
+
+      config.initMappingsTable();
+      const m = config.getMappings().LEG;
+      expect(m.ticketingConfig).toEqual({ kind: "linear" });
+
+      // Verify the column exists in the schema.
+      const reopened = new Database(dbPath);
+      const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
+      reopened.close();
+      expect(info.map((c) => c.name)).toContain("ticketing_config");
+    });
+
+    it("round-trips a Jira ticketingConfig", () => {
+      config.initMappingsTable();
+      config.upsertMapping("JIR", mapping({
+        owner: "acme",
+        repo: "x",
+        ticketingProvider: "jira",
+        ticketingConfig: {
+          kind: "jira",
+          jql: "project = TEST",
+          repoFieldValue: "acme/x",
+          statusFieldOverride: "customfield_10001",
+          repoFieldOverride: "customfield_10002",
+        },
+      }));
+      const m = config.getMappings().JIR;
+      expect(m.ticketingProvider).toBe("jira");
+      expect(m.ticketingConfig).toEqual({
+        kind: "jira",
+        jql: "project = TEST",
+        repoFieldValue: "acme/x",
+        statusFieldOverride: "customfield_10001",
+        repoFieldOverride: "customfield_10002",
+      });
+    });
+
+    it("drops the mapping from getMappings on malformed JSON in the column", () => {
+      config.initMappingsTable();
+      config.upsertMapping("GOOD", mapping({ owner: "org", repo: "good" }));
+      config.upsertMapping("BAD", mapping({ owner: "org", repo: "repo" }));
+      // Direct SQL update to corrupt the JSON.
+      const db = new Database(dbPath);
+      db.prepare("UPDATE mappings SET ticketing_config = ? WHERE team_key = ?").run("{bad json", "BAD");
+      db.close();
+
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const all = config.getMappings();
+      expect(all.BAD).toBeUndefined();
+      expect(all.GOOD).toBeDefined();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("BAD"));
+      warn.mockRestore();
+    });
+
+    it("drops a jira-provider mapping with corrupted ticketing_config", () => {
+      config.initMappingsTable();
+      config.upsertMapping(
+        "JIR-BAD",
+        mapping({
+          owner: "org",
+          repo: "jira-repo",
+          ticketingProvider: "jira",
+          ticketingConfig: {
+            kind: "jira",
+            jql: "project = TEST",
+            repoFieldValue: "org/jira-repo",
+          },
+        }),
+      );
+      // Corrupt JSON for the jira row.
+      const db = new Database(dbPath);
+      db.prepare("UPDATE mappings SET ticketing_config = ? WHERE team_key = ?").run("{not valid", "JIR-BAD");
+      db.close();
+
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const all = config.getMappings();
+      expect(all["JIR-BAD"]).toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("JIR-BAD"));
+      warn.mockRestore();
+    });
   });
 
   it("getMappings falls back to {} when extra_env contains invalid JSON", () => {

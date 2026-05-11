@@ -112,5 +112,22 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         expect(snap.inProgressCountsByScope.TEAM).toBe(2);
       });
     });
+
+    describe("issueUrl", () => {
+      it("returns a non-empty string", async () => {
+        const a = sampleIssue({ id: "a" });
+        const provider = await factory({ initialIssues: [a] });
+        const url = provider.issueUrl(a);
+        expect(typeof url).toBe("string");
+        expect(url.length).toBeGreaterThan(0);
+      });
+    });
+
+    describe("findByKey", () => {
+      it("returns null for an unknown identifier", async () => {
+        const provider = await factory({ initialIssues: [] });
+        expect(await provider.findByKey("UNKNOWN-99999")).toBeNull();
+      });
+    });
   });
 }

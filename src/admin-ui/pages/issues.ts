@@ -22,7 +22,7 @@ export const issuesHtml = `
           <thead><tr><th>Issue</th><th>Team</th><th>State</th><th>Plan</th><th></th></tr></thead>
           <tbody id="issues-body"></tbody>
         </table>
-        <div id="issues-empty" class="hidden text-tertiary" style="padding:12px">No AI-Implement labeled issues found in Linear.</div>
+        <div id="issues-empty" class="hidden text-tertiary" style="padding:12px">No AI-Implement issues found across configured mappings.</div>
       </div>
     </div>
 
@@ -116,7 +116,7 @@ export const issuesScript = `
         const errBody = await res.json();
         errorMsg = errBody.error || errorMsg;
       } catch (_) { /* ignore parse errors */ }
-      errorEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load Linear issues</div><div class="alert-desc">' + window.esc(errorMsg) + '</div></div>';
+      errorEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load issues</div><div class="alert-desc">' + window.esc(errorMsg) + '</div></div>';
       errorEl.hidden = false;
       document.getElementById('issues-body').innerHTML = '';
       document.getElementById('issues-progress-body').innerHTML = '';

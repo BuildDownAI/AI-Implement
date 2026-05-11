@@ -2,7 +2,8 @@ import http from "node:http";
 import { getJobByNonce } from "./log.js";
 import { postStatusComment } from "./status-events.js";
 import type { StatusEvent } from "./status-events.js";
-import type { TicketingProvider } from "./providers/types.js";
+import type { ProviderRegistry } from "./providers/registry.js";
+import type { RepoMapping } from "./config.js";
 import { upsertStepRecord } from "./step-log.js";
 import type { Step } from "./pipeline/types.js";
 
@@ -89,7 +90,8 @@ export async function handleStepReport(
 export async function handleStatusUpdate(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  provider: TicketingProvider,
+  registry: ProviderRegistry,
+  getMappings: () => Record<string, RepoMapping>,
   flyAppName?: string,
 ): Promise<void> {
   try {
@@ -147,6 +149,17 @@ export async function handleStatusUpdate(
       statusEvent = { type: "error", reason };
     }
 
+    const mapping = job.teamKey ? getMappings()[job.teamKey] : undefined;
+    if (!mapping) {
+      console.warn(
+        `[session-api] Cannot route status event: no mapping found for teamKey=${job.teamKey ?? "<none>"} (job ${job.id})`,
+      );
+      // Fail silently to the runner — the status comment is best-effort and
+      // returning an error here would just spam its retry loop.
+      json(res, 200, { ok: true });
+      return;
+    }
+    const provider = await registry.forMapping(mapping);
     await postStatusComment(provider, job.issueId, statusEvent, machineLogsUrl);
     json(res, 200, { ok: true });
   } catch (err) {

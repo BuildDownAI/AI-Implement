@@ -516,3 +516,72 @@ describe("LinearProvider.markImplementationFailed", () => {
     expect(body.variables.body).toContain("Implementation failed: tests timed out");
   });
 });
+
+describe("LinearProvider.issueUrl", () => {
+  it("uses linearWorkspaceUrl when provided", () => {
+    const p = new LinearProvider({ linearApiKey: "k", linearWorkspaceUrl: "https://linear.app/acme" });
+    expect(p.issueUrl({
+      id: "u", identifier: "ENG-1", title: "t", description: null, scopeKey: "ENG", nativeStatus: "",
+    })).toBe("https://linear.app/acme/issue/ENG-1");
+  });
+
+  it("falls back to https://linear.app when workspace URL is unset", () => {
+    const p = new LinearProvider({ linearApiKey: "k" });
+    expect(p.issueUrl({
+      id: "u", identifier: "ENG-1", title: "t", description: null, scopeKey: "ENG", nativeStatus: "",
+    })).toBe("https://linear.app/issue/ENG-1");
+  });
+});
+
+describe("LinearProvider.findByKey", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("returns null for malformed identifiers", async () => {
+    const p = new LinearProvider({ linearApiKey: "k" });
+    expect(await p.findByKey("not a key")).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("returns null when the GraphQL query yields no nodes", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: { issues: { nodes: [] } } }),
+    } as Response);
+    const p = new LinearProvider({ linearApiKey: "k" });
+    expect(await p.findByKey("ENG-999")).toBeNull();
+  });
+
+  it("bubbles non-404 errors from the Linear API", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      statusText: "Internal Server Error",
+      text: async () => "boom",
+    } as Response);
+    const p = new LinearProvider({ linearApiKey: "k" });
+    await expect(p.findByKey("ENG-1")).rejects.toThrow(/Linear API error/);
+  });
+
+  it("returns a TicketIssue when found", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: {
+          issues: {
+            nodes: [{
+              id: "issue-uuid", identifier: "ENG-1", title: "Hello", description: "World",
+              team: { key: "ENG" }, state: { name: "Todo", type: "unstarted" },
+            }],
+          },
+        },
+      }),
+    } as Response);
+    const p = new LinearProvider({ linearApiKey: "k" });
+    const issue = await p.findByKey("ENG-1");
+    expect(issue).toEqual({
+      id: "issue-uuid", identifier: "ENG-1", title: "Hello", description: "World",
+      scopeKey: "ENG", nativeStatus: "Todo (unstarted)",
+    });
+  });
+});
