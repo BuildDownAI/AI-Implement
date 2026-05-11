@@ -87,22 +87,26 @@ ${DEPENDENCIES}
 
 ## Instructions
 
-Use Read, Glob, and Grep to explore the codebase. Then post structured planning comments to Linear using `curl`. The `LINEAR_API_KEY` and `ISSUE_ID` environment variables are available.
+Use Read, Glob, and Grep to explore the codebase. Then write structured planning comments as separate Markdown files under `ai-output/comments/`, prefixed with a two-digit sequence number to control order.
 
-Use this pattern for each comment (replace `BODY` with the markdown content):
+Do NOT post comments directly to the ticketing system (Linear / Jira / etc.). The orchestrator handles posting after this workflow completes — it reads the `.md` files you write and posts each as a comment via the mapping's configured ticketing provider.
+
+Use this pattern:
 
 ```
-curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-  -H "Content-Type: application/json" \
-  -H "Authorization: $LINEAR_API_KEY" \
-  --data-raw "$(jq -n --arg id "$ISSUE_ID" --arg body "BODY" \
-    '{query: "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", variables: {id: $id, body: $body}}')"
+mkdir -p ai-output/comments
+cat > ai-output/comments/01-architecture-analysis.md <<'EOF'
+## 🏗️ AI Planning: Architecture Analysis
+
+(comment body here)
+EOF
 ```
 
-Post EXACTLY these comments in order:
+Write EXACTLY these comments, in this order (filenames matter — they sort lexicographically):
 
 ### Comment 1 — Architecture Analysis
 
+Filename: `ai-output/comments/01-architecture-analysis.md`
 Header must be exactly: `## 🏗️ AI Planning: Architecture Analysis`
 
 Required sections:
@@ -113,6 +117,7 @@ Required sections:
 
 ### Comment 2 — Test Plan
 
+Filename: `ai-output/comments/02-test-plan.md`
 Header must be exactly: `## 🧪 AI Planning: Test Plan`
 
 Required sections:
@@ -122,6 +127,7 @@ Required sections:
 
 ### Comment 3 — Work Units
 
+Filename: `ai-output/comments/03-work-units.md`
 Header must be exactly: `## 🔧 AI Planning: Work Units`
 
 Decompose the issue into work units that can be implemented by parallel subagents. Identify which pieces are independent (no dependencies on other units) and which are sequential.
@@ -143,8 +149,9 @@ Each work unit must specify: name, description, files it touches, and dependenci
 
 ### Comment 4 — Cross-Story Context (conditional)
 
-Only post this comment if `${PARENT}`, `${DEPENDENCIES}`, or `${SIBLINGS}` is not "None" AND there is meaningful coordination needed.
+Only write this file if `${PARENT}`, `${DEPENDENCIES}`, or `${SIBLINGS}` is not "None" AND there is meaningful coordination needed.
 
+Filename: `ai-output/comments/04-cross-story-context.md`
 Header must be exactly: `## 🔗 AI Planning: Cross-Story Context`
 
 Required sections:

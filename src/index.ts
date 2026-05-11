@@ -26,6 +26,11 @@ import { initReconciliationTable, getPendingReconciliations, updateReconciliatio
 import { resolveSessionImage } from "./repo-image.js";
 import { initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
+import { handleRunnerResult } from "./runner-callback.js";
+import type { RunnerResultBody } from "./runner-callback.js";
+import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { handleGapFillTrigger } from "./gap-fill-trigger.js";
+import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 
 // ---------- Configuration ----------
 
@@ -51,6 +56,9 @@ interface AppConfig {
   orchestratorUrl: string | null;
   reaperDryRun: boolean;
   reaperAlertThreshold: number;
+  runnerCallbackBaseUrl: string | null;
+  runnerTokenSecret: string | null;
+  gapFillTriggerSecret: string | null;
 }
 
 function loadConfig(): AppConfig {
@@ -75,6 +83,17 @@ function loadConfig(): AppConfig {
   const githubWebhookSecret = process.env.GITHUB_WEBHOOK_SECRET || null;
   if (!githubWebhookSecret) {
     console.warn("[main] GITHUB_WEBHOOK_SECRET not set — webhook endpoint will reject all requests");
+  }
+
+  const runnerCallbackBaseUrl = process.env.RUNNER_CALLBACK_BASE_URL || null;
+  const runnerTokenSecret = process.env.RUNNER_TOKEN_SECRET || null;
+  const gapFillTriggerSecret = process.env.GAP_FILL_TRIGGER_SECRET || null;
+
+  if (!runnerCallbackBaseUrl || !runnerTokenSecret) {
+    console.warn("[main] runner callback path disabled (RUNNER_CALLBACK_BASE_URL or RUNNER_TOKEN_SECRET not set)");
+  }
+  if (!gapFillTriggerSecret) {
+    console.warn("[main] /trigger/gap-fill endpoint disabled (GAP_FILL_TRIGGER_SECRET not set)");
   }
 
   return {
@@ -106,6 +125,9 @@ function loadConfig(): AppConfig {
     orchestratorUrl: process.env.ORCHESTRATOR_URL || null,
     reaperDryRun: process.env.REAPER_DRY_RUN === "true",
     reaperAlertThreshold: parseInt(process.env.REAPER_ALERT_THRESHOLD || "10", 10),
+    runnerCallbackBaseUrl,
+    runnerTokenSecret,
+    gapFillTriggerSecret,
   };
 }
 
@@ -276,12 +298,29 @@ async function dispatchGitHubActions(
   runnerMode: string,
 ): Promise<void> {
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+  let runnerCallbackUrl = "";
+  let runToken = "";
+  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+    const minted = mintRunToken({
+      issueId: issue.id,
+      mappingTeamKey: issue.scopeKey,
+      phase: "implementation",
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+      secret: config.runnerTokenSecret,
+    });
+    runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    runToken = minted.token;
+  }
+
   const result = await dispatchWorkflow(ghToken, mapping, {
     issue_id: issue.id,
     issue_identifier: issue.identifier,
     issue_title: issue.title,
     issue_description: issue.description || issue.title,
     ...providerDispatchFields(mapping),
+    runner_callback_url: runnerCallbackUrl,
+    run_token: runToken,
   });
 
   if (!result.success) {
@@ -335,12 +374,29 @@ async function dispatchPlanning(
 
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
+
+  let runnerCallbackUrl = "";
+  let runToken = "";
+  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+    const minted = mintRunToken({
+      issueId: issue.id,
+      mappingTeamKey: issue.scopeKey,
+      phase: "planning",
+      ttlSeconds: PLANNING_TTL_SECONDS,
+      secret: config.runnerTokenSecret,
+    });
+    runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    runToken = minted.token;
+  }
+
   const result = await dispatchWorkflow(ghToken, planningMapping, {
     issue_id: issue.id,
     issue_identifier: issue.identifier,
     issue_title: issue.title,
     issue_description: issue.description || issue.title,
     ...providerDispatchFields(planningMapping),
+    runner_callback_url: runnerCallbackUrl,
+    run_token: runToken,
   });
 
   if (!result.success) {
@@ -1152,6 +1208,15 @@ async function processReconciliations(config: AppConfig): Promise<void> {
 
 // ---------- HTTP server ----------
 
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", reject);
+  });
+}
+
 function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
   const server = http.createServer((req, res) => {
     const url = req.url || "/";
@@ -1202,6 +1267,94 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
       }
       handleGitHubWebhook(req, res, config.githubWebhookSecret).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Runner result callback — HMAC bearer token authenticated
+    if (url === "/runner/result" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        let body: string;
+        try {
+          body = await readBody(req);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to read body" }));
+          return;
+        }
+        let parsed: RunnerResultBody;
+        try {
+          parsed = JSON.parse(body) as RunnerResultBody;
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleRunnerResult({
+          authorization: req.headers.authorization,
+          body: parsed,
+          secret: config.runnerTokenSecret,
+          resolveProvider: async (mappingTeamKey) => {
+            const mapping = getMappings()[mappingTeamKey];
+            if (!mapping) return null;
+            return await registry.forMapping(mapping);
+          },
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[runner-callback] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Gap-fill trigger from target-repo /ai-implement PR comment workflows
+    if (url === "/trigger/gap-fill" && req.method === "POST") {
+      (async () => {
+        let bodyText: string;
+        try {
+          bodyText = await readBody(req);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to read body" }));
+          return;
+        }
+        let parsed: GapFillTriggerBody;
+        try {
+          parsed = JSON.parse(bodyText) as GapFillTriggerBody;
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleGapFillTrigger({
+          authorization: req.headers.authorization,
+          body: parsed,
+          triggerSecret: config.gapFillTriggerSecret,
+          runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+          runnerTokenSecret: config.runnerTokenSecret,
+          getMappings: () => getMappings(),
+          resolveProvider: (mapping) => registry.forMapping(mapping),
+          getInstallationToken: (owner) =>
+            getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[trigger/gap-fill] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

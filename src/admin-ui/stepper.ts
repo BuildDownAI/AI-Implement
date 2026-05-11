@@ -826,11 +826,33 @@ export const stepperScript = `
     await stepperPopulateRepoValueOptions(fieldId);
   }
 
+  function detectStatusFilterInJql(jql, statusFieldOverride) {
+    // Returns a warning string if the JQL looks like it references the AI-Implement Status
+    // field. The orchestrator wraps the user's JQL with its own status filter, so any
+    // status clause here will conflict with status transitions.
+    if (/ai[\\s\\-_]?implement[\\s\\-_]?status/i.test(jql)) {
+      return 'JQL appears to reference the AI-Implement Status field. ' +
+        'The orchestrator adds its own status filter at query time — including one in ' +
+        'your JQL will prevent the issue from being picked up after status transitions ' +
+        '(e.g. Plan Approved → Implementing won\\'t flow). Remove status filters from this JQL.';
+    }
+    if (statusFieldOverride) {
+      const idPattern = new RegExp('\\\\b' + statusFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
+      if (idPattern.test(jql)) {
+        return 'JQL appears to reference customfield ' + statusFieldOverride + ' (your status field). ' +
+          'The orchestrator adds its own status filter at query time — remove the status clause here.';
+      }
+    }
+    return null;
+  }
+
   async function stepperValidateJql() {
     const jqlEl = document.getElementById('np-jira-jql');
+    const statusFieldEl = document.getElementById('np-jira-status-field');
     const status = document.getElementById('np-jira-jql-status');
     if (!jqlEl || !status) return;
     const jql = jqlEl.value;
+    const statusFieldOverride = statusFieldEl ? statusFieldEl.value : '';
     status.textContent = 'Validating...';
     status.style.color = '';
     try {
@@ -847,8 +869,14 @@ export const stepperScript = `
         return;
       }
       await res.json();
-      status.textContent = 'Valid';
-      status.style.color = 'var(--st-ok-fg, #2a8)';
+      const warning = detectStatusFilterInJql(jql, statusFieldOverride);
+      if (warning) {
+        status.textContent = '⚠ Valid but: ' + warning;
+        status.style.color = 'var(--st-warn-fg, #c80)';
+      } else {
+        status.textContent = 'Valid';
+        status.style.color = 'var(--st-ok-fg, #2a8)';
+      }
     } catch (err) {
       status.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
       status.style.color = 'var(--st-fail-fg, #c33)';

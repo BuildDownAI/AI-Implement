@@ -23,6 +23,18 @@ name: AI Implement Comment Trigger
 on:
   issue_comment:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      runner_callback_url:
+        description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
+        required: false
+        type: string
+        default: ""
+      run_token:
+        description: "HMAC bearer token authorizing the result POST; empty skips callback"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   pull-requests: write
@@ -127,3 +139,38 @@ jobs:
           gh api repos/$REPO/issues/comments/$COMMENT_ID/reactions \
             --method POST \
             -f content='+1'
+
+      - name: Post results to orchestrator
+        if: always()
+        env:
+          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
+          RUN_TOKEN: ${{ inputs.run_token }}
+          JOB_STATUS: ${{ job.status }}
+        shell: /usr/bin/bash -e {0}
+        run: |
+          set -uo pipefail
+          if [ -z "${RUNNER_CALLBACK_URL:-}" ] || [ -z "${RUN_TOKEN:-}" ]; then
+            echo "Runner callback URL or token not provided; skipping result POST."
+            exit 0
+          fi
+
+          mkdir -p ai-output/comments
+          COMMENTS=$(jq -n '[]')
+          for f in $(ls ai-output/comments/*.md 2>/dev/null | sort); do
+            BODY=$(jq -Rs '.' < "$f")
+            COMMENTS=$(echo "$COMMENTS" | jq --argjson body "$BODY" '. + [{"body": $body}]')
+          done
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" \
+              '{phase: "gap-analysis", outcome: "success", comments: $comments}')
+          else
+            REASON=$(tail -c 4000 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "job failed")
+            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" --arg reason "$REASON" \
+              '{phase: "gap-analysis", outcome: "failure", failureReason: $reason, comments: $comments}')
+          fi
+
+          curl -fsS --max-time 30 -X POST "${RUNNER_CALLBACK_URL%/}/runner/result" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RUN_TOKEN" \
+            --data-raw "$PAYLOAD"

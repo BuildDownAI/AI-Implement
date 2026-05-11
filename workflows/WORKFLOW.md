@@ -123,8 +123,16 @@ Create a branch named `${ISSUE_IDENTIFIER}/short-description`, implement the
 feature described in the issue below, then open a pull request with:
 
 - **Title:** `${ISSUE_IDENTIFIER}: ${ISSUE_TITLE}`
-- **Body:** must include `Fixes ${ISSUE_IDENTIFIER}` so Linear automatically
-  closes the issue when the PR is merged.
+- **Body:** must include `Fixes ${ISSUE_IDENTIFIER}` so the ticketing system
+  automatically closes the issue when the PR is merged (Linear behaviour;
+  Jira ignores it harmlessly).
+
+After the PR is opened, write a brief implementation summary to
+`ai-output/comments/01-summary.md` (e.g. a paragraph describing what
+changed plus a checklist of what was tested). The orchestrator reads this
+file and posts it back to the ticketing issue via the configured provider.
+Do NOT post comments directly to Linear or Jira from this workflow —
+that pathway is handled by the orchestrator's runner-callback.
 
 ---
 
@@ -134,6 +142,10 @@ You are adding missing work to existing PR #${PR_NUMBER}.
 **Do NOT create a new branch or PR.** Commit your changes to the current
 branch and push. Review the gap analysis comment on the PR to understand
 what is still missing.
+
+After your changes are pushed, write a short note about what you addressed
+to `ai-output/comments/01-gap-fill-summary.md`. The orchestrator reads
+this file and posts it back to the ticketing issue.
 
 ---
 
