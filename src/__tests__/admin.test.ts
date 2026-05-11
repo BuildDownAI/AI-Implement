@@ -1187,3 +1187,39 @@ describe("admin pipelines-steps endpoint", () => {
     expect(Array.isArray(body.steps)).toBe(true);
   });
 });
+
+describe("classifyTemplate", () => {
+  it("flags a body that curls api.linear.app/graphql with LINEAR_API_KEY as stale", async () => {
+    const { classifyTemplate } = await import("../admin.js");
+    const stale = `
+      Post comments to Linear:
+      curl -X POST https://api.linear.app/graphql \\
+        -H "Authorization: $LINEAR_API_KEY" \\
+        --data-raw '{"query": "mutation { commentCreate(...) }"}'
+    `;
+    expect(classifyTemplate(stale)).toBe("stale");
+  });
+
+  it("flags a body with only api.linear.app/graphql but no LINEAR_API_KEY as current", async () => {
+    const { classifyTemplate } = await import("../admin.js");
+    // Mention of the URL alone (e.g. in a comment or doc) isn't enough.
+    const body = "// Background: this used to call api.linear.app/graphql before runner-callback.";
+    expect(classifyTemplate(body)).toBe("current");
+  });
+
+  it("flags a body with only LINEAR_API_KEY but no api.linear.app/graphql as current", async () => {
+    const { classifyTemplate } = await import("../admin.js");
+    // env var mentioned somewhere without a direct curl.
+    const body = "LINEAR_API_KEY is set on the runner for other reasons.";
+    expect(classifyTemplate(body)).toBe("current");
+  });
+
+  it("treats a body using the ai-output/comments convention as current", async () => {
+    const { classifyTemplate } = await import("../admin.js");
+    const body = `
+      Write planning comments to ai-output/comments/01-analysis.md.
+      Do NOT post to Linear directly.
+    `;
+    expect(classifyTemplate(body)).toBe("current");
+  });
+});

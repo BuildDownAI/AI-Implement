@@ -304,37 +304,64 @@ describe("/api/jira/field-options", () => {
 });
 
 describe("/api/admin/config-status", () => {
-  it("returns { linear: true, jira: false } when only LINEAR_API_KEY set", async () => {
-    process.env.LINEAR_API_KEY = "lk";
+  beforeEach(() => {
+    delete process.env.LINEAR_API_KEY;
     delete process.env.JIRA_TOKEN;
     delete process.env.JIRA_CLOUD_ID;
     delete process.env.JIRA_SITE_URL;
+    delete process.env.RUNNER_CALLBACK_BASE_URL;
+    delete process.env.RUNNER_TOKEN_SECRET;
+    delete process.env.GAP_FILL_TRIGGER_SECRET;
+  });
+
+  it("returns linear: true / jira: false when only LINEAR_API_KEY set", async () => {
+    process.env.LINEAR_API_KEY = "lk";
     const token = await login("secret");
     const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ linear: true, jira: false, jiraSiteUrl: null });
+    expect(JSON.parse(res.body)).toEqual({
+      linear: true, jira: false, jiraSiteUrl: null,
+      runnerCallback: false, gapFillTrigger: false,
+    });
   });
 
-  it("returns { linear: false, jira: true } when only Jira vars set", async () => {
-    delete process.env.LINEAR_API_KEY;
+  it("returns linear: false / jira: true when only Jira vars set", async () => {
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
     process.env.JIRA_SITE_URL = "https://x.atlassian.net";
     const token = await login("secret");
     const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ linear: false, jira: true, jiraSiteUrl: "https://x.atlassian.net" });
+    expect(JSON.parse(res.body)).toEqual({
+      linear: false, jira: true, jiraSiteUrl: "https://x.atlassian.net",
+      runnerCallback: false, gapFillTrigger: false,
+    });
   });
 
-  it("returns { linear: true, jira: true } when all set", async () => {
+  it("returns everything ON when all env vars set", async () => {
     process.env.LINEAR_API_KEY = "lk";
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
     process.env.JIRA_SITE_URL = "https://x.atlassian.net";
+    process.env.RUNNER_CALLBACK_BASE_URL = "https://cb";
+    process.env.RUNNER_TOKEN_SECRET = "rsec";
+    process.env.GAP_FILL_TRIGGER_SECRET = "gsec";
     const token = await login("secret");
     const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ linear: true, jira: true, jiraSiteUrl: "https://x.atlassian.net" });
+    expect(JSON.parse(res.body)).toEqual({
+      linear: true, jira: true, jiraSiteUrl: "https://x.atlassian.net",
+      runnerCallback: true, gapFillTrigger: true,
+    });
+  });
+
+  it("runnerCallback is false if only one of the two env vars is set", async () => {
+    process.env.RUNNER_CALLBACK_BASE_URL = "https://cb";
+    // RUNNER_TOKEN_SECRET intentionally unset
+    const token = await login("secret");
+    const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).runnerCallback).toBe(false);
   });
 
   it("returns 401 without auth", async () => {

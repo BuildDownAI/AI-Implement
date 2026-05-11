@@ -140,4 +140,30 @@ describe("JiraClient", () => {
     const client = new JiraClient(config);
     await expect(client.searchJql("project = X", [])).rejects.toThrow(/500/);
   });
+
+  it("tolerates 204 on body-less endpoints (setField, addComment)", async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 204 });
+    const client = new JiraClient(config);
+    await expect(client.setField("ENG-1", "customfield_1", { value: "x" })).resolves.toBeUndefined();
+    await expect(client.addComment("ENG-1", { version: 1, type: "doc", content: [] })).resolves.toBeUndefined();
+  });
+
+  it("throws a clear error if a body-expecting endpoint returns 204", async () => {
+    // searchJql expects JSON; a 204 here would have crashed dereferencing res.issues.
+    fetchMock.mockResolvedValue({ ok: true, status: 204 });
+    const client = new JiraClient(config);
+    await expect(client.searchJql("project = X", [])).rejects.toThrow(/204 No Content/);
+  });
+
+  it("throws on 204 from getIssue", async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 204 });
+    const client = new JiraClient(config);
+    await expect(client.getIssue("ENG-1", ["summary"])).rejects.toThrow(/204 No Content/);
+  });
+
+  it("throws on 204 from listFields", async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 204 });
+    const client = new JiraClient(config);
+    await expect(client.listFields()).rejects.toThrow(/204 No Content/);
+  });
 });

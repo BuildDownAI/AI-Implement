@@ -48,7 +48,7 @@ export class JiraClient {
     this.authHeader = `Bearer ${config.token}`;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async rawRequest(method: string, path: string, body?: unknown): Promise<Response> {
     const res = await fetch(`${this.apiBase}${path}`, {
       method,
       headers: {
@@ -66,11 +66,28 @@ export class JiraClient {
         `Jira ${method} ${path} → ${res.status}: ${text.slice(0, 500)}`,
       );
     }
-    // Jira returns 204 No Content for some endpoints (e.g. PUT /issue/{key}
-    // via setField). Tolerate empty bodies — callers that don't read the
-    // result (setField, addComment) get undefined; callers that do read it
-    // are hitting endpoints that always return JSON.
-    if (res.status === 204) return undefined as T;
+    return res;
+  }
+
+  /** For endpoints whose response body the caller does NOT read. Tolerates 204. */
+  private async request(method: string, path: string, body?: unknown): Promise<void> {
+    await this.rawRequest(method, path, body);
+  }
+
+  /**
+   * For endpoints whose response body the caller WILL read. Throws on 204 with
+   * a clear error rather than returning undefined (which would crash on the next
+   * property access).
+   */
+  private async requestJson<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await this.rawRequest(method, path, body);
+    if (res.status === 204) {
+      throw new JiraApiError(
+        res.status,
+        "",
+        `Jira ${method} ${path} returned 204 No Content; expected JSON body`,
+      );
+    }
     return (await res.json()) as T;
   }
 
@@ -88,7 +105,7 @@ export class JiraClient {
     do {
       const body: Record<string, unknown> = { jql, fields, maxResults: PAGE_SIZE };
       if (nextPageToken !== undefined) body.nextPageToken = nextPageToken;
-      const res = await this.request<{ issues: JiraIssue[]; nextPageToken?: string }>(
+      const res = await this.requestJson<{ issues: JiraIssue[]; nextPageToken?: string }>(
         "POST", "/rest/api/3/search/jql", body,
       );
       all.push(...res.issues);
@@ -121,7 +138,7 @@ export class JiraClient {
 
   async getIssue(issueKey: string, fields: string[]): Promise<JiraIssue> {
     const params = new URLSearchParams({ fields: fields.join(",") });
-    return this.request<JiraIssue>(
+    return this.requestJson<JiraIssue>(
       "GET",
       `/rest/api/3/issue/${encodeURIComponent(issueKey)}?${params}`,
     );
@@ -134,7 +151,7 @@ export class JiraClient {
   }
 
   async listComments(issueKey: string): Promise<JiraComment[]> {
-    const data = await this.request<{ comments: JiraComment[] }>(
+    const data = await this.requestJson<{ comments: JiraComment[] }>(
       "GET",
       `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`,
     );
@@ -142,7 +159,7 @@ export class JiraClient {
   }
 
   async listFields(): Promise<JiraField[]> {
-    return this.request<JiraField[]>("GET", "/rest/api/3/field");
+    return this.requestJson<JiraField[]>("GET", "/rest/api/3/field");
   }
 
   /**
@@ -161,7 +178,7 @@ export class JiraClient {
 
     let contexts: Array<{ id: string }>;
     try {
-      const res = await this.request<{ values: Array<{ id: string }> }>(
+      const res = await this.requestJson<{ values: Array<{ id: string }> }>(
         "GET",
         `/rest/api/3/field/${id}/context`,
       );
@@ -176,7 +193,7 @@ export class JiraClient {
     const merged = new Map<string, { id: string; value: string }>();
     for (const ctx of contexts) {
       const ctxId = encodeURIComponent(ctx.id);
-      const optRes = await this.request<{ values: Array<{ id: string; value: string }> }>(
+      const optRes = await this.requestJson<{ values: Array<{ id: string; value: string }> }>(
         "GET",
         `/rest/api/3/field/${id}/context/${ctxId}/option`,
       );

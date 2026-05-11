@@ -33,6 +33,7 @@ import type { ProviderRegistry } from "./providers/registry.js";
 import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
+import { getInstallationToken } from "./github-app-auth.js";
 import { listCustomizations } from "./customizations.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
@@ -335,6 +336,20 @@ export function handleAdminRequest(
         linear: !!process.env.LINEAR_API_KEY,
         jira: !!(process.env.JIRA_TOKEN && process.env.JIRA_CLOUD_ID && process.env.JIRA_SITE_URL),
         jiraSiteUrl: process.env.JIRA_SITE_URL ?? null,
+        runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),
+        gapFillTrigger: !!process.env.GAP_FILL_TRIGGER_SECRET,
+      });
+      return true;
+    }
+
+    if (url === "/api/admin/template-status" && method === "GET") {
+      // Scan each target repo's in-repo PLANNING.md and WORKFLOW.md for the
+      // legacy "curl Linear directly" pattern. Flag repos that still have it —
+      // those need an operator to update their prompts so the runner-callback
+      // path can deliver comments via the orchestrator's provider abstraction.
+      handleTemplateStatus(res, config).catch((err) => {
+        console.error("[admin] template-status failed:", err);
+        if (!res.headersSent) json(res, 500, { error: "internal_error" });
       });
       return true;
     }
@@ -1094,4 +1109,91 @@ async function handleListJiraFieldOptions(
     }
     json(res, 500, { error: err instanceof Error ? err.message : String(err) });
   }
+}
+
+interface TemplateStatusEntry {
+  teamKey: string;
+  owner: string;
+  repo: string;
+  planning: "current" | "stale" | "missing" | "error";
+  implementation: "current" | "stale" | "missing" | "error";
+  error?: string;
+}
+
+/**
+ * Classify a target-repo template file as stale (uses the legacy "curl Linear
+ * directly" pattern) or current. The detection is intentionally loose:
+ *   stale  = file body references api.linear.app/graphql AND mentions LINEAR_API_KEY
+ *   current = otherwise (file exists; assume operator has migrated or customized)
+ *
+ * False positives on heavily-customized "current" files are acceptable —
+ * the goal is to flag operators who haven't touched the file since the
+ * pre-Phase-3 seed.
+ */
+export function classifyTemplate(body: string): "current" | "stale" {
+  const hasLinearCurl =
+    /api\.linear\.app\/graphql/.test(body) &&
+    /LINEAR_API_KEY/.test(body);
+  return hasLinearCurl ? "stale" : "current";
+}
+
+async function fetchRepoFile(
+  ghToken: string,
+  owner: string,
+  repo: string,
+  path: string,
+): Promise<string | null> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`,
+    {
+      headers: {
+        Accept: "application/vnd.github.raw+json",
+        Authorization: `Bearer ${ghToken}`,
+        "User-Agent": "ai-implement-orchestrator",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return await res.text();
+}
+
+async function handleTemplateStatus(
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  const mappings = getMappings();
+  const entries = Object.entries(mappings);
+  const results: TemplateStatusEntry[] = await Promise.all(
+    entries.map(async ([teamKey, mapping]) => {
+      const base: TemplateStatusEntry = {
+        teamKey,
+        owner: mapping.owner,
+        repo: mapping.repo,
+        planning: "error",
+        implementation: "error",
+      };
+      try {
+        const ghToken = await getInstallationToken(
+          config.githubAppId,
+          config.githubAppPrivateKey,
+          mapping.owner,
+        );
+        const [planningBody, implBody] = await Promise.all([
+          fetchRepoFile(ghToken, mapping.owner, mapping.repo, "PLANNING.md"),
+          fetchRepoFile(ghToken, mapping.owner, mapping.repo, "WORKFLOW.md"),
+        ]);
+        base.planning = planningBody === null ? "missing" : classifyTemplate(planningBody);
+        base.implementation = implBody === null ? "missing" : classifyTemplate(implBody);
+      } catch (err) {
+        base.error = err instanceof Error ? err.message : String(err);
+      }
+      return base;
+    }),
+  );
+  json(res, 200, results);
 }
