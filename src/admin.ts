@@ -122,7 +122,7 @@ export interface AdminConfig {
   flySessionsToken: string | null;
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
-  linearApiKey: string;
+  linearApiKey: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
 }

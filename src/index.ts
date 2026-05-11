@@ -35,7 +35,7 @@ import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 // ---------- Configuration ----------
 
 interface AppConfig {
-  linearApiKey: string;
+  linearApiKey: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
   notifyWebhookUrl: string | null;
@@ -96,8 +96,13 @@ function loadConfig(): AppConfig {
     console.warn("[main] /trigger/gap-fill endpoint disabled (GAP_FILL_TRIGGER_SECRET not set)");
   }
 
+  const linearApiKey = process.env.LINEAR_API_KEY || null;
+  if (!linearApiKey) {
+    console.warn("[main] LINEAR_API_KEY not set — Linear mappings will be skipped (the ProviderRegistry tolerates missing per-provider env vars)");
+  }
+
   return {
-    linearApiKey: required("LINEAR_API_KEY"),
+    linearApiKey,
     githubAppId: required("GITHUB_APP_ID"),
     githubAppPrivateKey: required("GITHUB_APP_PRIVATE_KEY"),
     notifyWebhookUrl,
@@ -502,7 +507,7 @@ async function dispatchFlyMachine(
     owner: mapping.owner,
     repo: mapping.repo,
     defaultBranch: mapping.defaultBranch,
-    linearApiKey: config.linearApiKey,
+    linearApiKey: config.linearApiKey ?? undefined,
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     claudeOAuthToken: config.claudeOAuthToken ?? undefined,
     githubAppId: config.githubAppId,
