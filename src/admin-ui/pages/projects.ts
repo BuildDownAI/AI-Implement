@@ -16,7 +16,7 @@ export const projectsHtml = `
           <thead>
             <tr>
               <th>Team</th><th>Repo</th><th>Runner</th><th>Session</th>
-              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th></th>
+              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th>Status</th><th></th>
             </tr>
           </thead>
           <tbody id="mappings-body"></tbody>
@@ -62,6 +62,57 @@ export const projectsHtml = `
     </div>
     <input type="hidden" id="md-team-key-orig">
     <div class="md-body">
+      <fieldset>
+        <legend>Ticketing Provider</legend>
+        <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
+          <div class="md-field" style="margin-bottom:0;min-width:140px">
+            <label>Provider</label>
+            <select id="md-ticketing-provider" onchange="onTicketingProviderChange()">
+              <option value="linear">Linear</option>
+              <option value="jira">Jira</option>
+            </select>
+          </div>
+        </div>
+        <div id="md-jira-fields" class="hidden" style="margin-top:12px">
+          <div class="md-field">
+            <label>Mapping ID</label>
+            <input id="md-jira-mapping-id" placeholder="acme/billing">
+          </div>
+          <div class="md-field">
+            <label>JQL</label>
+            <textarea id="md-jira-jql" rows="3" placeholder="project = TEST"></textarea>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+              <button type="button" class="btn btn-ghost" onclick="validateJqlButton()">Validate</button>
+              <span id="md-jira-jql-status" class="text-tertiary" style="font-size:0.85em"></span>
+            </div>
+          </div>
+          <div class="md-field">
+            <label>Status Field</label>
+            <select id="md-jira-status-field">
+              <option value="">(auto-discover by name "AI-Implement Status")</option>
+            </select>
+            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
+              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Status&rdquo;. Otherwise pick the field that holds the workflow status (Ready, Planning, Implementing, etc.).
+            </div>
+          </div>
+          <div class="md-field">
+            <label>Repo Field</label>
+            <select id="md-jira-repo-field" onchange="onRepoFieldChange()">
+              <option value="">(auto-discover by name "AI-Implement Repo")</option>
+            </select>
+            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
+              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.
+            </div>
+          </div>
+          <div class="md-field">
+            <label>Repo Field Value</label>
+            <select id="md-jira-repo-value">
+              <option value="">Select a Repo Field first</option>
+            </select>
+            <input id="md-jira-repo-value-text" type="text" class="hidden" placeholder="owner/repo">
+          </div>
+        </div>
+      </fieldset>
       <div class="md-cols">
         <fieldset>
           <legend>Basic</legend>
@@ -112,7 +163,7 @@ export const projectsHtml = `
         </div>
       </fieldset>
       <fieldset>
-        <legend>Provider</legend>
+        <legend>Claude Provider</legend>
         <div style="display:flex;gap:20px;align-items:flex-end;flex-wrap:wrap">
           <div class="md-field" style="margin-bottom:0;min-width:140px">
             <label>Provider</label>
@@ -142,6 +193,8 @@ export const projectsScript = `
 (function () {
   let mappingsData = {};
   let currentSecretsTeam = null;
+  let pendingJiraRepoFieldValue = '';
+  let jiraFieldsLoaded = false;
 
   async function loadMappings() {
     const res = await window.api('/api/mappings');
@@ -167,6 +220,10 @@ export const projectsScript = `
       const providerBadge = m.provider === 'bedrock'
         ? '<span class="badge warn">bedrock</span>'
         : '<span class="text-tertiary" style="font-size:0.85em">anthropic</span>';
+      const statusBadge = m.paused
+        ? '<span class="badge warn">paused</span>'
+        : '<span class="badge success">active</span>';
+      const pauseLabel = m.paused ? 'Resume' : 'Pause';
       tr.innerHTML = '<td class="mono">' + ek + '</td>'
         + '<td class="mono">' + window.esc(m.owner) + '/' + window.esc(m.repo) + '</td>'
         + '<td>' + execBadge + '</td>'
@@ -174,7 +231,9 @@ export const projectsScript = `
         + '<td style="text-align:center">' + window.esc(String(m.maxInProgressAiIssues ?? 3)) + '</td>'
         + '<td>' + planBadge + '</td>'
         + '<td>' + providerBadge + '</td>'
+        + '<td>' + statusBadge + '</td>'
         + '<td style="white-space:nowrap">'
+          + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
           + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
           + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
           + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
@@ -208,9 +267,36 @@ export const projectsScript = `
     document.getElementById('md-provider').value = m.provider || 'anthropic';
     document.getElementById('md-aws-region').value = m.awsRegion || '';
 
+    // Ticketing provider + Jira config
+    const tp = m.ticketingProvider || 'linear';
+    document.getElementById('md-ticketing-provider').value = tp;
+    const tc = (m.ticketingConfig && typeof m.ticketingConfig === 'object') ? m.ticketingConfig : {};
+    document.getElementById('md-jira-mapping-id').value = (tp === 'jira' && tc.kind === 'jira') ? (key || '') : '';
+    document.getElementById('md-jira-jql').value = (tp === 'jira' && tc.kind === 'jira' && tc.jql) ? tc.jql : '';
+    const pendingStatus = (tp === 'jira' && tc.statusFieldOverride) ? tc.statusFieldOverride : '';
+    const pendingRepoFld = (tp === 'jira' && tc.repoFieldOverride) ? tc.repoFieldOverride : '';
+    const statusFldEl = document.getElementById('md-jira-status-field');
+    const repoFldEl = document.getElementById('md-jira-repo-field');
+    statusFldEl.dataset.pendingValue = pendingStatus;
+    repoFldEl.dataset.pendingValue = pendingRepoFld;
+    statusFldEl.value = pendingStatus;
+    repoFldEl.value = pendingRepoFld;
+    // Repo field value: stash for after the dropdown loads
+    const pendingRepoVal = (tp === 'jira' && tc.kind === 'jira' && tc.repoFieldValue) ? tc.repoFieldValue : '';
+    const sel = document.getElementById('md-jira-repo-value');
+    const txt = document.getElementById('md-jira-repo-value-text');
+    sel.innerHTML = '<option value="">Select a Repo Field first</option>';
+    sel.value = '';
+    txt.value = pendingRepoVal;
+    sel.classList.toggle('hidden', tp === 'jira' && !!pendingRepoVal);
+    txt.classList.toggle('hidden', !(tp === 'jira' && !!pendingRepoVal));
+    document.getElementById('md-jira-jql-status').textContent = '';
+    pendingJiraRepoFieldValue = pendingRepoVal;
+
     onExecModeChange();
     onProviderChange();
     onPlanningChange();
+    onTicketingProviderChange();
 
     document.getElementById('mapping-dialog').showModal();
   }
@@ -239,6 +325,213 @@ export const projectsScript = `
   }
   window.onPlanningChange = onPlanningChange;
 
+  function onTicketingProviderChange() {
+    const provider = document.getElementById('md-ticketing-provider').value;
+    const jiraFields = document.getElementById('md-jira-fields');
+    if (provider === 'jira') {
+      jiraFields.classList.remove('hidden');
+      loadJiraFields();
+      preloadRepoFieldOptions();
+    } else {
+      jiraFields.classList.add('hidden');
+    }
+  }
+  window.onTicketingProviderChange = onTicketingProviderChange;
+
+  async function loadJiraFields() {
+    const statusSel = document.getElementById('md-jira-status-field');
+    const repoSel = document.getElementById('md-jira-repo-field');
+    if (jiraFieldsLoaded) return;
+    try {
+      const res = await window.api('/api/jira/fields');
+      if (!res.ok) return;
+      const fields = await res.json();
+      fields.sort(function (a, b) {
+        return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+      });
+      const prevStatus = statusSel ? (statusSel.value || statusSel.dataset.pendingValue || '') : '';
+      const prevRepo = repoSel ? (repoSel.value || repoSel.dataset.pendingValue || '') : '';
+      const statusPlaceholder = statusSel && statusSel.options[0] ? statusSel.options[0] : null;
+      const repoPlaceholder = repoSel && repoSel.options[0] ? repoSel.options[0] : null;
+      if (statusSel) statusSel.innerHTML = '';
+      if (repoSel) repoSel.innerHTML = '';
+      if (statusSel && statusPlaceholder) statusSel.appendChild(statusPlaceholder);
+      if (repoSel && repoPlaceholder) repoSel.appendChild(repoPlaceholder);
+      for (const f of fields) {
+        const labelText = f.name + ' (' + f.id + ')';
+        if (statusSel) {
+          const o1 = document.createElement('option');
+          o1.value = f.id;
+          o1.textContent = labelText;
+          statusSel.appendChild(o1);
+        }
+        if (repoSel) {
+          const o2 = document.createElement('option');
+          o2.value = f.id;
+          o2.textContent = labelText;
+          repoSel.appendChild(o2);
+        }
+      }
+      // Restore previously set values (e.g. from openMappingDialog before fields loaded)
+      if (statusSel && prevStatus) statusSel.value = prevStatus;
+      if (repoSel && prevRepo) repoSel.value = prevRepo;
+      jiraFieldsLoaded = true;
+    } catch (err) {
+      console.error('loadJiraFields failed:', err);
+    }
+  }
+
+  async function preloadRepoFieldOptions() {
+    const repoFieldInput = document.getElementById('md-jira-repo-field');
+    if (repoFieldInput.value) {
+      // explicit override — let onRepoFieldChange handle population
+      onRepoFieldChange();
+      return;
+    }
+    try {
+      const res = await window.api('/api/jira/fields?name=' + encodeURIComponent('AI-Implement Repo'));
+      if (!res.ok) return;
+      const fields = await res.json();
+      if (Array.isArray(fields) && fields.length === 1) {
+        await populateRepoValueOptions(fields[0].id);
+      }
+    } catch (err) {
+      console.error('preloadRepoFieldOptions failed:', err);
+    }
+  }
+
+  async function populateRepoValueOptions(fieldId) {
+    const select = document.getElementById('md-jira-repo-value');
+    const text = document.getElementById('md-jira-repo-value-text');
+    try {
+      const res = await window.api('/api/jira/field-options?fieldId=' + encodeURIComponent(fieldId));
+      if (!res.ok) throw new Error('fetch failed');
+      const options = await res.json();
+      if (!Array.isArray(options) || options.length === 0) {
+        // fall back to text input
+        select.classList.add('hidden');
+        text.classList.remove('hidden');
+        if (pendingJiraRepoFieldValue) text.value = pendingJiraRepoFieldValue;
+        return;
+      }
+      let html = '<option value="">(select)</option>';
+      for (const o of options) {
+        const v = window.esc(o.value);
+        html += '<option value="' + v + '">' + v + '</option>';
+      }
+      select.innerHTML = html;
+      select.classList.remove('hidden');
+      text.classList.add('hidden');
+      // Try to apply pending value
+      if (pendingJiraRepoFieldValue) {
+        const has = Array.from(select.options).some(function (o) { return o.value === pendingJiraRepoFieldValue; });
+        if (has) {
+          select.value = pendingJiraRepoFieldValue;
+        } else {
+          select.classList.add('hidden');
+          text.classList.remove('hidden');
+          text.value = pendingJiraRepoFieldValue;
+        }
+      }
+    } catch (err) {
+      console.error('populateRepoValueOptions failed:', err);
+      select.classList.add('hidden');
+      text.classList.remove('hidden');
+      if (pendingJiraRepoFieldValue) text.value = pendingJiraRepoFieldValue;
+    }
+  }
+
+  async function onRepoFieldChange() {
+    const fieldId = document.getElementById('md-jira-repo-field').value;
+    const select = document.getElementById('md-jira-repo-value');
+    const text = document.getElementById('md-jira-repo-value-text');
+    if (!fieldId) {
+      select.innerHTML = '<option value="">Select a Repo Field first</option>';
+      select.classList.remove('hidden');
+      text.classList.add('hidden');
+      return;
+    }
+    await populateRepoValueOptions(fieldId);
+  }
+  window.onRepoFieldChange = onRepoFieldChange;
+
+  function detectStatusFilterInJql(jql, statusFieldOverride) {
+    // Returns a warning string if the JQL looks like it references the AI-Implement Status
+    // field. The orchestrator wraps the user's JQL with its own status filter, so any
+    // status clause here will conflict with status transitions.
+    if (/ai[\\s\\-_]?implement[\\s\\-_]?status/i.test(jql)) {
+      return 'JQL appears to reference the AI-Implement Status field. ' +
+        'The orchestrator adds its own status filter at query time — including one in ' +
+        'your JQL will prevent the issue from being picked up after status transitions ' +
+        '(e.g. Plan Approved → Implementing won\\'t flow). Remove status filters from this JQL.';
+    }
+    if (statusFieldOverride) {
+      const idPattern = new RegExp('\\\\b' + statusFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
+      if (idPattern.test(jql)) {
+        return 'JQL appears to reference customfield ' + statusFieldOverride + ' (your status field). ' +
+          'The orchestrator adds its own status filter at query time — remove the status clause here.';
+      }
+    }
+    return null;
+  }
+
+  async function validateJqlButton() {
+    const jql = document.getElementById('md-jira-jql').value;
+    const statusFieldOverride = document.getElementById('md-jira-status-field').value;
+    const status = document.getElementById('md-jira-jql-status');
+    status.textContent = 'Validating...';
+    status.style.color = '';
+    try {
+      const res = await window.api('/api/jira/validate-jql', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jql: jql }),
+      });
+      if (!res.ok) {
+        let errMsg = 'unknown error';
+        try { const err = await res.json(); errMsg = err.error || errMsg; } catch (_) {}
+        status.textContent = 'Invalid: ' + errMsg;
+        status.style.color = 'var(--st-fail-fg)';
+        return;
+      }
+      await res.json();
+      const warning = detectStatusFilterInJql(jql, statusFieldOverride);
+      if (warning) {
+        status.textContent = '⚠ Valid but: ' + warning;
+        status.style.color = 'var(--st-warn-fg, #c80)';
+      } else {
+        status.textContent = 'Valid';
+        status.style.color = 'var(--st-ok-fg, #2a8)';
+      }
+    } catch (err) {
+      status.textContent = 'Error: ' + (err && err.message ? err.message : String(err));
+      status.style.color = 'var(--st-fail-fg)';
+    }
+  }
+  window.validateJqlButton = validateJqlButton;
+
+  async function applyConfigStatus() {
+    try {
+      const res = await window.api('/api/admin/config-status');
+      if (!res.ok) return;
+      const status = await res.json();
+      if (status.jiraSiteUrl) window.jiraSiteUrl = status.jiraSiteUrl;
+      const select = document.getElementById('md-ticketing-provider');
+      for (const opt of Array.from(select.options)) {
+        if (opt.value === 'linear' && !status.linear) {
+          opt.disabled = true;
+          opt.textContent = 'Linear (not configured)';
+        }
+        if (opt.value === 'jira' && !status.jira) {
+          opt.disabled = true;
+          opt.textContent = 'Jira (not configured)';
+        }
+      }
+    } catch (err) {
+      console.error('applyConfigStatus failed:', err);
+    }
+  }
+
   async function saveMappingDialog() {
     const errEl = document.getElementById('md-error');
     errEl.classList.add('hidden');
@@ -265,6 +558,26 @@ export const projectsScript = `
       provider: document.getElementById('md-provider').value,
       awsRegion: document.getElementById('md-aws-region').value.trim() || null,
     };
+
+    const ticketingProvider = document.getElementById('md-ticketing-provider').value;
+    body.ticketingProvider = ticketingProvider;
+    if (ticketingProvider === 'linear') {
+      body.ticketingConfig = { kind: 'linear' };
+    } else if (ticketingProvider === 'jira') {
+      const jql = document.getElementById('md-jira-jql').value;
+      const sel = document.getElementById('md-jira-repo-value');
+      const txt = document.getElementById('md-jira-repo-value-text');
+      const repoFieldValue = sel.classList.contains('hidden') ? txt.value.trim() : sel.value.trim();
+      const statusFieldOverride = document.getElementById('md-jira-status-field').value.trim() || null;
+      const repoFieldOverride = document.getElementById('md-jira-repo-field').value.trim() || null;
+      body.ticketingConfig = {
+        kind: 'jira',
+        jql: jql,
+        repoFieldValue: repoFieldValue,
+        statusFieldOverride: statusFieldOverride,
+        repoFieldOverride: repoFieldOverride,
+      };
+    }
 
     if (!body.teamKey || !body.owner || !body.repo) {
       errEl.textContent = 'Team Key, Owner, and Repo are required.';
@@ -314,6 +627,20 @@ export const projectsScript = `
     await loadMappings();
   }
   window.delMapping = delMapping;
+
+  async function togglePause(key, currentlyPaused) {
+    const nextPaused = !currentlyPaused;
+    const res = await window.api('/api/mappings/' + encodeURIComponent(key), {
+      method: 'PATCH',
+      body: JSON.stringify({ paused: nextPaused }),
+    });
+    if (!res.ok) {
+      alert('Failed to ' + (nextPaused ? 'pause' : 'resume') + ' project');
+      return;
+    }
+    await loadMappings();
+  }
+  window.togglePause = togglePause;
 
   async function showSecrets(teamKey) {
     currentSecretsTeam = teamKey;
@@ -428,6 +755,7 @@ export const projectsScript = `
     return Object.entries(env).map(([k, v]) => k + '=' + v).join('\\n');
   }
 
-  window.registerPage('projects', function () { loadMappings(); });
+  window.loadMappings = loadMappings;
+  window.registerPage('projects', function () { loadMappings(); applyConfigStatus(); });
 })();
 `;

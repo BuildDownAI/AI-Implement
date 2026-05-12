@@ -54,6 +54,7 @@ function makeContext(): DefaultPipelineContext {
     issueDescription: "Description",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
+    ticketingProvider: "linear",
   });
 }
 
@@ -319,6 +320,7 @@ describe("feedbackLoopStep", () => {
       issueDescription: "Description",
       nonce: "nonce",
       orchestratorUrl: "http://localhost:8080",
+      ticketingProvider: "linear",
       model: "claude-opus-4-7",
     });
 
@@ -341,6 +343,7 @@ describe("feedbackLoopStep", () => {
       issueDescription: "Description",
       nonce: "nonce",
       orchestratorUrl: "http://localhost:8080",
+      ticketingProvider: "linear",
       model: "claude-sonnet-4-6",
     });
 

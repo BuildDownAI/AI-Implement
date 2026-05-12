@@ -11,6 +11,10 @@ interface DispatchInputs {
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */
   aws_region?: string;
+  /** Public base URL the runner should POST results back to. Empty when callback disabled. */
+  runner_callback_url?: string;
+  /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
+  run_token?: string;
 }
 
 interface DispatchResult {

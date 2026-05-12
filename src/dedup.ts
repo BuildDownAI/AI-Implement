@@ -43,6 +43,29 @@ export function getDb(): Database.Database {
       )
     `);
     ensureDispatchedColumns();
+    // runner_tokens migration:
+    // The fork's pre-reset schema had columns provider_id + issue_json instead of
+    // mapping_team_key. If we detect that old shape (or any shape missing the
+    // mapping_team_key column), drop and recreate. Outstanding tokens are lost,
+    // but they're short-lived (30min–2hr) and one-time-use — acceptable on a
+    // schema migration boundary.
+    const runnerTokensInfo = db.prepare("PRAGMA table_info(runner_tokens)").all() as Array<{ name: string }>;
+    if (runnerTokensInfo.length > 0 && !runnerTokensInfo.some((c) => c.name === "mapping_team_key")) {
+      console.warn("[db] runner_tokens table is missing mapping_team_key column — dropping and recreating (outstanding tokens will be invalidated)");
+      db.exec("DROP TABLE runner_tokens");
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runner_tokens (
+        dispatch_id      TEXT PRIMARY KEY,
+        issue_id         TEXT NOT NULL,
+        phase            TEXT NOT NULL,
+        expires_at       INTEGER NOT NULL,
+        consumed_at      INTEGER,
+        mapping_team_key TEXT NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_runner_tokens_issue ON runner_tokens(issue_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_runner_tokens_expires ON runner_tokens(expires_at)`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS admin_sessions (
         token TEXT PRIMARY KEY,

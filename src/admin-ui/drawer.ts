@@ -130,7 +130,7 @@ export const drawerScript = `
 
   function renderTimeline(job) {
     const phases = [
-      { label: 'Queued', detail: 'queued in Linear' },
+      { label: 'Queued', detail: 'queued in ticketing system' },
       { label: 'Planning', detail: 'claude-plan.yml' },
       { label: 'Implementing', detail: job.executionMode ? window.esc(job.executionMode) + ' run' : 'implementation run' },
       { label: 'Review', detail: job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR' },
@@ -219,10 +219,18 @@ export const drawerScript = `
     const owner = mapping ? mapping.owner : null;
 
     if (job.issueIdentifier) {
-      fields.push({
-        label: 'Linear issue',
-        value: '<a class="text-accent" href="https://linear.app/issue/' + window.esc(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>'
-      });
+      const ticketingProvider = mapping ? mapping.ticketingProvider : 'linear';
+      const jiraSiteUrl = (window.jiraSiteUrl || '');
+      let valueHtml;
+      if (ticketingProvider === 'jira' && jiraSiteUrl) {
+        valueHtml = '<a class="text-accent" href="' + window.esc(jiraSiteUrl) + '/browse/' + window.esc(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
+      } else if (ticketingProvider === 'jira') {
+        // Jira but we don't know the site URL — show plain text.
+        valueHtml = window.esc(job.issueIdentifier);
+      } else {
+        valueHtml = '<a class="text-accent" href="https://linear.app/issue/' + window.esc(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
+      }
+      fields.push({ label: 'Issue', value: valueHtml });
     }
 
     if (job.repo) {

@@ -13,6 +13,7 @@ import {
   DEFAULT_PROVIDER,
   upsertMapping,
   updateMappingCap,
+  setMappingPaused,
   deleteMapping,
 } from "./config.js";
 import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider } from "./config.js";
@@ -28,14 +29,28 @@ import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
-import { removeAIWorkingLabel, fetchAIImplementIssueSnapshot, type LinearIssue } from "./linear.js";
+import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
+import type { ProviderRegistry } from "./providers/registry.js";
 import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
+import { getInstallationToken } from "./github-app-auth.js";
 import { listCustomizations } from "./customizations.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
+import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
+import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+let _adminJiraClient: JiraClient | null = null;
+function getAdminJiraClient(): JiraClient | null {
+  if (_adminJiraClient) return _adminJiraClient;
+  const token = process.env.JIRA_TOKEN;
+  const cloudId = process.env.JIRA_CLOUD_ID;
+  if (!token || !cloudId) return null;
+  _adminJiraClient = new JiraClient({ token, cloudId });
+  return _adminJiraClient;
+}
 
 function createSession(): string {
   const token = crypto.randomBytes(32).toString("hex");
@@ -72,16 +87,30 @@ function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.end(JSON.stringify(data));
 }
 
-function shapeIssue(i: LinearIssue, bucket: "ready" | "needs-planning") {
+function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
   return {
     id: i.id,
     identifier: i.identifier,
     title: i.title,
-    teamKey: i.team.key,
-    stateName: i.state.name,
-    stateType: i.state.type,
+    teamKey: i.scopeKey,
+    stateName: i.nativeStatus,
+    stateType: "",
     bucket,
   };
+}
+
+interface ValidatedTicketing {
+  ticketingProvider: "linear" | "jira";
+  ticketingConfig: TicketingMappingConfig;
+}
+
+function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketingConfig?: unknown }): ValidatedTicketing {
+  const provider = body.ticketingProvider ?? "linear";
+  if (provider !== "linear" && provider !== "jira") {
+    throw new Error(`Invalid ticketingProvider: expected "linear" or "jira", got ${JSON.stringify(provider)}`);
+  }
+  const config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
+  return { ticketingProvider: provider, ticketingConfig: config };
 }
 
 function getToken(req: http.IncomingMessage): string | undefined {
@@ -95,7 +124,7 @@ export interface AdminConfig {
   flySessionsToken: string | null;
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
-  linearApiKey: string;
+  linearApiKey: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
 }
@@ -104,6 +133,7 @@ export function handleAdminRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   config: AdminConfig,
+  registry: ProviderRegistry,
 ): boolean {
   const url = req.url || "/";
   const method = req.method || "GET";
@@ -134,7 +164,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/mappings" && method === "POST") {
-      handleUpsertMapping(req, res);
+      handleUpsertMapping(req, res, registry);
       return true;
     }
 
@@ -168,6 +198,7 @@ export function handleAdminRequest(
     if (url.startsWith("/api/mappings/") && method === "DELETE") {
       const teamKey = decodeURIComponent(url.slice("/api/mappings/".length));
       const deleted = deleteMapping(teamKey);
+      if (deleted) registry.invalidate();
       json(res, deleted ? 200 : 404, { deleted });
       return true;
     }
@@ -191,13 +222,13 @@ export function handleAdminRequest(
       return true;
     }
 
-    if (url === "/api/linear/issues" && method === "GET") {
-      handleListLinearIssues(res, config);
+    if (url === "/api/issues" && method === "GET") {
+      handleListIssues(res, registry);
       return true;
     }
 
     if (url === "/api/blockers" && method === "GET") {
-      handleListBlockers(res, config);
+      handleListBlockers(res, registry);
       return true;
     }
 
@@ -245,7 +276,7 @@ export function handleAdminRequest(
 
     if (url.startsWith("/api/sessions/") && method === "DELETE") {
       const machineId = decodeURIComponent(url.slice("/api/sessions/".length));
-      handleDestroySession(req, res, config, machineId);
+      handleDestroySession(req, res, config, registry, machineId);
       return true;
     }
 
@@ -286,6 +317,44 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/jira/validate-jql" && method === "POST") {
+      handleValidateJql(req, res);
+      return true;
+    }
+
+    if (url.startsWith("/api/jira/fields") && method === "GET") {
+      handleListJiraFields(req, res);
+      return true;
+    }
+
+    if (url.startsWith("/api/jira/field-options") && method === "GET") {
+      handleListJiraFieldOptions(req, res);
+      return true;
+    }
+
+    if (url === "/api/admin/config-status" && method === "GET") {
+      json(res, 200, {
+        linear: !!process.env.LINEAR_API_KEY,
+        jira: !!(process.env.JIRA_TOKEN && process.env.JIRA_CLOUD_ID && process.env.JIRA_SITE_URL),
+        jiraSiteUrl: process.env.JIRA_SITE_URL ?? null,
+        runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),
+        gapFillTrigger: !!process.env.GAP_FILL_TRIGGER_SECRET,
+      });
+      return true;
+    }
+
+    if (url === "/api/admin/template-status" && method === "GET") {
+      // Scan each target repo's in-repo PLANNING.md and WORKFLOW.md for the
+      // legacy "curl Linear directly" pattern. Flag repos that still have it —
+      // those need an operator to update their prompts so the runner-callback
+      // path can deliver comments via the orchestrator's provider abstraction.
+      handleTemplateStatus(res, config).catch((err) => {
+        console.error("[admin] template-status failed:", err);
+        if (!res.headersSent) json(res, 500, { error: "internal_error" });
+      });
+      return true;
+    }
+
     json(res, 404, { error: "Not found" });
     return true;
   }
@@ -293,19 +362,38 @@ export function handleAdminRequest(
   return false;
 }
 
+async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplementSnapshot> {
+  const allMappings = Object.values(getMappings());
+  const providers = await registry.forAllMappings(allMappings);
+  if (providers.length === 0) {
+    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {} };
+  }
+  const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
+  return {
+    needsPlanning: snapshots.flatMap((s) => s.needsPlanning),
+    readyForImplementation: snapshots.flatMap((s) => s.readyForImplementation),
+    inProgressCountsByScope: snapshots.reduce<Record<string, number>>((acc, s) => {
+      for (const [k, v] of Object.entries(s.inProgressCountsByScope)) {
+        acc[k] = (acc[k] ?? 0) + v;
+      }
+      return acc;
+    }, {}),
+  };
+}
+
 async function handleListBlockers(
   res: http.ServerResponse,
-  config: AdminConfig,
+  registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const snapshot = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const snapshot = await fetchMergedSnapshot(registry);
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
     const blockers = selectBlockers(
       allIssues,
       teamRepoMap,
-      snapshot.inProgressCountsByTeam,
+      snapshot.inProgressCountsByScope,
       (id) => dispatchedSet.has(id),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
@@ -320,19 +408,19 @@ async function handleListBlockers(
   }
 }
 
-async function handleListLinearIssues(
+async function handleListIssues(
   res: http.ServerResponse,
-  config: AdminConfig,
+  registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const snapshot = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const snapshot = await fetchMergedSnapshot(registry);
     const issues = [
       ...snapshot.readyForImplementation.map((i) => shapeIssue(i, "ready")),
       ...snapshot.needsPlanning.map((i) => shapeIssue(i, "needs-planning")),
     ].sort((a, b) => a.identifier.localeCompare(b.identifier));
     json(res, 200, {
       issues,
-      inProgressCountsByTeam: snapshot.inProgressCountsByTeam,
+      inProgressCountsByTeam: snapshot.inProgressCountsByScope,
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });
@@ -416,6 +504,7 @@ async function handleDestroySession(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   config: AdminConfig,
+  registry: ProviderRegistry,
   machineId: string,
 ): Promise<void> {
   if (!config.flySessionsToken || !config.flySessionsApp) {
@@ -423,7 +512,7 @@ async function handleDestroySession(
     return;
   }
 
-  // Find the job first so we can reset its Linear issue
+  // Find the job first so we can reset its ticket
   const job = getInFlightJobs().find((j) => j.machineId === machineId);
 
   try {
@@ -441,10 +530,18 @@ async function handleDestroySession(
     updateJobStatus(job.id, "failed", "destroyed-by-admin");
     if (job.issueId) {
       try {
-        await removeAIWorkingLabel(config.linearApiKey, job.issueId);
-        deleteDispatched(job.issueId);
+        const mapping = job.teamKey ? getMappings()[job.teamKey] : undefined;
+        if (mapping) {
+          const provider = await registry.forMapping(mapping);
+          await provider.clearWorkingState(job.issueId);
+          deleteDispatched(job.issueId);
+        } else {
+          console.warn(
+            `[admin] Cannot reset ticket for job ${job.id}: no mapping found for teamKey=${job.teamKey ?? "<none>"}`,
+          );
+        }
       } catch (err) {
-        console.error(`[admin] Failed to reset Linear issue ${job.issueIdentifier}:`, err);
+        console.error(`[admin] Failed to reset issue ${job.issueIdentifier}:`, err);
       }
     }
   }
@@ -476,7 +573,25 @@ async function handlePatchMapping(
   teamKey: string,
 ): Promise<void> {
   try {
-    const body = JSON.parse(await readBody(req)) as { maxInProgressAiIssues?: number };
+    const body = JSON.parse(await readBody(req)) as {
+      maxInProgressAiIssues?: number;
+      paused?: boolean;
+    };
+    const hasPaused = typeof body.paused === "boolean";
+    const hasCap = body.maxInProgressAiIssues !== undefined;
+    if (hasPaused && hasCap) {
+      json(res, 400, { error: "Specify either paused or maxInProgressAiIssues, not both" });
+      return;
+    }
+    if (hasPaused) {
+      const updated = setMappingPaused(teamKey, body.paused as boolean);
+      if (!updated) {
+        json(res, 404, { error: "Team not found" });
+        return;
+      }
+      json(res, 200, { updated, paused: body.paused });
+      return;
+    }
     const max = body.maxInProgressAiIssues;
     if (!Number.isInteger(max) || (max as number) < 1) {
       json(res, 400, { error: "maxInProgressAiIssues must be a positive integer" });
@@ -793,6 +908,7 @@ async function handleUnsetGlobalSecret(
 async function handleUpsertMapping(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  registry: ProviderRegistry,
 ): Promise<void> {
   try {
     const body = JSON.parse(await readBody(req)) as {
@@ -812,6 +928,9 @@ async function handleUpsertMapping(
       extraEnv?: Record<string, string>;
       provider?: string;
       awsRegion?: string | null;
+      ticketingProvider?: string;
+      ticketingConfig?: unknown;
+      paused?: boolean;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -894,6 +1013,14 @@ async function handleUpsertMapping(
       return;
     }
 
+    let ticketing: ValidatedTicketing;
+    try {
+      ticketing = validateTicketingMapping(body);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -909,12 +1036,189 @@ async function handleUpsertMapping(
       autoApprovePlans,
       extraEnv,
       provider,
+      ticketingProvider: ticketing.ticketingProvider,
+      ticketingConfig: ticketing.ticketingConfig,
       awsRegion,
+      // Preserve current paused state if the request didn't include it,
+      // so an Edit form that omits `paused` doesn't silently resume the project.
+      paused: body.paused !== undefined
+        ? body.paused === true
+        : (getMappings()[body.teamKey]?.paused ?? false),
     };
 
     upsertMapping(body.teamKey, mapping);
+    registry.invalidate();
     json(res, 200, { teamKey: body.teamKey, ...mapping });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
+}
+
+async function handleValidateJql(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const client = getAdminJiraClient();
+  if (!client) {
+    json(res, 501, { error: "Jira not configured" });
+    return;
+  }
+  let parsed: { jql?: unknown };
+  try {
+    parsed = JSON.parse(await readBody(req)) as { jql?: unknown };
+  } catch {
+    json(res, 400, { error: "Invalid JSON body" });
+    return;
+  }
+  const jql = typeof parsed.jql === "string" ? parsed.jql : "";
+  if (!jql) {
+    json(res, 400, { error: "jql field required" });
+    return;
+  }
+  try {
+    const result = await client.validateJql(jql);
+    if (result.valid) {
+      json(res, 200, { ok: true });
+    } else {
+      json(res, 400, { error: result.errors.join("; ") });
+    }
+  } catch (err) {
+    json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleListJiraFields(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const client = getAdminJiraClient();
+  if (!client) {
+    json(res, 501, { error: "Jira not configured" });
+    return;
+  }
+  const queryUrl = new URL(req.url ?? "", "http://localhost");
+  const nameFilter = queryUrl.searchParams.get("name")?.toLowerCase() ?? null;
+  try {
+    const fields = await client.listFields();
+    const filtered = nameFilter
+      ? fields.filter((f) => f.name.toLowerCase().includes(nameFilter))
+      : fields;
+    json(res, 200, filtered);
+  } catch (err) {
+    json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleListJiraFieldOptions(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const client = getAdminJiraClient();
+  if (!client) {
+    json(res, 501, { error: "Jira not configured" });
+    return;
+  }
+  const queryUrl = new URL(req.url ?? "", "http://localhost");
+  const fieldId = queryUrl.searchParams.get("fieldId");
+  if (!fieldId) {
+    json(res, 400, { error: "fieldId query param required" });
+    return;
+  }
+  try {
+    const options = await client.getFieldOptions(fieldId);
+    json(res, 200, options);
+  } catch (err) {
+    if (err instanceof JiraFieldNotSelectError) {
+      json(res, 200, []);
+      return;
+    }
+    json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+interface TemplateStatusEntry {
+  teamKey: string;
+  owner: string;
+  repo: string;
+  planning: "current" | "stale" | "missing" | "error";
+  implementation: "current" | "stale" | "missing" | "error";
+  error?: string;
+}
+
+/**
+ * Classify a target-repo template file as stale (uses the legacy "curl Linear
+ * directly" pattern) or current. The detection is intentionally loose:
+ *   stale  = file body references api.linear.app/graphql AND mentions LINEAR_API_KEY
+ *   current = otherwise (file exists; assume operator has migrated or customized)
+ *
+ * False positives on heavily-customized "current" files are acceptable —
+ * the goal is to flag operators who haven't touched the file since the
+ * pre-Phase-3 seed.
+ */
+export function classifyTemplate(body: string): "current" | "stale" {
+  const hasLinearCurl =
+    /api\.linear\.app\/graphql/.test(body) &&
+    /LINEAR_API_KEY/.test(body);
+  return hasLinearCurl ? "stale" : "current";
+}
+
+async function fetchRepoFile(
+  ghToken: string,
+  owner: string,
+  repo: string,
+  path: string,
+): Promise<string | null> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`,
+    {
+      headers: {
+        Accept: "application/vnd.github.raw+json",
+        Authorization: `Bearer ${ghToken}`,
+        "User-Agent": "ai-implement-orchestrator",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return await res.text();
+}
+
+async function handleTemplateStatus(
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  const mappings = getMappings();
+  const entries = Object.entries(mappings);
+  const results: TemplateStatusEntry[] = await Promise.all(
+    entries.map(async ([teamKey, mapping]) => {
+      const base: TemplateStatusEntry = {
+        teamKey,
+        owner: mapping.owner,
+        repo: mapping.repo,
+        planning: "error",
+        implementation: "error",
+      };
+      try {
+        const ghToken = await getInstallationToken(
+          config.githubAppId,
+          config.githubAppPrivateKey,
+          mapping.owner,
+        );
+        const [planningBody, implBody] = await Promise.all([
+          fetchRepoFile(ghToken, mapping.owner, mapping.repo, "PLANNING.md"),
+          fetchRepoFile(ghToken, mapping.owner, mapping.repo, "WORKFLOW.md"),
+        ]);
+        base.planning = planningBody === null ? "missing" : classifyTemplate(planningBody);
+        base.implementation = implBody === null ? "missing" : classifyTemplate(implBody);
+      } catch (err) {
+        base.error = err instanceof Error ? err.message : String(err);
+      }
+      return base;
+    }),
+  );
+  json(res, 200, results);
 }

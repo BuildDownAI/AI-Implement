@@ -11,6 +11,25 @@ export const overviewHtml = `
   </header>
   <div class="page-body">
 
+    <!-- Environment status pills -->
+    <div id="overview-env-status" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px">
+      <!-- populated by loadEnvStatus() -->
+    </div>
+
+    <!-- Stale-template alert (hidden when everything is current) -->
+    <div id="overview-template-status" class="hidden" style="margin-bottom:16px">
+      <div class="alert warn">
+        <div class="alert-icon">&#9888;</div>
+        <div style="flex:1">
+          <div class="alert-title">Target repos with stale prompt templates</div>
+          <div class="alert-desc" id="overview-template-status-desc">
+            These repos still curl Linear directly from inside their workflows. Update each repo's PLANNING.md / WORKFLOW.md to write outputs to <code>ai-output/comments/</code> so the orchestrator's runner-callback can post via the configured ticketing provider.
+          </div>
+          <div id="overview-template-status-list" style="margin-top:8px;font-size:0.9em"></div>
+        </div>
+      </div>
+    </div>
+
     <!-- KPI grid -->
     <div class="kpi-grid">
       <div class="kpi" id="kpi-running">
@@ -353,6 +372,63 @@ export const overviewScript = `
     });
   }
 
+  function renderEnvStatus(status) {
+    const container = document.getElementById('overview-env-status');
+    if (!container) return;
+    const pills = [
+      { label: 'Linear', on: !!status.linear, hint: 'LINEAR_API_KEY' },
+      { label: 'Jira', on: !!status.jira, hint: 'JIRA_TOKEN + JIRA_CLOUD_ID + JIRA_SITE_URL' },
+      { label: 'Runner callback', on: !!status.runnerCallback, hint: 'RUNNER_CALLBACK_BASE_URL + RUNNER_TOKEN_SECRET' },
+      { label: 'Gap-fill trigger', on: !!status.gapFillTrigger, hint: 'GAP_FILL_TRIGGER_SECRET' },
+    ];
+    container.innerHTML = pills.map(function (p) {
+      const tint = p.on ? 'var(--st-ok-fg, #2a8)' : 'var(--text-tertiary, #888)';
+      const dot = p.on ? '●' : '○';
+      const text = p.label + ' ' + (p.on ? 'ON' : 'off');
+      return '<span title="' + window.esc(p.hint) + '" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border, #2a2a2a);border-radius:999px;font-size:0.85em;color:' + tint + '"><span style="font-size:0.7em">' + dot + '</span>' + window.esc(text) + '</span>';
+    }).join('');
+  }
+
+  async function loadEnvStatus() {
+    try {
+      const res = await window.api('/api/admin/config-status');
+      if (!res.ok) return;
+      const status = await res.json();
+      renderEnvStatus(status);
+    } catch (err) {
+      console.error('loadEnvStatus failed:', err);
+    }
+  }
+
+  function renderTemplateStatus(entries) {
+    const wrap = document.getElementById('overview-template-status');
+    const list = document.getElementById('overview-template-status-list');
+    if (!wrap || !list) return;
+    const stale = entries.filter(function (e) { return e.planning === 'stale' || e.implementation === 'stale'; });
+    if (stale.length === 0) {
+      wrap.classList.add('hidden');
+      return;
+    }
+    list.innerHTML = stale.map(function (e) {
+      const files = [];
+      if (e.planning === 'stale') files.push('PLANNING.md');
+      if (e.implementation === 'stale') files.push('WORKFLOW.md');
+      return '<div><code>' + window.esc(e.owner) + '/' + window.esc(e.repo) + '</code>: ' + window.esc(files.join(', ')) + '</div>';
+    }).join('');
+    wrap.classList.remove('hidden');
+  }
+
+  async function loadTemplateStatus() {
+    try {
+      const res = await window.api('/api/admin/template-status');
+      if (!res.ok) return;
+      const entries = await res.json();
+      renderTemplateStatus(Array.isArray(entries) ? entries : []);
+    } catch (err) {
+      console.error('loadTemplateStatus failed:', err);
+    }
+  }
+
   async function loadOverview() {
     try {
       const [logRes, mappingsRes, reaperRes] = await Promise.all([
@@ -372,6 +448,8 @@ export const overviewScript = `
       renderAtCapacity(running, safeMappings);
       renderRecentFailures(safeLog);
       renderProjectGrid(safeLog, safeMappings);
+      loadEnvStatus();
+      loadTemplateStatus();
     } catch (err) {
       console.error('loadOverview failed:', err);
     }

@@ -11,6 +11,43 @@ vi.mock("../status-events.js", () => ({
   postStatusComment: vi.fn(),
 }));
 
+import { FakeProvider } from "./providers/fake.js";
+import type { ProviderRegistry } from "../providers/registry.js";
+import type { RepoMapping } from "../config.js";
+
+function makeFakeRegistry(): ProviderRegistry {
+  const fake = new FakeProvider();
+  return {
+    forMapping: async () => fake,
+    forAllMappings: async () => [fake],
+    invalidate: () => {},
+  } as unknown as ProviderRegistry;
+}
+
+function makeMappingsFn(teamKey: string): () => Record<string, RepoMapping> {
+  const mapping = {
+    owner: "acme",
+    repo: "repo",
+    workflowFile: "claude-implement.yml",
+    defaultBranch: "main",
+    maxInProgressAiIssues: 3,
+    executionMode: "fly-machines" as const,
+    sessionMode: "autonomous" as const,
+    machineCpus: 1,
+    machineMemoryMb: 512,
+    planningEnabled: false,
+    planningWorkflowFile: "",
+    autoApprovePlans: true,
+    extraEnv: {},
+    provider: "anthropic" as const,
+    ticketingProvider: "linear" as const,
+    ticketingConfig: { kind: "linear" as const },
+    awsRegion: null,
+    paused: false,
+  };
+  return () => ({ [teamKey]: mapping });
+}
+
 class MockRequest extends EventEmitter {
   url?: string;
   method?: string;
@@ -77,7 +114,7 @@ async function callStatusEndpoint(
 ): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest("/api/status", "POST", {}, JSON.stringify(body));
   const res = new MockResponse();
-  sessionApi.handleStatusUpdate(req as never, res as never, "test-linear-key", flyAppName);
+  sessionApi.handleStatusUpdate(req as never, res as never, makeFakeRegistry(), makeMappingsFn("ENG"), flyAppName);
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -87,7 +124,7 @@ describe("handleStatusUpdate", () => {
     it("returns 400 for invalid JSON", async () => {
       const req = new MockRequest("/api/status", "POST", {}, "not-json");
       const res = new MockResponse();
-      sessionApi.handleStatusUpdate(req as never, res as never, "key");
+      sessionApi.handleStatusUpdate(req as never, res as never, makeFakeRegistry(), makeMappingsFn("ENG"));
       await res.done;
       expect(res.statusCode).toBe(400);
       expect(JSON.parse(res.body).error).toContain("Invalid JSON");
@@ -127,6 +164,7 @@ describe("handleStatusUpdate", () => {
       log.appendLog({
         issueId: "issue-99",
         issueIdentifier: "ENG-99",
+        teamKey: "ENG",
         repo: "acme/repo",
         machineNonce: jobNonce,
         machineId: "machine-abc",

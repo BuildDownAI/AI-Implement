@@ -54,19 +54,21 @@ jobs:
             core.setOutput('sha', pr.data.head.sha);
             core.setOutput('number', pr.data.number);
 
-      # Checkout PR head WITHOUT credentials so any malicious post-checkout
-      # script can't exfiltrate the GITHUB_TOKEN. We never run install/build/test
-      # steps on this checkout — Claude only reads the diff.
+      # Checkout PR head with credentials persisted — the claude-code-action
+      # runs its own `git fetch` internally and needs the credential helper set
+      # up by actions/checkout. We never run install/build/test steps on this
+      # checkout, so the diff-reading flow doesn't execute untrusted code.
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr.outputs.sha }}
-          persist-credentials: false
           fetch-depth: 0
 
       - name: Run Claude review
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "*"
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           trigger_phrase: "/claude-review"
           track_progress: true
           prompt: |

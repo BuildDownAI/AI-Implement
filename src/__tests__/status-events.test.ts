@@ -1,10 +1,31 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { formatStatusComment, formatDuration, postStatusComment } from "../status-events.js";
 import type { StatusEvent } from "../status-events.js";
+import type { TicketingProvider } from "../providers/types.js";
 
-vi.mock("../linear.js", () => ({
-  postIssueComment: vi.fn(),
-}));
+function makeFakeProvider(): TicketingProvider & {
+  comments: Array<{ issueId: string; body: string }>;
+  postComment: ReturnType<typeof vi.fn>;
+} {
+  const comments: Array<{ issueId: string; body: string }> = [];
+  const postComment = vi.fn(async (issueId: string, body: string) => {
+    comments.push({ issueId, body });
+  });
+  return {
+    id: "fake",
+    fetchAIImplementSnapshot: vi.fn(),
+    fetchLifecycleStates: vi.fn(),
+    markPlanningStarted: vi.fn(),
+    markPlanComplete: vi.fn(),
+    markPlanningFailed: vi.fn(),
+    markImplementing: vi.fn(),
+    markPrReady: vi.fn(),
+    markImplementationFailed: vi.fn(),
+    clearWorkingState: vi.fn(),
+    postComment,
+    comments,
+  } as never;
+}
 
 describe("formatDuration", () => {
   it("formats sub-minute durations as seconds", () => {
@@ -122,36 +143,32 @@ describe("postStatusComment", () => {
   beforeEach(() => { vi.clearAllMocks(); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it("calls postIssueComment with formatted body", async () => {
-    const { postIssueComment } = await import("../linear.js");
-    vi.mocked(postIssueComment).mockResolvedValueOnce(undefined);
+  it("calls provider.postComment with formatted body", async () => {
+    const fake = makeFakeProvider();
 
-    await postStatusComment("api-key", "issue-123", { type: "setup_complete" });
+    await postStatusComment(fake, "issue-123", { type: "setup_complete" });
 
-    expect(postIssueComment).toHaveBeenCalledOnce();
-    const [apiKey, issueId, body] = vi.mocked(postIssueComment).mock.calls[0];
-    expect(apiKey).toBe("api-key");
-    expect(issueId).toBe("issue-123");
-    expect(body).toContain("Environment ready");
+    expect(fake.postComment).toHaveBeenCalledOnce();
+    expect(fake.comments).toHaveLength(1);
+    expect(fake.comments[0].issueId).toBe("issue-123");
+    expect(fake.comments[0].body).toContain("Environment ready");
   });
 
   it("includes machine logs URL in the posted comment", async () => {
-    const { postIssueComment } = await import("../linear.js");
-    vi.mocked(postIssueComment).mockResolvedValueOnce(undefined);
+    const fake = makeFakeProvider();
 
     const logsUrl = "https://fly.io/apps/my-app/machines/m123";
-    await postStatusComment("api-key", "issue-123", { type: "machine_created", machineName: "session-eng-1" }, logsUrl);
+    await postStatusComment(fake, "issue-123", { type: "machine_created", machineName: "session-eng-1" }, logsUrl);
 
-    const body = vi.mocked(postIssueComment).mock.calls[0][2];
-    expect(body).toContain(logsUrl);
+    expect(fake.comments[0].body).toContain(logsUrl);
   });
 
-  it("propagates errors from postIssueComment", async () => {
-    const { postIssueComment } = await import("../linear.js");
-    vi.mocked(postIssueComment).mockRejectedValueOnce(new Error("Linear API error"));
+  it("propagates errors from provider.postComment", async () => {
+    const fake = makeFakeProvider();
+    fake.postComment.mockRejectedValueOnce(new Error("Provider API error"));
 
     await expect(
-      postStatusComment("api-key", "issue-123", { type: "setup_complete" }),
-    ).rejects.toThrow("Linear API error");
+      postStatusComment(fake, "issue-123", { type: "setup_complete" }),
+    ).rejects.toThrow("Provider API error");
   });
 });

@@ -9,7 +9,17 @@ import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as StepLogModule from "../step-log.js";
-import type * as LinearModuleType from "../linear.js";
+import { FakeProvider } from "./providers/fake.js";
+import type { TicketIssue } from "../providers/types.js";
+import type { ProviderRegistry } from "../providers/registry.js";
+
+function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
+  return {
+    forMapping: async () => provider,
+    forAllMappings: async () => [provider],
+    invalidate: () => {},
+  } as unknown as ProviderRegistry;
+}
 
 class MockRequest extends EventEmitter {
   url?: string;
@@ -54,13 +64,13 @@ let dedup: typeof DedupModule;
 let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let stepLog: typeof StepLogModule;
-let linear: typeof LinearModuleType;
+let provider: FakeProvider;
 
 beforeEach(async () => {
   vi.resetModules();
   dbPath = path.join(os.tmpdir(), `admin-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   process.env.DEDUP_DB_PATH = dbPath;
-  linear = await import("../linear.js");
+  provider = new FakeProvider();
   admin = await import("../admin.js");
   config = await import("../config.js");
   dedup = await import("../dedup.js");
@@ -93,7 +103,7 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
 async function request(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
-  admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode));
+  admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
   await res.done;
   return { statusCode: res.statusCode, body: res.body };
 }
@@ -143,7 +153,7 @@ describe("admin auth", () => {
       linearApiKey: "test",
       githubAppId: "test",
       githubAppPrivateKey: "test",
-    });
+    }, makeFakeRegistry(provider));
     await res.done;
     expect(res.statusCode).toBe(200);
   });
@@ -209,6 +219,54 @@ describe("admin mappings", () => {
     const token = await login("secret");
     const res = await request("/api/mappings/NOPE", "PATCH", "secret", { maxInProgressAiIssues: 2 }, token);
     expect(res.statusCode).toBe(404);
+  });
+
+  it("toggles paused via PATCH", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "PAU", owner: "org", repo: "p" }, token);
+    const patch = await request("/api/mappings/PAU", "PATCH", "secret", { paused: true }, token);
+    expect(patch.statusCode).toBe(200);
+    expect(JSON.parse(patch.body)).toMatchObject({ updated: true, paused: true });
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).PAU.paused).toBe(true);
+  });
+
+  it("returns 404 on PATCH paused for unknown team", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings/NOPE", "PATCH", "secret", { paused: true }, token);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("rejects PATCH that specifies both paused and maxInProgressAiIssues", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AMB", owner: "org", repo: "a" }, token);
+    const res = await request(
+      "/api/mappings/AMB",
+      "PATCH",
+      "secret",
+      { paused: true, maxInProgressAiIssues: 5 },
+      token,
+    );
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("upsert preserves existing paused state when body omits it", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "EDT", owner: "org", repo: "r" }, token);
+    await request("/api/mappings/EDT", "PATCH", "secret", { paused: true }, token);
+
+    // Re-POST the mapping (Edit form path) without specifying paused.
+    await request(
+      "/api/mappings",
+      "POST",
+      "secret",
+      { teamKey: "EDT", owner: "org", repo: "r", maxInProgressAiIssues: 5 },
+      token,
+    );
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).EDT.paused).toBe(true);
+    expect(JSON.parse(list.body).EDT.maxInProgressAiIssues).toBe(5);
   });
 
   it("deletes a mapping via DELETE", async () => {
@@ -411,6 +469,43 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toMatch(/bedrock.*fly-machines/);
   });
+
+  it("upsertMapping accepts a Jira ticketingProvider with valid config", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "JIRA1", owner: "org", repo: "jira-app",
+      ticketingProvider: "jira",
+      ticketingConfig: {
+        kind: "jira",
+        jql: "project = ACME",
+        repoFieldValue: "org/jira-app",
+      },
+    }, token);
+    expect(create.statusCode).toBe(200);
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(list.statusCode).toBe(200);
+    const entry = JSON.parse(list.body).JIRA1;
+    expect(entry).toBeDefined();
+    expect(entry.ticketingProvider).toBe("jira");
+    expect(entry.ticketingConfig).toEqual({
+      kind: "jira",
+      jql: "project = ACME",
+      repoFieldValue: "org/jira-app",
+      statusFieldOverride: null,
+      repoFieldOverride: null,
+    });
+  });
+
+  it("upsertMapping rejects Jira ticketingProvider with linear ticketingConfig", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad",
+      ticketingProvider: "jira",
+      ticketingConfig: { kind: "linear" },
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/kind/);
+  });
 });
 
 describe("admin runner-mode", () => {
@@ -490,7 +585,7 @@ describe("admin secrets", () => {
   async function requestFly(url: string, method: string, token: string, body?: unknown): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body !== undefined ? JSON.stringify(body) : undefined);
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, secretsConfig());
+    admin.handleAdminRequest(req as never, res as never, secretsConfig(), makeFakeRegistry(provider));
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
@@ -658,7 +753,7 @@ describe("admin secrets", () => {
 
     const req = new MockRequest("/api/mappings/ENG/secrets", "POST", { authorization: `Bearer ${token}` }, "not-json{{{");
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, secretsConfig());
+    admin.handleAdminRequest(req as never, res as never, secretsConfig(), makeFakeRegistry(provider));
     await res.done;
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("Invalid");
@@ -728,7 +823,7 @@ describe("admin settings", () => {
     for (const body of ["null", '"a string"', "42", "[]"]) {
       const req = new MockRequest("/api/settings", "POST", { authorization: `Bearer ${token}` }, body);
       const res = new MockResponse();
-      admin.handleAdminRequest(req as never, res as never, adminConfig());
+      admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
       await res.done;
       expect(res.statusCode).toBe(400);
     }
@@ -754,7 +849,7 @@ describe("admin global secrets", () => {
   async function requestFlyGlobal(url: string, method: string, token: string, body?: unknown): Promise<{ statusCode: number; body: string }> {
     const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body !== undefined ? JSON.stringify(body) : undefined);
     const res = new MockResponse();
-    admin.handleAdminRequest(req as never, res as never, globalSecretsConfig());
+    admin.handleAdminRequest(req as never, res as never, globalSecretsConfig(), makeFakeRegistry(provider));
     await res.done;
     return { statusCode: res.statusCode, body: res.body };
   }
@@ -878,7 +973,7 @@ describe("admin global secrets", () => {
     for (const body of ["null", '"a string"', "42", "[]"]) {
       const req = new MockRequest("/api/global-secrets", "POST", { authorization: `Bearer ${token}` }, body);
       const res = new MockResponse();
-      admin.handleAdminRequest(req as never, res as never, globalSecretsConfig());
+      admin.handleAdminRequest(req as never, res as never, globalSecretsConfig(), makeFakeRegistry(provider));
       await res.done;
       expect(res.statusCode).toBe(400);
     }
@@ -958,51 +1053,50 @@ describe("admin dedup", () => {
   });
 });
 
-describe("admin linear issues endpoint", () => {
+describe("admin issues endpoint", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
   it("returns 401 without auth token", async () => {
-    const res = await request("/api/linear/issues", "GET", "secret");
+    const res = await request("/api/issues", "GET", "secret");
     expect(res.statusCode).toBe(401);
   });
 
-  it("returns 502 on Linear failure", async () => {
-    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockRejectedValueOnce(
+  it("returns 502 on provider failure", async () => {
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockRejectedValueOnce(
       new Error("Linear API error: 401"),
     );
     const token = await login("secret");
-    const res = await request("/api/linear/issues", "GET", "secret", undefined, token);
+    const res = await request("/api/issues", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(502);
     expect(JSON.parse(res.body).error).toContain("Linear API error");
   });
 
   it("returns 200 with shaped issues on success", async () => {
-    const stubSnapshot = {
-      readyForImplementation: [
-        {
-          id: "issue-1",
-          identifier: "CORE-100",
-          title: "Implement feature X",
-          team: { id: "team-1", key: "CORE" },
-          state: { id: "state-1", name: "Todo", type: "unstarted" },
-        },
-      ],
-      needsPlanning: [
-        {
-          id: "issue-2",
-          identifier: "CORE-50",
-          title: "Plan something",
-          team: { id: "team-1", key: "CORE" },
-          state: { id: "state-2", name: "Backlog", type: "backlog" },
-        },
-      ],
-      inProgressCountsByTeam: { CORE: 2 },
+    const ready: TicketIssue = {
+      id: "issue-1",
+      identifier: "CORE-100",
+      title: "Implement feature X",
+      description: null,
+      scopeKey: "CORE",
+      nativeStatus: "Todo (unstarted)",
     };
-    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockResolvedValueOnce(stubSnapshot);
+    const needsPlan: TicketIssue = {
+      id: "issue-2",
+      identifier: "CORE-50",
+      title: "Plan something",
+      description: null,
+      scopeKey: "CORE",
+      nativeStatus: "Backlog (backlog)",
+    };
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [ready],
+      needsPlanning: [needsPlan],
+      inProgressCountsByScope: { CORE: 2 },
+    });
     const token = await login("secret");
-    const res = await request("/api/linear/issues", "GET", "secret", undefined, token);
+    const res = await request("/api/issues", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
     const body = JSON.parse(res.body);
     expect(Array.isArray(body.issues)).toBe(true);
@@ -1011,6 +1105,8 @@ describe("admin linear issues endpoint", () => {
     // Sorted by identifier (localeCompare): "CORE-100" < "CORE-50" lexicographically
     expect(body.issues[0].identifier).toBe("CORE-100");
     expect(body.issues[0].bucket).toBe("ready");
+    expect(body.issues[0].teamKey).toBe("CORE");
+    expect(body.issues[0].stateName).toBe("Todo (unstarted)");
     expect(body.issues[1].identifier).toBe("CORE-50");
     expect(body.issues[1].bucket).toBe("needs-planning");
   });
@@ -1071,8 +1167,8 @@ describe("admin blockers endpoint", () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it("returns 502 on Linear failure", async () => {
-    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockRejectedValueOnce(
+  it("returns 502 on provider failure", async () => {
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockRejectedValueOnce(
       new Error("boom"),
     );
     const token = await login("secret");
@@ -1082,20 +1178,19 @@ describe("admin blockers endpoint", () => {
   });
 
   it("returns 200 with shape — no-mapping blocker when issue team has no mapping", async () => {
-    const stubSnapshot = {
-      readyForImplementation: [
-        {
-          id: "issue-1",
-          identifier: "CORE-100",
-          title: "Implement feature X",
-          team: { id: "team-1", key: "CORE" },
-          state: { id: "state-1", name: "Todo", type: "unstarted" },
-        },
-      ],
-      needsPlanning: [],
-      inProgressCountsByTeam: {},
+    const issue: TicketIssue = {
+      id: "issue-1",
+      identifier: "CORE-100",
+      title: "Implement feature X",
+      description: null,
+      scopeKey: "CORE",
+      nativeStatus: "Todo (unstarted)",
     };
-    vi.spyOn(linear, "fetchAIImplementIssueSnapshot").mockResolvedValueOnce(stubSnapshot);
+    vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
+      readyForImplementation: [issue],
+      needsPlanning: [],
+      inProgressCountsByScope: {},
+    });
     const token = await login("secret");
     // No mapping for CORE team → should produce a no-mapping blocker
     const res = await request("/api/blockers", "GET", "secret", undefined, token);
@@ -1138,5 +1233,41 @@ describe("admin pipelines-steps endpoint", () => {
     const body = JSON.parse(res.body);
     expect(Array.isArray(body.pipelines)).toBe(true);
     expect(Array.isArray(body.steps)).toBe(true);
+  });
+});
+
+describe("classifyTemplate", () => {
+  it("flags a body that curls api.linear.app/graphql with LINEAR_API_KEY as stale", async () => {
+    const { classifyTemplate } = await import("../admin.js");
+    const stale = `
+      Post comments to Linear:
+      curl -X POST https://api.linear.app/graphql \\
+        -H "Authorization: $LINEAR_API_KEY" \\
+        --data-raw '{"query": "mutation { commentCreate(...) }"}'
+    `;
+    expect(classifyTemplate(stale)).toBe("stale");
+  });
+
+  it("flags a body with only api.linear.app/graphql but no LINEAR_API_KEY as current", async () => {
+    const { classifyTemplate } = await import("../admin.js");
+    // Mention of the URL alone (e.g. in a comment or doc) isn't enough.
+    const body = "// Background: this used to call api.linear.app/graphql before runner-callback.";
+    expect(classifyTemplate(body)).toBe("current");
+  });
+
+  it("flags a body with only LINEAR_API_KEY but no api.linear.app/graphql as current", async () => {
+    const { classifyTemplate } = await import("../admin.js");
+    // env var mentioned somewhere without a direct curl.
+    const body = "LINEAR_API_KEY is set on the runner for other reasons.";
+    expect(classifyTemplate(body)).toBe("current");
+  });
+
+  it("treats a body using the ai-output/comments convention as current", async () => {
+    const { classifyTemplate } = await import("../admin.js");
+    const body = `
+      Write planning comments to ai-output/comments/01-analysis.md.
+      Do NOT post to Linear directly.
+    `;
+    expect(classifyTemplate(body)).toBe("current");
   });
 });

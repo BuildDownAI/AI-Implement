@@ -6,7 +6,9 @@ import {
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields } from "./github.js";
-import { fetchAIImplementIssueSnapshot, getInProgressStateId, updateIssueState, ensureAIWorkingLabel, ensureAIPlanningLabel, addLabelToIssue, removeAIWorkingLabel, markIssueReadyForReview, fetchIssueStates, postIssueComment } from "./linear.js";
+import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
+import type { TicketingProvider, IssueLifecycleState } from "./providers/types.js";
+import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion } from "./notify.js";
 import { handleAdminRequest } from "./admin.js";
@@ -24,11 +26,16 @@ import { initReconciliationTable, getPendingReconciliations, updateReconciliatio
 import { resolveSessionImage } from "./repo-image.js";
 import { initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
+import { handleRunnerResult } from "./runner-callback.js";
+import type { RunnerResultBody } from "./runner-callback.js";
+import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
+import { handleGapFillTrigger } from "./gap-fill-trigger.js";
+import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 
 // ---------- Configuration ----------
 
 interface AppConfig {
-  linearApiKey: string;
+  linearApiKey: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
   notifyWebhookUrl: string | null;
@@ -49,6 +56,9 @@ interface AppConfig {
   orchestratorUrl: string | null;
   reaperDryRun: boolean;
   reaperAlertThreshold: number;
+  runnerCallbackBaseUrl: string | null;
+  runnerTokenSecret: string | null;
+  gapFillTriggerSecret: string | null;
 }
 
 function loadConfig(): AppConfig {
@@ -75,8 +85,24 @@ function loadConfig(): AppConfig {
     console.warn("[main] GITHUB_WEBHOOK_SECRET not set — webhook endpoint will reject all requests");
   }
 
+  const runnerCallbackBaseUrl = process.env.RUNNER_CALLBACK_BASE_URL || null;
+  const runnerTokenSecret = process.env.RUNNER_TOKEN_SECRET || null;
+  const gapFillTriggerSecret = process.env.GAP_FILL_TRIGGER_SECRET || null;
+
+  if (!runnerCallbackBaseUrl || !runnerTokenSecret) {
+    console.warn("[main] runner callback path disabled (RUNNER_CALLBACK_BASE_URL or RUNNER_TOKEN_SECRET not set)");
+  }
+  if (!gapFillTriggerSecret) {
+    console.warn("[main] /trigger/gap-fill endpoint disabled (GAP_FILL_TRIGGER_SECRET not set)");
+  }
+
+  const linearApiKey = process.env.LINEAR_API_KEY || null;
+  if (!linearApiKey) {
+    console.warn("[main] LINEAR_API_KEY not set — Linear mappings will be skipped (the ProviderRegistry tolerates missing per-provider env vars)");
+  }
+
   return {
-    linearApiKey: required("LINEAR_API_KEY"),
+    linearApiKey,
     githubAppId: required("GITHUB_APP_ID"),
     githubAppPrivateKey: required("GITHUB_APP_PRIVATE_KEY"),
     notifyWebhookUrl,
@@ -104,6 +130,9 @@ function loadConfig(): AppConfig {
     orchestratorUrl: process.env.ORCHESTRATOR_URL || null,
     reaperDryRun: process.env.REAPER_DRY_RUN === "true",
     reaperAlertThreshold: parseInt(process.env.REAPER_ALERT_THRESHOLD || "10", 10),
+    runnerCallbackBaseUrl,
+    runnerTokenSecret,
+    gapFillTriggerSecret,
   };
 }
 
@@ -111,25 +140,10 @@ function loadConfig(): AppConfig {
 
 let pollCount = 0;
 let pollInProgress = false;
-const aiWorkingLabelCache: Record<string, string> = {}; // teamId → labelId
-const aiPlanningLabelCache: Record<string, string> = {}; // teamId → labelId
 
-/** State types that indicate an issue is terminal and its dedup entry can be cleared. */
-const TERMINAL_STATE_TYPES = new Set(["completed", "canceled"]);
+type DispatchableIssue = TicketIssue;
 
-/** State types from which the poller will move an issue to "In Progress". */
-const MOVABLE_STATE_TYPES = new Set(["triage", "backlog", "unstarted"]);
-
-interface DispatchableIssue {
-  id: string;
-  identifier: string;
-  title: string;
-  description?: string | null;
-  state: { name: string; type: string };
-  team: { id: string; key: string };
-}
-
-async function poll(config: AppConfig): Promise<void> {
+async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   if (pollInProgress) {
     console.log(`[poll] Skipping poll cycle — previous poll still running`);
     return;
@@ -138,16 +152,36 @@ async function poll(config: AppConfig): Promise<void> {
   try {
   console.log(`[poll] Starting poll cycle #${++pollCount}`);
 
-  // Reconcile dedup table: clear entries only for issues that are completed/canceled/not found.
+  const allMappings = Object.values(getMappings());
+  const providers = await registry.forAllMappings(allMappings);
+
+  // Reconcile dedup table: clear entries only for issues that are completed/cancelled/not found.
+  // Each provider only knows its own issues; we ask all providers and clear an
+  // entry only when no provider claims it as still-active.
   const dispatchedIds = getDispatchedIds();
-  if (dispatchedIds.length > 0) {
+  if (dispatchedIds.length > 0 && providers.length > 0) {
     try {
-      const stateMap = await fetchIssueStates(config.linearApiKey, dispatchedIds);
+      const allStateMaps = await Promise.all(
+        providers.map((p) => p.fetchLifecycleStates(dispatchedIds).catch((err) => {
+          console.error("[reconcile] Provider fetchLifecycleStates failed:", err);
+          return new Map<string, IssueLifecycleState>();
+        })),
+      );
       for (const id of dispatchedIds) {
-        const stateType = stateMap.get(id);
-        if (stateType === undefined || TERMINAL_STATE_TYPES.has(stateType)) {
+        let observedActive = false;
+        let observedTerminal = false;
+        for (const m of allStateMaps) {
+          const state = m.get(id);
+          if (state === undefined) continue;
+          if (state === "active") { observedActive = true; break; }
+          if (state === "completed" || state === "cancelled") observedTerminal = true;
+        }
+        if (observedActive) continue;
+        // Clear dedup if any provider reports terminal, or no provider knows about it.
+        if (observedTerminal || allStateMaps.every((m) => m.get(id) === undefined)) {
           deleteDispatched(id);
-          console.log(`[reconcile] Cleared dedup for ${id} (state: ${stateType ?? "not found"})`);
+          const reason = observedTerminal ? "terminal" : "not found";
+          console.log(`[reconcile] Cleared dedup for ${id} (state: ${reason})`);
         }
       }
     } catch (err) {
@@ -156,10 +190,35 @@ async function poll(config: AppConfig): Promise<void> {
   }
 
   try {
-    const { needsPlanning, readyForImplementation, inProgressCountsByTeam } = await fetchAIImplementIssueSnapshot(config.linearApiKey);
+    const snapshots = providers.length === 0
+      ? []
+      : await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
+
+    const needsPlanning = snapshots.flatMap((s) => s.needsPlanning);
+    const readyForImplementation = snapshots.flatMap((s) => s.readyForImplementation);
+    const inProgressCountsByScope = snapshots.reduce<Record<string, number>>((acc, s) => {
+      for (const [k, v] of Object.entries(s.inProgressCountsByScope)) {
+        acc[k] = (acc[k] ?? 0) + v;
+      }
+      return acc;
+    }, {});
+    const inProgressCountsByTeam = inProgressCountsByScope;
     console.log(`[poll] Found ${needsPlanning.length} needing planning, ${readyForImplementation.length} ready for implementation`);
 
-    const teamRepoMap = getMappings();
+    // Build the dispatch view of mappings: hide paused ones so the poller
+    // skips them entirely (no new dispatches, no planning, no gap-fill). The
+    // unfiltered `getMappings()` is still used elsewhere for reconciliation
+    // and runner-callback handling, so in-flight runs that started before
+    // pause finish normally.
+    const allMappingsForDispatch = getMappings();
+    const teamRepoMap: Record<string, RepoMapping> = {};
+    for (const [k, m] of Object.entries(allMappingsForDispatch)) {
+      if (m.paused) {
+        console.log(`[poll] Skipping paused project ${k} (${m.owner}/${m.repo})`);
+        continue;
+      }
+      teamRepoMap[k] = m;
+    }
 
     // Implementation issues have priority over planning issues for slot allocation.
     // Both consume slots from the same per-team capacity pool.
@@ -174,17 +233,18 @@ async function poll(config: AppConfig): Promise<void> {
     );
 
     for (const issue of allCandidates) {
-      if (teamRepoMap[issue.team.key]) continue;
-      console.log(`[poll] No repo mapping for team ${issue.team.key}, skipping ${issue.identifier}`);
+      if (teamRepoMap[issue.scopeKey]) continue;
+      console.log(`[poll] No repo mapping for team ${issue.scopeKey}, skipping ${issue.identifier}`);
     }
 
     for (const issue of toProcess) {
       try {
-        const mapping = teamRepoMap[issue.team.key]!;
+        const mapping = teamRepoMap[issue.scopeKey]!;
+        const issueProvider = await registry.forMapping(mapping);
         const isPlanning = needsPlanningIds.has(issue.id) && mapping.planningEnabled;
 
         if (isPlanning) {
-          await dispatchPlanning(config, issue, mapping);
+          await dispatchPlanning(config, issueProvider, issue, mapping);
         } else {
           const prior = countPriorDispatches(issue.id);
 
@@ -194,8 +254,8 @@ async function poll(config: AppConfig): Promise<void> {
               : "unknown";
             console.warn(
               `[poll] RE-DISPATCH #${prior.count + 1} for ${issue.identifier} (last dispatch: ${ago}). ` +
-                `State: ${issue.state.name} (${issue.state.type}), team: ${issue.team.key}. ` +
-                `Issue was dispatchable because: no dedup entry, state not completed/canceled, ` +
+                `State: ${issue.nativeStatus}, team: ${issue.scopeKey}. ` +
+                `Issue was dispatchable because: no dedup entry, state not terminal, ` +
                 `no AI-Working label, no Ready for Review label, not blocked.`,
             );
           }
@@ -203,13 +263,13 @@ async function poll(config: AppConfig): Promise<void> {
           const { mode: runnerMode } = getRunnerMode();
           const execPath = resolveExecutionPath(runnerMode, mapping.executionMode);
           if (execPath === "both") {
-            // Shadow: GHA is primary (controls Linear state and dedup); Fly is secondary
-            await dispatchGitHubActions(config, issue, mapping, prior, runnerMode);
-            await dispatchFlyMachine(config, issue, mapping, prior, runnerMode, true);
+            // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, true);
           } else if (execPath === "fly-machines") {
-            await dispatchFlyMachine(config, issue, mapping, prior, runnerMode);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode);
           } else {
-            await dispatchGitHubActions(config, issue, mapping, prior, runnerMode);
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
           }
         }
       } catch (err) {
@@ -222,12 +282,18 @@ async function poll(config: AppConfig): Promise<void> {
   }
 
   // Monitor in-flight jobs and send completion notifications
-  await monitorJobs(config);
+  await monitorJobs(config, registry);
 
   // Sweep for orphaned/stale/aged-out Fly machines
-  await sweepOrphanedMachines(config, {
-    resetLinearIssue: (job) => resetLinearIssue(config, job),
-    postSessionLogsToLinear: (job, context) => postSessionLogsToLinear(config, job, context),
+  await sweepOrphanedMachines(reaperConfig(config, registry), {
+    resetTicket: async (job) => {
+      const provider = await providerForJob(registry, job);
+      if (provider) await resetTicket(provider, job);
+    },
+    postSessionLogs: async (job, context) => {
+      const provider = await providerForJob(registry, job);
+      if (provider) await postSessionLogs(config, provider, job, context);
+    },
     findPrForIssue: (repo, issueIdentifier) => findPrForIssue(config, repo, issueIdentifier),
   });
 
@@ -243,18 +309,36 @@ async function poll(config: AppConfig): Promise<void> {
 
 async function dispatchGitHubActions(
   config: AppConfig,
+  provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
 ): Promise<void> {
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+  let runnerCallbackUrl = "";
+  let runToken = "";
+  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+    const minted = mintRunToken({
+      issueId: issue.id,
+      mappingTeamKey: issue.scopeKey,
+      phase: "implementation",
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+      secret: config.runnerTokenSecret,
+    });
+    runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    runToken = minted.token;
+  }
+
   const result = await dispatchWorkflow(ghToken, mapping, {
     issue_id: issue.id,
     issue_identifier: issue.identifier,
     issue_title: issue.title,
     issue_description: issue.description || issue.title,
     ...providerDispatchFields(mapping),
+    runner_callback_url: runnerCallbackUrl,
+    run_token: runToken,
   });
 
   if (!result.success) {
@@ -267,9 +351,9 @@ async function dispatchGitHubActions(
     issueId: issue.id,
     issueIdentifier: issue.identifier,
     issueTitle: issue.title,
-    teamKey: issue.team.key,
+    teamKey: issue.scopeKey,
     repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: `${issue.state.name} (${issue.state.type})`,
+    issueState: issue.nativeStatus,
     dispatchNumber: prior.count + 1,
     executionMode: "github-actions",
     runnerMode,
@@ -281,7 +365,7 @@ async function dispatchGitHubActions(
     console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
   }
 
-  await postDispatch(config, issue, mapping, ghToken, jobId, "github-actions");
+  await postDispatch(config, provider, issue, mapping, ghToken, jobId, "github-actions");
 
   console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (github-actions)`);
 }
@@ -295,24 +379,42 @@ async function dispatchGitHubActions(
  */
 async function dispatchPlanning(
   config: AppConfig,
+  provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
 ): Promise<void> {
   if (!mapping.planningWorkflowFile) {
     console.warn(
-      `[poll] Planning enabled for team ${issue.team.key} but planningWorkflowFile is not set — skipping ${issue.identifier}`,
+      `[poll] Planning enabled for team ${issue.scopeKey} but planningWorkflowFile is not set — skipping ${issue.identifier}`,
     );
     return;
   }
 
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
+
+  let runnerCallbackUrl = "";
+  let runToken = "";
+  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+    const minted = mintRunToken({
+      issueId: issue.id,
+      mappingTeamKey: issue.scopeKey,
+      phase: "planning",
+      ttlSeconds: PLANNING_TTL_SECONDS,
+      secret: config.runnerTokenSecret,
+    });
+    runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    runToken = minted.token;
+  }
+
   const result = await dispatchWorkflow(ghToken, planningMapping, {
     issue_id: issue.id,
     issue_identifier: issue.identifier,
     issue_title: issue.title,
     issue_description: issue.description || issue.title,
     ...providerDispatchFields(planningMapping),
+    runner_callback_url: runnerCallbackUrl,
+    run_token: runToken,
   });
 
   if (!result.success) {
@@ -324,9 +426,9 @@ async function dispatchPlanning(
     issueId: issue.id,
     issueIdentifier: issue.identifier,
     issueTitle: issue.title,
-    teamKey: issue.team.key,
+    teamKey: issue.scopeKey,
     repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: `${issue.state.name} (${issue.state.type})`,
+    issueState: issue.nativeStatus,
     executionMode: "planning",
   });
 
@@ -334,25 +436,22 @@ async function dispatchPlanning(
     notify(config.notifyType, config.notifyWebhookUrl, {
       issueIdentifier: issue.identifier,
       issueTitle: issue.title,
-      issueUrl: `https://linear.app/issue/${issue.identifier}`,
+      issueUrl: provider.issueUrl(issue),
       repoFullName: `${mapping.owner}/${mapping.repo}`,
     }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
   }
 
-  // Add AI-Planning label — this acts as the in-progress marker and prevents
-  // re-dispatch. We intentionally do NOT call markDispatched() so the dedup
-  // table stays clear for the subsequent implementation dispatch.
-  if (!aiPlanningLabelCache[issue.team.id]) {
-    aiPlanningLabelCache[issue.team.id] = await ensureAIPlanningLabel(config.linearApiKey, issue.team.id);
-  }
+  // Mark planning started — this adds the AI-Planning label and moves the
+  // issue to In Progress (where applicable). Intentionally do NOT call
+  // markDispatched() so the dedup table stays clear for the subsequent
+  // implementation dispatch.
   try {
-    await addLabelToIssue(config.linearApiKey, issue.id, aiPlanningLabelCache[issue.team.id]);
+    await provider.markPlanningStarted(issue.id, issue.scopeKey);
   } catch (err) {
     // The planning workflow was already dispatched — log a warning so the operator
-    // knows the next poll may re-dispatch planning for this issue (no AI-Planning
-    // label means it will appear in needsPlanning again).
+    // knows the next poll may re-dispatch planning for this issue.
     console.warn(
-      `[poll] Planning workflow dispatched for ${issue.identifier} but failed to add AI-Planning label — next poll may re-dispatch planning:`,
+      `[poll] Planning workflow dispatched for ${issue.identifier} but failed to mark planning started — next poll may re-dispatch planning:`,
       err,
     );
   }
@@ -364,6 +463,7 @@ async function dispatchPlanning(
 
 async function dispatchFlyMachine(
   config: AppConfig,
+  provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
   prior: { count: number; lastDispatchedAt: number | null },
@@ -420,7 +520,7 @@ async function dispatchFlyMachine(
     owner: mapping.owner,
     repo: mapping.repo,
     defaultBranch: mapping.defaultBranch,
-    linearApiKey: config.linearApiKey,
+    linearApiKey: config.linearApiKey ?? undefined,
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     claudeOAuthToken: config.claudeOAuthToken ?? undefined,
     githubAppId: config.githubAppId,
@@ -431,7 +531,7 @@ async function dispatchFlyMachine(
     region: config.flySessionsRegion ?? undefined,
     cpus: mapping.machineCpus,
     memoryMb: mapping.machineMemoryMb,
-    teamKey: issue.team.key,
+    teamKey: issue.scopeKey,
     teamSecretNames: allSecretNames,
     minSecretsVersion: minSecretsVersion ?? undefined,
     orchestratorUrl: config.orchestratorUrl ?? undefined,
@@ -451,9 +551,9 @@ async function dispatchFlyMachine(
     issueId: issue.id,
     issueIdentifier: issue.identifier,
     issueTitle: issue.title,
-    teamKey: issue.team.key,
+    teamKey: issue.scopeKey,
     repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: `${issue.state.name} (${issue.state.type})`,
+    issueState: issue.nativeStatus,
     dispatchNumber: prior.count + 1,
     executionMode: "fly-machines",
     machineNonce,
@@ -469,11 +569,11 @@ async function dispatchFlyMachine(
       console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
     }
 
-    await postDispatch(config, issue, mapping, ghToken, jobId, "fly-machines");
+    await postDispatch(config, provider, issue, mapping, ghToken, jobId, "fly-machines");
 
     // Post machine_created status comment to Linear (best-effort)
     const machineLogsUrl = `https://fly.io/apps/${config.flySessionsApp}/machines/${machine.id}`;
-    postStatusComment(config.linearApiKey, issue.id, {
+    postStatusComment(provider, issue.id, {
       type: "machine_created",
       machineName: machine.name,
     }, machineLogsUrl).catch((err) => {
@@ -489,30 +589,22 @@ async function dispatchFlyMachine(
 
 async function postDispatch(
   config: AppConfig,
+  provider: TicketingProvider,
   issue: DispatchableIssue,
   mapping: RepoMapping,
   ghToken: string,
   jobId: number,
   actualExecutionMode: "github-actions" | "fly-machines",
 ): Promise<void> {
-  // Add AI-Working label
-  if (!aiWorkingLabelCache[issue.team.id]) {
-    aiWorkingLabelCache[issue.team.id] = await ensureAIWorkingLabel(config.linearApiKey, issue.team.id);
-  }
-  await addLabelToIssue(config.linearApiKey, issue.id, aiWorkingLabelCache[issue.team.id]);
-
-  // Move to In Progress if in a pre-start state
-  if (MOVABLE_STATE_TYPES.has(issue.state.type)) {
-    const stateId = await getInProgressStateId(config.linearApiKey, issue.team.id);
-    await updateIssueState(config.linearApiKey, issue.id, stateId);
-  }
+  // Mark implementing — add AI-Working label and move issue state if needed.
+  await provider.markImplementing(issue.id, issue.scopeKey);
 
   // Send dispatch notification
   if (config.notifyWebhookUrl) {
     notify(config.notifyType, config.notifyWebhookUrl, {
       issueIdentifier: issue.identifier,
       issueTitle: issue.title,
-      issueUrl: `https://linear.app/issue/${issue.identifier}`,
+      issueUrl: provider.issueUrl(issue),
       repoFullName: `${mapping.owner}/${mapping.repo}`,
     }).catch((err) => console.error(`[poll] Notification failed:`, err));
   }
@@ -567,8 +659,9 @@ const LOG_MAX_CHARS = 5_000;
  * "destroyed") the Fly API returns 404 and no log dump is possible.  Callers
  * must skip this function for that path.
  */
-async function postSessionLogsToLinear(
+async function postSessionLogs(
   config: AppConfig,
+  provider: TicketingProvider,
   job: Job,
   context: string,
 ): Promise<void> {
@@ -581,18 +674,32 @@ async function postSessionLogsToLinear(
     // Drop a possible partial first line introduced by the character-level slice
     const body = logs.length > LOG_MAX_CHARS ? raw.replace(/^[^\n]*\n/, "") : raw;
 
-    await postIssueComment(
-      config.linearApiKey,
+    await provider.postComment(
       job.issueId,
       `**Session Logs** (${context})\n\`\`\`\n${body}\n\`\`\``,
     );
-    console.log(`[monitor] Posted session logs to Linear for ${job.issueIdentifier} (${context})`);
+    console.log(`[monitor] Posted session logs for ${job.issueIdentifier} (${context})`);
   } catch (err) {
     console.error(`[monitor] Failed to post session logs for ${job.issueIdentifier} (${context}):`, err);
   }
 }
 
-async function monitorJobs(config: AppConfig): Promise<void> {
+/**
+ * Resolve the TicketingProvider for a job using its teamKey to look up the
+ * mapping. Returns null if no mapping is found (orphaned job after a mapping
+ * was deleted).
+ */
+async function providerForJob(
+  registry: ProviderRegistry,
+  job: Job,
+): Promise<TicketingProvider | null> {
+  if (!job.teamKey) return null;
+  const mapping = getMappings()[job.teamKey];
+  if (!mapping) return null;
+  return registry.forMapping(mapping);
+}
+
+async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const inFlightJobs = getInFlightJobs();
   if (inFlightJobs.length === 0 && getUnnotifiedTerminalJobs().length === 0) return;
 
@@ -604,7 +711,12 @@ async function monitorJobs(config: AppConfig): Promise<void> {
   for (const job of inFlightJobs) {
     try {
       if (job.executionMode === "fly-machines") {
-        await monitorFlyMachineJob(config, job);
+        const provider = await providerForJob(registry, job);
+        if (!provider) {
+          console.warn(`[monitor] No mapping for job ${job.id} (teamKey=${job.teamKey ?? "<none>"}); skipping`);
+          continue;
+        }
+        await monitorFlyMachineJob(config, provider, job);
       } else {
         await monitorGitHubActionsJob(config, job, teamRepoMap, claimedRunIds);
       }
@@ -614,7 +726,7 @@ async function monitorJobs(config: AppConfig): Promise<void> {
   }
 
   // Send notifications for newly terminal jobs
-  await sendCompletionNotifications(config);
+  await sendCompletionNotifications(config, registry);
 }
 
 async function monitorGitHubActionsJob(
@@ -738,6 +850,7 @@ async function findPrForIssue(
 
 async function monitorFlyMachineJob(
   config: AppConfig,
+  provider: TicketingProvider,
   job: Job,
 ): Promise<void> {
   if (!config.flySessionsToken || !config.flySessionsApp || !job.machineId) return;
@@ -746,7 +859,7 @@ async function monitorFlyMachineJob(
   if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
     // Fetch logs before destroying so the machine is still accessible
     if (job.runnerMode !== "shadow") {
-      await postSessionLogsToLinear(config, job, "machine_timeout");
+      await postSessionLogs(config, provider, job, "machine_timeout");
     }
 
     try {
@@ -766,7 +879,7 @@ async function monitorFlyMachineJob(
     // Post timeout status comment to Linear (best-effort, skip shadow jobs)
     if (job.runnerMode !== "shadow" && job.issueId) {
       const machineLogsUrl = `https://fly.io/apps/${config.flySessionsApp}/machines/${job.machineId}`;
-      postStatusComment(config.linearApiKey, job.issueId, {
+      postStatusComment(provider, job.issueId, {
         type: "timeout",
         reason: `machine timed out after ${elapsedMin}m`,
       }, machineLogsUrl).catch((err) => {
@@ -774,7 +887,7 @@ async function monitorFlyMachineJob(
       });
     }
 
-    await resetLinearIssue(config, job);
+    await resetTicket(provider, job);
     return;
   }
 
@@ -831,7 +944,7 @@ async function monitorFlyMachineJob(
       // Fetch logs before destroy on failure — machine is still accessible here.
       // Skip for "destroyed" (manual/external destroy; machine is already gone).
       if (jobStatus === "failed" && job.runnerMode !== "shadow") {
-        await postSessionLogsToLinear(config, job, "session_failed");
+        await postSessionLogs(config, provider, job, "session_failed");
       }
 
       try {
@@ -852,7 +965,7 @@ async function monitorFlyMachineJob(
     // Post machine_destroyed status comment to Linear (best-effort, skip shadow jobs)
     if (job.runnerMode !== "shadow" && job.issueId) {
       const machineLogsUrl = `https://fly.io/apps/${config.flySessionsApp}/machines/${job.machineId}`;
-      postStatusComment(config.linearApiKey, job.issueId, {
+      postStatusComment(provider, job.issueId, {
         type: "machine_destroyed",
         durationMs,
       }, machineLogsUrl).catch((err) => {
@@ -865,19 +978,19 @@ async function monitorFlyMachineJob(
       // label for Ready for Review, post a PR-link comment). The poller won't
       // re-dispatch issues with Ready for Review, so we don't need to clear
       // the dedup entry.
-      await markReadyForReview(config, job, prUrl);
+      await markReadyForReview(provider, job, prUrl);
     } else if (jobStatus === "failed") {
       // On failure/timeout, reset the Linear issue so it can be re-dispatched
-      await resetLinearIssue(config, job);
+      await resetTicket(provider, job);
     }
   }
 }
 
 /** Mark a Linear issue as Ready for Review after a successful Fly machine job. */
-async function markReadyForReview(config: AppConfig, job: Job, prUrl: string): Promise<void> {
+async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: string): Promise<void> {
   if (!job.issueId) return;
   try {
-    await markIssueReadyForReview(config.linearApiKey, job.issueId, prUrl);
+    await provider.markPrReady(job.issueId, prUrl);
     console.log(`[monitor] Marked ${job.issueIdentifier} as Ready for Review (PR: ${prUrl})`);
   } catch (err) {
     console.error(`[monitor] Failed to mark ${job.issueIdentifier} as Ready for Review:`, err);
@@ -885,15 +998,15 @@ async function markReadyForReview(config: AppConfig, job: Job, prUrl: string): P
 }
 
 /** Remove AI-Working label and reset issue state after a failed/timed-out job. */
-async function resetLinearIssue(config: AppConfig, job: Job): Promise<void> {
+async function resetTicket(provider: TicketingProvider, job: Job): Promise<void> {
   if (!job.issueId) return;
   try {
-    await removeAIWorkingLabel(config.linearApiKey, job.issueId);
+    await provider.clearWorkingState(job.issueId);
 
     // Clear the dedup entry so the issue can be re-dispatched
     deleteDispatched(job.issueId);
 
-    console.log(`[monitor] Reset Linear issue ${job.issueIdentifier}: removed AI-Working label, cleared dedup`);
+    console.log(`[monitor] Reset ticket ${job.issueIdentifier}: cleared working state and dedup`);
   } catch (err) {
     console.error(`[monitor] Failed to reset Linear issue ${job.issueIdentifier}:`, err);
   }
@@ -901,10 +1014,11 @@ async function resetLinearIssue(config: AppConfig, job: Job): Promise<void> {
 
 // ---------- Completion notifications ----------
 
-async function sendCompletionNotifications(config: AppConfig): Promise<void> {
+async function sendCompletionNotifications(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   if (!config.notifyWebhookUrl) return;
 
   const terminalJobs = getUnnotifiedTerminalJobs();
+  const mappings = getMappings();
   for (const job of terminalJobs) {
     try {
       const repoFullName = job.repo || "unknown";
@@ -921,10 +1035,32 @@ async function sendCompletionNotifications(config: AppConfig): Promise<void> {
       const durationMs =
         job.completedAt != null ? job.completedAt - job.dispatchedAt : null;
 
+      // Resolve provider via the job's teamKey -> mapping so the URL matches
+      // the issue's ticketing system. Fall back to the legacy Linear URL if
+      // the mapping is gone (orphaned job).
+      const identifier = job.issueIdentifier || job.issueId;
+      let issueUrl = `https://linear.app/issue/${identifier}`;
+      const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
+      if (mapping) {
+        try {
+          const provider = await registry.forMapping(mapping);
+          issueUrl = provider.issueUrl({
+            id: job.issueId,
+            identifier,
+            title: job.issueTitle || "",
+            description: null,
+            scopeKey: job.teamKey ?? "",
+            nativeStatus: "",
+          });
+        } catch (err) {
+          console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
+        }
+      }
+
       await notifyCompletion(config.notifyType, config.notifyWebhookUrl, {
-        issueIdentifier: job.issueIdentifier || job.issueId,
+        issueIdentifier: identifier,
         issueTitle: job.issueTitle || "Unknown",
-        issueUrl: `https://linear.app/issue/${job.issueIdentifier || job.issueId}`,
+        issueUrl,
         repoFullName,
         status: job.status as "completed" | "failed" | "timed_out",
         conclusion: job.conclusion,
@@ -948,7 +1084,21 @@ async function sendCompletionNotifications(config: AppConfig): Promise<void> {
  * against the dispatch log.  Orphans and stale machines are destroyed
  * immediately; valid in-progress machines are left for the normal monitor.
  */
-async function startupReconciliation(config: AppConfig): Promise<void> {
+function reaperConfig(config: AppConfig, registry: ProviderRegistry) {
+  return {
+    flySessionsToken: config.flySessionsToken,
+    flySessionsApp: config.flySessionsApp,
+    flyOrchestratorApp: config.flyOrchestratorApp,
+    registry,
+    getMappings,
+    reaperDryRun: config.reaperDryRun,
+    notifyType: config.notifyType,
+    notifyWebhookUrl: config.notifyWebhookUrl,
+    reaperAlertThreshold: config.reaperAlertThreshold,
+  };
+}
+
+async function startupReconciliation(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   if (!config.flySessionsToken || !config.flySessionsApp) return;
 
   console.log("[startup] Running machine reconciliation...");
@@ -984,7 +1134,7 @@ async function startupReconciliation(config: AppConfig): Promise<void> {
 
     if (!job) {
       // No dispatch log entry — orphan
-      await safeDestroyMachine(config, machine.id, "startup-orphan");
+      await safeDestroyMachine(reaperConfig(config, registry), machine.id, "startup-orphan");
       if (!config.reaperDryRun) destroyed++;
       continue;
     }
@@ -993,7 +1143,7 @@ async function startupReconciliation(config: AppConfig): Promise<void> {
       job.status === "completed" || job.status === "failed" || job.status === "timed_out";
     if (isTerminal) {
       // Job is done but machine was left running (e.g. service crashed mid-cleanup)
-      await safeDestroyMachine(config, machine.id, "startup-stale-terminal");
+      await safeDestroyMachine(reaperConfig(config, registry), machine.id, "startup-stale-terminal");
       if (!config.reaperDryRun) {
         invalidateNonce(job.id);
         destroyed++;
@@ -1040,6 +1190,14 @@ async function processReconciliations(config: AppConfig): Promise<void> {
         continue;
       }
 
+      if (mapping.paused) {
+        console.log(
+          `[reconcile] Project ${mapping.owner}/${mapping.repo} is paused, skipping reconciliation #${job.id}`,
+        );
+        updateReconciliationStatus(job.id, "skipped");
+        continue;
+      }
+
       const [owner] = job.repo.split("/");
       const ghToken = await getInstallationToken(
         config.githubAppId,
@@ -1076,7 +1234,16 @@ async function processReconciliations(config: AppConfig): Promise<void> {
 
 // ---------- HTTP server ----------
 
-function startServer(config: AppConfig): http.Server {
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", reject);
+  });
+}
+
+function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
   const server = http.createServer((req, res) => {
     const url = req.url || "/";
 
@@ -1095,7 +1262,7 @@ function startServer(config: AppConfig): http.Server {
 
     // Status events from session machines — no admin auth, nonce-validated
     if (url === "/api/status" && req.method === "POST") {
-      handleStatusUpdate(req, res, config.linearApiKey, config.flySessionsApp ?? undefined).catch((err) => {
+      handleStatusUpdate(req, res, registry, getMappings, config.flySessionsApp ?? undefined).catch((err) => {
         console.error("[session-api] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -1134,6 +1301,94 @@ function startServer(config: AppConfig): http.Server {
       return;
     }
 
+    // Runner result callback — HMAC bearer token authenticated
+    if (url === "/runner/result" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        let body: string;
+        try {
+          body = await readBody(req);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to read body" }));
+          return;
+        }
+        let parsed: RunnerResultBody;
+        try {
+          parsed = JSON.parse(body) as RunnerResultBody;
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleRunnerResult({
+          authorization: req.headers.authorization,
+          body: parsed,
+          secret: config.runnerTokenSecret,
+          resolveProvider: async (mappingTeamKey) => {
+            const mapping = getMappings()[mappingTeamKey];
+            if (!mapping) return null;
+            return await registry.forMapping(mapping);
+          },
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[runner-callback] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Gap-fill trigger from target-repo /ai-implement PR comment workflows
+    if (url === "/trigger/gap-fill" && req.method === "POST") {
+      (async () => {
+        let bodyText: string;
+        try {
+          bodyText = await readBody(req);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to read body" }));
+          return;
+        }
+        let parsed: GapFillTriggerBody;
+        try {
+          parsed = JSON.parse(bodyText) as GapFillTriggerBody;
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleGapFillTrigger({
+          authorization: req.headers.authorization,
+          body: parsed,
+          triggerSecret: config.gapFillTriggerSecret,
+          runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+          runnerTokenSecret: config.runnerTokenSecret,
+          getMappings: () => getMappings(),
+          resolveProvider: (mapping) => registry.forMapping(mapping),
+          getInstallationToken: (owner) =>
+            getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[trigger/gap-fill] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
     // Admin routes
     if (url === "/admin" || url.startsWith("/api/")) {
       if (!config.adminAccessCode) {
@@ -1151,7 +1406,7 @@ function startServer(config: AppConfig): http.Server {
         linearApiKey: config.linearApiKey,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-      })) return;
+      }, registry)) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -1180,6 +1435,12 @@ async function main(): Promise<void> {
 
   const config = loadConfig();
 
+  // Phase 2: per-mapping provider resolution. The registry caches one
+  // TicketingProvider per provider id (linear, jira) and resolves on demand
+  // for each mapping. Snapshot polling iterates unique providers; verb calls
+  // (markPlanningStarted, markImplementing, …) resolve at the call site.
+  const registry = new ProviderRegistry(providerConfigFromEnv(), () => getMappings());
+
   const teamRepoMap = getMappings();
 
   const { mode: initialRunnerMode, source: runnerModeSource } = getRunnerMode();
@@ -1206,17 +1467,17 @@ async function main(): Promise<void> {
     }
   }
 
-  const server = startServer(config);
+  const server = startServer(config, registry);
 
   // Reconcile machines from any previous run before starting the poll loop
-  await startupReconciliation(config);
+  await startupReconciliation(config, registry);
 
   // Run first poll immediately
-  await poll(config);
+  await poll(config, registry);
 
   // Schedule subsequent polls
   const interval = setInterval(() => {
-    poll(config);
+    poll(config, registry);
   }, config.pollIntervalMs);
 
   // Graceful shutdown

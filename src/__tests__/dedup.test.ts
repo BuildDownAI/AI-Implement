@@ -113,3 +113,50 @@ describe("reaper actions", () => {
     expect(rows).toHaveLength(3);
   });
 });
+
+describe("runner_tokens table", () => {
+  it("is created on init with the expected columns", () => {
+    const db = dedup.getDb();
+    const cols = db.prepare("PRAGMA table_info(runner_tokens)").all() as Array<{ name: string }>;
+    const names = new Set(cols.map((c) => c.name));
+    expect(names).toContain("dispatch_id");
+    expect(names).toContain("issue_id");
+    expect(names).toContain("phase");
+    expect(names).toContain("expires_at");
+    expect(names).toContain("consumed_at");
+    expect(names).toContain("mapping_team_key");
+  });
+
+  it("drops + recreates the table when an old fork-shape (provider_id + issue_json) is present", async () => {
+    // Set up a DB with the fork's old runner_tokens shape BEFORE init runs.
+    const Database = (await import("better-sqlite3")).default;
+    const seed = new Database(dbPath);
+    seed.exec(`
+      CREATE TABLE runner_tokens (
+        dispatch_id TEXT PRIMARY KEY,
+        issue_id TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        provider_id TEXT NOT NULL,
+        issue_json TEXT NOT NULL
+      )
+    `);
+    seed.prepare(
+      "INSERT INTO runner_tokens (dispatch_id, issue_id, phase, expires_at, consumed_at, provider_id, issue_json) VALUES (?, ?, ?, ?, NULL, ?, ?)",
+    ).run("d1", "i1", "planning", Date.now() + 60000, "linear", "{}");
+    seed.close();
+
+    // Now bring up dedup — its init should detect the old shape and recreate.
+    const db = dedup.getDb();
+    const cols = db.prepare("PRAGMA table_info(runner_tokens)").all() as Array<{ name: string }>;
+    const names = new Set(cols.map((c) => c.name));
+    expect(names).toContain("mapping_team_key");
+    expect(names).not.toContain("provider_id");
+    expect(names).not.toContain("issue_json");
+
+    // Old rows are gone (acceptable: tokens are short-lived).
+    const rows = db.prepare("SELECT COUNT(*) AS n FROM runner_tokens").get() as { n: number };
+    expect(rows.n).toBe(0);
+  });
+});

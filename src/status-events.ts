@@ -1,4 +1,4 @@
-import { postIssueComment } from "./linear.js";
+import type { TicketingProvider } from "./providers/types.js";
 
 export type StatusEvent =
   | { type: "machine_created"; machineName: string }
@@ -64,11 +64,11 @@ export function formatStatusComment(event: StatusEvent, machineLogsUrl?: string)
 }
 
 export async function postStatusComment(
-  apiKey: string,
+  provider: TicketingProvider,
   issueId: string,
   event: StatusEvent,
   machineLogsUrl?: string,
 ): Promise<void> {
   const body = formatStatusComment(event, machineLogsUrl);
-  await postIssueComment(apiKey, issueId, body);
+  await provider.postComment(issueId, body);
 }

@@ -52,6 +52,16 @@ on:
         required: false
         type: string
         default: ""
+      runner_callback_url:
+        description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
+        required: false
+        type: string
+        default: ""
+      run_token:
+        description: "HMAC bearer token authorizing the result POST; empty skips callback"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -284,6 +294,13 @@ jobs:
           ${ISSUE_DESCRIPTION}
 
           ${PLANNING_CONTEXT}
+
+          After implementation completes, write a brief summary as
+          `ai-output/comments/01-summary.md`. Do NOT post comments to the
+          ticketing system directly; the orchestrator handles posting
+          after the workflow completes. The opened PR's URL is captured
+          by a later step from the GitHub context — you don't need to
+          write it manually.
           PROMPT
             else
               cat > /tmp/claude-prompt.md << 'PROMPT'
@@ -299,6 +316,11 @@ jobs:
           ${ISSUE_DESCRIPTION}
 
           ${PLANNING_CONTEXT}
+
+          After implementation completes, write a brief summary as
+          `ai-output/comments/01-summary.md`. Do NOT post comments to the
+          ticketing system directly; the orchestrator handles posting
+          after the workflow completes.
           PROMPT
             fi
             envsubst '${ISSUE_ID} ${ISSUE_IDENTIFIER} ${ISSUE_TITLE} ${ISSUE_DESCRIPTION} ${PR_NUMBER} ${PLANNING_CONTEXT}' \
@@ -774,4 +796,63 @@ jobs:
             exit 1
           fi
           echo "Removed AI-Working label from $ISSUE_ID"
+
+      - name: Capture opened PR URL
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          LINEAR_UPDATE_PR_URL: ${{ steps.linear-update.outputs.pr_url }}
+        run: |
+          mkdir -p ai-output
+          PR_URL="${LINEAR_UPDATE_PR_URL:-}"
+          if [ -z "$PR_URL" ]; then
+            BRANCH=$(git rev-parse --abbrev-ref HEAD)
+            PR_URL=$(gh pr list --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+          fi
+          if [ -n "$PR_URL" ]; then
+            echo "$PR_URL" > ai-output/pr-url.txt
+            echo "Captured PR URL: $PR_URL"
+          else
+            echo "No PR URL to capture."
+          fi
+
+      - name: Post results to orchestrator
+        if: always()
+        env:
+          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
+          RUN_TOKEN: ${{ inputs.run_token }}
+          JOB_STATUS: ${{ job.status }}
+        shell: /usr/bin/bash -e {0}
+        run: |
+          set -uo pipefail
+          if [ -z "${RUNNER_CALLBACK_URL:-}" ] || [ -z "${RUN_TOKEN:-}" ]; then
+            echo "Runner callback URL or token not provided; skipping result POST."
+            exit 0
+          fi
+
+          mkdir -p ai-output/comments
+          COMMENTS=$(jq -n '[]')
+          for f in $(ls ai-output/comments/*.md 2>/dev/null | sort); do
+            BODY=$(jq -Rs '.' < "$f")
+            COMMENTS=$(echo "$COMMENTS" | jq --argjson body "$BODY" '. + [{"body": $body}]')
+          done
+
+          PR_URL=""
+          if [ -f ai-output/pr-url.txt ]; then
+            PR_URL=$(cat ai-output/pr-url.txt)
+          fi
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" --arg pr "$PR_URL" \
+              '{phase: "implementation", outcome: "success", comments: $comments, prUrl: $pr}')
+          else
+            REASON=$(tail -c 4000 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "job failed")
+            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" --arg reason "$REASON" \
+              '{phase: "implementation", outcome: "failure", failureReason: $reason, comments: $comments}')
+          fi
+
+          curl -fsS --max-time 30 -X POST "${RUNNER_CALLBACK_URL%/}/runner/result" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RUN_TOKEN" \
+            --data-raw "$PAYLOAD"
 

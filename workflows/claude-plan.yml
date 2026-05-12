@@ -44,6 +44,16 @@ on:
         required: false
         type: string
         default: ""
+      runner_callback_url:
+        description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
+        required: false
+        type: string
+        default: ""
+      run_token:
+        description: "HMAC bearer token authorizing the result POST; empty skips callback"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -148,7 +158,7 @@ jobs:
           else
             echo "No PLANNING.md found, using default prompt"
             cat > /tmp/claude-prompt.md << 'PROMPT'
-          You are a senior software architect performing a read-only planning analysis. Do NOT create any branches, files, or pull requests. Do NOT write any code. Explore the codebase and post structured planning comments to Linear.
+          You are a senior software architect performing a read-only planning analysis. Do NOT create any branches, files, or pull requests. Do NOT write any code. Explore the codebase and produce structured planning comments.
 
           **Issue:** ${ISSUE_IDENTIFIER} — ${ISSUE_TITLE}
 
@@ -170,18 +180,14 @@ jobs:
 
           1. Use Read, Glob, and Grep to explore the codebase — understand the relevant existing code, patterns, files that would need to change, and potential risks.
 
-          2. Post planning comments to Linear using `curl`. The LINEAR_API_KEY and ISSUE_ID environment variables are available.
+          2. Write each planning comment as a separate Markdown file under
+             `ai-output/comments/`, prefixed with a two-digit sequence number to
+             control order (e.g. `01-architecture.md`, `02-test-plan.md`,
+             `03-cross-story.md`). Do NOT post comments directly to the
+             ticketing system — the orchestrator handles posting after the
+             workflow completes.
 
-             Use this pattern for each comment:
-             ```
-             curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-               -H "Content-Type: application/json" \
-               -H "Authorization: $LINEAR_API_KEY" \
-               --data-raw "$(jq -n --arg id "$ISSUE_ID" --arg body "BODY" \
-                 '{query: "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", variables: {id: $id, body: $body}}')"
-             ```
-
-          3. Post EXACTLY these comments in order:
+          3. Write EXACTLY these comments as files in order:
 
           ### Comment 1 — Architecture Analysis
 
@@ -390,3 +396,38 @@ jobs:
               --arg issueId "$ISSUE_ID" \
               '{query: "mutation($id: String!, $labelIds: [String!]!) { issueUpdate(id: $id, input: { labelIds: $labelIds }) { success } }", variables: {id: $issueId, labelIds: $ids}}')"
           echo "Updated labels on $ISSUE_IDENTIFIER (status: $JOB_STATUS)"
+
+      - name: Post results to orchestrator
+        if: always()
+        env:
+          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
+          RUN_TOKEN: ${{ inputs.run_token }}
+          JOB_STATUS: ${{ job.status }}
+        shell: /usr/bin/bash -e {0}
+        run: |
+          set -uo pipefail
+          if [ -z "${RUNNER_CALLBACK_URL:-}" ] || [ -z "${RUN_TOKEN:-}" ]; then
+            echo "Runner callback URL or token not provided; skipping result POST."
+            exit 0
+          fi
+
+          mkdir -p ai-output/comments
+          COMMENTS=$(jq -n '[]')
+          for f in $(ls ai-output/comments/*.md 2>/dev/null | sort); do
+            BODY=$(jq -Rs '.' < "$f")
+            COMMENTS=$(echo "$COMMENTS" | jq --argjson body "$BODY" '. + [{"body": $body}]')
+          done
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" \
+              '{phase: "planning", outcome: "success", comments: $comments}')
+          else
+            REASON=$(tail -c 4000 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "job failed")
+            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" --arg reason "$REASON" \
+              '{phase: "planning", outcome: "failure", failureReason: $reason, comments: $comments}')
+          fi
+
+          curl -fsS --max-time 30 -X POST "${RUNNER_CALLBACK_URL%/}/runner/result" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RUN_TOKEN" \
+            --data-raw "$PAYLOAD"

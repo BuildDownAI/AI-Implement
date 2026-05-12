@@ -1,5 +1,5 @@
 import type { RepoMapping } from "./config.js";
-import type { LinearIssue } from "./linear.js";
+import type { TicketIssue } from "./providers/types.js";
 
 export interface Blocker {
   issueId: string;
@@ -11,14 +11,14 @@ export interface Blocker {
 }
 
 export function selectBlockers(
-  issues: LinearIssue[],
+  issues: TicketIssue[],
   teamRepoMap: Record<string, RepoMapping>,
   inProgressCountsByTeam: Record<string, number>,
   isAlreadyDispatched: (issueId: string) => boolean,
 ): Blocker[] {
   const blockers: Blocker[] = [];
   for (const issue of issues) {
-    const teamKey = issue.team.key;
+    const teamKey = issue.scopeKey;
     const mapping = teamRepoMap[teamKey];
     if (!mapping) {
       blockers.push({
@@ -64,11 +64,11 @@ export function selectBlockers(
 }
 
 export function selectIssuesToDispatch(
-  issues: LinearIssue[],
+  issues: TicketIssue[],
   teamRepoMap: Record<string, RepoMapping>,
   inProgressCountsByTeam: Record<string, number>,
   isAlreadyDispatched: (issueId: string) => boolean,
-): LinearIssue[] {
+): TicketIssue[] {
   const availableSlotsByTeam: Record<string, number> = {};
 
   for (const [teamKey, mapping] of Object.entries(teamRepoMap)) {
@@ -78,18 +78,18 @@ export function selectIssuesToDispatch(
     );
   }
 
-  const selected: LinearIssue[] = [];
+  const selected: TicketIssue[] = [];
   for (const issue of issues) {
     if (isAlreadyDispatched(issue.id)) continue;
 
-    const mapping = teamRepoMap[issue.team.key];
+    const mapping = teamRepoMap[issue.scopeKey];
     if (!mapping) continue;
 
-    const availableSlots = availableSlotsByTeam[issue.team.key] ?? 0;
+    const availableSlots = availableSlotsByTeam[issue.scopeKey] ?? 0;
     if (availableSlots <= 0) continue;
 
     selected.push(issue);
-    availableSlotsByTeam[issue.team.key] = availableSlots - 1;
+    availableSlotsByTeam[issue.scopeKey] = availableSlots - 1;
   }
 
   return selected;
