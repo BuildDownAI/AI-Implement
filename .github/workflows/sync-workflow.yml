@@ -144,6 +144,30 @@ jobs:
             CHANGES_MADE=true
           }
 
+          remote_file_exists() {
+            local REMOTE="$1"
+            local REF="$2"
+            gh api "repos/$REPO/contents/$REMOTE?ref=$REF" > /dev/null 2>&1
+          }
+
+          seed_once_file() {
+            local LOCAL="$1"
+            local REMOTE="$2"
+            local MSG="$3"
+
+            if remote_file_exists "$REMOTE" "$TARGET_BASE"; then
+              echo "  Skipping $REMOTE (already exists in $REPO on $TARGET_BASE)"
+              return
+            fi
+
+            if remote_file_exists "$REMOTE" "$SYNC_BRANCH"; then
+              echo "  Skipping $REMOTE (already exists in $REPO on $SYNC_BRANCH)"
+              return
+            fi
+
+            sync_file "$LOCAL" "$REMOTE" "$MSG"
+          }
+
           echo "==> $REPO"
 
           # 1. claude-implement.yml — always sync
@@ -166,37 +190,43 @@ jobs:
 
           # 4. WORKFLOW.md — seed once only; never overwrite (each repo owns its own prompt template)
           if [ -f "workflows/WORKFLOW.md" ]; then
-            if ! gh api "repos/$REPO/contents/WORKFLOW.md?ref=$TARGET_BASE" > /dev/null 2>&1; then
-              sync_file \
-                "workflows/WORKFLOW.md" \
-                "WORKFLOW.md" \
-                "Add WORKFLOW.md prompt template (customise for this repo)"
-            else
-              echo "  Skipping WORKFLOW.md (already exists in $REPO)"
-            fi
+            seed_once_file \
+              "workflows/WORKFLOW.md" \
+              "WORKFLOW.md" \
+              "Add WORKFLOW.md prompt template (customise for this repo)"
           fi
 
           # 5. PLANNING.md — seed once only; never overwrite (each repo owns its own planning template)
           if [ -f "workflows/PLANNING.md" ]; then
-            if ! gh api "repos/$REPO/contents/PLANNING.md?ref=$TARGET_BASE" > /dev/null 2>&1; then
-              sync_file \
-                "workflows/PLANNING.md" \
-                "PLANNING.md" \
-                "Add PLANNING.md planning template (customise for this repo)"
-            else
-              echo "  Skipping PLANNING.md (already exists in $REPO)"
-            fi
-          fi
-
-          if [ "$CHANGES_MADE" = "false" ]; then
-            echo "  No changes, skipping PR"
-            exit 0
+            seed_once_file \
+              "workflows/PLANNING.md" \
+              "PLANNING.md" \
+              "Add PLANNING.md planning template (customise for this repo)"
           fi
 
           # Open a PR if one isn't already open for the sync branch
           EXISTING_PR=$(gh api "repos/$REPO/pulls?state=open" \
             --jq "[.[] | select(.head.ref == \"$SYNC_BRANCH\")] | .[0].number" \
             2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+            EXISTING_PR_BASE=$(gh api "repos/$REPO/pulls/$EXISTING_PR" \
+              --jq '.base.ref' 2>/dev/null || echo "")
+            if [ "$EXISTING_PR_BASE" != "$TARGET_BASE" ]; then
+              gh api -X PATCH "repos/$REPO/pulls/$EXISTING_PR" \
+                -f base="$TARGET_BASE" >/dev/null
+              echo "  Retargeted PR #$EXISTING_PR from ${EXISTING_PR_BASE:-unknown} to $TARGET_BASE"
+            fi
+          fi
+
+          if [ "$CHANGES_MADE" = "false" ]; then
+            if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+              echo "  No file changes; PR #$EXISTING_PR already open in $REPO"
+            else
+              echo "  No changes, skipping PR"
+            fi
+            exit 0
+          fi
 
           if [ -z "$EXISTING_PR" ] || [ "$EXISTING_PR" = "null" ]; then
             PR_BODY=$(printf 'Auto-synced from ai-implement.\n\n**Always updated:**\n- `.github/workflows/claude-implement.yml`\n- `.github/workflows/comment-trigger.yml`\n- `.github/workflows/claude-plan.yml`\n\n**Added once (never overwritten):**\n- `WORKFLOW.md` — Claude implementation prompt template; customise this for your repo\n- `PLANNING.md` — Claude planning prompt template; customise this for your repo')
