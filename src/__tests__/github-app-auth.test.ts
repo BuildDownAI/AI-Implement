@@ -43,7 +43,7 @@ afterEach(() => {
 describe("getInstallationToken", () => {
   it("fetches and returns an installation token", async () => {
     vi.mocked(fetch).mockImplementation(mockFetch([
-      { ok: true, json: { id: 42 } },                              // GET /orgs/:org/installation
+      { ok: true, json: { id: 42 } },                              // GET /orgs/:owner/installation
       { ok: true, json: { token: "ghs_abc123", expires_at: "" } }, // POST /app/installations/:id/access_tokens
     ]));
 
@@ -56,6 +56,27 @@ describe("getInstallationToken", () => {
 
     const [tokenUrl] = vi.mocked(fetch).mock.calls[1];
     expect(tokenUrl).toBe("https://api.github.com/app/installations/42/access_tokens");
+  });
+
+  it("falls back to the user installation endpoint when the owner is not an org", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: false, status: 404, text: "Not Found" },
+      { ok: true, json: { id: 43 } },
+      { ok: true, json: { token: "ghs_user", expires_at: "" } },
+    ]));
+
+    const token = await getInstallationToken(APP_ID, privateKey, "my-user");
+    expect(token).toBe("ghs_user");
+    expect(fetch).toHaveBeenCalledTimes(3);
+
+    const [orgInstallUrl] = vi.mocked(fetch).mock.calls[0];
+    expect(orgInstallUrl).toBe("https://api.github.com/orgs/my-user/installation");
+
+    const [userInstallUrl] = vi.mocked(fetch).mock.calls[1];
+    expect(userInstallUrl).toBe("https://api.github.com/users/my-user/installation");
+
+    const [tokenUrl] = vi.mocked(fetch).mock.calls[2];
+    expect(tokenUrl).toBe("https://api.github.com/app/installations/43/access_tokens");
   });
 
   it("returns a cached token without re-fetching", async () => {
@@ -71,7 +92,7 @@ describe("getInstallationToken", () => {
     expect(fetch).toHaveBeenCalledTimes(2); // only called once per token, not twice per call
   });
 
-  it("maintains separate caches per org", async () => {
+  it("maintains separate caches per owner", async () => {
     vi.mocked(fetch).mockImplementation(mockFetch([
       { ok: true, json: { id: 1 } },
       { ok: true, json: { token: "token-org1", expires_at: "" } },
@@ -85,13 +106,14 @@ describe("getInstallationToken", () => {
     expect(t2).toBe("token-org2");
   });
 
-  it("throws if the app is not installed on the org", async () => {
+  it("throws if the app is not installed for either owner endpoint", async () => {
     vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: false, status: 404, text: "Not Found" },
       { ok: false, status: 404, text: "Not Found" },
     ]));
 
     await expect(getInstallationToken(APP_ID, privateKey, "unknown-org"))
-      .rejects.toThrow('GitHub App not installed on org "unknown-org"');
+      .rejects.toThrow('GitHub App not installed for owner "unknown-org"');
   });
 
   it("throws if the installation token request fails", async () => {
@@ -101,7 +123,7 @@ describe("getInstallationToken", () => {
     ]));
 
     await expect(getInstallationToken(APP_ID, privateKey, "my-org"))
-      .rejects.toThrow('Failed to get installation token for org "my-org"');
+      .rejects.toThrow('Failed to get installation token for owner "my-org"');
   });
 
   it("sends a JWT Authorization header to the installation endpoint", async () => {
