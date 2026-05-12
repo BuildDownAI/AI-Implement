@@ -74,13 +74,13 @@ TOML
 fi
 
 # Read values from config (section-aware parsing)
-APP_NAME=$(awk '/^\[fly\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'app_name' | head -1 | sed 's/.*= *//' | tr -d '"')
-FLY_ORG=$(awk '/^\[fly\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'org ' | head -1 | sed 's/.*= *//' | tr -d '"')
-REGION=$(awk '/^\[fly\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'region' | head -1 | sed 's/.*= *//' | tr -d '"')
+APP_NAME=$(awk '/^\[fly\]/,/^\[/' "$CONFIG_FILE" | grep 'app_name' | head -1 | sed 's/.*= *//' | tr -d '"')
+FLY_ORG=$(awk '/^\[fly\]/,/^\[/' "$CONFIG_FILE" | grep 'org ' | head -1 | sed 's/.*= *//' | tr -d '"')
+REGION=$(awk '/^\[fly\]/,/^\[/' "$CONFIG_FILE" | grep 'region' | head -1 | sed 's/.*= *//' | tr -d '"')
 
-SESSIONS_APP=$(awk '/^\[sessions\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'app_name' | head -1 | sed 's/.*= *//' | tr -d '"')
-SESSIONS_ORG=$(awk '/^\[sessions\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'org ' | head -1 | sed 's/.*= *//' | tr -d '"')
-SESSIONS_REGION=$(awk '/^\[sessions\]/{f=1;next}/^\[/{f=0}f' "$CONFIG_FILE" | grep 'region' | head -1 | sed 's/.*= *//' | tr -d '"')
+SESSIONS_APP=$(awk '/^\[sessions\]/,/^\[/' "$CONFIG_FILE" | grep 'app_name' | head -1 | sed 's/.*= *//' | tr -d '"')
+SESSIONS_ORG=$(awk '/^\[sessions\]/,/^\[/' "$CONFIG_FILE" | grep 'org ' | head -1 | sed 's/.*= *//' | tr -d '"')
+SESSIONS_REGION=$(awk '/^\[sessions\]/,/^\[/' "$CONFIG_FILE" | grep 'region' | head -1 | sed 's/.*= *//' | tr -d '"')
 
 # Fallback defaults if [sessions] section is missing
 SESSIONS_APP="${SESSIONS_APP:-ai-implement-sessions-${SLUG}}"
@@ -216,31 +216,62 @@ echo "FLY_SESSIONS_TOKEN: Fly API token for the '${SESSIONS_ORG}' org."
 echo "  Generate one with: fly tokens create org --org ${SESSIONS_ORG}"
 read_secret "FLY_SESSIONS_TOKEN" "FLY_SESSIONS_TOKEN (Fly API token for ${SESSIONS_ORG} org)" "true"
 
-# ---------- 5. Collect target repos (printed in next-steps) ----------
+# ---------- 5. Link GitHub repos ----------
+
+SYNC_WORKFLOW=".github/workflows/sync-workflow.yml"
 
 echo ""
-echo "=== Target repos ==="
-echo "Target repos receive the synced workflow templates via sync-workflow.yml,"
-echo "dispatched per-repo. Enter repos as owner/repo (e.g. acme/api)."
-echo "Press Enter when done. (You can also dispatch sync later with no entries here.)"
+echo "=== Link GitHub repos ==="
+echo "Add target repos so the workflow templates (claude-implement.yml, etc.)"
+echo "are synced to them. Enter repos as owner/repo (e.g. acme/my-app)."
+echo "Press Enter with no input when done."
 echo ""
 
-TARGET_REPOS=()
+REPOS_ADDED=false
 while true; do
-  read -rp "Target repo (owner/repo, or Enter to skip): " REPO_INPUT
+  read -rp "GitHub repo to link (owner/repo, or Enter to skip): " REPO_INPUT
   [ -z "$REPO_INPUT" ] && break
 
+  # Validate format
   if ! echo "$REPO_INPUT" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
-    echo "  Invalid format. Use owner/repo (e.g. acme/api)."
+    echo "  Invalid format. Use owner/repo (e.g. acme/my-app)"
     continue
   fi
 
-  TARGET_REPOS+=("$REPO_INPUT")
-  echo "  Added: $REPO_INPUT"
+  REPO_OWNER=$(echo "$REPO_INPUT" | cut -d/ -f1)
+
+  # Check if already in sync workflow
+  if grep -qF "$REPO_INPUT" "$SYNC_WORKFLOW" 2>/dev/null; then
+    echo "  $REPO_INPUT is already in sync-workflow.yml, skipping."
+    continue
+  fi
+
+  # Add to the matrix — insert before the closing "steps:" line
+  # Find the last matrix entry and append after it
+  sed -i.bak "/^    steps:$/i\\
+          - repo: ${REPO_INPUT}\\
+            owner: ${REPO_OWNER}" "$SYNC_WORKFLOW"
+  rm -f "${SYNC_WORKFLOW}.bak"
+
+  echo "  Added $REPO_INPUT to sync-workflow.yml"
+  REPOS_ADDED=true
 done
 
-# Detect this repo's owner/name for printing dispatch commands.
-ORCH_REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo "")
+if [ "$REPOS_ADDED" = "true" ]; then
+  echo ""
+  echo "New repos added to sync-workflow.yml."
+  read -rp "Commit and push to trigger the sync workflow? [Y/n]: " PUSH_CONFIRM
+  PUSH_CONFIRM="${PUSH_CONFIRM:-Y}"
+  if [[ "$PUSH_CONFIRM" =~ ^[Yy] ]]; then
+    git add "$SYNC_WORKFLOW"
+    git commit -m "Add repos to workflow sync matrix for client: $SLUG"
+    git push
+    echo "  Pushed. The sync workflow will run automatically."
+    echo "  Check progress: gh run list --workflow=sync-workflow.yml --limit 1"
+  else
+    echo "  Skipped. Remember to commit and push $SYNC_WORKFLOW to trigger the sync."
+  fi
+fi
 
 # ---------- 6. Done ----------
 
@@ -254,26 +285,11 @@ echo ""
 echo "  Next steps:"
 echo "    1. Commit clients/${SLUG}.toml and push to main to deploy:"
 echo "       git add clients/${SLUG}.toml && git commit -m 'Add client: $SLUG' && git push"
-echo "    2. Set GitHub Actions secrets on the orchestrator + target repos:"
-if [ "${#TARGET_REPOS[@]}" -gt 0 ] && [ -n "$ORCH_REPO" ]; then
-  echo "       ./scripts/set-github-secrets.sh $ORCH_REPO ${TARGET_REPOS[*]}"
-elif [ -n "$ORCH_REPO" ]; then
-  echo "       ./scripts/set-github-secrets.sh $ORCH_REPO <target-repo> [<target-repo>...]"
-else
-  echo "       ./scripts/set-github-secrets.sh <orchestrator-repo> <target-repo> [<target-repo>...]"
-fi
-echo "    3. Install the GitHub App on each target repo"
-echo "    4. Enable 'Allow GitHub Actions to create and approve pull requests'"
+echo "    2. Merge the sync PR in each target repo (opens automatically)"
+echo "    3. Enable 'Allow GitHub Actions to create and approve pull requests'"
 echo "       in each target repo: Settings → Actions → General"
-echo "    5. Dispatch sync-workflow.yml per target repo:"
-if [ "${#TARGET_REPOS[@]}" -gt 0 ] && [ -n "$ORCH_REPO" ]; then
-  for repo in "${TARGET_REPOS[@]}"; do
-    echo "       gh workflow run sync-workflow.yml --repo $ORCH_REPO -f target_repo=$repo"
-  done
-else
-  echo "       gh workflow run sync-workflow.yml --repo <orchestrator-repo> -f target_repo=<target-repo>"
-fi
-echo "    6. Add team→repo mappings via the admin UI at /admin"
+echo "    4. Install the GitHub App on each target repo"
+echo "    5. Add team→repo mappings via the admin UI at /admin"
 echo ""
 echo "  To re-run this script (update secrets, add more repos):"
 echo "    ./scripts/provision-client.sh $SLUG"
