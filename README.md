@@ -63,6 +63,10 @@ Then in your Linear workspace, create an `AI-Implement` label. In the orchestrat
 gh workflow run sync-workflow.yml -f target_repo=your-org/your-repo
 ```
 
+The synced workflows allow the GitHub App bot that minted the workflow token by
+default. To allow a different bot or a comma-separated allow-list, set the
+`AI_IMPLEMENT_ALLOWED_BOTS` Actions variable on the target repo or org.
+
 Merge the resulting PR in the target repo, enable "Allow GitHub Actions to create and approve pull requests" in its settings, install the GitHub App on it, then label any Linear issue `AI-Implement` and watch.
 
 The full architecture, env-var reference, SQLite schema, multi-client deploy model, and Bedrock setup live in [`CLAUDE.md`](CLAUDE.md).
