@@ -43,6 +43,7 @@ function makeMappingsFn(teamKey: string): () => Record<string, RepoMapping> {
     ticketingProvider: "linear" as const,
     ticketingConfig: { kind: "linear" as const },
     awsRegion: null,
+    paused: false,
   };
   return () => ({ [teamKey]: mapping });
 }

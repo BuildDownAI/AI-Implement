@@ -117,6 +117,7 @@ const baseMapping: Omit<RepoMapping, "ticketingProvider" | "ticketingConfig"> = 
   extraEnv: {},
   provider: "anthropic",
   awsRegion: null,
+  paused: false,
 };
 
 const jiraMapping = (

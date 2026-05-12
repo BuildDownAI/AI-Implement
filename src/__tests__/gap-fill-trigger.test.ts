@@ -59,6 +59,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     awsRegion: null,
     ticketingProvider: "linear",
     ticketingConfig: { kind: "linear" },
+    paused: false,
     ...overrides,
   };
 }
@@ -151,6 +152,27 @@ describe("handleGapFillTrigger", () => {
     );
     expect(res.status).toBe(404);
     expect(res.body.error).toBe("mapping_not_found");
+  });
+
+  it("returns 423 when the matching mapping is paused", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing", paused: true });
+    const issue = makeIssue({ id: "issue-uuid-1", identifier: "ACME-123", scopeKey: "ACME" });
+    const provider = new FakeProvider({ initialIssues: [issue] });
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+
+    const res = await handleGapFillTrigger(
+      makeInput({
+        body: { issueKey: "ACME-123", prNumber: 42 },
+        getMappings: () => ({ ACME: mapping }),
+        resolveProvider: async () => provider,
+        dispatchWorkflow: dispatchSpy,
+      }),
+    );
+
+    expect(res.status).toBe(423);
+    expect(res.body.error).toBe("project_paused");
+    expect(res.body.teamKey).toBe("ACME");
+    expect(dispatchSpy).not.toHaveBeenCalled();
   });
 
   it("dispatches comment-trigger.yml and returns 200 on success", async () => {

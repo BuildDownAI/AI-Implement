@@ -19,7 +19,9 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     extraEnv: {},
     provider: "anthropic",
     ticketingProvider: "linear",
+    ticketingConfig: { kind: "linear" },
     awsRegion: null,
+    paused: false,
     ...overrides,
   };
 }

@@ -29,6 +29,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     ticketingProvider: "linear",
     ticketingConfig: { kind: "linear" },
     awsRegion: null,
+    paused: false,
     ...overrides,
   };
 }
@@ -411,6 +412,64 @@ describe("config", () => {
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("JIR-BAD"));
       warn.mockRestore();
     });
+  });
+
+  it("upsertMapping defaults paused to false when not set", () => {
+    config.initMappingsTable();
+    config.upsertMapping("PAU", mapping({ owner: "org", repo: "p" }));
+    expect(config.getMappings().PAU.paused).toBe(false);
+  });
+
+  it("upsertMapping round-trips paused=true", () => {
+    config.initMappingsTable();
+    config.upsertMapping("PAU", mapping({ owner: "org", repo: "p", paused: true }));
+    expect(config.getMappings().PAU.paused).toBe(true);
+  });
+
+  it("setMappingPaused toggles the column and returns true on success", () => {
+    config.initMappingsTable();
+    config.upsertMapping("PAU", mapping({ owner: "org", repo: "p" }));
+    expect(config.setMappingPaused("PAU", true)).toBe(true);
+    expect(config.getMappings().PAU.paused).toBe(true);
+    expect(config.setMappingPaused("PAU", false)).toBe(true);
+    expect(config.getMappings().PAU.paused).toBe(false);
+  });
+
+  it("setMappingPaused returns false for an unknown team", () => {
+    config.initMappingsTable();
+    expect(config.setMappingPaused("NOPE", true)).toBe(false);
+  });
+
+  it("migrates a pre-existing mappings table to include the paused column with default false", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL,
+        max_in_progress_ai_issues INTEGER NOT NULL DEFAULT 3,
+        execution_mode TEXT NOT NULL DEFAULT 'github-actions',
+        session_mode TEXT NOT NULL DEFAULT 'autonomous',
+        machine_cpus INTEGER NOT NULL DEFAULT 2,
+        machine_memory_mb INTEGER NOT NULL DEFAULT 4096,
+        planning_enabled INTEGER NOT NULL DEFAULT 0,
+        planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
+        auto_approve_plans INTEGER NOT NULL DEFAULT 1,
+        extra_env TEXT,
+        provider TEXT NOT NULL DEFAULT 'anthropic',
+        ticketing_provider TEXT NOT NULL DEFAULT 'linear',
+        ticketing_config TEXT NOT NULL DEFAULT '{"kind":"linear"}',
+        aws_region TEXT
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.paused).toBe(false);
   });
 
   it("getMappings falls back to {} when extra_env contains invalid JSON", () => {

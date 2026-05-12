@@ -221,6 +221,54 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(404);
   });
 
+  it("toggles paused via PATCH", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "PAU", owner: "org", repo: "p" }, token);
+    const patch = await request("/api/mappings/PAU", "PATCH", "secret", { paused: true }, token);
+    expect(patch.statusCode).toBe(200);
+    expect(JSON.parse(patch.body)).toMatchObject({ updated: true, paused: true });
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).PAU.paused).toBe(true);
+  });
+
+  it("returns 404 on PATCH paused for unknown team", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings/NOPE", "PATCH", "secret", { paused: true }, token);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("rejects PATCH that specifies both paused and maxInProgressAiIssues", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AMB", owner: "org", repo: "a" }, token);
+    const res = await request(
+      "/api/mappings/AMB",
+      "PATCH",
+      "secret",
+      { paused: true, maxInProgressAiIssues: 5 },
+      token,
+    );
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("upsert preserves existing paused state when body omits it", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "EDT", owner: "org", repo: "r" }, token);
+    await request("/api/mappings/EDT", "PATCH", "secret", { paused: true }, token);
+
+    // Re-POST the mapping (Edit form path) without specifying paused.
+    await request(
+      "/api/mappings",
+      "POST",
+      "secret",
+      { teamKey: "EDT", owner: "org", repo: "r", maxInProgressAiIssues: 5 },
+      token,
+    );
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).EDT.paused).toBe(true);
+    expect(JSON.parse(list.body).EDT.maxInProgressAiIssues).toBe(5);
+  });
+
   it("deletes a mapping via DELETE", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "DEL", owner: "org", repo: "del" }, token);

@@ -16,7 +16,7 @@ export const projectsHtml = `
           <thead>
             <tr>
               <th>Team</th><th>Repo</th><th>Runner</th><th>Session</th>
-              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th></th>
+              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th>Status</th><th></th>
             </tr>
           </thead>
           <tbody id="mappings-body"></tbody>
@@ -220,6 +220,10 @@ export const projectsScript = `
       const providerBadge = m.provider === 'bedrock'
         ? '<span class="badge warn">bedrock</span>'
         : '<span class="text-tertiary" style="font-size:0.85em">anthropic</span>';
+      const statusBadge = m.paused
+        ? '<span class="badge warn">paused</span>'
+        : '<span class="badge success">active</span>';
+      const pauseLabel = m.paused ? 'Resume' : 'Pause';
       tr.innerHTML = '<td class="mono">' + ek + '</td>'
         + '<td class="mono">' + window.esc(m.owner) + '/' + window.esc(m.repo) + '</td>'
         + '<td>' + execBadge + '</td>'
@@ -227,7 +231,9 @@ export const projectsScript = `
         + '<td style="text-align:center">' + window.esc(String(m.maxInProgressAiIssues ?? 3)) + '</td>'
         + '<td>' + planBadge + '</td>'
         + '<td>' + providerBadge + '</td>'
+        + '<td>' + statusBadge + '</td>'
         + '<td style="white-space:nowrap">'
+          + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
           + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
           + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
           + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
@@ -621,6 +627,20 @@ export const projectsScript = `
     await loadMappings();
   }
   window.delMapping = delMapping;
+
+  async function togglePause(key, currentlyPaused) {
+    const nextPaused = !currentlyPaused;
+    const res = await window.api('/api/mappings/' + encodeURIComponent(key), {
+      method: 'PATCH',
+      body: JSON.stringify({ paused: nextPaused }),
+    });
+    if (!res.ok) {
+      alert('Failed to ' + (nextPaused ? 'pause' : 'resume') + ' project');
+      return;
+    }
+    await loadMappings();
+  }
+  window.togglePause = togglePause;
 
   async function showSecrets(teamKey) {
     currentSecretsTeam = teamKey;

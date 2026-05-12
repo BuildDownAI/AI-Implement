@@ -87,6 +87,9 @@ export async function handleGapFillTrigger(
   if (!owningScopeKey || !owningMapping || !owningIssueId) {
     return bad(404, "mapping_not_found");
   }
+  if (owningMapping.paused) {
+    return bad(423, "project_paused", { teamKey: owningScopeKey });
+  }
 
   let runnerCallbackUrl = "";
   let runToken = "";

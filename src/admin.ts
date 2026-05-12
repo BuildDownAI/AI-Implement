@@ -13,6 +13,7 @@ import {
   DEFAULT_PROVIDER,
   upsertMapping,
   updateMappingCap,
+  setMappingPaused,
   deleteMapping,
 } from "./config.js";
 import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider } from "./config.js";
@@ -572,7 +573,25 @@ async function handlePatchMapping(
   teamKey: string,
 ): Promise<void> {
   try {
-    const body = JSON.parse(await readBody(req)) as { maxInProgressAiIssues?: number };
+    const body = JSON.parse(await readBody(req)) as {
+      maxInProgressAiIssues?: number;
+      paused?: boolean;
+    };
+    const hasPaused = typeof body.paused === "boolean";
+    const hasCap = body.maxInProgressAiIssues !== undefined;
+    if (hasPaused && hasCap) {
+      json(res, 400, { error: "Specify either paused or maxInProgressAiIssues, not both" });
+      return;
+    }
+    if (hasPaused) {
+      const updated = setMappingPaused(teamKey, body.paused as boolean);
+      if (!updated) {
+        json(res, 404, { error: "Team not found" });
+        return;
+      }
+      json(res, 200, { updated, paused: body.paused });
+      return;
+    }
     const max = body.maxInProgressAiIssues;
     if (!Number.isInteger(max) || (max as number) < 1) {
       json(res, 400, { error: "maxInProgressAiIssues must be a positive integer" });
@@ -911,6 +930,7 @@ async function handleUpsertMapping(
       awsRegion?: string | null;
       ticketingProvider?: string;
       ticketingConfig?: unknown;
+      paused?: boolean;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1019,6 +1039,11 @@ async function handleUpsertMapping(
       ticketingProvider: ticketing.ticketingProvider,
       ticketingConfig: ticketing.ticketingConfig,
       awsRegion,
+      // Preserve current paused state if the request didn't include it,
+      // so an Edit form that omits `paused` doesn't silently resume the project.
+      paused: body.paused !== undefined
+        ? body.paused === true
+        : (getMappings()[body.teamKey]?.paused ?? false),
     };
 
     upsertMapping(body.teamKey, mapping);

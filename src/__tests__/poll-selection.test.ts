@@ -31,7 +31,9 @@ function makeMapping(maxInProgressAiIssues = 3): RepoMapping {
     extraEnv: {},
     provider: "anthropic",
     ticketingProvider: "linear",
+    ticketingConfig: { kind: "linear" },
     awsRegion: null,
+    paused: false,
   };
 }
 

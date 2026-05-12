@@ -205,7 +205,20 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const inProgressCountsByTeam = inProgressCountsByScope;
     console.log(`[poll] Found ${needsPlanning.length} needing planning, ${readyForImplementation.length} ready for implementation`);
 
-    const teamRepoMap = getMappings();
+    // Build the dispatch view of mappings: hide paused ones so the poller
+    // skips them entirely (no new dispatches, no planning, no gap-fill). The
+    // unfiltered `getMappings()` is still used elsewhere for reconciliation
+    // and runner-callback handling, so in-flight runs that started before
+    // pause finish normally.
+    const allMappingsForDispatch = getMappings();
+    const teamRepoMap: Record<string, RepoMapping> = {};
+    for (const [k, m] of Object.entries(allMappingsForDispatch)) {
+      if (m.paused) {
+        console.log(`[poll] Skipping paused project ${k} (${m.owner}/${m.repo})`);
+        continue;
+      }
+      teamRepoMap[k] = m;
+    }
 
     // Implementation issues have priority over planning issues for slot allocation.
     // Both consume slots from the same per-team capacity pool.
@@ -1172,6 +1185,14 @@ async function processReconciliations(config: AppConfig): Promise<void> {
       if (!mapping) {
         console.warn(
           `[reconcile] No mapping found for repo ${job.repo}, skipping reconciliation #${job.id}`,
+        );
+        updateReconciliationStatus(job.id, "skipped");
+        continue;
+      }
+
+      if (mapping.paused) {
+        console.log(
+          `[reconcile] Project ${mapping.owner}/${mapping.repo} is paused, skipping reconciliation #${job.id}`,
         );
         updateReconciliationStatus(job.id, "skipped");
         continue;

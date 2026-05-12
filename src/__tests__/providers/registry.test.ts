@@ -21,6 +21,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     awsRegion: null,
     ticketingProvider: "linear",
     ticketingConfig: { kind: "linear" },
+    paused: false,
     ...overrides,
   };
 }
