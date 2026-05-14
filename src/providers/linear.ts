@@ -261,20 +261,31 @@ export class LinearProvider implements TicketingProvider {
     if (cached) return cached;
     const teamId = await this.getTeamIdByKey(teamKey);
 
+    // Search case-insensitively across the workspace: Linear's uniqueness check
+    // on issueLabelCreate is case-insensitive and treats a workspace-level label
+    // as conflicting with a team-level label of the same name. A strict
+    // case-sensitive, team-scoped search misses both cases and the create then
+    // fails with "duplicate label name". Prefer the team-scoped match if one
+    // exists, otherwise fall back to any workspace label with the same name.
     const searchData = await this.linearMutation<{
-      issueLabels: { nodes: Array<{ id: string }> };
+      issueLabels: {
+        nodes: Array<{ id: string; team: { id: string } | null }>;
+      };
     }>(
-      `query($teamId: ID!, $name: String!) {
-        issueLabels(filter: { team: { id: { eq: $teamId } }, name: { eq: $name } }) {
-          nodes { id }
+      `query($name: String!) {
+        issueLabels(filter: { name: { eqIgnoreCase: $name } }) {
+          nodes { id team { id } }
         }
       }`,
-      { teamId, name },
+      { name },
     );
-    if (searchData.issueLabels.nodes.length > 0) {
-      const id = searchData.issueLabels.nodes[0].id;
-      cache.set(teamKey, id);
-      return id;
+    const teamMatch = searchData.issueLabels.nodes.find(
+      (n) => n.team?.id === teamId,
+    );
+    const anyMatch = teamMatch ?? searchData.issueLabels.nodes[0];
+    if (anyMatch) {
+      cache.set(teamKey, anyMatch.id);
+      return anyMatch.id;
     }
 
     const createData = await this.linearMutation<{
@@ -300,7 +311,7 @@ export class LinearProvider implements TicketingProvider {
       issueLabels: { nodes: Array<{ id: string }> };
     }>(
       `query {
-        issueLabels(filter: { name: { eq: "Ready for Review" } }) {
+        issueLabels(filter: { name: { eqIgnoreCase: "Ready for Review" } }) {
           nodes { id }
         }
       }`,
