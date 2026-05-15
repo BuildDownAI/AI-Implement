@@ -3,6 +3,7 @@ import type { PipelineDefinition, StepModule } from "./types.js";
 import { cloneStep } from "./steps/clone.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { installStep } from "./steps/install.js";
+import { postPushReviewStep } from "./steps/post-push-review.js";
 import { preflightStep } from "./steps/preflight.js";
 import { pushStep } from "./steps/push.js";
 import { loadPipelineDefinition } from "./pipeline-loader.js";
@@ -22,6 +23,7 @@ const BUILTIN_STEPS: Array<[string, StepModule]> = [
   ["feedback-loop", feedbackLoopStep],
   ["preflight", preflightStep],
   ["push", pushStep],
+  ["post-push-review", postPushReviewStep],
 ];
 
 /**

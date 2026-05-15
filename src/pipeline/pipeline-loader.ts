@@ -129,6 +129,16 @@ function applyWiring(step: YamlStep): StepDefinition {
         skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
       };
 
+    case "post-push-review":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          prNumber: String(ctx.getOutputs("push").prNumber ?? ""),
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+        }),
+        skip: (ctx: PipelineContext) => ctx.getOutputs("push").branchPushed !== true,
+      };
+
     default:
       return step;
   }

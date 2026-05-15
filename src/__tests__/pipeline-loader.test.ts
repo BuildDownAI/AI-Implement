@@ -36,6 +36,9 @@ steps:
     type: preflight
   - id: push
     type: push
+  - id: post-push-review
+    type: custom
+    moduleId: post-push-review
 `;
 
 function makeModule(outputs: Record<string, unknown> = {}): StepModule {
@@ -69,6 +72,7 @@ describe("loadPipelineDefinition", () => {
       "feedback-loop",
       "preflight",
       "push",
+      "post-push-review",
     ]);
   });
 
@@ -224,6 +228,39 @@ describe("loadPipelineDefinition", () => {
     const ctxRejected = makeContext();
     ctxRejected.setOutputs("feedback-loop", { approved: false });
     expect(pushStep.skip?.(ctxRejected)).toBe(true);
+  });
+
+  it("applies post-push-review input wiring from clone and push outputs", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
+
+    const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.prNumber).toBe("42");
+  });
+
+  it("applies post-push-review skip condition based on push output", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
+
+    const ctxPushed = makeContext();
+    ctxPushed.setOutputs("push", { branchPushed: true });
+    expect(step.skip?.(ctxPushed)).toBe(false);
+
+    const ctxSkipped = makeContext();
+    ctxSkipped.setOutputs("push", { branchPushed: false });
+    expect(step.skip?.(ctxSkipped)).toBe(true);
   });
 
   it("custom pipeline with extra step is used by the pipeline runner", async () => {
