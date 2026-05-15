@@ -378,10 +378,18 @@ chown -R coder:coder /workspace
 cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 
-# ── 11. Start the dev command ────────────────────────────────────────────────
-
-start_dev_server
-wait_for_ready
+# ── 11. Start the dev command (interactive/preview sessions only) ────────────
+# Autonomous implementation sessions do NOT start the target repo's dev server.
+# Their job is to implement the issue, not serve the app. Running the repo's
+# `dev` script and then hard-gating on a readiness check is pure downside here:
+# a dev server that never binds — slow start, an unexpected port, or a repo
+# whose `dev` script is itself a long-running daemon (e.g. this orchestrator) —
+# makes wait_for_ready call fail() and abort the whole session before Claude
+# ever runs. The dev server exists for interactive/preview modes; gate on mode.
+if [ "$SESSION_MODE" != "autonomous" ]; then
+  start_dev_server
+  wait_for_ready
+fi
 
 post_status "{\"nonce\":\"${MACHINE_NONCE}\",\"event\":\"setup_complete\"}"
 
