@@ -1,5 +1,5 @@
 # Synced to target repos. /ai-implement on a PR → gap-fill run.
-# All pipeline logic lives in the runner image (ghcr.io/eudoxus-ai/ai-implement-runner).
+# All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
 #
 # Required secrets:
@@ -9,6 +9,10 @@
 # Optional repository variables (Bedrock-enabled repos only):
 #   AI_IMPLEMENT_PROVIDER    - Set to "bedrock" to route through AWS Bedrock.
 #   AI_IMPLEMENT_AWS_REGION  - AWS region (required when provider=bedrock).
+#
+# Optional repository or organization variables:
+#   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
 
 name: AI Implementation Comment Trigger
 
@@ -24,26 +28,42 @@ permissions:
 
 jobs:
   check-trigger:
-    if: github.event.issue.pull_request && contains(github.event.comment.body, '/ai-implement')
+    if: github.event.issue.pull_request
     runs-on: ubuntu-latest
     outputs:
+      matched: ${{ steps.trigger.outputs.matched }}
       pr_number: ${{ steps.pr.outputs.pr_number }}
       issue_meta: ${{ steps.pr.outputs.issue_meta }}
       provider: ${{ steps.pr.outputs.provider }}
       aws_region: ${{ steps.pr.outputs.aws_region }}
+      runner_image: ${{ steps.runner-image.outputs.runner_image }}
     steps:
-      - name: Auth check (write or admin)
+      - name: Check trigger command
+        id: trigger
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment.body ?? "";
+            const matched = body.trim() === "/ai-implement";
+            core.setOutput("matched", matched ? "true" : "false");
+            if (!matched) {
+              core.info("Ignoring comment because it is not exactly /ai-implement");
+            }
+
+      - name: Auth check (write, maintain, or admin)
+        if: steps.trigger.outputs.matched == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
               owner: context.repo.owner, repo: context.repo.repo, username: context.actor,
             });
-            if (!["write", "admin"].includes(perm.permission)) {
-              core.setFailed(`Actor ${context.actor} lacks write permission`);
+            if (!["write", "maintain", "admin"].includes(perm.permission)) {
+              core.setFailed(`Actor ${context.actor} lacks write, maintain, or admin permission`);
             }
 
       - name: Extract PR metadata
+        if: steps.trigger.outputs.matched == 'true'
         id: pr
         uses: actions/github-script@v7
         env:
@@ -56,7 +76,10 @@ jobs:
               pull_number: context.payload.issue.number,
             });
             const m = pr.data.body?.match(/<!--\s*ai-implement-meta([\s\S]*?)-->/);
-            if (!m) core.setFailed("PR body has no ai-implement-meta block");
+            if (!m) {
+              core.setFailed("PR body has no ai-implement-meta block");
+              return;
+            }
             const meta = Object.fromEntries(
               m[1].split("\n").map((l) => l.match(/^\s*([a-z_]+):\s*(.+?)\s*$/))
                   .filter(Boolean).map((mm) => [mm[1], mm[2]])
@@ -66,12 +89,68 @@ jobs:
             core.setOutput("provider", process.env.AI_IMPLEMENT_PROVIDER || "anthropic");
             core.setOutput("aws_region", process.env.AI_IMPLEMENT_AWS_REGION || "");
 
+      - name: Resolve and validate runner image
+        if: steps.trigger.outputs.matched == 'true'
+        id: runner-image
+        env:
+          CONFIGURED_RUNNER_IMAGE: ${{ vars.AI_IMPLEMENT_RUNNER_IMAGE }}
+          EXTRA_ALLOWED_PREFIXES: ${{ vars.AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES }}
+        run: |
+          set -euo pipefail
+
+          runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
+          if [ -z "$runner_image" ]; then
+            runner_image="ghcr.io/builddownai/ai-implement-runner:next"
+          fi
+
+          case "$runner_image" in
+            *[!A-Za-z0-9._:/@-]*)
+              echo "::error::runner_image \"$runner_image\" contains invalid characters for a container image reference." >&2
+              exit 1
+              ;;
+          esac
+
+          allowed_prefixes="ghcr.io/builddownai/"
+          if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
+            allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
+          fi
+
+          allowed=false
+          IFS=',' read -ra prefixes <<< "$allowed_prefixes"
+          for raw_prefix in "${prefixes[@]}"; do
+            prefix="$(echo "$raw_prefix" | xargs)"
+            [ -z "$prefix" ] && continue
+            case "$runner_image" in
+              "$prefix"*)
+                allowed=true
+                break
+                ;;
+            esac
+          done
+
+          if [ "$allowed" != "true" ]; then
+            echo "::error::runner_image \"$runner_image\" is not allowed." >&2
+            echo "::error::Allowed prefixes:" >&2
+            for raw_prefix in "${prefixes[@]}"; do
+              prefix="$(echo "$raw_prefix" | xargs)"
+              [ -z "$prefix" ] && continue
+              echo "::error::- $prefix" >&2
+            done
+            echo "::error::To allow this image, set the repository or organization variable AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>." >&2
+            echo "::error::Example: AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=ghcr.io/acme/" >&2
+            echo "::error::Use comma-separated prefixes for multiple registries or namespaces." >&2
+            exit 1
+          fi
+
+          echo "runner_image=$runner_image" >> "$GITHUB_OUTPUT"
+
   implement:
     needs: check-trigger
+    if: needs.check-trigger.outputs.matched == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
-      image: ghcr.io/eudoxus-ai/ai-implement-runner:next
+      image: ${{ needs.check-trigger.outputs.runner_image }}
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -98,6 +177,8 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
+          # ISSUE_META is parsed from the PR body. The JavaScript parser only emits
+          # lower_snake_case keys, and jq @sh quotes values before this eval.
           eval $(echo "$ISSUE_META" | jq -r 'to_entries[] | "export \(.key | ascii_upcase)=\(.value | @sh)"')
           export ISSUE_DESCRIPTION=$(echo "$ISSUE_DESCRIPTION_B64" | base64 -d)
           /opt/ai-implement/entrypoint.sh

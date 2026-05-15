@@ -1,5 +1,5 @@
 # Synced to target repos by sync-workflow.yml.
-# All pipeline logic lives in the runner image (ghcr.io/eudoxus-ai/ai-implement-runner).
+# All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 # Do not edit in target repos.
 #
 # Required secrets:
@@ -14,6 +14,10 @@
 #
 # Required repo setting:
 #   Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests" → ENABLED
+#
+# Optional repository or organization variables:
+#   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
 
 name: Claude AI Implementation
 
@@ -62,7 +66,7 @@ on:
         type: string
         default: ""
       runner_image:
-        description: "Override the default runner image (ghcr.io/eudoxus-ai/ai-implement-runner:next)"
+        description: "Override the default runner image (must match ghcr.io/builddownai/* or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
         default: ""
@@ -74,11 +78,75 @@ permissions:
   id-token: write
 
 jobs:
+  validate-runner-image:
+    runs-on: ubuntu-latest
+    outputs:
+      runner_image: ${{ steps.resolve.outputs.runner_image }}
+    steps:
+      - name: Resolve and validate runner image
+        id: resolve
+        env:
+          REQUESTED_RUNNER_IMAGE: ${{ inputs.runner_image }}
+          CONFIGURED_RUNNER_IMAGE: ${{ vars.AI_IMPLEMENT_RUNNER_IMAGE }}
+          EXTRA_ALLOWED_PREFIXES: ${{ vars.AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES }}
+        run: |
+          set -euo pipefail
+
+          runner_image="${REQUESTED_RUNNER_IMAGE:-}"
+          if [ -z "$runner_image" ]; then
+            runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
+          fi
+          if [ -z "$runner_image" ]; then
+            runner_image="ghcr.io/builddownai/ai-implement-runner:next"
+          fi
+
+          case "$runner_image" in
+            *[!A-Za-z0-9._:/@-]*)
+              echo "::error::runner_image \"$runner_image\" contains invalid characters for a container image reference." >&2
+              exit 1
+              ;;
+          esac
+
+          allowed_prefixes="ghcr.io/builddownai/"
+          if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
+            allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
+          fi
+
+          allowed=false
+          IFS=',' read -ra prefixes <<< "$allowed_prefixes"
+          for raw_prefix in "${prefixes[@]}"; do
+            prefix="$(echo "$raw_prefix" | xargs)"
+            [ -z "$prefix" ] && continue
+            case "$runner_image" in
+              "$prefix"*)
+                allowed=true
+                break
+                ;;
+            esac
+          done
+
+          if [ "$allowed" != "true" ]; then
+            echo "::error::runner_image \"$runner_image\" is not allowed." >&2
+            echo "::error::Allowed prefixes:" >&2
+            for raw_prefix in "${prefixes[@]}"; do
+              prefix="$(echo "$raw_prefix" | xargs)"
+              [ -z "$prefix" ] && continue
+              echo "::error::- $prefix" >&2
+            done
+            echo "::error::To allow this image, set the repository or organization variable AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>." >&2
+            echo "::error::Example: AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=ghcr.io/acme/" >&2
+            echo "::error::Use comma-separated prefixes for multiple registries or namespaces." >&2
+            exit 1
+          fi
+
+          echo "runner_image=$runner_image" >> "$GITHUB_OUTPUT"
+
   implement:
+    needs: validate-runner-image
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
-      image: ${{ inputs.runner_image != '' && inputs.runner_image || 'ghcr.io/eudoxus-ai/ai-implement-runner:next' }}
+      image: ${{ needs.validate-runner-image.outputs.runner_image }}
     steps:
       - name: Generate GitHub App token
         id: app-token
