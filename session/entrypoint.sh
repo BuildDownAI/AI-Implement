@@ -378,10 +378,13 @@ chown -R coder:coder /workspace
 cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 
-# ── 11. Start the dev command ────────────────────────────────────────────────
-
-start_dev_server
-wait_for_ready
+# ── 11. Start the dev command (interactive/preview sessions only) ────────────
+# Autonomous implementation sessions do NOT start the target repo's dev server.
+# Their job is to implement the issue, not serve the app. 
+if [ "$SESSION_MODE" != "autonomous" ]; then
+  start_dev_server
+  wait_for_ready
+fi
 
 post_status "{\"nonce\":\"${MACHINE_NONCE}\",\"event\":\"setup_complete\"}"
 
