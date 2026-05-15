@@ -441,9 +441,9 @@ export async function updateMachineMetadata(
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
-        "Content-Type": "text/plain",
+        "Content-Type": "application/json",
       },
-      body: value,
+      body: JSON.stringify({ value }),
     },
   );
   if (!res.ok) {
