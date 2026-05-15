@@ -67,9 +67,13 @@ jobs:
       - name: Smoke-test — verify TS dist is present in :next image
         run: |
           docker pull "${{ steps.meta.outputs.image }}:next"
-          output=$(docker run --rm --entrypoint node \
+          if ! output=$(docker run --rm --entrypoint node \
             "${{ steps.meta.outputs.image }}:next" \
-            -e "import('/app/dist/pipeline/runner.js').then(m => console.log(Object.keys(m)))")
+            -e "import('/app/dist/pipeline/runner.js').then(m => console.log(Object.keys(m)))" 2>&1); then
+            echo "ERROR: docker run failed to start or import the module"
+            echo "$output"
+            exit 1
+          fi
           echo "Module exports: $output"
           echo "$output" | grep -q "PipelineRunner" || \
             { echo "ERROR: PipelineRunner not found in /app/dist/pipeline/runner.js exports"; exit 1; }
