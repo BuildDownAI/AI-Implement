@@ -20,6 +20,7 @@ RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
 COPY pipelines/ ./pipelines/
+COPY workflows/ ./workflows/
 
 # Create data directory (Fly volume will mount here)
 RUN mkdir -p /data

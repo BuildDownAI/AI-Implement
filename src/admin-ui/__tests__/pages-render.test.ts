@@ -19,4 +19,10 @@ describe("admin HTML", () => {
     expect(adminHtml).toContain('id="access-code"');
     expect(adminHtml).toContain('id="login-error"');
   });
+
+  it("exposes the per-project workflow sync action", () => {
+    expect(adminHtml).toContain("Sync workflows");
+    expect(adminHtml).toContain("/sync-workflows");
+    expect(adminHtml).toContain("window.syncWorkflows");
+  });
 });

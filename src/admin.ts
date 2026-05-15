@@ -39,6 +39,7 @@ import { listCustomizations } from "./customizations.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
+import { syncWorkflowTemplates } from "./workflow-sync.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -165,6 +166,18 @@ export function handleAdminRequest(
 
     if (url === "/api/mappings" && method === "POST") {
       handleUpsertMapping(req, res, registry);
+      return true;
+    }
+
+    const workflowSyncMatch = url.match(/^\/api\/mappings\/([^/]+)\/sync-workflows$/);
+    if (workflowSyncMatch && method === "POST") {
+      const teamKey = decodeURIComponent(workflowSyncMatch[1]);
+      handleSyncWorkflows(res, config, teamKey).catch((err) => {
+        console.error(`[admin] workflow sync failed for ${teamKey}:`, err);
+        if (!res.headersSent) {
+          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        }
+      });
       return true;
     }
 
@@ -602,6 +615,25 @@ async function handlePatchMapping(
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
+}
+
+async function handleSyncWorkflows(
+  res: http.ServerResponse,
+  config: AdminConfig,
+  teamKey: string,
+): Promise<void> {
+  const mappings = getMappings();
+  const mapping = mappings[teamKey];
+  if (!mapping) {
+    json(res, 404, { error: "Team not found" });
+    return;
+  }
+  const result = await syncWorkflowTemplates({
+    mapping,
+    githubAppId: config.githubAppId,
+    githubAppPrivateKey: config.githubAppPrivateKey,
+  });
+  json(res, 200, result);
 }
 
 async function handleListSecrets(
