@@ -27,7 +27,7 @@ describe("createDefaultRunner", () => {
       existsSyncImpl: () => false,
     });
 
-    for (const id of ["clone", "install", "feedback-loop", "preflight", "push"]) {
+    for (const id of ["clone", "install", "feedback-loop", "preflight", "push", "post-push-review"]) {
       expect(registeredModule(runner, id)).toBeDefined();
     }
   });
