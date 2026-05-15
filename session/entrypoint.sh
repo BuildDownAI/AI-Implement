@@ -47,6 +47,7 @@ fi
 
 # ── 4. Git config + clone ────────────────────────────────────────────────────
 GITHUB_DEFAULT_BRANCH="${GITHUB_DEFAULT_BRANCH:-main}"
+export GITHUB_DEFAULT_BRANCH
 git config --global user.name "ai-implement-bot"
 git config --global user.email "ai-implement-bot@users.noreply.github.com"
 git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
@@ -58,6 +59,8 @@ cd /workspace
 if [ -n "$PR_NUMBER" ]; then
   log "Gap-fill: checking out PR #$PR_NUMBER"
   gh pr checkout "$PR_NUMBER"
+  GITHUB_DEFAULT_BRANCH="$(git branch --show-current)"
+  export GITHUB_DEFAULT_BRANCH
 fi
 
 # ── 5. Workspace ownership for non-root Claude ───────────────────────────────
@@ -69,4 +72,4 @@ git config --global --add safe.directory /workspace
 # ── 6. Invoke TS pipeline ────────────────────────────────────────────────────
 export WORKSPACE_DIR=/workspace
 log "Invoking TS pipeline (node /app/dist/run-autonomous.js)..."
-exec dbus-run-session -- su -m -p coder -c "HOME=/home/coder exec node /app/dist/run-autonomous.js"
+exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/run-autonomous.js"

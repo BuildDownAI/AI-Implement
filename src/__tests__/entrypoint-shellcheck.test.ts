@@ -21,6 +21,24 @@ describe("session/entrypoint.sh", () => {
 
   it("detects GHA mode by GITHUB_ACTIONS=true", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toMatch(/GITHUB_ACTIONS/);
+    expect(content).toMatch(/GITHUB_ACTIONS.*=.*"true"/);
+  });
+
+  it("exports GITHUB_DEFAULT_BRANCH for the TS runner", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\{GITHUB_DEFAULT_BRANCH:-main\}"/);
+    expect(content).toMatch(/export GITHUB_DEFAULT_BRANCH/);
+  });
+
+  it("preserves the checked-out gap-fill PR branch for the TS clone step", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    expect(content).toMatch(/gh pr checkout "\$PR_NUMBER"/);
+    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(git branch --show-current\)"/);
+  });
+
+  it("does not pass duplicate preserve-environment flags to su", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    expect(content).toContain("su -p coder");
+    expect(content).not.toContain("su -m -p coder");
   });
 });

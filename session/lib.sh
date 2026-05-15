@@ -27,8 +27,7 @@ require_one_of() {
   for var in "$@"; do
     if [ -n "${!var:-}" ]; then return 0; fi
   done
-  log "ERROR: one of ${*} must be set"
-  exit 1
+  fail "At least one of $* must be set"
 }
 
 # Base64url encode from stdin (no padding, URL-safe alphabet).
