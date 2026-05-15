@@ -1,176 +1,103 @@
-# Copy this file to .github/workflows/comment-trigger.yml in each target repo.
-# This is managed by the ai-implement sync workflow — do not edit directly in target repos.
+# Synced to target repos. /ai-implement on a PR → gap-fill run.
+# All pipeline logic lives in the runner image (ghcr.io/eudoxus-ai/ai-implement-runner).
+# Do not edit in target repos.
 #
-# Triggers claude-implement.yml when a user with write access comments /ai-implement on a PR.
-#
-# Required secrets (same as claude-implement.yml):
+# Required secrets:
 #   AI_IMPLEMENT_APP_ID, AI_IMPLEMENT_PRIVATE_KEY
+#   ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, LINEAR_API_KEY
 #
 # Optional repository variables (Bedrock-enabled repos only):
-#   AI_IMPLEMENT_PROVIDER    - Set to "bedrock" to route comment-triggered gap-fill
-#                              runs through AWS Bedrock. Defaults to "anthropic".
-#   AI_IMPLEMENT_AWS_REGION  - AWS region for Bedrock (required when provider=bedrock).
-# Set these at Settings → Secrets and variables → Actions → Variables. They must
-# match the mapping's provider/awsRegion in the orchestrator admin UI; otherwise
-# the orchestrator-initiated runs and the comment-triggered runs will route to
-# different auth paths.
-#
-# The app token is used for all GitHub operations — no PAT required.
-# The app needs: actions:write, contents:write, pull-requests:write, issues:write
+#   AI_IMPLEMENT_PROVIDER    - Set to "bedrock" to route through AWS Bedrock.
+#   AI_IMPLEMENT_AWS_REGION  - AWS region (required when provider=bedrock).
 
-name: AI Implement Comment Trigger
+name: AI Implementation Comment Trigger
 
 on:
   issue_comment:
     types: [created]
-  workflow_dispatch:
-    inputs:
-      runner_callback_url:
-        description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
-        required: false
-        type: string
-        default: ""
-      run_token:
-        description: "HMAC bearer token authorizing the result POST; empty skips callback"
-        required: false
-        type: string
-        default: ""
 
 permissions:
+  contents: write
   pull-requests: write
   issues: write
+  id-token: write
 
 jobs:
-  trigger:
+  check-trigger:
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/ai-implement')
     runs-on: ubuntu-latest
-    # Only run on PR comments (not issue comments) with the trigger phrase
-    if: github.event.issue.pull_request != null && contains(github.event.comment.body, '/ai-implement')
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      issue_meta: ${{ steps.pr.outputs.issue_meta }}
+      provider: ${{ steps.pr.outputs.provider }}
+      aws_region: ${{ steps.pr.outputs.aws_region }}
     steps:
-      - uses: actions/create-github-app-token@v2
+      - name: Auth check (write or admin)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner, repo: context.repo.repo, username: context.actor,
+            });
+            if (!["write", "admin"].includes(perm.permission)) {
+              core.setFailed(`Actor ${context.actor} lacks write permission`);
+            }
+
+      - name: Extract PR metadata
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          AI_IMPLEMENT_PROVIDER: ${{ vars.AI_IMPLEMENT_PROVIDER }}
+          AI_IMPLEMENT_AWS_REGION: ${{ vars.AI_IMPLEMENT_AWS_REGION }}
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: context.payload.issue.number,
+            });
+            const m = pr.data.body?.match(/<!--\s*ai-implement-meta([\s\S]*?)-->/);
+            if (!m) core.setFailed("PR body has no ai-implement-meta block");
+            const meta = Object.fromEntries(
+              m[1].split("\n").map((l) => l.match(/^\s*([a-z_]+):\s*(.+?)\s*$/))
+                  .filter(Boolean).map((mm) => [mm[1], mm[2]])
+            );
+            core.setOutput("pr_number", String(context.payload.issue.number));
+            core.setOutput("issue_meta", JSON.stringify(meta));
+            core.setOutput("provider", process.env.AI_IMPLEMENT_PROVIDER || "anthropic");
+            core.setOutput("aws_region", process.env.AI_IMPLEMENT_AWS_REGION || "");
+
+  implement:
+    needs: check-trigger
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/eudoxus-ai/ai-implement-runner:next
+    steps:
+      - name: Generate GitHub App token
         id: app-token
+        uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
 
-      - name: Check commenter has write access
-        id: check-access
+      - name: Configure AWS credentials (Bedrock)
+        if: needs.check-trigger.outputs.provider == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ needs.check-trigger.outputs.aws_region }}
+          role-session-duration: 14400
+
+      - name: Run pipeline (gap-fill)
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          COMMENTER: ${{ github.event.comment.user.login }}
-          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+          ISSUE_META: ${{ needs.check-trigger.outputs.issue_meta }}
+          PROVIDER: ${{ needs.check-trigger.outputs.provider }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
-          PERMISSION=$(gh api repos/$REPO/collaborators/$COMMENTER/permission --jq '.permission' 2>/dev/null || echo "none")
-          if [[ "$PERMISSION" != "admin" && "$PERMISSION" != "maintain" && "$PERMISSION" != "write" ]]; then
-            echo "User $COMMENTER does not have write access (permission: $PERMISSION), skipping"
-            exit 0
-          fi
-          echo "has_access=true" >> "$GITHUB_OUTPUT"
-
-      - name: Parse metadata and dispatch
-        id: dispatch
-        if: steps.check-access.outputs.has_access == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          # Repo-variable-driven provider override. Empty default routes to
-          # anthropic, matching the claude-implement.yml workflow_dispatch default.
-          PROVIDER: ${{ vars.AI_IMPLEMENT_PROVIDER }}
-          AWS_REGION: ${{ vars.AI_IMPLEMENT_AWS_REGION }}
-        run: |
-          # Only trigger on comments that are exactly /ai-implement
-          TRIMMED=$(echo "$COMMENT_BODY" | tr -d '[:space:]')
-          if [ "$TRIMMED" != "/ai-implement" ]; then
-            echo "Comment is not exactly /ai-implement, skipping"
-            exit 0
-          fi
-
-          PR_BODY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq '.body')
-
-          # Extract metadata from the <!-- ai-implement-meta ... --> block
-          META_BLOCK=$(echo "$PR_BODY" | sed -n '/<!-- ai-implement-meta/,/-->/p')
-          ISSUE_ID=$(echo "$META_BLOCK" | grep 'issue_id:' | head -1 | sed 's/^issue_id: //' | tr -d '\r')
-          ISSUE_IDENTIFIER=$(echo "$META_BLOCK" | grep 'issue_identifier:' | head -1 | sed 's/^issue_identifier: //' | tr -d '\r')
-          ISSUE_TITLE=$(echo "$META_BLOCK" | grep 'issue_title:' | head -1 | sed 's/^issue_title: //' | tr -d '\r')
-          DESC_B64=$(echo "$META_BLOCK" | grep 'issue_description_b64:' | head -1 | sed 's/^issue_description_b64: //' | tr -d '\r')
-          ISSUE_DESCRIPTION=$(echo "$DESC_B64" | base64 -d)
-
-          if [ -z "$ISSUE_ID" ] || [ -z "$ISSUE_IDENTIFIER" ]; then
-            echo "Could not find ai-implement-meta block in PR body."
-            GH_TOKEN="$APP_TOKEN" gh pr comment "$PR_NUMBER" --repo "$REPO" --body "⚠️ Could not find implementation metadata in this PR body. The \`/ai-implement\` trigger only works on PRs created by the Claude AI Implementation workflow."
-            exit 1
-          fi
-
-          # Provider-specific dispatch fields. Only add provider/aws_region when
-          # the repo is configured for bedrock; anthropic repos dispatch with
-          # the original set of inputs so nothing changes for them.
-          PROVIDER_ARGS=()
-          if [ "$PROVIDER" = "bedrock" ]; then
-            if [ -z "$AWS_REGION" ]; then
-              echo "AI_IMPLEMENT_PROVIDER=bedrock but AI_IMPLEMENT_AWS_REGION repo variable is not set."
-              GH_TOKEN="$APP_TOKEN" gh pr comment "$PR_NUMBER" --repo "$REPO" --body "⚠️ This repo is configured for Bedrock (\`AI_IMPLEMENT_PROVIDER=bedrock\`) but \`AI_IMPLEMENT_AWS_REGION\` is not set. Set it at Settings → Secrets and variables → Actions → Variables, then re-comment \`/ai-implement\`."
-              exit 1
-            fi
-            PROVIDER_ARGS+=(--field "provider=bedrock" --field "aws_region=$AWS_REGION")
-          elif [ -n "$PROVIDER" ] && [ "$PROVIDER" != "anthropic" ]; then
-            echo "AI_IMPLEMENT_PROVIDER=$PROVIDER is not recognised; falling back to anthropic."
-          fi
-
-          echo "Dispatching claude-implement.yml for $ISSUE_IDENTIFIER (PR #$PR_NUMBER, provider=${PROVIDER:-anthropic})"
-          gh workflow run claude-implement.yml \
-            --repo "$REPO" \
-            --field issue_id="$ISSUE_ID" \
-            --field issue_identifier="$ISSUE_IDENTIFIER" \
-            --field issue_title="$ISSUE_TITLE" \
-            --field issue_description="$ISSUE_DESCRIPTION" \
-            --field pr_number="$PR_NUMBER" \
-            "${PROVIDER_ARGS[@]}"
-          echo "dispatched=true" >> "$GITHUB_OUTPUT"
-
-      - name: React to comment
-        if: steps.dispatch.outputs.dispatched == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          COMMENT_ID: ${{ github.event.comment.id }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh api repos/$REPO/issues/comments/$COMMENT_ID/reactions \
-            --method POST \
-            -f content='+1'
-
-      - name: Post results to orchestrator
-        if: always()
-        env:
-          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
-          RUN_TOKEN: ${{ inputs.run_token }}
-          JOB_STATUS: ${{ job.status }}
-        shell: /usr/bin/bash -e {0}
-        run: |
-          set -uo pipefail
-          if [ -z "${RUNNER_CALLBACK_URL:-}" ] || [ -z "${RUN_TOKEN:-}" ]; then
-            echo "Runner callback URL or token not provided; skipping result POST."
-            exit 0
-          fi
-
-          mkdir -p ai-output/comments
-          COMMENTS=$(jq -n '[]')
-          for f in $(ls ai-output/comments/*.md 2>/dev/null | sort); do
-            BODY=$(jq -Rs '.' < "$f")
-            COMMENTS=$(echo "$COMMENTS" | jq --argjson body "$BODY" '. + [{"body": $body}]')
-          done
-
-          if [ "$JOB_STATUS" = "success" ]; then
-            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" \
-              '{phase: "gap-analysis", outcome: "success", comments: $comments}')
-          else
-            REASON=$(tail -c 4000 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "job failed")
-            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" --arg reason "$REASON" \
-              '{phase: "gap-analysis", outcome: "failure", failureReason: $reason, comments: $comments}')
-          fi
-
-          curl -fsS --max-time 30 -X POST "${RUNNER_CALLBACK_URL%/}/runner/result" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $RUN_TOKEN" \
-            --data-raw "$PAYLOAD"
+          eval $(echo "$ISSUE_META" | jq -r 'to_entries[] | "export \(.key | ascii_upcase)=\(.value | @sh)"')
+          export ISSUE_DESCRIPTION=$(echo "$ISSUE_DESCRIPTION_B64" | base64 -d)
+          /opt/ai-implement/entrypoint.sh
