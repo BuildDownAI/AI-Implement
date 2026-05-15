@@ -48,6 +48,22 @@ export interface PipelineContextData {
   dependencies?: string;
   /** Optional model override for Claude invocations (e.g. "claude-opus-4-5"). */
   model?: string;
+  /** Autonomous runner: absolute path to the cloned workspace. */
+  workspaceDir?: string;
+  /** Autonomous runner: planning context fetched from the ticketing provider. */
+  planningContext?: string;
+  /** Autonomous runner: fully rendered implementation prompt from WORKFLOW.md or fallback. */
+  implementationPrompt?: string;
+  /** Autonomous runner: existing PR number for gap-fill runs, "" if none. */
+  prNumber?: string;
+  /** Autonomous runner: target GitHub repo owner. */
+  githubOwner?: string;
+  /** Autonomous runner: target GitHub repo name. */
+  githubRepo?: string;
+  /** Autonomous runner: token used for clone/push. */
+  githubToken?: string;
+  /** Autonomous runner: branch to clone/push. */
+  branch?: string;
 }
 
 export interface PipelineContext {

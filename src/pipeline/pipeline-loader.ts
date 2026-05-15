@@ -81,6 +81,18 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
  */
 function applyWiring(step: YamlStep): StepDefinition {
   switch (step.id) {
+    case "clone":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          repoOwner: ctx.data.githubOwner,
+          repoRepo: ctx.data.githubRepo,
+          branch: ctx.data.branch,
+          githubToken: ctx.data.githubToken,
+          workspaceDir: ctx.data.workspaceDir,
+        }),
+      };
+
     case "install":
       return {
         ...step,
@@ -100,6 +112,8 @@ function applyWiring(step: YamlStep): StepDefinition {
             workspaceDir: ctx.getOutputs("clone").workspaceDir,
             issueTitle: ctx.data.issueTitle,
             issueDescription: ctx.data.issueDescription,
+            implementationPrompt: ctx.data.implementationPrompt,
+            planningContext: ctx.data.planningContext,
             repoImplementModel: repoModels?.implement,
             repoReviewModel: repoModels?.review,
           };

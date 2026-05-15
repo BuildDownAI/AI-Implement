@@ -38,11 +38,12 @@ model: claude-sonnet-4-6
 
   COMMENT FORMAT
   ---------------
-  Claude posts up to 3 structured comments to Linear. Headers are parseable
+  Claude posts up to 4 structured comments to Linear. Headers are parseable
   so the implementation workflow can locate them later:
 
     ## 🏗️ AI Planning: Architecture Analysis
     ## 🧪 AI Planning: Test Plan
+    ## 🔧 AI Planning: Work Units
     ## 🔗 AI Planning: Cross-Story Context   ← only when dependencies exist
 
   HOW TO CUSTOMISE THIS FILE
@@ -86,22 +87,26 @@ ${DEPENDENCIES}
 
 ## Instructions
 
-Use Read, Glob, and Grep to explore the codebase. Then post structured planning comments to Linear using `curl`. The `LINEAR_API_KEY` and `ISSUE_ID` environment variables are available.
+Use Read, Glob, and Grep to explore the codebase. Then write structured planning comments as separate Markdown files under `ai-output/comments/`, prefixed with a two-digit sequence number to control order.
 
-Use this pattern for each comment (replace `BODY` with the markdown content):
+Do NOT post comments directly to the ticketing system (Linear / Jira / etc.). The orchestrator handles posting after this workflow completes — it reads the `.md` files you write and posts each as a comment via the mapping's configured ticketing provider.
+
+Use this pattern:
 
 ```
-curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-  -H "Content-Type: application/json" \
-  -H "Authorization: $LINEAR_API_KEY" \
-  --data-raw "$(jq -n --arg id "$ISSUE_ID" --arg body "BODY" \
-    '{query: "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", variables: {id: $id, body: $body}}')"
+mkdir -p ai-output/comments
+cat > ai-output/comments/01-architecture-analysis.md <<'EOF'
+## 🏗️ AI Planning: Architecture Analysis
+
+(comment body here)
+EOF
 ```
 
-Post EXACTLY these comments in order:
+Write EXACTLY these comments, in this order (filenames matter — they sort lexicographically):
 
 ### Comment 1 — Architecture Analysis
 
+Filename: `ai-output/comments/01-architecture-analysis.md`
 Header must be exactly: `## 🏗️ AI Planning: Architecture Analysis`
 
 Required sections:
@@ -112,6 +117,7 @@ Required sections:
 
 ### Comment 2 — Test Plan
 
+Filename: `ai-output/comments/02-test-plan.md`
 Header must be exactly: `## 🧪 AI Planning: Test Plan`
 
 Required sections:
@@ -119,10 +125,33 @@ Required sections:
 - **Integration Tests**: End-to-end or cross-component scenarios
 - **Manual Verification**: Step-by-step human verification checklist
 
-### Comment 3 — Cross-Story Context (conditional)
+### Comment 3 — Work Units
 
-Only post this comment if `${DEPENDENCIES}` or `${SIBLINGS}` is not "None" AND there is meaningful coordination needed.
+Filename: `ai-output/comments/03-work-units.md`
+Header must be exactly: `## 🔧 AI Planning: Work Units`
 
+Decompose the issue into work units that can be implemented by parallel subagents. Identify which pieces are independent (no dependencies on other units) and which are sequential.
+
+Required format:
+
+```markdown
+## 🔧 AI Planning: Work Units
+
+### Independent (can be implemented in parallel)
+- **WU-1: Short name** — brief description. Files: `src/file.ts`, `src/other.ts`. No dependencies.
+- **WU-2: Short name** — brief description. Files: `src/another.ts`. No dependencies.
+
+### Sequential (must follow independent units)
+- **WU-3: Short name** — brief description. Files: `src/file.ts` (update), `tests/integration/foo.test.ts`. Depends on: WU-1, WU-2.
+```
+
+Each work unit must specify: name, description, files it touches, and dependencies (or "No dependencies").
+
+### Comment 4 — Cross-Story Context (conditional)
+
+Only write this file if `${PARENT}`, `${DEPENDENCIES}`, or `${SIBLINGS}` is not "None" AND there is meaningful coordination needed.
+
+Filename: `ai-output/comments/04-cross-story-context.md`
 Header must be exactly: `## 🔗 AI Planning: Cross-Story Context`
 
 Required sections:

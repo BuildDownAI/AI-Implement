@@ -99,6 +99,19 @@ describe("feedbackLoopStep", () => {
     expect(reviewStep.run).toHaveBeenCalledTimes(1);
   });
 
+  it("uses implementationPrompt for the implement step", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, implementationPrompt: "Follow WORKFLOW.md instructions" },
+      new NoopStepReporter(),
+    );
+
+    const implementCall = vi.mocked(implementStep.run).mock.calls[0];
+    expect(implementCall[1]).toMatchObject({ prompt: "Follow WORKFLOW.md instructions" });
+  });
+
   it("loops until approved within maxIterations", async () => {
     vi.mocked(reviewStep.run)
       .mockResolvedValueOnce(REJECTED_REVIEW)

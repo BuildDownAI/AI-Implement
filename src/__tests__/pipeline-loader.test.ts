@@ -3,7 +3,7 @@ import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { StepModule } from "../pipeline/types.js";
+import type { PipelineContextData, StepModule } from "../pipeline/types.js";
 
 const CUSTOM_PIPELINE_YAML = `id: custom-loop
 steps:
@@ -42,7 +42,7 @@ function makeModule(outputs: Record<string, unknown> = {}): StepModule {
   return { run: async () => outputs };
 }
 
-function makeContext(): DefaultPipelineContext {
+function makeContext(overrides: Partial<PipelineContextData> = {}): DefaultPipelineContext {
   return new DefaultPipelineContext({
     jobId: 1,
     issueId: "issue-1",
@@ -52,6 +52,7 @@ function makeContext(): DefaultPipelineContext {
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
     ticketingProvider: "linear",
+    ...overrides,
   });
 }
 
@@ -131,13 +132,39 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.workspaceDir).toBe("/tmp/repo");
   });
 
+  it("applies clone input wiring from context data", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const ctx = makeContext({
+      githubOwner: "acme",
+      githubRepo: "api",
+      githubToken: "tok",
+      branch: "main",
+      workspaceDir: "/tmp/repo",
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "clone")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.repoOwner).toBe("acme");
+    expect(inputs.repoRepo).toBe("api");
+    expect(inputs.githubToken).toBe("tok");
+    expect(inputs.branch).toBe("main");
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+  });
+
   it("applies feedback-loop input wiring from clone, install, and ctx.data", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,
       readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
     });
 
-    const ctx = makeContext();
+    const ctx = makeContext({
+      implementationPrompt: "Use the workflow body",
+      planningContext: "Use the planning comments",
+    });
     ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
     ctx.setOutputs("install", {
       repoModels: { implement: "claude-opus-4-7", review: "claude-haiku-4-5" },
@@ -148,6 +175,8 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.workspaceDir).toBe("/tmp/repo");
     expect(inputs.issueTitle).toBe("Test");
     expect(inputs.issueDescription).toBe("Desc");
+    expect(inputs.implementationPrompt).toBe("Use the workflow body");
+    expect(inputs.planningContext).toBe("Use the planning comments");
     expect(inputs.repoImplementModel).toBe("claude-opus-4-7");
     expect(inputs.repoReviewModel).toBe("claude-haiku-4-5");
   });
