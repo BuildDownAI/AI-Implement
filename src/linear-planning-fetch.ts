@@ -63,8 +63,17 @@ export async function fetchPlanningContext(params: PlanningFetchParams): Promise
 
   let full = `${PREAMBLE}\n\n<planning_context>\n${bodies}\n</planning_context>\n`;
   if (Buffer.byteLength(full, "utf8") > capBytes) {
-    const truncated = Buffer.from(full, "utf8").subarray(0, capBytes).toString("utf8");
+    const truncated = sliceUtf8(Buffer.from(full, "utf8"), capBytes);
     full = `${truncated}\n\n[... planning context truncated ...]\n</planning_context>\n`;
   }
   return full;
+}
+
+/** Slice a UTF-8 buffer at or before maxBytes without splitting a codepoint. */
+function sliceUtf8(buf: Buffer, maxBytes: number): string {
+  let end = Math.min(maxBytes, buf.length);
+  // Back off while the first excluded byte is a continuation byte (0b10xxxxxx),
+  // which means the slice would land mid-codepoint.
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString("utf8");
 }

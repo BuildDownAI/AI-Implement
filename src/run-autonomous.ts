@@ -5,6 +5,7 @@ import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
 import type { LLMExecutor, PipelineDefinition, StepReporter } from "./pipeline/types.js";
+import { HttpStepReporter, NoopStepReporter } from "./pipeline/reporter.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContext } from "./linear-planning-fetch.js";
 
@@ -19,29 +20,12 @@ export interface RunAutonomousOptions {
 
 export interface RunAutonomousResult {
   exitCode: number;
-  prUrl?: string;
 }
 
 function requireEnv(n: string): string {
   const v = process.env[n];
   if (!v) throw new Error(`Missing required env var: ${n}`);
   return v;
-}
-
-function createOrchestratorReporter(o: { url: string; nonce: string }): StepReporter {
-  return {
-    async report(step) {
-      try {
-        await fetch(`${o.url}/api/status`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ nonce: o.nonce, event: "step", step }),
-        });
-      } catch (err) {
-        console.warn(`Status POST failed: ${err}`);
-      }
-    },
-  };
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
@@ -79,11 +63,14 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
-  const reporter =
+  if (orchestratorUrl && !nonce) {
+    console.warn("ORCHESTRATOR_URL is set but MACHINE_NONCE is empty — step reports will be rejected (403).");
+  }
+  const reporter: StepReporter =
     opts.reporter ??
-    (orchestratorUrl
-      ? createOrchestratorReporter({ url: orchestratorUrl, nonce })
-      : { async report() {} });
+    (orchestratorUrl && nonce
+      ? new HttpStepReporter(orchestratorUrl, nonce)
+      : new NoopStepReporter());
 
   const context = new DefaultPipelineContext(
     {
@@ -96,15 +83,14 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       orchestratorUrl: orchestratorUrl ?? "",
       ticketingProvider: "linear",
       model,
+      workspaceDir,
+      planningContext,
+      prNumber,
+      githubOwner,
+      githubRepo,
     },
     llmExecutor,
   );
-  const extras = context.data as unknown as Record<string, unknown>;
-  extras.workspaceDir = workspaceDir;
-  extras.planningContext = planningContext;
-  extras.prNumber = prNumber;
-  extras.githubOwner = githubOwner;
-  extras.githubRepo = githubRepo;
 
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
@@ -118,5 +104,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  runAutonomous().then((r) => process.exit(r.exitCode));
+  runAutonomous()
+    .then((r) => process.exit(r.exitCode))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
 }

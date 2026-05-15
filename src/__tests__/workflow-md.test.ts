@@ -17,6 +17,7 @@ describe("parseWorkflowMd", () => {
     const out = parseWorkflowMd(md, {});
     expect(out.body).toContain("Before");
     expect(out.body).toContain("After");
+    expect(out.body).toContain("---");
   });
 
   it("returns empty front matter when WORKFLOW.md has none", () => {
