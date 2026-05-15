@@ -13,6 +13,7 @@
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
+# The default runner image uses the public ghcr.io/builddownai/ai-implement-runner:latest tag.
 
 name: AI Implementation Comment Trigger
 
@@ -24,7 +25,6 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  id-token: write
 
 jobs:
   check-trigger:
@@ -61,6 +61,18 @@ jobs:
             if (!["write", "maintain", "admin"].includes(perm.permission)) {
               core.setFailed(`Actor ${context.actor} lacks write, maintain, or admin permission`);
             }
+
+      - name: Acknowledge trigger
+        if: steps.trigger.outputs.matched == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: "+1",
+            });
 
       - name: Extract PR metadata
         if: steps.trigger.outputs.matched == 'true'
@@ -100,7 +112,7 @@ jobs:
 
           runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
           if [ -z "$runner_image" ]; then
-            runner_image="ghcr.io/builddownai/ai-implement-runner:next"
+            runner_image="ghcr.io/builddownai/ai-implement-runner:latest"
           fi
 
           case "$runner_image" in
@@ -149,6 +161,11 @@ jobs:
     if: needs.check-trigger.outputs.matched == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
     container:
       image: ${{ needs.check-trigger.outputs.runner_image }}
     steps:
@@ -158,6 +175,23 @@ jobs:
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
+
+      - name: Validate Bedrock inputs
+        if: needs.check-trigger.outputs.provider == 'bedrock'
+        env:
+          AWS_REGION: ${{ needs.check-trigger.outputs.aws_region }}
+          ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_REGION" ]; then
+            echo "::error::AI_IMPLEMENT_PROVIDER=bedrock but AI_IMPLEMENT_AWS_REGION repository or organization variable is empty."
+            echo "::error::Set AI_IMPLEMENT_AWS_REGION to the Bedrock region used by this repo."
+            exit 1
+          fi
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::AI_IMPLEMENT_PROVIDER=bedrock but AWS_BEDROCK_ROLE_ARN repo secret is not set."
+            echo "::error::Add the IAM role ARN trusted to GitHub OIDC with bedrock:InvokeModel permission."
+            exit 1
+          fi
 
       - name: Configure AWS credentials (Bedrock)
         if: needs.check-trigger.outputs.provider == 'bedrock'
@@ -178,7 +212,8 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
           # ISSUE_META is parsed from the PR body. The JavaScript parser only emits
-          # lower_snake_case keys, and jq @sh quotes values before this eval.
-          eval $(echo "$ISSUE_META" | jq -r 'to_entries[] | "export \(.key | ascii_upcase)=\(.value | @sh)"')
+          # lower_snake_case keys, jq allows only expected metadata keys here, and
+          # jq @sh quotes values before this eval.
+          eval "$(echo "$ISSUE_META" | jq -r 'to_entries[] | select(.key | IN("issue_id", "issue_identifier", "issue_title", "issue_description_b64")) | "export \(.key | ascii_upcase)=\(.value | @sh)"')"
           export ISSUE_DESCRIPTION=$(echo "$ISSUE_DESCRIPTION_B64" | base64 -d)
           /opt/ai-implement/entrypoint.sh

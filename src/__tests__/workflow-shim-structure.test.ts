@@ -6,7 +6,15 @@ const IMPLEMENT_WORKFLOWS = [
   "workflows/claude-implement.yml",
   ".github/workflows/claude-implement.yml",
 ];
-const FILES = [...IMPLEMENT_WORKFLOWS, "workflows/comment-trigger.yml"];
+const COMMENT_TRIGGER_WORKFLOWS = [
+  "workflows/comment-trigger.yml",
+  ".github/workflows/comment-trigger.yml",
+];
+const PLANNING_WORKFLOWS = [
+  "workflows/claude-plan.yml",
+  ".github/workflows/claude-plan.yml",
+];
+const FILES = [...IMPLEMENT_WORKFLOWS, ...COMMENT_TRIGGER_WORKFLOWS];
 
 describe("GHA workflow shims", () => {
   it("ships workflow templates in the orchestrator image for admin-triggered syncs", () => {
@@ -16,6 +24,18 @@ describe("GHA workflow shims", () => {
   it("keeps the canonical and synced dispatch workflows byte-for-byte identical", () => {
     expect(readFileSync(".github/workflows/claude-implement.yml", "utf-8")).toBe(
       readFileSync("workflows/claude-implement.yml", "utf-8"),
+    );
+  });
+
+  it("keeps the canonical and synced comment trigger workflows byte-for-byte identical", () => {
+    expect(readFileSync(".github/workflows/comment-trigger.yml", "utf-8")).toBe(
+      readFileSync("workflows/comment-trigger.yml", "utf-8"),
+    );
+  });
+
+  it("keeps the canonical and synced planning workflows byte-for-byte identical", () => {
+    expect(readFileSync(".github/workflows/claude-plan.yml", "utf-8")).toBe(
+      readFileSync("workflows/claude-plan.yml", "utf-8"),
     );
   });
 
@@ -84,6 +104,7 @@ describe("GHA workflow shims", () => {
     expect(yaml).toMatch(/runner_image:\s*\$\{\{\s*steps\.runner-image\.outputs\.runner_image\s*\}\}/);
     expect(yaml).toMatch(/image:\s*\$\{\{\s*needs\.check-trigger\.outputs\.runner_image\s*\}\}/);
     expect(yaml).toMatch(/AI_IMPLEMENT_RUNNER_IMAGE/);
+    expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
     expect(yaml).toMatch(/invalid characters for a container image reference/);
     expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
   });
@@ -91,9 +112,49 @@ describe("GHA workflow shims", () => {
   it("documents and constrains the ISSUE_META eval trust boundary", () => {
     const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
     expect(yaml).toMatch(/lower_snake_case keys/);
+    expect(yaml).toMatch(/select\(\.key \| IN\("issue_id", "issue_identifier", "issue_title", "issue_description_b64"\)\)/);
+    expect(yaml).not.toMatch(/IN\([^)]*github_token/);
+    expect(yaml).not.toMatch(/IN\([^)]*anthropic_api_key/);
     expect(yaml).toMatch(/jq @sh quotes values/);
-    expect(yaml).toMatch(/jq -r 'to_entries\[\] \| "export/);
+    expect(yaml).toMatch(/jq -r 'to_entries\[\] \| select/);
     expect(yaml).toMatch(/@sh/);
     expect(yaml).toMatch(/ISSUE_DESCRIPTION_B64.*base64 -d/);
   });
+
+  it("comment trigger grants OIDC only to the container implementation job", () => {
+    const doc = parse(readFileSync("workflows/comment-trigger.yml", "utf-8")) as any;
+    expect(doc.permissions).not.toHaveProperty("id-token");
+    expect(doc.jobs["check-trigger"].permissions).toBeUndefined();
+    expect(doc.jobs.implement.permissions["id-token"]).toBe("write");
+  });
+
+  it("comment trigger acknowledges valid trigger comments", () => {
+    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
+    expect(yaml).toMatch(/Acknowledge trigger/);
+    expect(yaml).toMatch(/createForIssueComment/);
+    expect(yaml).toMatch(/content: "\+1"/);
+  });
+
+  it("comment trigger validates Bedrock config before configuring AWS credentials", () => {
+    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
+    expect(yaml).toMatch(/Validate Bedrock inputs/);
+    expect(yaml).toMatch(/AI_IMPLEMENT_AWS_REGION repository or organization variable is empty/);
+    expect(yaml.indexOf("Validate Bedrock inputs")).toBeLessThan(yaml.indexOf("Configure AWS credentials (Bedrock)"));
+  });
+
+  for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} does not allow Claude to curl Linear directly`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/Bash\(curl\*api\.linear\.app\/graphql\*\)/);
+      expect(yaml).toMatch(/Do NOT post comments directly to the/);
+    });
+
+    it(`${f} uses default bash pipefail and glob iteration for callback comments`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/shell:\s*\/usr\/bin\/bash -e \{0\}/);
+      expect(yaml).toMatch(/shopt -s nullglob/);
+      expect(yaml).toMatch(/for f in ai-output\/comments\/\*\.md; do/);
+      expect(yaml).not.toMatch(/for f in \$\(ls ai-output\/comments\/\*\.md/);
+    });
+  }
 });
