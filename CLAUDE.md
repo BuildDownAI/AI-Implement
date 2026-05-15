@@ -102,12 +102,11 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 
 ## Adding a new target repo
 
-1. Add the repo to the matrix in `.github/workflows/sync-workflow.yml`
-2. Run the sync workflow — it opens a PR in the target repo with the workflow files and a starter `WORKFLOW.md`
-3. Merge the PR in the target repo
-4. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
-5. Install the GitHub App on the target repo
-6. Add the team→repo mapping in the admin UI at `/admin`
+1. Add the team→repo mapping in the admin UI at `/admin`
+2. Install the GitHub App on the target repo
+3. Click **Sync workflows** on that project row — the orchestrator opens or updates a PR in the target repo with workflow files and starter prompt templates
+4. Merge the PR in the target repo
+5. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
 
 ## admin-ui
 
@@ -145,7 +144,7 @@ The 14 not-yet-implemented routes (`overview`, `issues`, `pulls`, `blockers`, `p
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
 
-`sync-workflow.yml` always syncs `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml`. It seeds `WORKFLOW.md` and `PLANNING.md` once and never overwrites them (each repo owns its own prompt templates after initial setup).
+The Projects page **Sync workflows** action always syncs `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml` into the target repo. It seeds `WORKFLOW.md` and `PLANNING.md` once and never overwrites them (each repo owns its own prompt templates after initial setup). `.github/workflows/sync-workflow.yml` remains as a manual fallback, but normal distribution should happen from the orchestrator.
 
 ### Model IDs are passed through verbatim
 

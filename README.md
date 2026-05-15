@@ -57,17 +57,13 @@ npm install
 npm run dev                # starts polling + HTTP server on :8080
 ```
 
-Then in your Linear workspace, create an `AI-Implement` label. In the orchestrator's admin UI at http://localhost:8080/admin (gated by `ADMIN_ACCESS_CODE`), add a team → repo mapping. Sync the workflow templates into the target repo:
-
-```bash
-gh workflow run sync-workflow.yml -f target_repo=your-org/your-repo
-```
+Then in your Linear workspace, create an `AI-Implement` label. Install the GitHub App on the target repo, then in the orchestrator's admin UI at http://localhost:8080/admin (gated by `ADMIN_ACCESS_CODE`), add a team → repo mapping. From the Projects page, click **Sync workflows** for that project; the orchestrator opens or updates a PR in the target repo with the workflow templates.
 
 The synced workflows allow the GitHub App bot that minted the workflow token by
 default. To allow a different bot or a comma-separated allow-list, set the
 `AI_IMPLEMENT_ALLOWED_BOTS` Actions variable on the target repo or org.
 
-Merge the resulting PR in the target repo, enable "Allow GitHub Actions to create and approve pull requests" in its settings, install the GitHub App on it, then label any Linear issue `AI-Implement` and watch.
+Merge the resulting PR in the target repo, enable "Allow GitHub Actions to create and approve pull requests" in its settings, then label any Linear issue `AI-Implement` and watch.
 
 The full architecture, env-var reference, SQLite schema, multi-client deploy model, and Bedrock setup live in [`CLAUDE.md`](CLAUDE.md).
 

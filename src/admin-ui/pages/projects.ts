@@ -236,6 +236,7 @@ export const projectsScript = `
           + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
           + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
           + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
+          + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> '
           + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
         + '</td>';
       tbody.appendChild(tr);
@@ -641,6 +642,44 @@ export const projectsScript = `
     await loadMappings();
   }
   window.togglePause = togglePause;
+
+  async function syncWorkflows(button) {
+    const key = button.dataset.key;
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Syncing...';
+    try {
+      const res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/sync-workflows', {
+        method: 'POST',
+      });
+      let data = {};
+      try { data = await res.json(); } catch (_) {}
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to sync workflows');
+      }
+      const labels = {
+        'up-to-date': 'Up to date',
+        'pr-existing': 'PR exists',
+        'pr-opened': 'PR opened',
+        'pr-updated': 'PR updated',
+      };
+      button.textContent = labels[data.status] || 'Synced';
+      if (data.prUrl) {
+        button.title = data.prUrl;
+        window.open(data.prUrl, '_blank', 'noopener,noreferrer');
+      }
+      setTimeout(function () {
+        button.textContent = original;
+        button.disabled = false;
+      }, 4000);
+    } catch (err) {
+      button.textContent = 'Sync failed';
+      button.disabled = false;
+      alert(err && err.message ? err.message : String(err));
+      setTimeout(function () { button.textContent = original; }, 4000);
+    }
+  }
+  window.syncWorkflows = syncWorkflows;
 
   async function showSecrets(teamKey) {
     currentSecretsTeam = teamKey;

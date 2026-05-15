@@ -9,6 +9,10 @@ const IMPLEMENT_WORKFLOWS = [
 const FILES = [...IMPLEMENT_WORKFLOWS, "workflows/comment-trigger.yml"];
 
 describe("GHA workflow shims", () => {
+  it("ships workflow templates in the orchestrator image for admin-triggered syncs", () => {
+    expect(readFileSync("Dockerfile", "utf-8")).toMatch(/COPY workflows\/ \.\/workflows\//);
+  });
+
   it("keeps the canonical and synced dispatch workflows byte-for-byte identical", () => {
     expect(readFileSync(".github/workflows/claude-implement.yml", "utf-8")).toBe(
       readFileSync("workflows/claude-implement.yml", "utf-8"),
