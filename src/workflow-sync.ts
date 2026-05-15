@@ -33,11 +33,13 @@ const SEED_ONCE_FILES = [
     local: "workflows/WORKFLOW.md",
     remote: "WORKFLOW.md",
     message: "Add WORKFLOW.md prompt template (customise for this repo)",
+    description: "Claude implementation prompt template; customise this for your repo",
   },
   {
     local: "workflows/PLANNING.md",
     remote: "PLANNING.md",
     message: "Add PLANNING.md planning template (customise for this repo)",
+    description: "Claude planning prompt template; customise this for your repo",
   },
 ] as const;
 
@@ -80,13 +82,17 @@ class GitHubClient {
   ) {}
 
   async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const headers: Record<string, string> = {
+      ...GH_HEADERS,
+      Authorization: `Bearer ${this.token}`,
+      ...(init.headers as Record<string, string> | undefined ?? {}),
+    };
+    if (init.body !== undefined && !Object.keys(headers).some((key) => key.toLowerCase() === "content-type")) {
+      headers["Content-Type"] = "application/json";
+    }
     const res = await this.fetchImpl(`https://api.github.com${path}`, {
       ...init,
-      headers: {
-        ...GH_HEADERS,
-        Authorization: `Bearer ${this.token}`,
-        ...(init.headers ?? {}),
-      },
+      headers,
     });
     if (!res.ok) {
       const text = await res.text();
@@ -177,9 +183,12 @@ async function syncFile(params: {
   localContent: string;
   remotePath: string;
   message: string;
+  remote?: RemoteFile | null;
 }): Promise<boolean> {
   const { gh, repo, branch, localContent, remotePath, message } = params;
-  const remote = await getRemoteFile(gh, repo, remotePath, branch);
+  const remote = params.remote !== undefined
+    ? params.remote
+    : await getRemoteFile(gh, repo, remotePath, branch);
   if (remote?.content === localContent) return false;
 
   await gh.request(`/repos/${repo}/contents/${encodeRepoPath(remotePath)}`, {
@@ -205,8 +214,9 @@ async function syncMaybeSeedFile(params: {
 }): Promise<boolean> {
   const { gh, repo, baseBranch, syncBranch, localContent, remotePath, message } = params;
   if (await remoteFileExists(gh, repo, remotePath, baseBranch)) return false;
-  if (await remoteFileExists(gh, repo, remotePath, syncBranch)) return false;
-  return await syncFile({ gh, repo, branch: syncBranch, localContent, remotePath, message });
+  const remote = await getRemoteFile(gh, repo, remotePath, syncBranch);
+  if (remote) return false;
+  return await syncFile({ gh, repo, branch: syncBranch, localContent, remotePath, message, remote });
 }
 
 async function ensureSyncBranch(params: {
@@ -250,7 +260,19 @@ async function findSyncPr(
   const prs = await gh.request<PullRequest[]>(
     `/repos/${repo}/pulls?state=open&head=${encodeURIComponent(`${repo.split("/")[0]}:${syncBranch}`)}`,
   );
-  return prs.find((pr) => pr.base && pr.number) ?? null;
+  return prs[0] ?? null;
+}
+
+function syncPrBody(): string {
+  return [
+    "Auto-synced from ai-implement.",
+    "",
+    "**Always updated:**",
+    ...ALWAYS_SYNC_FILES.map((file) => `- \`${file.remote}\``),
+    "",
+    "**Added once (never overwritten):**",
+    ...SEED_ONCE_FILES.map((file) => `- \`${file.remote}\` — ${file.description}`),
+  ].join("\n");
 }
 
 async function createSyncPr(params: {
@@ -260,25 +282,13 @@ async function createSyncPr(params: {
   syncBranch: string;
 }): Promise<PullRequest> {
   const { gh, repo, baseBranch, syncBranch } = params;
-  const body = [
-    "Auto-synced from ai-implement.",
-    "",
-    "**Always updated:**",
-    "- `.github/workflows/claude-implement.yml`",
-    "- `.github/workflows/comment-trigger.yml`",
-    "- `.github/workflows/claude-plan.yml`",
-    "",
-    "**Added once (never overwritten):**",
-    "- `WORKFLOW.md` — Claude implementation prompt template; customise this for your repo",
-    "- `PLANNING.md` — Claude planning prompt template; customise this for your repo",
-  ].join("\n");
   return await gh.request<PullRequest>(`/repos/${repo}/pulls`, {
     method: "POST",
     body: JSON.stringify({
       title: "Sync AI implementation workflow files",
       head: syncBranch,
       base: baseBranch,
-      body,
+      body: syncPrBody(),
     }),
   });
 }

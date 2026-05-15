@@ -108,6 +108,8 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 4. Merge the PR in the target repo
 5. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
 
+The GitHub App must have **workflows** permission in addition to **contents** permission. GitHub rejects writes under `.github/workflows/` without it, so the Sync workflows action will fail before opening or updating the target-repo PR.
+
 ## admin-ui
 
 The admin SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/`. `src/admin-html.ts` is a thin re-export of `src/admin-ui/index.ts`. There is **no client-side build step** — all client JS is concatenated into a single inline `<script>` block at module load time.

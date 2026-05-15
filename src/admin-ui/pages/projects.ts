@@ -665,6 +665,7 @@ export const projectsScript = `
       };
       button.textContent = labels[data.status] || 'Synced';
       if (data.prUrl) {
+        button.dataset.prUrl = data.prUrl;
         button.title = data.prUrl;
         window.open(data.prUrl, '_blank', 'noopener,noreferrer');
       }

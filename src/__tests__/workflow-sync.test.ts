@@ -67,6 +67,7 @@ function response(status: number, body?: unknown): Response {
 function makeGithubFetch(opts?: {
   mainFiles?: Record<string, string>;
   syncFiles?: Record<string, string>;
+  syncAheadBy?: number;
   existingPr?: FakePull | null;
 }) {
   const branches: Record<string, { sha: string; aheadBy: number; files: Record<string, string> }> = {
@@ -75,17 +76,19 @@ function makeGithubFetch(opts?: {
   if (opts?.syncFiles) {
     branches["sync/ai-implement"] = {
       sha: "sync-sha",
-      aheadBy: 0,
+      aheadBy: opts.syncAheadBy ?? 0,
       files: { ...opts.syncFiles },
     };
   }
   const pulls: FakePull[] = opts?.existingPr ? [opts.existingPr] : [];
+  const calls: Array<{ path: string; method: string; headers: HeadersInit | undefined; body: unknown }> = [];
 
   const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
     const url = new URL(String(input));
     const path = url.pathname;
     const method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : {};
+    calls.push({ path, method, headers: init?.headers, body });
 
     if (method === "GET" && path === "/repos/acme/app") {
       return response(200, { default_branch: "main" });
@@ -168,7 +171,7 @@ function makeGithubFetch(opts?: {
     return response(500, { message: `Unhandled fake GitHub route: ${method} ${path}` });
   }) as typeof fetch;
 
-  return { fetchImpl, branches, pulls };
+  return { fetchImpl, branches, pulls, calls };
 }
 
 describe("syncWorkflowTemplates", () => {
@@ -196,6 +199,9 @@ describe("syncWorkflowTemplates", () => {
     ]);
     expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-implement.yml"]).toBe("implement-yml\n");
     expect(fake.branches["sync/ai-implement"].files["WORKFLOW.md"]).toBe("workflow-md\n");
+    const writeCalls = fake.calls.filter((call) => ["POST", "PUT", "PATCH"].includes(call.method));
+    expect(writeCalls.length).toBeGreaterThan(0);
+    expect(writeCalls.every((call) => (call.headers as Record<string, string>)["Content-Type"] === "application/json")).toBe(true);
   });
 
   it("does not overwrite repo-owned prompt templates when they already exist on base", async () => {
@@ -251,5 +257,106 @@ describe("syncWorkflowTemplates", () => {
     expect(result.status).toBe("up-to-date");
     expect(result.changedFiles).toEqual([]);
     expect(result.prUrl).toBeNull();
+  });
+
+  it("updates an existing sync PR when files change", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch({
+      syncFiles: {
+        ".github/workflows/claude-implement.yml": "old implement\n",
+      },
+      existingPr: {
+        number: 77,
+        html_url: "https://github.com/acme/app/pull/77",
+        head: "sync/ai-implement",
+        base: { ref: "develop" },
+      },
+    });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.status).toBe("pr-updated");
+    expect(result.prNumber).toBe(77);
+    expect(result.prUrl).toBe("https://github.com/acme/app/pull/77");
+    expect(fake.pulls).toHaveLength(1);
+    expect(fake.pulls[0].base.ref).toBe("main");
+  });
+
+  it("returns pr-existing when no files changed and a sync PR is already open", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const syncedFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/comment-trigger.yml": "comment-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({
+      mainFiles: syncedFiles,
+      syncFiles: syncedFiles,
+      existingPr: {
+        number: 88,
+        html_url: "https://github.com/acme/app/pull/88",
+        head: "sync/ai-implement",
+        base: { ref: "main" },
+      },
+    });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.status).toBe("pr-existing");
+    expect(result.prNumber).toBe(88);
+    expect(result.changedFiles).toEqual([]);
+  });
+
+  it("preserves an existing sync branch that is ahead of base", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch({
+      syncFiles: {
+        "operator-note.txt": "keep me\n",
+      },
+      syncAheadBy: 2,
+    });
+
+    await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(fake.branches["sync/ai-implement"].files["operator-note.txt"]).toBe("keep me\n");
+    expect(fake.calls.some((call) => call.method === "PATCH" && call.path.includes("/git/refs/heads/"))).toBe(false);
+  });
+
+  it("throws when an always-synced workflow template is missing", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    rmSync(join(templatesRoot, "workflows/claude-plan.yml"));
+    const fake = makeGithubFetch();
+
+    await expect(syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    })).rejects.toThrow("Missing workflow template: workflows/claude-plan.yml");
   });
 });
