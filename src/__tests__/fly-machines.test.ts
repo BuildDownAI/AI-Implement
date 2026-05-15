@@ -644,7 +644,7 @@ describe("updateMachineMetadata", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it("sends POST to the metadata key endpoint with plain-text body", async () => {
+  it("sends POST to the metadata key endpoint with JSON value body", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response);
 
     await updateMachineMetadata(TOKEN, APP, "machine-123", "pr_number", "42");
@@ -652,8 +652,8 @@ describe("updateMachineMetadata", () => {
     const [url, opts] = vi.mocked(fetch).mock.calls[0];
     expect(url).toBe(`https://api.machines.dev/v1/apps/${APP}/machines/machine-123/metadata/pr_number`);
     expect((opts as RequestInit).method).toBe("POST");
-    expect((opts as RequestInit).body).toBe("42");
-    expect(((opts as RequestInit).headers as Record<string, string>)["Content-Type"]).toBe("text/plain");
+    expect((opts as RequestInit).body).toBe(JSON.stringify({ value: "42" }));
+    expect(((opts as RequestInit).headers as Record<string, string>)["Content-Type"]).toBe("application/json");
     expect(((opts as RequestInit).headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${TOKEN}`);
   });
 
@@ -678,7 +678,7 @@ describe("updateMachineMetadata", () => {
     await updateMachineMetadata(TOKEN, APP, "machine-123", "pr_number", prNumberMatch![1]);
 
     const [, opts] = vi.mocked(fetch).mock.calls[0];
-    expect((opts as RequestInit).body).toBe("99");
+    expect((opts as RequestInit).body).toBe(JSON.stringify({ value: "99" }));
   });
 });
 
