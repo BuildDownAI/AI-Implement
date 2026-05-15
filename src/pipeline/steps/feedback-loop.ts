@@ -22,6 +22,7 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   repoReviewModel?: string;
   maxIterations?: number;
   planningContext?: string;
+  implementationPrompt?: string;
   parentStepId?: string;
 }
 
@@ -36,11 +37,17 @@ function buildImplementPrompt(
   issueDescription: string,
   reviewFeedback: string | undefined,
   issueIdentifier: string,
+  implementationPrompt?: string,
 ): string {
+  const basePrompt =
+    implementationPrompt && implementationPrompt.trim()
+      ? implementationPrompt
+      : `Implement the following issue.\n\nTitle: ${issueTitle}\n\nDescription:\n${issueDescription}`;
+
   if (reviewFeedback) {
-    return `You previously attempted to implement ${issueIdentifier}: ${issueTitle}.\n\nReviewer feedback:\n${reviewFeedback}\n\nPlease address the feedback and improve the implementation.`;
+    return `${basePrompt}\n\n## Reviewer Feedback\n\nYou previously attempted to implement ${issueIdentifier}: ${issueTitle}.\n\nReviewer feedback:\n${reviewFeedback}\n\nPlease address the feedback and improve the implementation.`;
   }
-  return `Implement the following issue.\n\nTitle: ${issueTitle}\n\nDescription:\n${issueDescription}`;
+  return basePrompt;
 }
 
 function getDiff(workspaceDir: string): string {
@@ -95,6 +102,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         String(inputs.issueDescription),
         feedback || undefined,
         context.data.issueIdentifier,
+        inputs.implementationPrompt !== undefined ? String(inputs.implementationPrompt) : undefined,
       );
 
       // --- implement sub-step ---

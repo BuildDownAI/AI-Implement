@@ -28,6 +28,38 @@ function requireEnv(n: string): string {
   return v;
 }
 
+function buildDefaultImplementationPrompt(params: {
+  issueIdentifier: string;
+  issueTitle: string;
+  issueDescription: string;
+  prNumber: string;
+}): string {
+  const { issueIdentifier, issueTitle, issueDescription, prNumber } = params;
+  if (prNumber) {
+    return `Read CLAUDE.md if it exists.
+
+## Gap-fill run (PR #${prNumber})
+
+You are filling implementation gaps on existing PR #${prNumber}. Do NOT create a new branch or PR. Commit your changes to the current branch and push.
+
+**Issue:** ${issueIdentifier}
+**Title:** ${issueTitle}
+**Description:**
+${issueDescription}`;
+  }
+
+  return `Read CLAUDE.md if it exists.
+
+## New implementation
+
+Create a branch named "${issueIdentifier}/short-description" then implement the feature below and open a PR with title "${issueIdentifier}: ${issueTitle}". The PR body must include "Fixes ${issueIdentifier}" so Linear auto-closes the issue on merge.
+
+**Issue:** ${issueIdentifier}
+**Title:** ${issueTitle}
+**Description:**
+${issueDescription}`;
+}
+
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
   const issueId = requireEnv("ISSUE_ID");
@@ -36,21 +68,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const issueDescription = requireEnv("ISSUE_DESCRIPTION");
   const githubOwner = requireEnv("GITHUB_OWNER");
   const githubRepo = requireEnv("GITHUB_REPO");
+  const githubToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
+  if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
+  const branch = process.env.GITHUB_DEFAULT_BRANCH || "main";
   const prNumber = process.env.PR_NUMBER ?? "";
-
-  let model: string | undefined;
-  const wfPath = join(workspaceDir, "WORKFLOW.md");
-  if (existsSync(wfPath)) {
-    const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {
-      ISSUE_ID: issueId,
-      ISSUE_IDENTIFIER: issueIdentifier,
-      ISSUE_TITLE: issueTitle,
-      ISSUE_DESCRIPTION: issueDescription,
-      PR_NUMBER: prNumber,
-    });
-    model = parsed.frontMatter.model;
-  }
-  if (!model) model = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
 
   const planningContext = process.env.LINEAR_API_KEY
     ? await fetchPlanningContext({
@@ -59,6 +80,28 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         fetchImpl: opts.fetchImpl,
       })
     : "";
+
+  let workflowModel: string | undefined;
+  let implementationPrompt = buildDefaultImplementationPrompt({
+    issueIdentifier,
+    issueTitle,
+    issueDescription,
+    prNumber,
+  });
+  const wfPath = join(workspaceDir, "WORKFLOW.md");
+  if (existsSync(wfPath)) {
+    const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {
+      ISSUE_ID: issueId,
+      ISSUE_IDENTIFIER: issueIdentifier,
+      ISSUE_TITLE: issueTitle,
+      ISSUE_DESCRIPTION: issueDescription,
+      PR_NUMBER: prNumber,
+      PLANNING_CONTEXT: planningContext,
+    });
+    workflowModel = parsed.frontMatter.model;
+    if (parsed.body.trim()) implementationPrompt = parsed.body;
+  }
+  const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
 
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
@@ -85,9 +128,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       model,
       workspaceDir,
       planningContext,
+      implementationPrompt,
       prNumber,
       githubOwner,
       githubRepo,
+      githubToken,
+      branch,
     },
     llmExecutor,
   );

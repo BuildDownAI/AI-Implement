@@ -52,12 +52,18 @@ export interface PipelineContextData {
   workspaceDir?: string;
   /** Autonomous runner: planning context fetched from the ticketing provider. */
   planningContext?: string;
+  /** Autonomous runner: fully rendered implementation prompt from WORKFLOW.md or fallback. */
+  implementationPrompt?: string;
   /** Autonomous runner: existing PR number for gap-fill runs, "" if none. */
   prNumber?: string;
   /** Autonomous runner: target GitHub repo owner. */
   githubOwner?: string;
   /** Autonomous runner: target GitHub repo name. */
   githubRepo?: string;
+  /** Autonomous runner: token used for clone/push. */
+  githubToken?: string;
+  /** Autonomous runner: branch to clone/push. */
+  branch?: string;
 }
 
 export interface PipelineContext {

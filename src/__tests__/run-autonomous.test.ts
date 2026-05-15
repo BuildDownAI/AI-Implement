@@ -14,6 +14,7 @@ const REQUIRED_ENV: Record<string, string> = {
   ISSUE_DESCRIPTION: "Issue description",
   GITHUB_OWNER: "acme",
   GITHUB_REPO: "app",
+  GITHUB_TOKEN: "ghs_test",
 };
 
 function stubRequiredEnv() {
@@ -113,6 +114,56 @@ describe("runAutonomous", () => {
     expect(capturedModel).toBe("claude-opus-4-7");
   });
 
+  it("uses CLAUDE_MODEL env var over WORKFLOW.md front matter", async () => {
+    vi.stubEnv("CLAUDE_MODEL", "anthropic.claude-sonnet-bedrock-v1:0");
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nmodel: claude-opus-4-7\n---\nDo the thing\n");
+
+    let capturedModel: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedModel = ctx.data.model;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-model", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedModel).toBe("anthropic.claude-sonnet-bedrock-v1:0");
+  });
+
+  it("uses WORKFLOW.md body as the implementation prompt", async () => {
+    writeFileSync(
+      join(workspaceDir, "WORKFLOW.md"),
+      "---\nmodel: claude-opus-4-7\n---\nCustom prompt for ${ISSUE_IDENTIFIER}: ${ISSUE_TITLE}\n",
+    );
+
+    let capturedPrompt: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedPrompt = ctx.data.implementationPrompt;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-prompt", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedPrompt).toBe("Custom prompt for AII-1: Test issue\n");
+  });
+
   it("falls back to CLAUDE_MODEL env var when WORKFLOW.md has no model", async () => {
     vi.stubEnv("CLAUDE_MODEL", "claude-haiku-4-5");
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\n---\nNo model here\n");
@@ -208,6 +259,84 @@ describe("runAutonomous", () => {
       "https://api.linear.app/graphql",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+
+  it("stores fetched planning context on the pipeline context", async () => {
+    vi.stubEnv("LINEAR_API_KEY", "lin_api_test");
+
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            comments: {
+              nodes: [
+                {
+                  body: "## 🏗️ AI Planning: Architecture Analysis\nUse the service layer",
+                  createdAt: "2026-05-15T00:00:00.000Z",
+                },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    });
+
+    let capturedPlanningContext: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedPlanningContext = ctx.data.planningContext;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-planning", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(capturedPlanningContext).toContain("Use the service layer");
+  });
+
+  it("runs the default autonomous pipeline with clone inputs from context", async () => {
+    let cloneInputs: Record<string, unknown> | undefined;
+    const runner = new PipelineRunner()
+      .register("clone", {
+        run: vi.fn(async (_ctx, inputs) => {
+          cloneInputs = inputs;
+          return {
+            workspaceDir: inputs.workspaceDir,
+            repoOwner: inputs.repoOwner,
+            repoRepo: inputs.repoRepo,
+            githubToken: inputs.githubToken,
+            branch: inputs.branch,
+          };
+        }),
+      })
+      .register("install", { run: vi.fn().mockResolvedValue({}) })
+      .register("feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(cloneInputs).toMatchObject({
+      repoOwner: "acme",
+      repoRepo: "app",
+      githubToken: "ghs_test",
+      branch: "main",
+      workspaceDir,
+    });
   });
 
   it("skips planning context fetch when LINEAR_API_KEY is absent", async () => {
