@@ -150,7 +150,10 @@ function applyWiring(step: YamlStep): StepDefinition {
           prNumber: String(ctx.getOutputs("push").prNumber ?? ""),
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
         }),
-        skip: (ctx: PipelineContext) => ctx.getOutputs("push").branchPushed !== true,
+        skip: (ctx: PipelineContext) => {
+          const pushOutputs = ctx.getOutputs("push");
+          return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
+        },
       };
 
     default:

@@ -284,12 +284,16 @@ describe("loadPipelineDefinition", () => {
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
 
     const ctxPushed = makeContext();
-    ctxPushed.setOutputs("push", { branchPushed: true });
+    ctxPushed.setOutputs("push", { branchPushed: true, prNumber: 42 });
     expect(step.skip?.(ctxPushed)).toBe(false);
 
     const ctxSkipped = makeContext();
     ctxSkipped.setOutputs("push", { branchPushed: false });
     expect(step.skip?.(ctxSkipped)).toBe(true);
+
+    const ctxMissingPr = makeContext();
+    ctxMissingPr.setOutputs("push", { branchPushed: true, prNumber: null });
+    expect(step.skip?.(ctxMissingPr)).toBe(true);
   });
 
   it("custom pipeline with extra step is used by the pipeline runner", async () => {

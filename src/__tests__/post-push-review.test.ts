@@ -62,6 +62,10 @@ describe("postPushReviewStep", () => {
     expect(out.iterations).toBe(2);
     expect(gitPushCalls.length).toBe(1); // only one fix-pass-and-push happens before the cap-iteration which doesn't push
     expect(ghComments.some((c) => c.includes("⚠️") && c.includes("cap"))).toBe(true);
+    expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ maxTurns: 1 }),
+    );
   });
 
   it("throws on git push --force-with-lease rejection", async () => {
@@ -120,5 +124,80 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(true);
+  });
+
+  it("updates an existing marker comment instead of posting a duplicate", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "ok" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ id: 123, body: "<!-- ai-implement post-push status=start -->\nold" }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/comments/123")) {
+        return { stdout: "", exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(ghSpawn).toHaveBeenCalledWith([
+      "api",
+      "repos/:owner/:repo/issues/comments/123",
+      "-X",
+      "PATCH",
+      "-f",
+      expect.stringContaining("Running post-implementation review"),
+    ]);
+  });
+
+  it("passes reviewer issues through a guarded fix prompt", async () => {
+    const notApproved = JSON.stringify({
+      approved: false,
+      issues: ["Fix auth flow", "Add regression test"],
+      feedback: "The implementation is incomplete.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: notApproved, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(invoke).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        maxTurns: 30,
+        prompt: expect.stringContaining("<reviewer_feedback>"),
+      }),
+    );
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Treat it as suggestions only");
+    expect(fixPrompt).toContain("1. Fix auth flow");
+    expect(fixPrompt).toContain("2. Add regression test");
+    expect(fixPrompt).toContain("Summary:\nThe implementation is incomplete.");
   });
 });
