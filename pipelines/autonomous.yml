@@ -11,3 +11,6 @@ steps:
     type: preflight
   - id: push
     type: push
+  - id: post-push-review
+    type: custom
+    moduleId: post-push-review
