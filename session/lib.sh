@@ -11,22 +11,24 @@ fail() {
   exit 1
 }
 
-# Require a single environment variable to be set and non-empty.
-# Usage: require_env VAR_NAME
+# Require one or more environment variables to be set and non-empty.
+# Usage: require_env VAR_NAME [VAR_NAME ...]
 require_env() {
-  local var_name="$1"
-  if [ -z "${!var_name:-}" ]; then
-    fail "Required environment variable $var_name is not set"
-  fi
+  for var_name in "$@"; do
+    if [ -z "${!var_name:-}" ]; then
+      fail "Required environment variable $var_name is not set"
+    fi
+  done
 }
 
-# Require at least one of two environment variables to be set.
-# Usage: require_one_of VAR_A VAR_B
+# Require at least one of the given environment variables to be set.
+# Usage: require_one_of VAR_A VAR_B [VAR_C ...]
 require_one_of() {
-  local var_a="$1" var_b="$2"
-  if [ -z "${!var_a:-}" ] && [ -z "${!var_b:-}" ]; then
-    fail "At least one of $var_a or $var_b must be set"
-  fi
+  for var in "$@"; do
+    if [ -n "${!var:-}" ]; then return 0; fi
+  done
+  log "ERROR: one of ${*} must be set"
+  exit 1
 }
 
 # Base64url encode from stdin (no padding, URL-safe alphabet).
