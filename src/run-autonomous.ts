@@ -62,6 +62,7 @@ ${issueDescription}`;
 
 function appendPipelineOwnedGitInstructions(prompt: string, prNumber: string): string {
   if (prNumber) return prompt;
+  if (prompt.includes("Pipeline-owned Git")) return prompt;
   return `${prompt.trimEnd()}
 
 ## Pipeline-owned Git and PR handling

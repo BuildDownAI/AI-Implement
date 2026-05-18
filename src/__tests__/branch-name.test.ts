@@ -13,4 +13,10 @@ describe("buildIssueBranchName", () => {
       "ai-implement/gen-123-implementation",
     );
   });
+
+  it("handles undefined issue metadata defensively", () => {
+    expect(buildIssueBranchName(undefined, undefined)).toBe(
+      "ai-implement/issue-implementation",
+    );
+  });
 });

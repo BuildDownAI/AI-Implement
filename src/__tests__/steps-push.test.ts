@@ -210,6 +210,30 @@ describe("pushStep", () => {
     );
   });
 
+  it("throws when Claude leaves no working tree changes", async () => {
+    mockGitSuccess("abc123", false);
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Nothing to commit/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("throws when git status fails", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") {
+        return spawnResult(128, "", "fatal: not a git repository");
+      }
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/git status failed/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("refuses to push over the base branch", async () => {
     await expect(
       pushStep.run(

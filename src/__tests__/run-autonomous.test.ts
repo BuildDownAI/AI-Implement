@@ -217,6 +217,32 @@ describe("runAutonomous", () => {
     expect(capturedPrompt).not.toContain("Pipeline-owned Git and PR handling");
   });
 
+  it("does not duplicate pipeline-owned git instructions from custom prompts", async () => {
+    writeFileSync(
+      join(workspaceDir, "WORKFLOW.md"),
+      "Do the work\n\n## Pipeline-owned Git and PR handling\n\nDo NOT create or switch branches.\n",
+    );
+
+    let capturedPrompt: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedPrompt = ctx.data.implementationPrompt;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-prompt", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedPrompt?.match(/Pipeline-owned Git and PR handling/g)).toHaveLength(1);
+  });
+
   it("falls back to CLAUDE_MODEL env var when WORKFLOW.md has no model", async () => {
     vi.stubEnv("CLAUDE_MODEL", "claude-haiku-4-5");
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\n---\nNo model here\n");

@@ -34,17 +34,18 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     }
 
     runGit(workspaceDir, ["checkout", "-B", branchName], githubToken, "git checkout");
-    if (hasWorkingTreeChanges(workspaceDir)) {
-      runGit(workspaceDir, ["config", "user.name", "ai-implement[bot]"], githubToken, "git config user.name");
-      runGit(
-        workspaceDir,
-        ["config", "user.email", "ai-implement[bot]@users.noreply.github.com"],
-        githubToken,
-        "git config user.email",
-      );
-      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
-      runGit(workspaceDir, ["commit", "-m", buildCommitMessage(issueIdentifier, issueTitle)], githubToken, "git commit");
+    if (!hasWorkingTreeChanges(workspaceDir, githubToken)) {
+      throw new Error("Nothing to commit: Claude left no file changes in the working tree");
     }
+    runGit(workspaceDir, ["config", "user.name", "ai-implement[bot]"], githubToken, "git config user.name");
+    runGit(
+      workspaceDir,
+      ["config", "user.email", "ai-implement[bot]@users.noreply.github.com"],
+      githubToken,
+      "git config user.email",
+    );
+    runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+    runGit(workspaceDir, ["commit", "-m", buildCommitMessage(issueIdentifier, issueTitle)], githubToken, "git commit");
     const commitSha = resolveCommitSha(workspaceDir);
 
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
@@ -136,12 +137,15 @@ function runGit(
   }
 }
 
-function hasWorkingTreeChanges(workspaceDir: string): boolean {
+function hasWorkingTreeChanges(workspaceDir: string, githubToken: string): boolean {
   const result = spawnSync("git", ["status", "--porcelain"], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  if (result.status !== 0) return false;
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    throw new Error(`git status failed (exit ${result.status ?? "null"}): ${stderr}`);
+  }
   return result.stdout.toString().trim().length > 0;
 }
 
