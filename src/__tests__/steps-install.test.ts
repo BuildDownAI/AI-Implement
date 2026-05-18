@@ -39,6 +39,13 @@ function makeContext(): DefaultPipelineContext {
   });
 }
 
+function mockRootPackageJson(extraMatches?: (p: string) => boolean) {
+  vi.mocked(fs.existsSync).mockImplementation((p) => {
+    const rawPath = String(p);
+    return rawPath.endsWith("package.json") || extraMatches?.(rawPath) === true;
+  });
+}
+
 describe("installStep", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -46,7 +53,7 @@ describe("installStep", () => {
   });
 
   it("detects npm when no lock files exist", async () => {
-    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockRootPackageJson();
 
     const outputs = await installStep.run(
       makeContext(),
@@ -60,9 +67,7 @@ describe("installStep", () => {
   });
 
   it("detects yarn when yarn.lock exists", async () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) =>
-      String(p).endsWith("yarn.lock"),
-    );
+    mockRootPackageJson((p) => p.endsWith("yarn.lock"));
 
     const outputs = await installStep.run(
       makeContext(),
@@ -75,9 +80,7 @@ describe("installStep", () => {
   });
 
   it("detects pnpm when pnpm-lock.yaml exists", async () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) =>
-      String(p).endsWith("pnpm-lock.yaml"),
-    );
+    mockRootPackageJson((p) => p.endsWith("pnpm-lock.yaml"));
 
     const outputs = await installStep.run(
       makeContext(),
@@ -90,9 +93,7 @@ describe("installStep", () => {
   });
 
   it("reads packageManager from .ai-implement/config.yml when present", async () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) =>
-      String(p).includes(".ai-implement/config.yml"),
-    );
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
     vi.mocked(fs.readFileSync).mockReturnValue("packageManager: pnpm\n");
 
     const outputs = await installStep.run(
@@ -105,9 +106,7 @@ describe("installStep", () => {
   });
 
   it("parses models.implement from .ai-implement/config.yml", async () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) =>
-      String(p).includes(".ai-implement/config.yml"),
-    );
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
     vi.mocked(fs.readFileSync).mockReturnValue(
       "models:\n  implement: claude-opus-4-7\n",
     );
@@ -122,9 +121,7 @@ describe("installStep", () => {
   });
 
   it("parses models.review from .ai-implement/config.yml", async () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) =>
-      String(p).includes(".ai-implement/config.yml"),
-    );
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
     vi.mocked(fs.readFileSync).mockReturnValue(
       "models:\n  review: claude-haiku-4-5-20251001\n",
     );
@@ -139,9 +136,7 @@ describe("installStep", () => {
   });
 
   it("parses both models from .ai-implement/config.yml", async () => {
-    vi.mocked(fs.existsSync).mockImplementation((p) =>
-      String(p).includes(".ai-implement/config.yml"),
-    );
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
     vi.mocked(fs.readFileSync).mockReturnValue(
       "packageManager: npm\nmodels:\n  implement: claude-opus-4-7\n  review: claude-haiku-4-5-20251001\n",
     );
@@ -160,7 +155,7 @@ describe("installStep", () => {
   });
 
   it("returns empty repoModels when config.yml has no models section", async () => {
-    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockRootPackageJson();
 
     const outputs = await installStep.run(
       makeContext(),
@@ -172,7 +167,7 @@ describe("installStep", () => {
   });
 
   it("includes durationMs in outputs", async () => {
-    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockRootPackageJson();
 
     const outputs = await installStep.run(
       makeContext(),
@@ -185,7 +180,7 @@ describe("installStep", () => {
   });
 
   it("throws when the install command exits with non-zero code", async () => {
-    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockRootPackageJson();
     vi.mocked(spawn).mockImplementation(() => {
       const emitter = new EventEmitter() as ReturnType<typeof spawn>;
       setImmediate(() => emitter.emit("close", 1));
@@ -195,5 +190,37 @@ describe("installStep", () => {
     await expect(
       installStep.run(makeContext(), { workspaceDir: "/tmp/test" }, new NoopStepReporter()),
     ).rejects.toThrow("exited with code 1");
+  });
+
+  it("skips install when the repo root has no package.json", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.packageManager).toBe("none");
+    expect(outputs.installMethod).toBe("skipped: no package.json");
+    expect(outputs.durationMs).toBe(0);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("preserves configured packageManager when skipping without package.json", async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) =>
+      String(p).includes(".ai-implement/config.yml"),
+    );
+    vi.mocked(fs.readFileSync).mockReturnValue("packageManager: pnpm\n");
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.packageManager).toBe("pnpm");
+    expect(outputs.installMethod).toBe("skipped: no package.json");
+    expect(spawn).not.toHaveBeenCalled();
   });
 });

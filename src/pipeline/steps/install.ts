@@ -76,6 +76,9 @@ function detectPackageManager(workspaceDir: string): string {
 function buildInstallCommand(packageManager: string): string {
   if (packageManager === "yarn") return "yarn install --frozen-lockfile";
   if (packageManager === "pnpm") return "pnpm install --frozen-lockfile";
+  if (packageManager === "none") {
+    throw new Error("buildInstallCommand called with packageManager=none");
+  }
   return "npm ci";
 }
 
@@ -88,6 +91,17 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     const { workspaceDir } = inputs;
 
     const config = readAiImplementConfig(workspaceDir);
+    const hasPackageJson = fs.existsSync(path.join(workspaceDir, "package.json"));
+
+    if (!hasPackageJson) {
+      return {
+        packageManager: config.packageManager ?? "none",
+        installMethod: "skipped: no package.json",
+        durationMs: 0,
+        repoModels: config.models ?? {},
+      };
+    }
+
     const packageManager = config.packageManager ?? detectPackageManager(workspaceDir);
     const installMethod = buildInstallCommand(packageManager);
 
