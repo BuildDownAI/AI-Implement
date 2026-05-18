@@ -218,19 +218,19 @@ describe("loadPipelineDefinition", () => {
     expect(preflightStep.skip?.(ctxRejected)).toBe(true);
   });
 
-  it("applies push input wiring from clone outputs", () => {
+  it("applies push input wiring with an issue-scoped implementation branch", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,
       readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
     });
 
-    const ctx = makeContext();
+    const ctx = makeContext({ issueIdentifier: "ENG-42", issueTitle: "Add profile page" });
     ctx.setOutputs("clone", {
       workspaceDir: "/tmp/repo",
       repoOwner: "acme",
       repoRepo: "api",
       githubToken: "tok",
-      branch: "feature/x",
+      branch: "main",
     });
 
     const step = pipeline.steps.find((s) => s.id === "push")!;
@@ -239,7 +239,9 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.repoOwner).toBe("acme");
     expect(inputs.repoRepo).toBe("api");
     expect(inputs.githubToken).toBe("tok");
-    expect(inputs.branchName).toBe("feature/x");
+    expect(inputs.branchName).toBe("ai-implement/eng-42-add-profile-page");
+    expect(inputs.baseBranch).toBe("main");
+    expect(inputs.prTitle).toBe("ENG-42: Add profile page");
   });
 
   it("applies push skip condition based on feedback-loop approval", () => {

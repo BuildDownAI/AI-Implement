@@ -161,7 +161,60 @@ describe("runAutonomous", () => {
       llmExecutor: makeMockExecutor(0),
     });
 
-    expect(capturedPrompt).toBe("Custom prompt for AII-1: Test issue\n");
+    expect(capturedPrompt).toContain("Custom prompt for AII-1: Test issue");
+    expect(capturedPrompt).toContain("Pipeline-owned Git and PR handling");
+  });
+
+  it("appends pipeline-owned git instructions to custom implementation prompts", async () => {
+    writeFileSync(
+      join(workspaceDir, "WORKFLOW.md"),
+      "Create a branch and open a PR for ${ISSUE_IDENTIFIER}\n",
+    );
+
+    let capturedPrompt: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedPrompt = ctx.data.implementationPrompt;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-prompt", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedPrompt).toContain("Create a branch and open a PR for AII-1");
+    expect(capturedPrompt).toContain("Do NOT create or switch branches");
+    expect(capturedPrompt).toContain("Do NOT commit, push, or open a pull request");
+  });
+
+  it("does not append new-implementation git instructions for gap-fill runs", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+
+    let capturedPrompt: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedPrompt = ctx.data.implementationPrompt;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-prompt", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedPrompt).toContain("Gap-fill run");
+    expect(capturedPrompt).not.toContain("Pipeline-owned Git and PR handling");
   });
 
   it("falls back to CLAUDE_MODEL env var when WORKFLOW.md has no model", async () => {
