@@ -119,15 +119,15 @@ Read CLAUDE.md if it exists for repo-specific context and conventions.
 
 ## New implementation
 
-Create a branch named `${ISSUE_IDENTIFIER}/short-description`, implement the
-feature described in the issue below, then open a pull request with:
+Implement the feature described in the issue below in the current checkout.
+Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
+Leave your file changes unstaged and uncommitted. The AI-Implement pipeline
+will create the implementation commit, push an issue-scoped branch, and open
+the PR after review passes. The generated PR body includes
+`Fixes ${ISSUE_IDENTIFIER}` so the ticketing system automatically closes the
+issue when the PR is merged (Linear behaviour; Jira ignores it harmlessly).
 
-- **Title:** `${ISSUE_IDENTIFIER}: ${ISSUE_TITLE}`
-- **Body:** must include `Fixes ${ISSUE_IDENTIFIER}` so the ticketing system
-  automatically closes the issue when the PR is merged (Linear behaviour;
-  Jira ignores it harmlessly).
-
-After the PR is opened, write a brief implementation summary to
+After making the code changes, write a brief implementation summary to
 `ai-output/comments/01-summary.md` (e.g. a paragraph describing what
 changed plus a checklist of what was tested). The orchestrator reads this
 file and posts it back to the ticketing issue via the configured provider.

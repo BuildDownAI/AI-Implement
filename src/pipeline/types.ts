@@ -62,7 +62,7 @@ export interface PipelineContextData {
   githubRepo?: string;
   /** Autonomous runner: token used for clone/push. */
   githubToken?: string;
-  /** Autonomous runner: branch to clone/push. */
+  /** Autonomous runner: base branch to clone. Implementation branches are derived per issue. */
   branch?: string;
 }
 

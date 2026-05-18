@@ -27,31 +27,29 @@ const BASE_INPUTS = {
   repoOwner: "acme",
   repoRepo: "app",
   githubToken: "gh-token",
-  branchName: "ENG-42/feature",
+  branchName: "ai-implement/eng-42-feature",
+  baseBranch: "main",
 };
 
-function mockPushSuccess(sha = "deadbeef") {
-  vi.mocked(spawnSync)
-    // rev-parse HEAD (commitSha)
-    .mockReturnValueOnce({
-      status: 0,
-      stdout: Buffer.from(`${sha}\n`),
-      stderr: Buffer.from(""),
-      pid: 0,
-      output: [],
-      signal: null,
-      error: undefined,
-    })
-    // git push
-    .mockReturnValueOnce({
-      status: 0,
-      stdout: Buffer.from(""),
-      stderr: Buffer.from(""),
-      pid: 0,
-      output: [],
-      signal: null,
-      error: undefined,
-    });
+function spawnResult(status: number, stdout = "", stderr = ""): ReturnType<typeof spawnSync> {
+  return {
+    status,
+    stdout: Buffer.from(stdout),
+    stderr: Buffer.from(stderr),
+    pid: 0,
+    output: [],
+    signal: null,
+    error: undefined,
+  };
+}
+
+function mockGitSuccess(sha = "deadbeef", dirty = true) {
+  vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+    const gitArgs = args as string[];
+    if (gitArgs[0] === "status") return spawnResult(0, dirty ? " M src/app.ts\n" : "");
+    if (gitArgs[0] === "rev-parse") return spawnResult(0, `${sha}\n`);
+    return spawnResult(0);
+  });
 }
 
 describe("pushStep", () => {
@@ -61,7 +59,7 @@ describe("pushStep", () => {
   });
 
   it("creates PR and returns prUrl, prNumber, commitSha on success", async () => {
-    mockPushSuccess("abc123");
+    mockGitSuccess("abc123");
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: true,
       status: 201,
@@ -78,7 +76,7 @@ describe("pushStep", () => {
   });
 
   it("returns existing PR info on 422 (PR already open)", async () => {
-    mockPushSuccess("sha999");
+    mockGitSuccess("sha999");
     vi.mocked(fetch)
       .mockResolvedValueOnce({
         ok: false,
@@ -101,26 +99,15 @@ describe("pushStep", () => {
   });
 
   it("throws on git push failure and redacts token", async () => {
-    // rev-parse succeeds, push fails
-    vi.mocked(spawnSync)
-      .mockReturnValueOnce({
-        status: 0,
-        stdout: Buffer.from("sha\n"),
-        stderr: Buffer.from(""),
-        pid: 0,
-        output: [],
-        signal: null,
-        error: undefined,
-      })
-      .mockReturnValueOnce({
-        status: 128,
-        stdout: Buffer.from(""),
-        stderr: Buffer.from("fatal: gh-token authentication failed"),
-        pid: 0,
-        output: [],
-        signal: null,
-        error: undefined,
-      });
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
+      if (gitArgs[0] === "push") {
+        return spawnResult(128, "", "fatal: gh-token authentication failed");
+      }
+      return spawnResult(0);
+    });
 
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
@@ -128,7 +115,7 @@ describe("pushStep", () => {
   });
 
   it("throws on non-200 non-422 PR creation", async () => {
-    mockPushSuccess();
+    mockGitSuccess();
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: false,
       status: 500,
@@ -141,7 +128,7 @@ describe("pushStep", () => {
   });
 
   it("throws when listing open PRs fails after 422", async () => {
-    mockPushSuccess("sha404");
+    mockGitSuccess("sha404");
     vi.mocked(fetch)
       .mockResolvedValueOnce({
         ok: false,
@@ -161,7 +148,7 @@ describe("pushStep", () => {
   });
 
   it("throws when 422 returned but no open PR found for branch", async () => {
-    mockPushSuccess("sha405");
+    mockGitSuccess("sha405");
     vi.mocked(fetch)
       .mockResolvedValueOnce({
         ok: false,
@@ -182,7 +169,7 @@ describe("pushStep", () => {
   });
 
   it("uses issueIdentifier in default PR title", async () => {
-    mockPushSuccess();
+    mockGitSuccess();
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: true,
       status: 201,
@@ -194,5 +181,43 @@ describe("pushStep", () => {
     const fetchCall = vi.mocked(fetch).mock.calls[0];
     const body = JSON.parse(fetchCall[1]?.body as string) as { title: string };
     expect(body.title).toContain("ENG-42");
+  });
+
+  it("checks out implementation branch and commits working tree changes before pushing", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["checkout", "-B", "ai-implement/eng-42-feature"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["commit", "-m", "ENG-42: Test"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining(["push", expect.any(String), "HEAD:refs/heads/ai-implement/eng-42-feature"]),
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+  });
+
+  it("refuses to push over the base branch", async () => {
+    await expect(
+      pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, branchName: "main", baseBranch: "main" },
+        new NoopStepReporter(),
+      ),
+    ).rejects.toThrow(/Refusing to push implementation branch/);
+    expect(spawnSync).not.toHaveBeenCalled();
   });
 });
