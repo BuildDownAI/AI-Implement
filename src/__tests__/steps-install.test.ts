@@ -206,4 +206,21 @@ describe("installStep", () => {
     expect(outputs.durationMs).toBe(0);
     expect(spawn).not.toHaveBeenCalled();
   });
+
+  it("preserves configured packageManager when skipping without package.json", async () => {
+    vi.mocked(fs.existsSync).mockImplementation((p) =>
+      String(p).includes(".ai-implement/config.yml"),
+    );
+    vi.mocked(fs.readFileSync).mockReturnValue("packageManager: pnpm\n");
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.packageManager).toBe("pnpm");
+    expect(outputs.installMethod).toBe("skipped: no package.json");
+    expect(spawn).not.toHaveBeenCalled();
+  });
 });
