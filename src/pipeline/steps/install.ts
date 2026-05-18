@@ -88,7 +88,20 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     const { workspaceDir } = inputs;
 
     const config = readAiImplementConfig(workspaceDir);
-    const packageManager = config.packageManager ?? detectPackageManager(workspaceDir);
+    const hasPackageJson = fs.existsSync(path.join(workspaceDir, "package.json"));
+    const packageManager = hasPackageJson
+      ? config.packageManager ?? detectPackageManager(workspaceDir)
+      : config.packageManager ?? "none";
+
+    if (!hasPackageJson) {
+      return {
+        packageManager,
+        installMethod: "skipped: no package.json",
+        durationMs: 0,
+        repoModels: config.models ?? {},
+      };
+    }
+
     const installMethod = buildInstallCommand(packageManager);
 
     const start = Date.now();
