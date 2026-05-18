@@ -8,6 +8,10 @@
 #   CLAUDE_CODE_OAUTH_TOKEN  - Claude Code OAuth token (preferred over API key)
 #   LINEAR_API_KEY           - Linear API key for fetching related issues and posting comments
 #
+# Optional org/repo variable:
+#   AI_IMPLEMENT_ALLOWED_BOTS - Override claude-code-action allowed_bots.
+#                               Defaults to this workflow's GitHub App slug.
+#
 # Additional secret (Bedrock provider, when orchestrator sets provider=bedrock):
 #   AWS_BEDROCK_ROLE_ARN     - IAM role ARN that the GitHub OIDC provider can assume;
 #                              role must grant bedrock:InvokeModel on the relevant
@@ -41,6 +45,16 @@ on:
         default: "anthropic"
       aws_region:
         description: "AWS region for Bedrock (required when provider=bedrock)"
+        required: false
+        type: string
+        default: ""
+      runner_callback_url:
+        description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
+        required: false
+        type: string
+        default: ""
+      run_token:
+        description: "HMAC bearer token authorizing the result POST; empty skips callback"
         required: false
         type: string
         default: ""
@@ -148,7 +162,7 @@ jobs:
           else
             echo "No PLANNING.md found, using default prompt"
             cat > /tmp/claude-prompt.md << 'PROMPT'
-          You are a senior software architect performing a read-only planning analysis. Do NOT create any branches, files, or pull requests. Do NOT write any code. Explore the codebase and post structured planning comments to Linear.
+          You are a senior software architect performing a read-only planning analysis. Do NOT create any branches, files, or pull requests. Do NOT write any code. Explore the codebase and produce structured planning comments.
 
           **Issue:** ${ISSUE_IDENTIFIER} — ${ISSUE_TITLE}
 
@@ -170,18 +184,14 @@ jobs:
 
           1. Use Read, Glob, and Grep to explore the codebase — understand the relevant existing code, patterns, files that would need to change, and potential risks.
 
-          2. Post planning comments to Linear using `curl`. The LINEAR_API_KEY and ISSUE_ID environment variables are available.
+          2. Write each planning comment as a separate Markdown file under
+             `ai-output/comments/`, prefixed with a two-digit sequence number to
+             control order (e.g. `01-architecture.md`, `02-test-plan.md`,
+             `03-cross-story.md`). Do NOT post comments directly to the
+             ticketing system — the orchestrator handles posting after the
+             workflow completes.
 
-             Use this pattern for each comment:
-             ```
-             curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-               -H "Content-Type: application/json" \
-               -H "Authorization: $LINEAR_API_KEY" \
-               --data-raw "$(jq -n --arg id "$ISSUE_ID" --arg body "BODY" \
-                 '{query: "mutation($id: String!, $body: String!) { commentCreate(input: { issueId: $id, body: $body }) { success } }", variables: {id: $id, body: $body}}')"
-             ```
-
-          3. Post EXACTLY these comments in order:
+          3. Write EXACTLY these comments as files in order:
 
           ### Comment 1 — Architecture Analysis
 
@@ -314,8 +324,8 @@ jobs:
         with:
           use_bedrock: "true"
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
-          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'Bash(curl*api.linear.app/graphql*)'"
+          allowed_bots: "${{ vars.AI_IMPLEMENT_ALLOWED_BOTS || steps.app-token.outputs.app-slug }}"
+          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 
       - name: Run Claude (OAuth token)
@@ -327,8 +337,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
-          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'Bash(curl*api.linear.app/graphql*)'"
+          allowed_bots: "${{ vars.AI_IMPLEMENT_ALLOWED_BOTS || steps.app-token.outputs.app-slug }}"
+          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 
       - name: Run Claude (API key)
@@ -340,8 +350,8 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "ai-implement-bot"
-          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep' --allowedTools 'Bash(curl*api.linear.app/graphql*)'"
+          allowed_bots: "${{ vars.AI_IMPLEMENT_ALLOWED_BOTS || steps.app-token.outputs.app-slug }}"
+          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
 
       - name: Update Linear labels
@@ -390,3 +400,38 @@ jobs:
               --arg issueId "$ISSUE_ID" \
               '{query: "mutation($id: String!, $labelIds: [String!]!) { issueUpdate(id: $id, input: { labelIds: $labelIds }) { success } }", variables: {id: $issueId, labelIds: $ids}}')"
           echo "Updated labels on $ISSUE_IDENTIFIER (status: $JOB_STATUS)"
+
+      - name: Post results to orchestrator
+        if: always()
+        env:
+          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
+          RUN_TOKEN: ${{ inputs.run_token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -uo pipefail
+          if [ -z "${RUNNER_CALLBACK_URL:-}" ] || [ -z "${RUN_TOKEN:-}" ]; then
+            echo "Runner callback URL or token not provided; skipping result POST."
+            exit 0
+          fi
+
+          mkdir -p ai-output/comments
+          COMMENTS=$(jq -n '[]')
+          shopt -s nullglob
+          for f in ai-output/comments/*.md; do
+            BODY=$(jq -Rs '.' < "$f")
+            COMMENTS=$(echo "$COMMENTS" | jq --argjson body "$BODY" '. + [{"body": $body}]')
+          done
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" \
+              '{phase: "planning", outcome: "success", comments: $comments}')
+          else
+            REASON=$(tail -c 4000 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "job failed")
+            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" --arg reason "$REASON" \
+              '{phase: "planning", outcome: "failure", failureReason: $reason, comments: $comments}')
+          fi
+
+          curl -fsS --max-time 30 -X POST "${RUNNER_CALLBACK_URL%/}/runner/result" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $RUN_TOKEN" \
+            --data-raw "$PAYLOAD"
