@@ -92,18 +92,25 @@ async function postRunnerResult(params: {
   const runToken = process.env.RUN_TOKEN;
   if (!callbackUrl || !runToken) return;
 
-  const body: Record<string, unknown> = {
-    phase: "implementation",
-    outcome: params.outcome,
-    comments: collectRunnerComments(params.workspaceDir),
-  };
-  if (params.prUrl) body.prUrl = params.prUrl;
-  if (params.failureReason) body.failureReason = params.failureReason;
-
   if (params.outcome === "success" && !params.prUrl) {
     console.warn("RUNNER_CALLBACK_URL is set but no PR URL was produced; skipping runner result callback.");
     return;
   }
+
+  let comments: Array<{ body: string }> = [];
+  try {
+    comments = collectRunnerComments(params.workspaceDir);
+  } catch (err) {
+    console.warn("[runner-callback] Failed to collect runner comments; continuing with no comments:", err);
+  }
+
+  const body: Record<string, unknown> = {
+    phase: "implementation",
+    outcome: params.outcome,
+    comments,
+  };
+  if (params.prUrl) body.prUrl = params.prUrl;
+  if (params.failureReason) body.failureReason = params.failureReason;
 
   const fetchFn = params.fetchImpl ?? fetch;
   try {

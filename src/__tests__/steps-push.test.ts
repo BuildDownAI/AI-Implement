@@ -260,7 +260,62 @@ describe("pushStep", () => {
 
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
-    ).rejects.toThrow(/git ls-remote failed/);
+    ).rejects.toThrow(/git ls-remote failed after 3 attempts/);
+    const lsRemoteCalls = vi.mocked(spawnSync).mock.calls.filter(
+      (call) => (call[1] as string[])[0] === "ls-remote",
+    );
+    expect(lsRemoteCalls).toHaveLength(3);
+  });
+
+  it("retries transient remote lease lookup failures", async () => {
+    let lsRemoteAttempts = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
+      if (gitArgs[0] === "ls-remote") {
+        lsRemoteAttempts++;
+        if (lsRemoteAttempts < 3) return spawnResult(128, "", "temporary DNS failure");
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(lsRemoteAttempts).toBe(3);
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining([
+        "push",
+        expect.any(String),
+        "HEAD:refs/heads/ai-implement/eng-42-feature",
+        "--force-with-lease=refs/heads/ai-implement/eng-42-feature:beadfeed",
+      ]),
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+  });
+
+  it("looks up the exact implementation branch ref for the remote lease", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["ls-remote", expect.any(String), "refs/heads/ai-implement/eng-42-feature"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
   });
 
   it("throws when Claude leaves no working tree changes", async () => {
