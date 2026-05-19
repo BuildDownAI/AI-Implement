@@ -25,10 +25,27 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     _reporter: StepReporter,
   ): Promise<PushOutputs> {
     const { workspaceDir, repoOwner, repoRepo, githubToken, branchName } = inputs;
-    const { issueIdentifier } = context.data;
+    const { issueIdentifier, issueTitle } = context.data;
     const baseBranch = String(inputs.baseBranch ?? "main");
-    const prTitle = String(inputs.prTitle ?? `${issueIdentifier}: AI implementation`);
+    const prTitle = String(inputs.prTitle ?? `${issueIdentifier}: ${issueTitle || "AI implementation"}`);
 
+    if (!branchName || branchName === baseBranch) {
+      throw new Error(`Refusing to push implementation branch "${branchName}" over base branch "${baseBranch}"`);
+    }
+
+    runGit(workspaceDir, ["checkout", "-B", branchName], githubToken, "git checkout");
+    if (!hasWorkingTreeChanges(workspaceDir, githubToken)) {
+      throw new Error("Nothing to commit: Claude left no file changes in the working tree");
+    }
+    runGit(workspaceDir, ["config", "user.name", "ai-implement[bot]"], githubToken, "git config user.name");
+    runGit(
+      workspaceDir,
+      ["config", "user.email", "ai-implement[bot]@users.noreply.github.com"],
+      githubToken,
+      "git config user.email",
+    );
+    runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+    runGit(workspaceDir, ["commit", "-m", buildCommitMessage(issueIdentifier, issueTitle)], githubToken, "git commit");
     const commitSha = resolveCommitSha(workspaceDir);
 
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
@@ -98,6 +115,39 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
   },
 };
+
+function buildCommitMessage(issueIdentifier: string, issueTitle: string): string {
+  const title = (issueTitle || "AI implementation").replace(/\s+/g, " ").trim();
+  return `${issueIdentifier}: ${title}`.slice(0, 120);
+}
+
+function runGit(
+  workspaceDir: string,
+  args: string[],
+  githubToken: string,
+  label: string,
+): void {
+  const result = spawnSync("git", args, {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    throw new Error(`${label} failed (exit ${result.status ?? "null"}): ${stderr}`);
+  }
+}
+
+function hasWorkingTreeChanges(workspaceDir: string, githubToken: string): boolean {
+  const result = spawnSync("git", ["status", "--porcelain"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    throw new Error(`git status failed (exit ${result.status ?? "null"}): ${stderr}`);
+  }
+  return result.stdout.toString().trim().length > 0;
+}
 
 function resolveCommitSha(workspaceDir: string): string | null {
   const result = spawnSync("git", ["rev-parse", "HEAD"], {

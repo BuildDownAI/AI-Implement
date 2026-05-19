@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
+import { buildIssueBranchName } from "./branch-name.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",
@@ -138,7 +139,9 @@ function applyWiring(step: YamlStep): StepDefinition {
           repoOwner: ctx.getOutputs("clone").repoOwner,
           repoRepo: ctx.getOutputs("clone").repoRepo,
           githubToken: ctx.getOutputs("clone").githubToken,
-          branchName: ctx.getOutputs("clone").branch,
+          branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle),
+          baseBranch: ctx.getOutputs("clone").branch,
+          prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
         }),
         skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
       };

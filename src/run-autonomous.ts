@@ -52,12 +52,24 @@ ${issueDescription}`;
 
 ## New implementation
 
-Create a branch named "${issueIdentifier}/short-description" then implement the feature below and open a PR with title "${issueIdentifier}: ${issueTitle}". The PR body must include "Fixes ${issueIdentifier}" so Linear auto-closes the issue on merge.
+Implement the feature below in the current checkout. Do not create a branch, commit, push, or open a PR. Leave your file changes unstaged and uncommitted; the AI-Implement pipeline will commit, push an issue-scoped branch, and open the PR after review passes.
 
 **Issue:** ${issueIdentifier}
 **Title:** ${issueTitle}
 **Description:**
 ${issueDescription}`;
+}
+
+function appendPipelineOwnedGitInstructions(prompt: string, prNumber: string): string {
+  if (prNumber) return prompt;
+  if (prompt.includes("Pipeline-owned Git")) return prompt;
+  return `${prompt.trimEnd()}
+
+## Pipeline-owned Git and PR handling
+
+Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
+Modify files only in the current checkout and leave the working tree changes unstaged and uncommitted.
+The AI-Implement pipeline will create the implementation commit, push an issue-scoped branch, and open the PR after review passes.`;
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
@@ -101,6 +113,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     workflowModel = parsed.frontMatter.model;
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
+  implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
   const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
 
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
