@@ -350,6 +350,8 @@ export interface SessionMachineInput {
   teamSecretNames?: string[]; // full prefixed secret names from the Fly app (e.g. ["ENG_DATABASE_URL"])
   minSecretsVersion?: number;
   orchestratorUrl?: string;
+  runnerCallbackUrl?: string;
+  runToken?: string;
   orchestratorApp?: string; // Fly app name of this orchestrator, stamped into machine metadata
   tenantId?: string; // client slug (e.g. "acme-corp"), stamped as tenant_id in metadata
   expectedTtlSeconds?: number; // expected machine lifetime in seconds, stamped in metadata for reaper
@@ -383,6 +385,12 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
   if (input.orchestratorUrl) {
     env.ORCHESTRATOR_URL = input.orchestratorUrl;
+  }
+  if (input.runnerCallbackUrl) {
+    env.RUNNER_CALLBACK_URL = input.runnerCallbackUrl;
+  }
+  if (input.runToken) {
+    env.RUN_TOKEN = input.runToken;
   }
   if (input.extraEnv) {
     Object.assign(env, input.extraEnv);

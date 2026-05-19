@@ -579,6 +579,16 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.env!.CUSTOM_VAR).toBe("hello");
   });
 
+  it("injects runner callback env when provided", () => {
+    const result = buildSessionMachineConfig({
+      ...baseInput,
+      runnerCallbackUrl: "https://orchestrator.example",
+      runToken: "run-token",
+    });
+    expect(result.config.env!.RUNNER_CALLBACK_URL).toBe("https://orchestrator.example");
+    expect(result.config.env!.RUN_TOKEN).toBe("run-token");
+  });
+
   it("extraEnv overrides standard env vars when keys collide", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,

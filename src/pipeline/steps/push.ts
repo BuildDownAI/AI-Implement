@@ -51,9 +51,16 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
     // stdout/stderr. Token is redacted from any error messages.
     const remote = `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`;
+    const remoteRef = `refs/heads/${branchName}`;
+    const expectedRemoteSha = resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken);
     const pushResult = spawnSync(
       "git",
-      ["push", remote, `HEAD:refs/heads/${branchName}`, "--force-with-lease"],
+      [
+        "push",
+        remote,
+        `HEAD:${remoteRef}`,
+        `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
+      ],
       { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
     );
     if (pushResult.status !== 0) {
@@ -156,4 +163,23 @@ function resolveCommitSha(workspaceDir: string): string | null {
   });
   if (result.status !== 0) return null;
   return result.stdout.toString().trim() || null;
+}
+
+function resolveRemoteBranchSha(
+  workspaceDir: string,
+  remote: string,
+  branchName: string,
+  githubToken: string,
+): string | null {
+  const result = spawnSync("git", ["ls-remote", "--heads", remote, branchName], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    throw new Error(`git ls-remote failed (exit ${result.status ?? "null"}): ${stderr}`);
+  }
+  const line = result.stdout.toString().trim();
+  if (!line) return null;
+  return line.split(/\s+/)[0] || null;
 }

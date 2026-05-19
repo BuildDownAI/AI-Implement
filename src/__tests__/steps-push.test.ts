@@ -48,6 +48,9 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
     const gitArgs = args as string[];
     if (gitArgs[0] === "status") return spawnResult(0, dirty ? " M src/app.ts\n" : "");
     if (gitArgs[0] === "rev-parse") return spawnResult(0, `${sha}\n`);
+    if (gitArgs[0] === "ls-remote") {
+      return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+    }
     return spawnResult(0);
   });
 }
@@ -103,6 +106,9 @@ describe("pushStep", () => {
       const gitArgs = args as string[];
       if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
       if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
       if (gitArgs[0] === "push") {
         return spawnResult(128, "", "fatal: gh-token authentication failed");
       }
@@ -205,9 +211,56 @@ describe("pushStep", () => {
     );
     expect(spawnSync).toHaveBeenCalledWith(
       "git",
-      expect.arrayContaining(["push", expect.any(String), "HEAD:refs/heads/ai-implement/eng-42-feature"]),
+      expect.arrayContaining([
+        "push",
+        expect.any(String),
+        "HEAD:refs/heads/ai-implement/eng-42-feature",
+        "--force-with-lease=refs/heads/ai-implement/eng-42-feature:beadfeed",
+      ]),
       expect.objectContaining({ cwd: "/tmp/workspace" }),
     );
+  });
+
+  it("uses an empty explicit lease when the remote implementation branch does not exist", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, "");
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining([
+        "push",
+        expect.any(String),
+        "HEAD:refs/heads/ai-implement/eng-42-feature",
+        "--force-with-lease=refs/heads/ai-implement/eng-42-feature:",
+      ]),
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+  });
+
+  it("throws when remote lease lookup fails", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(128, "", "fatal: gh-token auth failed");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/git ls-remote failed/);
   });
 
   it("throws when Claude leaves no working tree changes", async () => {
