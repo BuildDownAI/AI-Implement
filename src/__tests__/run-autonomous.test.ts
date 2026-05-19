@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAutonomous } from "../run-autonomous.js";
@@ -50,6 +50,8 @@ describe("runAutonomous", () => {
     vi.stubEnv("LINEAR_API_KEY", "");
     vi.stubEnv("ORCHESTRATOR_URL", "");
     vi.stubEnv("MACHINE_NONCE", "");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "");
+    vi.stubEnv("RUN_TOKEN", "");
     vi.stubEnv("CLAUDE_MODEL", "");
     vi.stubEnv("PR_NUMBER", "");
   });
@@ -465,6 +467,125 @@ describe("runAutonomous", () => {
     expect(extras.githubOwner).toBe("acme");
     expect(extras.githubRepo).toBe("app");
     expect(extras.prNumber).toBe("42");
+  });
+
+  it("posts implementation callback comments after successful push", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    mkdirSync(join(workspaceDir, "ai-output", "comments"), { recursive: true });
+    writeFileSync(join(workspaceDir, "ai-output", "comments", "02-second.md"), "second");
+    writeFileSync(join(workspaceDir, "ai-output", "comments", "01-first.md"), "first");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://orchestrator.example/runner/result",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer run-token" }),
+      }),
+    );
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+      prUrl: string;
+      comments: Array<{ body: string }>;
+    };
+    expect(body).toMatchObject({
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/acme/app/pull/1",
+    });
+    expect(body.comments).toEqual([{ body: "first" }, { body: "second" }]);
+  });
+
+  it("posts implementation failure callback when pipeline fails", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example/");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = { run: vi.fn().mockRejectedValue(new Error("push failed")) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(1);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+      failureReason: string;
+    };
+    expect(body).toMatchObject({
+      phase: "implementation",
+      outcome: "failure",
+      failureReason: "push failed",
+    });
+  });
+
+  it("skips success callback when push produces no PR URL", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn();
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("continues callback with empty comments when comment collection fails", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    mkdirSync(join(workspaceDir, "ai-output"), { recursive: true });
+    writeFileSync(join(workspaceDir, "ai-output", "comments"), "not a directory");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      comments: Array<{ body: string }>;
+    };
+    expect(body.comments).toEqual([]);
   });
 
   it("throws when a required env var is missing", async () => {

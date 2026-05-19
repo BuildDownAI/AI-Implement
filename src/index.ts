@@ -504,6 +504,20 @@ async function dispatchFlyMachine(
 
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
+  let runnerCallbackUrl = "";
+  let runToken = "";
+  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+    const minted = mintRunToken({
+      issueId: issue.id,
+      mappingTeamKey: issue.scopeKey,
+      phase: "implementation",
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+      secret: config.runnerTokenSecret,
+    });
+    runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    runToken = minted.token;
+  }
+
   const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
     owner: mapping.owner,
     repo: mapping.repo,
@@ -535,6 +549,8 @@ async function dispatchFlyMachine(
     teamSecretNames: allSecretNames,
     minSecretsVersion: minSecretsVersion ?? undefined,
     orchestratorUrl: config.orchestratorUrl ?? undefined,
+    runnerCallbackUrl: runnerCallbackUrl || undefined,
+    runToken: runToken || undefined,
     orchestratorApp: config.flyOrchestratorApp ?? undefined,
     tenantId: config.tenantId ?? undefined,
     expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),

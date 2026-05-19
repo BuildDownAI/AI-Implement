@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
@@ -70,6 +70,65 @@ function appendPipelineOwnedGitInstructions(prompt: string, prNumber: string): s
 Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
 Modify files only in the current checkout and leave the working tree changes unstaged and uncommitted.
 The AI-Implement pipeline will create the implementation commit, push an issue-scoped branch, and open the PR after review passes.`;
+}
+
+function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
+  const commentsDir = join(workspaceDir, "ai-output", "comments");
+  if (!existsSync(commentsDir)) return [];
+  return readdirSync(commentsDir)
+    .filter((name) => name.endsWith(".md"))
+    .sort()
+    .map((name) => ({ body: readFileSync(join(commentsDir, name), "utf-8") }));
+}
+
+async function postRunnerResult(params: {
+  workspaceDir: string;
+  outcome: "success" | "failure";
+  prUrl?: string;
+  failureReason?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<void> {
+  const callbackUrl = process.env.RUNNER_CALLBACK_URL;
+  const runToken = process.env.RUN_TOKEN;
+  if (!callbackUrl || !runToken) return;
+
+  if (params.outcome === "success" && !params.prUrl) {
+    console.warn("RUNNER_CALLBACK_URL is set but no PR URL was produced; skipping runner result callback.");
+    return;
+  }
+
+  let comments: Array<{ body: string }> = [];
+  try {
+    comments = collectRunnerComments(params.workspaceDir);
+  } catch (err) {
+    console.warn("[runner-callback] Failed to collect runner comments; continuing with no comments:", err);
+  }
+
+  const body: Record<string, unknown> = {
+    phase: "implementation",
+    outcome: params.outcome,
+    comments,
+  };
+  if (params.prUrl) body.prUrl = params.prUrl;
+  if (params.failureReason) body.failureReason = params.failureReason;
+
+  const fetchFn = params.fetchImpl ?? fetch;
+  try {
+    const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${runToken}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(`[runner-callback] POST /runner/result failed with HTTP ${res.status}: ${text}`);
+    }
+  } catch (err) {
+    console.error("[runner-callback] POST /runner/result failed:", err);
+  }
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
@@ -155,9 +214,22 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
     const runner = opts.runner ?? (await createDefaultRunner());
     await runner.run(pipeline, context, reporter);
+    const pushOutputs = context.getOutputs("push");
+    await postRunnerResult({
+      workspaceDir,
+      outcome: "success",
+      prUrl: typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined,
+      fetchImpl: opts.fetchImpl,
+    });
     return { exitCode: 0 };
   } catch (err) {
     console.error(`Pipeline failed: ${err}`);
+    await postRunnerResult({
+      workspaceDir,
+      outcome: "failure",
+      failureReason: err instanceof Error ? err.message : String(err),
+      fetchImpl: opts.fetchImpl,
+    });
     return { exitCode: 1 };
   }
 }

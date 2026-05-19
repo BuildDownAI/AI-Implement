@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 
+const LS_REMOTE_MAX_ATTEMPTS = 3;
+const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
+
 interface PushInputs extends Record<string, unknown> {
   workspaceDir: string;
   repoOwner: string;
@@ -51,9 +54,16 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
     // stdout/stderr. Token is redacted from any error messages.
     const remote = `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`;
+    const remoteRef = `refs/heads/${branchName}`;
+    const expectedRemoteSha = resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken);
     const pushResult = spawnSync(
       "git",
-      ["push", remote, `HEAD:refs/heads/${branchName}`, "--force-with-lease"],
+      [
+        "push",
+        remote,
+        `HEAD:${remoteRef}`,
+        `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
+      ],
       { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
     );
     if (pushResult.status !== 0) {
@@ -156,4 +166,40 @@ function resolveCommitSha(workspaceDir: string): string | null {
   });
   if (result.status !== 0) return null;
   return result.stdout.toString().trim() || null;
+}
+
+function resolveRemoteBranchSha(
+  workspaceDir: string,
+  remote: string,
+  branchName: string,
+  githubToken: string,
+): string | null {
+  const remoteRef = `refs/heads/${branchName}`;
+  let lastError = "";
+  for (let attempt = 1; attempt <= LS_REMOTE_MAX_ATTEMPTS; attempt++) {
+    const result = spawnSync("git", ["ls-remote", remote, remoteRef], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (result.status === 0) {
+      const line = result.stdout
+        .toString()
+        .trim()
+        .split("\n")
+        .find((entry) => entry.endsWith(`\t${remoteRef}`));
+      if (!line) return null;
+      return line.split("\t")[0] || null;
+    }
+
+    lastError = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    if (attempt < LS_REMOTE_MAX_ATTEMPTS) {
+      sleepSync(LS_REMOTE_RETRY_DELAYS_MS[attempt - 1] ?? 1000);
+    }
+  }
+  throw new Error(`git ls-remote failed after ${LS_REMOTE_MAX_ATTEMPTS} attempts: ${lastError}`);
+}
+
+function sleepSync(ms: number): void {
+  if (process.env.NODE_ENV === "test") return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
