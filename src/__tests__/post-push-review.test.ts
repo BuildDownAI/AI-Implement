@@ -83,7 +83,7 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("cap") && c.includes("Blocking issues:\n1. bug"))).toBe(true);
     expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({ maxTurns: 1 }),
+      expect.objectContaining({ maxTurns: 12 }),
     );
   });
 
