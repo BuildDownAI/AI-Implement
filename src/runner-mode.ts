@@ -1,6 +1,6 @@
 import { getDb } from "./dedup.js";
 
-export const VALID_RUNNER_MODES = ["default", "gha", "fly", "shadow"] as const;
+export const VALID_RUNNER_MODES = ["default", "gha", "fly", "local", "shadow"] as const;
 export type RunnerMode = typeof VALID_RUNNER_MODES[number];
 export const DEFAULT_RUNNER_MODE: RunnerMode = "default";
 const RUNNER_MODE_SETTING_KEY = "runner_mode";
@@ -60,8 +60,9 @@ export function getRunnerMode(): RunnerModeStatus {
 export function resolveExecutionPath(
   runnerMode: RunnerMode,
   mappingMode: "github-actions" | "fly-machines",
-): "github-actions" | "fly-machines" | "both" {
+): "github-actions" | "fly-machines" | "local-docker" | "both" {
   if (runnerMode === "shadow") return "both";
+  if (runnerMode === "local") return "local-docker";
   if (runnerMode === "fly") return "fly-machines";
   if (runnerMode === "gha") return "github-actions";
   // "default": honour per-team setting

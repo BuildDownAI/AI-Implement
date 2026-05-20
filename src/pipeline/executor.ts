@@ -31,13 +31,16 @@ export class ClaudeCliExecutor implements LLMExecutor {
       });
 
       const chunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
       proc.stdout.on("data", (d: Buffer) => chunks.push(d));
+      proc.stderr.on("data", (d: Buffer) => stderrChunks.push(d));
 
       proc.on("close", (code) => {
         // tokensUsed is not available from Claude CLI stdout; budget enforcement
         // should rely on the orchestrator's own token tracking.
         resolve({
           stdout: Buffer.concat(chunks).toString(),
+          stderr: Buffer.concat(stderrChunks).toString(),
           exitCode: code ?? 1,
           tokensUsed: 0,
         });

@@ -10,11 +10,16 @@ cd AI-Implement
 cp .env.example .env       # fill in LINEAR_API_KEY + GitHub App creds for local testing
 npm install
 npm run dev                # polling + HTTP server on :8080
+npm run dev:local          # dev server + local Docker implementation jobs
 npm test                   # vitest
 npm run typecheck          # tsc --noEmit
 ```
 
 Node 24 is the supported runtime (see `.tool-versions`). Earlier versions may work but aren't tested.
+
+`npm run dev:local` first runs `npm run build:runner:local`, which builds
+`Dockerfile.session` as `ai-implement-runner:local`. Docker must be running.
+Local implementation jobs still create real GitHub branches and PRs.
 
 ## Before opening a PR
 

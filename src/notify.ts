@@ -15,7 +15,7 @@ export interface CompletionNotification {
   issueTitle: string;
   issueUrl: string;
   repoFullName: string;
-  status: "completed" | "failed" | "timed_out";
+  status: "completed" | "review_failed" | "failed" | "timed_out";
   conclusion: string | null;
   prUrl: string | null;
   runUrl: string | null;
@@ -148,6 +148,8 @@ function completionEmoji(status: string): string {
   switch (status) {
     case "completed":
       return ":white_check_mark:";
+    case "review_failed":
+      return ":warning:";
     case "failed":
       return ":x:";
     case "timed_out":
@@ -161,6 +163,8 @@ function completionLabel(status: string): string {
   switch (status) {
     case "completed":
       return "AI Implementation Completed";
+    case "review_failed":
+      return "AI Implementation Needs Review";
     case "failed":
       return "AI Implementation Failed";
     case "timed_out":
@@ -174,6 +178,8 @@ function completionTeamsIcon(status: string): string {
   switch (status) {
     case "completed":
       return "&#x2705;";
+    case "review_failed":
+      return "&#x26A0;";
     case "failed":
       return "&#x274C;";
     case "timed_out":

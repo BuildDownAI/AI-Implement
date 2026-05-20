@@ -32,6 +32,16 @@ describe("resolveExecutionPath", () => {
     });
   });
 
+  describe("local override", () => {
+    it("returns local-docker for local + github-actions mapping", () => {
+      expect(resolveExecutionPath("local", "github-actions")).toBe("local-docker");
+    });
+
+    it("returns local-docker for local + fly-machines mapping", () => {
+      expect(resolveExecutionPath("local", "fly-machines")).toBe("local-docker");
+    });
+  });
+
   describe("default mode — respects per-team executionMode", () => {
     it("returns github-actions when mapping is github-actions", () => {
       expect(resolveExecutionPath("default", "github-actions")).toBe("github-actions");

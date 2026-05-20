@@ -2,7 +2,14 @@ import { getDb } from "./dedup.js";
 
 const MAX_LOG_ENTRIES = 500;
 
-export type JobStatus = "unknown" | "dispatched" | "running" | "completed" | "failed" | "timed_out";
+export type JobStatus =
+  | "unknown"
+  | "dispatched"
+  | "running"
+  | "completed"
+  | "review_failed"
+  | "failed"
+  | "timed_out";
 
 export interface Job {
   id: number;
@@ -179,7 +186,7 @@ export function updateJobStatus(
   conclusion?: string | null,
   prUrl?: string | null,
 ): void {
-  const isTerminal = status === "completed" || status === "failed" || status === "timed_out";
+  const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out";
   getDb()
     .prepare(
       "UPDATE dispatch_log SET status = ?, conclusion = ?, pr_url = ?, completed_at = ? WHERE id = ?",
@@ -208,7 +215,7 @@ export function markJobNotified(jobId: number): void {
 export function suppressStaleNotifications(issueId: string, excludeJobId: number): number {
   const result = getDb()
     .prepare(
-      "UPDATE dispatch_log SET notified_at = ? WHERE issue_id = ? AND id != ? AND status IN ('completed', 'failed', 'timed_out') AND notified_at IS NULL",
+      "UPDATE dispatch_log SET notified_at = ? WHERE issue_id = ? AND id != ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out') AND notified_at IS NULL",
     )
     .run(Date.now(), issueId, excludeJobId);
   return result.changes;
@@ -230,7 +237,7 @@ export function getUnnotifiedTerminalJobs(): Job[] {
   return mapRows(
     getDb()
       .prepare(
-        "SELECT * FROM dispatch_log WHERE status IN ('completed', 'failed', 'timed_out') AND notified_at IS NULL ORDER BY completed_at ASC",
+        "SELECT * FROM dispatch_log WHERE status IN ('completed', 'review_failed', 'failed', 'timed_out') AND notified_at IS NULL ORDER BY completed_at ASC",
       )
       .all() as RawRow[],
   );

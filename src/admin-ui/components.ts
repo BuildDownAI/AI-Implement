@@ -315,6 +315,8 @@ export const componentsCss = `
 .kpi-trend.down { color: var(--st-fail-fg); }
 
 /* ── Status badges & dots ──────────────────────────────────── */
+[hidden] { display: none !important; }
+
 .badge {
   display: inline-flex;
   align-items: center;

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { listLog } from "./log.js";
 import { enqueueReconciliation } from "./reconciliation.js";
+import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -46,7 +47,8 @@ interface PullRequestPayload {
  *
  * Matching uses two strategies (in order):
  * 1. PR URL stored in the dispatch log (`pr_url` column).
- * 2. Branch prefix: the PR branch starts with `{issueIdentifier}/` (case-insensitive).
+ * 2. Branch naming: legacy `{issueIdentifier}/...` or current
+ *    `ai-implement/{issueIdentifier}-...`.
  */
 function findMatchingDispatch(repo: string, branch: string, prUrl: string) {
   const jobs = listLog(500);
@@ -57,11 +59,8 @@ function findMatchingDispatch(repo: string, branch: string, prUrl: string) {
     // Strategy 1: match by stored PR URL
     if (job.prUrl && job.prUrl === prUrl) return job;
 
-    // Strategy 2: match by branch prefix pattern {ISSUE_IDENTIFIER}/...
-    if (
-      job.issueIdentifier &&
-      branch.toLowerCase().startsWith(job.issueIdentifier.toLowerCase() + "/")
-    ) {
+    // Strategy 2: match by implementation branch naming.
+    if (branchMatchesIssueIdentifier(branch, job.issueIdentifier ?? undefined)) {
       return job;
     }
   }

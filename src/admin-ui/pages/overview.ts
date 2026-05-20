@@ -182,9 +182,10 @@ export const overviewScript = `
   }
 
   function statusBadge(status) {
-    const map = { running: 'running', failed: 'fail', completed: 'success' };
+    const map = { running: 'running', review_failed: 'warn', failed: 'fail', completed: 'success' };
     const kind = map[status] || 'neutral';
-    return '<span class="badge ' + kind + '">' + window.esc(status) + '</span>';
+    const label = status === 'review_failed' ? 'review failed' : status;
+    return '<span class="badge ' + kind + '">' + window.esc(label) + '</span>';
   }
 
   function dispatch24hBuckets(log) {
@@ -210,7 +211,7 @@ export const overviewScript = `
   function renderKpis(log, mappings, running) {
     const now = Date.now();
     const failed24h = log.filter(function (e) {
-      return e.status === 'failed' && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed') && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     });
 
     const mappingEntries = Object.entries(mappings);
@@ -266,6 +267,8 @@ export const overviewScript = `
     const now = Date.now();
     running.slice(0, 6).forEach(function (e) {
       const tr = document.createElement('tr');
+      if (e.id != null) tr.setAttribute('data-job-id', String(e.id));
+      tr.style.cursor = 'pointer';
       const issueLabel = e.issueIdentifier || e.issueId || '—';
       const title = e.issueTitle ? window.esc(e.issueTitle) : '';
       const duration = e.dispatchedAt ? fmtDuration(now - new Date(e.dispatchedAt).getTime()) : '—';
@@ -318,7 +321,7 @@ export const overviewScript = `
     if (!tbody || !empty) return;
     const now = Date.now();
     const failures = log.filter(function (e) {
-      return e.status === 'failed' && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed') && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     }).sort(function (a, b) {
       return new Date(b.dispatchedAt).getTime() - new Date(a.dispatchedAt).getTime();
     }).slice(0, 8);
@@ -330,6 +333,8 @@ export const overviewScript = `
     empty.classList.add('hidden');
     failures.forEach(function (e) {
       const tr = document.createElement('tr');
+      if (e.id != null) tr.setAttribute('data-job-id', String(e.id));
+      tr.style.cursor = 'pointer';
       const issueLabel = e.issueIdentifier || e.issueId || '—';
       const failedAt = e.dispatchedAt ? new Date(e.dispatchedAt).toLocaleString() : '—';
       const when = e.dispatchedAt ? fmtAgo(e.dispatchedAt) : '—';
@@ -338,6 +343,21 @@ export const overviewScript = `
         + '<td class="mono text-tertiary" style="white-space:nowrap">' + failedAt + '</td>'
         + '<td style="text-align:right" class="mono text-tertiary">' + when + '</td>';
       tbody.appendChild(tr);
+    });
+  }
+
+  function wireOverviewDrawerRows() {
+    ['overview-running-body', 'overview-failures-body'].forEach(function (id) {
+      const tbody = document.getElementById(id);
+      if (!tbody || tbody.dataset.drawerWired) return;
+      tbody.addEventListener('click', function (e) {
+        const target = e.target;
+        if (target.closest('a')) return;
+        const tr = target.closest('tr');
+        const jobId = tr && tr.getAttribute('data-job-id');
+        if (jobId && window.openJobDrawer) window.openJobDrawer(Number(jobId));
+      });
+      tbody.dataset.drawerWired = '1';
     });
   }
 
@@ -459,6 +479,7 @@ export const overviewScript = `
 
   window.registerPage('overview', function () {
     loadOverview();
+    wireOverviewDrawerRows();
     setInterval(loadOverview, 30000);
   });
 })();
