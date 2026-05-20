@@ -75,6 +75,7 @@ export const runnersScript = `
   function kindForMode(mode) {
     if (mode === 'gha') return 'info';
     if (mode === 'fly') return 'success';
+    if (mode === 'local') return 'neutral';
     if (mode === 'shadow') return 'warn';
     return 'neutral';
   }

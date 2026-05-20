@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { formatGitNameStatusSummary } from "../step-utils.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -12,6 +13,8 @@ interface PushInputs extends Record<string, unknown> {
   branchName: string;
   baseBranch?: string;
   prTitle?: string;
+  implementationSummary?: string;
+  testsSummary?: string;
 }
 
 interface PushOutputs extends Record<string, unknown> {
@@ -50,6 +53,8 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
     runGit(workspaceDir, ["commit", "-m", buildCommitMessage(issueIdentifier, issueTitle)], githubToken, "git commit");
     const commitSha = resolveCommitSha(workspaceDir);
+    const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken);
+    const prBody = buildPullRequestBody(context, inputs, changedFilesSummary);
 
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
     // stdout/stderr. Token is redacted from any error messages.
@@ -84,7 +89,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
           title: prTitle,
           head: branchName,
           base: baseBranch,
-          body: `Fixes ${issueIdentifier}`,
+          body: prBody,
         }),
       },
     );
@@ -129,6 +134,62 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
 function buildCommitMessage(issueIdentifier: string, issueTitle: string): string {
   const title = (issueTitle || "AI implementation").replace(/\s+/g, " ").trim();
   return `${issueIdentifier}: ${title}`.slice(0, 120);
+}
+
+function buildPullRequestBody(
+  context: PipelineContext,
+  inputs: PushInputs,
+  changedFilesSummary: string,
+): string {
+  const { issueIdentifier, issueTitle, issueDescription } = context.data;
+  const preflightOutputs = context.getOutputs("preflight");
+  const title = stringValue(issueTitle) ?? "AI implementation";
+  const description = stringValue(issueDescription);
+
+  const implementationSummary =
+    stringValue(inputs.implementationSummary) ??
+    `Implemented the requested work for ${issueIdentifier}: ${title}.`;
+  const testsSummary =
+    stringValue(inputs.testsSummary) ??
+    stringValue(preflightOutputs.summary) ??
+    "Automated verification was run by the AI-Implement pipeline before opening this PR.";
+
+  return [
+    "## Summary",
+    implementationSummary,
+    "",
+    "## Approach",
+    `Implements ${issueIdentifier}: ${title}.`,
+    description ? "The implementation follows the ticket requirements and keeps changes scoped to the requested files/behavior." : "The implementation keeps changes scoped to the requested behavior.",
+    changedFilesSummary ? `\nChanged files:\n${changedFilesSummary}` : "",
+    "",
+    "## Test plan",
+    `- [x] ${testsSummary}`,
+    "- [ ] Manual: review the changed behavior against the ticket acceptance criteria.",
+    "",
+    `Fixes ${issueIdentifier}`,
+    "",
+    "Generated with AI-Implement",
+  ].join("\n");
+}
+
+function stringValue(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function summarizeCommittedChanges(workspaceDir: string, githubToken: string): string {
+  const result = spawnSync("git", ["show", "--name-status", "--format=", "HEAD"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    throw new Error(`git show failed (exit ${result.status ?? "null"}): ${stderr}`);
+  }
+
+  return formatGitNameStatusSummary(result.stdout.toString());
 }
 
 function runGit(

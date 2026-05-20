@@ -24,13 +24,21 @@ import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecu
 import { handleGitHubWebhook } from "./webhook.js";
 import { initReconciliationTable, getPendingReconciliations, updateReconciliationStatus } from "./reconciliation.js";
 import { resolveSessionImage } from "./repo-image.js";
-import { initStepLogTable } from "./step-log.js";
+import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerResult } from "./runner-callback.js";
 import type { RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
+import {
+  fetchLocalContainerLogs,
+  inspectLocalContainer,
+  removeLocalContainer,
+  startLocalRunnerContainer,
+} from "./local-docker.js";
+import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
+import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 
 // ---------- Configuration ----------
 
@@ -59,6 +67,8 @@ interface AppConfig {
   runnerCallbackBaseUrl: string | null;
   runnerTokenSecret: string | null;
   gapFillTriggerSecret: string | null;
+  localRunnerImage: string;
+  localRunnerOrchestratorUrl: string | null;
 }
 
 function loadConfig(): AppConfig {
@@ -133,6 +143,8 @@ function loadConfig(): AppConfig {
     runnerCallbackBaseUrl,
     runnerTokenSecret,
     gapFillTriggerSecret,
+    localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
+    localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
   };
 }
 
@@ -266,6 +278,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
             // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
             await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
             await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, true);
+          } else if (execPath === "local-docker") {
+            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode);
           } else if (execPath === "fly-machines") {
             await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode);
           } else {
@@ -601,6 +615,104 @@ async function dispatchFlyMachine(
   console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${tag}, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
 }
 
+// ---------- Dispatch: Local Docker ----------
+
+async function dispatchLocalDocker(
+  config: AppConfig,
+  provider: TicketingProvider,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  prior: { count: number; lastDispatchedAt: number | null },
+  runnerMode: string,
+): Promise<void> {
+  if (mapping.provider === "bedrock") {
+    console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: provider=bedrock is not supported on container runners`);
+    return;
+  }
+
+  if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+    console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`);
+    return;
+  }
+
+  const sessionToken = generateSessionToken();
+  const machineNonce = generateMachineNonce();
+
+  let runnerCallbackUrl = "";
+  let runToken = "";
+  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+    const minted = mintRunToken({
+      issueId: issue.id,
+      mappingTeamKey: issue.scopeKey,
+      phase: "implementation",
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+      secret: config.runnerTokenSecret,
+    });
+    runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    runToken = minted.token;
+  }
+
+  const localOrchestratorUrl =
+    config.localRunnerOrchestratorUrl ??
+    config.orchestratorUrl ??
+    `http://host.docker.internal:${config.healthPort}`;
+
+  const container = await startLocalRunnerContainer({
+    image: config.localRunnerImage,
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    issueTitle: issue.title,
+    issueDescription: issue.description || issue.title,
+    owner: mapping.owner,
+    repo: mapping.repo,
+    defaultBranch: mapping.defaultBranch,
+    linearApiKey: config.linearApiKey ?? undefined,
+    anthropicApiKey: config.anthropicApiKey ?? undefined,
+    claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+    githubAppId: config.githubAppId,
+    githubAppPrivateKey: config.githubAppPrivateKey,
+    sessionToken,
+    machineNonce,
+    sessionMode: mapping.sessionMode,
+    orchestratorUrl: localOrchestratorUrl,
+    runnerCallbackUrl: runnerCallbackUrl || undefined,
+    runToken: runToken || undefined,
+    extraEnv: Object.keys(mapping.extraEnv).length > 0 ? mapping.extraEnv : undefined,
+  });
+
+  markDispatched(issue.id, issue.identifier, issue.title);
+  const jobId = appendLog({
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    issueTitle: issue.title,
+    teamKey: issue.scopeKey,
+    repo: `${mapping.owner}/${mapping.repo}`,
+    issueState: issue.nativeStatus,
+    dispatchNumber: prior.count + 1,
+    executionMode: "local-docker",
+    machineNonce,
+    machineId: container.containerId,
+    runnerMode,
+    sessionImage: config.localRunnerImage,
+  });
+
+  const suppressed = suppressStaleNotifications(issue.id, jobId);
+  if (suppressed > 0) {
+    console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
+  }
+
+  await postDispatch(config, provider, issue, mapping, "", jobId, "local-docker");
+
+  postStatusComment(provider, issue.id, {
+    type: "machine_created",
+    machineName: container.containerName || container.containerId.slice(0, 12),
+  }).catch((err) => {
+    console.error(`[poll] Failed to post local container status for ${issue.identifier}:`, err);
+  });
+
+  console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (local-docker, container: ${container.containerId}, image: ${config.localRunnerImage})`);
+}
+
 // ---------- Shared post-dispatch logic ----------
 
 async function postDispatch(
@@ -610,7 +722,7 @@ async function postDispatch(
   mapping: RepoMapping,
   ghToken: string,
   jobId: number,
-  actualExecutionMode: "github-actions" | "fly-machines",
+  actualExecutionMode: "github-actions" | "fly-machines" | "local-docker",
 ): Promise<void> {
   // Mark implementing — add AI-Working label and move issue state if needed.
   await provider.markImplementing(issue.id, issue.scopeKey);
@@ -700,6 +812,42 @@ async function postSessionLogs(
   }
 }
 
+async function postLocalContainerLogs(
+  provider: TicketingProvider,
+  job: Job,
+  context: string,
+): Promise<void> {
+  if (!job.machineId || !job.issueId) return;
+  try {
+    const logs = await fetchLocalContainerLogs(job.machineId);
+    if (!logs) return;
+
+    const raw = logs.length > LOG_MAX_CHARS ? logs.slice(-LOG_MAX_CHARS) : logs;
+    const body = logs.length > LOG_MAX_CHARS ? raw.replace(/^[^\n]*\n/, "") : raw;
+
+    await provider.postComment(
+      job.issueId,
+      `**Local Docker Logs** (${context})\n\`\`\`\n${body}\n\`\`\``,
+    );
+    console.log(`[monitor] Posted local Docker logs for ${job.issueIdentifier} (${context})`);
+  } catch (err) {
+    console.error(`[monitor] Failed to post local Docker logs for ${job.issueIdentifier} (${context}):`, err);
+  }
+}
+
+function postPushReviewNeedsAttention(jobId: number): boolean {
+  const postPush = getStepRecord(jobId, "post-push-review");
+  if (!postPush) return false;
+  if (postPush.status === "failed") return true;
+
+  try {
+    const outputs = JSON.parse(postPush.outputsJson) as { approved?: unknown };
+    return outputs.approved !== true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve the TicketingProvider for a job using its teamKey to look up the
  * mapping. Returns null if no mapping is found (orphaned job after a mapping
@@ -733,6 +881,13 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
           continue;
         }
         await monitorFlyMachineJob(config, provider, job);
+      } else if (job.executionMode === "local-docker") {
+        const provider = await providerForJob(registry, job);
+        if (!provider) {
+          console.warn(`[monitor] No mapping for job ${job.id} (teamKey=${job.teamKey ?? "<none>"}); skipping`);
+          continue;
+        }
+        await monitorLocalDockerJob(config, provider, job);
       } else {
         await monitorGitHubActionsJob(config, job, teamRepoMap, claimedRunIds);
       }
@@ -848,13 +1003,10 @@ async function findPrForIssue(
     });
     if (prRes.ok) {
       const prs = (await prRes.json()) as Array<{ html_url: string; head: { ref: string } }>;
-      const identifier = issueIdentifier.toLowerCase();
-      // Require a "/" boundary so ENG-10 doesn't match eng-100/foo. Branches
-      // produced by claude-implement follow the ${IDENTIFIER}/short-description
-      // convention; also accept an exact-match branch just in case.
+      // Accept both the legacy ${IDENTIFIER}/... branch shape and the TS
+      // pipeline's ai-implement/${identifier}-... branch shape.
       const match = prs.find((pr) => {
-        const ref = pr.head.ref.toLowerCase();
-        return ref === identifier || ref.startsWith(identifier + "/");
+        return branchMatchesIssueIdentifier(pr.head.ref, issueIdentifier);
       });
       if (match) return match.html_url;
     }
@@ -943,7 +1095,10 @@ async function monitorFlyMachineJob(
     const prUrl = await findPrForIssue(config, job.repo, job.issueIdentifier);
     // Use PR existence to distinguish success from failure:
     // if a PR was created, the session completed its job; otherwise it failed
-    const jobStatus: JobStatus = prUrl ? "completed" : "failed";
+    const reviewNeedsAttention = !!prUrl && postPushReviewNeedsAttention(job.id);
+    const jobStatus: JobStatus = prUrl
+      ? (reviewNeedsAttention ? "review_failed" : "completed")
+      : "failed";
 
     // Stamp pr_number on the machine before it's destroyed so reaper/audit
     // tools can read it. Only possible when machine is still accessible.
@@ -961,6 +1116,8 @@ async function monitorFlyMachineJob(
       // Skip for "destroyed" (manual/external destroy; machine is already gone).
       if (jobStatus === "failed" && job.runnerMode !== "shadow") {
         await postSessionLogs(config, provider, job, "session_failed");
+      } else if (reviewNeedsAttention && job.runnerMode !== "shadow") {
+        await postSessionLogs(config, provider, job, "post_push_review_not_approved");
       }
 
       try {
@@ -989,7 +1146,7 @@ async function monitorFlyMachineJob(
       });
     }
 
-    if (jobStatus === "completed" && prUrl) {
+    if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
       // On success, mark the Linear issue ready for review (swap AI-Working
       // label for Ready for Review, post a PR-link comment). The poller won't
       // re-dispatch issues with Ready for Review, so we don't need to clear
@@ -999,6 +1156,91 @@ async function monitorFlyMachineJob(
       // On failure/timeout, reset the Linear issue so it can be re-dispatched
       await resetTicket(provider, job);
     }
+  }
+}
+
+async function monitorLocalDockerJob(
+  config: AppConfig,
+  provider: TicketingProvider,
+  job: Job,
+): Promise<void> {
+  if (!job.machineId) return;
+
+  if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
+    await postLocalContainerLogs(provider, job, "container_timeout");
+    try {
+      await removeLocalContainer(job.machineId);
+      console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
+    } catch (err) {
+      console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
+    }
+
+    updateJobStatus(job.id, "timed_out", "container_timeout");
+    invalidateNonce(job.id);
+    const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
+    console.warn(`[monitor] Local Docker job ${job.id} (${job.issueIdentifier}) timed out after ${elapsedMin}m`);
+
+    if (job.issueId) {
+      postStatusComment(provider, job.issueId, {
+        type: "timeout",
+        reason: `local Docker container timed out after ${elapsedMin}m`,
+      }).catch((err) => {
+        console.error(`[monitor] Failed to post local timeout status for ${job.issueIdentifier}:`, err);
+      });
+    }
+
+    await resetTicket(provider, job);
+    return;
+  }
+
+  const state = await inspectLocalContainer(job.machineId);
+  if (state.running) {
+    if (job.status === "dispatched") {
+      updateJobStatus(job.id, "running" as JobStatus);
+      console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) is running`);
+    }
+    return;
+  }
+
+  if (state.exitCode === null) return;
+
+  const prUrl = state.exitCode === 0
+    ? await findPrForIssue(config, job.repo, job.issueIdentifier)
+    : null;
+  const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
+  const jobStatus = resolveLocalDockerTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention);
+
+  if (jobStatus === "failed") {
+    await postLocalContainerLogs(provider, job, state.exitCode === 0 ? "pr_not_found" : "container_failed");
+  } else if (reviewNeedsAttention) {
+    await postLocalContainerLogs(provider, job, "post_push_review_not_approved");
+  }
+
+  try {
+    await removeLocalContainer(job.machineId);
+    console.log(`[monitor] Removed local Docker container ${job.machineId}`);
+  } catch (err) {
+    console.error(`[monitor] Failed to remove local Docker container ${job.machineId}:`, err);
+  }
+
+  const durationMs = Date.now() - job.dispatchedAt;
+  updateJobStatus(job.id, jobStatus, `exit_${state.exitCode}`, prUrl);
+  invalidateNonce(job.id);
+  console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (exit ${state.exitCode}, PR: ${prUrl || "none"})`);
+
+  if (job.issueId) {
+    postStatusComment(provider, job.issueId, {
+      type: "machine_destroyed",
+      durationMs,
+    }).catch((err) => {
+      console.error(`[monitor] Failed to post local cleanup status for ${job.issueIdentifier}:`, err);
+    });
+  }
+
+  if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
+    await markReadyForReview(provider, job, prUrl);
+  } else {
+    await resetTicket(provider, job);
   }
 }
 
@@ -1078,7 +1320,7 @@ async function sendCompletionNotifications(config: AppConfig, registry: Provider
         issueTitle: job.issueTitle || "Unknown",
         issueUrl,
         repoFullName,
-        status: job.status as "completed" | "failed" | "timed_out",
+        status: job.status as "completed" | "review_failed" | "failed" | "timed_out",
         conclusion: job.conclusion,
         prUrl: job.prUrl,
         runUrl,
@@ -1156,7 +1398,7 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
     }
 
     const isTerminal =
-      job.status === "completed" || job.status === "failed" || job.status === "timed_out";
+      job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";
     if (isTerminal) {
       // Job is done but machine was left running (e.g. service crashed mid-cleanup)
       await safeDestroyMachine(reaperConfig(config, registry), machine.id, "startup-stale-terminal");
@@ -1471,6 +1713,9 @@ async function main(): Promise<void> {
   console.log(`[main] Poll interval: ${config.pollIntervalMs}ms`);
   console.log(`[main] Mapped teams: ${Object.keys(teamRepoMap).join(", ")}`);
   console.log(`[main] Notification type: ${config.notifyType}`);
+  if (initialRunnerMode === "local") {
+    console.log(`[main] Local Docker runner image: ${config.localRunnerImage}`);
+  }
 
   // Check if Fly config is needed
   const hasFlyMappings = Object.values(teamRepoMap).some((m) => m.executionMode === "fly-machines");

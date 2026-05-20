@@ -65,6 +65,15 @@ default. To allow a different bot or a comma-separated allow-list, set the
 
 Merge the resulting PR in the target repo, enable "Allow GitHub Actions to create and approve pull requests" in its settings, then label any Linear issue `AI-Implement` and watch.
 
+For local runner development, keep the orchestrator on your host and run implementation jobs in Docker:
+
+```bash
+npm run build:runner:local # builds Dockerfile.session as ai-implement-runner:local
+npm run dev:local          # rebuilds the runner image, then starts RUNNER_MODE=local
+```
+
+Docker must be running. Local mode still opens real GitHub PRs; it just avoids deploying the orchestrator or publishing a runner image while you test changes.
+
 The full architecture, env-var reference, SQLite schema, multi-client deploy model, and Bedrock setup live in [`CLAUDE.md`](CLAUDE.md).
 
 ## Layout

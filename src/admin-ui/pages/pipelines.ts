@@ -55,6 +55,7 @@ export const pipelinesScript = `
         dispatched: 'neutral',
         running: 'running',
         completed: 'success',
+        review_failed: 'warn',
         failed: 'fail',
         timed_out: 'warn'
       };
@@ -63,7 +64,8 @@ export const pipelinesScript = `
         return '<span class="badge tight ' + cls + '">' + window.esc(text) + '</span>';
       }
       function statusBadge(status) {
-        return makeBadge(statusClass[status] || 'neutral', status || 'dispatched');
+        const label = status === 'review_failed' ? 'review failed' : (status || 'dispatched');
+        return makeBadge(statusClass[status] || 'neutral', label);
       }
       function execBadge(mode, runnerMode) {
         const short = mode === 'fly-machines' ? 'fly' : mode === 'planning' ? 'plan' : 'gha';

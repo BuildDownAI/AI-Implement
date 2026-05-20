@@ -15,3 +15,20 @@ export function buildIssueBranchName(issueIdentifier: string | undefined, issueT
   const summary = slugify(issueTitle, "implementation");
   return `ai-implement/${key}-${summary}`;
 }
+
+export function branchMatchesIssueIdentifier(branchRef: string | undefined, issueIdentifier: string | undefined): boolean {
+  if (!branchRef || !issueIdentifier) return false;
+
+  const ref = branchRef.toLowerCase();
+  const rawIdentifier = issueIdentifier.toLowerCase();
+  const slugIdentifier = slugify(issueIdentifier, "");
+  const candidates = [...new Set([rawIdentifier, slugIdentifier].filter(Boolean))];
+
+  return candidates.some((identifier) => (
+    ref === identifier ||
+    ref.startsWith(`${identifier}/`) ||
+    ref === `ai-implement/${identifier}` ||
+    ref.startsWith(`ai-implement/${identifier}-`) ||
+    ref.startsWith(`ai-implement/${identifier}/`)
+  ));
+}

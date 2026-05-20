@@ -131,6 +131,19 @@ describe("jobs table", () => {
     expect(unnotified[0].status).toBe("timed_out");
   });
 
+  it("review_failed status is treated as terminal", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.updateJobStatus(jobId, "review_failed", "post_push_review_not_approved", "https://github.com/org/repo/pull/1");
+
+    const inFlight = log.getInFlightJobs();
+    expect(inFlight).toHaveLength(0);
+
+    const unnotified = log.getUnnotifiedTerminalJobs();
+    expect(unnotified).toHaveLength(1);
+    expect(unnotified[0].status).toBe("review_failed");
+    expect(unnotified[0].prUrl).toBe("https://github.com/org/repo/pull/1");
+  });
+
   it("appendLog persists runnerMode and executionMode for GHA dispatches", () => {
     const jobId = log.appendLog({
       issueId: "gha-issue",

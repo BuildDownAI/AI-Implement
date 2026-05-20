@@ -92,6 +92,7 @@ export interface StepModule<
 
 export interface LLMResult {
   stdout: string;
+  stderr?: string;
   exitCode: number;
   tokensUsed: number;
 }

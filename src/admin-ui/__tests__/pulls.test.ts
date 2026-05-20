@@ -23,4 +23,9 @@ describe("pulls page", () => {
   it("uses const/let, not var", () => {
     expect(pullsScript).not.toMatch(/\bvar\s+\w/);
   });
+  it("shows review_failed pull rows as review failed", () => {
+    expect(pullsScript).toContain("s === 'review_failed'");
+    expect(pullsScript).toContain("jobStatus === 'review_failed'");
+    expect(pullsScript).toContain("review failed");
+  });
 });

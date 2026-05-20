@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { formatLlmResultDetail } from "../step-utils.js";
 
 export interface WorkUnit {
   id: string;
@@ -70,7 +71,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     });
 
     if (result.exitCode !== 0) {
-      throw new Error(`LLM invocation failed with exit code ${result.exitCode}`);
+      throw new Error(`LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
     }
 
     return {

@@ -34,8 +34,11 @@ export const drawerHtml = `
 
 export const drawerScript = `
 (function () {
+  const DRAWER_REFRESH_MS = 5000;
   let currentJobId = null;
   let mappingsCache = null;
+  let drawerRefreshTimer = null;
+  let drawerRefreshInFlightFor = null;
 
   async function ensureMappings() {
     if (!mappingsCache) {
@@ -66,9 +69,10 @@ export const drawerScript = `
     let kind;
     if (s === 'running') kind = 'running';
     else if (s === 'failed' || s === 'timed_out') kind = 'fail';
+    else if (s === 'review_failed') kind = 'warn';
     else if (s === 'completed') kind = 'success';
     else kind = 'neutral';
-    const label = s || 'unknown';
+    const label = s === 'review_failed' ? 'review failed' : (s || 'unknown');
     return '<span class="badge ' + kind + '"><span class="dot"></span>' + window.esc(label) + '</span>';
   }
 
@@ -99,7 +103,7 @@ export const drawerScript = `
   function renderElapsed(job, steps) {
     const elapsedEl = document.getElementById('drawer-elapsed');
     let endMs = null;
-    if (job.status === 'completed' || job.status === 'failed' || job.status === 'timed_out') {
+    if (job.status === 'completed' || job.status === 'review_failed' || job.status === 'failed' || job.status === 'timed_out') {
       if (job.completedAt) {
         endMs = job.completedAt;
       } else {
@@ -121,6 +125,8 @@ export const drawerScript = `
     const alertEl = document.getElementById('drawer-failure-alert');
     if (job.status === 'failed') {
       alertEl.innerHTML = '<div class="alert fail" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Job failed</div><div class="alert-desc">Failed during execution.</div></div></div>';
+    } else if (job.status === 'review_failed') {
+      alertEl.innerHTML = '<div class="alert warn" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Review needs attention</div><div class="alert-desc">Implementation opened a PR, but post-push review did not approve it.</div></div></div>';
     } else if (job.status === 'timed_out') {
       alertEl.innerHTML = '<div class="alert warn" style="margin-bottom:16px"><div class="alert-icon">&#9888;</div><div style="flex:1"><div class="alert-title">Job timed out</div><div class="alert-desc">Workflow exceeded timeout.</div></div></div>';
     } else {
@@ -128,12 +134,13 @@ export const drawerScript = `
     }
   }
 
-  function renderTimeline(job) {
+  function renderTimeline(job, steps) {
+    const latestRunningStep = (Array.isArray(steps) ? steps : []).find(function (s) { return s.status === 'running'; });
     const phases = [
       { label: 'Queued', detail: 'queued in ticketing system' },
       { label: 'Planning', detail: 'claude-plan.yml' },
       { label: 'Implementing', detail: job.executionMode ? window.esc(job.executionMode) + ' run' : 'implementation run' },
-      { label: 'Review', detail: job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR' },
+      { label: 'Review', detail: job.status === 'review_failed' ? 'post-push review needs attention' : (latestRunningStep && latestRunningStep.stepId === 'post-push-review' ? 'post-push review running' : (job.prUrl ? 'PR opened: #' + window.esc(job.prUrl.split('/').pop() || '') : 'awaiting PR')) },
       { label: 'Done', detail: 'merged' }
     ];
 
@@ -141,12 +148,16 @@ export const drawerScript = `
     const mode = job.executionMode || '';
     if (mode === 'planning') {
       activeIndex = 1;
-    } else if (mode === 'fly-machines' || mode === 'github-actions') {
+    } else if (mode === 'fly-machines' || mode === 'github-actions' || mode === 'local-docker') {
       activeIndex = 2;
       if (job.prUrl) activeIndex = 3;
       if (job.status === 'completed' && job.prUrl) activeIndex = 4;
+      if (job.status === 'review_failed') activeIndex = 3;
     } else {
       activeIndex = 0;
+    }
+    if (latestRunningStep && latestRunningStep.stepId === 'post-push-review') {
+      activeIndex = 3;
     }
 
     const timelineEl = document.getElementById('drawer-timeline');
@@ -159,7 +170,7 @@ export const drawerScript = `
         cls = 'done';
         markerText = '&#10003;';
       } else if (i === activeIndex) {
-        if (job.status === 'failed' || job.status === 'timed_out') {
+        if (job.status === 'failed' || job.status === 'timed_out' || job.status === 'review_failed') {
           cls = 'fail';
           markerText = '&#10007;';
         } else if (job.status === 'running') {
@@ -192,7 +203,7 @@ export const drawerScript = `
       let badgeKind;
       if (step.status === 'running') badgeKind = 'running';
       else if (step.status === 'failed') badgeKind = 'fail';
-      else if (step.status === 'completed') badgeKind = 'success';
+      else if (step.status === 'completed' || step.status === 'passed') badgeKind = 'success';
       else badgeKind = 'neutral';
 
       const logsLink = step.logsUrl
@@ -216,7 +227,7 @@ export const drawerScript = `
     const fields = [];
 
     const mapping = mappings && job.teamKey ? mappings[job.teamKey] : null;
-    const owner = mapping ? mapping.owner : null;
+    const repoParts = repoPartsForJob(job, mapping);
 
     if (job.issueIdentifier) {
       const ticketingProvider = mapping ? mapping.ticketingProvider : 'linear';
@@ -234,7 +245,7 @@ export const drawerScript = `
     }
 
     if (job.repo) {
-      const repoDisplay = owner ? window.esc(owner) + '/' + window.esc(job.repo) : '?/' + window.esc(job.repo);
+      const repoDisplay = repoParts ? window.esc(repoParts.owner) + '/' + window.esc(repoParts.repo) : window.esc(job.repo);
       fields.push({ label: 'Repository', value: '<span class="mono">' + repoDisplay + '</span>' });
     }
 
@@ -272,13 +283,27 @@ export const drawerScript = `
   function renderLogsLink(job, mappings) {
     const logsLink = document.getElementById('drawer-logs-link');
     const mapping = mappings && job.teamKey ? mappings[job.teamKey] : null;
-    const owner = mapping ? mapping.owner : null;
-    if (job.runId && owner && job.repo) {
-      logsLink.href = 'https://github.com/' + owner + '/' + job.repo + '/actions/runs/' + job.runId;
+    const repoParts = repoPartsForJob(job, mapping);
+    const hasWorkflowLogs = job.runId && (job.executionMode === 'github-actions' || job.executionMode === 'planning');
+    if (hasWorkflowLogs && repoParts) {
+      logsLink.href = 'https://github.com/' + repoParts.owner + '/' + repoParts.repo + '/actions/runs/' + job.runId;
+      logsLink.textContent = 'View workflow logs ↗';
       logsLink.removeAttribute('hidden');
     } else {
       logsLink.setAttribute('hidden', '');
+      logsLink.removeAttribute('href');
     }
+  }
+
+  function repoPartsForJob(job, mapping) {
+    if (job.repo && job.repo.includes('/')) {
+      const parts = job.repo.split('/');
+      if (parts[0] && parts[1]) return { owner: parts[0], repo: parts.slice(1).join('/') };
+    }
+    if (job.repo && mapping && mapping.owner) {
+      return { owner: mapping.owner, repo: job.repo };
+    }
+    return null;
   }
 
   function renderDrawer(job, steps, mappings) {
@@ -287,15 +312,13 @@ export const drawerScript = `
     renderMeta(job);
     renderElapsed(job, steps);
     renderFailureAlert(job);
-    renderTimeline(job);
+    renderTimeline(job, steps);
     renderSteps(steps);
     renderContext(job, mappings);
     renderLogsLink(job, mappings);
   }
 
-  async function openJobDrawer(id) {
-    currentJobId = id;
-    const wrap = document.getElementById('job-drawer-wrap');
+  function resetDrawerContent() {
     document.getElementById('drawer-title').textContent = 'Loading…';
     document.getElementById('drawer-issue-row').innerHTML = '';
     document.getElementById('drawer-meta').innerHTML = '';
@@ -306,9 +329,27 @@ export const drawerScript = `
     document.getElementById('drawer-step-count').textContent = '';
     document.getElementById('drawer-context').innerHTML = '';
     document.getElementById('drawer-logs-link').setAttribute('hidden', '');
-    wrap.removeAttribute('hidden');
-    document.body.style.overflow = 'hidden';
+    document.getElementById('drawer-logs-link').removeAttribute('href');
+  }
 
+  function stopDrawerAutoRefresh() {
+    if (drawerRefreshTimer) {
+      clearInterval(drawerRefreshTimer);
+      drawerRefreshTimer = null;
+    }
+  }
+
+  function startDrawerAutoRefresh(id) {
+    stopDrawerAutoRefresh();
+    drawerRefreshTimer = setInterval(function () {
+      refreshJobDrawer(id, { background: true });
+    }, DRAWER_REFRESH_MS);
+  }
+
+  async function refreshJobDrawer(id, options) {
+    if (drawerRefreshInFlightFor === id) return;
+    drawerRefreshInFlightFor = id;
+    const background = options && options.background === true;
     let mappings;
     try {
       mappings = await ensureMappings();
@@ -317,31 +358,44 @@ export const drawerScript = `
       mappings = null;
     }
 
-    let json;
     try {
       const res = await window.api('/api/jobs/' + id + '/steps');
+      if (currentJobId !== id) return;
       if (res.status === 404) {
         document.getElementById('drawer-title').textContent = 'Job not found';
+        stopDrawerAutoRefresh();
         return;
       }
       if (!res.ok) {
         console.error('Failed to load job:', res.status);
-        document.getElementById('drawer-title').textContent = 'Failed to load job';
+        if (!background) document.getElementById('drawer-title').textContent = 'Failed to load job';
         return;
       }
-      json = await res.json();
+      const json = await res.json();
+      if (currentJobId !== id) return;
+      renderDrawer(json.job, json.steps, mappings);
     } catch (err) {
       console.error('Failed to fetch job steps:', err);
-      document.getElementById('drawer-title').textContent = 'Failed to load job';
-      return;
+      if (!background && currentJobId === id) document.getElementById('drawer-title').textContent = 'Failed to load job';
+    } finally {
+      if (drawerRefreshInFlightFor === id) drawerRefreshInFlightFor = null;
     }
+  }
 
-    if (currentJobId !== id) return;
+  async function openJobDrawer(id) {
+    stopDrawerAutoRefresh();
+    currentJobId = id;
+    const wrap = document.getElementById('job-drawer-wrap');
+    resetDrawerContent();
+    wrap.removeAttribute('hidden');
+    document.body.style.overflow = 'hidden';
 
-    renderDrawer(json.job, json.steps, mappings);
+    await refreshJobDrawer(id, { background: false });
+    if (currentJobId === id) startDrawerAutoRefresh(id);
   }
 
   function closeJobDrawer() {
+    stopDrawerAutoRefresh();
     const wrap = document.getElementById('job-drawer-wrap');
     if (wrap) wrap.setAttribute('hidden', '');
     document.body.style.overflow = '';

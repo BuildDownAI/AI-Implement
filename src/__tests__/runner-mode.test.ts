@@ -58,6 +58,13 @@ describe("runner-mode", () => {
       expect(source).toBe("env");
     });
 
+    it("returns env mode when RUNNER_MODE is set to local", () => {
+      process.env.RUNNER_MODE = "local";
+      const { mode, source } = runnerMode.getRunnerMode();
+      expect(mode).toBe("local");
+      expect(source).toBe("env");
+    });
+
     it("returns env mode when RUNNER_MODE is set to shadow", () => {
       process.env.RUNNER_MODE = "shadow";
       const { mode, source } = runnerMode.getRunnerMode();
@@ -104,6 +111,13 @@ describe("runner-mode", () => {
       expect(source).toBe("db");
     });
 
+    it("stores and retrieves local mode", () => {
+      runnerMode.setRunnerMode("local");
+      const { mode, source } = runnerMode.getRunnerMode();
+      expect(mode).toBe("local");
+      expect(source).toBe("db");
+    });
+
     it("stores and retrieves shadow mode", () => {
       runnerMode.setRunnerMode("shadow");
       const { mode, source } = runnerMode.getRunnerMode();
@@ -140,8 +154,8 @@ describe("runner-mode", () => {
   });
 
   describe("VALID_RUNNER_MODES", () => {
-    it("contains exactly default, gha, fly, shadow", () => {
-      expect(runnerMode.VALID_RUNNER_MODES).toEqual(["default", "gha", "fly", "shadow"]);
+    it("contains exactly default, gha, fly, local, shadow", () => {
+      expect(runnerMode.VALID_RUNNER_MODES).toEqual(["default", "gha", "fly", "local", "shadow"]);
     });
   });
 
@@ -150,9 +164,10 @@ describe("runner-mode", () => {
       expect(runnerMode.isRunnerMode("default")).toBe(true);
     });
 
-    it("accepts gha, fly, shadow", () => {
+    it("accepts gha, fly, local, shadow", () => {
       expect(runnerMode.isRunnerMode("gha")).toBe(true);
       expect(runnerMode.isRunnerMode("fly")).toBe(true);
+      expect(runnerMode.isRunnerMode("local")).toBe(true);
       expect(runnerMode.isRunnerMode("shadow")).toBe(true);
     });
 

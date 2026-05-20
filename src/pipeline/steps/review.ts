@@ -1,4 +1,5 @@
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { formatLlmResultDetail } from "../step-utils.js";
 
 interface ReviewInputs extends Record<string, unknown> {
   model?: string;
@@ -99,7 +100,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     });
 
     if (result.exitCode !== 0) {
-      throw new Error(`Review LLM invocation failed with exit code ${result.exitCode}`);
+      throw new Error(`Review LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
     }
 
     let approved = false;

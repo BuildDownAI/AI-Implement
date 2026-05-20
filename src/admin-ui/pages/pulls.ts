@@ -53,6 +53,7 @@ export const pullsScript = `
   function statusBadgeKind(s) {
     if (s === 'running') return 'running';
     if (s === 'completed') return 'success';
+    if (s === 'review_failed') return 'warn';
     if (s === 'failed') return 'fail';
     if (s === 'timed_out') return 'warn';
     return 'neutral';
@@ -82,7 +83,8 @@ export const pullsScript = `
         issueCell = '<span class="text-tertiary">&mdash;</span>';
       }
       const repoCell = '<span class="mono">' + (repo ? window.esc(repo) : '&mdash;') + '</span>';
-      const statusCell = '<span class="badge ' + kind + '"><span class="dot"></span>' + window.esc(jobStatus) + '</span>';
+      const statusLabel = jobStatus === 'review_failed' ? 'review failed' : jobStatus;
+      const statusCell = '<span class="badge ' + kind + '"><span class="dot"></span>' + window.esc(statusLabel) + '</span>';
       const iterCell = '<span class="mono' + (dispatchNumber > 1 ? ' text-secondary' : '') + '">' + dispatchNumber + '</span>';
       const lastCell = '<td style="text-align:right" class="mono text-tertiary">' + fmtAgo(lastDispatchedAt) + '</td>';
       const actionCell = '<a class="text-accent" href="' + window.esc(prUrl) + '" target="_blank">Open &#8599;</a>';

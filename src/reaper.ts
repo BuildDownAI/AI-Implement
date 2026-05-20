@@ -172,7 +172,7 @@ export async function sweepOrphanedMachines(
     }
 
     const isTerminal =
-      job.status === "completed" || job.status === "failed" || job.status === "timed_out";
+      job.status === "completed" || job.status === "review_failed" || job.status === "failed" || job.status === "timed_out";
     if (isTerminal) {
       // Job already reached a terminal state but machine was not destroyed
       recordReaperAction({

@@ -35,4 +35,18 @@ describe("overview page", () => {
   it("uses const/let, not var", () => {
     expect(overviewScript).not.toMatch(/\bvar\s+\w/);
   });
+
+  it("opens the shared job drawer from running and failure rows", () => {
+    expect(overviewScript).toContain("function wireOverviewDrawerRows");
+    expect(overviewScript).toContain("overview-running-body");
+    expect(overviewScript).toContain("overview-failures-body");
+    expect(overviewScript).toContain("data-job-id");
+    expect(overviewScript).toContain("window.openJobDrawer(Number(jobId))");
+  });
+
+  it("treats review_failed jobs as failed/attention rows", () => {
+    expect(overviewScript).toContain("review_failed: 'warn'");
+    expect(overviewScript).toContain("status === 'review_failed'");
+    expect(overviewScript).toContain("review failed");
+  });
 });

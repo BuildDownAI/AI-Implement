@@ -135,6 +135,22 @@ describe("notifyCompletion", () => {
       expect(body.blocks[0].text.text).toContain("Timed Out");
     });
 
+    it("sends a review-failed message with the PR link", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase,
+        status: "review_failed",
+        conclusion: "post_push_review_not_approved",
+      });
+
+      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+      const text = body.blocks[0].text.text;
+      expect(text).toContain("Needs Review");
+      expect(text).toContain("pull/42");
+    });
+
+
     it("throws on non-ok response", async () => {
       vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "err" } as Response);
       await expect(

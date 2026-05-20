@@ -48,6 +48,7 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
     const gitArgs = args as string[];
     if (gitArgs[0] === "status") return spawnResult(0, dirty ? " M src/app.ts\n" : "");
     if (gitArgs[0] === "rev-parse") return spawnResult(0, `${sha}\n`);
+    if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\nA\tsrc/app.test.ts\n");
     if (gitArgs[0] === "ls-remote") {
       return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
     }
@@ -187,6 +188,37 @@ describe("pushStep", () => {
     const fetchCall = vi.mocked(fetch).mock.calls[0];
     const body = JSON.parse(fetchCall[1]?.body as string) as { title: string };
     expect(body.title).toContain("ENG-42");
+  });
+
+  it("creates a concise PR body with summary, approach, and test plan sections", async () => {
+    mockGitSuccess();
+    const ctx = makeContext();
+    ctx.setOutputs("feedback-loop", { approved: true });
+    ctx.setOutputs("preflight", { summary: "typecheck: passed, tests: passed (12 assertions)" });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(ctx, BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("## Summary");
+    expect(body.body).toContain("Implemented the requested work for ENG-42: Test.");
+    expect(body.body).toContain("## Approach");
+    expect(body.body).toContain("Implements ENG-42: Test.");
+    expect(body.body).toContain("Fixes ENG-42");
+    expect(body.body).toContain("- Modified: `src/app.ts`");
+    expect(body.body).toContain("- Added: `src/app.test.ts`");
+    expect(body.body).toContain("## Test plan");
+    expect(body.body).toContain("- [x] typecheck: passed");
+    expect(body.body).toContain("typecheck: passed");
+    expect(body.body).toContain("- [ ] Manual: review the changed behavior against the ticket acceptance criteria.");
+    expect(body.body).toContain("Generated with AI-Implement");
+    expect(body.body).not.toContain("## What was implemented");
+    expect(body.body).not.toContain("## AI review");
   });
 
   it("checks out implementation branch and commits working tree changes before pushing", async () => {

@@ -61,6 +61,7 @@ scripts/
 cp .env.example .env   # fill in LINEAR_API_KEY, GITHUB_PAT
 npm install
 npm run dev            # runs src/index.ts via tsx
+npm run dev:local      # rebuilds local session image, then runs local Docker jobs
 ```
 
 Health check: `curl http://localhost:8080/`
