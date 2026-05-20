@@ -37,6 +37,7 @@ import {
   removeLocalContainer,
   startLocalRunnerContainer,
 } from "./local-docker.js";
+import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 
 // ---------- Configuration ----------
@@ -1159,7 +1160,7 @@ async function monitorFlyMachineJob(
 }
 
 async function monitorLocalDockerJob(
-  _config: AppConfig,
+  config: AppConfig,
   provider: TicketingProvider,
   job: Job,
 ): Promise<void> {
@@ -1204,12 +1205,10 @@ async function monitorLocalDockerJob(
   if (state.exitCode === null) return;
 
   const prUrl = state.exitCode === 0
-    ? await findPrForIssue(_config, job.repo, job.issueIdentifier)
+    ? await findPrForIssue(config, job.repo, job.issueIdentifier)
     : null;
   const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
-  const jobStatus: JobStatus = state.exitCode === 0 && prUrl
-    ? (reviewNeedsAttention ? "review_failed" : "completed")
-    : "failed";
+  const jobStatus = resolveLocalDockerTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention);
 
   if (jobStatus === "failed") {
     await postLocalContainerLogs(provider, job, state.exitCode === 0 ? "pr_not_found" : "container_failed");

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { formatGitNameStatusSummary } from "../step-utils.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -188,14 +189,7 @@ function summarizeCommittedChanges(workspaceDir: string, githubToken: string): s
     throw new Error(`git show failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
 
-  const lines = result.stdout.toString().split("\n").map((line) => line.trim()).filter(Boolean);
-  if (lines.length === 0) return "";
-
-  return lines.map((line) => {
-    const [status, file] = line.split(/\s+/, 2);
-    const label = status === "A" ? "Added" : status === "M" ? "Modified" : status === "D" ? "Deleted" : "Changed";
-    return `- ${label}: \`${file ?? line}\``;
-  }).join("\n");
+  return formatGitNameStatusSummary(result.stdout.toString());
 }
 
 function runGit(

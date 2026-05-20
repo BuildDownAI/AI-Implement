@@ -1,7 +1,19 @@
 import { execFile as nodeExecFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFile = promisify(nodeExecFile);
+const SECRET_ENV_KEYS = new Set([
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "GITHUB_APP_PRIVATE_KEY",
+  "LINEAR_API_KEY",
+  "RUN_TOKEN",
+  "SESSION_TOKEN",
+]);
 
 export interface LocalRunnerInput {
   image: string;
@@ -64,13 +76,35 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
   return env;
 }
 
+export function splitLocalRunnerEnv(env: Record<string, string>): {
+  publicEnv: Record<string, string>;
+  secretEnv: Record<string, string>;
+} {
+  const publicEnv: Record<string, string> = {};
+  const secretEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (SECRET_ENV_KEYS.has(key)) {
+      secretEnv[key] = value;
+    } else {
+      publicEnv[key] = value;
+    }
+  }
+  return { publicEnv, secretEnv };
+}
+
+export function buildDockerEnvFileContent(env: Record<string, string>): string {
+  return Object.entries(env)
+    .map(([key, value]) => `${key}=${escapeEnvFileValue(value)}`)
+    .join("\n") + "\n";
+}
+
 function sanitizeContainerName(issueIdentifier: string): string {
   const slug = issueIdentifier.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
   return `ai-implement-${slug || "session"}-${Date.now().toString(36)}`;
 }
 
-export function buildDockerRunArgs(input: StartLocalContainerInput): string[] {
-  const env = buildLocalRunnerEnv(input);
+export function buildDockerRunArgs(input: StartLocalContainerInput, envFilePath?: string): string[] {
+  const { publicEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv(input));
   const args = [
     "run",
     "-d",
@@ -80,7 +114,11 @@ export function buildDockerRunArgs(input: StartLocalContainerInput): string[] {
     "host.docker.internal:host-gateway",
   ];
 
-  for (const [key, value] of Object.entries(env)) {
+  if (envFilePath) {
+    args.push("--env-file", envFilePath);
+  }
+
+  for (const [key, value] of Object.entries(publicEnv)) {
     args.push("-e", `${key}=${value}`);
   }
 
@@ -92,7 +130,8 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
   containerId: string;
   containerName: string;
 }> {
-  const args = buildDockerRunArgs(input);
+  const envFilePath = await writeSecretEnvFile(buildLocalRunnerEnv(input));
+  const args = buildDockerRunArgs(input, envFilePath);
   const nameIndex = args.indexOf("--name");
   const containerName = nameIndex >= 0 ? args[nameIndex + 1] : "";
 
@@ -101,6 +140,8 @@ export async function startLocalRunnerContainer(input: StartLocalContainerInput)
     return { containerId: stdout.trim(), containerName };
   } catch (err) {
     throw new Error(`Failed to start local Docker runner: ${errorMessage(err)}`);
+  } finally {
+    await unlink(envFilePath).catch(() => undefined);
   }
 }
 
@@ -145,4 +186,20 @@ function errorMessage(err: unknown): string {
     return maybe.stderr?.trim() || maybe.stdout?.trim() || maybe.message || String(err);
   }
   return String(err);
+}
+
+async function writeSecretEnvFile(env: Record<string, string>): Promise<string> {
+  const { secretEnv } = splitLocalRunnerEnv(env);
+  const dir = join(tmpdir(), "ai-implement-local-runner");
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const filePath = join(dir, `${randomUUID()}.env`);
+  await writeFile(filePath, buildDockerEnvFileContent(secretEnv), { mode: 0o600 });
+  await chmod(filePath, 0o600);
+  return filePath;
+}
+
+function escapeEnvFileValue(value: string): string {
+  return value
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
 }

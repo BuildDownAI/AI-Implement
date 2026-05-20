@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildDockerRunArgs, buildLocalRunnerEnv } from "../local-docker.js";
+import {
+  buildDockerEnvFileContent,
+  buildDockerRunArgs,
+  buildLocalRunnerEnv,
+  splitLocalRunnerEnv,
+} from "../local-docker.js";
 import type { LocalRunnerInput } from "../local-docker.js";
 
 const baseInput: LocalRunnerInput = {
@@ -59,20 +64,50 @@ describe("buildLocalRunnerEnv", () => {
 });
 
 describe("buildDockerRunArgs", () => {
-  it("builds a detached docker run command with host gateway and env vars", () => {
+  it("builds a detached docker run command with host gateway and env file for secrets", () => {
     const args = buildDockerRunArgs({
       ...baseInput,
       containerName: "ai-implement-eng-42-test",
-    });
+    }, "/tmp/runner.env");
 
     expect(args.slice(0, 2)).toEqual(["run", "-d"]);
     expect(args).toContain("--name");
     expect(args).toContain("ai-implement-eng-42-test");
     expect(args).toContain("--add-host");
     expect(args).toContain("host.docker.internal:host-gateway");
+    expect(args).toContain("--env-file");
+    expect(args).toContain("/tmp/runner.env");
     expect(args).toContain("-e");
     expect(args).toContain("AI_IMPLEMENT_MODE=local");
     expect(args).toContain("ISSUE_IDENTIFIER=ENG-42");
+    expect(args).not.toContain("GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----");
+    expect(args).not.toContain("SESSION_TOKEN=session-token");
+    expect(args).not.toContain("LINEAR_API_KEY=lin_api_test");
+    expect(args).not.toContain("ANTHROPIC_API_KEY=sk-ant-test");
     expect(args.at(-1)).toBe("ai-implement-runner:local");
+  });
+});
+
+describe("splitLocalRunnerEnv", () => {
+  it("separates secrets from public docker argv env", () => {
+    const { publicEnv, secretEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv(baseInput));
+
+    expect(publicEnv.ISSUE_IDENTIFIER).toBe("ENG-42");
+    expect(publicEnv.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
+    expect(publicEnv.SESSION_TOKEN).toBeUndefined();
+    expect(secretEnv.GITHUB_APP_PRIVATE_KEY).toContain("BEGIN RSA PRIVATE KEY");
+    expect(secretEnv.SESSION_TOKEN).toBe("session-token");
+  });
+});
+
+describe("buildDockerEnvFileContent", () => {
+  it("escapes literal newlines for env-file compatibility", () => {
+    const content = buildDockerEnvFileContent({
+      GITHUB_APP_PRIVATE_KEY: "-----BEGIN-----\nkey\n-----END-----",
+      SESSION_TOKEN: "session-token",
+    });
+
+    expect(content).toContain("GITHUB_APP_PRIVATE_KEY=-----BEGIN-----\\nkey\\n-----END-----");
+    expect(content).toContain("SESSION_TOKEN=session-token");
   });
 });

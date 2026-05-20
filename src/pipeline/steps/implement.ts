@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { formatLlmResultDetail } from "../step-utils.js";
 
 export interface WorkUnit {
   id: string;
@@ -70,7 +71,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     });
 
     if (result.exitCode !== 0) {
-      throw new Error(`LLM invocation failed with exit code ${result.exitCode}${llmResultDetail(result)}`);
+      throw new Error(`LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
     }
 
     return {
@@ -84,11 +85,6 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     };
   },
 };
-
-function llmResultDetail(result: { stdout?: string; stderr?: string }): string {
-  const detail = (result.stderr || result.stdout || "").trim();
-  return detail ? `: ${detail}` : "";
-}
 
 function getChangedFiles(workspaceDir: string): string[] {
   const result = spawnSync("git", ["diff", "--name-only", "HEAD"], {

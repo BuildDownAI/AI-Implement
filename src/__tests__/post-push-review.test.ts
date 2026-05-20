@@ -83,7 +83,7 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("cap") && c.includes("Blocking issues:\n1. bug"))).toBe(true);
     expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({ maxTurns: 12 }),
+      expect.objectContaining({ maxTurns: 1 }),
     );
   });
 
@@ -267,6 +267,33 @@ describe("postPushReviewStep", () => {
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(ghComments.some((comment) => comment.includes("Ready to merge"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Not ready to merge"))).toBe(false);
+  });
+
+  it("does not treat benign should-pass approval language as actionable", async () => {
+    const approvedWithShouldPass = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "The implementation is ready; tests should pass and this should be merged as-is.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: approvedWithShouldPass, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
   });
 
   it("does not fail the job when post-push reviewer LLM exits non-zero", async () => {
