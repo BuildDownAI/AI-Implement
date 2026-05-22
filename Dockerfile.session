@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # ---------- Build stage ----------
 FROM node:22-bookworm-slim AS builder
 
@@ -20,6 +21,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG YQ_VERSION=v4.53.2
 ARG AST_GREP_VERSION=0.42.1
 ARG CLAUDE_CODE_VERSION=2.1.114
+ARG UV_VERSION=0.5.31
+ARG PYTHON_AGENTICA_VERSION=3.12
+ARG AGENTICA_VERSION=0.4.0
 
 # System dependencies — base tools + power tools for the agent.
 # dbus + libsecret-1-0 are required so Claude Code's startup keychain read
@@ -82,6 +86,31 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # Claude Code CLI and ast-grep (structural search/rewrite)
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@ast-grep/cli@${AST_GREP_VERSION}" \
     && corepack enable
+
+# uv (Astral) — single static binary that manages Python toolchains. Used to
+# install Python 3.12 alongside the system python3 (3.11). symbolica-agentica
+# requires Python >= 3.12; we keep the system python3 untouched for
+# parse-ai-implement-toml.py and expose 3.12 as `python3.12`.
+RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-installer.sh" \
+      | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh \
+    && uv --version
+
+# Install Python 3.12 + symbolica-agentica into a dedicated venv at
+# /opt/agentica-venv. uv refuses to install into its managed Python directly
+# (the toolchain is locked "externally-managed"), so we materialize a venv,
+# install agentica into it, then expose the venv's python as
+# /usr/local/bin/python3.12 via a wrapper script. A bare symlink confuses
+# Python's venv detection (it can resolve the symlink and lose the venv
+# prefix); the wrapper guarantees the venv's site-packages are used.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN uv python install "${PYTHON_AGENTICA_VERSION}" \
+    && uv venv --python "${PYTHON_AGENTICA_VERSION}" /opt/agentica-venv \
+    && uv pip install --python /opt/agentica-venv/bin/python \
+         "symbolica-agentica==${AGENTICA_VERSION}" \
+    && printf '#!/bin/sh\nexec /opt/agentica-venv/bin/python "$@"\n' \
+         > /usr/local/bin/python3.12 \
+    && chmod +x /usr/local/bin/python3.12 \
+    && python3.12 -c "from agentica import spawn; print('agentica import OK')"
 
 # Create non-root user for Claude Code (refuses --dangerously-skip-permissions as root)
 RUN useradd -m -s /bin/bash coder \

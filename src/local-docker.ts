@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 
 const execFile = promisify(nodeExecFile);
 const SECRET_ENV_KEYS = new Set([
+  "AGENTICA_API_KEY",
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
   "GITHUB_APP_PRIVATE_KEY",
@@ -27,6 +28,7 @@ export interface LocalRunnerInput {
   linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
+  agenticaApiKey?: string;
   githubAppId: string;
   githubAppPrivateKey: string;
   sessionToken: string;
@@ -68,6 +70,7 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
   if (input.linearApiKey) env.LINEAR_API_KEY = input.linearApiKey;
   if (input.claudeOAuthToken) env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   if (input.anthropicApiKey) env.ANTHROPIC_API_KEY = input.anthropicApiKey;
+  if (input.agenticaApiKey) env.AGENTICA_API_KEY = input.agenticaApiKey;
   if (input.orchestratorUrl) env.ORCHESTRATOR_URL = input.orchestratorUrl;
   if (input.runnerCallbackUrl) env.RUNNER_CALLBACK_URL = input.runnerCallbackUrl;
   if (input.runToken) env.RUN_TOKEN = input.runToken;

@@ -22,6 +22,7 @@ const baseInput: LocalRunnerInput = {
   machineNonce: "nonce-123",
   linearApiKey: "lin_api_test",
   anthropicApiKey: "sk-ant-test",
+  agenticaApiKey: "agt_test_xyz",
   orchestratorUrl: "http://host.docker.internal:8080",
 };
 
@@ -37,8 +38,14 @@ describe("buildLocalRunnerEnv", () => {
     expect(env.GITHUB_APP_ID).toBe("12345");
     expect(env.LINEAR_API_KEY).toBe("lin_api_test");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
+    expect(env.AGENTICA_API_KEY).toBe("agt_test_xyz");
     expect(env.ORCHESTRATOR_URL).toBe("http://host.docker.internal:8080");
     expect(env.SESSION_MODE).toBe("autonomous");
+  });
+
+  it("omits AGENTICA_API_KEY when not provided", () => {
+    const env = buildLocalRunnerEnv({ ...baseInput, agenticaApiKey: undefined });
+    expect(env.AGENTICA_API_KEY).toBeUndefined();
   });
 
   it("uses OAuth when provided instead of requiring an Anthropic key", () => {
@@ -84,6 +91,7 @@ describe("buildDockerRunArgs", () => {
     expect(args).not.toContain("SESSION_TOKEN=session-token");
     expect(args).not.toContain("LINEAR_API_KEY=lin_api_test");
     expect(args).not.toContain("ANTHROPIC_API_KEY=sk-ant-test");
+    expect(args).not.toContain("AGENTICA_API_KEY=agt_test_xyz");
     expect(args.at(-1)).toBe("ai-implement-runner:local");
   });
 });
@@ -97,6 +105,8 @@ describe("splitLocalRunnerEnv", () => {
     expect(publicEnv.SESSION_TOKEN).toBeUndefined();
     expect(secretEnv.GITHUB_APP_PRIVATE_KEY).toContain("BEGIN RSA PRIVATE KEY");
     expect(secretEnv.SESSION_TOKEN).toBe("session-token");
+    expect(secretEnv.AGENTICA_API_KEY).toBe("agt_test_xyz");
+    expect(publicEnv.AGENTICA_API_KEY).toBeUndefined();
   });
 });
 

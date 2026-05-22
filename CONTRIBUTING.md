@@ -21,6 +21,11 @@ Node 24 is the supported runtime (see `.tool-versions`). Earlier versions may wo
 `Dockerfile.session` as `ai-implement-runner:local`. Docker must be running.
 Local implementation jobs still create real GitHub branches and PRs.
 
+If a target repo uses [agentica](https://docs.symbolica.ai/), set
+`AGENTICA_API_KEY` in `.env`; the runner image ships with Python 3.12 and
+`symbolica-agentica` preinstalled, and the orchestrator passes the key through
+as a secret. See [docs/AGENTICA.md](docs/AGENTICA.md).
+
 ## Before opening a PR
 
 1. **Tests pass** — `npm test` and `npm run typecheck` are both green.

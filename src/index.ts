@@ -60,6 +60,7 @@ interface AppConfig {
   sessionImage: string;
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
+  agenticaApiKey: string | null;
   githubWebhookSecret: string | null;
   orchestratorUrl: string | null;
   reaperDryRun: boolean;
@@ -136,6 +137,7 @@ function loadConfig(): AppConfig {
     sessionImage: process.env.SESSION_IMAGE || "ghcr.io/builddownai/ai-implement-runner:latest",
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
+    agenticaApiKey: process.env.AGENTICA_API_KEY || null,
     githubWebhookSecret,
     orchestratorUrl: process.env.ORCHESTRATOR_URL || null,
     reaperDryRun: process.env.REAPER_DRY_RUN === "true",
@@ -551,6 +553,7 @@ async function dispatchFlyMachine(
     linearApiKey: config.linearApiKey ?? undefined,
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+    agenticaApiKey: config.agenticaApiKey ?? undefined,
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     sessionToken,
@@ -669,6 +672,7 @@ async function dispatchLocalDocker(
     linearApiKey: config.linearApiKey ?? undefined,
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+    agenticaApiKey: config.agenticaApiKey ?? undefined,
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     sessionToken,

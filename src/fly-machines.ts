@@ -338,6 +338,7 @@ export interface SessionMachineInput {
   linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
+  agenticaApiKey?: string;
   githubAppId: string;
   githubAppPrivateKey: string;
   sessionToken: string;
@@ -382,6 +383,9 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
   if (input.anthropicApiKey) {
     env.ANTHROPIC_API_KEY = input.anthropicApiKey;
+  }
+  if (input.agenticaApiKey) {
+    env.AGENTICA_API_KEY = input.agenticaApiKey;
   }
   if (input.orchestratorUrl) {
     env.ORCHESTRATOR_URL = input.orchestratorUrl;

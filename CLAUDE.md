@@ -94,6 +94,7 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `LINEAR_API_KEY` | Yes | Linear personal API key |
 | `GITHUB_APP_ID` | Yes | GitHub App numeric ID |
 | `GITHUB_APP_PRIVATE_KEY` | Yes | GitHub App RSA private key (PEM, `\n`-escaped) |
+| `AGENTICA_API_KEY` | No | Symbolica agentica API key. Plumbed through to the runner so target-repo code can `from agentica import spawn`. See [docs/AGENTICA.md](docs/AGENTICA.md). |
 | `NOTIFY_TYPE` | No | `slack` (default) or `teams` |
 | `NOTIFY_WEBHOOK_URL` | No | Webhook URL; notifications skipped if unset |
 | `ADMIN_ACCESS_CODE` | No | Admin UI password; UI disabled if unset |

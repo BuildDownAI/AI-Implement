@@ -74,6 +74,8 @@ npm run dev:local          # rebuilds the runner image, then starts RUNNER_MODE=
 
 Docker must be running. Local mode still opens real GitHub PRs; it just avoids deploying the orchestrator or publishing a runner image while you test changes.
 
+If a target repo uses [agentica](https://docs.symbolica.ai/) (the Symbolica AI Python framework), set `AGENTICA_API_KEY` in your `.env`. The runner image bundles Python 3.12 and `symbolica-agentica`; the orchestrator passes the key through as a session secret. See [`docs/AGENTICA.md`](docs/AGENTICA.md) for details.
+
 The full architecture, env-var reference, SQLite schema, multi-client deploy model, and Bedrock setup live in [`CLAUDE.md`](CLAUDE.md).
 
 ## Layout

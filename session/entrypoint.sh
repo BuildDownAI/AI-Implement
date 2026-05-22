@@ -33,6 +33,21 @@ export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
 export GITHUB_OWNER GITHUB_REPO
 export PR_NUMBER="${PR_NUMBER:-}"
 
+# Agentica is optional; soft-validate only. If a key is plumbed through, run a
+# one-line import smoke test so failures show up here (clear), not deep in a
+# user workspace script. python3.12 + symbolica-agentica are baked into the
+# runner image; see Dockerfile.session.
+if [ -n "${AGENTICA_API_KEY:-}" ]; then
+  export AGENTICA_API_KEY
+  if python3.12 -c "from agentica import spawn" >/dev/null 2>&1; then
+    log "agentica available (python3.12 import OK; AGENTICA_API_KEY set)"
+  else
+    log "WARN: AGENTICA_API_KEY is set but \`python3.12 -c 'from agentica import spawn'\` failed"
+  fi
+else
+  log "agentica skipped (AGENTICA_API_KEY not set)"
+fi
+
 # ── 3. Token acquisition ─────────────────────────────────────────────────────
 if [ "$AI_IMPLEMENT_MODE" = "gha" ]; then
   log "Using GITHUB_TOKEN from GHA"

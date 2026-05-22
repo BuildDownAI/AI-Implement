@@ -449,6 +449,16 @@ describe("buildSessionMachineConfig", () => {
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
   });
 
+  it("includes AGENTICA_API_KEY when provided", () => {
+    const result = buildSessionMachineConfig({ ...baseInput, agenticaApiKey: "agt_test" });
+    expect(result.config.env!.AGENTICA_API_KEY).toBe("agt_test");
+  });
+
+  it("omits AGENTICA_API_KEY when not provided", () => {
+    const result = buildSessionMachineConfig(baseInput);
+    expect(result.config.env!.AGENTICA_API_KEY).toBeUndefined();
+  });
+
   it("sets OAuth token when provided", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
