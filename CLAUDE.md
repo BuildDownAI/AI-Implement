@@ -1,5 +1,9 @@
 # AI-Implement — Codebase Guide
 
+## Branching
+
+**All PRs target `testing`, not `main`.** `testing` is the integration branch; `main` is downstream and updated separately. When you branch for new work, base off `testing` and open the PR against `testing`. Comparison URLs and `gh pr create --base` should both use `testing`.
+
 ## What this is
 
 A Node.js service that polls Linear for issues labeled "AI-Implement" and dispatches GitHub Actions workflows that run Claude Code to implement them. It also provides an admin UI and manages workflow templates synced to target repos.
