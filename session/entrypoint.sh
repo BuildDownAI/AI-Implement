@@ -37,10 +37,12 @@ export PR_NUMBER="${PR_NUMBER:-}"
 # one-line import smoke test so failures show up here (clear), not deep in a
 # user workspace script. python3.12 + symbolica-agentica are baked into the
 # runner image; see Dockerfile.session.
+export AGENTICA_MODEL_PRIMARY="${AGENTICA_MODEL_PRIMARY:-}"
+export AGENTICA_MODEL_FALLBACK="${AGENTICA_MODEL_FALLBACK:-}"
 if [ -n "${AGENTICA_API_KEY:-}" ]; then
   export AGENTICA_API_KEY
   if python3.12 -c "from agentica import spawn" >/dev/null 2>&1; then
-    log "agentica available (python3.12 import OK; AGENTICA_API_KEY set)"
+    log "agentica available (python3.12 import OK; AGENTICA_API_KEY set; primary=${AGENTICA_MODEL_PRIMARY:-<unset>}, fallback=${AGENTICA_MODEL_FALLBACK:-<unset>})"
   else
     log "WARN: AGENTICA_API_KEY is set but \`python3.12 -c 'from agentica import spawn'\` failed"
   fi

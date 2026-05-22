@@ -99,6 +99,8 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `GITHUB_APP_ID` | Yes | GitHub App numeric ID |
 | `GITHUB_APP_PRIVATE_KEY` | Yes | GitHub App RSA private key (PEM, `\n`-escaped) |
 | `AGENTICA_API_KEY` | No | Symbolica agentica API key. Plumbed through to the runner so target-repo code can `from agentica import spawn`. See [docs/AGENTICA.md](docs/AGENTICA.md). |
+| `AGENTICA_MODEL_PRIMARY` | No | Default primary model for target-repo agentica calls. Default `anthropic:claude-sonnet-4.6`. |
+| `AGENTICA_MODEL_FALLBACK` | No | Default fallback model (non-Anthropic) for target-repo agentica calls. Default `openai:gpt-4.1`. |
 | `NOTIFY_TYPE` | No | `slack` (default) or `teams` |
 | `NOTIFY_WEBHOOK_URL` | No | Webhook URL; notifications skipped if unset |
 | `ADMIN_ACCESS_CODE` | No | Admin UI password; UI disabled if unset |

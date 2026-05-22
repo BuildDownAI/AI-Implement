@@ -29,6 +29,8 @@ export interface LocalRunnerInput {
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
   agenticaApiKey?: string;
+  agenticaModelPrimary?: string;
+  agenticaModelFallback?: string;
   githubAppId: string;
   githubAppPrivateKey: string;
   sessionToken: string;
@@ -71,6 +73,8 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
   if (input.claudeOAuthToken) env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   if (input.anthropicApiKey) env.ANTHROPIC_API_KEY = input.anthropicApiKey;
   if (input.agenticaApiKey) env.AGENTICA_API_KEY = input.agenticaApiKey;
+  if (input.agenticaModelPrimary) env.AGENTICA_MODEL_PRIMARY = input.agenticaModelPrimary;
+  if (input.agenticaModelFallback) env.AGENTICA_MODEL_FALLBACK = input.agenticaModelFallback;
   if (input.orchestratorUrl) env.ORCHESTRATOR_URL = input.orchestratorUrl;
   if (input.runnerCallbackUrl) env.RUNNER_CALLBACK_URL = input.runnerCallbackUrl;
   if (input.runToken) env.RUN_TOKEN = input.runToken;

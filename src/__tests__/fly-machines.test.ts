@@ -459,6 +459,16 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.env!.AGENTICA_API_KEY).toBeUndefined();
   });
 
+  it("includes AGENTICA_MODEL_PRIMARY and AGENTICA_MODEL_FALLBACK when provided", () => {
+    const result = buildSessionMachineConfig({
+      ...baseInput,
+      agenticaModelPrimary: "anthropic:claude-sonnet-4.6",
+      agenticaModelFallback: "openai:gpt-4.1",
+    });
+    expect(result.config.env!.AGENTICA_MODEL_PRIMARY).toBe("anthropic:claude-sonnet-4.6");
+    expect(result.config.env!.AGENTICA_MODEL_FALLBACK).toBe("openai:gpt-4.1");
+  });
+
   it("sets OAuth token when provided", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,

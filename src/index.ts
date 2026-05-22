@@ -61,6 +61,8 @@ interface AppConfig {
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   agenticaApiKey: string | null;
+  agenticaModelPrimary: string;
+  agenticaModelFallback: string;
   githubWebhookSecret: string | null;
   orchestratorUrl: string | null;
   reaperDryRun: boolean;
@@ -138,6 +140,8 @@ function loadConfig(): AppConfig {
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
     agenticaApiKey: process.env.AGENTICA_API_KEY || null,
+    agenticaModelPrimary: process.env.AGENTICA_MODEL_PRIMARY || "anthropic:claude-sonnet-4.6",
+    agenticaModelFallback: process.env.AGENTICA_MODEL_FALLBACK || "openai:gpt-4.1",
     githubWebhookSecret,
     orchestratorUrl: process.env.ORCHESTRATOR_URL || null,
     reaperDryRun: process.env.REAPER_DRY_RUN === "true",
@@ -554,6 +558,8 @@ async function dispatchFlyMachine(
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     claudeOAuthToken: config.claudeOAuthToken ?? undefined,
     agenticaApiKey: config.agenticaApiKey ?? undefined,
+    agenticaModelPrimary: config.agenticaModelPrimary,
+    agenticaModelFallback: config.agenticaModelFallback,
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     sessionToken,
@@ -673,6 +679,8 @@ async function dispatchLocalDocker(
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     claudeOAuthToken: config.claudeOAuthToken ?? undefined,
     agenticaApiKey: config.agenticaApiKey ?? undefined,
+    agenticaModelPrimary: config.agenticaModelPrimary,
+    agenticaModelFallback: config.agenticaModelFallback,
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     sessionToken,

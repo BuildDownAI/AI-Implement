@@ -23,6 +23,8 @@ const baseInput: LocalRunnerInput = {
   linearApiKey: "lin_api_test",
   anthropicApiKey: "sk-ant-test",
   agenticaApiKey: "agt_test_xyz",
+  agenticaModelPrimary: "anthropic:claude-sonnet-4.6",
+  agenticaModelFallback: "openai:gpt-4.1",
   orchestratorUrl: "http://host.docker.internal:8080",
 };
 
@@ -46,6 +48,22 @@ describe("buildLocalRunnerEnv", () => {
   it("omits AGENTICA_API_KEY when not provided", () => {
     const env = buildLocalRunnerEnv({ ...baseInput, agenticaApiKey: undefined });
     expect(env.AGENTICA_API_KEY).toBeUndefined();
+  });
+
+  it("maps AGENTICA_MODEL_PRIMARY and AGENTICA_MODEL_FALLBACK as public env", () => {
+    const env = buildLocalRunnerEnv(baseInput);
+    expect(env.AGENTICA_MODEL_PRIMARY).toBe("anthropic:claude-sonnet-4.6");
+    expect(env.AGENTICA_MODEL_FALLBACK).toBe("openai:gpt-4.1");
+  });
+
+  it("omits model env vars when not provided (orchestrator owns the default)", () => {
+    const env = buildLocalRunnerEnv({
+      ...baseInput,
+      agenticaModelPrimary: undefined,
+      agenticaModelFallback: undefined,
+    });
+    expect(env.AGENTICA_MODEL_PRIMARY).toBeUndefined();
+    expect(env.AGENTICA_MODEL_FALLBACK).toBeUndefined();
   });
 
   it("uses OAuth when provided instead of requiring an Anthropic key", () => {
@@ -107,6 +125,9 @@ describe("splitLocalRunnerEnv", () => {
     expect(secretEnv.SESSION_TOKEN).toBe("session-token");
     expect(secretEnv.AGENTICA_API_KEY).toBe("agt_test_xyz");
     expect(publicEnv.AGENTICA_API_KEY).toBeUndefined();
+    expect(publicEnv.AGENTICA_MODEL_PRIMARY).toBe("anthropic:claude-sonnet-4.6");
+    expect(publicEnv.AGENTICA_MODEL_FALLBACK).toBe("openai:gpt-4.1");
+    expect(secretEnv.AGENTICA_MODEL_PRIMARY).toBeUndefined();
   });
 });
 
