@@ -15,6 +15,23 @@ export interface ReviewLedgerFinding {
   url?: string;
 }
 
+export interface GhResult {
+  stdout: string;
+  stderr?: string;
+  exitCode: number;
+}
+
+export type GhSpawn = (args: string[]) => GhResult;
+
+export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): ReviewLedgerFinding[] {
+  const findings: ReviewLedgerFinding[] = [];
+
+  collectChangesRequestedReviews(ghSpawn, prNumber, findings);
+  collectUnresolvedReviewThreads(ghSpawn, prNumber, findings);
+
+  return findings;
+}
+
 export function extractClaudeSummaryFindings(body: string, url?: string): ReviewLedgerFinding[] {
   const items: string[] = [];
   let inBlockingSection = false;
@@ -85,6 +102,109 @@ function formatLocation(finding: ReviewLedgerFinding): string | undefined {
   return typeof finding.line === "number" ? `${finding.path}:${finding.line}` : finding.path;
 }
 
+function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
+  const result = safeGhSpawn(ghSpawn, ["api", `repos/:owner/:repo/pulls/${prNumber}/reviews`]);
+  if (!result || result.exitCode !== 0) return;
+
+  const reviews = parseJson(result.stdout);
+  if (!Array.isArray(reviews)) return;
+
+  for (const review of reviews) {
+    if (!isRecord(review) || review.state !== "CHANGES_REQUESTED" || typeof review.body !== "string") {
+      continue;
+    }
+
+    const body = review.body.trim();
+    if (!body) continue;
+
+    findings.push({
+      source: "github-review",
+      severity: "blocking",
+      body,
+      ...(typeof review.html_url === "string" ? { url: review.html_url } : {}),
+    });
+  }
+}
+
+function collectUnresolvedReviewThreads(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
+  const result = safeGhSpawn(ghSpawn, [
+    "api",
+    "graphql",
+    "-F",
+    "owner={owner}",
+    "-F",
+    "repo={repo}",
+    "-F",
+    `number=${prNumber}`,
+    "-f",
+    `query=${reviewThreadsQuery}`,
+  ]);
+  if (!result || result.exitCode !== 0) return;
+
+  const payload = parseJson(result.stdout);
+  const nodes = getReviewThreadNodes(payload);
+  if (!nodes) return;
+
+  for (const thread of nodes) {
+    if (!isRecord(thread) || thread.isResolved !== false) continue;
+
+    const comments = getCommentNodes(thread);
+    const latestComment = comments?.at(-1);
+    if (!isRecord(latestComment) || typeof latestComment.body !== "string") continue;
+
+    const body = latestComment.body.trim();
+    if (!body) continue;
+
+    findings.push({
+      source: "github-review-thread",
+      severity: "blocking",
+      body,
+      ...(typeof thread.path === "string" ? { path: thread.path } : {}),
+      ...(typeof thread.line === "number" ? { line: thread.line } : {}),
+      ...(typeof latestComment.url === "string" ? { url: latestComment.url } : {}),
+    });
+  }
+}
+
+function safeGhSpawn(ghSpawn: GhSpawn, args: string[]): GhResult | undefined {
+  try {
+    return ghSpawn(args);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function getReviewThreadNodes(payload: unknown): unknown[] | undefined {
+  if (!isRecord(payload)) return undefined;
+  const data = payload.data;
+  if (!isRecord(data)) return undefined;
+  const repository = data.repository;
+  if (!isRecord(repository)) return undefined;
+  const pullRequest = repository.pullRequest;
+  if (!isRecord(pullRequest)) return undefined;
+  const reviewThreads = pullRequest.reviewThreads;
+  if (!isRecord(reviewThreads)) return undefined;
+  return Array.isArray(reviewThreads.nodes) ? reviewThreads.nodes : undefined;
+}
+
+function getCommentNodes(thread: Record<string, unknown>): unknown[] | undefined {
+  const comments = thread.comments;
+  if (!isRecord(comments)) return undefined;
+  return Array.isArray(comments.nodes) ? comments.nodes : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 function normalizeText(value: string): string {
   return value
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
@@ -93,3 +213,25 @@ function normalizeText(value: string): string {
     .replace(/\s+/g, " ")
     .trim();
 }
+
+const reviewThreadsQuery = `
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          path
+          line
+          comments(first: 100) {
+            nodes {
+              body
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`;
