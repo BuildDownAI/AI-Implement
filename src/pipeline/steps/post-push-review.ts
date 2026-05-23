@@ -1,6 +1,11 @@
 import { spawnSync } from "node:child_process";
 import type { StepModule } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
+import {
+  collectExternalReviewFindingsFromGh,
+  formatReviewLedgerForPrompt,
+  type ReviewLedgerFinding,
+} from "../review-ledger.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -131,6 +136,11 @@ ${issueList}
 Summary:
 ${finding.feedback || "(none)"}`;
   }).join("\n\n");
+}
+
+function externalReviewFindingsBlock(findings: ReviewLedgerFinding[]): string {
+  if (findings.length === 0) return "";
+  return `\n\nRequired external review findings:\n${formatReviewLedgerForPrompt(findings)}`;
 }
 
 function extractFirstJsonObject(text: string): Record<string, unknown> | null {
@@ -313,6 +323,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
+      const externalFindings: ReviewLedgerFinding[] = collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
 
       const previousFindings = formatReviewHistory(reviewHistory);
       const reviewPrompt = `You are reviewing the diff for PR #${prNumber} against issue ${context.data.issueIdentifier}: ${context.data.issueTitle}.
@@ -417,6 +428,8 @@ Output ONLY valid JSON: {"approved": bool, "issues": [string], "score": int, "pr
       if (issues.length === 0 && parsed.approved === true && feedbackImpliesFixNeeded(feedback)) {
         issues.push(feedback);
       }
+      const externalBlockingFindings = externalFindings.filter((finding) => finding.severity === "blocking");
+      issues.push(...externalBlockingFindings.map((finding) => finding.body));
       if (issues.length === 0 && parsed.approved === false && !feedbackImpliesFixNeeded(feedback)) {
         approved = true;
         feedback = feedback || "Reviewer did not identify actionable blockers.";
@@ -502,6 +515,7 @@ ${issueList}
 
 Summary:
 ${feedback}
+${externalReviewFindingsBlock(externalFindings)}
 </reviewer_feedback>`;
 
       const fixResult = await context.llmExecutor.invoke({ prompt: fixPrompt, model, maxTurns: FIX_MAX_TURNS });
