@@ -11,6 +11,7 @@ interface RepoModels {
 interface AiImplementConfig {
   packageManager?: string;
   models?: RepoModels;
+  reviewProviders?: string[];
 }
 
 interface InstallInputs extends Record<string, unknown> {
@@ -22,7 +23,10 @@ interface InstallOutputs extends Record<string, unknown> {
   installMethod: string;
   durationMs: number;
   repoModels: RepoModels;
+  reviewProviders?: string[];
 }
+
+const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
 
 function parseModelsSection(raw: string): RepoModels {
   const result: RepoModels = {};
@@ -50,6 +54,34 @@ function parseModelsSection(raw: string): RepoModels {
   return result;
 }
 
+function parseReviewProvidersSection(raw: string): string[] | undefined {
+  const lines = raw.split(/\r?\n/);
+  let inReviewProviders = false;
+  const providers: string[] = [];
+  let sawReviewProviders = false;
+
+  for (const line of lines) {
+    if (/^reviewProviders:/.test(line)) {
+      inReviewProviders = true;
+      sawReviewProviders = true;
+      continue;
+    }
+    if (inReviewProviders) {
+      if (/^\S/.test(line) && line.trim() !== "") {
+        inReviewProviders = false;
+        continue;
+      }
+      const providerMatch = /^\s+-\s*(\S+)/.exec(line);
+      const provider = providerMatch?.[1];
+      if (provider && KNOWN_REVIEW_PROVIDERS.has(provider)) {
+        providers.push(provider);
+      }
+    }
+  }
+
+  return sawReviewProviders ? providers : undefined;
+}
+
 function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
   const configPath = path.join(workspaceDir, ".ai-implement", "config.yml");
   if (!fs.existsSync(configPath)) return {};
@@ -58,9 +90,11 @@ function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
     // Minimal YAML key: value parsing — avoids pulling in a yaml dep
     const pkgMatch = /^packageManager:\s*(\S+)/m.exec(raw);
     const models = parseModelsSection(raw);
+    const reviewProviders = parseReviewProvidersSection(raw);
     const config: AiImplementConfig = {};
     if (pkgMatch) config.packageManager = pkgMatch[1];
     if (models.implement || models.review) config.models = models;
+    if (reviewProviders !== undefined) config.reviewProviders = reviewProviders;
     return config;
   } catch {
     return {};
@@ -99,6 +133,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         installMethod: "skipped: no package.json",
         durationMs: 0,
         repoModels: config.models ?? {},
+        reviewProviders: config.reviewProviders,
       };
     }
 
@@ -121,6 +156,12 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     });
     const durationMs = Date.now() - start;
 
-    return { packageManager, installMethod, durationMs, repoModels: config.models ?? {} };
+    return {
+      packageManager,
+      installMethod,
+      durationMs,
+      repoModels: config.models ?? {},
+      reviewProviders: config.reviewProviders,
+    };
   },
 };

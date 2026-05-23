@@ -269,12 +269,14 @@ describe("loadPipelineDefinition", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("install", { reviewProviders: ["github-claude-code-review"] });
     ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
 
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
     const inputs = ctx.resolveInputs(step.inputs);
     expect(inputs.workspaceDir).toBe("/tmp/repo");
     expect(inputs.prNumber).toBe("42");
+    expect(inputs.reviewProviders).toEqual(["github-claude-code-review"]);
   });
 
   it("applies post-push-review skip condition based on push output", () => {

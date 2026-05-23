@@ -12,6 +12,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   workspaceDir: string;
   model?: string;
   maxIterations?: number;
+  reviewProviders?: string[];
   ghSpawn?: (args: string[]) => SpawnResult;
   gitSpawn?: (args: string[]) => SpawnResult;
 }
@@ -36,6 +37,7 @@ const FEEDBACK_INJECTION_PREAMBLE =
 const REVIEW_MAX_TURNS = 12;
 const FIX_MAX_TURNS = 45;
 const DEFAULT_MAX_ITERATIONS = 3;
+const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
 
 interface ReviewFinding {
   iteration: number;
@@ -245,6 +247,10 @@ function externalBlockingCommentBlock(hasExternalBlockers: boolean): string {
   return hasExternalBlockers ? "\n\nExternal review findings are blocking this PR." : "";
 }
 
+function shouldCollectExternalReviewFindings(reviewProviders: string[] | undefined): boolean {
+  return reviewProviders === undefined || reviewProviders.includes(GITHUB_CLAUDE_CODE_REVIEW_PROVIDER);
+}
+
 function parseFixSummary(stdout: string): FixSummary | null {
   const parsed = extractFirstJsonObject(stdout);
   if (!parsed) return null;
@@ -361,7 +367,9 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
-      const externalFindings: ReviewLedgerFinding[] = collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
+      const externalFindings: ReviewLedgerFinding[] = shouldCollectExternalReviewFindings(inputs.reviewProviders)
+        ? collectExternalReviewFindingsFromGh(ghSpawn, prNumber)
+        : [];
       const hasExternalBlockers = externalFindings.some((finding) => finding.severity === "blocking");
 
       const previousFindings = formatReviewHistory(reviewHistory);

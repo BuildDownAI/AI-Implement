@@ -154,6 +154,36 @@ describe("installStep", () => {
     expect(outputs.packageManager).toBe("npm");
   });
 
+  it("parses known reviewProviders from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders:\n  - github-claude-code-review\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual(["github-claude-code-review"]);
+  });
+
+  it("ignores unknown reviewProviders from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders:\n  - unsupported-reviewer\n  - github-claude-code-review\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual(["github-claude-code-review"]);
+  });
+
   it("returns empty repoModels when config.yml has no models section", async () => {
     mockRootPackageJson();
 
