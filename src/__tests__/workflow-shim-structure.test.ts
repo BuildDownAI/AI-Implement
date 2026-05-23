@@ -143,6 +143,14 @@ describe("GHA workflow shims", () => {
   });
 
   for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} does not call Linear directly from the workflow`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/api\.linear\.app\/graphql/);
+      expect(yaml).not.toMatch(/LINEAR_API_KEY/);
+      expect(yaml).not.toMatch(/Update Linear labels/);
+      expect(yaml).toMatch(/runner\/result/);
+    });
+
     it(`${f} does not allow Claude to curl Linear directly`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).not.toMatch(/Bash\(curl\*api\.linear\.app\/graphql\*\)/);
