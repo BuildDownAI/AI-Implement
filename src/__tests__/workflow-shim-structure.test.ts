@@ -15,6 +15,7 @@ const PLANNING_WORKFLOWS = [
   ".github/workflows/claude-plan.yml",
 ];
 const FILES = [...IMPLEMENT_WORKFLOWS, ...COMMENT_TRIGGER_WORKFLOWS];
+const SYNCED_WORKFLOW_FILES = [...IMPLEMENT_WORKFLOWS, ...COMMENT_TRIGGER_WORKFLOWS, ...PLANNING_WORKFLOWS];
 
 describe("GHA workflow shims", () => {
   it("ships workflow templates in the orchestrator image for admin-triggered syncs", () => {
@@ -38,6 +39,17 @@ describe("GHA workflow shims", () => {
       readFileSync("workflows/claude-plan.yml", "utf-8"),
     );
   });
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} pins external actions to full commit SHAs`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const actionRefs = [...yaml.matchAll(/^\s*uses:\s*([^\s#]+@[^\s#]+)/gm)].map((m) => m[1]);
+      expect(actionRefs.length).toBeGreaterThan(0);
+      for (const ref of actionRefs) {
+        expect(ref).toMatch(/@[0-9a-f]{40}$/);
+      }
+    });
+  }
 
   for (const f of FILES) {
     it(`${f} uses a resolved runner image for its container job`, () => {
