@@ -5,6 +5,9 @@ interface DispatchInputs {
   issue_identifier: string;
   issue_title: string;
   issue_description: string;
+  parent?: string;
+  siblings?: string;
+  dependencies?: string;
   /** When set, the workflow checks out the existing PR branch (gap-fill run). */
   pr_number?: string;
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */

@@ -37,6 +37,21 @@ on:
         description: "Ticketing-system issue description"
         required: true
         type: string
+      parent:
+        description: "Related parent issue summary for planning context"
+        required: false
+        type: string
+        default: "None"
+      siblings:
+        description: "Related sibling issues summary for planning context"
+        required: false
+        type: string
+        default: "None"
+      dependencies:
+        description: "Related dependency issues summary for planning context"
+        required: false
+        type: string
+        default: "None"
       provider:
         description: "Claude provider: 'anthropic' (default) or 'bedrock'"
         required: false
@@ -85,9 +100,9 @@ jobs:
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PROVIDER: ${{ inputs.provider }}
-          PARENT: None
-          SIBLINGS: None
-          DEPENDENCIES: None
+          PARENT: ${{ inputs.parent }}
+          SIBLINGS: ${{ inputs.siblings }}
+          DEPENDENCIES: ${{ inputs.dependencies }}
         run: |
           FRONTMATTER=""
 
