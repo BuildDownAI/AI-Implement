@@ -184,6 +184,80 @@ describe("installStep", () => {
     expect(outputs.reviewProviders).toEqual(["github-claude-code-review"]);
   });
 
+  it("parses quoted reviewProviders with trailing comments from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders:\n  - \"github-claude-code-review\" # enabled by repo config\n  - 'github-claude-code-review'\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual([
+      "github-claude-code-review",
+      "github-claude-code-review",
+    ]);
+  });
+
+  it("parses inline reviewProviders arrays from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders: [\"github-claude-code-review\"]\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual(["github-claude-code-review"]);
+  });
+
+  it("preserves explicit empty reviewProviders arrays from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue("reviewProviders: []\n");
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual([]);
+  });
+
+  it("treats unknown-only reviewProviders as absent", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders:\n  - unsupported-reviewer\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toBeUndefined();
+  });
+
+  it("treats malformed reviewProviders config as absent", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue("reviewProviders: github-claude-code-review\n");
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toBeUndefined();
+  });
+
   it("returns empty repoModels when config.yml has no models section", async () => {
     mockRootPackageJson();
 

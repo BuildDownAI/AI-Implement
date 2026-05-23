@@ -28,6 +28,56 @@ interface InstallOutputs extends Record<string, unknown> {
 
 const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
 
+function stripYamlComment(value: string): string {
+  let quote: "'" | "\"" | null = null;
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+    if ((char === "'" || char === "\"") && quote === null) {
+      quote = char;
+    } else if (char === quote) {
+      quote = null;
+    } else if (char === "#" && quote === null) {
+      return value.slice(0, i).trim();
+    }
+  }
+  return value.trim();
+}
+
+function normalizeYamlScalar(value: string): string | undefined {
+  const trimmed = stripYamlComment(value);
+  if (!trimmed) return undefined;
+  const quote = trimmed[0];
+  if ((quote === "'" || quote === "\"") && trimmed.endsWith(quote)) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function splitInlineYamlArrayItems(value: string): string[] | null {
+  const trimmed = stripYamlComment(value);
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return null;
+  const inner = trimmed.slice(1, -1).trim();
+  if (!inner) return [];
+
+  const items: string[] = [];
+  let quote: "'" | "\"" | null = null;
+  let start = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const char = inner[i];
+    if ((char === "'" || char === "\"") && quote === null) {
+      quote = char;
+    } else if (char === quote) {
+      quote = null;
+    } else if (char === "," && quote === null) {
+      items.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (quote !== null) return null;
+  items.push(inner.slice(start));
+  return items;
+}
+
 function parseModelsSection(raw: string): RepoModels {
   const result: RepoModels = {};
   const lines = raw.split(/\r?\n/);
@@ -59,9 +109,23 @@ function parseReviewProvidersSection(raw: string): string[] | undefined {
   let inReviewProviders = false;
   const providers: string[] = [];
   let sawReviewProviders = false;
+  let sawListItem = false;
 
   for (const line of lines) {
-    if (/^reviewProviders:/.test(line)) {
+    const topLevelMatch = /^reviewProviders:\s*(.*)$/.exec(line);
+    if (topLevelMatch) {
+      const inlineValue = stripYamlComment(topLevelMatch[1] ?? "");
+      if (inlineValue) {
+        const inlineItems = splitInlineYamlArrayItems(inlineValue);
+        if (inlineItems === null) return undefined;
+        if (inlineItems.length === 0) return [];
+        const knownProviders = inlineItems
+          .map((item) => normalizeYamlScalar(item))
+          .filter((provider): provider is string =>
+            provider !== undefined && KNOWN_REVIEW_PROVIDERS.has(provider),
+          );
+        return knownProviders.length > 0 ? knownProviders : undefined;
+      }
       inReviewProviders = true;
       sawReviewProviders = true;
       continue;
@@ -71,15 +135,17 @@ function parseReviewProvidersSection(raw: string): string[] | undefined {
         inReviewProviders = false;
         continue;
       }
-      const providerMatch = /^\s+-\s*(\S+)/.exec(line);
-      const provider = providerMatch?.[1];
+      const providerMatch = /^\s+-\s*(.+?)\s*$/.exec(line);
+      if (providerMatch) sawListItem = true;
+      const provider = providerMatch ? normalizeYamlScalar(providerMatch[1]) : undefined;
       if (provider && KNOWN_REVIEW_PROVIDERS.has(provider)) {
         providers.push(provider);
       }
     }
   }
 
-  return sawReviewProviders ? providers : undefined;
+  if (!sawReviewProviders || !sawListItem) return undefined;
+  return providers.length > 0 ? providers : undefined;
 }
 
 function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
