@@ -285,6 +285,59 @@ describe("postPushReviewStep", () => {
     ]);
   });
 
+  it("collects external findings when github-claude-code-review is configured", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Configured provider blocker.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 2,
+        ghSpawn,
+        gitSpawn,
+        reviewProviders: ["github-claude-code-review"],
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(ghSpawn).toHaveBeenCalledWith([
+      "api",
+      "--paginate",
+      "--slurp",
+      "repos/:owner/:repo/pulls/42/reviews?per_page=100",
+    ]);
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Required external review findings");
+    expect(fixPrompt).toContain("Configured provider blocker.");
+  });
+
   it("deduplicates internal issues that repeat external review findings", async () => {
     const reviewerJson = JSON.stringify({
       approved: false,
