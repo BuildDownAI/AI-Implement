@@ -34,6 +34,50 @@ describe("extractClaudeSummaryFindings", () => {
       },
     ]);
   });
+
+  it("extracts ordered bullets from blocking issues sections", () => {
+    const body = `
+## Blocking issues
+1. Missing UUID validation
+2) Fix confidence validation
+`;
+
+    expect(extractClaudeSummaryFindings(body)).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Missing UUID validation",
+      },
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Fix confidence validation",
+      },
+    ]);
+  });
+
+  it("folds indented continuation lines into the previous blocking bullet", () => {
+    const body = `
+## Blocking
+- Fix auth
+  because missing validation returns 500
+- Fix status
+  because it reports success too early
+`;
+
+    expect(extractClaudeSummaryFindings(body)).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Fix auth because missing validation returns 500",
+      },
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Fix status because it reports success too early",
+      },
+    ]);
+  });
 });
 
 describe("formatReviewLedgerForPrompt", () => {

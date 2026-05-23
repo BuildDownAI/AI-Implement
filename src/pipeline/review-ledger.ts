@@ -16,33 +16,52 @@ export interface ReviewLedgerFinding {
 }
 
 export function extractClaudeSummaryFindings(body: string, url?: string): ReviewLedgerFinding[] {
-  const findings: ReviewLedgerFinding[] = [];
+  const items: string[] = [];
   let inBlockingSection = false;
+  let currentItem: string | undefined;
+
+  const flushCurrentItem = () => {
+    if (!currentItem) return;
+
+    const normalizedBody = normalizeText(currentItem);
+    if (normalizedBody) {
+      items.push(normalizedBody);
+    }
+
+    currentItem = undefined;
+  };
 
   for (const line of body.split(/\r?\n/)) {
     const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
     if (heading) {
+      flushCurrentItem();
       inBlockingSection = /^blocking\b/i.test(normalizeText(heading[1]));
       continue;
     }
 
     if (!inBlockingSection) continue;
 
-    const bullet = line.match(/^\s*[-*+]\s+(.+)$/);
-    if (!bullet) continue;
+    const bullet = line.match(/^\s*(?:[-*+]|\d+[\.)])\s+(.+)$/);
+    if (bullet) {
+      flushCurrentItem();
+      currentItem = bullet[1];
+      continue;
+    }
 
-    const normalizedBody = normalizeText(bullet[1]);
-    if (!normalizedBody) continue;
-
-    findings.push({
-      source: "claude-review-summary",
-      severity: "blocking",
-      body: normalizedBody,
-      ...(url ? { url } : {}),
-    });
+    const continuation = line.match(/^\s{2,}(\S.*)$/);
+    if (continuation && currentItem) {
+      currentItem = `${currentItem} ${continuation[1]}`;
+    }
   }
 
-  return findings;
+  flushCurrentItem();
+
+  return items.map((item) => ({
+    source: "claude-review-summary",
+    severity: "blocking",
+    body: item,
+    ...(url ? { url } : {}),
+  }));
 }
 
 export function formatReviewLedgerForPrompt(findings: ReviewLedgerFinding[]): string {
