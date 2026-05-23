@@ -143,6 +143,17 @@ function externalReviewFindingsBlock(findings: ReviewLedgerFinding[]): string {
   return `\n\nRequired external review findings:\n${formatReviewLedgerForPrompt(findings)}`;
 }
 
+function externalReviewFindingsCommentBlock(findings: ReviewLedgerFinding[]): string {
+  if (findings.length === 0) return "";
+  const issues = findings.map((finding) => {
+    const location = finding.path
+      ? `${finding.path}${typeof finding.line === "number" ? `:${finding.line}` : ""}: `
+      : "";
+    return `${location}${finding.body}`;
+  });
+  return `\n\nUnresolved external review findings:\n${formatIssueList(issues, { compact: true })}`;
+}
+
 function extractFirstJsonObject(text: string): Record<string, unknown> | null {
   let depth = 0;
   let start = -1;
@@ -572,7 +583,7 @@ ${externalReviewFindingsBlock(externalFindings)}
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Fix pass ${fixPassLabel(iteration, maxIterations)} completed with no file changes; stopping the post-push review loop.${externalReviewFindingsCommentBlock(externalFindings)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
