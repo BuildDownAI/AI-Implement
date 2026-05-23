@@ -80,7 +80,7 @@ Proposed (agentica path):
                        → feedback-loop reports + advances pipeline
 ```
 
-The agentica-agent code lives in its own directory (`src-agentica-agent/` or similar), compiles with `tspc` to its own `dist/` (so the transformer doesn't touch the rest of AI-Implement). The orchestrator's main TS compile stays on plain `tsc` — zero risk to existing tests/builds.
+The agentica-agent code lives in its own directory (`agentica-agent/` or similar), compiles with `tspc` to its own `dist/` (so the transformer doesn't touch the rest of AI-Implement). The orchestrator's main TS compile stays on plain `tsc` — zero risk to existing tests/builds.
 
 ### Why subprocess (not in-process import)
 
@@ -97,7 +97,7 @@ The agentica-agent code lives in its own directory (`src-agentica-agent/` or sim
 Port Claude Code's primary tools to JS functions passed in `scope`:
 
 ```typescript
-// src-agentica-agent/tools.ts
+// agentica-agent/tools.ts
 import { readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { glob } from "glob";
@@ -154,7 +154,7 @@ export function fileExists(path: string): boolean {
 `WORKFLOW.md` already supports `${ISSUE_DESCRIPTION}` etc. substitution; the existing renderer is reused unchanged. The rendered output becomes the agentica `premise:`:
 
 ```typescript
-// src-agentica-agent/main.ts (sketch)
+// agentica-agent/main.ts (sketch)
 import { spawn } from "@symbolica/agentica";
 import { readFile, writeFile, editFile, bash, globFiles, fileExists } from "./tools.js";
 
@@ -221,13 +221,14 @@ return await runClaudeCodeSubprocess({ workspaceDir, renderedPrompt, env });
 ```
 AI-Implement/
 ├── src/                       # main orchestrator, compiled with tsc (unchanged)
-├── src-agentica-agent/        # agentica subprocess code (new)
+├── agentica-agent/            # agentica subprocess code (own package)
 │   ├── main.ts
 │   ├── tools.ts
-│   ├── package.json           # only @symbolica/agentica + ts-patch
-│   └── tsconfig.json          # transformer plugin
-├── dist/                      # orchestrator output (tsc)
-└── dist-agentica-agent/       # subprocess output (tspc)
+│   ├── package.json           # @symbolica/agentica + ts-patch
+│   ├── tsconfig.json          # transformer plugin; outDir = ./dist
+│   ├── node_modules/          # gitignored — own deps to resolve @symbolica/agentica
+│   └── dist/                  # gitignored — tspc output
+└── dist/                      # gitignored — orchestrator tsc output
 ```
 
 Build scripts in root `package.json`:
@@ -236,20 +237,22 @@ Build scripts in root `package.json`:
 {
   "scripts": {
     "build": "tsc && npm run build:agentica-agent",
-    "build:agentica-agent": "cd src-agentica-agent && npx ts-patch install -s && npx tspc",
-    "typecheck": "tsc --noEmit"
+    "build:agentica-agent": "cd agentica-agent && npm install --silent && npm run build",
+    "smoke:agentica-agent": "cd agentica-agent && npm run smoke"
   }
 }
 ```
 
-`Dockerfile.session` copies both dist directories. Runner-image size impact: small (`@symbolica/agentica` is ~5 MB unpacked; no extra Python needed since we're not using the Python framework here).
+Why `agentica-agent/dist/` (inside the package) and not a sibling `dist-agentica-agent/`: when `main.js` is executed by `node`, Node.js resolves `@symbolica/agentica` by walking up from the script's directory looking for `node_modules`. A sibling dist directory wouldn't see `agentica-agent/node_modules`. Self-contained avoids the resolver issue entirely.
+
+`Dockerfile.session` copies the whole `agentica-agent/` directory (including its `node_modules` and `dist`). Runner-image size impact: small (~50 MB for @symbolica/agentica + its transitive deps).
 
 ## Phased implementation plan
 
 | Phase | Scope | Acceptance |
 |---|---|---|
 | **0. Deeper POC** | Spike a realistic agent task: clone a repo, give agentica all tools, ask it to implement a small Linear-issue-shaped task end-to-end. Iterative tool use, real test runs. | Agent successfully edits multi-file change + passes a test. Document any framework limits found. |
-| **1. Subprocess skeleton** | `src-agentica-agent/` builds, main.ts spawns hosted agent with stub tools, reads env-passed prompt, exits with status code. | `npm run build:agentica-agent` produces `dist-agentica-agent/main.js` that runs end-to-end against a hard-coded prompt. |
+| **1. Subprocess skeleton** ✅ | `agentica-agent/` builds, main.ts spawns hosted agent with the full tool surface, reads env-passed prompt, exits with status code. | `npm run build:agentica-agent` produces `agentica-agent/dist/main.js`; `npm run smoke:agentica-agent` runs end-to-end with a hard-coded prompt. **Done 2026-05-23.** |
 | **2. Tool surface** | Implement all tools from §"Tool surface". Unit tests for each. | Tests pass; tools mirror Claude Code's behaviour on simple file/shell operations. |
 | **3. Pipeline integration** | `feedback-loop.ts` branches on `mapping.agent`. Subprocess invocation matches Claude Code's invocation pattern (env-var contract, exit codes, stdout streaming). | E2E test: a Linear issue with `agent=agentica` mapping runs through the pipeline, opens a PR. Same Linear issue with `agent=claude-code` opens an equivalent PR. |
 | **4. Admin UI + schema** | DB migration adds `agent` column; admin UI drawer exposes the dropdown. | New project mappings default to `claude-code`; agentica selectable via UI. |
