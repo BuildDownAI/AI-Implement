@@ -177,7 +177,8 @@ describe("collectExternalReviewFindingsFromGh", () => {
         url: "https://example.com/review-2",
       },
     ]);
-    expect(calls[0]).toEqual(["api", "repos/:owner/:repo/pulls/42/reviews"]);
+    expect(calls[0]).toContain("--paginate");
+    expect(calls[0]).toContain("repos/:owner/:repo/pulls/42/reviews?per_page=100");
     expect(calls[1]?.slice(0, 2)).toEqual(["api", "graphql"]);
   });
 
@@ -219,7 +220,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
     const ghSpawn: GhSpawn = (args) => {
       calls.push(args);
 
-      if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42/reviews") {
+      if (isPullReviewsRequest(args)) {
         return { exitCode: 0, stdout: "[]" };
       }
 
@@ -287,7 +288,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
 
   it("ignores unresolved review threads that GitHub marks as outdated", () => {
     const ghSpawn: GhSpawn = (args) => {
-      if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42/reviews") {
+      if (isPullReviewsRequest(args)) {
         return { exitCode: 0, stdout: "[]" };
       }
 
@@ -325,9 +326,88 @@ describe("collectExternalReviewFindingsFromGh", () => {
     expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
   });
 
+  it("collects unresolved review threads from later GraphQL pages", () => {
+    const calls: string[][] = [];
+    const ghSpawn: GhSpawn = (args) => {
+      calls.push(args);
+
+      if (isPullReviewsRequest(args)) {
+        return { exitCode: 0, stdout: "[]" };
+      }
+
+      if (args.includes("after=cursor-1")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            data: {
+              repository: {
+                pullRequest: {
+                  reviewThreads: {
+                    nodes: [
+                      {
+                        isResolved: false,
+                        isOutdated: false,
+                        path: "src/later.ts",
+                        line: 88,
+                        comments: {
+                          nodes: [
+                            {
+                              body: "Later page unresolved finding.",
+                              url: "https://example.com/later-thread",
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                    pageInfo: {
+                      hasNextPage: false,
+                      endCursor: null,
+                    },
+                  },
+                },
+              },
+            },
+          }),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [],
+                  pageInfo: {
+                    hasNextPage: true,
+                    endCursor: "cursor-1",
+                  },
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
+      {
+        source: "github-review-thread",
+        severity: "blocking",
+        path: "src/later.ts",
+        line: 88,
+        body: "Later page unresolved finding.",
+        url: "https://example.com/later-thread",
+      },
+    ]);
+    expect(calls.filter((call) => call[0] === "api" && call[1] === "graphql")).toHaveLength(2);
+    expect(calls[2]).toContain("after=cursor-1");
+  });
+
   it("does not throw when GraphQL returns malformed JSON", () => {
     const ghSpawn: GhSpawn = (args) => {
-      if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42/reviews") {
+      if (isPullReviewsRequest(args)) {
         return {
           exitCode: 0,
           stdout: JSON.stringify([
@@ -355,3 +435,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
     ]);
   });
 });
+
+function isPullReviewsRequest(args: string[]): boolean {
+  return args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100");
+}

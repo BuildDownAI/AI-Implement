@@ -103,11 +103,15 @@ function formatLocation(finding: ReviewLedgerFinding): string | undefined {
 }
 
 function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
-  const result = safeGhSpawn(ghSpawn, ["api", `repos/:owner/:repo/pulls/${prNumber}/reviews`]);
+  const result = safeGhSpawn(ghSpawn, [
+    "api",
+    "--paginate",
+    "--slurp",
+    `repos/:owner/:repo/pulls/${prNumber}/reviews?per_page=100`,
+  ]);
   if (!result || result.exitCode !== 0) return;
 
-  const reviews = parseJson(result.stdout);
-  if (!Array.isArray(reviews)) return;
+  const reviews = parseReviewPages(result.stdout);
 
   const latestActionableReviewsByReviewer = new Map<string, Record<string, unknown>>();
 
@@ -132,7 +136,27 @@ function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, find
 }
 
 function collectUnresolvedReviewThreads(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
-  const result = safeGhSpawn(ghSpawn, [
+  let after: string | undefined;
+
+  for (;;) {
+    const result = safeGhSpawn(ghSpawn, buildReviewThreadsArgs(prNumber, after));
+    if (!result || result.exitCode !== 0) return;
+
+    const payload = parseJson(result.stdout);
+    const reviewThreads = getReviewThreadsConnection(payload);
+    if (!reviewThreads) return;
+
+    collectReviewThreadFindings(reviewThreads.nodes, findings);
+
+    if (reviewThreads.pageInfo?.hasNextPage !== true) return;
+    if (typeof reviewThreads.pageInfo.endCursor !== "string" || !reviewThreads.pageInfo.endCursor) return;
+
+    after = reviewThreads.pageInfo.endCursor;
+  }
+}
+
+function buildReviewThreadsArgs(prNumber: string, after?: string): string[] {
+  const args = [
     "api",
     "graphql",
     "-F",
@@ -143,13 +167,16 @@ function collectUnresolvedReviewThreads(ghSpawn: GhSpawn, prNumber: string, find
     `number=${prNumber}`,
     "-f",
     `query=${reviewThreadsQuery}`,
-  ]);
-  if (!result || result.exitCode !== 0) return;
+  ];
 
-  const payload = parseJson(result.stdout);
-  const nodes = getReviewThreadNodes(payload);
-  if (!nodes) return;
+  if (after) {
+    args.push("-F", `after=${after}`);
+  }
 
+  return args;
+}
+
+function collectReviewThreadFindings(nodes: unknown[], findings: ReviewLedgerFinding[]): void {
   for (const thread of nodes) {
     if (!isRecord(thread) || thread.isResolved !== false || thread.isOutdated === true) continue;
 
@@ -187,7 +214,14 @@ function parseJson(value: string): unknown {
   }
 }
 
-function getReviewThreadNodes(payload: unknown): unknown[] | undefined {
+function parseReviewPages(stdout: string): unknown[] {
+  const payload = parseJson(stdout);
+  if (!Array.isArray(payload)) return [];
+  if (payload.every(Array.isArray)) return payload.flat();
+  return payload;
+}
+
+function getReviewThreadsConnection(payload: unknown): { nodes: unknown[]; pageInfo?: Record<string, unknown> } | undefined {
   if (!isRecord(payload)) return undefined;
   const data = payload.data;
   if (!isRecord(data)) return undefined;
@@ -197,7 +231,11 @@ function getReviewThreadNodes(payload: unknown): unknown[] | undefined {
   if (!isRecord(pullRequest)) return undefined;
   const reviewThreads = pullRequest.reviewThreads;
   if (!isRecord(reviewThreads)) return undefined;
-  return Array.isArray(reviewThreads.nodes) ? reviewThreads.nodes : undefined;
+  if (!Array.isArray(reviewThreads.nodes)) return undefined;
+  return {
+    nodes: reviewThreads.nodes,
+    ...(isRecord(reviewThreads.pageInfo) ? { pageInfo: reviewThreads.pageInfo } : {}),
+  };
 }
 
 function getCommentNodes(thread: Record<string, unknown>): unknown[] | undefined {
@@ -232,10 +270,10 @@ function normalizeText(value: string): string {
 }
 
 const reviewThreadsQuery = `
-query($owner: String!, $repo: String!, $number: Int!) {
+query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $after) {
         nodes {
           isResolved
           isOutdated
@@ -247,6 +285,10 @@ query($owner: String!, $repo: String!, $number: Int!) {
               url
             }
           }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
