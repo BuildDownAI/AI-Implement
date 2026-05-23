@@ -34,6 +34,33 @@ Three reasons we'd want this option:
 
 These all want a deeper POC before integration locks in.
 
+## Phase-0 follow-up POC (2026-05-23) — open questions resolved
+
+Two additional spikes in `agentica-spike-2/`:
+
+**Spike 2A — implement-from-scratch (`spike.ts`).** Asked the agent to write `calc.js` + tests for add/subtract/multiply/divide and iterate until tests pass. Result: **4 tool calls, 16 s, all 12 tests pass first try.** Agent self-corrected once when it mistakenly wrote `await bash(...)` (bash is synchronous) — switched to the correct sync call on the next turn.
+
+**Spike 2B — fix-from-failure (`spike-fix.ts`).** Pre-planted a buggy `subtract(a,b) { return a + b }`, gave the agent the existing test file, and asked it to diagnose and fix without modifying the tests. Result: **8 tool calls, 16 s, tests pass.** Critical: the agent's first `editFile` hit the wrong occurrence (matched `return a + b;` in `add` instead of `subtract`), tests then failed for *both* functions, the agent recognized the over-eager edit, reverted `add`, then targeted `subtract` precisely using the planted bug-comment as a uniqueness anchor. **It debugged its own mistake.**
+
+### What this resolved
+
+| Open question | Phase-0 verdict |
+|---|---|
+| Multi-turn iterative tool use? | **Yes.** Spike 2B ran 8 turns with read → edit → test → read → multi-edit → test pattern. |
+| Tool-error recovery? | **Yes.** Spike 2B: test failure → diagnosis → wrong edit → test re-failure → re-diagnosis → correct edit → pass. Agent did not crash, did not give up. |
+| Streaming format? | **Workable.** Agent emits Python-style code blocks; our `listener:` callback receives chunks in real time. Reporter parsing is a fenced-code-block pattern, not arbitrary text. |
+| `editFile` uniqueness model? | **Same as Claude Code's `Edit` tool.** First-match replacement; if the `oldString` isn't unique, the agent must add surrounding context (or use unique anchors like comments). Phase-2B agent learned this on its own. |
+
+### Still unanswered (deferred to phase-1 implementation work)
+
+- **Long premise.** Spike premises were ~15 lines; real `WORKFLOW.md` is 200+. No reason to expect breakage but not verified.
+- **Token cost.** No usage telemetry plumbed. Both 16-second runs are likely cheap (~10–20k tokens each), but a sustained 30-minute implementation session is the real concern.
+- **Process-level signals.** Subprocess exit codes, stdout/stderr separation, OOM/timeout handling — these are subprocess-architecture concerns, not framework concerns. Tackled in phase 1.
+
+### Revised recommendation
+
+Phase 0 is **done**. Proceed to phase 1 (subprocess skeleton) with confidence. The remaining unknowns are integration-level, not framework-level, and resolving them requires building the subprocess anyway.
+
 ## Architecture: agentica as a subprocess
 
 ```
