@@ -27,9 +27,10 @@ export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: 
   const findings: ReviewLedgerFinding[] = [];
 
   collectChangesRequestedReviews(ghSpawn, prNumber, findings);
+  collectClaudeIssueComments(ghSpawn, prNumber, findings);
   collectUnresolvedReviewThreads(ghSpawn, prNumber, findings);
 
-  return findings;
+  return dedupeReviewFindings(findings);
 }
 
 export function extractClaudeSummaryFindings(body: string, url?: string): ReviewLedgerFinding[] {
@@ -135,6 +136,29 @@ function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, find
   }
 }
 
+function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
+  const result = safeGhSpawn(ghSpawn, [
+    "api",
+    "--paginate",
+    "--slurp",
+    `repos/:owner/:repo/issues/${prNumber}/comments?per_page=100`,
+  ]);
+  if (!result || result.exitCode !== 0) return;
+
+  const comments = parseReviewPages(result.stdout);
+
+  for (const comment of comments) {
+    if (!isRecord(comment) || !isLikelyClaudeReviewComment(comment)) continue;
+
+    findings.push(
+      ...extractClaudeSummaryFindings(
+        comment.body,
+        typeof comment.html_url === "string" ? comment.html_url : undefined,
+      ),
+    );
+  }
+}
+
 function collectUnresolvedReviewThreads(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
   let after: string | undefined;
 
@@ -153,6 +177,30 @@ function collectUnresolvedReviewThreads(ghSpawn: GhSpawn, prNumber: string, find
 
     after = reviewThreads.pageInfo.endCursor;
   }
+}
+
+function dedupeReviewFindings(findings: ReviewLedgerFinding[]): ReviewLedgerFinding[] {
+  const deduped: ReviewLedgerFinding[] = [];
+  const indexByNormalizedBody = new Map<string, number>();
+
+  for (const finding of findings) {
+    const key = normalizeText(finding.body).toLowerCase();
+    if (!key) continue;
+
+    const existingIndex = indexByNormalizedBody.get(key);
+    if (existingIndex === undefined) {
+      indexByNormalizedBody.set(key, deduped.length);
+      deduped.push(finding);
+      continue;
+    }
+
+    const existing = deduped[existingIndex];
+    if (!hasLineLocation(existing) && hasLineLocation(finding)) {
+      deduped[existingIndex] = finding;
+    }
+  }
+
+  return deduped;
 }
 
 function buildReviewThreadsArgs(prNumber: string, after?: string): string[] {
@@ -244,6 +292,30 @@ function getCommentNodes(thread: Record<string, unknown>): unknown[] | undefined
   return Array.isArray(comments.nodes) ? comments.nodes : undefined;
 }
 
+function isLikelyClaudeReviewComment(comment: Record<string, unknown>): comment is Record<string, unknown> & { body: string } {
+  if (typeof comment.body !== "string" || isAiImplementComment(comment.body)) return false;
+  return isClaudeAuthor(comment) || hasClaudeReviewHeading(comment.body);
+}
+
+function isAiImplementComment(body: string): boolean {
+  return body.includes("<!-- ai-implement");
+}
+
+function isClaudeAuthor(comment: Record<string, unknown>): boolean {
+  const user = comment.user;
+  if (!isRecord(user) || typeof user.login !== "string") return false;
+  return user.login.toLowerCase().includes("claude");
+}
+
+function hasClaudeReviewHeading(body: string): boolean {
+  return /(?:^|\n)\s{0,3}#{1,6}\s+(?:Code Review|Follow-up Review|Code Review Complete|Changes Requested)\b/i.test(body)
+    || /(?:^|\n)\s*Changes Requested\b/i.test(body);
+}
+
+function hasLineLocation(finding: ReviewLedgerFinding): boolean {
+  return typeof finding.path === "string" && typeof finding.line === "number";
+}
+
 function isActionableReviewState(value: unknown): value is "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED" {
   return value === "APPROVED" || value === "CHANGES_REQUESTED" || value === "DISMISSED";
 }
@@ -279,7 +351,7 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           isOutdated
           path
           line
-          comments(first: 100) {
+          comments(last: 1) {
             nodes {
               body
               url

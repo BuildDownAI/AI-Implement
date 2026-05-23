@@ -204,6 +204,65 @@ describe("postPushReviewStep", () => {
     expect(reviewComment).not.toContain("Missing UUID validation on path params.");
   });
 
+  it("runs a fix pass when a Claude issue comment has blocking findings and internal review approves", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            {
+              user: { login: "claude" },
+              body: "### Code Review\n\n## Blocking\n- Validate path params before database access.",
+              html_url: "https://example.com/claude-comment",
+            },
+          ]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Required external review findings");
+    expect(fixPrompt).toContain("Validate path params before database access.");
+    expect(ghSpawn).toHaveBeenCalledWith([
+      "api",
+      "--paginate",
+      "--slurp",
+      "repos/:owner/:repo/issues/42/comments?per_page=100",
+    ]);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("External review findings are blocking this PR.");
+  });
+
   it("preserves opportunistic external collection when reviewProviders is undefined", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,

@@ -179,7 +179,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
     ]);
     expect(calls[0]).toContain("--paginate");
     expect(calls[0]).toContain("repos/:owner/:repo/pulls/42/reviews?per_page=100");
-    expect(calls[1]?.slice(0, 2)).toEqual(["api", "graphql"]);
+    expect(calls.some((call) => call[0] === "api" && call[1] === "graphql")).toBe(true);
   });
 
   it("ignores stale changes-requested reviews when the same reviewer later approves", () => {
@@ -283,7 +283,131 @@ describe("collectExternalReviewFindingsFromGh", () => {
         url: "https://example.com/thread-latest",
       },
     ]);
-    expect(calls[1]?.slice(0, 2)).toEqual(["api", "graphql"]);
+    const graphqlCall = calls.find((call) => call[0] === "api" && call[1] === "graphql");
+    expect(graphqlCall?.slice(0, 2)).toEqual(["api", "graphql"]);
+    const queryArg = graphqlCall?.find((arg) => arg.startsWith("query="));
+    expect(queryArg).toContain("comments(last: 1)");
+    expect(queryArg).not.toContain("comments(first: 100)");
+  });
+
+  it("collects blocking bullets from likely Claude issue comments", () => {
+    const calls: string[][] = [];
+    const ghSpawn: GhSpawn = (args) => {
+      calls.push(args);
+
+      if (isPullReviewsRequest(args)) {
+        return { exitCode: 0, stdout: "[]" };
+      }
+
+      if (isIssueCommentsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            [
+              {
+                user: { login: "random-user" },
+                body: "Maybe check this before merge.",
+                html_url: "https://example.com/random",
+              },
+              {
+                user: { login: "ai-implement" },
+                body: "<!-- ai-implement post-push iter=1 review-feedback -->\n### Code Review\n\n## Blocking\n- Ignore our own marker comment.",
+                html_url: "https://example.com/self",
+              },
+              {
+                user: { login: "claude" },
+                body: "### Code Review\n\n## Blocking\n- Validate path params before database access.\n\n## Medium\n- Optional cleanup.",
+                html_url: "https://example.com/claude",
+              },
+            ],
+          ]),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Validate path params before database access.",
+        url: "https://example.com/claude",
+      },
+    ]);
+    expect(calls[1]).toEqual([
+      "api",
+      "--paginate",
+      "--slurp",
+      "repos/:owner/:repo/issues/42/comments?per_page=100",
+    ]);
+  });
+
+  it("deduplicates external findings by body while preferring path and line context", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) {
+        return { exitCode: 0, stdout: "[]" };
+      }
+
+      if (isIssueCommentsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            {
+              user: { login: "claude" },
+              body: "### Code Review\n\n## Blocking\n- Validate path params before database access.",
+              html_url: "https://example.com/claude-summary",
+            },
+          ]),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [
+                    {
+                      isResolved: false,
+                      isOutdated: false,
+                      path: "src/app.ts",
+                      line: 27,
+                      comments: {
+                        nodes: [
+                          {
+                            body: "Validate path params before database access.",
+                            url: "https://example.com/thread",
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
+      {
+        source: "github-review-thread",
+        severity: "blocking",
+        path: "src/app.ts",
+        line: 27,
+        body: "Validate path params before database access.",
+        url: "https://example.com/thread",
+      },
+    ]);
   });
 
   it("ignores unresolved review threads that GitHub marks as outdated", () => {
@@ -402,7 +526,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
       },
     ]);
     expect(calls.filter((call) => call[0] === "api" && call[1] === "graphql")).toHaveLength(2);
-    expect(calls[2]).toContain("after=cursor-1");
+    expect(calls.find((call) => call.includes("after=cursor-1"))).toBeTruthy();
   });
 
   it("does not throw when GraphQL returns malformed JSON", () => {
@@ -438,4 +562,8 @@ describe("collectExternalReviewFindingsFromGh", () => {
 
 function isPullReviewsRequest(args: string[]): boolean {
   return args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100");
+}
+
+function isIssueCommentsRequest(args: string[]): boolean {
+  return args.includes("repos/:owner/:repo/issues/42/comments?per_page=100");
 }
