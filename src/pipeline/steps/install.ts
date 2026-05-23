@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 
 interface RepoModels {
@@ -28,123 +29,25 @@ interface InstallOutputs extends Record<string, unknown> {
 
 const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
 
-function stripYamlComment(value: string): string {
-  let quote: "'" | "\"" | null = null;
-  for (let i = 0; i < value.length; i++) {
-    const char = value[i];
-    if ((char === "'" || char === "\"") && quote === null) {
-      quote = char;
-    } else if (char === quote) {
-      quote = null;
-    } else if (char === "#" && quote === null) {
-      return value.slice(0, i).trim();
-    }
-  }
-  return value.trim();
-}
-
-function normalizeYamlScalar(value: string): string | undefined {
-  const trimmed = stripYamlComment(value);
-  if (!trimmed) return undefined;
-  const quote = trimmed[0];
-  if ((quote === "'" || quote === "\"") && trimmed.endsWith(quote)) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
-}
-
-function splitInlineYamlArrayItems(value: string): string[] | null {
-  const trimmed = stripYamlComment(value);
-  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return null;
-  const inner = trimmed.slice(1, -1).trim();
-  if (!inner) return [];
-
-  const items: string[] = [];
-  let quote: "'" | "\"" | null = null;
-  let start = 0;
-  for (let i = 0; i < inner.length; i++) {
-    const char = inner[i];
-    if ((char === "'" || char === "\"") && quote === null) {
-      quote = char;
-    } else if (char === quote) {
-      quote = null;
-    } else if (char === "," && quote === null) {
-      items.push(inner.slice(start, i));
-      start = i + 1;
-    }
-  }
-  if (quote !== null) return null;
-  items.push(inner.slice(start));
-  return items;
-}
-
-function parseModelsSection(raw: string): RepoModels {
+function parseModelsConfig(value: unknown): RepoModels {
   const result: RepoModels = {};
-  const lines = raw.split(/\r?\n/);
-  let inModels = false;
-  for (const line of lines) {
-    if (/^models:/.test(line)) {
-      inModels = true;
-      continue;
-    }
-    if (inModels) {
-      // A non-empty line starting without indentation means a new top-level key
-      if (/^\S/.test(line) && line.trim() !== "") {
-        inModels = false;
-        continue;
-      }
-      // Note: quoted YAML values (e.g. implement: "model-name") are not stripped —
-      // users should write unquoted values to avoid silently including quote characters.
-      const implMatch = /^\s+implement:\s*(\S+)/.exec(line);
-      if (implMatch) result.implement = implMatch[1];
-      const reviewMatch = /^\s+review:\s*(\S+)/.exec(line);
-      if (reviewMatch) result.review = reviewMatch[1];
-    }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+  const models = value as Record<string, unknown>;
+  if (typeof models.implement === "string" && models.implement.trim()) {
+    result.implement = models.implement.trim();
+  }
+  if (typeof models.review === "string" && models.review.trim()) {
+    result.review = models.review.trim();
   }
   return result;
 }
 
-function parseReviewProvidersSection(raw: string): string[] | undefined {
-  const lines = raw.split(/\r?\n/);
-  let inReviewProviders = false;
-  const providers: string[] = [];
-  let sawReviewProviders = false;
-  let sawListItem = false;
-
-  for (const line of lines) {
-    const topLevelMatch = /^reviewProviders:\s*(.*)$/.exec(line);
-    if (topLevelMatch) {
-      const inlineValue = stripYamlComment(topLevelMatch[1] ?? "");
-      if (inlineValue) {
-        const inlineItems = splitInlineYamlArrayItems(inlineValue);
-        if (inlineItems === null) return undefined;
-        if (inlineItems.length === 0) return [];
-        const knownProviders = inlineItems
-          .map((item) => normalizeYamlScalar(item))
-          .filter((provider): provider is string =>
-            provider !== undefined && KNOWN_REVIEW_PROVIDERS.has(provider),
-          );
-        return knownProviders.length > 0 ? knownProviders : undefined;
-      }
-      inReviewProviders = true;
-      sawReviewProviders = true;
-      continue;
-    }
-    if (inReviewProviders) {
-      if (/^\S/.test(line) && line.trim() !== "") {
-        inReviewProviders = false;
-        continue;
-      }
-      const providerMatch = /^\s+-\s*(.+?)\s*$/.exec(line);
-      if (providerMatch) sawListItem = true;
-      const provider = providerMatch ? normalizeYamlScalar(providerMatch[1]) : undefined;
-      if (provider && KNOWN_REVIEW_PROVIDERS.has(provider)) {
-        providers.push(provider);
-      }
-    }
-  }
-
-  if (!sawReviewProviders || !sawListItem) return undefined;
+function parseReviewProvidersConfig(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  if (value.length === 0) return [];
+  const providers = value.filter((provider): provider is string =>
+    typeof provider === "string" && KNOWN_REVIEW_PROVIDERS.has(provider),
+  );
   return providers.length > 0 ? providers : undefined;
 }
 
@@ -153,12 +56,15 @@ function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
   if (!fs.existsSync(configPath)) return {};
   try {
     const raw = fs.readFileSync(configPath, "utf-8");
-    // Minimal YAML key: value parsing — avoids pulling in a yaml dep
-    const pkgMatch = /^packageManager:\s*(\S+)/m.exec(raw);
-    const models = parseModelsSection(raw);
-    const reviewProviders = parseReviewProvidersSection(raw);
+    const parsed = parseYaml(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const doc = parsed as Record<string, unknown>;
+    const models = parseModelsConfig(doc.models);
+    const reviewProviders = parseReviewProvidersConfig(doc.reviewProviders);
     const config: AiImplementConfig = {};
-    if (pkgMatch) config.packageManager = pkgMatch[1];
+    if (typeof doc.packageManager === "string" && doc.packageManager.trim()) {
+      config.packageManager = doc.packageManager.trim();
+    }
     if (models.implement || models.review) config.models = models;
     if (reviewProviders !== undefined) config.reviewProviders = reviewProviders;
     return config;
