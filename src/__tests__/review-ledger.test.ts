@@ -137,21 +137,25 @@ describe("collectExternalReviewFindingsFromGh", () => {
         stdout: JSON.stringify([
           {
             state: "COMMENTED",
+            user: { login: "reviewer-a" },
             body: "not blocking",
             html_url: "https://example.com/commented",
           },
           {
             state: "CHANGES_REQUESTED",
+            user: { login: "reviewer-b" },
             body: "Please fix the failing validation.",
             html_url: "https://example.com/review-1",
           },
           {
             state: "CHANGES_REQUESTED",
+            user: { login: "reviewer-c" },
             body: "   ",
             html_url: "https://example.com/empty",
           },
           {
             state: "CHANGES_REQUESTED",
+            user: { login: "reviewer-d" },
             body: "Also restore the timeout handling.",
             html_url: "https://example.com/review-2",
           },
@@ -177,6 +181,39 @@ describe("collectExternalReviewFindingsFromGh", () => {
     expect(calls[1]?.slice(0, 2)).toEqual(["api", "graphql"]);
   });
 
+  it("ignores stale changes-requested reviews when the same reviewer later approves", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (args[0] === "api" && args[1] === "graphql") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } },
+          }),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify([
+          {
+            state: "CHANGES_REQUESTED",
+            user: { login: "reviewer-a" },
+            body: "This old issue was fixed before approval.",
+            html_url: "https://example.com/stale-review",
+          },
+          {
+            state: "APPROVED",
+            user: { login: "reviewer-a" },
+            body: "Approved now.",
+            html_url: "https://example.com/approval",
+          },
+        ]),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+  });
+
   it("collects latest comments from unresolved review threads as blocking findings", () => {
     const calls: string[][] = [];
     const ghSpawn: GhSpawn = (args) => {
@@ -196,6 +233,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
                   nodes: [
                     {
                       isResolved: true,
+                      isOutdated: false,
                       path: "src/ignored.ts",
                       line: 1,
                       comments: {
@@ -209,6 +247,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
                     },
                     {
                       isResolved: false,
+                      isOutdated: false,
                       path: "src/app.ts",
                       line: 27,
                       comments: {
@@ -246,6 +285,46 @@ describe("collectExternalReviewFindingsFromGh", () => {
     expect(calls[1]?.slice(0, 2)).toEqual(["api", "graphql"]);
   });
 
+  it("ignores unresolved review threads that GitHub marks as outdated", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42/reviews") {
+        return { exitCode: 0, stdout: "[]" };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [
+                    {
+                      isResolved: false,
+                      isOutdated: true,
+                      path: "src/app.ts",
+                      line: 27,
+                      comments: {
+                        nodes: [
+                          {
+                            body: "This comment belongs to an outdated diff.",
+                            url: "https://example.com/outdated-thread",
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+  });
+
   it("does not throw when GraphQL returns malformed JSON", () => {
     const ghSpawn: GhSpawn = (args) => {
       if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42/reviews") {
@@ -254,6 +333,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
           stdout: JSON.stringify([
             {
               state: "CHANGES_REQUESTED",
+              user: { login: "reviewer-a" },
               body: "Keep already collected review findings.",
               html_url: "https://example.com/review",
             },

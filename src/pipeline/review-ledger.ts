@@ -109,11 +109,16 @@ function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, find
   const reviews = parseJson(result.stdout);
   if (!Array.isArray(reviews)) return;
 
-  for (const review of reviews) {
-    if (!isRecord(review) || review.state !== "CHANGES_REQUESTED" || typeof review.body !== "string") {
-      continue;
-    }
+  const latestActionableReviewsByReviewer = new Map<string, Record<string, unknown>>();
 
+  reviews.forEach((review, index) => {
+    if (!isRecord(review) || !isActionableReviewState(review.state)) return;
+
+    latestActionableReviewsByReviewer.set(getReviewReviewerKey(review, index), review);
+  });
+
+  for (const review of latestActionableReviewsByReviewer.values()) {
+    if (review.state !== "CHANGES_REQUESTED" || typeof review.body !== "string") continue;
     const body = review.body.trim();
     if (!body) continue;
 
@@ -146,7 +151,7 @@ function collectUnresolvedReviewThreads(ghSpawn: GhSpawn, prNumber: string, find
   if (!nodes) return;
 
   for (const thread of nodes) {
-    if (!isRecord(thread) || thread.isResolved !== false) continue;
+    if (!isRecord(thread) || thread.isResolved !== false || thread.isOutdated === true) continue;
 
     const comments = getCommentNodes(thread);
     const latestComment = comments?.at(-1);
@@ -201,6 +206,18 @@ function getCommentNodes(thread: Record<string, unknown>): unknown[] | undefined
   return Array.isArray(comments.nodes) ? comments.nodes : undefined;
 }
 
+function isActionableReviewState(value: unknown): value is "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED" {
+  return value === "APPROVED" || value === "CHANGES_REQUESTED" || value === "DISMISSED";
+}
+
+function getReviewReviewerKey(review: Record<string, unknown>, fallbackIndex: number): string {
+  const user = review.user;
+  if (!isRecord(user)) return `review:${fallbackIndex}`;
+  if (typeof user.id === "number" || typeof user.id === "string") return `user-id:${user.id}`;
+  if (typeof user.login === "string") return `user-login:${user.login}`;
+  return `review:${fallbackIndex}`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -221,6 +238,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
       reviewThreads(first: 100) {
         nodes {
           isResolved
+          isOutdated
           path
           line
           comments(first: 100) {
