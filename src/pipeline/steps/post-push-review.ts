@@ -207,6 +207,24 @@ function filterNonBlockingIssues(issues: string[]): string[] {
   return issues.filter((issue) => !(isDeferredOrNonBlocking(issue) && !hasStrongActionSignal(issue)));
 }
 
+function dedupeIssuesAgainstExternalFindings(
+  issues: string[],
+  externalFindings: ReviewLedgerFinding[],
+): string[] {
+  const externalBodies = new Set(externalFindings.map((finding) => normalizeForComparison(finding.body)));
+  const seen = new Set<string>();
+  return issues.filter((issue) => {
+    const normalized = normalizeForComparison(issue);
+    if (!normalized || externalBodies.has(normalized) || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+}
+
+function externalBlockingCommentBlock(hasExternalBlockers: boolean): string {
+  return hasExternalBlockers ? "\n\nExternal review findings are blocking this PR." : "";
+}
+
 function parseFixSummary(stdout: string): FixSummary | null {
   const parsed = extractFirstJsonObject(stdout);
   if (!parsed) return null;
@@ -324,6 +342,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
       const externalFindings: ReviewLedgerFinding[] = collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
+      const hasExternalBlockers = externalFindings.some((finding) => finding.severity === "blocking");
 
       const previousFindings = formatReviewHistory(reviewHistory);
       const reviewPrompt = `You are reviewing the diff for PR #${prNumber} against issue ${context.data.issueIdentifier}: ${context.data.issueTitle}.
@@ -428,15 +447,17 @@ Output ONLY valid JSON: {"approved": bool, "issues": [string], "score": int, "pr
       if (issues.length === 0 && parsed.approved === true && feedbackImpliesFixNeeded(feedback)) {
         issues.push(feedback);
       }
-      const externalBlockingFindings = externalFindings.filter((finding) => finding.severity === "blocking");
-      issues.push(...externalBlockingFindings.map((finding) => finding.body));
-      if (issues.length === 0 && parsed.approved === false && !feedbackImpliesFixNeeded(feedback)) {
+      issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
+      if (issues.length === 0 && parsed.approved === false && !feedbackImpliesFixNeeded(feedback) && !hasExternalBlockers) {
         approved = true;
         feedback = feedback || "Reviewer did not identify actionable blockers.";
-      } else if (issues.length === 0 && parsed.approved === false) {
+      } else if (issues.length === 0 && parsed.approved === false && feedbackImpliesFixNeeded(feedback)) {
         issues.push(feedback || "Reviewer marked the PR not ready but did not provide actionable issue details.");
+        issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
+      } else if (issues.length === 0 && parsed.approved === false && !hasExternalBlockers) {
+        issues.push("Reviewer marked the PR not ready but did not provide actionable issue details.");
       }
-      approved = approved || (parsed.approved === true && issues.length === 0);
+      approved = approved || (parsed.approved === true && issues.length === 0 && !hasExternalBlockers);
       reviewHistory.push({ iteration, issues: [...issues], feedback });
 
       await reporter.report({
@@ -467,7 +488,7 @@ Output ONLY valid JSON: {"approved": bool, "issues": [string], "score": int, "pr
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues, { compact: true })}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues, { compact: true })}${externalBlockingCommentBlock(hasExternalBlockers)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
@@ -477,7 +498,7 @@ Output ONLY valid JSON: {"approved": bool, "issues": [string], "score": int, "pr
       postPrComment(
         ghSpawn,
         prNumber,
-        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues, { compact: true })}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues, { compact: true })}${externalBlockingCommentBlock(hasExternalBlockers)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
         feedbackMarker,
       );
 

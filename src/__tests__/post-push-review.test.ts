@@ -11,6 +11,10 @@ function makeCtx(execMock: any) {
   } as any;
 }
 
+function countOccurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
 describe("postPushReviewStep", () => {
   it("approves on first iteration, posts ✅ comment, returns approved=true", async () => {
     const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
@@ -165,6 +169,7 @@ describe("postPushReviewStep", () => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
+    const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
@@ -174,6 +179,9 @@ describe("postPushReviewStep", () => {
           ]),
           exitCode: 0,
         };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
       }
       return { stdout: "", exitCode: 0 };
     });
@@ -190,7 +198,53 @@ describe("postPushReviewStep", () => {
     expect(invoke).toHaveBeenCalledTimes(2);
     const fixPrompt = invoke.mock.calls[1][0].prompt;
     expect(fixPrompt).toContain("Required external review findings");
-    expect(fixPrompt).toContain("Missing UUID validation on path params.");
+    expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("External review findings are blocking this PR.");
+    expect(reviewComment).not.toContain("Missing UUID validation on path params.");
+  });
+
+  it("deduplicates internal issues that repeat external review findings", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      issues: ["Missing UUID validation on path params."],
+      feedback: "External blocker is still unresolved.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Missing UUID validation on path params.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(0);
   });
 
   it("runs a fix pass when approved feedback contains actionable language but issues is empty", async () => {
