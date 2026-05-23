@@ -221,6 +221,15 @@ function dedupeIssuesAgainstExternalFindings(
   });
 }
 
+function suppressDuplicateExternalFeedback(feedback: string, externalFindings: ReviewLedgerFinding[]): string {
+  const normalizedFeedback = normalizeForComparison(feedback);
+  if (!normalizedFeedback) return "";
+  const duplicatesExternalFinding = externalFindings.some((finding) => {
+    return normalizeForComparison(finding.body) === normalizedFeedback;
+  });
+  return duplicatesExternalFinding ? "" : feedback;
+}
+
 function externalBlockingCommentBlock(hasExternalBlockers: boolean): string {
   return hasExternalBlockers ? "\n\nExternal review findings are blocking this PR." : "";
 }
@@ -439,7 +448,7 @@ Output ONLY valid JSON: {"approved": bool, "issues": [string], "score": int, "pr
         break;
       }
 
-      feedback = String(parsed.feedback ?? "");
+      feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
       let issues = Array.isArray(parsed.issues)
         ? parsed.issues.filter((issue): issue is string => typeof issue === "string")
         : [];
