@@ -31,6 +31,7 @@ import type { RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
+import { buildPlanningContextInputs } from "./planning-context.js";
 import {
   fetchLocalContainerLogs,
   inspectLocalContainer,
@@ -421,11 +422,18 @@ async function dispatchPlanning(
     runToken = minted.token;
   }
 
+  const planningContextInputs = await buildPlanningContextInputs({
+    issue,
+    linearApiKey: config.linearApiKey,
+    ticketingProviderId: provider.id,
+  });
+
   const result = await dispatchWorkflow(ghToken, planningMapping, {
     issue_id: issue.id,
     issue_identifier: issue.identifier,
     issue_title: issue.title,
     issue_description: issue.description || issue.title,
+    ...planningContextInputs,
     ...providerDispatchFields(planningMapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,

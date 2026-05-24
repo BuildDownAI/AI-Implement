@@ -6,7 +6,6 @@
 #   AI_IMPLEMENT_PRIVATE_KEY - GitHub App PEM private key
 #   ANTHROPIC_API_KEY        - Anthropic API key (fallback if no OAuth token)
 #   CLAUDE_CODE_OAUTH_TOKEN  - Claude Code OAuth token (preferred over API key)
-#   LINEAR_API_KEY           - Linear API key for fetching related issues and posting comments
 #
 # Optional org/repo variable:
 #   AI_IMPLEMENT_ALLOWED_BOTS - Override claude-code-action allowed_bots.
@@ -23,21 +22,36 @@ on:
   workflow_dispatch:
     inputs:
       issue_id:
-        description: "Linear issue UUID"
+        description: "Ticketing-system issue ID"
         required: true
         type: string
       issue_identifier:
-        description: "Linear issue identifier (e.g., ENG-123)"
+        description: "Ticketing-system issue identifier (e.g., ENG-123)"
         required: true
         type: string
       issue_title:
-        description: "Linear issue title"
+        description: "Ticketing-system issue title"
         required: true
         type: string
       issue_description:
-        description: "Linear issue description"
+        description: "Ticketing-system issue description"
         required: true
         type: string
+      parent:
+        description: "Related parent issue summary for planning context"
+        required: false
+        type: string
+        default: "None"
+      siblings:
+        description: "Related sibling issues summary for planning context"
+        required: false
+        type: string
+        default: "None"
+      dependencies:
+        description: "Related dependency issues summary for planning context"
+        required: false
+        type: string
+        default: "None"
       provider:
         description: "Claude provider: 'anthropic' (default) or 'bedrock'"
         required: false
@@ -68,65 +82,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+      - uses: actions/create-github-app-token@v2
         id: app-token
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
-
-      - name: Fetch related issues from Linear
-        id: fetch-related
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
-        run: |
-          FETCH_LOG=/tmp/related-fetch.log
-          : > "$FETCH_LOG"
-          # curl -fsS: fail on HTTP errors, suppress progress, keep error messages.
-          if ! RESPONSE=$(curl -fsS --max-time 30 -X POST https://api.linear.app/graphql \
-            -H "Content-Type: application/json" \
-            -H "Authorization: $LINEAR_API_KEY" \
-            --data-raw "$(jq -n --arg id "$ISSUE_ID" \
-              '{query: "query($id: String!) { issue(id: $id) { parent { id identifier title children { nodes { id identifier title } } } relations { nodes { type relatedIssue { id identifier title } } } } }", variables: {id: $id}}')" \
-            2>"$FETCH_LOG"); then
-            echo "::warning::Failed to fetch related issues from Linear — proceeding without them."
-            if [ -s "$FETCH_LOG" ]; then
-              echo "Linear fetch error details:"
-              sed 's/^/  /' "$FETCH_LOG"
-            fi
-            RESPONSE='{"data":{"issue":{"parent":null,"relations":{"nodes":[]}}}}'
-          fi
-
-          PARENT=$(echo "$RESPONSE" | jq -r \
-            'if .data.issue.parent then "- \(.data.issue.parent.identifier): \(.data.issue.parent.title)" else "" end' \
-            2>/dev/null || echo "")
-
-          SIBLINGS=$(echo "$RESPONSE" | jq -r \
-            --arg issueId "$ISSUE_ID" \
-            '[.data.issue.parent.children.nodes[]? | select(.id != $issueId) | "- \(.identifier): \(.title)"] | join("\n")' \
-            2>/dev/null || echo "")
-
-          DEPENDENCIES=$(echo "$RESPONSE" | jq -r \
-            '[.data.issue.relations.nodes[]? | "- [\(.type)] \(.relatedIssue.identifier): \(.relatedIssue.title)"] | join("\n")' \
-            2>/dev/null || echo "")
-
-          # Unique delimiter guards against Linear content that happens to contain a fixed token.
-          EOF_TOKEN=$(openssl rand -hex 8)
-          {
-            echo "parent<<RELATED_${EOF_TOKEN}"
-            echo "$PARENT"
-            echo "RELATED_${EOF_TOKEN}"
-            echo "siblings<<RELATED_${EOF_TOKEN}"
-            echo "$SIBLINGS"
-            echo "RELATED_${EOF_TOKEN}"
-            echo "dependencies<<RELATED_${EOF_TOKEN}"
-            echo "$DEPENDENCIES"
-            echo "RELATED_${EOF_TOKEN}"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare planning prompt
         id: prepare-prompt
@@ -136,9 +100,9 @@ jobs:
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PROVIDER: ${{ inputs.provider }}
-          PARENT: ${{ steps.fetch-related.outputs.parent }}
-          SIBLINGS: ${{ steps.fetch-related.outputs.siblings }}
-          DEPENDENCIES: ${{ steps.fetch-related.outputs.dependencies }}
+          PARENT: ${{ inputs.parent }}
+          SIBLINGS: ${{ inputs.siblings }}
+          DEPENDENCIES: ${{ inputs.dependencies }}
         run: |
           FRONTMATTER=""
 
@@ -318,9 +282,6 @@ jobs:
       - name: Run Claude (Bedrock)
         if: steps.auth-check.outputs.auth_method == 'bedrock'
         uses: anthropics/claude-code-action@3ed282bf5e31de156a90889428e1d6a5013b0fdf
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
         with:
           use_bedrock: "true"
           github_token: ${{ steps.app-token.outputs.token }}
@@ -331,9 +292,6 @@ jobs:
       - name: Run Claude (OAuth token)
         if: steps.auth-check.outputs.auth_method == 'oauth'
         uses: anthropics/claude-code-action@3ed282bf5e31de156a90889428e1d6a5013b0fdf
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}
@@ -344,62 +302,12 @@ jobs:
       - name: Run Claude (API key)
         if: steps.auth-check.outputs.auth_method == 'api_key'
         uses: anthropics/claude-code-action@3ed282bf5e31de156a90889428e1d6a5013b0fdf
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "${{ vars.AI_IMPLEMENT_ALLOWED_BOTS || steps.app-token.outputs.app-slug }}"
           claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep'"
           prompt: ${{ steps.prepare-prompt.outputs.prompt }}
-
-      - name: Update Linear labels
-        if: always()
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
-          ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
-          JOB_STATUS: ${{ job.status }}
-        run: |
-          # Fetch current labels
-          RESPONSE=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-            -H "Content-Type: application/json" \
-            -H "Authorization: $LINEAR_API_KEY" \
-            -d "{\"query\":\"{ issue(id: \\\"$ISSUE_ID\\\") { labels { nodes { id name } } } }\"}")
-
-          # Remove AI-Planning from label set
-          LABEL_IDS=$(echo "$RESPONSE" | jq -c '[.data.issue.labels.nodes[] | select(.name != "AI-Planning") | .id]')
-
-          # On success, find or create Plan-Complete and add it
-          if [ "$JOB_STATUS" = "success" ]; then
-            PLAN_COMPLETE_ID=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-              -H "Content-Type: application/json" \
-              -H "Authorization: $LINEAR_API_KEY" \
-              -d '{"query":"{ issueLabels(filter: { name: { eq: \"Plan-Complete\" } }) { nodes { id } } }"}' \
-              | jq -r '.data.issueLabels.nodes[0].id')
-
-            if [ "$PLAN_COMPLETE_ID" = "null" ] || [ -z "$PLAN_COMPLETE_ID" ]; then
-              PLAN_COMPLETE_ID=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-                -H "Content-Type: application/json" \
-                -H "Authorization: $LINEAR_API_KEY" \
-                -d '{"query":"mutation { issueLabelCreate(input: { name: \"Plan-Complete\", color: \"#7c3aed\" }) { issueLabel { id } } }"}' \
-                | jq -r '.data.issueLabelCreate.issueLabel.id')
-              echo "Created 'Plan-Complete' label: $PLAN_COMPLETE_ID"
-            fi
-
-            LABEL_IDS=$(echo "$LABEL_IDS" | jq --arg id "$PLAN_COMPLETE_ID" '. + [$id] | unique')
-            echo "Adding Plan-Complete label to $ISSUE_IDENTIFIER"
-          fi
-
-          curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-            -H "Content-Type: application/json" \
-            -H "Authorization: $LINEAR_API_KEY" \
-            --data-raw "$(jq -n \
-              --argjson ids "$LABEL_IDS" \
-              --arg issueId "$ISSUE_ID" \
-              '{query: "mutation($id: String!, $labelIds: [String!]!) { issueUpdate(id: $id, input: { labelIds: $labelIds }) { success } }", variables: {id: $issueId, labelIds: $ids}}')"
-          echo "Updated labels on $ISSUE_IDENTIFIER (status: $JOB_STATUS)"
 
       - name: Post results to orchestrator
         if: always()

@@ -155,6 +155,24 @@ describe("GHA workflow shims", () => {
   });
 
   for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} accepts related-issue context as dispatch inputs`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/parent:\n\s+description:\s*"Related parent issue summary/);
+      expect(yaml).toMatch(/siblings:\n\s+description:\s*"Related sibling issues summary/);
+      expect(yaml).toMatch(/dependencies:\n\s+description:\s*"Related dependency issues summary/);
+      expect(yaml).toMatch(/PARENT:\s*\$\{\{\s*inputs\.parent\s*\}\}/);
+      expect(yaml).toMatch(/SIBLINGS:\s*\$\{\{\s*inputs\.siblings\s*\}\}/);
+      expect(yaml).toMatch(/DEPENDENCIES:\s*\$\{\{\s*inputs\.dependencies\s*\}\}/);
+    });
+
+    it(`${f} does not call Linear directly from the workflow`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/api\.linear\.app\/graphql/);
+      expect(yaml).not.toMatch(/LINEAR_API_KEY/);
+      expect(yaml).not.toMatch(/Update Linear labels/);
+      expect(yaml).toMatch(/runner\/result/);
+    });
+
     it(`${f} does not allow Claude to curl Linear directly`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).not.toMatch(/Bash\(curl\*api\.linear\.app\/graphql\*\)/);
