@@ -274,14 +274,14 @@ jobs:
 
       - name: Configure AWS credentials (Bedrock)
         if: steps.auth-check.outputs.auth_method == 'bedrock'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
 
       - name: Run Claude (Bedrock)
         if: steps.auth-check.outputs.auth_method == 'bedrock'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@3ed282bf5e31de156a90889428e1d6a5013b0fdf
         with:
           use_bedrock: "true"
           github_token: ${{ steps.app-token.outputs.token }}
@@ -291,7 +291,7 @@ jobs:
 
       - name: Run Claude (OAuth token)
         if: steps.auth-check.outputs.auth_method == 'oauth'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@3ed282bf5e31de156a90889428e1d6a5013b0fdf
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ steps.app-token.outputs.token }}
@@ -301,7 +301,7 @@ jobs:
 
       - name: Run Claude (API key)
         if: steps.auth-check.outputs.auth_method == 'api_key'
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@3ed282bf5e31de156a90889428e1d6a5013b0fdf
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ steps.app-token.outputs.token }}
