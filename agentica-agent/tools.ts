@@ -15,7 +15,7 @@
 import {
   readFileSync, writeFileSync, mkdirSync, statSync, readdirSync,
 } from "node:fs";
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { dirname, isAbsolute, join } from "node:path";
 
 const BASH_TIMEOUT_MS = parseInt(process.env.AGENTICA_AGENT_BASH_TIMEOUT_MS ?? "300000", 10);
@@ -70,25 +70,33 @@ export function editFile(path: string, oldString: string, newString: string): vo
  * Run a shell command (cwd = WORKSPACE_DIR). Never throws — returns
  * `{ stdout, stderr, exitCode }` so the agent reads the result as data
  * and can recover from non-zero exits.
+ *
+ * Uses `spawnSync("bash", ["-c", command])` rather than `execSync` so
+ * stdout and stderr are captured separately even on success (execSync's
+ * return value is only stdout; stderr would be discarded).
  */
 export function bash(command: string): { stdout: string; stderr: string; exitCode: number } {
-  try {
-    const stdout = execSync(command, {
-      cwd: getWorkspace(),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: BASH_TIMEOUT_MS,
-      env: process.env,
-    });
-    return { stdout, stderr: "", exitCode: 0 };
-  } catch (err) {
-    const e = err as { stdout?: Buffer | string; stderr?: Buffer | string; status?: number; message: string };
+  const result = spawnSync("bash", ["-c", command], {
+    cwd: getWorkspace(),
+    encoding: "utf8",
+    timeout: BASH_TIMEOUT_MS,
+    env: process.env,
+  });
+
+  if (result.error) {
+    // Process couldn't spawn (e.g. ENOENT for bash itself).
     return {
-      stdout: typeof e.stdout === "string" ? e.stdout : (e.stdout?.toString() ?? ""),
-      stderr: typeof e.stderr === "string" ? e.stderr : (e.stderr?.toString() ?? e.message),
-      exitCode: e.status ?? 1,
+      stdout: result.stdout ?? "",
+      stderr: (result.stderr ?? "") + result.error.message,
+      exitCode: 1,
     };
   }
+
+  return {
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+    exitCode: result.status ?? 1,
+  };
 }
 
 /** True if the path exists (file, dir, or symlink). */

@@ -17,6 +17,6 @@
       { "transform": "@symbolica/agentica/transformer" }
     ]
   },
-  "include": ["main.ts", "tools.ts"],
+  "include": ["main.ts", "tools.ts", "tools.test.ts"],
   "exclude": ["node_modules", "dist"]
 }

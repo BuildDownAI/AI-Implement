@@ -7,6 +7,7 @@
   "scripts": {
     "prepare": "ts-patch install -s",
     "build": "tspc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tools.test.js",
     "smoke": "AGENTICA_AGENT_SMOKE=1 node dist/main.js"
   },
   "dependencies": {
