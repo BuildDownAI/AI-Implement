@@ -16,7 +16,7 @@ export const projectsHtml = `
           <thead>
             <tr>
               <th>Team</th><th>Repo</th><th>Runner</th><th>Session</th>
-              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th>Status</th><th></th>
+              <th style="text-align:center">Cap</th><th>Planning</th><th>Provider</th><th>Agent</th><th>Status</th><th></th>
             </tr>
           </thead>
           <tbody id="mappings-body"></tbody>
@@ -172,6 +172,13 @@ export const projectsHtml = `
               <option value="bedrock">bedrock</option>
             </select>
           </div>
+          <div class="md-field" style="margin-bottom:0;min-width:140px">
+            <label>Agent</label>
+            <select id="md-agent">
+              <option value="claude-code">claude-code</option>
+              <option value="agentica">agentica</option>
+            </select>
+          </div>
           <div id="md-aws-region-wrap" class="md-field hidden" style="flex:1;min-width:180px;margin-bottom:0">
             <label>AWS Region</label><input id="md-aws-region" placeholder="us-west-2">
           </div>
@@ -220,6 +227,9 @@ export const projectsScript = `
       const providerBadge = m.provider === 'bedrock'
         ? '<span class="badge warn">bedrock</span>'
         : '<span class="text-tertiary" style="font-size:0.85em">anthropic</span>';
+      const agentBadge = m.agent === 'agentica'
+        ? '<span class="badge info">agentica</span>'
+        : '<span class="text-tertiary" style="font-size:0.85em">claude-code</span>';
       const statusBadge = m.paused
         ? '<span class="badge warn">paused</span>'
         : '<span class="badge success">active</span>';
@@ -231,6 +241,7 @@ export const projectsScript = `
         + '<td style="text-align:center">' + window.esc(String(m.maxInProgressAiIssues ?? 3)) + '</td>'
         + '<td>' + planBadge + '</td>'
         + '<td>' + providerBadge + '</td>'
+        + '<td>' + agentBadge + '</td>'
         + '<td>' + statusBadge + '</td>'
         + '<td style="white-space:nowrap">'
           + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
@@ -266,6 +277,7 @@ export const projectsScript = `
     document.getElementById('md-auto-approve').checked = m.autoApprovePlans !== false;
     document.getElementById('md-planning-wf').value = m.planningWorkflowFile || 'claude-plan.yml';
     document.getElementById('md-provider').value = m.provider || 'anthropic';
+    document.getElementById('md-agent').value = m.agent || 'claude-code';
     document.getElementById('md-aws-region').value = m.awsRegion || '';
 
     // Ticketing provider + Jira config
@@ -557,6 +569,7 @@ export const projectsScript = `
       planningWorkflowFile: document.getElementById('md-planning-wf').value.trim(),
       extraEnv: parseEnvText(document.getElementById('md-env').value),
       provider: document.getElementById('md-provider').value,
+      agent: document.getElementById('md-agent').value,
       awsRegion: document.getElementById('md-aws-region').value.trim() || null,
     };
 

@@ -35,12 +35,26 @@ export class AgenticaAgentExecutor implements LLMExecutor {
     private readonly entryPath?: string,
   ) {}
 
-  invoke(params: {
+  async invoke(params: {
     prompt: string;
     model: string;
     maxTurns?: number;
     tools?: string[];
   }): Promise<LLMResult> {
+    const result = await this.spawnAgent(params.prompt, params.model);
+
+    const fallbackModel = process.env.AGENTICA_MODEL_FALLBACK;
+    if (result.exitCode === 2 && fallbackModel && fallbackModel !== params.model) {
+      console.log(
+        `[agentica] primary model failed (exit 2), retrying with fallback: ${fallbackModel}`,
+      );
+      return this.spawnAgent(params.prompt, fallbackModel);
+    }
+
+    return result;
+  }
+
+  private spawnAgent(prompt: string, model: string): Promise<LLMResult> {
     return new Promise((resolve, reject) => {
       const entry = this.resolveEntry();
       if (!entry) {
@@ -57,8 +71,8 @@ export class AgenticaAgentExecutor implements LLMExecutor {
 
       const env = { ...process.env };
       env.WORKSPACE_DIR = this.workspaceDir;
-      env.AGENTICA_AGENT_PROMPT = params.prompt;
-      if (params.model) env.AGENTICA_MODEL_PRIMARY = params.model;
+      env.AGENTICA_AGENT_PROMPT = prompt;
+      if (model) env.AGENTICA_MODEL_PRIMARY = model;
 
       const proc = spawn("node", [entry], {
         cwd: this.workspaceDir,
@@ -76,8 +90,6 @@ export class AgenticaAgentExecutor implements LLMExecutor {
           stdout: Buffer.concat(chunks).toString(),
           stderr: Buffer.concat(stderrChunks).toString(),
           exitCode: code ?? 1,
-          // Agentica's hosted endpoint doesn't expose token counts in stdout
-          // (yet). Phase-5 telemetry work will add a structured channel.
           tokensUsed: 0,
         });
       });

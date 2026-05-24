@@ -377,6 +377,7 @@ async function dispatchGitHubActions(
     dispatchNumber: prior.count + 1,
     executionMode: "github-actions",
     runnerMode,
+    agent: mapping.agent,
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -600,6 +601,7 @@ async function dispatchFlyMachine(
     machineId: machine.id,
     runnerMode,
     sessionImage: resolvedImage,
+    agent: mapping.agent,
   });
 
   if (!shadow) {
@@ -708,6 +710,7 @@ async function dispatchLocalDocker(
     machineId: container.containerId,
     runnerMode,
     sessionImage: config.localRunnerImage,
+    agent: mapping.agent,
   });
 
   const suppressed = suppressStaleNotifications(issue.id, jobId);
