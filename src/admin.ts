@@ -11,12 +11,13 @@ import {
   DEFAULT_PLANNING_WORKFLOW_FILE,
   DEFAULT_AUTO_APPROVE_PLANS,
   DEFAULT_PROVIDER,
+  DEFAULT_AGENT,
   upsertMapping,
   updateMappingCap,
   setMappingPaused,
   deleteMapping,
 } from "./config.js";
-import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider } from "./config.js";
+import type { RepoMapping, ExecutionMode, SessionMode, ClaudeProvider, AgentId } from "./config.js";
 import {
   getRunnerMode,
   setRunnerMode,
@@ -960,6 +961,7 @@ async function handleUpsertMapping(
       extraEnv?: Record<string, string>;
       provider?: string;
       awsRegion?: string | null;
+      agent?: string;
       ticketingProvider?: string;
       ticketingConfig?: unknown;
       paused?: boolean;
@@ -1032,6 +1034,13 @@ async function handleUpsertMapping(
       return;
     }
 
+    const validAgents: AgentId[] = ["claude-code", "agentica"];
+    const agent = (body.agent ?? DEFAULT_AGENT) as AgentId;
+    if (!validAgents.includes(agent)) {
+      json(res, 400, { error: "agent must be 'claude-code' or 'agentica'" });
+      return;
+    }
+
     const awsRegionRaw = typeof body.awsRegion === "string" ? body.awsRegion.trim() : "";
     const awsRegion = awsRegionRaw.length > 0 ? awsRegionRaw : null;
     if (provider === "bedrock" && !awsRegion) {
@@ -1071,6 +1080,7 @@ async function handleUpsertMapping(
       ticketingProvider: ticketing.ticketingProvider,
       ticketingConfig: ticketing.ticketingConfig,
       awsRegion,
+      agent,
       // Preserve current paused state if the request didn't include it,
       // so an Edit form that omits `paused` doesn't silently resume the project.
       paused: body.paused !== undefined

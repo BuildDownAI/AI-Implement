@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 
 const execFile = promisify(nodeExecFile);
 const SECRET_ENV_KEYS = new Set([
+  "AGENTICA_API_KEY",
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
   "GITHUB_APP_PRIVATE_KEY",
@@ -27,6 +28,14 @@ export interface LocalRunnerInput {
   linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
+  /** Hosted-agentica auth key. Required when agent='agentica'. */
+  agenticaApiKey?: string;
+  /** Primary model ID for agentica callsites. Defaulted by the orchestrator. */
+  agenticaModelPrimary?: string;
+  /** Non-Anthropic fallback model. Phase-5 work; ignored today. */
+  agenticaModelFallback?: string;
+  /** Implementation agent selector ('claude-code' | 'agentica'). */
+  agent?: string;
   githubAppId: string;
   githubAppPrivateKey: string;
   sessionToken: string;
@@ -68,6 +77,10 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
   if (input.linearApiKey) env.LINEAR_API_KEY = input.linearApiKey;
   if (input.claudeOAuthToken) env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   if (input.anthropicApiKey) env.ANTHROPIC_API_KEY = input.anthropicApiKey;
+  if (input.agenticaApiKey) env.AGENTICA_API_KEY = input.agenticaApiKey;
+  if (input.agenticaModelPrimary) env.AGENTICA_MODEL_PRIMARY = input.agenticaModelPrimary;
+  if (input.agenticaModelFallback) env.AGENTICA_MODEL_FALLBACK = input.agenticaModelFallback;
+  if (input.agent) env.AI_IMPLEMENT_AGENT = input.agent;
   if (input.orchestratorUrl) env.ORCHESTRATOR_URL = input.orchestratorUrl;
   if (input.runnerCallbackUrl) env.RUNNER_CALLBACK_URL = input.runnerCallbackUrl;
   if (input.runToken) env.RUN_TOKEN = input.runToken;
