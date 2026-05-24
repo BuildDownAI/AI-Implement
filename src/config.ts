@@ -17,11 +17,6 @@ export const DEFAULT_AUTO_APPROVE_PLANS = true;
 export type ExecutionMode = "github-actions" | "fly-machines";
 export type SessionMode = "autonomous" | "interactive" | "hybrid";
 export type ClaudeProvider = "anthropic" | "bedrock";
-/**
- * Which implementation agent the runner uses. `claude-code` is the default
- * (Anthropic's CLI). `agentica` invokes the agentica-agent subprocess
- * documented in docs/AGENTICA-AGENT.md.
- */
 export type AgentId = "claude-code" | "agentica";
 
 export const DEFAULT_PROVIDER: ClaudeProvider = "anthropic";
@@ -54,7 +49,6 @@ export interface RepoMapping {
   ticketingConfig: TicketingMappingConfig;
   /** AWS region for Bedrock. Required when provider='bedrock'. */
   awsRegion: string | null;
-  /** Implementation agent used inside the runner. Default 'claude-code'. */
   agent: AgentId;
   /** When true, the poller and gap-fill trigger skip this mapping. In-flight runs (runner callbacks) are unaffected. */
   paused: boolean;

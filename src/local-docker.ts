@@ -28,13 +28,9 @@ export interface LocalRunnerInput {
   linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
-  /** Hosted-agentica auth key. Required when agent='agentica'. */
   agenticaApiKey?: string;
-  /** Primary model ID for agentica callsites. Defaulted by the orchestrator. */
   agenticaModelPrimary?: string;
-  /** Non-Anthropic fallback model. Phase-5 work; ignored today. */
   agenticaModelFallback?: string;
-  /** Implementation agent selector ('claude-code' | 'agentica'). */
   agent?: string;
   githubAppId: string;
   githubAppPrivateKey: string;

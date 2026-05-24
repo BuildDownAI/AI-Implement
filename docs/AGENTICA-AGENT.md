@@ -1,6 +1,6 @@
 # Agentica as an alternative implementation agent
 
-**Status**: Design doc, post-POC. POC passed 2026-05-23. Implementation not started.
+**Status**: Implemented. All 5 phases complete (2026-05-24). Branch: `agentica-agent-design`.
 
 ## TL;DR
 
@@ -249,16 +249,14 @@ Why `agentica-agent/dist/` (inside the package) and not a sibling `dist-agentica
 
 ## Phased implementation plan
 
-| Phase | Scope | Acceptance |
+| Phase | Scope | Status |
 |---|---|---|
-| **0. Deeper POC** | Spike a realistic agent task: clone a repo, give agentica all tools, ask it to implement a small Linear-issue-shaped task end-to-end. Iterative tool use, real test runs. | Agent successfully edits multi-file change + passes a test. Document any framework limits found. |
-| **1. Subprocess skeleton** ✅ | `agentica-agent/` builds, main.ts spawns hosted agent with the full tool surface, reads env-passed prompt, exits with status code. | `npm run build:agentica-agent` produces `agentica-agent/dist/main.js`; `npm run smoke:agentica-agent` runs end-to-end with a hard-coded prompt. **Done 2026-05-23.** |
-| **2. Tool surface** | Implement all tools from §"Tool surface". Unit tests for each. | Tests pass; tools mirror Claude Code's behaviour on simple file/shell operations. |
-| **3. Pipeline integration** | `feedback-loop.ts` branches on `mapping.agent`. Subprocess invocation matches Claude Code's invocation pattern (env-var contract, exit codes, stdout streaming). | E2E test: a Linear issue with `agent=agentica` mapping runs through the pipeline, opens a PR. Same Linear issue with `agent=claude-code` opens an equivalent PR. |
-| **4. Admin UI + schema** | DB migration adds `agent` column; admin UI drawer exposes the dropdown. | New project mappings default to `claude-code`; agentica selectable via UI. |
-| **5. Fallback logic** | Primary→fallback model retry on transient errors. Telemetry tags agentica runs in `dispatch_log`. | Forced failures retry on fallback; logs reflect routing. |
-
-Phases 0–3 are the MVP. Phases 4–5 polish.
+| **0. Deeper POC** ✅ | Spike iterative tool use, error recovery, streaming. | Done 2026-05-23. |
+| **1. Subprocess skeleton** ✅ | `agentica-agent/` builds, spawns hosted agent, exits with status. | Done 2026-05-23. |
+| **2. Tool surface** ✅ | All tools implemented with unit tests. | Done 2026-05-23. |
+| **3. Pipeline integration** ✅ | `run-autonomous.ts` branches on `AI_IMPLEMENT_AGENT` env var to select executor. | Done 2026-05-23. |
+| **4. Admin UI + schema** ✅ | DB `agent` column + admin UI dropdown. | Done 2026-05-24. |
+| **5. Fallback + telemetry** ✅ | Exit-code-2 retry with fallback model. `dispatch_log.agent` column. | Done 2026-05-24. |
 
 ## Risks & open questions
 
@@ -276,8 +274,8 @@ Phases 0–3 are the MVP. Phases 4–5 polish.
 - The `add-agentica-support` branch's runtime-library work. That branch stays parked on the remote; if a customer wants both runtime library + agent (alphawheel might), we resurrect it later.
 - Workflow file changes. `WORKFLOW.md`'s schema stays the same; just the consumer changes.
 
-## Next decisions for you
+## Decisions made
 
-1. Approve / amend phasing — especially whether phase 0 (deeper POC) is required before phase 1.
-2. Confirm subprocess approach over in-process import (already chosen in design conversation, but worth pinning).
-3. Decide whether `agent: "agentica"` should also surface in the admin UI for fresh projects (vs being a hidden field set via DB only at first).
+1. Phase 0 (deeper POC) was completed before phase 1; all open questions resolved.
+2. Subprocess approach confirmed over in-process import.
+3. Agent selector is exposed in the admin UI for all projects (not hidden).
