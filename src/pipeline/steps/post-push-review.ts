@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import type { StepModule } from "../types.js";
+import type { StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import {
   collectExternalReviewFindingsFromGh,
@@ -200,26 +200,6 @@ function extractCommentIdWithMarker(stdout: string, marker: string): number | nu
   return null;
 }
 
-function isDeferredOrNonBlocking(text: string): boolean {
-  return /\b(later tasks?|future tasks?|future work|later cleanup|cleanup pass|cosmetic note|minor cosmetic|nice[- ]to[- ]have|at some point|not required|not required by this task|not blocking|non[- ]blocking|optional|consider)\b/i
-    .test(text);
-}
-
-function hasStrongActionSignal(text: string): boolean {
-  return /\b(must|needs?|required fix|fix required|blocking|blocker|not ready|bug|missing|incomplete|incorrect|unsafe|regression|breaks?|fails?|failure)\b/i
-    .test(text);
-}
-
-function feedbackImpliesFixNeeded(feedback: string): boolean {
-  if (isDeferredOrNonBlocking(feedback)) return false;
-  return /\b(worth addressing|should\s+(?:be\s+)?(?:fix(?:ed)?|address(?:ed)?|handle(?:d)?|include(?:d)?|add(?:ed)?|remove(?:d)?|update(?:d)?|change(?:d)?)|must|needs?|required fix|fix required|fix(?:es|ing)?\s+(?:the\s+)?(?:bug|issue|problem|failure|regression|breakage)|there\s+is\s+(?:a\s+)?bug|bug\s+(?:found|remain(?:s|ing)?|causes?|in|where|when|with|because|that\s+(?:causes|breaks?|fails?))|regression\s+(?:found|remain(?:s|ing)?|causes?|in|where|when|with|because)|blocking issue|issue(?:s)?\s+(?:found|to fix|remain|remaining|required)|missing|incomplete|at minimum|incorrect|unsafe|breaks?|fails?)\b/i
-    .test(feedback);
-}
-
-function filterNonBlockingIssues(issues: string[]): string[] {
-  return issues.filter((issue) => !(isDeferredOrNonBlocking(issue) && !hasStrongActionSignal(issue)));
-}
-
 function dedupeIssuesAgainstExternalFindings(
   issues: string[],
   externalFindings: ReviewLedgerFinding[],
@@ -339,6 +319,33 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
   }
 }
 
+async function reportInvalidStructuredReview(
+  reporter: StepReporter,
+  ghSpawn: (args: string[]) => SpawnResult,
+  prNumber: string,
+  iteration: number,
+  feedback: string,
+) {
+  await reporter.report({
+    id: `post-push-review.${iteration}`,
+    type: "custom",
+    status: "failed",
+    started_at: new Date().toISOString(),
+    ended_at: new Date().toISOString(),
+    parent_step_id: "post-push-review",
+    inputs: { iteration, prNumber },
+    outputs: { approved: false, feedback, issues: [feedback] },
+    logs_url: null,
+  });
+  const marker = `<!-- ai-implement post-push iter=${iteration} review-invalid -->`;
+  postPrComment(
+    ghSpawn,
+    prNumber,
+    `${marker}\n⚠️ Post-push review returned invalid output.\n\n${feedback}\n\nThe implementation PR is still available, but this automated review pass did not finish. No actionable code feedback was produced by this review attempt.\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
+    marker,
+  );
+}
+
 export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReviewOutputs> = {
   async run(context, inputs, reporter) {
     const ghSpawn = inputs.ghSpawn ?? makeDefaultGhSpawn(inputs.workspaceDir);
@@ -378,7 +385,9 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 Set approved=true only when no code changes are needed. If you find any bug,
 missing requirement, unsafe behavior, test gap, or follow-up that should be
 fixed in this PR, set approved=false and put every actionable item in issues[].
-Do not approve while listing "minor issues worth addressing" in feedback.
+The orchestrator treats issues[] as the only blocking finding list; it will not
+infer blockers from feedback prose. If something must be fixed before merge, it
+must be present in issues[].
 Do not set approved=false for future/later-task concerns that are not required
 by this issue; mention those in feedback only.
 
@@ -467,23 +476,23 @@ Output ONLY valid JSON: {"approved": bool, "issues": [string], "score": int, "pr
         break;
       }
 
-      feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
-      let issues = Array.isArray(parsed.issues)
-        ? parsed.issues.filter((issue): issue is string => typeof issue === "string")
-        : [];
-      issues = filterNonBlockingIssues(issues);
-      if (issues.length === 0 && parsed.approved === true && feedbackImpliesFixNeeded(feedback)) {
-        issues.push(feedback);
+      if (
+        typeof parsed.approved !== "boolean"
+        || !Array.isArray(parsed.issues)
+        || parsed.issues.some((issue) => typeof issue !== "string")
+      ) {
+        feedback = "Reviewer returned invalid structured review output: expected approved:boolean and issues:string[].";
+        await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
+        break;
       }
+
+      feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
+      let issues = parsed.issues.map((issue) => issue.trim()).filter((issue) => issue.length > 0);
       issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
-      if (issues.length === 0 && parsed.approved === false && !feedbackImpliesFixNeeded(feedback) && !hasExternalBlockers) {
-        approved = true;
-        feedback = feedback || "Reviewer did not identify actionable blockers.";
-      } else if (issues.length === 0 && parsed.approved === false && feedbackImpliesFixNeeded(feedback)) {
-        issues.push(feedback || "Reviewer marked the PR not ready but did not provide actionable issue details.");
-        issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
-      } else if (issues.length === 0 && parsed.approved === false && !hasExternalBlockers) {
-        issues.push("Reviewer marked the PR not ready but did not provide actionable issue details.");
+      if (issues.length === 0 && parsed.approved === false && !hasExternalBlockers) {
+        feedback = "Reviewer returned invalid structured review output: approved=false requires at least one issues[] entry.";
+        await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
+        break;
       }
       approved = approved || (parsed.approved === true && issues.length === 0 && !hasExternalBlockers);
       reviewHistory.push({ iteration, issues: [...issues], feedback });

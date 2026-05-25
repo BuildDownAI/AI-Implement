@@ -485,7 +485,7 @@ describe("postPushReviewStep", () => {
     expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(0);
   });
 
-  it("runs a fix pass when approved feedback contains actionable language but issues is empty", async () => {
+  it("does not run a fix pass when approved feedback contains actionable language but issues is empty", async () => {
     const approvedWithFeedback = JSON.stringify({
       approved: true,
       issues: [],
@@ -510,9 +510,9 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(false);
-    expect(invoke).toHaveBeenCalledTimes(2);
-    expect(invoke.mock.calls[1][0].prompt).toContain("Two minor issues worth addressing");
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
   });
 
   it("does not run a fix pass for deferred future-task concerns", async () => {
@@ -569,11 +569,11 @@ describe("postPushReviewStep", () => {
     expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
   });
 
-  it("approves malformed not-ready reviews when no actionable blocker is present", async () => {
+  it("requires structured issues when reviewer marks a PR not ready", async () => {
     const notReadyWithoutBlocker = JSON.stringify({
       approved: false,
-      issues: ["Clean resolution of the cosmetic note. All core requirements remain correctly in place. No regressions observed."],
-      feedback: "Clean resolution of the cosmetic note. All core requirements remain correctly in place. No regressions observed.",
+      issues: [],
+      feedback: "There is a bug in the timer restart flow, so this is not ready.",
       score: 9,
       progress_delta: 0,
     });
@@ -595,10 +595,11 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(true);
+    expect(out.approved).toBe(false);
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(ghComments.some((comment) => comment.includes("Ready to merge"))).toBe(true);
-    expect(ghComments.some((comment) => comment.includes("Not ready to merge"))).toBe(false);
+    expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
+    expect(ghComments.some((comment) => comment.includes("invalid structured review output"))).toBe(true);
+    expect(ghComments.some((comment) => comment.includes("Manual review required"))).toBe(true);
   });
 
   it("does not treat benign should-pass approval language as actionable", async () => {
