@@ -628,6 +628,33 @@ describe("postPushReviewStep", () => {
     expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
   });
 
+  it("does not treat resolved prior blockers in approval feedback as actionable", async () => {
+    const approvedWithResolvedBlockers = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Both Review 1 blockers are resolved. The expired-timer restart bug is fixed and the regression test covers it. Merge readiness: ready to merge.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: approvedWithResolvedBlockers, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
+  });
+
   it("does not fail the job when post-push reviewer LLM exits non-zero", async () => {
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {

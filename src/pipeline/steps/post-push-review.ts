@@ -212,7 +212,7 @@ function hasStrongActionSignal(text: string): boolean {
 
 function feedbackImpliesFixNeeded(feedback: string): boolean {
   if (isDeferredOrNonBlocking(feedback)) return false;
-  return /\b(worth addressing|should\s+(?:be\s+)?(?:fix(?:ed)?|address(?:ed)?|handle(?:d)?|include(?:d)?|add(?:ed)?|remove(?:d)?|update(?:d)?|change(?:d)?)|must|needs?|fix|bug|blocking issue|issue(?:s)?\s+(?:found|to fix|remain|remaining|required)|missing|incomplete|at minimum|incorrect|unsafe|regression|breaks?|fails?)\b/i
+  return /\b(worth addressing|should\s+(?:be\s+)?(?:fix(?:ed)?|address(?:ed)?|handle(?:d)?|include(?:d)?|add(?:ed)?|remove(?:d)?|update(?:d)?|change(?:d)?)|must|needs?|required fix|fix required|fix(?:es|ing)?\s+(?:the\s+)?(?:bug|issue|problem|failure|regression|breakage)|there\s+is\s+(?:a\s+)?bug|bug\s+(?:found|remain(?:s|ing)?|causes?|in|where|when|with|because|that\s+(?:causes|breaks?|fails?))|regression\s+(?:found|remain(?:s|ing)?|causes?|in|where|when|with|because)|blocking issue|issue(?:s)?\s+(?:found|to fix|remain|remaining|required)|missing|incomplete|at minimum|incorrect|unsafe|breaks?|fails?)\b/i
     .test(feedback);
 }
 
