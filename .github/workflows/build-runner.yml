@@ -24,7 +24,6 @@ on:
         description: "Runner image channel to publish. Policy: main -> latest, testing -> next."
         type: choice
         required: true
-        default: next
         options:
           - next
           - latest
@@ -123,7 +122,7 @@ jobs:
           set -euo pipefail
           digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
 
-          if ! current_sha=$(git ls-remote origin "refs/heads/${{ github.ref_name }}" | awk '{print $1}'); then
+          if ! current_sha=$(git ls-remote origin "refs/heads/$GITHUB_REF_NAME" | awk '{print $1}'); then
             echo "::error::Could not verify current head for ${{ github.ref_name }}. Re-run this job after the transient failure clears to re-test and promote the digest image." >&2
             exit 1
           fi

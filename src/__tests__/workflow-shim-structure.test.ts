@@ -33,6 +33,7 @@ describe("GHA workflow shims", () => {
     expect(doc.on.push.branches).toEqual(["main", "testing"]);
     expect(doc.on.workflow_dispatch.inputs.channel.type).toBe("choice");
     expect(doc.on.workflow_dispatch.inputs.channel.description).toContain("main -> latest, testing -> next");
+    expect(doc.on.workflow_dispatch.inputs.channel.default).toBeUndefined();
     expect(doc.on.workflow_dispatch.inputs.channel.options).toEqual(["next", "latest"]);
     expect(doc.concurrency.group).toBe("build-runner-${{ github.ref_name }}");
     expect(doc.concurrency["cancel-in-progress"]).toBe(true);
@@ -60,7 +61,8 @@ describe("GHA workflow shims", () => {
     expect(promoteStep.name).toContain("tested digest");
     expect(promoteStep.run).toContain("set -euo pipefail");
     expect(promoteStep.run).toContain('digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"');
-    expect(promoteStep.run).toContain('git ls-remote origin "refs/heads/${{ github.ref_name }}"');
+    expect(promoteStep.run).toContain('git ls-remote origin "refs/heads/$GITHUB_REF_NAME"');
+    expect(promoteStep.run).not.toContain('refs/heads/${{ github.ref_name }}');
     expect(promoteStep.run).toContain("Could not verify current head");
     expect(promoteStep.run).toContain("re-test and promote the digest image");
     expect(promoteStep.run).toContain('if [ "$current_sha" != "${{ github.sha }}" ]; then');
