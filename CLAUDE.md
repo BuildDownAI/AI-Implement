@@ -223,7 +223,15 @@ The image must be publicly pullable. The customer owns building and publishing i
 
 The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
 
-Typical use: your repo needs a language runtime or tool that isn't in the base image (e.g. terraform, ruby, go). Build an image `FROM` the published base `ghcr.io/builddownai/ai-implement-runner:latest`, add your tools, push, and point `image.yml` at it.
+Runner image channels:
+
+- `ghcr.io/builddownai/ai-implement-runner:latest` is published from `main` and is the stable default for production orchestrators and synced target-repo workflows.
+- `ghcr.io/builddownai/ai-implement-runner:next` is published from `testing` and is intended for staging/testing orchestrators. Set `SESSION_IMAGE=ghcr.io/builddownai/ai-implement-runner:next` in that orchestrator environment to keep it paired with the testing runner.
+- Commit SHA tags are pushed first, then the build digest is smoke-tested before any mutable channel is promoted. Use the immutable digest for the strongest rollback pin; the SHA tag is a convenient lookup tag for the same build.
+- Channel-scoped date/debug tags are promoted only after the digest image passes smoke testing. They use `base-<channel>-vYYYYMMDD-<12-char-sha>` (for example, `base-next-v20260526-abc123def456`) so `latest` and `next` builds do not collide and same-day builds do not overwrite each other.
+- Cancelled or failed runs can leave SHA-only images with no channel pointer. That is intentional fail-closed behavior; clean old SHA-only images through GHCR retention/cleanup rather than relying on mutable channel tags for retention.
+
+Typical custom-image use: your repo needs a language runtime or tool that isn't in the base image (e.g. terraform, ruby, go). Build an image `FROM` the channel that matches your orchestrator (`latest` for production, `next` for testing), add your tools, push, and point `image.yml` at it.
 
 ## Multi-client deploy
 
