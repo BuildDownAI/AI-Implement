@@ -189,6 +189,18 @@ function formatIssueList(issues: ReviewIssue[]): string {
   }).join("\n");
 }
 
+function formatIssueListForPrompt(issues: ReviewIssue[]): string {
+  return issues.map((issue, index) => {
+    if (issue.rawText) return `${index + 1}. ${issue.rawText}`;
+
+    const lines = [`${index + 1}. ${issue.title}`];
+    if (issue.location) lines.push(`   - Location: ${issue.location}`);
+    if (issue.problem) lines.push(`   - Problem: ${issue.problem}`);
+    if (issue.requiredFix) lines.push(`   - Required fix: ${issue.requiredFix}`);
+    return lines.join("\n");
+  }).join("\n");
+}
+
 function normalizeForComparison(text: string): string {
   return text.toLowerCase().replace(/[`*_()[\]{}.,:;!?'"-]+/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -220,7 +232,7 @@ function formatReviewHistory(history: ReviewFinding[]): string {
   }
 
   return history.map((finding) => {
-    const issueList = finding.issues.length > 0 ? formatIssueList(finding.issues) : "None provided.";
+    const issueList = finding.issues.length > 0 ? formatIssueListForPrompt(finding.issues) : "None provided.";
     return `Review ${finding.iteration}:
 Issues:
 ${issueList}
@@ -640,7 +652,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       );
 
       const issueList = issues.length > 0
-        ? formatIssueList(issues)
+        ? formatIssueListForPrompt(issues)
         : "None provided.";
 
       const fixPrompt = `You are fixing reviewer feedback on PR #${prNumber} for issue ${context.data.issueIdentifier}: ${context.data.issueTitle}.

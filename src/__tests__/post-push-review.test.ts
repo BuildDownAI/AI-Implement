@@ -1069,8 +1069,8 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(true);
     const secondReviewPrompt = invoke.mock.calls[2][0].prompt;
     expect(secondReviewPrompt).toContain("Review 1:");
-    expect(secondReviewPrompt).toContain("1. **First-visit hydration state is unsafe**");
-    expect(secondReviewPrompt).toContain("Location: `src/app/page.tsx`");
+    expect(secondReviewPrompt).toContain("1. First-visit hydration state is unsafe");
+    expect(secondReviewPrompt).toContain("Location: src/app/page.tsx");
     expect(secondReviewPrompt).toContain("Problem: The first render can decide panel visibility before browser-only sessionStorage state is available.");
     expect(secondReviewPrompt).toContain(`Required fix: ${requiredFix}`);
   });
@@ -1116,7 +1116,8 @@ describe("postPushReviewStep", () => {
     expect(reviewComment).toContain(requiredFix);
 
     const fixPrompt = invoke.mock.calls[1][0].prompt;
-    expect(fixPrompt).toContain("**First-visit detection is incomplete**");
+    expect(fixPrompt).toContain("First-visit detection is incomplete");
+    expect(fixPrompt).not.toContain("**First-visit detection is incomplete**");
     expect(fixPrompt).toContain(requiredFix);
     expect(fixPrompt).not.toContain(`${requiredFix.slice(0, 80)}...`);
   });
@@ -1199,6 +1200,13 @@ describe("postPushReviewStep", () => {
     expect(reviewComment).toContain("Location: `src/app/'weird'.tsx`");
     expect(reviewComment).toContain("Do not render \\[click me\\]\\(https://example.com\\) as a link.");
     expect(reviewComment).toContain("Escape \\*markdown\\* before posting.");
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Fix **unsafe** label");
+    expect(fixPrompt).toContain("src/app/`weird`.tsx");
+    expect(fixPrompt).toContain("Do not render [click me](https://example.com) as a link.");
+    expect(fixPrompt).toContain("Escape *markdown* before posting.");
+    expect(fixPrompt).not.toContain("\\[click me\\]\\(https://example.com\\)");
   });
 
   it("includes unresolved structured issues when a fix pass makes no file changes", async () => {
