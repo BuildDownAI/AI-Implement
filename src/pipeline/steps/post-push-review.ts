@@ -131,6 +131,7 @@ function parseReviewIssue(value: unknown): ReviewIssue | null {
   const requiredFix = stringValue(issue.required_fix) || stringValue(issue.requiredFix) || stringValue(issue.fix) || stringValue(issue.recommendation);
   const rawText = stringValue(issue.text);
   if (!problem && !requiredFix && !rawText) return null;
+  if (rawText && !problem && !requiredFix) return issueFromString(rawText);
 
   return {
     title,
@@ -164,14 +165,26 @@ function plainIssueText(issue: ReviewIssue): string {
   ].filter(Boolean).join("\n");
 }
 
+function escapeMarkdownText(text: string): string {
+  return text
+    .replace(/\\/g, "\\\\")
+    .replace(/`/g, "\\`")
+    .replace(/\*/g, "\\*")
+    .replace(/_/g, "\\_")
+    .replace(/\[/g, "\\[")
+    .replace(/\]/g, "\\]")
+    .replace(/\(/g, "\\(")
+    .replace(/\)/g, "\\)");
+}
+
 function formatIssueList(issues: ReviewIssue[]): string {
   return issues.map((issue, index) => {
     if (issue.rawText) return `${index + 1}. ${issue.rawText}`;
 
-    const lines = [`${index + 1}. **${issue.title}**`];
+    const lines = [`${index + 1}. **${escapeMarkdownText(issue.title)}**`];
     if (issue.location) lines.push(`   - Location: \`${issue.location.replace(/`/g, "'")}\``);
-    if (issue.problem) lines.push(`   - Problem: ${issue.problem}`);
-    if (issue.requiredFix) lines.push(`   - Required fix: ${issue.requiredFix}`);
+    if (issue.problem) lines.push(`   - Problem: ${escapeMarkdownText(issue.problem)}`);
+    if (issue.requiredFix) lines.push(`   - Required fix: ${escapeMarkdownText(issue.requiredFix)}`);
     return lines.join("\n");
   }).join("\n");
 }
@@ -395,6 +408,16 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
   }
 }
 
+function failedReviewOutputs(feedback: string) {
+  const issue = issueFromString(feedback);
+  return {
+    approved: false,
+    feedback,
+    issues: [plainIssueText(issue)],
+    blockingIssues: [issue],
+  };
+}
+
 async function reportInvalidStructuredReview(
   reporter: StepReporter,
   ghSpawn: (args: string[]) => SpawnResult,
@@ -410,7 +433,7 @@ async function reportInvalidStructuredReview(
     ended_at: new Date().toISOString(),
     parent_step_id: "post-push-review",
     inputs: { iteration, prNumber },
-    outputs: { approved: false, feedback, issues: [feedback] },
+    outputs: failedReviewOutputs(feedback),
     logs_url: null,
   });
   const marker = `<!-- ai-implement post-push iter=${iteration} review-invalid -->`;
@@ -504,7 +527,7 @@ ${DIFF_INJECTION_PREAMBLE}
 ${diffRes.stdout}
 </pr_diff>
 
-Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string", "location": "file/function or empty string", "problem": "full failing behavior", "required_fix": "full required fix"}], "score": int, "progress_delta": int, "feedback": "string"}.`;
+Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string", "location": "file/function; omit when unknown", "problem": "full failing behavior", "required_fix": "full required fix"}], "score": int, "progress_delta": int, "feedback": "string"}.`;
 
       const reviewResult = await context.llmExecutor.invoke({ prompt: reviewPrompt, model, maxTurns: REVIEW_MAX_TURNS });
       if (reviewResult.exitCode !== 0) {
@@ -518,7 +541,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           ended_at: new Date().toISOString(),
           parent_step_id: "post-push-review",
           inputs: { iteration, prNumber },
-          outputs: { approved: false, feedback, issues: [feedback] },
+          outputs: failedReviewOutputs(feedback),
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} review-failed -->`;
@@ -544,7 +567,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           ended_at: new Date().toISOString(),
           parent_step_id: "post-push-review",
           inputs: { iteration, prNumber },
-          outputs: { approved: false, feedback, issues: [feedback] },
+          outputs: failedReviewOutputs(feedback),
           logs_url: null,
         });
         const marker = `<!-- ai-implement post-push iter=${iteration} review-invalid -->`;

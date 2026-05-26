@@ -685,11 +685,53 @@ describe("postPushReviewStep", () => {
     expect(report).toHaveBeenCalledWith(expect.objectContaining({
       id: "post-push-review.1",
       status: "failed",
+      outputs: expect.objectContaining({
+        issues: [expect.stringContaining("claude auth temporarily unavailable")],
+        blockingIssues: [expect.objectContaining({
+          rawText: expect.stringContaining("claude auth temporarily unavailable"),
+        })],
+      }),
     }));
     expect(ghComments.some((comment) => comment.includes("review-failed"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("No actionable code feedback was produced"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Manual review required; automated review did not complete"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Not ready to merge until manually reviewed"))).toBe(false);
+  });
+
+  it("reports invalid non-JSON reviewer output with structured blocking issue outputs", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const report = vi.fn(async () => undefined);
+    const ctx = makeCtx(vi.fn(async () => ({
+      stdout: "this is not json",
+      exitCode: 0,
+      tokensUsed: 100,
+    })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
+      { report },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(report).toHaveBeenCalledWith(expect.objectContaining({
+      id: "post-push-review.1",
+      status: "failed",
+      outputs: expect.objectContaining({
+        issues: [expect.stringContaining("Reviewer returned non-JSON output")],
+        blockingIssues: [expect.objectContaining({
+          rawText: expect.stringContaining("Reviewer returned non-JSON output"),
+        })],
+      }),
+    }));
+    expect(ghComments.some((comment) => comment.includes("review-invalid"))).toBe(true);
   });
 
   it("does not fail the job when a post-push fix-pass LLM exits non-zero", async () => {
@@ -1077,6 +1119,86 @@ describe("postPushReviewStep", () => {
     expect(fixPrompt).toContain("**First-visit detection is incomplete**");
     expect(fixPrompt).toContain(requiredFix);
     expect(fixPrompt).not.toContain(`${requiredFix.slice(0, 80)}...`);
+  });
+
+  it("renders text-only blocking issue objects like legacy string issues", async () => {
+    const issueText = "The reviewer returned a legacy text-only object that should stay flat in comments and prompts.";
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{ text: issueText }],
+      feedback: issueText,
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain(`Blocking issues:\n1. ${issueText}`);
+    expect(reviewComment).not.toContain("**Blocking issue**");
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain(`Issues:\n1. ${issueText}`);
+    expect(fixPrompt).not.toContain("**Blocking issue**");
+  });
+
+  it("escapes markdown control characters in structured issue fields", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "Fix **unsafe** label",
+        location: "src/app/`weird`.tsx",
+        problem: "Do not render [click me](https://example.com) as a link.",
+        required_fix: "Escape *markdown* before posting.",
+      }],
+      feedback: "Structured fields contain markdown.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("**Fix \\*\\*unsafe\\*\\* label**");
+    expect(reviewComment).toContain("Location: `src/app/'weird'.tsx`");
+    expect(reviewComment).toContain("Do not render \\[click me\\]\\(https://example.com\\) as a link.");
+    expect(reviewComment).toContain("Escape \\*markdown\\* before posting.");
   });
 
   it("includes unresolved structured issues when a fix pass makes no file changes", async () => {
