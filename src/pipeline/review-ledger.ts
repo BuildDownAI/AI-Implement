@@ -23,6 +23,16 @@ export interface GhResult {
 
 export type GhSpawn = (args: string[]) => GhResult;
 
+const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
+  "ai-implement",
+  "ai-implement[bot]",
+  "claude",
+  "claude[bot]",
+  "claude-code[bot]",
+  "github-actions",
+  "github-actions[bot]",
+]);
+
 export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): ReviewLedgerFinding[] {
   const findings: ReviewLedgerFinding[] = [];
 
@@ -294,7 +304,7 @@ function getCommentNodes(thread: Record<string, unknown>): unknown[] | undefined
 
 function isLikelyClaudeReviewComment(comment: Record<string, unknown>): comment is Record<string, unknown> & { body: string } {
   if (typeof comment.body !== "string" || isAiImplementComment(comment.body)) return false;
-  return isClaudeAuthor(comment) || hasClaudeReviewHeading(comment.body);
+  return isClaudeAuthor(comment) && hasClaudeReviewHeading(comment.body);
 }
 
 function isAiImplementComment(body: string): boolean {
@@ -304,12 +314,11 @@ function isAiImplementComment(body: string): boolean {
 function isClaudeAuthor(comment: Record<string, unknown>): boolean {
   const user = comment.user;
   if (!isRecord(user) || typeof user.login !== "string") return false;
-  return user.login.toLowerCase().includes("claude");
+  return TRUSTED_REVIEW_COMMENT_AUTHORS.has(user.login.toLowerCase());
 }
 
 function hasClaudeReviewHeading(body: string): boolean {
-  return /(?:^|\n)\s{0,3}#{1,6}\s+(?:Code Review|Follow-up Review|Code Review Complete|Changes Requested)\b/i.test(body)
-    || /(?:^|\n)\s*Changes Requested\b/i.test(body);
+  return /(?:^|\n)\s{0,3}#{1,6}\s+(?:Code Review|Follow-up Review|Code Review Complete|Changes Requested)\b/i.test(body);
 }
 
 function hasLineLocation(finding: ReviewLedgerFinding): boolean {

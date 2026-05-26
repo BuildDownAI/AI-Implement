@@ -230,7 +230,7 @@ describe("installStep", () => {
     expect(outputs.reviewProviders).toEqual([]);
   });
 
-  it("treats unknown-only reviewProviders as absent", async () => {
+  it("treats unknown-only reviewProviders as explicit empty config", async () => {
     mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
     vi.mocked(fs.readFileSync).mockReturnValue(
       "reviewProviders:\n  - unsupported-reviewer\n",
@@ -242,7 +242,7 @@ describe("installStep", () => {
       new NoopStepReporter(),
     );
 
-    expect(outputs.reviewProviders).toBeUndefined();
+    expect(outputs.reviewProviders).toEqual([]);
   });
 
   it("treats malformed reviewProviders config as absent", async () => {

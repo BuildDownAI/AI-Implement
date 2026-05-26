@@ -348,6 +348,94 @@ describe("collectExternalReviewFindingsFromGh", () => {
     ]);
   });
 
+  it("ignores Claude-like usernames that are not trusted automation authors", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) {
+        return { exitCode: 0, stdout: "[]" };
+      }
+
+      if (isIssueCommentsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            {
+              user: { login: "claude-fan-99" },
+              body: "### Code Review\n\n## Blocking\n- Spoofed blocker should not be trusted.",
+              html_url: "https://example.com/spoofed",
+            },
+            {
+              user: { login: "aclaudeuser" },
+              body: "### Code Review\n\n## Blocking\n- Another spoofed blocker.",
+              html_url: "https://example.com/spoofed-2",
+            },
+          ]),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+  });
+
+  it("accepts trusted automation authors only when the comment has a Claude review heading", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) {
+        return { exitCode: 0, stdout: "[]" };
+      }
+
+      if (isIssueCommentsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            {
+              user: { login: "github-actions[bot]" },
+              body: "No Changes Requested here.\n\n## Blocking\n- This plain text is not a Claude review.",
+              html_url: "https://example.com/plain-actions",
+            },
+            {
+              user: { login: "ai-implement[bot]" },
+              body: "### Code Review\n\n## Blocking\n- Trusted app review blocker.",
+              html_url: "https://example.com/app-review",
+            },
+            {
+              user: { login: "github-actions" },
+              body: "### Changes Requested\n\n## Blocking\n- Trusted GitHub Actions review blocker.",
+              html_url: "https://example.com/actions-review",
+            },
+          ]),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Trusted app review blocker.",
+        url: "https://example.com/app-review",
+      },
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Trusted GitHub Actions review blocker.",
+        url: "https://example.com/actions-review",
+      },
+    ]);
+  });
+
   it("deduplicates external findings by body while preferring path and line context", () => {
     const ghSpawn: GhSpawn = (args) => {
       if (isPullReviewsRequest(args)) {
@@ -554,6 +642,36 @@ describe("collectExternalReviewFindingsFromGh", () => {
         source: "github-review",
         severity: "blocking",
         body: "Keep already collected review findings.",
+        url: "https://example.com/review",
+      },
+    ]);
+  });
+
+  it("does not throw when ghSpawn throws while collecting external findings", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            {
+              state: "CHANGES_REQUESTED",
+              user: { login: "reviewer-a" },
+              body: "Keep findings collected before a later gh failure.",
+              html_url: "https://example.com/review",
+            },
+          ]),
+        };
+      }
+
+      throw new Error(`gh failed: ${args.join(" ")}`);
+    };
+
+    expect(() => collectExternalReviewFindingsFromGh(ghSpawn, "42")).not.toThrow();
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
+      {
+        source: "github-review",
+        severity: "blocking",
+        body: "Keep findings collected before a later gh failure.",
         url: "https://example.com/review",
       },
     ]);

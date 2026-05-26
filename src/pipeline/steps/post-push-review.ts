@@ -374,6 +374,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
+      // Re-fetch each iteration so review comments posted during a fix pass can still gate merge readiness.
       const externalFindings: ReviewLedgerFinding[] = shouldCollectExternalReviewFindings(inputs.reviewProviders)
         ? collectExternalReviewFindingsFromGh(ghSpawn, prNumber)
         : [];

@@ -48,7 +48,7 @@ function parseReviewProvidersConfig(value: unknown): string[] | undefined {
   const providers = value.filter((provider): provider is string =>
     typeof provider === "string" && KNOWN_REVIEW_PROVIDERS.has(provider),
   );
-  return providers.length > 0 ? providers : undefined;
+  return providers;
 }
 
 function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
