@@ -685,11 +685,53 @@ describe("postPushReviewStep", () => {
     expect(report).toHaveBeenCalledWith(expect.objectContaining({
       id: "post-push-review.1",
       status: "failed",
+      outputs: expect.objectContaining({
+        issues: [expect.stringContaining("claude auth temporarily unavailable")],
+        blockingIssues: [expect.objectContaining({
+          rawText: expect.stringContaining("claude auth temporarily unavailable"),
+        })],
+      }),
     }));
     expect(ghComments.some((comment) => comment.includes("review-failed"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("No actionable code feedback was produced"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Manual review required; automated review did not complete"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Not ready to merge until manually reviewed"))).toBe(false);
+  });
+
+  it("reports invalid non-JSON reviewer output with structured blocking issue outputs", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const report = vi.fn(async () => undefined);
+    const ctx = makeCtx(vi.fn(async () => ({
+      stdout: "this is not json",
+      exitCode: 0,
+      tokensUsed: 100,
+    })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
+      { report },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(report).toHaveBeenCalledWith(expect.objectContaining({
+      id: "post-push-review.1",
+      status: "failed",
+      outputs: expect.objectContaining({
+        issues: [expect.stringContaining("Reviewer returned non-JSON output")],
+        blockingIssues: [expect.objectContaining({
+          rawText: expect.stringContaining("Reviewer returned non-JSON output"),
+        })],
+      }),
+    }));
+    expect(ghComments.some((comment) => comment.includes("review-invalid"))).toBe(true);
   });
 
   it("does not fail the job when a post-push fix-pass LLM exits non-zero", async () => {
@@ -972,14 +1014,243 @@ describe("postPushReviewStep", () => {
     const secondReviewPrompt = invoke.mock.calls[2][0].prompt;
     expect(firstReviewPrompt).toContain("complete merge-readiness review");
     expect(firstReviewPrompt).toContain("Do not stop after the first issue");
-    expect(firstReviewPrompt).toContain("Every issues[] entry must be self-contained");
+    expect(firstReviewPrompt).toContain("Every blocking_issues[] entry must be self-contained");
     expect(secondReviewPrompt).toContain("Review 1:");
     expect(secondReviewPrompt).toContain("1. Fix auth flow");
     expect(secondReviewPrompt).toContain("first verify every previous issue is fixed");
     expect(invoke.mock.calls[1][0]).toEqual(expect.objectContaining({ maxTurns: 45 }));
   });
 
-  it("omits duplicate review summaries and compacts long blocking issues in PR comments", async () => {
+  it("includes structured issue details in follow-up review history", async () => {
+    const requiredFix = "Move the sessionStorage read into the hydrated effect and keep the dismissed flag synchronized when the first-visit panel is closed.";
+    const firstReview = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "First-visit hydration state is unsafe",
+        location: "src/app/page.tsx",
+        problem: "The first render can decide panel visibility before browser-only sessionStorage state is available.",
+        required_fix: requiredFix,
+      }],
+      feedback: "The first-visit state handling still needs one fix.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const secondReview = JSON.stringify({
+      approved: true,
+      blocking_issues: [],
+      feedback: "Looks good.",
+      score: 9,
+      progress_delta: 1,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M src/app/page.tsx\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "codex/structured-review-feedback\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/codex/structured-review-feedback\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tsrc/app/page.tsx\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn()
+      .mockResolvedValueOnce({ stdout: firstReview, exitCode: 0, tokensUsed: 100 })
+      .mockResolvedValueOnce({ stdout: "", exitCode: 0, tokensUsed: 100 })
+      .mockResolvedValueOnce({ stdout: secondReview, exitCode: 0, tokensUsed: 100 });
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    const secondReviewPrompt = invoke.mock.calls[2][0].prompt;
+    expect(secondReviewPrompt).toContain("Review 1:");
+    expect(secondReviewPrompt).toContain("1. First-visit hydration state is unsafe");
+    expect(secondReviewPrompt).toContain("Location: src/app/page.tsx");
+    expect(secondReviewPrompt).toContain("Problem: The first render can decide panel visibility before browser-only sessionStorage state is available.");
+    expect(secondReviewPrompt).toContain(`Required fix: ${requiredFix}`);
+  });
+
+  it("posts full structured blocking issues in PR comments and fix prompts", async () => {
+    const requiredFix = "Read sessionStorage only after the component has mounted, keep the dismissed flag in sync when the user dismisses the first-visit panel, and preserve the isHydrated guard so server-rendered markup cannot diverge from client-rendered markup.";
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "First-visit detection is incomplete",
+        location: "src/app/page.tsx",
+        problem: "The implementation renders the first-visit panel from a default client value before sessionStorage has been checked, which can show the wrong state during hydration and can re-open a dismissed panel.",
+        required_fix: requiredFix,
+      }],
+      feedback: "The review found one blocker.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("**First-visit detection is incomplete**");
+    expect(reviewComment).toContain("Location: `src/app/page.tsx`");
+    expect(reviewComment).toContain(requiredFix);
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("First-visit detection is incomplete");
+    expect(fixPrompt).not.toContain("**First-visit detection is incomplete**");
+    expect(fixPrompt).toContain(requiredFix);
+    expect(fixPrompt).not.toContain(`${requiredFix.slice(0, 80)}...`);
+  });
+
+  it("renders text-only blocking issue objects like legacy string issues", async () => {
+    const issueText = "The reviewer returned a legacy text-only object that should stay flat in comments and prompts.";
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{ text: issueText }],
+      feedback: issueText,
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain(`Blocking issues:\n1. ${issueText}`);
+    expect(reviewComment).not.toContain("**Blocking issue**");
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain(`Issues:\n1. ${issueText}`);
+    expect(fixPrompt).not.toContain("**Blocking issue**");
+  });
+
+  it("escapes markdown control characters in structured issue fields", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "Fix **unsafe** label",
+        location: "src/app/`weird`.tsx",
+        problem: "Do not render [click me](https://example.com) as a link.",
+        required_fix: "Escape *markdown* before posting.",
+      }],
+      feedback: "Structured fields contain markdown.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("**Fix \\*\\*unsafe\\*\\* label**");
+    expect(reviewComment).toContain("Location: `src/app/'weird'.tsx`");
+    expect(reviewComment).toContain("Do not render \\[click me\\]\\(https://example.com\\) as a link.");
+    expect(reviewComment).toContain("Escape \\*markdown\\* before posting.");
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Fix **unsafe** label");
+    expect(fixPrompt).toContain("src/app/`weird`.tsx");
+    expect(fixPrompt).toContain("Do not render [click me](https://example.com) as a link.");
+    expect(fixPrompt).toContain("Escape *markdown* before posting.");
+    expect(fixPrompt).not.toContain("\\[click me\\]\\(https://example.com\\)");
+  });
+
+  it("includes unresolved structured issues when a fix pass makes no file changes", async () => {
+    const requiredFix = "Persist the dismissed state to sessionStorage before hiding the panel and ensure the initial render waits for the hydrated guard before deciding whether to show the first-visit UI.";
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "Dismissed first-visit state is lost",
+        location: "src/app/page.tsx",
+        problem: "The fix pass must not stop with a generic message because reviewers need the unresolved blocker in the terminal PR comment.",
+        required_fix: requiredFix,
+      }],
+      feedback: "Not ready until the first-visit state is fixed.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const noChangesComment = ghComments.find((comment) => comment.includes("no-changes"));
+    expect(noChangesComment).toContain("Unresolved blocking issues:");
+    expect(noChangesComment).toContain("Dismissed first-visit state is lost");
+    expect(noChangesComment).toContain(requiredFix);
+  });
+
+  it("omits duplicate review summaries without truncating legacy blocking issues in PR comments", async () => {
     const longIssue = "The parse API error path is missing user-visible error handling in app/page.tsx, so failed parse requests leave the user stuck on the input surface without feedback or a retry path. Add an error state, render it near OpenInput, and reset loading after failures.";
     const notApproved = JSON.stringify({
       approved: false,
@@ -1010,9 +1281,8 @@ describe("postPushReviewStep", () => {
     );
 
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
-    expect(reviewComment).toContain("Blocking issues:\n1. The parse API error path is missing user-visible error handling");
+    expect(reviewComment).toContain(`Blocking issues:\n1. ${longIssue}`);
     expect(reviewComment).not.toContain("Reviewer summary:");
-    expect(reviewComment!.length).toBeLessThan(longIssue.length * 2);
   });
 
   it("posts a concrete fix summary when the fixer reports one", async () => {
