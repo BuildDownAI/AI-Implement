@@ -121,7 +121,12 @@ const baseMapping: Omit<RepoMapping, "ticketingProvider" | "ticketingConfig"> = 
 };
 
 const jiraMapping = (
-  overrides: Partial<{ jql: string; repoFieldValue: string }> = {},
+  overrides: Partial<{
+    jql: string;
+    repoFieldValue: string;
+    statusFieldOverride: string | null;
+    repoFieldOverride: string | null;
+  }> = {},
 ): RepoMapping => ({
   ...baseMapping,
   ticketingProvider: "jira",
@@ -129,6 +134,8 @@ const jiraMapping = (
     kind: "jira",
     jql: overrides.jql ?? "project = TEST",
     repoFieldValue: overrides.repoFieldValue ?? "acme/x",
+    statusFieldOverride: overrides.statusFieldOverride,
+    repoFieldOverride: overrides.repoFieldOverride,
   },
 });
 
@@ -346,7 +353,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     expect(snap.needsPlanning[0].scopeKey).toBe("acme/x");
   });
 
-  it("references the status field by customfield id in the JQL wrapper (not a hardcoded display name)", async () => {
+  it("references custom fields with cf[n] syntax in the JQL wrapper", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
       .mockResolvedValueOnce(searchOk([]))
@@ -362,10 +369,35 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     // Search calls are the 2nd and 3rd fetches; listFields is the 1st.
     const bucketBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
     const capacityBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
-    expect(bucketBody.jql).toContain("customfield_10100");
+    expect(bucketBody.jql).toContain("cf[10100]");
+    expect(bucketBody.jql).not.toContain("customfield_10100");
     expect(bucketBody.jql).not.toContain('"AI-Implement Status"');
-    expect(capacityBody.jql).toContain("customfield_10100");
+    expect(capacityBody.jql).toContain("cf[10100]");
+    expect(capacityBody.jql).not.toContain("customfield_10100");
     expect(capacityBody.jql).not.toContain('"AI-Implement Status"');
+  });
+
+  it("leaves non-customfield status overrides unchanged in the JQL wrapper", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-jql-passthrough" }),
+      cacheScope: "c-jql-passthrough", siteUrl: "https://x",
+      getMappings: () => ({
+        "acme/x": jiraMapping({
+          statusFieldOverride: "status",
+          repoFieldOverride: "customfield_10101",
+        }),
+      }),
+    });
+    await p.fetchAIImplementSnapshot();
+
+    const bucketBody = JSON.parse(vi.mocked(fetch).mock.calls[0][1]?.body as string);
+    const capacityBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
+    expect(bucketBody.jql).toContain("status in (Ready");
+    expect(capacityBody.jql).toContain("status in (Planning");
   });
 
   it("counts capacity from the in-flight query", async () => {
