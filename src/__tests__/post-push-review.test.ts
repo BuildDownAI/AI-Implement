@@ -979,6 +979,60 @@ describe("postPushReviewStep", () => {
     expect(invoke.mock.calls[1][0]).toEqual(expect.objectContaining({ maxTurns: 45 }));
   });
 
+  it("includes structured issue details in follow-up review history", async () => {
+    const requiredFix = "Move the sessionStorage read into the hydrated effect and keep the dismissed flag synchronized when the first-visit panel is closed.";
+    const firstReview = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "First-visit hydration state is unsafe",
+        location: "src/app/page.tsx",
+        problem: "The first render can decide panel visibility before browser-only sessionStorage state is available.",
+        required_fix: requiredFix,
+      }],
+      feedback: "The first-visit state handling still needs one fix.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const secondReview = JSON.stringify({
+      approved: true,
+      blocking_issues: [],
+      feedback: "Looks good.",
+      score: 9,
+      progress_delta: 1,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M src/app/page.tsx\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "codex/structured-review-feedback\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/codex/structured-review-feedback\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tsrc/app/page.tsx\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn()
+      .mockResolvedValueOnce({ stdout: firstReview, exitCode: 0, tokensUsed: 100 })
+      .mockResolvedValueOnce({ stdout: "", exitCode: 0, tokensUsed: 100 })
+      .mockResolvedValueOnce({ stdout: secondReview, exitCode: 0, tokensUsed: 100 });
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    const secondReviewPrompt = invoke.mock.calls[2][0].prompt;
+    expect(secondReviewPrompt).toContain("Review 1:");
+    expect(secondReviewPrompt).toContain("1. **First-visit hydration state is unsafe**");
+    expect(secondReviewPrompt).toContain("Location: `src/app/page.tsx`");
+    expect(secondReviewPrompt).toContain("Problem: The first render can decide panel visibility before browser-only sessionStorage state is available.");
+    expect(secondReviewPrompt).toContain(`Required fix: ${requiredFix}`);
+  });
+
   it("posts full structured blocking issues in PR comments and fix prompts", async () => {
     const requiredFix = "Read sessionStorage only after the component has mounted, keep the dismissed flag in sync when the user dismisses the first-visit panel, and preserve the isHydrated guard so server-rendered markup cannot diverge from client-rendered markup.";
     const reviewerJson = JSON.stringify({
