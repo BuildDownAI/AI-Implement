@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       channel:
-        description: "Runner image channel to publish"
+        description: "Runner image channel to publish. Policy: main -> latest, testing -> next."
         type: choice
         required: true
         default: next
@@ -48,7 +48,7 @@ jobs:
         run: |
           # GHCR namespaces must be lowercase; github.repository_owner preserves
           # the original casing, so lowercase it here.
-          owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
           case "${{ github.ref_name }}" in
             main)
               expected_channel="latest"
@@ -118,11 +118,18 @@ jobs:
 
       - name: Promote tested SHA image to channel and debug tags
         run: |
-          current_sha=$(git ls-remote origin "refs/heads/${{ github.ref_name }}" | awk '{print $1}')
+          set -euo pipefail
+
+          if ! current_sha=$(git ls-remote origin "refs/heads/${{ github.ref_name }}" | awk '{print $1}'); then
+            echo "::error::Could not verify current head for ${{ github.ref_name }}. Re-run this job after the transient failure clears to re-test and promote the SHA image." >&2
+            exit 1
+          fi
           if [ "$current_sha" != "${{ github.sha }}" ]; then
             echo "::error::Ref ${{ github.ref_name }} now points at ${current_sha:-unknown}, not tested SHA ${{ github.sha }}. Skipping channel promotion." >&2
             exit 1
           fi
+          # Re-pull immediately before tagging so promotion fails closed if the
+          # tested SHA manifest was removed between smoke test and promotion.
           docker pull "${{ steps.meta.outputs.image }}:${{ github.sha }}"
           docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"
           docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"

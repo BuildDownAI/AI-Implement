@@ -32,9 +32,11 @@ describe("GHA workflow shims", () => {
 
     expect(doc.on.push.branches).toEqual(["main", "testing"]);
     expect(doc.on.workflow_dispatch.inputs.channel.type).toBe("choice");
+    expect(doc.on.workflow_dispatch.inputs.channel.description).toContain("main -> latest, testing -> next");
     expect(doc.on.workflow_dispatch.inputs.channel.options).toEqual(["next", "latest"]);
     expect(doc.concurrency.group).toBe("build-runner-${{ github.ref_name }}");
     expect(doc.concurrency["cancel-in-progress"]).toBe(true);
+    expect(yaml).toContain('owner="${GITHUB_REPOSITORY_OWNER,,}"');
     expect(yaml).toMatch(/main\)\s+expected_channel="latest"/);
     expect(yaml).toMatch(/testing\)\s+expected_channel="next"/);
     expect(yaml).toMatch(/does not match selected channel/);
@@ -51,9 +53,13 @@ describe("GHA workflow shims", () => {
     expect(smokeStep.run).not.toContain("steps.meta.outputs.channel");
 
     expect(promoteStep).toBeDefined();
+    expect(promoteStep.run).toContain("set -euo pipefail");
     expect(promoteStep.run).toContain('git ls-remote origin "refs/heads/${{ github.ref_name }}"');
+    expect(promoteStep.run).toContain("Could not verify current head");
+    expect(promoteStep.run).toContain("re-test and promote the SHA image");
     expect(promoteStep.run).toContain('if [ "$current_sha" != "${{ github.sha }}" ]; then');
     expect(promoteStep.run).toContain("Skipping channel promotion");
+    expect(promoteStep.run).toContain("Re-pull immediately before tagging");
     expect(promoteStep.run).toContain('docker pull "${{ steps.meta.outputs.image }}:${{ github.sha }}"');
     expect(promoteStep.run).toContain(
       'docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"',
