@@ -90,23 +90,25 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.session
           push: true
           # Push only non-channel tags before smoke testing; the channel is
-          # promoted to this tested SHA after the smoke test passes.
+          # promoted from the immutable build digest after the smoke test passes.
           tags: |
             ${{ steps.meta.outputs.image }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke-test — verify TS dist is present in SHA image
+      - name: Smoke-test — verify TS dist is present in built digest
         run: |
-          docker pull "${{ steps.meta.outputs.image }}:${{ github.sha }}"
+          digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+          docker pull "$digest_ref"
           if ! output=$(docker run --rm --entrypoint node \
-            "${{ steps.meta.outputs.image }}:${{ github.sha }}" \
+            "$digest_ref" \
             -e "import('/app/dist/pipeline/runner.js').then(m => console.log(Object.keys(m)))" 2>&1); then
             echo "ERROR: docker run failed to start or import the module"
             echo "$output"
@@ -116,12 +118,13 @@ jobs:
           echo "$output" | grep -q "PipelineRunner" || \
             { echo "ERROR: PipelineRunner not found in /app/dist/pipeline/runner.js exports"; exit 1; }
 
-      - name: Promote tested SHA image to channel and debug tags
+      - name: Promote tested digest to channel and debug tags
         run: |
           set -euo pipefail
+          digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
 
           if ! current_sha=$(git ls-remote origin "refs/heads/${{ github.ref_name }}" | awk '{print $1}'); then
-            echo "::error::Could not verify current head for ${{ github.ref_name }}. Re-run this job after the transient failure clears to re-test and promote the SHA image." >&2
+            echo "::error::Could not verify current head for ${{ github.ref_name }}. Re-run this job after the transient failure clears to re-test and promote the digest image." >&2
             exit 1
           fi
           if [ "$current_sha" != "${{ github.sha }}" ]; then
@@ -129,9 +132,9 @@ jobs:
             exit 1
           fi
           # Re-pull immediately before tagging so promotion fails closed if the
-          # tested SHA manifest was removed between smoke test and promotion.
-          docker pull "${{ steps.meta.outputs.image }}:${{ github.sha }}"
-          docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"
-          docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"
+          # tested digest manifest was removed between smoke test and promotion.
+          docker pull "$digest_ref"
+          docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"
+          docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"
           docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"
           docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"
