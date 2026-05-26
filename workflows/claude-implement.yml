@@ -97,7 +97,7 @@ jobs:
             runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
           fi
           if [ -z "$runner_image" ]; then
-            runner_image="ghcr.io/builddownai/ai-implement-runner:next"
+            runner_image="ghcr.io/builddownai/ai-implement-runner:latest"
           fi
 
           case "$runner_image" in

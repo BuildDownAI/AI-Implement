@@ -22,6 +22,49 @@ describe("GHA workflow shims", () => {
     expect(readFileSync("Dockerfile", "utf-8")).toMatch(/COPY workflows\/ \.\/workflows\//);
   });
 
+  it("publishes runner image channels from the correct source branches", () => {
+    const yaml = readFileSync(".github/workflows/build-runner.yml", "utf-8");
+    const doc = parse(yaml) as any;
+    const steps = doc.jobs.build.steps as any[];
+    const buildStep = steps.find((step) => step.name === "Build and push");
+    const smokeStep = steps.find((step) => String(step.name).startsWith("Smoke-test"));
+    const promoteStep = steps.find((step) => String(step.name).startsWith("Promote"));
+
+    expect(doc.on.push.branches).toEqual(["main", "testing"]);
+    expect(doc.on.workflow_dispatch.inputs.channel.type).toBe("choice");
+    expect(doc.on.workflow_dispatch.inputs.channel.options).toEqual(["next", "latest"]);
+    expect(doc.concurrency.group).toBe("build-runner-${{ github.ref_name }}");
+    expect(doc.concurrency["cancel-in-progress"]).toBe(true);
+    expect(yaml).toMatch(/main\)\s+expected_channel="latest"/);
+    expect(yaml).toMatch(/testing\)\s+expected_channel="next"/);
+    expect(yaml).toMatch(/does not match selected channel/);
+    expect(yaml).toMatch(/date_tag=base-\$\{channel\}-v\$\(date -u \+%Y%m%d\)-\$\{GITHUB_SHA::12\}/);
+
+    expect(buildStep).toBeDefined();
+    expect(buildStep.with.tags.trim()).toBe("${{ steps.meta.outputs.image }}:${{ github.sha }}");
+    expect(buildStep.with.tags).not.toContain("${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}");
+    expect(buildStep.with.tags).not.toContain("${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}");
+
+    expect(smokeStep).toBeDefined();
+    expect(smokeStep.run).toContain('docker pull "${{ steps.meta.outputs.image }}:${{ github.sha }}"');
+    expect(smokeStep.run).toContain('"${{ steps.meta.outputs.image }}:${{ github.sha }}"');
+    expect(smokeStep.run).not.toContain("steps.meta.outputs.channel");
+
+    expect(promoteStep).toBeDefined();
+    expect(promoteStep.run).toContain('git ls-remote origin "refs/heads/${{ github.ref_name }}"');
+    expect(promoteStep.run).toContain('if [ "$current_sha" != "${{ github.sha }}" ]; then');
+    expect(promoteStep.run).toContain("Skipping channel promotion");
+    expect(promoteStep.run).toContain('docker pull "${{ steps.meta.outputs.image }}:${{ github.sha }}"');
+    expect(promoteStep.run).toContain(
+      'docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"',
+    );
+    expect(promoteStep.run).toContain(
+      'docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"',
+    );
+    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"');
+    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"');
+  });
+
   it("keeps the canonical and synced dispatch workflows byte-for-byte identical", () => {
     expect(readFileSync(".github/workflows/claude-implement.yml", "utf-8")).toBe(
       readFileSync("workflows/claude-implement.yml", "utf-8"),
@@ -92,7 +135,7 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/validate-runner-image:/);
       expect(yaml).toMatch(/needs:\s*validate-runner-image/);
       expect(yaml).toMatch(/image:\s*\$\{\{\s*needs\.validate-runner-image\.outputs\.runner_image\s*\}\}/);
-      expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:next/);
+      expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
       expect(yaml).toMatch(/invalid characters for a container image reference/);
       expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
     });

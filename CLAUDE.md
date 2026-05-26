@@ -223,7 +223,14 @@ The image must be publicly pullable. The customer owns building and publishing i
 
 The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
 
-Typical use: your repo needs a language runtime or tool that isn't in the base image (e.g. terraform, ruby, go). Build an image `FROM` the published base `ghcr.io/builddownai/ai-implement-runner:latest`, add your tools, push, and point `image.yml` at it.
+Runner image channels:
+
+- `ghcr.io/builddownai/ai-implement-runner:latest` is published from `main` and is the stable default for production orchestrators and synced target-repo workflows.
+- `ghcr.io/builddownai/ai-implement-runner:next` is published from `testing` and is intended for staging/testing orchestrators. Set `SESSION_IMAGE=ghcr.io/builddownai/ai-implement-runner:next` in that orchestrator environment to keep it paired with the testing runner.
+- Commit SHA tags are pushed first and smoke-tested before any mutable channel is promoted. They are immutable and are the safest rollback target.
+- Channel-scoped date/debug tags are promoted only after the SHA image passes smoke testing. They use `base-<channel>-vYYYYMMDD-<12-char-sha>` (for example, `base-next-v20260526-abc123def456`) so `latest` and `next` builds do not collide and same-day builds do not overwrite each other.
+
+Typical custom-image use: your repo needs a language runtime or tool that isn't in the base image (e.g. terraform, ruby, go). Build an image `FROM` the channel that matches your orchestrator (`latest` for production, `next` for testing), add your tools, push, and point `image.yml` at it.
 
 ## Multi-client deploy
 

@@ -11,7 +11,7 @@ name: Build runner image
 
 on:
   push:
-    branches: [main]
+    branches: [main, testing]
     paths:
       - "Dockerfile.session"
       - "session/**"
@@ -19,10 +19,23 @@ on:
       - "pipelines/**"
       - ".github/workflows/build-runner.yml"
   workflow_dispatch:
+    inputs:
+      channel:
+        description: "Runner image channel to publish"
+        type: choice
+        required: true
+        default: next
+        options:
+          - next
+          - latest
 
 permissions:
   contents: read
   packages: write
+
+concurrency:
+  group: build-runner-${{ github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -36,8 +49,36 @@ jobs:
           # GHCR namespaces must be lowercase; github.repository_owner preserves
           # the original casing, so lowercase it here.
           owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
-          echo "image=ghcr.io/${owner}/ai-implement-runner" >> "$GITHUB_OUTPUT"
-          echo "date_tag=base-v$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          case "${{ github.ref_name }}" in
+            main)
+              expected_channel="latest"
+              ;;
+            testing)
+              expected_channel="next"
+              ;;
+            *)
+              echo "Unsupported runner image source branch: ${{ github.ref_name }}" >&2
+              exit 1
+              ;;
+          esac
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            channel="${{ inputs.channel }}"
+          else
+            channel="${expected_channel}"
+          fi
+          if [[ "${channel}" != "next" && "${channel}" != "latest" ]]; then
+            echo "Unsupported runner image channel: ${channel}" >&2
+            exit 1
+          fi
+          if [[ "${channel}" != "${expected_channel}" ]]; then
+            echo "Ref ${{ github.ref_name }} maps to ${expected_channel}, but selected channel ${channel} does not match selected channel policy" >&2
+            exit 1
+          fi
+          {
+            echo "image=ghcr.io/${owner}/ai-implement-runner"
+            echo "date_tag=base-${channel}-v$(date -u +%Y%m%d)-${GITHUB_SHA::12}"
+            echo "channel=${channel}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -54,21 +95,18 @@ jobs:
           context: .
           file: Dockerfile.session
           push: true
-          # :next is the v2 cutover tag (ships the TS dist). :latest continues to
-          # point at the bash-canonical image and is promoted manually after pilot
-          # validation in Task 6. Do NOT add :latest here until that gate clears.
+          # Push only non-channel tags before smoke testing; the channel is
+          # promoted to this tested SHA after the smoke test passes.
           tags: |
-            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}
             ${{ steps.meta.outputs.image }}:${{ github.sha }}
-            ${{ steps.meta.outputs.image }}:next
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke-test — verify TS dist is present in :next image
+      - name: Smoke-test — verify TS dist is present in SHA image
         run: |
-          docker pull "${{ steps.meta.outputs.image }}:next"
+          docker pull "${{ steps.meta.outputs.image }}:${{ github.sha }}"
           if ! output=$(docker run --rm --entrypoint node \
-            "${{ steps.meta.outputs.image }}:next" \
+            "${{ steps.meta.outputs.image }}:${{ github.sha }}" \
             -e "import('/app/dist/pipeline/runner.js').then(m => console.log(Object.keys(m)))" 2>&1); then
             echo "ERROR: docker run failed to start or import the module"
             echo "$output"
@@ -77,3 +115,16 @@ jobs:
           echo "Module exports: $output"
           echo "$output" | grep -q "PipelineRunner" || \
             { echo "ERROR: PipelineRunner not found in /app/dist/pipeline/runner.js exports"; exit 1; }
+
+      - name: Promote tested SHA image to channel and debug tags
+        run: |
+          current_sha=$(git ls-remote origin "refs/heads/${{ github.ref_name }}" | awk '{print $1}')
+          if [ "$current_sha" != "${{ github.sha }}" ]; then
+            echo "::error::Ref ${{ github.ref_name }} now points at ${current_sha:-unknown}, not tested SHA ${{ github.sha }}. Skipping channel promotion." >&2
+            exit 1
+          fi
+          docker pull "${{ steps.meta.outputs.image }}:${{ github.sha }}"
+          docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"
+          docker tag "${{ steps.meta.outputs.image }}:${{ github.sha }}" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"
+          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"
+          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"
