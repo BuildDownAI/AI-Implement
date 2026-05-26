@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 
 interface RepoModels {
@@ -11,6 +12,7 @@ interface RepoModels {
 interface AiImplementConfig {
   packageManager?: string;
   models?: RepoModels;
+  reviewProviders?: string[];
 }
 
 interface InstallInputs extends Record<string, unknown> {
@@ -22,32 +24,31 @@ interface InstallOutputs extends Record<string, unknown> {
   installMethod: string;
   durationMs: number;
   repoModels: RepoModels;
+  reviewProviders?: string[];
 }
 
-function parseModelsSection(raw: string): RepoModels {
+const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
+
+function parseModelsConfig(value: unknown): RepoModels {
   const result: RepoModels = {};
-  const lines = raw.split(/\r?\n/);
-  let inModels = false;
-  for (const line of lines) {
-    if (/^models:/.test(line)) {
-      inModels = true;
-      continue;
-    }
-    if (inModels) {
-      // A non-empty line starting without indentation means a new top-level key
-      if (/^\S/.test(line) && line.trim() !== "") {
-        inModels = false;
-        continue;
-      }
-      // Note: quoted YAML values (e.g. implement: "model-name") are not stripped —
-      // users should write unquoted values to avoid silently including quote characters.
-      const implMatch = /^\s+implement:\s*(\S+)/.exec(line);
-      if (implMatch) result.implement = implMatch[1];
-      const reviewMatch = /^\s+review:\s*(\S+)/.exec(line);
-      if (reviewMatch) result.review = reviewMatch[1];
-    }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+  const models = value as Record<string, unknown>;
+  if (typeof models.implement === "string" && models.implement.trim()) {
+    result.implement = models.implement.trim();
+  }
+  if (typeof models.review === "string" && models.review.trim()) {
+    result.review = models.review.trim();
   }
   return result;
+}
+
+function parseReviewProvidersConfig(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  if (value.length === 0) return [];
+  const providers = value.filter((provider): provider is string =>
+    typeof provider === "string" && KNOWN_REVIEW_PROVIDERS.has(provider),
+  );
+  return providers;
 }
 
 function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
@@ -55,12 +56,17 @@ function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
   if (!fs.existsSync(configPath)) return {};
   try {
     const raw = fs.readFileSync(configPath, "utf-8");
-    // Minimal YAML key: value parsing — avoids pulling in a yaml dep
-    const pkgMatch = /^packageManager:\s*(\S+)/m.exec(raw);
-    const models = parseModelsSection(raw);
+    const parsed = parseYaml(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const doc = parsed as Record<string, unknown>;
+    const models = parseModelsConfig(doc.models);
+    const reviewProviders = parseReviewProvidersConfig(doc.reviewProviders);
     const config: AiImplementConfig = {};
-    if (pkgMatch) config.packageManager = pkgMatch[1];
+    if (typeof doc.packageManager === "string" && doc.packageManager.trim()) {
+      config.packageManager = doc.packageManager.trim();
+    }
     if (models.implement || models.review) config.models = models;
+    if (reviewProviders !== undefined) config.reviewProviders = reviewProviders;
     return config;
   } catch {
     return {};
@@ -99,6 +105,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         installMethod: "skipped: no package.json",
         durationMs: 0,
         repoModels: config.models ?? {},
+        reviewProviders: config.reviewProviders,
       };
     }
 
@@ -121,6 +128,12 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     });
     const durationMs = Date.now() - start;
 
-    return { packageManager, installMethod, durationMs, repoModels: config.models ?? {} };
+    return {
+      packageManager,
+      installMethod,
+      durationMs,
+      repoModels: config.models ?? {},
+      reviewProviders: config.reviewProviders,
+    };
   },
 };
