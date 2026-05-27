@@ -40,7 +40,8 @@ import {
 } from "./local-docker.js";
 import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
-import { getPendingReviewFixes, updateReviewFixStatus } from "./review-fix-queue.js";
+import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
+import { listOpenReviewFindings } from "./review-ledger-store.js";
 
 // ---------- Configuration ----------
 
@@ -369,6 +370,7 @@ async function dispatchGitHubActions(
     issue_identifier: issue.identifier,
     issue_title: issue.title,
     issue_description: issue.description || issue.title,
+    runner_phase: "implementation",
     ...providerDispatchFields(mapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
@@ -1511,6 +1513,7 @@ async function processReconciliations(config: AppConfig): Promise<void> {
         issue_title: `Reconciliation for PR #${job.prNumber}`,
         issue_description: `Gap-fill after PR #${job.prNumber} was merged (${job.mergeCommitSha})`,
         pr_number: String(job.prNumber),
+        runner_phase: "gap-analysis",
         ...providerDispatchFields(mapping),
       });
 
@@ -1563,6 +1566,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       let runToken = "";
       let runProgressToken = "";
       let dispatchId: string | undefined;
+      const dispatchFindingIds = listOpenReviewFindings(fix.repo, fix.prNumber).map((finding) => finding.id);
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
         // Gap-fill dispatches run the implementation workflow and can take as
         // long as the initial implementation, even though they report back as
@@ -1598,6 +1602,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         issue_title: `Review feedback fix for PR #${fix.prNumber}`,
         issue_description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
         pr_number: String(fix.prNumber),
+        runner_phase: "gap-analysis",
         ...providerDispatchFields(mapping),
         runner_callback_url: runnerCallbackUrl,
         run_token: runToken,
@@ -1623,6 +1628,15 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         runnerMode: "default",
       });
       updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
+      if (dispatchId) {
+        recordReviewFixDispatch({
+          queueId: fix.id,
+          dispatchId,
+          repo: fix.repo,
+          prNumber: fix.prNumber,
+          findingIds: dispatchFindingIds,
+        });
+      }
       suppressStaleNotifications(fix.issueId, jobId);
       updateReviewFixStatus(fix.id, "dispatched");
       console.log(`[review-fix] Dispatched review fix for ${fix.issueIdentifier ?? fix.issueId} (PR #${fix.prNumber} in ${fix.repo})`);

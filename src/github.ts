@@ -10,6 +10,8 @@ interface DispatchInputs {
   dependencies?: string;
   /** When set, the workflow checks out the existing PR branch (gap-fill run). */
   pr_number?: string;
+  /** Explicit callback phase reported by the runner. */
+  runner_phase?: "implementation" | "gap-analysis";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */

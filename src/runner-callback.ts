@@ -3,7 +3,8 @@ import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { upsertStepRecord } from "./step-log.js";
-import { markReviewFindingsResolvedForPr } from "./review-ledger-store.js";
+import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
+import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
 
@@ -186,7 +187,12 @@ export async function handleRunnerResult(
     const job = getJobByDispatchId(claims.dispatchId);
     const prNumber = parsePrNumber(job?.prUrl ?? null);
     if (job?.repo && prNumber !== null) {
-      markReviewFindingsResolvedForPr(job.repo, prNumber);
+      const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
+      if (snapshot) {
+        markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds);
+      } else {
+        markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
+      }
     }
   }
   // gap-analysis success: no status transition
@@ -206,11 +212,11 @@ export async function handleRunnerProgress(
   const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
   if (!auth) return bad(401, "missing_bearer");
 
-  const stepOrError = validateStepBody(input.body);
-  if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
-
   const verified = verifyRunToken(auth[1], input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
+
+  const stepOrError = validateStepBody(input.body);
+  if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
 
   const job = getJobByDispatchId(verified.claims.dispatchId);
   if (!job) return bad(404, "job_not_found");

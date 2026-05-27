@@ -56,7 +56,7 @@ describe("review fix queue", () => {
         issueIdentifier: "AII-1",
         repo: "org/repo",
         prNumber: 42,
-        reason: "review_comment",
+        reason: "multiple",
         status: "pending",
       },
     ]);
@@ -101,6 +101,32 @@ describe("review fix queue", () => {
         findingIds: [102],
       },
     ]);
+  });
+
+  it("records the finding snapshot attached to a dispatched gap-fill run", () => {
+    const id = queue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 42,
+      reason: "changes_requested",
+    });
+
+    queue.recordReviewFixDispatch({
+      queueId: id,
+      dispatchId: "dispatch-1",
+      repo: "org/repo",
+      prNumber: 42,
+      findingIds: [10, 11],
+    });
+
+    expect(queue.getReviewFixDispatchSnapshot("dispatch-1")).toMatchObject({
+      queueId: id,
+      dispatchId: "dispatch-1",
+      repo: "org/repo",
+      prNumber: 42,
+      findingIds: [10, 11],
+    });
   });
 
   it("removes non-pending fixes from the pending list", () => {

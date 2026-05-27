@@ -144,6 +144,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
   const branch = process.env.GITHUB_DEFAULT_BRANCH || "main";
   const prNumber = process.env.PR_NUMBER ?? "";
+  const runnerPhase = resolveRunnerPhase(process.env.RUNNER_PHASE, prNumber);
 
   const planningContext = process.env.LINEAR_API_KEY
     ? await fetchPlanningContext({
@@ -222,7 +223,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const pushOutputs = context.getOutputs("push");
     await postRunnerResult({
       workspaceDir,
-      phase: prNumber ? "gap-analysis" : "implementation",
+      phase: runnerPhase,
       outcome: "success",
       prUrl: typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined,
       fetchImpl: opts.fetchImpl,
@@ -232,13 +233,19 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     console.error(`Pipeline failed: ${err}`);
     await postRunnerResult({
       workspaceDir,
-      phase: prNumber ? "gap-analysis" : "implementation",
+      phase: runnerPhase,
       outcome: "failure",
       failureReason: err instanceof Error ? err.message : String(err),
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
   }
+}
+
+function resolveRunnerPhase(rawPhase: string | undefined, prNumber: string): "implementation" | "gap-analysis" {
+  if (!rawPhase) return prNumber ? "gap-analysis" : "implementation";
+  if (rawPhase === "implementation" || rawPhase === "gap-analysis") return rawPhase;
+  throw new Error(`Invalid RUNNER_PHASE: ${rawPhase}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -139,6 +139,7 @@ export async function handleGapFillTrigger(
     issue_title: "(gap-fill triggered from PR comment)",
     issue_description: "(gap-fill triggered from PR comment)",
     pr_number: String(prNumber),
+    runner_phase: "gap-analysis",
     ...providerDispatchFields(owningMapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,

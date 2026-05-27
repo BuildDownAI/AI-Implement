@@ -41,6 +41,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   dedup.closeDb();
   try {
     fs.unlinkSync(dbPath);
@@ -311,6 +312,17 @@ describe("handleRunnerResult — implementation", () => {
 });
 
 describe("handleRunnerProgress", () => {
+  it("returns 401 before validating body when bearer token is invalid", async () => {
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: "Bearer invalid",
+      body: {} as never,
+      secret: SECRET,
+    });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).not.toBe("step_required");
+  });
+
   it("persists a step report by reusable progress token", async () => {
     const dispatchId = "dispatch-progress";
     const { token } = runnerTokens.mintRunToken({
@@ -384,6 +396,13 @@ describe("handleRunnerResult — gap-analysis", () => {
   });
 
   it("resolves open review findings after a successful gap-analysis callback for the PR", async () => {
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix me",
+    });
     const { token, dispatchId } = runnerTokens.mintRunToken({
       issueId: "i",
       mappingTeamKey: "ENG",
@@ -397,13 +416,6 @@ describe("handleRunnerResult — gap-analysis", () => {
       dispatchId,
     });
     log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
-    reviewStore.upsertReviewFinding({
-      repo: "org/repo",
-      prNumber: 12,
-      source: "github-review",
-      severity: "blocking",
-      body: "Fix me",
-    });
 
     const res = await runnerCallback.handleRunnerResult({
       authorization: `Bearer ${token}`,
@@ -418,6 +430,56 @@ describe("handleRunnerResult — gap-analysis", () => {
 
     expect(res.status).toBe(200);
     expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+  });
+
+  it("does not resolve review findings that arrived after the gap-fill dispatch started", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-27T00:00:00.000Z"));
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Original feedback",
+    });
+    vi.setSystemTime(new Date("2026-05-27T00:01:00.000Z"));
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      repo: "org/repo",
+      dispatchId,
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    vi.setSystemTime(new Date("2026-05-27T00:02:00.000Z"));
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review-thread",
+      severity: "blocking",
+      body: "New feedback that arrived while the gap-fill was running",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toMatchObject([
+      { body: "New feedback that arrived while the gap-fill was running" },
+    ]);
   });
 });
 

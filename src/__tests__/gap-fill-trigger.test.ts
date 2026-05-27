@@ -203,6 +203,7 @@ describe("handleGapFillTrigger", () => {
     expect(inputs.issue_id).toBe("issue-uuid-1");
     expect(inputs.issue_identifier).toBe("ACME-123");
     expect(inputs.pr_number).toBe("42");
+    expect(inputs.runner_phase).toBe("gap-analysis");
     expect(inputs.runner_callback_url).toBe(CALLBACK_URL);
     expect(inputs.run_token).toBeTruthy();
     expect(typeof inputs.run_token).toBe("string");

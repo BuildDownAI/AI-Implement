@@ -108,6 +108,30 @@ export function markReviewFindingsResolvedForPr(repo: string, prNumber: number):
   return result.changes;
 }
 
+export function markReviewFindingsResolvedForPrSeenBefore(repo: string, prNumber: number, seenBefore: number): number {
+  const result = getDb()
+    .prepare(`
+      UPDATE review_findings
+      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      WHERE repo = ? AND pr_number = ? AND status = 'open' AND last_seen_at <= ?
+    `)
+    .run(Date.now(), Date.now(), repo, prNumber, seenBefore);
+  return result.changes;
+}
+
+export function markReviewFindingsResolvedByIds(repo: string, prNumber: number, findingIds: number[]): number {
+  if (findingIds.length === 0) return 0;
+  const placeholders = findingIds.map(() => "?").join(", ");
+  const result = getDb()
+    .prepare(`
+      UPDATE review_findings
+      SET status = 'resolved', resolved_at = ?, last_seen_at = ?
+      WHERE repo = ? AND pr_number = ? AND status = 'open' AND id IN (${placeholders})
+    `)
+    .run(Date.now(), Date.now(), repo, prNumber, ...findingIds);
+  return result.changes;
+}
+
 function mapRow(row: ReviewFindingRow): StoredReviewFinding {
   return {
     id: row.id,

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
 
-export type RunTokenAudience = "result" | "progress" | "review";
+export type RunTokenAudience = "result" | "progress";
 
 export interface RunTokenClaims {
   issueId: string;

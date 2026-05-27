@@ -584,6 +584,7 @@ describe("runAutonomous", () => {
 
   it("posts gap-analysis callback phase for PR_NUMBER runs", async () => {
     vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
@@ -607,6 +608,36 @@ describe("runAutonomous", () => {
     };
     expect(body).toMatchObject({
       phase: "gap-analysis",
+      outcome: "success",
+    });
+  });
+
+  it("uses RUNNER_PHASE instead of inferring callback phase from PR_NUMBER", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "implementation");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/99" }) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+    };
+    expect(body).toMatchObject({
+      phase: "implementation",
       outcome: "success",
     });
   });

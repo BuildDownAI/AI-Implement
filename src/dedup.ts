@@ -172,6 +172,18 @@ export function getDb(): Database.Database {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_events_queue ON review_fix_events(queue_id, created_at)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_events_pr ON review_fix_events(repo, pr_number, created_at)`);
     db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_dispatches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        queue_id INTEGER NOT NULL,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        finding_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_dispatches_pr ON review_fix_dispatches(repo, pr_number, created_at)`);
+    db.exec(`
       CREATE TABLE IF NOT EXISTS admin_sessions (
         token TEXT PRIMARY KEY,
         expires_at INTEGER NOT NULL

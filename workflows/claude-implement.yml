@@ -45,6 +45,11 @@ on:
         required: false
         type: string
         default: ""
+      runner_phase:
+        description: "Runner callback phase: implementation or gap-analysis (empty keeps legacy PR_NUMBER inference)"
+        required: false
+        type: string
+        default: ""
       provider:
         description: "Claude provider: 'anthropic' (default) or 'bedrock'"
         required: false
@@ -176,6 +181,7 @@ jobs:
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          RUNNER_PHASE: ${{ inputs.runner_phase }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

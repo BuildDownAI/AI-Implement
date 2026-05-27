@@ -510,6 +510,39 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
   });
 
+  it("ignores edited PR review comments so typo fixes do not requeue gap-fill", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-2",
+      issueIdentifier: "AII-2",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/43");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "edited",
+      comment: {
+        body: "This line still accepts null owners. Typo fixed.",
+        html_url: "https://github.com/org/repo/pull/43#discussion_r1",
+        path: "src/auth.ts",
+        line: 12,
+      },
+      pull_request: {
+        number: 43,
+        html_url: "https://github.com/org/repo/pull/43",
+        head: { ref: "ai-implement/AII-2-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 43)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
   it("stores Claude PR summary comments and queues a late fix for matching AI PRs", async () => {
     const jobId = log.appendLog({
       issueId: "issue-4",

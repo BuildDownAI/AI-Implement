@@ -29,6 +29,16 @@ export interface ReviewFixEvent {
   createdAt: number;
 }
 
+export interface ReviewFixDispatchSnapshot {
+  id: number;
+  queueId: number;
+  dispatchId: string;
+  repo: string;
+  prNumber: number;
+  findingIds: number[];
+  createdAt: number;
+}
+
 export interface EnqueueReviewFixInput {
   issueId: string;
   issueIdentifier: string | null;
@@ -67,6 +77,16 @@ interface ReviewFixEventRow {
   created_at: number;
 }
 
+interface ReviewFixDispatchRow {
+  id: number;
+  queue_id: number;
+  dispatch_id: string;
+  repo: string;
+  pr_number: number;
+  finding_ids_json: string;
+  created_at: number;
+}
+
 export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
   const now = Date.now();
   const db = getDb();
@@ -78,7 +98,10 @@ export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
     ON CONFLICT (repo, pr_number) DO UPDATE SET
       issue_id = excluded.issue_id,
       issue_identifier = excluded.issue_identifier,
-      reason = excluded.reason,
+      reason = CASE
+        WHEN review_fix_queue.reason = excluded.reason THEN excluded.reason
+        ELSE 'multiple'
+      END,
       status = 'pending',
       updated_at = excluded.updated_at,
       dispatched_at = NULL
@@ -134,6 +157,40 @@ export function listReviewFixEvents(queueId: number): ReviewFixEvent[] {
   return rows.map(mapEventRow);
 }
 
+export function recordReviewFixDispatch(input: {
+  queueId: number;
+  dispatchId: string;
+  repo: string;
+  prNumber: number;
+  findingIds: number[];
+}): number {
+  const result = getDb()
+    .prepare(`
+      INSERT INTO review_fix_dispatches
+        (queue_id, dispatch_id, repo, pr_number, finding_ids_json, created_at)
+      VALUES
+        (@queueId, @dispatchId, @repo, @prNumber, @findingIdsJson, @now)
+      ON CONFLICT (dispatch_id) DO UPDATE SET
+        finding_ids_json = excluded.finding_ids_json
+    `)
+    .run({
+      queueId: input.queueId,
+      dispatchId: input.dispatchId,
+      repo: input.repo,
+      prNumber: input.prNumber,
+      findingIdsJson: JSON.stringify(input.findingIds),
+      now: Date.now(),
+    });
+  return Number(result.lastInsertRowid);
+}
+
+export function getReviewFixDispatchSnapshot(dispatchId: string): ReviewFixDispatchSnapshot | null {
+  const row = getDb()
+    .prepare("SELECT * FROM review_fix_dispatches WHERE dispatch_id = ?")
+    .get(dispatchId) as ReviewFixDispatchRow | undefined;
+  return row ? mapDispatchRow(row) : null;
+}
+
 function mapRow(row: ReviewFixQueueRow): ReviewFixQueueItem {
   return {
     id: row.id,
@@ -160,6 +217,18 @@ function mapEventRow(row: ReviewFixEventRow): ReviewFixEvent {
     reason: row.reason,
     sourceUrl: row.source_url,
     actor: row.actor,
+    findingIds: parseFindingIds(row.finding_ids_json),
+    createdAt: row.created_at,
+  };
+}
+
+function mapDispatchRow(row: ReviewFixDispatchRow): ReviewFixDispatchSnapshot {
+  return {
+    id: row.id,
+    queueId: row.queue_id,
+    dispatchId: row.dispatch_id,
+    repo: row.repo,
+    prNumber: row.pr_number,
     findingIds: parseFindingIds(row.finding_ids_json),
     createdAt: row.created_at,
   };

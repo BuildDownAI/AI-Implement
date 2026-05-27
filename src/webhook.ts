@@ -293,7 +293,7 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
 }
 
 function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse): void {
-  if (payload.action !== "created" && payload.action !== "edited") {
+  if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;
@@ -322,6 +322,9 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     : typeof payload.comment?.original_line === "number"
       ? payload.comment.original_line
       : undefined;
+  // The review comment webhook does not carry the parent review state.
+  // Treat matched created comments as blocking until review-state correlation
+  // can distinguish required fixes from nits without dropping tool feedback.
   const findingId = upsertReviewFinding({
     repo: repoFullName,
     prNumber,
