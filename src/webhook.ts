@@ -248,8 +248,8 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
   const branch = payload.pull_request?.head?.ref;
   const repoFullName = payload.repository?.full_name;
   if (!prNumber || !prUrl || !repoFullName) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing required review fields" }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_review_fields" }));
     return;
   }
 
@@ -303,8 +303,8 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
   const repoFullName = payload.repository?.full_name;
   const body = payload.comment?.body?.trim();
   if (!prNumber || !prUrl || !repoFullName || !body) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing required review comment fields" }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_review_comment_fields" }));
     return;
   }
 
@@ -394,8 +394,8 @@ function handleIssueCommentWebhook(payload: IssueCommentPayload, res: http.Serve
   const repoFullName = payload.repository?.full_name;
   const body = payload.comment?.body?.trim();
   if (!prNumber || !prUrl || !repoFullName || !body) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing required issue comment fields" }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_issue_comment_fields" }));
     return;
   }
 

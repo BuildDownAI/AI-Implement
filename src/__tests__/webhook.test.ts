@@ -470,6 +470,30 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  it("ignores malformed review payloads with 200 so GitHub does not retry", async () => {
+    const { req, res } = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body: "Please fix the callback race.",
+      },
+      pull_request: {
+        html_url: "https://github.com/org/repo/pull/42",
+        head: { ref: "ai-implement/AII-1-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({
+      ignored: true,
+      reason: "missing_review_fields",
+    });
+  });
+
   it("stores PR review comments and queues a late fix for matching AI PRs", async () => {
     const jobId = log.appendLog({
       issueId: "issue-2",
@@ -543,6 +567,30 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
   });
 
+  it("ignores malformed review comment payloads with 200 so GitHub does not retry", async () => {
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "This line still accepts null owners.",
+        html_url: "https://github.com/org/repo/pull/43#discussion_r1",
+      },
+      pull_request: {
+        number: 43,
+        head: { ref: "ai-implement/AII-2-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({
+      ignored: true,
+      reason: "missing_review_comment_fields",
+    });
+  });
+
   it("stores Claude PR summary comments and queues a late fix for matching AI PRs", async () => {
     const jobId = log.appendLog({
       issueId: "issue-4",
@@ -612,6 +660,31 @@ describe("review feedback ingestion", () => {
     expect(JSON.parse(res.body)).toMatchObject({ ignored: true });
     expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toEqual([]);
     expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("ignores malformed issue comment payloads with 200 so GitHub does not retry", async () => {
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
+        html_url: "https://github.com/org/repo/issues/45#issuecomment-1",
+        user: { login: "claude-code[bot]" },
+      },
+      issue: {
+        html_url: "https://github.com/org/repo/pull/45",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/45" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({
+      ignored: true,
+      reason: "missing_issue_comment_fields",
+    });
   });
 
   it("does not trust generic github-actions bot PR summary comments", async () => {
