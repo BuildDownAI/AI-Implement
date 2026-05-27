@@ -15,12 +15,29 @@ export interface ReviewFixQueueItem {
   dispatchedAt: number | null;
 }
 
+export interface ReviewFixEvent {
+  id: number;
+  queueId: number;
+  issueId: string;
+  issueIdentifier: string | null;
+  repo: string;
+  prNumber: number;
+  reason: string;
+  sourceUrl: string | null;
+  actor: string | null;
+  findingIds: number[];
+  createdAt: number;
+}
+
 export interface EnqueueReviewFixInput {
   issueId: string;
   issueIdentifier: string | null;
   repo: string;
   prNumber: number;
   reason: string;
+  sourceUrl?: string | null;
+  actor?: string | null;
+  findingIds?: number[];
 }
 
 interface ReviewFixQueueRow {
@@ -34,6 +51,20 @@ interface ReviewFixQueueRow {
   created_at: number;
   updated_at: number;
   dispatched_at: number | null;
+}
+
+interface ReviewFixEventRow {
+  id: number;
+  queue_id: number;
+  issue_id: string;
+  issue_identifier: string | null;
+  repo: string;
+  pr_number: number;
+  reason: string;
+  source_url: string | null;
+  actor: string | null;
+  finding_ids_json: string;
+  created_at: number;
 }
 
 export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
@@ -63,6 +94,23 @@ export function enqueueReviewFix(input: EnqueueReviewFixInput): number {
   const row = db
     .prepare("SELECT id FROM review_fix_queue WHERE repo = ? AND pr_number = ?")
     .get(input.repo, input.prNumber) as { id: number };
+  db.prepare(`
+    INSERT INTO review_fix_events
+      (queue_id, issue_id, issue_identifier, repo, pr_number, reason, source_url, actor, finding_ids_json, created_at)
+    VALUES
+      (@queueId, @issueId, @issueIdentifier, @repo, @prNumber, @reason, @sourceUrl, @actor, @findingIdsJson, @now)
+  `).run({
+    queueId: row.id,
+    issueId: input.issueId,
+    issueIdentifier: input.issueIdentifier ?? null,
+    repo: input.repo,
+    prNumber: input.prNumber,
+    reason: input.reason,
+    sourceUrl: input.sourceUrl ?? null,
+    actor: input.actor ?? null,
+    findingIdsJson: JSON.stringify(input.findingIds ?? []),
+    now,
+  });
   return row.id;
 }
 
@@ -79,6 +127,13 @@ export function updateReviewFixStatus(id: number, status: ReviewFixStatus): void
     .run(status, Date.now(), status, Date.now(), id);
 }
 
+export function listReviewFixEvents(queueId: number): ReviewFixEvent[] {
+  const rows = getDb()
+    .prepare("SELECT * FROM review_fix_events WHERE queue_id = ? ORDER BY created_at ASC, id ASC")
+    .all(queueId) as ReviewFixEventRow[];
+  return rows.map(mapEventRow);
+}
+
 function mapRow(row: ReviewFixQueueRow): ReviewFixQueueItem {
   return {
     id: row.id,
@@ -92,4 +147,31 @@ function mapRow(row: ReviewFixQueueRow): ReviewFixQueueItem {
     updatedAt: row.updated_at,
     dispatchedAt: row.dispatched_at,
   };
+}
+
+function mapEventRow(row: ReviewFixEventRow): ReviewFixEvent {
+  return {
+    id: row.id,
+    queueId: row.queue_id,
+    issueId: row.issue_id,
+    issueIdentifier: row.issue_identifier,
+    repo: row.repo,
+    prNumber: row.pr_number,
+    reason: row.reason,
+    sourceUrl: row.source_url,
+    actor: row.actor,
+    findingIds: parseFindingIds(row.finding_ids_json),
+    createdAt: row.created_at,
+  };
+}
+
+function parseFindingIds(raw: string): number[] {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is number => typeof id === "number" && Number.isFinite(id))
+      : [];
+  } catch {
+    return [];
+  }
 }

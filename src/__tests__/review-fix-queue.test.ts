@@ -62,6 +62,47 @@ describe("review fix queue", () => {
     ]);
   });
 
+  it("records an append-only audit event for each enqueue", () => {
+    const first = queue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 42,
+      reason: "changes_requested",
+      sourceUrl: "https://github.com/org/repo/pull/42#pullrequestreview-1",
+      actor: "claude[bot]",
+      findingIds: [101],
+    });
+    const second = queue.enqueueReviewFix({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+      prNumber: 42,
+      reason: "review_comment",
+      sourceUrl: "https://github.com/org/repo/pull/42#discussion_r2",
+      actor: "github-actions[bot]",
+      findingIds: [102],
+    });
+
+    expect(second).toBe(first);
+    expect(queue.listReviewFixEvents(first)).toMatchObject([
+      {
+        queueId: first,
+        reason: "changes_requested",
+        sourceUrl: "https://github.com/org/repo/pull/42#pullrequestreview-1",
+        actor: "claude[bot]",
+        findingIds: [101],
+      },
+      {
+        queueId: first,
+        reason: "review_comment",
+        sourceUrl: "https://github.com/org/repo/pull/42#discussion_r2",
+        actor: "github-actions[bot]",
+        findingIds: [102],
+      },
+    ]);
+  });
+
   it("removes non-pending fixes from the pending list", () => {
     const id = queue.enqueueReviewFix({
       issueId: "issue-1",

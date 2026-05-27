@@ -51,6 +51,7 @@ interface ReviewPayload {
     state?: string;
     body?: string | null;
     html_url?: string;
+    user?: { login?: string };
   };
   pull_request?: {
     number?: number;
@@ -70,6 +71,7 @@ interface ReviewCommentPayload {
     path?: string;
     line?: number | null;
     original_line?: number | null;
+    user?: { login?: string };
   };
   pull_request?: {
     number?: number;
@@ -281,6 +283,9 @@ function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): 
     repo: repoFullName,
     prNumber,
     reason: "changes_requested",
+    sourceUrl: payload.review?.html_url,
+    actor: payload.review?.user?.login,
+    findingIds: [findingId],
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
@@ -333,6 +338,9 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     repo: repoFullName,
     prNumber,
     reason: "review_comment",
+    sourceUrl: payload.comment?.html_url,
+    actor: payload.comment?.user?.login,
+    findingIds: [findingId],
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
@@ -411,6 +419,9 @@ function handleIssueCommentWebhook(payload: IssueCommentPayload, res: http.Serve
     repo: repoFullName,
     prNumber,
     reason: "claude_review_summary",
+    sourceUrl: payload.comment?.html_url,
+    actor: payload.comment?.user?.login,
+    findingIds,
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });

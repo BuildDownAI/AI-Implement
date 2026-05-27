@@ -395,6 +395,7 @@ describe("review feedback ingestion", () => {
         state: "changes_requested",
         body: "Please fix the callback race.",
         html_url: "https://github.com/org/repo/pull/42#pullrequestreview-1",
+        user: { login: "claude[bot]" },
       },
       pull_request: {
         number: 42,
@@ -408,7 +409,8 @@ describe("review feedback ingestion", () => {
     await res.done;
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    const response = JSON.parse(res.body) as { queued: boolean; findingId: number; reviewFixId: number };
+    expect(response).toMatchObject({ queued: true });
     expect(reviewStore.listOpenReviewFindings("org/repo", 42)).toMatchObject([
       {
         source: "github-review",
@@ -424,6 +426,14 @@ describe("review feedback ingestion", () => {
         repo: "org/repo",
         prNumber: 42,
         reason: "changes_requested",
+      },
+    ]);
+    expect(reviewFixQueue.listReviewFixEvents(response.reviewFixId)).toMatchObject([
+      {
+        reason: "changes_requested",
+        sourceUrl: "https://github.com/org/repo/pull/42#pullrequestreview-1",
+        actor: "claude[bot]",
+        findingIds: [response.findingId],
       },
     ]);
   });
