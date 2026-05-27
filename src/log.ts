@@ -19,6 +19,7 @@ export interface Job {
   teamKey: string | null;
   repo: string | null;
   dispatchedAt: number;
+  dispatchId: string | null;
   dispatchNumber: number;
   issueState: string | null;
   runId: number | null;
@@ -66,6 +67,10 @@ function ensureLogColumns(): void {
   }
   if (!names.has("run_id")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN run_id INTEGER");
+  }
+  if (!names.has("dispatch_id")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN dispatch_id TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_dispatch_id ON dispatch_log(dispatch_id)");
   }
   if (!names.has("status")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown'");
@@ -123,6 +128,7 @@ export function appendLog(entry: {
   teamKey?: string;
   repo?: string;
   issueState?: string;
+  dispatchId?: string;
   dispatchNumber?: number;
   machineNonce?: string;
   executionMode?: string;
@@ -134,7 +140,7 @@ export function appendLog(entry: {
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId).count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -142,6 +148,7 @@ export function appendLog(entry: {
     entry.teamKey ?? null,
     entry.repo ?? null,
     Date.now(),
+    entry.dispatchId ?? null,
     dispatchNumber,
     entry.issueState ?? null,
     entry.machineNonce ?? null,
@@ -253,6 +260,22 @@ export function listLog(limit = 100): Job[] {
   );
 }
 
+export function getJobByDispatchId(dispatchId: string): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE dispatch_id = ? ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    )
+    .get(dispatchId) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
+export function updateJobPrUrl(jobId: number, prUrl: string): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET pr_url = ? WHERE id = ?")
+    .run(prUrl, jobId);
+}
+
 interface RawRow {
   id: number;
   issue_id: string;
@@ -261,6 +284,7 @@ interface RawRow {
   team_key: string | null;
   repo: string | null;
   dispatched_at: number;
+  dispatch_id: string | null;
   dispatch_number: number;
   issue_state: string | null;
   run_id: number | null;
@@ -285,6 +309,7 @@ function mapRows(rows: RawRow[]): Job[] {
     teamKey: row.team_key,
     repo: row.repo,
     dispatchedAt: row.dispatched_at,
+    dispatchId: row.dispatch_id ?? null,
     dispatchNumber: row.dispatch_number ?? 1,
     issueState: row.issue_state ?? null,
     runId: row.run_id ?? null,

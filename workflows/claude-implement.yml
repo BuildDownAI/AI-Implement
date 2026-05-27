@@ -65,6 +65,11 @@ on:
         required: false
         type: string
         default: ""
+      run_progress_token:
+        description: "HMAC bearer token authorizing progress POSTs; empty skips progress callback"
+        required: false
+        type: string
+        default: ""
       runner_image:
         description: "Override the default runner image (must match ghcr.io/builddownai/* or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
@@ -178,4 +183,5 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUN_TOKEN: ${{ inputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
         run: /opt/ai-implement/entrypoint.sh

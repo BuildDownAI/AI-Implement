@@ -511,6 +511,47 @@ describe("runAutonomous", () => {
     expect(body.comments).toEqual([{ body: "first" }, { body: "second" }]);
   });
 
+  it("uses token-backed progress reporting when a progress token is present", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "progress-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = {
+      run: vi.fn(async (_ctx, _inputs, reporter) => {
+        await reporter.report({
+          id: "do-work",
+          type: "custom",
+          status: "running",
+          started_at: "2026-05-27T00:00:00.000Z",
+          ended_at: null,
+          parent_step_id: null,
+          inputs: {},
+          outputs: {},
+          logs_url: null,
+        });
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://orchestrator.example/runner/progress",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer progress-token" }),
+      }),
+    );
+  });
+
   it("posts implementation failure callback when pipeline fails", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example/");
     vi.stubEnv("RUN_TOKEN", "run-token");
@@ -538,6 +579,35 @@ describe("runAutonomous", () => {
       phase: "implementation",
       outcome: "failure",
       failureReason: "push failed",
+    });
+  });
+
+  it("posts gap-analysis callback phase for PR_NUMBER runs", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+    };
+    expect(body).toMatchObject({
+      phase: "gap-analysis",
+      outcome: "success",
     });
   });
 

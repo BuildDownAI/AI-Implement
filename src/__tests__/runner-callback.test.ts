@@ -3,17 +3,22 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
+import type * as LogModule from "../log.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
+import type * as StepLogModule from "../step-log.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
+import type { Step } from "../pipeline/types.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
 let dbPath: string;
 let dedup: typeof DedupModule;
+let log: typeof LogModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
+let stepLog: typeof StepLogModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -23,9 +28,13 @@ beforeEach(async () => {
   );
   process.env.DEDUP_DB_PATH = dbPath;
   dedup = await import("../dedup.js");
+  log = await import("../log.js");
   runnerTokens = await import("../runner-tokens.js");
   runnerCallback = await import("../runner-callback.js");
+  stepLog = await import("../step-log.js");
   dedup.getDb();
+  log.initLogTable();
+  stepLog.initStepLogTable();
 });
 
 afterEach(() => {
@@ -41,6 +50,18 @@ afterEach(() => {
 function makeResolve(provider: TicketingProvider | null) {
   return async (_mappingTeamKey: string) => provider;
 }
+
+const STEP: Step = {
+  id: "implement.1",
+  type: "implement",
+  status: "running",
+  started_at: "2026-05-27T00:00:00.000Z",
+  ended_at: null,
+  parent_step_id: "feedback-loop",
+  inputs: {},
+  outputs: {},
+  logs_url: null,
+};
 
 describe("handleRunnerResult — auth", () => {
   it("returns 401 when Authorization header is missing", async () => {
@@ -224,6 +245,40 @@ describe("handleRunnerResult — implementation", () => {
     ]);
   });
 
+  it("updates the dispatch log with the PR URL when the result token returns", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.prUrl).toBe("https://github.com/o/r/pull/1");
+  });
+
   it("calls markImplementationFailed on failure", async () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -249,6 +304,52 @@ describe("handleRunnerResult — implementation", () => {
     expect(
       calls.find((c) => c.method === "markImplementationFailed")?.args,
     ).toEqual(["i", "tests fail"]);
+  });
+});
+
+describe("handleRunnerProgress", () => {
+  it("persists a step report by reusable progress token", async () => {
+    const dispatchId = "dispatch-progress";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const first = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { step: STEP },
+      secret: SECRET,
+    });
+    const second = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { step: { ...STEP, status: "completed", ended_at: "2026-05-27T00:01:00.000Z" } },
+      secret: SECRET,
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(stepLog.getStepsByJobId(jobId)).toMatchObject([
+      {
+        stepId: "implement.1",
+        stepType: "implement",
+        status: "completed",
+        endedAt: "2026-05-27T00:01:00.000Z",
+      },
+    ]);
   });
 });
 

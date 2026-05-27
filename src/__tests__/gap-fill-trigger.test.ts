@@ -206,6 +206,8 @@ describe("handleGapFillTrigger", () => {
     expect(inputs.runner_callback_url).toBe(CALLBACK_URL);
     expect(inputs.run_token).toBeTruthy();
     expect(typeof inputs.run_token).toBe("string");
+    expect(inputs.run_progress_token).toBeTruthy();
+    expect(typeof inputs.run_progress_token).toBe("string");
   });
 
   it("dispatches with empty token/url when runner callback env not configured", async () => {
@@ -228,6 +230,7 @@ describe("handleGapFillTrigger", () => {
     const [, , inputs] = dispatchSpy.mock.calls[0];
     expect(inputs.runner_callback_url).toBe("");
     expect(inputs.run_token).toBe("");
+    expect(inputs.run_progress_token).toBe("");
   });
 
   it("returns 502 when workflow_dispatch fails", async () => {

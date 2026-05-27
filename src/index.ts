@@ -26,8 +26,8 @@ import { initReconciliationTable, getPendingReconciliations, updateReconciliatio
 import { resolveSessionImage } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
-import { handleRunnerResult } from "./runner-callback.js";
-import type { RunnerResultBody } from "./runner-callback.js";
+import { handleRunnerProgress, handleRunnerResult } from "./runner-callback.js";
+import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
@@ -40,6 +40,7 @@ import {
 } from "./local-docker.js";
 import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+import { getPendingReviewFixes, updateReviewFixStatus } from "./review-fix-queue.js";
 
 // ---------- Configuration ----------
 
@@ -315,6 +316,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // Process any pending reconciliation jobs triggered by merged PRs
   await processReconciliations(config);
 
+  // Process pending late review feedback that arrived after the original run.
+  await processReviewFixQueue(config);
+
   } finally {
     pollInProgress = false;
   }
@@ -334,16 +338,30 @@ async function dispatchGitHubActions(
 
   let runnerCallbackUrl = "";
   let runToken = "";
+  let runProgressToken = "";
+  let dispatchId: string | undefined;
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
     const minted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: "implementation",
+      audience: "result",
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+      secret: config.runnerTokenSecret,
+    });
+    dispatchId = minted.dispatchId;
+    const progressMinted = mintRunToken({
+      issueId: issue.id,
+      mappingTeamKey: issue.scopeKey,
+      phase: "implementation",
+      audience: "progress",
+      dispatchId,
       ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
       secret: config.runnerTokenSecret,
     });
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
     runToken = minted.token;
+    runProgressToken = progressMinted.token;
   }
 
   const result = await dispatchWorkflow(ghToken, mapping, {
@@ -354,6 +372,7 @@ async function dispatchGitHubActions(
     ...providerDispatchFields(mapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
+    run_progress_token: runProgressToken,
   });
 
   if (!result.success) {
@@ -369,6 +388,7 @@ async function dispatchGitHubActions(
     teamKey: issue.scopeKey,
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
+    dispatchId,
     dispatchNumber: prior.count + 1,
     executionMode: "github-actions",
     runnerMode,
@@ -410,14 +430,17 @@ async function dispatchPlanning(
 
   let runnerCallbackUrl = "";
   let runToken = "";
+  let dispatchId: string | undefined;
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
     const minted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: "planning",
+      audience: "result",
       ttlSeconds: PLANNING_TTL_SECONDS,
       secret: config.runnerTokenSecret,
     });
+    dispatchId = minted.dispatchId;
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
     runToken = minted.token;
   }
@@ -451,6 +474,7 @@ async function dispatchPlanning(
     teamKey: issue.scopeKey,
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
+    dispatchId,
     executionMode: "planning",
   });
 
@@ -528,14 +552,17 @@ async function dispatchFlyMachine(
 
   let runnerCallbackUrl = "";
   let runToken = "";
+  let dispatchId: string | undefined;
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
     const minted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: "implementation",
+      audience: "result",
       ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
       secret: config.runnerTokenSecret,
     });
+    dispatchId = minted.dispatchId;
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
     runToken = minted.token;
   }
@@ -592,6 +619,7 @@ async function dispatchFlyMachine(
     teamKey: issue.scopeKey,
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
+    dispatchId,
     dispatchNumber: prior.count + 1,
     executionMode: "fly-machines",
     machineNonce,
@@ -648,14 +676,17 @@ async function dispatchLocalDocker(
 
   let runnerCallbackUrl = "";
   let runToken = "";
+  let dispatchId: string | undefined;
   if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
     const minted = mintRunToken({
       issueId: issue.id,
       mappingTeamKey: issue.scopeKey,
       phase: "implementation",
+      audience: "result",
       ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
       secret: config.runnerTokenSecret,
     });
+    dispatchId = minted.dispatchId;
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
     runToken = minted.token;
   }
@@ -696,6 +727,7 @@ async function dispatchLocalDocker(
     teamKey: issue.scopeKey,
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
+    dispatchId,
     dispatchNumber: prior.count + 1,
     executionMode: "local-docker",
     machineNonce,
@@ -1498,6 +1530,104 @@ async function processReconciliations(config: AppConfig): Promise<void> {
   }
 }
 
+// ---------- Late Review Fix Queue ----------
+
+async function processReviewFixQueue(config: AppConfig): Promise<void> {
+  const pending = getPendingReviewFixes();
+  if (pending.length === 0) return;
+
+  console.log(`[review-fix] Processing ${pending.length} pending review fix run(s)`);
+
+  const teamRepoMap = getMappings();
+
+  for (const fix of pending) {
+    try {
+      const mappingEntry = Object.entries(teamRepoMap).find(
+        ([, mapping]) => `${mapping.owner}/${mapping.repo}` === fix.repo,
+      );
+
+      if (!mappingEntry) {
+        console.warn(`[review-fix] No mapping found for repo ${fix.repo}, skipping review fix #${fix.id}`);
+        updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
+
+      const [scopeKey, mapping] = mappingEntry;
+      if (mapping.paused) {
+        console.log(`[review-fix] Project ${mapping.owner}/${mapping.repo} is paused, skipping review fix #${fix.id}`);
+        updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
+
+      let runnerCallbackUrl = "";
+      let runToken = "";
+      let runProgressToken = "";
+      let dispatchId: string | undefined;
+      if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+        const minted = mintRunToken({
+          issueId: fix.issueId,
+          mappingTeamKey: scopeKey,
+          phase: "gap-analysis",
+          audience: "result",
+          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          secret: config.runnerTokenSecret,
+        });
+        dispatchId = minted.dispatchId;
+        const progressMinted = mintRunToken({
+          issueId: fix.issueId,
+          mappingTeamKey: scopeKey,
+          phase: "gap-analysis",
+          audience: "progress",
+          dispatchId,
+          ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+          secret: config.runnerTokenSecret,
+        });
+        runnerCallbackUrl = config.runnerCallbackBaseUrl;
+        runToken = minted.token;
+        runProgressToken = progressMinted.token;
+      }
+
+      const [owner] = fix.repo.split("/");
+      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+      const result = await dispatchWorkflow(ghToken, mapping, {
+        issue_id: fix.issueId,
+        issue_identifier: fix.issueIdentifier ?? fix.issueId,
+        issue_title: `Review feedback fix for PR #${fix.prNumber}`,
+        issue_description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
+        pr_number: String(fix.prNumber),
+        ...providerDispatchFields(mapping),
+        runner_callback_url: runnerCallbackUrl,
+        run_token: runToken,
+        run_progress_token: runProgressToken,
+      });
+
+      if (!result.success) {
+        console.error(`[review-fix] Failed to dispatch review fix #${fix.id}: ${result.status} ${result.error}`);
+        updateReviewFixStatus(fix.id, "failed");
+        continue;
+      }
+
+      const prior = countPriorDispatches(fix.issueId);
+      const jobId = appendLog({
+        issueId: fix.issueId,
+        issueIdentifier: fix.issueIdentifier ?? undefined,
+        issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
+        teamKey: scopeKey,
+        repo: fix.repo,
+        dispatchId,
+        dispatchNumber: prior.count + 1,
+        executionMode: "github-actions",
+        runnerMode: "default",
+      });
+      suppressStaleNotifications(fix.issueId, jobId);
+      updateReviewFixStatus(fix.id, "dispatched");
+      console.log(`[review-fix] Dispatched review fix for ${fix.issueIdentifier ?? fix.issueId} (PR #${fix.prNumber} in ${fix.repo})`);
+    } catch (err) {
+      console.error(`[review-fix] Error processing review fix #${fix.id}:`, err);
+    }
+  }
+}
+
 // ---------- HTTP server ----------
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -1605,6 +1735,47 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[runner-callback] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Runner progress callback — scoped bearer token authenticated
+    if (url === "/runner/progress" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        let body: string;
+        try {
+          body = await readBody(req);
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Failed to read body" }));
+          return;
+        }
+        let parsed: RunnerProgressBody;
+        try {
+          parsed = JSON.parse(body) as RunnerProgressBody;
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
+        const result = await handleRunnerProgress({
+          authorization: req.headers.authorization,
+          body: parsed,
+          secret: config.runnerTokenSecret,
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[runner-progress] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

@@ -5,7 +5,7 @@ import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
 import type { LLMExecutor, PipelineDefinition, StepReporter } from "./pipeline/types.js";
-import { HttpStepReporter, NoopStepReporter } from "./pipeline/reporter.js";
+import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContext } from "./linear-planning-fetch.js";
 
@@ -83,6 +83,7 @@ function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
 
 async function postRunnerResult(params: {
   workspaceDir: string;
+  phase: "implementation" | "gap-analysis";
   outcome: "success" | "failure";
   prUrl?: string;
   failureReason?: string;
@@ -92,7 +93,7 @@ async function postRunnerResult(params: {
   const runToken = process.env.RUN_TOKEN;
   if (!callbackUrl || !runToken) return;
 
-  if (params.outcome === "success" && !params.prUrl) {
+  if (params.outcome === "success" && params.phase === "implementation" && !params.prUrl) {
     console.warn("RUNNER_CALLBACK_URL is set but no PR URL was produced; skipping runner result callback.");
     return;
   }
@@ -105,7 +106,7 @@ async function postRunnerResult(params: {
   }
 
   const body: Record<string, unknown> = {
-    phase: "implementation",
+    phase: params.phase,
     outcome: params.outcome,
     comments,
   };
@@ -178,12 +179,16 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
+  const callbackUrl = process.env.RUNNER_CALLBACK_URL;
+  const progressToken = process.env.RUN_PROGRESS_TOKEN;
   if (orchestratorUrl && !nonce) {
     console.warn("ORCHESTRATOR_URL is set but MACHINE_NONCE is empty — step reports will be rejected (403).");
   }
   const reporter: StepReporter =
     opts.reporter ??
-    (orchestratorUrl && nonce
+    (callbackUrl && progressToken
+      ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
+      : orchestratorUrl && nonce
       ? new HttpStepReporter(orchestratorUrl, nonce)
       : new NoopStepReporter());
 
@@ -217,6 +222,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const pushOutputs = context.getOutputs("push");
     await postRunnerResult({
       workspaceDir,
+      phase: prNumber ? "gap-analysis" : "implementation",
       outcome: "success",
       prUrl: typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined,
       fetchImpl: opts.fetchImpl,
@@ -226,6 +232,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     console.error(`Pipeline failed: ${err}`);
     await postRunnerResult({
       workspaceDir,
+      phase: prNumber ? "gap-analysis" : "implementation",
       outcome: "failure",
       failureReason: err instanceof Error ? err.message : String(err),
       fetchImpl: opts.fetchImpl,

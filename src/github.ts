@@ -18,6 +18,8 @@ interface DispatchInputs {
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
   run_token?: string;
+  /** Signed reusable token authorizing step progress POSTs. Empty when progress callback disabled. */
+  run_progress_token?: string;
 }
 
 interface DispatchResult {

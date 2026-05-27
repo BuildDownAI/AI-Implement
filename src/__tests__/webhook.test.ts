@@ -8,6 +8,8 @@ import type * as WebhookModule from "../webhook.js";
 import type * as LogModule from "../log.js";
 import type * as ReconciliationModule from "../reconciliation.js";
 import type * as DedupModule from "../dedup.js";
+import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
+import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 
 // ---------- Test infrastructure ----------
 
@@ -85,6 +87,8 @@ let webhook: typeof WebhookModule;
 let log: typeof LogModule;
 let reconciliation: typeof ReconciliationModule;
 let dedup: typeof DedupModule;
+let reviewStore: typeof ReviewLedgerStoreModule;
+let reviewFixQueue: typeof ReviewFixQueueModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -97,6 +101,8 @@ beforeEach(async () => {
   log = await import("../log.js");
   reconciliation = await import("../reconciliation.js");
   webhook = await import("../webhook.js");
+  reviewStore = await import("../review-ledger-store.js");
+  reviewFixQueue = await import("../review-fix-queue.js");
   log.initLogTable();
   reconciliation.initReconciliationTable();
 });
@@ -369,5 +375,201 @@ describe("reconciliation queue", () => {
     });
     reconciliation.updateReconciliationStatus(id, "skipped");
     expect(reconciliation.getPendingReconciliations()).toHaveLength(0);
+  });
+});
+
+// ---------- Review feedback ingestion ----------
+
+describe("review feedback ingestion", () => {
+  it("stores CHANGES_REQUESTED reviews and queues a late fix for matching AI PRs", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-1",
+      issueIdentifier: "AII-1",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/42");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body: "Please fix the callback race.",
+        html_url: "https://github.com/org/repo/pull/42#pullrequestreview-1",
+      },
+      pull_request: {
+        number: 42,
+        html_url: "https://github.com/org/repo/pull/42",
+        head: { ref: "ai-implement/AII-1-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 42)).toMatchObject([
+      {
+        source: "github-review",
+        severity: "blocking",
+        body: "Please fix the callback race.",
+        url: "https://github.com/org/repo/pull/42#pullrequestreview-1",
+      },
+    ]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toMatchObject([
+      {
+        issueId: "issue-1",
+        issueIdentifier: "AII-1",
+        repo: "org/repo",
+        prNumber: 42,
+        reason: "changes_requested",
+      },
+    ]);
+  });
+
+  it("ignores AI-Implement native request-changes reviews to avoid self-triggered fix loops", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-self",
+      issueIdentifier: "AII-SELF",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/46");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review", {
+      action: "submitted",
+      review: {
+        state: "changes_requested",
+        body: "<!-- ai-implement native-review -->\nAI-Implement post-push review found unresolved blockers.",
+        html_url: "https://github.com/org/repo/pull/46#pullrequestreview-1",
+      },
+      pull_request: {
+        number: 46,
+        html_url: "https://github.com/org/repo/pull/46",
+        head: { ref: "ai-implement/AII-SELF-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true, reason: "self_review" });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 46)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("stores PR review comments and queues a late fix for matching AI PRs", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-2",
+      issueIdentifier: "AII-2",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/43");
+
+    const { req, res } = makeRequest(SECRET, "pull_request_review_comment", {
+      action: "created",
+      comment: {
+        body: "This line still accepts null owners.",
+        html_url: "https://github.com/org/repo/pull/43#discussion_r1",
+        path: "src/auth.ts",
+        line: 12,
+      },
+      pull_request: {
+        number: 43,
+        html_url: "https://github.com/org/repo/pull/43",
+        head: { ref: "ai-implement/AII-2-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 43)).toMatchObject([
+      {
+        source: "github-review-thread",
+        severity: "blocking",
+        body: "This line still accepts null owners.",
+        path: "src/auth.ts",
+        line: 12,
+      },
+    ]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("stores Claude PR summary comments and queues a late fix for matching AI PRs", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-4",
+      issueIdentifier: "AII-4",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/45");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
+        html_url: "https://github.com/org/repo/issues/45#issuecomment-1",
+        user: { login: "claude-code[bot]" },
+      },
+      issue: {
+        number: 45,
+        html_url: "https://github.com/org/repo/pull/45",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/45" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ queued: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toMatchObject([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Missing callback update Persist the PR URL before the runner exits.",
+        url: "https://github.com/org/repo/issues/45#issuecomment-1",
+      },
+    ]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
+  });
+
+  it("resolves stored findings when a matching PR receives a new synchronize event", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-3",
+      issueIdentifier: "AII-3",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "running", null, "https://github.com/org/repo/pull/44");
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 44,
+      source: "github-review",
+      severity: "blocking",
+      body: "Old feedback",
+    });
+
+    const { req, res } = makeRequest(SECRET, "pull_request", {
+      action: "synchronize",
+      pull_request: {
+        number: 44,
+        merged: false,
+        html_url: "https://github.com/org/repo/pull/44",
+        head: { ref: "ai-implement/AII-3-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ resolved: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 44)).toEqual([]);
   });
 });

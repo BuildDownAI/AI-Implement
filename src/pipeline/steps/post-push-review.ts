@@ -38,6 +38,7 @@ const REVIEW_MAX_TURNS = 12;
 const FIX_MAX_TURNS = 45;
 const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
+const AI_IMPLEMENT_NATIVE_REVIEW_MARKER = "<!-- ai-implement native-review -->";
 
 interface ReviewFinding {
   iteration: number;
@@ -420,6 +421,27 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
   }
 }
 
+function submitPrReview(
+  ghSpawn: (args: string[]) => SpawnResult,
+  prNumber: string,
+  event: "APPROVE" | "REQUEST_CHANGES",
+  body: string,
+): void {
+  const result = ghSpawn([
+    "api",
+    `repos/:owner/:repo/pulls/${prNumber}/reviews`,
+    "-X",
+    "POST",
+    "-f",
+    `event=${event}`,
+    "-f",
+    `body=${body}`,
+  ]);
+  if (result.exitCode !== 0) {
+    console.warn(`[post-push-review] Failed to submit ${event} review: ${resultMessage(result)}`);
+  }
+}
+
 function failedReviewOutputs(feedback: string) {
   const issue = issueFromString(feedback);
   return {
@@ -623,6 +645,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
 
       if (approved) {
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
+        submitPrReview(ghSpawn, prNumber, "APPROVE", `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.`);
         postPrComment(
           ghSpawn,
           prNumber,
@@ -634,6 +657,12 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
 
       if (iteration >= maxIterations) {
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
+        submitPrReview(
+          ghSpawn,
+          prNumber,
+          "REQUEST_CHANGES",
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${externalReviewFindingsCommentBlock(externalFindings)}`,
+        );
         postPrComment(
           ghSpawn,
           prNumber,
@@ -709,6 +738,12 @@ ${externalReviewFindingsBlock(externalFindings)}
       if (status.exitCode !== 0) throw new Error(`git status failed: ${resultMessage(status)}`);
       if (!status.stdout.trim()) {
         const marker = `<!-- ai-implement post-push iter=${iteration} no-changes -->`;
+        submitPrReview(
+          ghSpawn,
+          prNumber,
+          "REQUEST_CHANGES",
+          `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${externalReviewFindingsCommentBlock(externalFindings)}`,
+        );
         postPrComment(
           ghSpawn,
           prNumber,

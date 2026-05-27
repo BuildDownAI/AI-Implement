@@ -80,6 +80,33 @@ describe("extractClaudeSummaryFindings", () => {
       },
     ]);
   });
+
+  it("extracts Claude PR Review required fixes from bold numbered blockers", () => {
+    const body = `
+### PR Review: Changes requested
+
+**1. Missing tenant guard**
+src/auth.ts:12 does not verify ownership.
+
+**2. Callback lifecycle can drop feedback**
+Late reviews are not persisted.
+`;
+
+    expect(extractClaudeSummaryFindings(body, "https://example.com/claude-review")).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Missing tenant guard src/auth.ts:12 does not verify ownership.",
+        url: "https://example.com/claude-review",
+      },
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Callback lifecycle can drop feedback Late reviews are not persisted.",
+        url: "https://example.com/claude-review",
+      },
+    ]);
+  });
 });
 
 describe("formatReviewLedgerForPrompt", () => {

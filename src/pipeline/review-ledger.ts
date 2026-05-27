@@ -63,7 +63,7 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
     const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
     if (heading) {
       flushCurrentItem();
-      inBlockingSection = /^blocking\b/i.test(normalizeText(heading[1]));
+      inBlockingSection = isClaudeBlockingHeading(heading[1]);
       continue;
     }
 
@@ -76,7 +76,14 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
       continue;
     }
 
-    const continuation = line.match(/^\s{2,}(\S.*)$/);
+    const boldNumbered = line.match(/^\s*\*\*\s*\d+[\.)]\s+(.+?)\s*\*\*\s*$/);
+    if (boldNumbered) {
+      flushCurrentItem();
+      currentItem = boldNumbered[1];
+      continue;
+    }
+
+    const continuation = line.match(/^\s*(\S.*)$/);
     if (continuation && currentItem) {
       currentItem = `${currentItem} ${continuation[1]}`;
     }
@@ -318,7 +325,13 @@ function isClaudeAuthor(comment: Record<string, unknown>): boolean {
 }
 
 function hasClaudeReviewHeading(body: string): boolean {
-  return /(?:^|\n)\s{0,3}#{1,6}\s+(?:Code Review|Follow-up Review|Code Review Complete|Changes Requested)\b/i.test(body);
+  return /(?:^|\n)\s{0,3}#{1,6}\s+(?:PR Review|Code Review|Follow-up Review|Code Review Complete|Changes Requested)\b/i.test(body);
+}
+
+function isClaudeBlockingHeading(value: string): boolean {
+  const normalized = normalizeText(value);
+  if (/approved|complete/i.test(normalized) && !/changes requested/i.test(normalized)) return false;
+  return /^blocking\b/i.test(normalized) || /changes requested/i.test(normalized);
 }
 
 function hasLineLocation(finding: ReviewLedgerFinding): boolean {

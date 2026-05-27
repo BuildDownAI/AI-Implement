@@ -1,9 +1,12 @@
 import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
 
+export type RunTokenAudience = "result" | "progress" | "review";
+
 export interface RunTokenClaims {
   issueId: string;
   phase: "planning" | "implementation" | "gap-analysis";
+  audience: RunTokenAudience;
   dispatchId: string;
   exp: number;
 }
@@ -12,6 +15,7 @@ export interface MintInput {
   issueId: string;
   mappingTeamKey: string;
   phase: RunTokenClaims["phase"];
+  audience?: RunTokenAudience;
   ttlSeconds: number;
   secret: string;
   dispatchId?: string;
@@ -24,7 +28,7 @@ export interface MintOutput {
 
 export type VerifyResult =
   | { ok: true; claims: RunTokenClaims; mappingTeamKey: string }
-  | { ok: false; reason: "malformed" | "bad_signature" | "expired" | "already_consumed" };
+  | { ok: false; reason: "malformed" | "bad_signature" | "expired" | "already_consumed" | "wrong_audience" };
 
 export const PLANNING_TTL_SECONDS = 30 * 60;
 export const IMPLEMENTATION_TTL_SECONDS = 2 * 60 * 60;
@@ -48,6 +52,7 @@ export function mintRunToken(input: MintInput): MintOutput {
   const claims: RunTokenClaims = {
     issueId: input.issueId,
     phase: input.phase,
+    audience: input.audience ?? "result",
     dispatchId,
     exp: Date.now() + input.ttlSeconds * 1000,
   };
@@ -57,14 +62,14 @@ export function mintRunToken(input: MintInput): MintOutput {
 
   getDb()
     .prepare(
-      "INSERT INTO runner_tokens (dispatch_id, issue_id, phase, expires_at, consumed_at, mapping_team_key) VALUES (?, ?, ?, ?, NULL, ?)",
+      "INSERT INTO runner_tokens (dispatch_id, audience, issue_id, phase, expires_at, consumed_at, mapping_team_key) VALUES (?, ?, ?, ?, ?, NULL, ?)",
     )
-    .run(dispatchId, claims.issueId, claims.phase, claims.exp, input.mappingTeamKey);
+    .run(dispatchId, claims.audience, claims.issueId, claims.phase, claims.exp, input.mappingTeamKey);
 
   return { token, dispatchId };
 }
 
-export function verifyAndConsumeRunToken(token: string, secret: string): VerifyResult {
+function verifyTokenSignatureAndLoadClaims(token: string, secret: string): VerifyResult {
   const parts = token.split(".");
   if (parts.length !== 2) return { ok: false, reason: "malformed" };
   const [payload, sig] = parts;
@@ -81,19 +86,45 @@ export function verifyAndConsumeRunToken(token: string, secret: string): VerifyR
   } catch {
     return { ok: false, reason: "malformed" };
   }
+  claims.audience ??= "result";
   if (claims.exp < Date.now()) return { ok: false, reason: "expired" };
 
   const db = getDb();
   const row = db
-    .prepare("SELECT consumed_at, mapping_team_key FROM runner_tokens WHERE dispatch_id = ?")
-    .get(claims.dispatchId) as { consumed_at: number | null; mapping_team_key: string } | undefined;
+    .prepare("SELECT consumed_at, mapping_team_key FROM runner_tokens WHERE dispatch_id = ? AND audience = ?")
+    .get(claims.dispatchId, claims.audience) as { consumed_at: number | null; mapping_team_key: string } | undefined;
   if (!row) return { ok: false, reason: "malformed" };
-  if (row.consumed_at !== null) return { ok: false, reason: "already_consumed" };
-
-  const result = db
-    .prepare("UPDATE runner_tokens SET consumed_at = ? WHERE dispatch_id = ? AND consumed_at IS NULL")
-    .run(Date.now(), claims.dispatchId);
-  if (result.changes === 0) return { ok: false, reason: "already_consumed" };
 
   return { ok: true, claims, mappingTeamKey: row.mapping_team_key };
+}
+
+export function verifyRunToken(
+  token: string,
+  secret: string,
+  expectedAudience: RunTokenAudience,
+  options: { consume: boolean },
+): VerifyResult {
+  const verified = verifyTokenSignatureAndLoadClaims(token, secret);
+  if (!verified.ok) return verified;
+  const { claims } = verified;
+  if (claims.audience !== expectedAudience) return { ok: false, reason: "wrong_audience" };
+
+  const db = getDb();
+  const row = db
+    .prepare("SELECT consumed_at FROM runner_tokens WHERE dispatch_id = ? AND audience = ?")
+    .get(claims.dispatchId, claims.audience) as { consumed_at: number | null } | undefined;
+  if (!row) return { ok: false, reason: "malformed" };
+  if (row.consumed_at !== null) return { ok: false, reason: "already_consumed" };
+  if (!options.consume) return verified;
+
+  const result = db
+    .prepare("UPDATE runner_tokens SET consumed_at = ? WHERE dispatch_id = ? AND audience = ? AND consumed_at IS NULL")
+    .run(Date.now(), claims.dispatchId, claims.audience);
+  if (result.changes === 0) return { ok: false, reason: "already_consumed" };
+
+  return verified;
+}
+
+export function verifyAndConsumeRunToken(token: string, secret: string): VerifyResult {
+  return verifyRunToken(token, secret, "result", { consume: true });
 }
