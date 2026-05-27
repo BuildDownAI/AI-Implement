@@ -12,7 +12,7 @@ import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion } from "./notify.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, markJobNotified, getInFlightJobs, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId } from "./log.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { handleTokenRequest } from "./token-vending.js";
@@ -1564,6 +1564,9 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       let runProgressToken = "";
       let dispatchId: string | undefined;
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+        // Gap-fill dispatches run the implementation workflow and can take as
+        // long as the initial implementation, even though they report back as
+        // gap-analysis so Linear status does not regress.
         const minted = mintRunToken({
           issueId: fix.issueId,
           mappingTeamKey: scopeKey,
@@ -1619,6 +1622,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         executionMode: "github-actions",
         runnerMode: "default",
       });
+      updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
       suppressStaleNotifications(fix.issueId, jobId);
       updateReviewFixStatus(fix.id, "dispatched");
       console.log(`[review-fix] Dispatched review fix for ${fix.issueIdentifier ?? fix.issueId} (PR #${fix.prNumber} in ${fix.repo})`);

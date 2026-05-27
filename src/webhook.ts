@@ -4,8 +4,8 @@ import { listLog } from "./log.js";
 import { enqueueReconciliation } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { enqueueReviewFix } from "./review-fix-queue.js";
-import { extractClaudeSummaryFindings } from "./pipeline/review-ledger.js";
-import { markReviewFindingsResolvedForPr, upsertReviewFinding } from "./review-ledger-store.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings } from "./pipeline/review-ledger.js";
+import { upsertReviewFinding } from "./review-ledger-store.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -107,8 +107,6 @@ const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
   "github-actions",
   "github-actions[bot]",
 ]);
-
-const AI_IMPLEMENT_NATIVE_REVIEW_MARKER = "<!-- ai-implement native-review -->";
 
 /**
  * Finds a dispatch log entry that matches the merged PR.
@@ -359,9 +357,8 @@ function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.Ser
     return;
   }
 
-  const resolvedCount = markReviewFindingsResolvedForPr(repoFullName, prNumber);
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ resolved: true, resolvedCount }));
+  res.end(JSON.stringify({ acknowledged: true, reason: "awaiting_gap_analysis_result" }));
 }
 
 function handleIssueCommentWebhook(payload: IssueCommentPayload, res: http.ServerResponse): void {

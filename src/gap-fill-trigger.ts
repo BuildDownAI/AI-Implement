@@ -95,6 +95,9 @@ export async function handleGapFillTrigger(
   let runToken = "";
   let runProgressToken = "";
   if (input.runnerCallbackBaseUrl && input.runnerTokenSecret) {
+    // Gap-fill dispatches run the implementation workflow and can take as
+    // long as the initial implementation, even though they report back as
+    // gap-analysis so ticket status does not regress.
     const minted = mintRunToken({
       issueId: owningIssueId,
       mappingTeamKey: owningScopeKey,

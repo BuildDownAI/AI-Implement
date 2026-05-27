@@ -7,6 +7,7 @@ import type * as LogModule from "../log.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import type * as StepLogModule from "../step-log.js";
+import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { Step } from "../pipeline/types.js";
@@ -19,6 +20,7 @@ let log: typeof LogModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 let stepLog: typeof StepLogModule;
+let reviewStore: typeof ReviewLedgerStoreModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -32,6 +34,7 @@ beforeEach(async () => {
   runnerTokens = await import("../runner-tokens.js");
   runnerCallback = await import("../runner-callback.js");
   stepLog = await import("../step-log.js");
+  reviewStore = await import("../review-ledger-store.js");
   dedup.getDb();
   log.initLogTable();
   stepLog.initStepLogTable();
@@ -378,6 +381,43 @@ describe("handleRunnerResult — gap-analysis", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPlanComplete")).toBeUndefined();
     expect(calls.find((c) => c.method === "markPrReady")).toBeUndefined();
+  });
+
+  it("resolves open review findings after a successful gap-analysis callback for the PR", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      repo: "org/repo",
+      dispatchId,
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix me",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
   });
 });
 

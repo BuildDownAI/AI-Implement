@@ -539,7 +539,7 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
   });
 
-  it("resolves stored findings when a matching PR receives a new synchronize event", async () => {
+  it("does not resolve stored findings when a matching PR receives a new synchronize event", async () => {
     const jobId = log.appendLog({
       issueId: "issue-3",
       issueIdentifier: "AII-3",
@@ -569,7 +569,12 @@ describe("review feedback ingestion", () => {
     await res.done;
 
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toMatchObject({ resolved: true });
-    expect(reviewStore.listOpenReviewFindings("org/repo", 44)).toEqual([]);
+    expect(JSON.parse(res.body)).toMatchObject({
+      acknowledged: true,
+      reason: "awaiting_gap_analysis_result",
+    });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 44)).toMatchObject([
+      { body: "Old feedback", status: "open" },
+    ]);
   });
 });

@@ -81,6 +81,22 @@ describe("extractClaudeSummaryFindings", () => {
     ]);
   });
 
+  it("does not fold unindented prose into regular blocking bullets", () => {
+    const body = `
+## Blocking
+- Fix auth
+This explanatory line should not become part of the finding.
+`;
+
+    expect(extractClaudeSummaryFindings(body)).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Fix auth",
+      },
+    ]);
+  });
+
   it("extracts Claude PR Review required fixes from bold numbered blockers", () => {
     const body = `
 ### PR Review: Changes requested

@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import type { StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import {
+  AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
   collectExternalReviewFindingsFromGh,
   formatReviewLedgerForPrompt,
   type ReviewLedgerFinding,
@@ -38,7 +39,6 @@ const REVIEW_MAX_TURNS = 12;
 const FIX_MAX_TURNS = 45;
 const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
-const AI_IMPLEMENT_NATIVE_REVIEW_MARKER = "<!-- ai-implement native-review -->";
 
 interface ReviewFinding {
   iteration: number;

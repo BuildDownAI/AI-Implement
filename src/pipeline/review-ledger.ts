@@ -6,6 +6,8 @@ export type ReviewLedgerSource =
 
 export type ReviewLedgerSeverity = "blocking" | "medium" | "minor";
 
+export const AI_IMPLEMENT_NATIVE_REVIEW_MARKER = "<!-- ai-implement native-review -->";
+
 export interface ReviewLedgerFinding {
   source: ReviewLedgerSource;
   severity: ReviewLedgerSeverity;
@@ -47,6 +49,7 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
   const items: string[] = [];
   let inBlockingSection = false;
   let currentItem: string | undefined;
+  let currentItemAllowsUnindentedContinuation = false;
 
   const flushCurrentItem = () => {
     if (!currentItem) return;
@@ -57,9 +60,15 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
     }
 
     currentItem = undefined;
+    currentItemAllowsUnindentedContinuation = false;
   };
 
   for (const line of body.split(/\r?\n/)) {
+    if (!line.trim()) {
+      if (currentItemAllowsUnindentedContinuation) flushCurrentItem();
+      continue;
+    }
+
     const heading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
     if (heading) {
       flushCurrentItem();
@@ -73,6 +82,7 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
     if (bullet) {
       flushCurrentItem();
       currentItem = bullet[1];
+      currentItemAllowsUnindentedContinuation = false;
       continue;
     }
 
@@ -80,10 +90,12 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
     if (boldNumbered) {
       flushCurrentItem();
       currentItem = boldNumbered[1];
+      currentItemAllowsUnindentedContinuation = true;
       continue;
     }
 
-    const continuation = line.match(/^\s*(\S.*)$/);
+    const continuation = line.match(/^\s{2,}(\S.*)$/) ??
+      (currentItemAllowsUnindentedContinuation ? line.match(/^\s{0,3}(\S.*)$/) : null);
     if (continuation && currentItem) {
       currentItem = `${currentItem} ${continuation[1]}`;
     }

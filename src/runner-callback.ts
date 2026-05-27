@@ -3,6 +3,7 @@ import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { upsertStepRecord } from "./step-log.js";
+import { markReviewFindingsResolvedForPr } from "./review-ledger-store.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
 
@@ -181,10 +182,22 @@ export async function handleRunnerResult(
     if (job) {
       updateJobPrUrl(job.id, input.body.prUrl!);
     }
+  } else if (input.body.phase === "gap-analysis") {
+    const job = getJobByDispatchId(claims.dispatchId);
+    const prNumber = parsePrNumber(job?.prUrl ?? null);
+    if (job?.repo && prNumber !== null) {
+      markReviewFindingsResolvedForPr(job.repo, prNumber);
+    }
   }
   // gap-analysis success: no status transition
 
   return { status: 200, body: { acknowledged: true, warnings } };
+}
+
+function parsePrNumber(prUrl: string | null): number | null {
+  if (!prUrl) return null;
+  const match = prUrl.match(/\/pull\/(\d+)(?:$|[?#])/);
+  return match ? Number.parseInt(match[1], 10) : null;
 }
 
 export async function handleRunnerProgress(

@@ -27,7 +27,7 @@ export interface MintOutput {
 }
 
 export type VerifyResult =
-  | { ok: true; claims: RunTokenClaims; mappingTeamKey: string }
+  | { ok: true; claims: RunTokenClaims; mappingTeamKey: string; consumedAt: number | null }
   | { ok: false; reason: "malformed" | "bad_signature" | "expired" | "already_consumed" | "wrong_audience" };
 
 export const PLANNING_TTL_SECONDS = 30 * 60;
@@ -95,7 +95,7 @@ function verifyTokenSignatureAndLoadClaims(token: string, secret: string): Verif
     .get(claims.dispatchId, claims.audience) as { consumed_at: number | null; mapping_team_key: string } | undefined;
   if (!row) return { ok: false, reason: "malformed" };
 
-  return { ok: true, claims, mappingTeamKey: row.mapping_team_key };
+  return { ok: true, claims, mappingTeamKey: row.mapping_team_key, consumedAt: row.consumed_at };
 }
 
 export function verifyRunToken(
@@ -108,16 +108,10 @@ export function verifyRunToken(
   if (!verified.ok) return verified;
   const { claims } = verified;
   if (claims.audience !== expectedAudience) return { ok: false, reason: "wrong_audience" };
-
-  const db = getDb();
-  const row = db
-    .prepare("SELECT consumed_at FROM runner_tokens WHERE dispatch_id = ? AND audience = ?")
-    .get(claims.dispatchId, claims.audience) as { consumed_at: number | null } | undefined;
-  if (!row) return { ok: false, reason: "malformed" };
-  if (row.consumed_at !== null) return { ok: false, reason: "already_consumed" };
+  if (verified.consumedAt !== null) return { ok: false, reason: "already_consumed" };
   if (!options.consume) return verified;
 
-  const result = db
+  const result = getDb()
     .prepare("UPDATE runner_tokens SET consumed_at = ? WHERE dispatch_id = ? AND audience = ? AND consumed_at IS NULL")
     .run(Date.now(), claims.dispatchId, claims.audience);
   if (result.changes === 0) return { ok: false, reason: "already_consumed" };
