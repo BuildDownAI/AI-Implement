@@ -31,8 +31,6 @@ const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
   "claude",
   "claude[bot]",
   "claude-code[bot]",
-  "github-actions",
-  "github-actions[bot]",
 ]);
 
 export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): ReviewLedgerFinding[] {

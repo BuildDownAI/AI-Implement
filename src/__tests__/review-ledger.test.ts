@@ -470,12 +470,6 @@ describe("collectExternalReviewFindingsFromGh", () => {
         body: "Trusted app review blocker.",
         url: "https://example.com/app-review",
       },
-      {
-        source: "claude-review-summary",
-        severity: "blocking",
-        body: "Trusted GitHub Actions review blocker.",
-        url: "https://example.com/actions-review",
-      },
     ]);
   });
 

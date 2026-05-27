@@ -582,6 +582,70 @@ describe("review feedback ingestion", () => {
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
   });
 
+  it("ignores edited Claude PR summary comments so progress edits do not requeue gap-fill", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-4",
+      issueIdentifier: "AII-4",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/45");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "edited",
+      comment: {
+        body: "### PR Review: Changes requested\n\n**1. Missing callback update**\nPersist the PR URL before the runner exits.",
+        html_url: "https://github.com/org/repo/issues/45#issuecomment-1",
+        user: { login: "claude-code[bot]" },
+      },
+      issue: {
+        number: 45,
+        html_url: "https://github.com/org/repo/pull/45",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/45" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
+  it("does not trust generic github-actions bot PR summary comments", async () => {
+    const jobId = log.appendLog({
+      issueId: "issue-4",
+      issueIdentifier: "AII-4",
+      repo: "org/repo",
+    });
+    log.updateJobStatus(jobId, "completed", "success", "https://github.com/org/repo/pull/45");
+
+    const { req, res } = makeRequest(SECRET, "issue_comment", {
+      action: "created",
+      comment: {
+        body: "### PR Review: Changes requested\n\n**1. Spoofable action feedback**\nThis should not be trusted from generic Actions.",
+        html_url: "https://github.com/org/repo/issues/45#issuecomment-2",
+        user: { login: "github-actions[bot]" },
+      },
+      issue: {
+        number: 45,
+        html_url: "https://github.com/org/repo/pull/45",
+        pull_request: { url: "https://api.github.com/repos/org/repo/pulls/45" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ ignored: true });
+    expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toEqual([]);
+    expect(reviewFixQueue.getPendingReviewFixes()).toEqual([]);
+  });
+
   it("does not resolve stored findings when a matching PR receives a new synchronize event", async () => {
     const jobId = log.appendLog({
       issueId: "issue-3",
@@ -619,5 +683,25 @@ describe("review feedback ingestion", () => {
     expect(reviewStore.listOpenReviewFindings("org/repo", 44)).toMatchObject([
       { body: "Old feedback", status: "open" },
     ]);
+  });
+
+  it("ignores malformed synchronize payloads with 200 so GitHub does not retry", async () => {
+    const { req, res } = makeRequest(SECRET, "pull_request", {
+      action: "synchronize",
+      pull_request: {
+        merged: false,
+        head: { ref: "ai-implement/AII-3-fix" },
+      },
+      repository: { full_name: "org/repo" },
+    });
+
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET);
+    await res.done;
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({
+      ignored: true,
+      reason: "missing_pr_fields",
+    });
   });
 });

@@ -153,6 +153,12 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/invalid characters for a container image reference/);
       expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
     });
+
+    it(`${f} masks runner progress tokens before the container step uses them`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
+    });
   }
 
   it("comment trigger only runs implementation for an exact trimmed /ai-implement command", () => {

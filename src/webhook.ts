@@ -106,8 +106,6 @@ const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
   "claude",
   "claude[bot]",
   "claude-code[bot]",
-  "github-actions",
-  "github-actions[bot]",
 ]);
 
 /**
@@ -356,8 +354,8 @@ function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.Ser
   const branch = payload.pull_request?.head?.ref;
   const repoFullName = payload.repository?.full_name;
   if (!prNumber || !prUrl || !repoFullName) {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Missing required PR fields" }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_pr_fields" }));
     return;
   }
 
@@ -373,7 +371,7 @@ function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.Ser
 }
 
 function handleIssueCommentWebhook(payload: IssueCommentPayload, res: http.ServerResponse): void {
-  if (payload.action !== "created" && payload.action !== "edited") {
+  if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;

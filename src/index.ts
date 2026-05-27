@@ -1566,6 +1566,9 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       let runToken = "";
       let runProgressToken = "";
       let dispatchId: string | undefined;
+      // This snapshot defines the findings this specific gap-fill dispatch is
+      // allowed to resolve. Findings that arrive after the snapshot remain open
+      // for a later queue event rather than being cleared by an older run.
       const dispatchFindingIds = listOpenReviewFindings(fix.repo, fix.prNumber).map((finding) => finding.id);
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
         // Gap-fill dispatches run the implementation workflow and can take as
