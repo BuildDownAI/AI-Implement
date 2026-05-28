@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # ---------- Build stage ----------
 FROM node:22-bookworm-slim AS builder
 
@@ -8,14 +9,11 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY src/ ./src/
+# agentica-agent must be present before `npm run build` because the orchestrator's
+# build script chains `tsc && npm run build:agentica-agent` (which `cd`s into here).
+COPY agentica-agent/ ./agentica-agent/
 
 RUN npm run build
-
-# Build the agentica-agent subprocess (optional alternative implementation
-# agent). Self-contained: own package.json, own node_modules, own tspc build.
-# At runtime, AgenticaAgentExecutor spawns /app/agentica-agent/dist/main.js.
-COPY agentica-agent/ ./agentica-agent/
-RUN cd agentica-agent && npm install --silent && npm run build
 
 # ---------- Runtime stage ----------
 FROM node:22-bookworm-slim
