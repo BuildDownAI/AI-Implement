@@ -88,7 +88,17 @@ async function main(): Promise<void> {
 
   const userMessage = env.smoke
     ? "Implement the task described in your premise."
-    : `Implement the work described in your premise. The issue title is "${env.issueTitle}".`;
+    : [
+        `Implement the work described in your premise. The issue title is "${env.issueTitle}".`,
+        ``,
+        `Stopping rules (important — read these before starting):`,
+        `- Make each file edit at most ONCE. If editFile fails with "oldString not found",`,
+        `  the edit was likely already made — skip it, do not retry.`,
+        `- Do NOT re-read files after editing them to verify.`,
+        `- Stop as soon as the workspace diff matches the issue's "Done when" criteria.`,
+        `- Do NOT run tests, do NOT commit, do NOT push, do NOT open PRs — the pipeline`,
+        `  handles git and PR creation after you exit.`,
+      ].join("\n");
 
   const startedAt = Date.now();
 
