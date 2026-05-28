@@ -17,6 +17,7 @@ on:
       - "session/**"
       - "src/**"
       - "pipelines/**"
+      - "agentica-agent/**"
       - ".github/workflows/build-runner.yml"
   workflow_dispatch:
 
