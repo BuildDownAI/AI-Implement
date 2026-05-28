@@ -10,7 +10,7 @@ function resolveDbPath(): string {
     mkdirSync(dirname(configured), { recursive: true });
     return configured;
   } catch (err: any) {
-    if (!["EACCES", "ENOENT", "EROFS"].includes(err.code)) throw err;
+    if (!["EACCES", "ENOENT", "EPERM", "EROFS"].includes(err.code)) throw err;
     console.warn(`[db] Cannot create ${dirname(configured)} (${err.code}), falling back to ${FALLBACK_DB_PATH}`);
     return FALLBACK_DB_PATH;
   }

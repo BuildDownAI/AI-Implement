@@ -52,6 +52,7 @@ You'll need a Linear workspace, a GitHub App you control, a Fly.io account, and 
 ```bash
 git clone https://github.com/BuildDownAI/AI-Implement.git
 cd AI-Implement
+asdf install                 # installs the Node version pinned in .tool-versions
 cp .env.example .env       # fill in LINEAR_API_KEY + GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY
 npm install
 npm run dev                # starts polling + HTTP server on :8080
@@ -73,6 +74,13 @@ npm run dev:local          # rebuilds the runner image, then starts RUNNER_MODE=
 ```
 
 Docker must be running. Local mode still opens real GitHub PRs; it just avoids deploying the orchestrator or publishing a runner image while you test changes.
+
+AI-Implement uses `better-sqlite3`, which ships a native Node addon. Always run
+`npm install`, `npm ci`, and `npm rebuild` with the Node major pinned in
+`.tool-versions` / `.nvmrc`; otherwise `node_modules` can be compiled for one
+Node ABI and fail when the service starts under another. If that happens after
+switching runtimes, run `npm ci` or `npm rebuild better-sqlite3` from the
+correct Node shell.
 
 The full architecture, env-var reference, SQLite schema, multi-client deploy model, and Bedrock setup live in [`CLAUDE.md`](CLAUDE.md).
 
