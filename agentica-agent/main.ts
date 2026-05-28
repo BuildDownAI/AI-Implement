@@ -24,7 +24,7 @@
 
 import { spawn } from "@symbolica/agentica";
 import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
-import { readFile, writeFile, editFile, bash, fileExists, listDir } from "./tools.js";
+import { readFile, writeFile, editFile, bash, fileExists, listDir, done } from "./tools.js";
 
 interface RuntimeEnv {
   apiKey: string;
@@ -87,17 +87,23 @@ async function main(): Promise<void> {
   await using agent = await spawn({ premise: env.prompt });
 
   const userMessage = env.smoke
-    ? "Implement the task described in your premise."
+    ? "Implement the task described in your premise. Call done() when the file changes are complete."
     : [
         `Implement the work described in your premise. The issue title is "${env.issueTitle}".`,
         ``,
-        `Stopping rules (important — read these before starting):`,
+        `Tools: readFile, writeFile, editFile, bash, fileExists, listDir, done.`,
+        ``,
+        `**You MUST call done() when finished.** This is how you signal completion —`,
+        `the hosted-agentica framework will not terminate the session on its own.`,
+        ``,
+        `Stopping rules:`,
         `- Make each file edit at most ONCE. If editFile fails with "oldString not found",`,
         `  the edit was likely already made — skip it, do not retry.`,
         `- Do NOT re-read files after editing them to verify.`,
-        `- Stop as soon as the workspace diff matches the issue's "Done when" criteria.`,
         `- Do NOT run tests, do NOT commit, do NOT push, do NOT open PRs — the pipeline`,
-        `  handles git and PR creation after you exit.`,
+        `  handles git and PR creation after done() exits the subprocess.`,
+        `- As soon as your workspace diff matches the issue's "Done when" criteria,`,
+        `  call done() with a short summary string.`,
       ].join("\n");
 
   const startedAt = Date.now();
@@ -105,7 +111,7 @@ async function main(): Promise<void> {
   try {
     await agent.call<void>(
       userMessage,
-      { readFile, writeFile, editFile, bash, fileExists, listDir },
+      { readFile, writeFile, editFile, bash, fileExists, listDir, done },
       {
         listener: (_iid: string, chunk: { role?: string; content?: string }) => {
           if (chunk.role === "agent" && chunk.content) {

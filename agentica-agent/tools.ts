@@ -113,3 +113,23 @@ export function fileExists(path: string): boolean {
 export function listDir(path: string): string[] {
   return readdirSync(resolveInWorkspace(path));
 }
+
+/**
+ * Signal that the agent has finished the task. Schedules an exit on the next
+ * tick so the agent can observe the return value before the subprocess dies,
+ * then process.exit(0) terminates everything — including the in-flight
+ * agent.call() promise that the hosted-agentica framework otherwise keeps
+ * pending until the model decides "done" on its own.
+ *
+ * The orchestrator pipeline checks exitCode === 0 for success, so calling
+ * done() is the agent's commitment that the workspace diff matches the
+ * issue's "Done when" criteria.
+ */
+export function done(summary?: string): string {
+  setImmediate(() => {
+    if (summary) console.log(`[agentica-agent] done(): ${summary}`);
+    else console.log("[agentica-agent] done() called");
+    process.exit(0);
+  });
+  return "Task marked complete. Subprocess will exit; the AI-Implement pipeline will commit and open the PR.";
+}
