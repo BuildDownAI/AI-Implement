@@ -29,7 +29,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/jsdom": "^28.0.1",
-    "@types/node": "^22.0.0",
+    "@types/node": "^24.12.4",
     "jsdom": "^29.1.0",
     "tsx": "^4.0.0",
     "typescript": "^5.7.0",
