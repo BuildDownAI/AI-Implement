@@ -1,0 +1,22 @@
+{
+  "name": "ai-implement-agentica-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Subprocess that runs the agentica hosted agent as an alternative implementation agent for AI-Implement. Spawned by the feedback-loop step when a mapping's agent='agentica'. See ../docs/AGENTICA-AGENT.md.",
+  "scripts": {
+    "prepare": "ts-patch install -s",
+    "build": "tspc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tools.test.js",
+    "smoke": "AGENTICA_AGENT_SMOKE=1 node dist/main.js"
+  },
+  "dependencies": {
+    "@symbolica/agentica": "^0.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ts-patch": "^3.3.0",
+    "tsc-alias": "^1.8.16",
+    "typescript": "^5.7.0"
+  }
+}

@@ -61,6 +61,9 @@ interface AppConfig {
   sessionImage: string;
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
+  agenticaApiKey: string | null;
+  agenticaModelPrimary: string;
+  agenticaModelFallback: string;
   githubWebhookSecret: string | null;
   orchestratorUrl: string | null;
   reaperDryRun: boolean;
@@ -137,6 +140,9 @@ function loadConfig(): AppConfig {
     sessionImage: process.env.SESSION_IMAGE || "ghcr.io/builddownai/ai-implement-runner:latest",
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
+    agenticaApiKey: process.env.AGENTICA_API_KEY || null,
+    agenticaModelPrimary: process.env.AGENTICA_MODEL_PRIMARY || "anthropic:claude-sonnet-4.6",
+    agenticaModelFallback: process.env.AGENTICA_MODEL_FALLBACK || "openai:gpt-4.1",
     githubWebhookSecret,
     orchestratorUrl: process.env.ORCHESTRATOR_URL || null,
     reaperDryRun: process.env.REAPER_DRY_RUN === "true",
@@ -372,6 +378,7 @@ async function dispatchGitHubActions(
     dispatchNumber: prior.count + 1,
     executionMode: "github-actions",
     runnerMode,
+    agent: mapping.agent,
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -559,6 +566,10 @@ async function dispatchFlyMachine(
     linearApiKey: config.linearApiKey ?? undefined,
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+    agenticaApiKey: config.agenticaApiKey ?? undefined,
+    agenticaModelPrimary: config.agenticaModelPrimary,
+    agenticaModelFallback: config.agenticaModelFallback,
+    agent: mapping.agent,
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     sessionToken,
@@ -598,6 +609,7 @@ async function dispatchFlyMachine(
     machineId: machine.id,
     runnerMode,
     sessionImage: resolvedImage,
+    agent: mapping.agent,
   });
 
   if (!shadow) {
@@ -677,6 +689,10 @@ async function dispatchLocalDocker(
     linearApiKey: config.linearApiKey ?? undefined,
     anthropicApiKey: config.anthropicApiKey ?? undefined,
     claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+    agenticaApiKey: config.agenticaApiKey ?? undefined,
+    agenticaModelPrimary: config.agenticaModelPrimary,
+    agenticaModelFallback: config.agenticaModelFallback,
+    agent: mapping.agent,
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     sessionToken,
@@ -702,6 +718,7 @@ async function dispatchLocalDocker(
     machineId: container.containerId,
     runnerMode,
     sessionImage: config.localRunnerImage,
+    agent: mapping.agent,
   });
 
   const suppressed = suppressStaleNotifications(issue.id, jobId);

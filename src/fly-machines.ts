@@ -338,6 +338,10 @@ export interface SessionMachineInput {
   linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
+  agenticaApiKey?: string;
+  agenticaModelPrimary?: string;
+  agenticaModelFallback?: string;
+  agent?: string;
   githubAppId: string;
   githubAppPrivateKey: string;
   sessionToken: string;
@@ -382,6 +386,18 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   }
   if (input.anthropicApiKey) {
     env.ANTHROPIC_API_KEY = input.anthropicApiKey;
+  }
+  if (input.agenticaApiKey) {
+    env.AGENTICA_API_KEY = input.agenticaApiKey;
+  }
+  if (input.agenticaModelPrimary) {
+    env.AGENTICA_MODEL_PRIMARY = input.agenticaModelPrimary;
+  }
+  if (input.agenticaModelFallback) {
+    env.AGENTICA_MODEL_FALLBACK = input.agenticaModelFallback;
+  }
+  if (input.agent) {
+    env.AI_IMPLEMENT_AGENT = input.agent;
   }
   if (input.orchestratorUrl) {
     env.ORCHESTRATOR_URL = input.orchestratorUrl;

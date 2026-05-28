@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "outDir": "./dist",
+    "rootDir": "./",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": false,
+    "sourceMap": true,
+    "plugins": [
+      { "transform": "@symbolica/agentica/transformer" }
+    ]
+  },
+  "include": ["main.ts", "tools.ts", "tools.test.ts"],
+  "exclude": ["node_modules", "dist"]
+}

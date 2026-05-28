@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
+import { AgenticaAgentExecutor } from "./pipeline/executor-agentica.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
@@ -175,7 +176,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
   const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
 
-  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
+  const agentId = process.env.AI_IMPLEMENT_AGENT ?? "claude-code";
+  const llmExecutor = opts.llmExecutor ?? createExecutor(agentId, workspaceDir);
+  if (!opts.llmExecutor) {
+    console.log(`[run-autonomous] agent=${agentId} executor=${llmExecutor.constructor.name}`);
+  }
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
   if (orchestratorUrl && !nonce) {
@@ -231,6 +236,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
+  }
+}
+
+function createExecutor(agentId: string, workspaceDir: string): LLMExecutor {
+  switch (agentId) {
+    case "agentica":
+      return new AgenticaAgentExecutor(workspaceDir);
+    default:
+      return new ClaudeCliExecutor(workspaceDir);
   }
 }
 

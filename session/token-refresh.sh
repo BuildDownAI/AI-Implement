@@ -32,16 +32,25 @@ SIGNATURE=$(printf '%s' "$SIGNING_INPUT" | openssl dgst -sha256 -sign "$PEM_FILE
 
 JWT="${SIGNING_INPUT}.${SIGNATURE}"
 
-# --- Step 3: Resolve installation ID for the org ---
-log "Fetching installation ID for org '$GITHUB_OWNER'..."
+# --- Step 3: Resolve installation ID for the owner ---
+# GitHub Apps can be installed on either an organization or a user account.
+# Try /orgs/X/installation first; on 404 (or any failure) fall back to
+# /users/X/installation. Only fail hard if both endpoints fail.
+log "Fetching installation ID for owner '$GITHUB_OWNER'..."
 
 INSTALL_RESPONSE=$(curl -sf --max-time 30 \
   -H "Authorization: Bearer $JWT" \
   -H "Accept: application/vnd.github+json" \
   -H "X-GitHub-Api-Version: 2022-11-28" \
   -H "User-Agent: ai-implement-runner" \
-  "https://api.github.com/orgs/${GITHUB_OWNER}/installation") \
-  || fail "GitHub App not installed on org '$GITHUB_OWNER' (or API call failed)"
+  "https://api.github.com/orgs/${GITHUB_OWNER}/installation" 2>/dev/null) || \
+INSTALL_RESPONSE=$(curl -sf --max-time 30 \
+  -H "Authorization: Bearer $JWT" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  -H "User-Agent: ai-implement-runner" \
+  "https://api.github.com/users/${GITHUB_OWNER}/installation") || \
+  fail "GitHub App not installed on owner '$GITHUB_OWNER' (tried both /orgs and /users endpoints)"
 
 INSTALL_ID=$(echo "$INSTALL_RESPONSE" | jq -r '.id')
 if [ -z "$INSTALL_ID" ] || [ "$INSTALL_ID" = "null" ]; then
