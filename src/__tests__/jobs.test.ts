@@ -100,6 +100,17 @@ describe("jobs table", () => {
     expect(inFlight.map((j) => j.issueId).sort()).toEqual(["issue-1", "issue-2"]);
   });
 
+  it("getInFlightIssueIds returns distinct issue IDs for dispatched and running jobs", () => {
+    const id1 = log.appendLog({ issueId: "issue-1" });
+    log.appendLog({ issueId: "issue-1" });
+    const id3 = log.appendLog({ issueId: "issue-3" });
+
+    log.updateJobRunId(id1, 111);
+    log.updateJobStatus(id3, "completed", "success");
+
+    expect([...log.getInFlightIssueIds()].sort()).toEqual(["issue-1"]);
+  });
+
   it("getUnnotifiedTerminalJobs returns terminal jobs that haven't been notified", () => {
     const id1 = log.appendLog({ issueId: "issue-1" });
     const id2 = log.appendLog({ issueId: "issue-2" });

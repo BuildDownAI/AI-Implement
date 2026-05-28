@@ -263,10 +263,9 @@ export class LinearProvider implements TicketingProvider {
 
     // Search case-insensitively across the workspace: Linear's uniqueness check
     // on issueLabelCreate is case-insensitive and treats a workspace-level label
-    // as conflicting with a team-level label of the same name. A strict
-    // case-sensitive, team-scoped search misses both cases and the create then
-    // fails with "duplicate label name". Prefer the team-scoped match if one
-    // exists, otherwise fall back to any workspace label with the same name.
+    // as conflicting with a team-level label of the same name. Prefer the
+    // requested team's label, otherwise reuse only a workspace-level label. A
+    // label scoped to a different team cannot be applied to this issue.
     const searchData = await this.linearMutation<{
       issueLabels: {
         nodes: Array<{ id: string; team: { id: string } | null }>;
@@ -282,10 +281,11 @@ export class LinearProvider implements TicketingProvider {
     const teamMatch = searchData.issueLabels.nodes.find(
       (n) => n.team?.id === teamId,
     );
-    const anyMatch = teamMatch ?? searchData.issueLabels.nodes[0];
-    if (anyMatch) {
-      cache.set(teamKey, anyMatch.id);
-      return anyMatch.id;
+    const workspaceMatch = searchData.issueLabels.nodes.find((n) => n.team === null || n.team === undefined);
+    const reusableMatch = teamMatch ?? workspaceMatch;
+    if (reusableMatch) {
+      cache.set(teamKey, reusableMatch.id);
+      return reusableMatch.id;
     }
 
     const createData = await this.linearMutation<{
@@ -446,15 +446,16 @@ export class LinearProvider implements TicketingProvider {
 
   // ---------- lifecycle verbs ----------
 
-  async markPlanningStarted(issueId: string, scopeKey: string): Promise<void> {
+  async markPlanningStarted(issueId: string, _scopeKey: string): Promise<void> {
+    const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(
-      scopeKey,
+      teamKey,
       "AI-Planning",
       "#8B5CF6",
       this.aiPlanningLabelCache,
     );
     await this.addLabelToIssue(issueId, labelId);
-    await this.transitionToInProgressIfMovable(issueId, scopeKey);
+    await this.transitionToInProgressIfMovable(issueId, teamKey);
   }
 
   async markPlanComplete(issueId: string): Promise<void> {
@@ -474,15 +475,16 @@ export class LinearProvider implements TicketingProvider {
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
   }
 
-  async markImplementing(issueId: string, scopeKey: string): Promise<void> {
+  async markImplementing(issueId: string, _scopeKey: string): Promise<void> {
+    const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(
-      scopeKey,
+      teamKey,
       "AI-Working",
       "#F59E0B",
       this.aiWorkingLabelCache,
     );
     await this.addLabelToIssue(issueId, labelId);
-    await this.transitionToInProgressIfMovable(issueId, scopeKey);
+    await this.transitionToInProgressIfMovable(issueId, teamKey);
   }
 
   async markPrReady(issueId: string, prUrl: string): Promise<void> {

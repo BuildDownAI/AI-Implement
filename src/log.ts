@@ -239,6 +239,15 @@ export function getInFlightJobs(): Job[] {
   );
 }
 
+export function getInFlightIssueIds(): Set<string> {
+  const rows = getDb()
+    .prepare(
+      "SELECT DISTINCT issue_id FROM dispatch_log WHERE status IN ('dispatched', 'running')",
+    )
+    .all() as Array<{ issue_id: string }>;
+  return new Set(rows.map((row) => row.issue_id));
+}
+
 /** Returns jobs that reached a terminal state but haven't been notified yet. */
 export function getUnnotifiedTerminalJobs(): Job[] {
   return mapRows(

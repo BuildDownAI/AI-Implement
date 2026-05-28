@@ -12,7 +12,7 @@ import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion } from "./notify.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId } from "./log.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { handleTokenRequest } from "./token-vending.js";
@@ -240,11 +240,15 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const allCandidates = [...readyForImplementation, ...needsPlanning];
     const needsPlanningIds = new Set(needsPlanning.map((i) => i.id));
 
+    const inFlightIssueIds = getInFlightIssueIds();
+    const isDispatchBlocked = (issueId: string) =>
+      isAlreadyDispatched(issueId) || inFlightIssueIds.has(issueId);
+
     const toProcess = selectIssuesToDispatch(
       allCandidates,
       teamRepoMap,
       inProgressCountsByTeam,
-      isAlreadyDispatched,
+      isDispatchBlocked,
     );
 
     for (const issue of allCandidates) {
