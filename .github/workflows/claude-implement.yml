@@ -177,8 +177,10 @@ jobs:
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PR_NUMBER: ${{ inputs.pr_number }}
           # Feature-branch grouping: clone + PR-target this branch. Empty falls back to
-          # the runner's default ("main") via entrypoint.sh; the orchestrator sends the
-          # repo default when not grouping, so non-main bases are honored too.
+          # the runner's default ("main") via entrypoint.sh. The orchestrator omits
+          # base_branch when it equals the repo default (to avoid 422 on un-resynced
+          # repos), so a non-main default is honored on GHA only when grouping sends a
+          # branch; the Fly/local-docker paths always pass the resolved base.
           GITHUB_DEFAULT_BRANCH: ${{ inputs.base_branch }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}

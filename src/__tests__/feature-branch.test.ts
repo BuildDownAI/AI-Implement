@@ -39,7 +39,7 @@ function makeIssue(parentRef?: TicketIssue["parentRef"]): TicketIssue {
   };
 }
 
-const parent = { id: "p", identifier: "OOL-78", title: "Parent epic", childCount: 3 };
+const parent = { identifier: "OOL-78", childCount: 3 };
 
 describe("qualifiesForFeatureBranch", () => {
   it("is true only for a parent with >= MIN children", () => {

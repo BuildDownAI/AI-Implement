@@ -120,7 +120,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     stateType?: string;
     labels?: string[];
     inverseRelations?: Array<{ type: string; issue: { state: { type: string } } }>;
-    parent?: { id: string; identifier: string; title: string; childCount: number } | null;
+    parent?: { identifier: string; childCount: number } | null;
   } = {}) {
     return {
       id: overrides.id ?? "uuid-1",
@@ -137,9 +137,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       inverseRelations: { nodes: overrides.inverseRelations ?? [] },
       parent: overrides.parent
         ? {
-            id: overrides.parent.id,
             identifier: overrides.parent.identifier,
-            title: overrides.parent.title,
             children: { nodes: Array.from({ length: overrides.parent.childCount }, (_, i) => ({ id: `c${i}` })) },
           }
         : null,
@@ -182,7 +180,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
         id: "child",
         identifier: "ENG-2",
         labels: ["AI-Implement", "Plan-Complete"],
-        parent: { id: "parent-uuid", identifier: "ENG-1", title: "Parent epic", childCount: 3 },
+        parent: { identifier: "ENG-1", childCount: 3 },
       }),
       makeIssue({ id: "orphan", identifier: "ENG-9", labels: ["AI-Implement", "Plan-Complete"] }),
     ]);
@@ -191,12 +189,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     const snap = await p.fetchAIImplementSnapshot();
 
     const child = snap.readyForImplementation.find((i) => i.id === "child")!;
-    expect(child.parentRef).toEqual({
-      id: "parent-uuid",
-      identifier: "ENG-1",
-      title: "Parent epic",
-      childCount: 3,
-    });
+    expect(child.parentRef).toEqual({ identifier: "ENG-1", childCount: 3 });
     const orphan = snap.readyForImplementation.find((i) => i.id === "orphan")!;
     expect(orphan.parentRef).toBeUndefined();
   });

@@ -121,9 +121,7 @@ export class LinearProvider implements TicketingProvider {
               nodes { type issue { state { type } } }
             }
             parent {
-              id
               identifier
-              title
               # first:50 caps childCount; harmless for the >=2 grouping threshold
               children(first: 50) { nodes { id } }
             }
@@ -146,9 +144,7 @@ export class LinearProvider implements TicketingProvider {
       labels: { nodes: Array<{ id: string; name: string }> };
       inverseRelations: { nodes: Array<{ type: string; issue: { state: { type: string } } }> };
       parent: {
-        id: string;
         identifier: string;
-        title: string;
         children: { nodes: Array<{ id: string }> };
       } | null;
     };
@@ -219,9 +215,7 @@ export class LinearProvider implements TicketingProvider {
         ...(issue.parent
           ? {
               parentRef: {
-                id: issue.parent.id,
                 identifier: issue.parent.identifier,
-                title: issue.parent.title,
                 childCount: issue.parent.children?.nodes?.length ?? 0,
               },
             }

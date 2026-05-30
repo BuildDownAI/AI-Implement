@@ -93,7 +93,11 @@ export async function getBranchSha(
   repo: string,
   branch: string,
 ): Promise<string | null> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`;
+  // Encode each path segment but preserve the "/" separators — feature branch names
+  // like "ai-implement/feature/ool-78" are multi-segment refs; encodeURIComponent on
+  // the whole string would turn the slashes into %2F and the ref lookup would 404.
+  const encodedBranch = branch.split("/").map(encodeURIComponent).join("/");
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodedBranch}`;
   const res = await fetch(url, { headers: ghHeaders(token) });
   if (res.status === 404) return null;
   if (!res.ok) {
@@ -134,9 +138,10 @@ export async function ensureBranchExists(
     body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: fromSha }),
   });
   if (res.status === 201) return;
-  // 422 = ref already exists (lost a creation race) — treat as success.
-  if (res.status === 422) return;
   const body = await res.text().catch(() => "");
+  // 422 with "Reference already exists" = lost a creation race — treat as success.
+  // Any other 422 (invalid SHA, malformed ref) is a real error and must surface.
+  if (res.status === 422 && /already exists/i.test(body)) return;
   throw new Error(`ensureBranchExists: creating "${branch}" failed: HTTP ${res.status}: ${body}`);
 }
 

@@ -112,6 +112,13 @@ describe("dispatchWorkflow", () => {
     expect(body.ref).toBe("main");
     expect(body.inputs.base_branch).toBe("ai-implement/feature/eng-1");
   });
+
+  it("omits base_branch from inputs when it is not provided (non-grouped path)", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    await dispatchWorkflow("gh-token", mockMapping, mockInputs);
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    expect("base_branch" in body.inputs).toBe(false);
+  });
 });
 
 describe("ensureBranchExists", () => {
@@ -129,6 +136,23 @@ describe("ensureBranchExists", () => {
 
     vi.mocked(fetch).mockResolvedValueOnce(notFound);
     expect(await getBranchSha("t", "o", "r", "missing")).toBeNull();
+  });
+
+  it("preserves slash separators in the ref path for multi-segment branch names", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(refResponse("abc123"));
+    await getBranchSha("t", "o", "r", "ai-implement/feature/ool-78");
+    const url = vi.mocked(fetch).mock.calls[0][0] as string;
+    expect(url).toBe("https://api.github.com/repos/o/r/git/ref/heads/ai-implement/feature/ool-78");
+    expect(url).not.toContain("%2F");
+  });
+
+  it("throws on a 422 that is not an 'already exists' race", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(notFound)
+      .mockResolvedValueOnce(refResponse("base-sha"))
+      .mockResolvedValueOnce({ ok: false, status: 422, text: async () => "Validation Failed: sha is not a commit" } as Response);
+
+    await expect(ensureBranchExists("t", "o", "r", "feat", "testing")).rejects.toThrow(/HTTP 422/);
   });
 
   it("creates the branch from the base head when it does not exist", async () => {
