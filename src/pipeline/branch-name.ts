@@ -16,6 +16,16 @@ export function buildIssueBranchName(issueIdentifier: string | undefined, issueT
   return `ai-implement/${key}-${summary}`;
 }
 
+/**
+ * Shared feature branch for a parent issue's children. Derived from the parent
+ * identifier only (stable across child dispatches; no title drift), so no registry
+ * is needed to recover the name. Collision-free because Linear identifiers are
+ * unique and slug-safe within a workspace.
+ */
+export function buildFeatureBranchName(parentIdentifier: string | undefined): string {
+  return `ai-implement/feature/${slugify(parentIdentifier, "parent")}`;
+}
+
 export function branchMatchesIssueIdentifier(branchRef: string | undefined, issueIdentifier: string | undefined): boolean {
   if (!branchRef || !issueIdentifier) return false;
 
