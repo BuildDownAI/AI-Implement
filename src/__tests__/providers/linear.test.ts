@@ -120,6 +120,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     stateType?: string;
     labels?: string[];
     inverseRelations?: Array<{ type: string; issue: { state: { type: string } } }>;
+    parent?: { id: string; identifier: string; title: string; childCount: number } | null;
   } = {}) {
     return {
       id: overrides.id ?? "uuid-1",
@@ -134,6 +135,14 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       },
       labels: { nodes: (overrides.labels ?? []).map((name, i) => ({ id: `l${i}`, name })) },
       inverseRelations: { nodes: overrides.inverseRelations ?? [] },
+      parent: overrides.parent
+        ? {
+            id: overrides.parent.id,
+            identifier: overrides.parent.identifier,
+            title: overrides.parent.title,
+            children: { nodes: Array.from({ length: overrides.parent.childCount }, (_, i) => ({ id: `c${i}` })) },
+          }
+        : null,
     };
   }
 
@@ -165,6 +174,31 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     expect(snap.inProgressCountsByScope).toEqual({});
     expect(snap.readyForImplementation[0].scopeKey).toBe("ENG");
     expect(snap.readyForImplementation[0].nativeStatus).toBe("Todo (unstarted)");
+  });
+
+  it("maps parentRef with childCount when the issue has a parent; omits it otherwise", async () => {
+    mockSinglePage([
+      makeIssue({
+        id: "child",
+        identifier: "ENG-2",
+        labels: ["AI-Implement", "Plan-Complete"],
+        parent: { id: "parent-uuid", identifier: "ENG-1", title: "Parent epic", childCount: 3 },
+      }),
+      makeIssue({ id: "orphan", identifier: "ENG-9", labels: ["AI-Implement", "Plan-Complete"] }),
+    ]);
+
+    const p = new LinearProvider({ linearApiKey: "k" });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    const child = snap.readyForImplementation.find((i) => i.id === "child")!;
+    expect(child.parentRef).toEqual({
+      id: "parent-uuid",
+      identifier: "ENG-1",
+      title: "Parent epic",
+      childCount: 3,
+    });
+    const orphan = snap.readyForImplementation.find((i) => i.id === "orphan")!;
+    expect(orphan.parentRef).toBeUndefined();
   });
 
   it("counts AI-Working / AI-Planning issues by scope and excludes them from buckets", async () => {

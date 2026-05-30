@@ -120,6 +120,13 @@ export class LinearProvider implements TicketingProvider {
             inverseRelations(first: 50) {
               nodes { type issue { state { type } } }
             }
+            parent {
+              id
+              identifier
+              title
+              # first:50 caps childCount; harmless for the >=2 grouping threshold
+              children(first: 50) { nodes { id } }
+            }
           }
           pageInfo {
             hasNextPage
@@ -138,6 +145,12 @@ export class LinearProvider implements TicketingProvider {
       state: { id: string; name: string; type: string };
       labels: { nodes: Array<{ id: string; name: string }> };
       inverseRelations: { nodes: Array<{ type: string; issue: { state: { type: string } } }> };
+      parent: {
+        id: string;
+        identifier: string;
+        title: string;
+        children: { nodes: Array<{ id: string }> };
+      } | null;
     };
 
     type IssuePage = {
@@ -196,13 +209,23 @@ export class LinearProvider implements TicketingProvider {
         continue;
       }
 
-      const ticketIssue = {
+      const ticketIssue: TicketIssue = {
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
         description: issue.description,
         scopeKey: issue.team.key,
         nativeStatus: `${issue.state.name} (${issue.state.type})`,
+        ...(issue.parent
+          ? {
+              parentRef: {
+                id: issue.parent.id,
+                identifier: issue.parent.identifier,
+                title: issue.parent.title,
+                childCount: issue.parent.children?.nodes?.length ?? 0,
+              },
+            }
+          : {}),
       };
 
       if (labelNames.has("Plan-Complete")) {
