@@ -45,6 +45,11 @@ on:
         required: false
         type: string
         default: ""
+      base_branch:
+        description: "Branch the runner clones and the PR targets (feature-branch grouping). Empty = repo default."
+        required: false
+        type: string
+        default: ""
       provider:
         description: "Claude provider: 'anthropic' (default) or 'bedrock'"
         required: false
@@ -171,6 +176,10 @@ jobs:
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          # Feature-branch grouping: clone + PR-target this branch. Empty falls back to
+          # the runner's default ("main") via entrypoint.sh; the orchestrator sends the
+          # repo default when not grouping, so non-main bases are honored too.
+          GITHUB_DEFAULT_BRANCH: ${{ inputs.base_branch }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
