@@ -10,6 +10,12 @@ interface DispatchInputs {
   dependencies?: string;
   /** When set, the workflow checks out the existing PR branch (gap-fill run). */
   pr_number?: string;
+  /**
+   * Base branch the runner clones and the child PR targets. Only forwarded when it
+   * differs from the workflow's declared default (feature-branch grouping); omitted
+   * otherwise so target repos that haven't re-synced the workflow input don't 422.
+   */
+  base_branch?: string;
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */
@@ -76,6 +82,62 @@ export async function dispatchWorkflow(
 
   const body = await res.text();
   return { success: false, status: res.status, error: body };
+}
+
+/**
+ * Returns the commit SHA a branch points at, or null if the branch does not exist.
+ */
+export async function getBranchSha(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<string | null> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`getBranchSha(${branch}) failed: HTTP ${res.status}: ${body}`);
+  }
+  const data = (await res.json()) as { object?: { sha?: unknown } };
+  const sha = data.object?.sha;
+  if (typeof sha !== "string") {
+    throw new Error(`getBranchSha(${branch}) returned an unexpected shape`);
+  }
+  return sha;
+}
+
+/**
+ * Ensures `branch` exists on the remote, creating it from `fromBranch`'s current
+ * head if missing. Idempotent: a no-op when the branch already exists, and tolerant
+ * of a 422 race (another caller created it between the check and the create).
+ */
+export async function ensureBranchExists(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  fromBranch: string,
+): Promise<void> {
+  const existing = await getBranchSha(token, owner, repo, branch);
+  if (existing !== null) return;
+
+  const fromSha = await getBranchSha(token, owner, repo, fromBranch);
+  if (fromSha === null) {
+    throw new Error(`ensureBranchExists: base branch "${fromBranch}" does not exist in ${owner}/${repo}`);
+  }
+
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs`, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: fromSha }),
+  });
+  if (res.status === 201) return;
+  // 422 = ref already exists (lost a creation race) — treat as success.
+  if (res.status === 422) return;
+  const body = await res.text().catch(() => "");
+  throw new Error(`ensureBranchExists: creating "${branch}" failed: HTTP ${res.status}: ${body}`);
 }
 
 /**

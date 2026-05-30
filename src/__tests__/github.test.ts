@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -100,6 +100,64 @@ describe("dispatchWorkflow", () => {
     const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
     expect(body.inputs.provider).toBe("bedrock");
     expect(body.inputs.aws_region).toBe("us-west-2");
+  });
+
+  it("forwards base_branch in inputs while ref stays the workflow default branch", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    await dispatchWorkflow("gh-token", mockMapping, {
+      ...mockInputs,
+      base_branch: "ai-implement/feature/eng-1",
+    });
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    expect(body.ref).toBe("main");
+    expect(body.inputs.base_branch).toBe("ai-implement/feature/eng-1");
+  });
+});
+
+describe("ensureBranchExists", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  function refResponse(sha: string) {
+    return { ok: true, status: 200, json: async () => ({ object: { sha } }) } as Response;
+  }
+  const notFound = { ok: false, status: 404 } as Response;
+
+  it("returns the SHA when a branch exists and null on 404 (getBranchSha)", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(refResponse("abc123"));
+    expect(await getBranchSha("t", "o", "r", "feat")).toBe("abc123");
+
+    vi.mocked(fetch).mockResolvedValueOnce(notFound);
+    expect(await getBranchSha("t", "o", "r", "missing")).toBeNull();
+  });
+
+  it("creates the branch from the base head when it does not exist", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(notFound)              // target branch missing
+      .mockResolvedValueOnce(refResponse("base-sha")) // base branch head
+      .mockResolvedValueOnce({ ok: true, status: 201 } as Response); // create ref
+
+    await ensureBranchExists("t", "o", "r", "ai-implement/feature/eng-1", "testing");
+
+    const createCall = vi.mocked(fetch).mock.calls[2];
+    expect(createCall[0]).toBe("https://api.github.com/repos/o/r/git/refs");
+    const body = JSON.parse((createCall[1] as RequestInit).body as string);
+    expect(body).toEqual({ ref: "refs/heads/ai-implement/feature/eng-1", sha: "base-sha" });
+  });
+
+  it("is a no-op when the branch already exists", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(refResponse("already-here"));
+    await ensureBranchExists("t", "o", "r", "feat", "testing");
+    expect(vi.mocked(fetch).mock.calls.length).toBe(1); // only the existence check
+  });
+
+  it("tolerates a 422 create race as success", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(notFound)
+      .mockResolvedValueOnce(refResponse("base-sha"))
+      .mockResolvedValueOnce({ ok: false, status: 422, text: async () => "Reference already exists" } as Response);
+
+    await expect(ensureBranchExists("t", "o", "r", "feat", "testing")).resolves.toBeUndefined();
   });
 });
 
