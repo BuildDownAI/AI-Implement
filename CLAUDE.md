@@ -53,6 +53,12 @@ scripts/
   sync-workflow.yml  — sync workflow templates to target repos
   claude-review.yml  — Claude reviews PRs (auto for same-repo, /claude-review for forks)
   build-runner.yml   — build and push the session runner image to GHCR
+
+docs/
+  plans/      — implementation plans (decision artifacts; progress derived from git)
+  solutions/  — documented solutions to past problems (bugs, best practices, workflow
+                patterns), by category with YAML frontmatter (module, tags, problem_type);
+                relevant when implementing or debugging in documented areas
 ```
 
 ## Running locally

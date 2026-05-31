@@ -14,6 +14,13 @@ export interface TicketIssue {
   scopeKey: string;
   /** Free-form, for logging only. Never branched on. */
   nativeStatus: string;
+  /**
+   * Parent issue, when this issue is a child of a parent that has children.
+   * Populated by the Linear provider only; undefined for other providers.
+   * Drives feature-branch grouping (see src/feature-branch.ts). `identifier` names the
+   * shared branch; `childCount` is the parent's child count (capped at the query's page size).
+   */
+  parentRef?: { identifier: string; childCount: number };
 }
 
 export interface AIImplementSnapshot {

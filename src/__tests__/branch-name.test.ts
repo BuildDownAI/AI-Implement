@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { branchMatchesIssueIdentifier, buildIssueBranchName } from "../pipeline/branch-name.js";
+import { branchMatchesIssueIdentifier, buildIssueBranchName, buildFeatureBranchName } from "../pipeline/branch-name.js";
 
 describe("buildIssueBranchName", () => {
   it("builds issue-scoped branch names from issue metadata", () => {
@@ -18,6 +18,21 @@ describe("buildIssueBranchName", () => {
     expect(buildIssueBranchName(undefined, undefined)).toBe(
       "ai-implement/issue-implementation",
     );
+  });
+});
+
+describe("buildFeatureBranchName", () => {
+  it("derives a stable feature branch from the parent identifier only", () => {
+    expect(buildFeatureBranchName("OOL-78")).toBe("ai-implement/feature/ool-78");
+  });
+
+  it("produces distinct names for distinct realistic Linear identifiers", () => {
+    const names = ["OOL-78", "OOL-781", "ENG-7"].map(buildFeatureBranchName);
+    expect(new Set(names).size).toBe(3);
+  });
+
+  it("falls back defensively for empty identifiers", () => {
+    expect(buildFeatureBranchName(undefined)).toBe("ai-implement/feature/parent");
   });
 });
 
