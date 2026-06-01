@@ -481,6 +481,103 @@ async function dispatchPlanning(
   console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile})`);
 }
 
+// ---------- Shared session-dispatch core ----------
+
+interface SessionBackendResult {
+  machineId: string;
+  sessionImage: string;
+  ghToken: string;
+  executionMode: "fly-machines" | "local-docker";
+  statusComment: { machineName: string; logsUrl?: string } | null;
+}
+
+async function dispatchSession(
+  config: AppConfig,
+  provider: TicketingProvider,
+  issue: DispatchableIssue,
+  mapping: RepoMapping,
+  prior: { count: number; lastDispatchedAt: number | null },
+  runnerMode: string,
+  opts: {
+    phase: "implementation" | "planning";
+    tokenTtlSeconds: number;
+    doMarkDispatched: boolean;
+    shadow: boolean;
+    backend: (input: {
+      sessionToken: string;
+      machineNonce: string;
+      runnerCallbackUrl: string;
+      runToken: string;
+    }) => Promise<SessionBackendResult>;
+    onPostDispatch?: (
+      config: AppConfig,
+      provider: TicketingProvider,
+      issue: DispatchableIssue,
+      mapping: RepoMapping,
+      ghToken: string,
+      jobId: number,
+      executionMode: "github-actions" | "fly-machines" | "local-docker",
+    ) => Promise<void>;
+  },
+): Promise<void> {
+  const sessionToken = generateSessionToken();
+  const machineNonce = generateMachineNonce();
+
+  let runnerCallbackUrl = "";
+  let runToken = "";
+  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
+    const minted = mintRunToken({
+      issueId: issue.id,
+      mappingTeamKey: issue.scopeKey,
+      phase: opts.phase,
+      ttlSeconds: opts.tokenTtlSeconds,
+      secret: config.runnerTokenSecret,
+    });
+    runnerCallbackUrl = config.runnerCallbackBaseUrl;
+    runToken = minted.token;
+  }
+
+  const result = await opts.backend({ sessionToken, machineNonce, runnerCallbackUrl, runToken });
+
+  if (opts.doMarkDispatched) {
+    markDispatched(issue.id, issue.identifier, issue.title);
+  }
+
+  const jobId = appendLog({
+    issueId: issue.id,
+    issueIdentifier: issue.identifier,
+    issueTitle: issue.title,
+    teamKey: issue.scopeKey,
+    repo: `${mapping.owner}/${mapping.repo}`,
+    issueState: issue.nativeStatus,
+    dispatchNumber: prior.count + 1,
+    executionMode: result.executionMode,
+    machineNonce,
+    machineId: result.machineId,
+    runnerMode,
+    sessionImage: result.sessionImage,
+  });
+
+  if (!opts.shadow) {
+    const suppressed = suppressStaleNotifications(issue.id, jobId);
+    if (suppressed > 0) {
+      console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
+    }
+
+    const doPostDispatch = opts.onPostDispatch ?? postDispatch;
+    await doPostDispatch(config, provider, issue, mapping, result.ghToken, jobId, result.executionMode);
+
+    if (result.statusComment) {
+      postStatusComment(provider, issue.id, {
+        type: "machine_created",
+        machineName: result.statusComment.machineName,
+      }, result.statusComment.logsUrl).catch((err) => {
+        console.error(`[poll] Failed to post machine_created status for ${issue.identifier}:`, err);
+      });
+    }
+  }
+}
+
 // ---------- Dispatch: Fly Machines ----------
 
 async function dispatchFlyMachine(
@@ -512,115 +609,83 @@ async function dispatchFlyMachine(
     return;
   }
 
-  const sessionToken = generateSessionToken();
-  const machineNonce = generateMachineNonce();
-  const minSecretsVersion = getFlySecretsMinVersion();
+  // Capture at call time so the non-null assertion inside the closure is sound
+  // (the pre-checks above have already verified these are non-null).
+  const flyToken = config.flySessionsToken;
+  const flyApp = config.flySessionsApp;
 
-  let allSecretNames: string[] = [];
-  try {
-    const secrets = await listAppSecrets(config.flySessionsToken, config.flySessionsApp);
-    allSecretNames = secrets.map((s) => s.name);
-  } catch (err) {
-    console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
-  }
+  await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
+    phase: "implementation",
+    tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
+    doMarkDispatched: !shadow,
+    shadow,
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+      const minSecretsVersion = getFlySecretsMinVersion();
 
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+      let allSecretNames: string[] = [];
+      try {
+        const secrets = await listAppSecrets(flyToken, flyApp);
+        allSecretNames = secrets.map((s) => s.name);
+      } catch (err) {
+        console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
+      }
 
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: "implementation",
-      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-      secret: config.runnerTokenSecret,
-    });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
-  }
+      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
-  const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
-    owner: mapping.owner,
-    repo: mapping.repo,
-    token: ghToken,
-    defaultImage: config.sessionImage,
+      const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
+        owner: mapping.owner,
+        repo: mapping.repo,
+        token: ghToken,
+        defaultImage: config.sessionImage,
+      });
+
+      const machineConfig = buildSessionMachineConfig({
+        image: resolvedImage,
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        issueTitle: issue.title,
+        issueDescription: issue.description || issue.title,
+        owner: mapping.owner,
+        repo: mapping.repo,
+        defaultBranch: mapping.defaultBranch,
+        linearApiKey: config.linearApiKey ?? undefined,
+        anthropicApiKey: config.anthropicApiKey ?? undefined,
+        claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+        sessionToken,
+        machineNonce,
+        sessionMode: mapping.sessionMode,
+        region: config.flySessionsRegion ?? undefined,
+        cpus: mapping.machineCpus,
+        memoryMb: mapping.machineMemoryMb,
+        teamKey: issue.scopeKey,
+        teamSecretNames: allSecretNames,
+        minSecretsVersion: minSecretsVersion ?? undefined,
+        orchestratorUrl: config.orchestratorUrl ?? undefined,
+        runnerCallbackUrl: runnerCallbackUrl || undefined,
+        runToken: runToken || undefined,
+        orchestratorApp: config.flyOrchestratorApp ?? undefined,
+        tenantId: config.tenantId ?? undefined,
+        expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
+        extraEnv: Object.keys(mapping.extraEnv).length > 0 ? mapping.extraEnv : undefined,
+      });
+
+      const machine = await createMachine(flyToken, flyApp, machineConfig);
+
+      const tag = shadow ? "shadow fly-machines" : "fly-machines";
+      console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${tag}, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
+
+      const machineLogsUrl = `https://fly.io/apps/${flyApp}/machines/${machine.id}`;
+      return {
+        machineId: machine.id,
+        sessionImage: resolvedImage,
+        ghToken,
+        executionMode: "fly-machines",
+        statusComment: shadow ? null : { machineName: machine.name, logsUrl: machineLogsUrl },
+      };
+    },
   });
-
-  const machineConfig = buildSessionMachineConfig({
-    image: resolvedImage,
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
-    issueDescription: issue.description || issue.title,
-    owner: mapping.owner,
-    repo: mapping.repo,
-    defaultBranch: mapping.defaultBranch,
-    linearApiKey: config.linearApiKey ?? undefined,
-    anthropicApiKey: config.anthropicApiKey ?? undefined,
-    claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-    githubAppId: config.githubAppId,
-    githubAppPrivateKey: config.githubAppPrivateKey,
-    sessionToken,
-    machineNonce,
-    sessionMode: mapping.sessionMode,
-    region: config.flySessionsRegion ?? undefined,
-    cpus: mapping.machineCpus,
-    memoryMb: mapping.machineMemoryMb,
-    teamKey: issue.scopeKey,
-    teamSecretNames: allSecretNames,
-    minSecretsVersion: minSecretsVersion ?? undefined,
-    orchestratorUrl: config.orchestratorUrl ?? undefined,
-    runnerCallbackUrl: runnerCallbackUrl || undefined,
-    runToken: runToken || undefined,
-    orchestratorApp: config.flyOrchestratorApp ?? undefined,
-    tenantId: config.tenantId ?? undefined,
-    expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
-    extraEnv: Object.keys(mapping.extraEnv).length > 0 ? mapping.extraEnv : undefined,
-  });
-
-  const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
-
-  if (!shadow) {
-    markDispatched(issue.id, issue.identifier, issue.title);
-  }
-
-  const jobId = appendLog({
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
-    teamKey: issue.scopeKey,
-    repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: issue.nativeStatus,
-    dispatchNumber: prior.count + 1,
-    executionMode: "fly-machines",
-    machineNonce,
-    machineId: machine.id,
-    runnerMode,
-    sessionImage: resolvedImage,
-  });
-
-  if (!shadow) {
-    // Suppress pending notifications for earlier failed attempts — they're stale.
-    const suppressed = suppressStaleNotifications(issue.id, jobId);
-    if (suppressed > 0) {
-      console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
-    }
-
-    await postDispatch(config, provider, issue, mapping, ghToken, jobId, "fly-machines");
-
-    // Post machine_created status comment to Linear (best-effort)
-    const machineLogsUrl = `https://fly.io/apps/${config.flySessionsApp}/machines/${machine.id}`;
-    postStatusComment(provider, issue.id, {
-      type: "machine_created",
-      machineName: machine.name,
-    }, machineLogsUrl).catch((err) => {
-      console.error(`[poll] Failed to post machine_created status for ${issue.identifier}:`, err);
-    });
-  }
-
-  const tag = shadow ? "shadow fly-machines" : "fly-machines";
-  console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${tag}, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
 }
 
 // ---------- Dispatch: Local Docker ----------
@@ -643,82 +708,53 @@ async function dispatchLocalDocker(
     return;
   }
 
-  const sessionToken = generateSessionToken();
-  const machineNonce = generateMachineNonce();
+  await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
+    phase: "implementation",
+    tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
+    doMarkDispatched: true,
+    shadow: false,
+    backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+      const localOrchestratorUrl =
+        config.localRunnerOrchestratorUrl ??
+        config.orchestratorUrl ??
+        `http://host.docker.internal:${config.healthPort}`;
 
-  let runnerCallbackUrl = "";
-  let runToken = "";
-  if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
-    const minted = mintRunToken({
-      issueId: issue.id,
-      mappingTeamKey: issue.scopeKey,
-      phase: "implementation",
-      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
-      secret: config.runnerTokenSecret,
-    });
-    runnerCallbackUrl = config.runnerCallbackBaseUrl;
-    runToken = minted.token;
-  }
+      const container = await startLocalRunnerContainer({
+        image: config.localRunnerImage,
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        issueTitle: issue.title,
+        issueDescription: issue.description || issue.title,
+        owner: mapping.owner,
+        repo: mapping.repo,
+        defaultBranch: mapping.defaultBranch,
+        linearApiKey: config.linearApiKey ?? undefined,
+        anthropicApiKey: config.anthropicApiKey ?? undefined,
+        claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+        sessionToken,
+        machineNonce,
+        sessionMode: mapping.sessionMode,
+        orchestratorUrl: localOrchestratorUrl,
+        runnerCallbackUrl: runnerCallbackUrl || undefined,
+        runToken: runToken || undefined,
+        extraEnv: Object.keys(mapping.extraEnv).length > 0 ? mapping.extraEnv : undefined,
+      });
 
-  const localOrchestratorUrl =
-    config.localRunnerOrchestratorUrl ??
-    config.orchestratorUrl ??
-    `http://host.docker.internal:${config.healthPort}`;
+      console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (local-docker, container: ${container.containerId}, image: ${config.localRunnerImage})`);
 
-  const container = await startLocalRunnerContainer({
-    image: config.localRunnerImage,
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
-    issueDescription: issue.description || issue.title,
-    owner: mapping.owner,
-    repo: mapping.repo,
-    defaultBranch: mapping.defaultBranch,
-    linearApiKey: config.linearApiKey ?? undefined,
-    anthropicApiKey: config.anthropicApiKey ?? undefined,
-    claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-    githubAppId: config.githubAppId,
-    githubAppPrivateKey: config.githubAppPrivateKey,
-    sessionToken,
-    machineNonce,
-    sessionMode: mapping.sessionMode,
-    orchestratorUrl: localOrchestratorUrl,
-    runnerCallbackUrl: runnerCallbackUrl || undefined,
-    runToken: runToken || undefined,
-    extraEnv: Object.keys(mapping.extraEnv).length > 0 ? mapping.extraEnv : undefined,
+      return {
+        machineId: container.containerId,
+        sessionImage: config.localRunnerImage,
+        ghToken: "",
+        executionMode: "local-docker",
+        statusComment: {
+          machineName: container.containerName || container.containerId.slice(0, 12),
+        },
+      };
+    },
   });
-
-  markDispatched(issue.id, issue.identifier, issue.title);
-  const jobId = appendLog({
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
-    teamKey: issue.scopeKey,
-    repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: issue.nativeStatus,
-    dispatchNumber: prior.count + 1,
-    executionMode: "local-docker",
-    machineNonce,
-    machineId: container.containerId,
-    runnerMode,
-    sessionImage: config.localRunnerImage,
-  });
-
-  const suppressed = suppressStaleNotifications(issue.id, jobId);
-  if (suppressed > 0) {
-    console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
-  }
-
-  await postDispatch(config, provider, issue, mapping, "", jobId, "local-docker");
-
-  postStatusComment(provider, issue.id, {
-    type: "machine_created",
-    machineName: container.containerName || container.containerId.slice(0, 12),
-  }).catch((err) => {
-    console.error(`[poll] Failed to post local container status for ${issue.identifier}:`, err);
-  });
-
-  console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (local-docker, container: ${container.containerId}, image: ${config.localRunnerImage})`);
 }
 
 // ---------- Shared post-dispatch logic ----------
