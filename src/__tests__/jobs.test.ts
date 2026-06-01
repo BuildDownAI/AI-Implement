@@ -389,3 +389,53 @@ describe("getPulls", () => {
     expect(pulls[0].prNumber).toBe(123);
   });
 });
+
+describe("stuck_attempts counter", () => {
+  it("returns 0 for an issue with no record", () => {
+    expect(log.getStuckAttempts("unknown-issue")).toBe(0);
+  });
+
+  it("incrementStuckAttempts returns 1 on first call", () => {
+    const count = log.incrementStuckAttempts("issue-stuck-1");
+    expect(count).toBe(1);
+    expect(log.getStuckAttempts("issue-stuck-1")).toBe(1);
+  });
+
+  it("incrementStuckAttempts increments on subsequent calls", () => {
+    log.incrementStuckAttempts("issue-stuck-2");
+    const count = log.incrementStuckAttempts("issue-stuck-2");
+    expect(count).toBe(2);
+    expect(log.getStuckAttempts("issue-stuck-2")).toBe(2);
+  });
+
+  it("resetStuckAttempts removes the row so getStuckAttempts returns 0", () => {
+    log.incrementStuckAttempts("issue-stuck-3");
+    log.incrementStuckAttempts("issue-stuck-3");
+    log.resetStuckAttempts("issue-stuck-3");
+    expect(log.getStuckAttempts("issue-stuck-3")).toBe(0);
+  });
+
+  it("resetStuckAttempts is idempotent", () => {
+    log.incrementStuckAttempts("issue-stuck-4");
+    log.resetStuckAttempts("issue-stuck-4");
+    expect(() => log.resetStuckAttempts("issue-stuck-4")).not.toThrow();
+    expect(log.getStuckAttempts("issue-stuck-4")).toBe(0);
+  });
+
+  it("incrementStuckAttempts stamps last_attempt_at", () => {
+    const before = Date.now();
+    log.incrementStuckAttempts("issue-ts");
+    const db = dedup.getDb();
+    const row = db.prepare("SELECT last_attempt_at FROM stuck_attempts WHERE issue_id = ?").get("issue-ts") as { last_attempt_at: number };
+    expect(row.last_attempt_at).toBeGreaterThanOrEqual(before);
+  });
+
+  it("full lifecycle: 0 → increment → increment → reset → 0", () => {
+    const id = "issue-lifecycle";
+    expect(log.getStuckAttempts(id)).toBe(0);
+    expect(log.incrementStuckAttempts(id)).toBe(1);
+    expect(log.incrementStuckAttempts(id)).toBe(2);
+    log.resetStuckAttempts(id);
+    expect(log.getStuckAttempts(id)).toBe(0);
+  });
+});

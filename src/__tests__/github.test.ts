@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, cancelWorkflowRun } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -118,5 +118,37 @@ describe("providerDispatchFields", () => {
     expect(
       providerDispatchFields(makeMapping({ provider: "bedrock", awsRegion: null })),
     ).toEqual({ provider: "bedrock" });
+  });
+});
+
+describe("cancelWorkflowRun", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("returns true on 202 Accepted", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 202, ok: true } as Response);
+    const result = await cancelWorkflowRun("token", "owner", "repo", 42);
+    expect(result).toBe(true);
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      "https://api.github.com/repos/owner/repo/actions/runs/42/cancel",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("returns true on 409 (run already finished)", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 409, ok: false } as Response);
+    const result = await cancelWorkflowRun("token", "owner", "repo", 99);
+    expect(result).toBe(true);
+  });
+
+  it("returns false on other non-OK statuses", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 500, ok: false } as Response);
+    const result = await cancelWorkflowRun("token", "owner", "repo", 7);
+    expect(result).toBe(false);
+  });
+
+  it("returns false on 404 without throwing", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 404, ok: false } as Response);
+    await expect(cancelWorkflowRun("token", "owner", "repo", 1)).resolves.toBe(false);
   });
 });
