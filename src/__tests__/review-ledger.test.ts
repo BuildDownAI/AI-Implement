@@ -258,7 +258,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
     expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
   });
 
-  it("collects latest comments from unresolved review threads as blocking findings", () => {
+  it("collects latest comments from unresolved review threads as non-blocking context by default", () => {
     const calls: string[][] = [];
     const ghSpawn: GhSpawn = (args) => {
       calls.push(args);
@@ -319,7 +319,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
     expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
       {
         source: "github-review-thread",
-        severity: "blocking",
+        severity: "medium",
         path: "src/app.ts",
         line: 27,
         body: "Latest unresolved note",
@@ -331,6 +331,123 @@ describe("collectExternalReviewFindingsFromGh", () => {
     const queryArg = graphqlCall?.find((arg) => arg.startsWith("query="));
     expect(queryArg).toContain("comments(last: 1)");
     expect(queryArg).not.toContain("comments(first: 100)");
+  });
+
+  it("treats unresolved threads as non-blocking when the author's latest review is not changes-requested", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            { state: "COMMENTED", user: { login: "claude[bot]" }, body: "", html_url: "https://example.com/commented" },
+            { state: "APPROVED", user: { login: "claude[bot]" }, body: "Approved with minor notes.", html_url: "https://example.com/approved" },
+          ]),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [
+                    {
+                      isResolved: false,
+                      isOutdated: false,
+                      path: "frontend/components/rubrics/RubricBuilder.tsx",
+                      line: 132,
+                      comments: {
+                        nodes: [
+                          {
+                            body: "Missing client-side validation: empty criterion names.",
+                            url: "https://example.com/nit",
+                            author: { login: "claude" },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
+      {
+        source: "github-review-thread",
+        severity: "medium",
+        path: "frontend/components/rubrics/RubricBuilder.tsx",
+        line: 132,
+        body: "Missing client-side validation: empty criterion names.",
+        url: "https://example.com/nit",
+      },
+    ]);
+  });
+
+  it("keeps unresolved threads blocking when the author's latest review is changes-requested", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            { state: "CHANGES_REQUESTED", user: { login: "claude[bot]" }, body: "Please address the inline findings.", html_url: "https://example.com/cr" },
+          ]),
+        };
+      }
+
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [
+                    {
+                      isResolved: false,
+                      isOutdated: false,
+                      path: "src/app.ts",
+                      line: 27,
+                      comments: {
+                        nodes: [
+                          {
+                            body: "Validate path params before database access.",
+                            url: "https://example.com/blocking-thread",
+                            author: { login: "claude" },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
+      {
+        source: "github-review",
+        severity: "blocking",
+        body: "Please address the inline findings.",
+        url: "https://example.com/cr",
+      },
+      {
+        source: "github-review-thread",
+        severity: "blocking",
+        path: "src/app.ts",
+        line: 27,
+        body: "Validate path params before database access.",
+        url: "https://example.com/blocking-thread",
+      },
+    ]);
   });
 
   it("collects blocking bullets from likely Claude issue comments", () => {
@@ -526,7 +643,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
     expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
       {
         source: "github-review-thread",
-        severity: "blocking",
+        severity: "medium",
         path: "src/app.ts",
         line: 27,
         body: "Validate path params before database access.",
@@ -643,7 +760,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
     expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
       {
         source: "github-review-thread",
-        severity: "blocking",
+        severity: "medium",
         path: "src/later.ts",
         line: 88,
         body: "Later page unresolved finding.",

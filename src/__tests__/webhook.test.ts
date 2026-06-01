@@ -494,7 +494,7 @@ describe("review feedback ingestion", () => {
     });
   });
 
-  it("stores PR review comments and queues a late fix for matching AI PRs", async () => {
+  it("stores PR review comments as non-blocking context and queues a late fix for matching AI PRs", async () => {
     const jobId = log.appendLog({
       issueId: "issue-2",
       issueIdentifier: "AII-2",
@@ -525,7 +525,7 @@ describe("review feedback ingestion", () => {
     expect(reviewStore.listOpenReviewFindings("org/repo", 43)).toMatchObject([
       {
         source: "github-review-thread",
-        severity: "blocking",
+        severity: "medium",
         body: "This line still accepts null owners.",
         path: "src/auth.ts",
         line: 12,

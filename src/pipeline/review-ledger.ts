@@ -36,11 +36,19 @@ const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
 export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): ReviewLedgerFinding[] {
   const findings: ReviewLedgerFinding[] = [];
 
-  collectChangesRequestedReviews(ghSpawn, prNumber, findings);
+  // A reviewer's latest formal verdict is authoritative: only reviewers currently in
+  // CHANGES_REQUESTED state contribute blocking inline threads. Leftover nit threads from
+  // a reviewer who has since approved (or only commented) are surfaced as non-blocking context.
+  const blockingReviewerLogins = collectChangesRequestedReviews(ghSpawn, prNumber, findings);
   collectClaudeIssueComments(ghSpawn, prNumber, findings);
-  collectUnresolvedReviewThreads(ghSpawn, prNumber, findings);
+  collectUnresolvedReviewThreads(ghSpawn, prNumber, findings, blockingReviewerLogins);
 
   return dedupeReviewFindings(findings);
+}
+
+/** Normalizes a GitHub login so REST (`claude[bot]`) and GraphQL (`claude`) forms compare equal. */
+function normalizeReviewerLogin(login: string): string {
+  return login.trim().toLowerCase().replace(/\[bot\]$/, "");
 }
 
 export function extractClaudeSummaryFindings(body: string, url?: string): ReviewLedgerFinding[] {
@@ -130,14 +138,15 @@ function formatLocation(finding: ReviewLedgerFinding): string | undefined {
   return typeof finding.line === "number" ? `${finding.path}:${finding.line}` : finding.path;
 }
 
-function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
+function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): Set<string> {
+  const blockingReviewerLogins = new Set<string>();
   const result = safeGhSpawn(ghSpawn, [
     "api",
     "--paginate",
     "--slurp",
     `repos/:owner/:repo/pulls/${prNumber}/reviews?per_page=100`,
   ]);
-  if (!result || result.exitCode !== 0) return;
+  if (!result || result.exitCode !== 0) return blockingReviewerLogins;
 
   const reviews = parseReviewPages(result.stdout);
 
@@ -150,7 +159,15 @@ function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, find
   });
 
   for (const review of latestActionableReviewsByReviewer.values()) {
-    if (review.state !== "CHANGES_REQUESTED" || typeof review.body !== "string") continue;
+    if (review.state !== "CHANGES_REQUESTED") continue;
+
+    // Record the reviewer regardless of body so their unresolved inline threads stay blocking.
+    const user = review.user;
+    if (isRecord(user) && typeof user.login === "string") {
+      blockingReviewerLogins.add(normalizeReviewerLogin(user.login));
+    }
+
+    if (typeof review.body !== "string") continue;
     const body = review.body.trim();
     if (!body) continue;
 
@@ -161,6 +178,8 @@ function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, find
       ...(typeof review.html_url === "string" ? { url: review.html_url } : {}),
     });
   }
+
+  return blockingReviewerLogins;
 }
 
 function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
@@ -186,7 +205,12 @@ function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings
   }
 }
 
-function collectUnresolvedReviewThreads(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
+function collectUnresolvedReviewThreads(
+  ghSpawn: GhSpawn,
+  prNumber: string,
+  findings: ReviewLedgerFinding[],
+  blockingReviewerLogins: Set<string>,
+): void {
   let after: string | undefined;
 
   for (;;) {
@@ -197,7 +221,7 @@ function collectUnresolvedReviewThreads(ghSpawn: GhSpawn, prNumber: string, find
     const reviewThreads = getReviewThreadsConnection(payload);
     if (!reviewThreads) return;
 
-    collectReviewThreadFindings(reviewThreads.nodes, findings);
+    collectReviewThreadFindings(reviewThreads.nodes, findings, blockingReviewerLogins);
 
     if (reviewThreads.pageInfo?.hasNextPage !== true) return;
     if (typeof reviewThreads.pageInfo.endCursor !== "string" || !reviewThreads.pageInfo.endCursor) return;
@@ -251,7 +275,11 @@ function buildReviewThreadsArgs(prNumber: string, after?: string): string[] {
   return args;
 }
 
-function collectReviewThreadFindings(nodes: unknown[], findings: ReviewLedgerFinding[]): void {
+function collectReviewThreadFindings(
+  nodes: unknown[],
+  findings: ReviewLedgerFinding[],
+  blockingReviewerLogins: Set<string>,
+): void {
   for (const thread of nodes) {
     if (!isRecord(thread) || thread.isResolved !== false || thread.isOutdated === true) continue;
 
@@ -262,9 +290,18 @@ function collectReviewThreadFindings(nodes: unknown[], findings: ReviewLedgerFin
     const body = latestComment.body.trim();
     if (!body) continue;
 
+    // An unresolved inline thread only blocks when its author's current verdict is
+    // CHANGES_REQUESTED. Otherwise (approved, commented, or no formal review) it is a
+    // non-blocking nit that should not override the reviewer's approval.
+    const author = latestComment.author;
+    const authorLogin = isRecord(author) && typeof author.login === "string" ? author.login : "";
+    const severity: ReviewLedgerSeverity = authorLogin && blockingReviewerLogins.has(normalizeReviewerLogin(authorLogin))
+      ? "blocking"
+      : "medium";
+
     findings.push({
       source: "github-review-thread",
-      severity: "blocking",
+      severity,
       body,
       ...(typeof thread.path === "string" ? { path: thread.path } : {}),
       ...(typeof thread.line === "number" ? { line: thread.line } : {}),
@@ -387,6 +424,9 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
             nodes {
               body
               url
+              author {
+                login
+              }
             }
           }
         }

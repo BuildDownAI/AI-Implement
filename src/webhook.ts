@@ -320,14 +320,16 @@ function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.Ser
     : typeof payload.comment?.original_line === "number"
       ? payload.comment.original_line
       : undefined;
-  // The review comment webhook does not carry the parent review state.
-  // Treat matched created comments as blocking until review-state correlation
-  // can distinguish required fixes from nits without dropping tool feedback.
+  // The review comment webhook does not carry the parent review state, so an inline
+  // comment alone cannot be assumed to block. Record it as non-blocking context; a
+  // genuine "changes requested" verdict arrives separately via handleReviewWebhook
+  // (state=CHANGES_REQUESTED), which records the blocking finding. This keeps tool
+  // feedback flowing to the fixer without overriding an approving reviewer.
   const findingId = upsertReviewFinding({
     repo: repoFullName,
     prNumber,
     source: "github-review-thread",
-    severity: "blocking",
+    severity: "medium",
     body,
     ...(payload.comment?.path ? { path: payload.comment.path } : {}),
     ...(typeof line === "number" ? { line } : {}),
