@@ -490,6 +490,16 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.env!.SESSION_MODE).toBe("autonomous");
   });
 
+  it("defaults RUNNER_PHASE to implementation", () => {
+    const result = buildSessionMachineConfig(baseInput);
+    expect(result.config.env!.RUNNER_PHASE).toBe("implementation");
+  });
+
+  it("sets RUNNER_PHASE=planning when phase is planning", () => {
+    const result = buildSessionMachineConfig({ ...baseInput, phase: "planning" });
+    expect(result.config.env!.RUNNER_PHASE).toBe("planning");
+  });
+
   it("sets auto_destroy false and no-restart policy", () => {
     const result = buildSessionMachineConfig(baseInput);
     expect(result.config.auto_destroy).toBe(false);
