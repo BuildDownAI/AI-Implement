@@ -135,7 +135,7 @@ describe("cancelWorkflowRun", () => {
     );
   });
 
-  it("returns true on 409 (run already finished)", async () => {
+  it("returns true on 409 (run not in a cancellable state)", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({ status: 409, ok: false } as Response);
     const result = await cancelWorkflowRun("token", "owner", "repo", 99);
     expect(result).toBe(true);

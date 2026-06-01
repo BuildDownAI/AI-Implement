@@ -145,8 +145,10 @@ export async function getWorkflowRunStatus(
 
 /**
  * Cancels a GitHub Actions workflow run.
- * Returns true on 202 (accepted) or 409 (already finished — benign).
- * Returns false on other non-OK statuses without throwing.
+ * Returns true on 202 (accepted) or 409 (run not in a cancellable state — benign).
+ * Returns false on other non-OK HTTP statuses. Network-level errors (DNS, TCP
+ * reset, timeout) propagate as a rejected promise, consistent with the other
+ * helpers in this module.
  */
 export async function cancelWorkflowRun(
   token: string,
