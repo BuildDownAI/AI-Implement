@@ -71,5 +71,12 @@ git config --global --add safe.directory /workspace
 
 # ── 6. Invoke TS pipeline ────────────────────────────────────────────────────
 export WORKSPACE_DIR=/workspace
-log "Invoking TS pipeline (node /app/dist/run-autonomous.js)..."
-exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/run-autonomous.js"
+RUNNER_PHASE="${RUNNER_PHASE:-implementation}"
+export RUNNER_PHASE
+if [ "$RUNNER_PHASE" = "planning" ]; then
+  RUNNER_ENTRY="run-planning.js"
+else
+  RUNNER_ENTRY="run-autonomous.js"
+fi
+log "Invoking TS pipeline (node /app/dist/$RUNNER_ENTRY, phase=$RUNNER_PHASE)..."
+exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"
