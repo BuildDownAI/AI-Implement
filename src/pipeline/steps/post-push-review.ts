@@ -14,9 +14,18 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   model?: string;
   maxIterations?: number;
   reviewProviders?: string[];
+  /** Check-run names that identify the external review provider. Defaults to the Claude Code Review check. */
+  reviewCheckNames?: string[];
+  /** Poll interval while waiting for the external review check to finish. */
+  reviewWaitPollMs?: number;
+  /** Total time to wait for an in-flight external review check before failing closed. */
+  reviewWaitTimeoutMs?: number;
   ghSpawn?: (args: string[]) => SpawnResult;
   gitSpawn?: (args: string[]) => SpawnResult;
+  sleep?: (ms: number) => Promise<void>;
 }
+
+type ExternalReviewState = "skipped" | "absent" | "running" | "completed";
 
 interface PostPushReviewOutputs extends Record<string, unknown> {
   approved: boolean;
@@ -39,6 +48,8 @@ const REVIEW_MAX_TURNS = 12;
 const FIX_MAX_TURNS = 45;
 const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
+const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
+const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 300000;
 
 interface ReviewFinding {
   iteration: number;
@@ -94,6 +105,21 @@ function llmResultMessage(result: { stdout?: string; stderr?: string; exitCode: 
 function compactErrorMessage(message: string): string {
   const compact = message.replace(/\s+/g, " ").trim();
   return compact.length > 1200 ? `${compact.slice(0, 1200)}...` : compact;
+}
+
+function compactLogValue(text: string | undefined, maxLength = 1200): string {
+  const compact = (text ?? "").replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, maxLength - 3).trim()}...`;
+}
+
+function resultDiagnostics(result: SpawnResult): string {
+  const parts = [`exit=${result.exitCode}`];
+  const stderr = compactLogValue(result.stderr);
+  const stdout = compactLogValue(result.stdout);
+  if (stderr) parts.push(`stderr=${stderr}`);
+  if (stdout) parts.push(`stdout=${stdout}`);
+  return parts.join(" ");
 }
 
 function compactForComment(text: string, maxLength = 260): string {
@@ -333,6 +359,159 @@ function shouldCollectExternalReviewFindings(reviewProviders: string[] | undefin
   return reviewProviders === undefined || reviewProviders.includes(GITHUB_CLAUDE_CODE_REVIEW_PROVIDER);
 }
 
+function isExternalReviewCheckName(name: string, configured: string[] | undefined): boolean {
+  const normalized = name.trim().toLowerCase();
+  if (!normalized) return false;
+  if (configured && configured.length > 0) {
+    return configured.some((candidate) => candidate.trim().toLowerCase() === normalized);
+  }
+  if (normalized === "claude-review" || normalized === "claude code review") return true;
+  return /claude/.test(normalized) && /review/.test(normalized);
+}
+
+function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): string {
+  const res = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
+  if (res.exitCode !== 0) return "";
+  try {
+    const head = recordProp(asRecord(JSON.parse(res.stdout)), "head");
+    return stringProp(head, "sha");
+  } catch {
+    return "";
+  }
+}
+
+function parseCheckRuns(stdout: string): { name: string; status: string }[] {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  // `gh api` returns { check_runs: [...] }; with --slurp/--paginate it can be an array of pages.
+  const pages = Array.isArray(payload) ? payload : [payload];
+  const runs: { name: string; status: string }[] = [];
+  for (const page of pages) {
+    const record = asRecord(page);
+    const checkRuns = record?.check_runs;
+    if (!Array.isArray(checkRuns)) continue;
+    for (const run of checkRuns) {
+      const r = asRecord(run);
+      const name = stringProp(r, "name");
+      const status = stringProp(r, "status");
+      if (name) runs.push({ name, status });
+    }
+  }
+  return runs;
+}
+
+function probeExternalReviewCheck(
+  ghSpawn: (args: string[]) => SpawnResult,
+  headSha: string,
+  configuredCheckNames: string[] | undefined,
+): "absent" | "running" | "completed" {
+  const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
+  // If we cannot read check state, fail open rather than stall the loop indefinitely.
+  if (res.exitCode !== 0) return "absent";
+  const matching = parseCheckRuns(res.stdout).filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
+  if (matching.length === 0) return "absent";
+  return matching.every((run) => run.status === "completed") ? "completed" : "running";
+}
+
+/**
+ * Waits until the external review provider's check run for the PR's current head SHA
+ * reaches a terminal state, so the merge-readiness decision is made against a real
+ * external verdict instead of the empty snapshot that exists when both reviews start.
+ *
+ * - "completed": the external check finished — read its findings and gate normally.
+ * - "absent": no external review check exists for this SHA — fail open (repo has none).
+ * - "running": the check exists but did not finish within the budget — fail closed.
+ */
+async function waitForExternalReviewCompletion(
+  ghSpawn: (args: string[]) => SpawnResult,
+  prNumber: string,
+  opts: {
+    sleep: (ms: number) => Promise<void>;
+    pollMs: number;
+    timeoutMs: number;
+    configuredCheckNames: string[] | undefined;
+  },
+): Promise<ExternalReviewState> {
+  const headSha = resolvePrHeadSha(ghSpawn, prNumber);
+  if (!headSha) return "absent";
+
+  let elapsed = 0;
+  for (;;) {
+    const state = probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames);
+    if (state !== "running") return state;
+    if (elapsed >= opts.timeoutMs) return "running";
+    await opts.sleep(opts.pollMs);
+    elapsed += opts.pollMs;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function recordProp(record: Record<string, unknown> | null, key: string): Record<string, unknown> | null {
+  return record ? asRecord(record[key]) : null;
+}
+
+function stringProp(record: Record<string, unknown> | null, key: string): string {
+  const value = record?.[key];
+  return typeof value === "string" ? value : "";
+}
+
+function shortSha(sha: string): string {
+  return sha ? sha.slice(0, 7) : "";
+}
+
+function formatRefSha(ref: string, sha: string): string {
+  const short = shortSha(sha);
+  if (ref && short) return `${ref}@${short}`;
+  return ref || short;
+}
+
+function summarizePrDiagnostics(stdout: string): string {
+  try {
+    const pr = asRecord(JSON.parse(stdout));
+    if (!pr) return compactLogValue(stdout);
+
+    const user = recordProp(pr, "user");
+    const head = recordProp(pr, "head");
+    const headUser = recordProp(head, "user");
+    const headRepo = recordProp(head, "repo");
+    const base = recordProp(pr, "base");
+    const baseRepo = recordProp(base, "repo");
+    const mergeable = pr.mergeable;
+    const draft = pr.draft;
+    const parts = [
+      stringProp(pr, "html_url") ? `url=${stringProp(pr, "html_url")}` : "",
+      stringProp(pr, "state") ? `state=${stringProp(pr, "state")}` : "",
+      typeof draft === "boolean" ? `draft=${draft}` : "",
+      stringProp(user, "login") ? `author=${stringProp(user, "login")}` : "",
+      formatRefSha(stringProp(head, "ref"), stringProp(head, "sha")) ? `head=${formatRefSha(stringProp(head, "ref"), stringProp(head, "sha"))}` : "",
+      stringProp(headRepo, "full_name") ? `headRepo=${stringProp(headRepo, "full_name")}` : "",
+      stringProp(headUser, "login") ? `headOwner=${stringProp(headUser, "login")}` : "",
+      formatRefSha(stringProp(base, "ref"), stringProp(base, "sha")) ? `base=${formatRefSha(stringProp(base, "ref"), stringProp(base, "sha"))}` : "",
+      stringProp(baseRepo, "full_name") ? `baseRepo=${stringProp(baseRepo, "full_name")}` : "",
+      typeof mergeable === "boolean" || mergeable === null ? `mergeable=${String(mergeable)}` : "",
+    ].filter(Boolean);
+    return parts.length > 0 ? parts.join(" ") : compactLogValue(stdout);
+  } catch {
+    return compactLogValue(stdout);
+  }
+}
+
+function logReviewFailureDiagnostics(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
+  const prDetails = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
+  if (prDetails.exitCode === 0) {
+    console.warn(`[post-push-review] Native review PR context: ${summarizePrDiagnostics(prDetails.stdout)}`);
+  } else {
+    console.warn(`[post-push-review] Failed to fetch native review PR context: ${resultDiagnostics(prDetails)}`);
+  }
+}
+
 function parseFixSummary(stdout: string): FixSummary | null {
   const parsed = extractFirstJsonObject(stdout);
   if (!parsed) return null;
@@ -427,9 +606,10 @@ function submitPrReview(
   event: "APPROVE" | "REQUEST_CHANGES",
   body: string,
 ): void {
+  const endpoint = `repos/:owner/:repo/pulls/${prNumber}/reviews`;
   const result = ghSpawn([
     "api",
-    `repos/:owner/:repo/pulls/${prNumber}/reviews`,
+    endpoint,
     "-X",
     "POST",
     "-f",
@@ -438,7 +618,9 @@ function submitPrReview(
     `body=${body}`,
   ]);
   if (result.exitCode !== 0) {
-    console.warn(`[post-push-review] Failed to submit ${event} review: ${resultMessage(result)}`);
+    console.warn(`[post-push-review] Failed to submit ${event} review for PR #${prNumber}: ${resultDiagnostics(result)}`);
+    console.warn(`[post-push-review] Native review request: endpoint=${endpoint} event=${event} bodyChars=${body.length} bodyPreview=${compactLogValue(body, 260)}`);
+    logReviewFailureDiagnostics(ghSpawn, prNumber);
   }
 }
 
@@ -488,6 +670,10 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     const prNumber = String(inputs.prNumber ?? "");
     if (!prNumber) throw new Error("post-push-review requires a PR number");
 
+    const sleep = inputs.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const reviewWaitPollMs = inputs.reviewWaitPollMs ?? DEFAULT_REVIEW_WAIT_POLL_MS;
+    const reviewWaitTimeoutMs = inputs.reviewWaitTimeoutMs ?? DEFAULT_REVIEW_WAIT_TIMEOUT_MS;
+
     const startMarker = "<!-- ai-implement post-push status=start -->";
     postPrComment(
       ghSpawn,
@@ -507,11 +693,6 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
-      // Re-fetch each iteration so review comments posted during a fix pass can still gate merge readiness.
-      const externalFindings: ReviewLedgerFinding[] = shouldCollectExternalReviewFindings(inputs.reviewProviders)
-        ? collectExternalReviewFindingsFromGh(ghSpawn, prNumber)
-        : [];
-      const hasExternalBlockers = externalFindings.some((finding) => finding.severity === "blocking");
 
       const previousFindings = formatReviewHistory(reviewHistory);
       const reviewPrompt = `You are reviewing the diff for PR #${prNumber} against issue ${context.data.issueIdentifier}: ${context.data.issueTitle}.
@@ -620,6 +801,25 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         break;
       }
 
+      // The external review (e.g. Claude Code Review) runs concurrently and finishes
+      // around the same time as the internal LLM review above. Wait for its check run
+      // on the PR's current head SHA to reach a terminal state, then read its findings,
+      // so merge readiness is decided against the real external verdict rather than the
+      // empty snapshot that exists when both reviews start.
+      const externalReviewState: ExternalReviewState = shouldCollectExternalReviewFindings(inputs.reviewProviders)
+        ? await waitForExternalReviewCompletion(ghSpawn, prNumber, {
+            sleep,
+            pollMs: reviewWaitPollMs,
+            timeoutMs: reviewWaitTimeoutMs,
+            configuredCheckNames: inputs.reviewCheckNames,
+          })
+        : "skipped";
+      const externalReviewPending = externalReviewState === "running";
+      const externalFindings: ReviewLedgerFinding[] = externalReviewState === "skipped"
+        ? []
+        : collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
+      const hasExternalBlockers = externalFindings.some((finding) => finding.severity === "blocking");
+
       feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
       let issues = parseReviewIssues(parsed);
       issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
@@ -628,7 +828,35 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
       }
-      approved = approved || (parsed.approved === true && issues.length === 0 && !hasExternalBlockers);
+
+      // Fail closed: the internal verdict is clean and no blockers are visible, but the
+      // external review check did not finish within the wait budget. Do not auto-approve
+      // against a reviewer that is still in flight — defer to a human.
+      const internalApprovable = parsed.approved === true && issues.length === 0 && !hasExternalBlockers;
+      if (internalApprovable && externalReviewPending) {
+        feedback = "External review did not complete within the wait budget; not auto-approving.";
+        await reporter.report({
+          id: `post-push-review.${iteration}`,
+          type: "custom",
+          status: "passed",
+          started_at: new Date().toISOString(),
+          ended_at: new Date().toISOString(),
+          parent_step_id: "post-push-review",
+          inputs: { iteration, prNumber },
+          outputs: { approved: false, feedback, issues: [], blockingIssues: [] },
+          logs_url: null,
+        });
+        const marker = `<!-- ai-implement post-push iter=${iteration} external-pending -->`;
+        postPrComment(
+          ghSpawn,
+          prNumber,
+          `${marker}\n⚠️ Internal review passed, but the external review did not complete within the wait budget. Not auto-approving.\n\n**Merge readiness:** Manual review required; external review did not complete.`,
+          marker,
+        );
+        break;
+      }
+
+      approved = approved || (internalApprovable && !externalReviewPending);
       reviewHistory.push({ iteration, issues: [...issues], feedback });
 
       await reporter.report({
