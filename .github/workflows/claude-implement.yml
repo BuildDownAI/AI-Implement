@@ -166,6 +166,7 @@ jobs:
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_DEFAULT_BRANCH: ${{ github.ref_name }}
           ISSUE_ID: ${{ inputs.issue_id }}
           ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
           ISSUE_TITLE: ${{ inputs.issue_title }}

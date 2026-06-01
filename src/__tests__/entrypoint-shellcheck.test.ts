@@ -26,8 +26,10 @@ describe("session/entrypoint.sh", () => {
 
   it("exports GITHUB_DEFAULT_BRANCH for the TS runner", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\{GITHUB_DEFAULT_BRANCH:-main\}"/);
+    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\{GITHUB_REF_NAME\}"/);
+    expect(content).toMatch(/gh api "repos\/\$\{GITHUB_OWNER\}\/\$\{GITHUB_REPO\}"/);
     expect(content).toMatch(/export GITHUB_DEFAULT_BRANCH/);
+    expect(content).not.toContain("GITHUB_DEFAULT_BRANCH:-main");
   });
 
   it("preserves the checked-out gap-fill PR branch for the TS clone step", () => {
