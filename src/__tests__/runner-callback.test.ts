@@ -3,17 +3,24 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
+import type * as LogModule from "../log.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
+import type * as StepLogModule from "../step-log.js";
+import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
+import type { Step } from "../pipeline/types.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
 let dbPath: string;
 let dedup: typeof DedupModule;
+let log: typeof LogModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
+let stepLog: typeof StepLogModule;
+let reviewStore: typeof ReviewLedgerStoreModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -23,12 +30,18 @@ beforeEach(async () => {
   );
   process.env.DEDUP_DB_PATH = dbPath;
   dedup = await import("../dedup.js");
+  log = await import("../log.js");
   runnerTokens = await import("../runner-tokens.js");
   runnerCallback = await import("../runner-callback.js");
+  stepLog = await import("../step-log.js");
+  reviewStore = await import("../review-ledger-store.js");
   dedup.getDb();
+  log.initLogTable();
+  stepLog.initStepLogTable();
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   dedup.closeDb();
   try {
     fs.unlinkSync(dbPath);
@@ -41,6 +54,18 @@ afterEach(() => {
 function makeResolve(provider: TicketingProvider | null) {
   return async (_mappingTeamKey: string) => provider;
 }
+
+const STEP: Step = {
+  id: "implement.1",
+  type: "implement",
+  status: "running",
+  started_at: "2026-05-27T00:00:00.000Z",
+  ended_at: null,
+  parent_step_id: "feedback-loop",
+  inputs: {},
+  outputs: {},
+  logs_url: null,
+};
 
 describe("handleRunnerResult — auth", () => {
   it("returns 401 when Authorization header is missing", async () => {
@@ -224,6 +249,40 @@ describe("handleRunnerResult — implementation", () => {
     ]);
   });
 
+  it("updates the dispatch log with the PR URL when the result token returns", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.prUrl).toBe("https://github.com/o/r/pull/1");
+  });
+
   it("calls markImplementationFailed on failure", async () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -252,6 +311,63 @@ describe("handleRunnerResult — implementation", () => {
   });
 });
 
+describe("handleRunnerProgress", () => {
+  it("returns 401 before validating body when bearer token is invalid", async () => {
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: "Bearer invalid",
+      body: {} as never,
+      secret: SECRET,
+    });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).not.toBe("step_required");
+  });
+
+  it("persists a step report by reusable progress token", async () => {
+    const dispatchId = "dispatch-progress";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const first = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { step: STEP },
+      secret: SECRET,
+    });
+    const second = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { step: { ...STEP, status: "completed", ended_at: "2026-05-27T00:01:00.000Z" } },
+      secret: SECRET,
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(stepLog.getStepsByJobId(jobId)).toMatchObject([
+      {
+        stepId: "implement.1",
+        stepType: "implement",
+        status: "completed",
+        endedAt: "2026-05-27T00:01:00.000Z",
+      },
+    ]);
+  });
+});
+
 describe("handleRunnerResult — gap-analysis", () => {
   it("posts comments but skips status transition on success", async () => {
     const { token } = runnerTokens.mintRunToken({
@@ -277,6 +393,93 @@ describe("handleRunnerResult — gap-analysis", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPlanComplete")).toBeUndefined();
     expect(calls.find((c) => c.method === "markPrReady")).toBeUndefined();
+  });
+
+  it("resolves open review findings after a successful gap-analysis callback for the PR", async () => {
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix me",
+    });
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      repo: "org/repo",
+      dispatchId,
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+  });
+
+  it("does not resolve review findings that arrived after the gap-fill dispatch started", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-27T00:00:00.000Z"));
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Original feedback",
+    });
+    vi.setSystemTime(new Date("2026-05-27T00:01:00.000Z"));
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      repo: "org/repo",
+      dispatchId,
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    vi.setSystemTime(new Date("2026-05-27T00:02:00.000Z"));
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review-thread",
+      severity: "blocking",
+      body: "New feedback that arrived while the gap-fill was running",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toMatchObject([
+      { body: "New feedback that arrived while the gap-fill was running" },
+    ]);
   });
 });
 

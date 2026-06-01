@@ -209,6 +209,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           GITHUB_DEFAULT_BRANCH: ${{ needs.check-trigger.outputs.default_branch }}
           PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+          RUNNER_PHASE: gap-analysis
           ISSUE_META: ${{ needs.check-trigger.outputs.issue_meta }}
           PROVIDER: ${{ needs.check-trigger.outputs.provider }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
