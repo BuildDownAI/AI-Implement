@@ -213,13 +213,15 @@ Both check `custom/<path>` (relative to `process.cwd()`) first, then fall back t
 
 ## Per-repo runner image override
 
-A target repo can boot its Fly Machine session on a custom runner image by committing `.ai-implement/image.yml` at the default branch:
+A target repo can boot its runner on a custom image by committing `.ai-implement/image.yml` at the default branch:
 
 ```yaml
 image: ghcr.io/your-org/your-runner:v1
 ```
 
 The image must be publicly pullable. The customer owns building and publishing it. If the file is absent, malformed, or points at an unreachable reference, the orchestrator falls back to the default runner (`SESSION_IMAGE` env var, or `ghcr.io/builddownai/ai-implement-runner:latest`).
+
+This resolution applies to **both** execution modes. On the Fly Machines path the orchestrator boots the session machine on the resolved image directly. On the GitHub Actions path the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-implement.yml` (which runs it as the job's `container.image`) — but only when the choice is explicit: a per-repo `.ai-implement/image.yml` override, or an explicitly-set `SESSION_IMAGE`. When neither is set the orchestrator sends no `runner_image`, so the workflow keeps its own resolution order (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in `:latest` default) and repos that pin via that variable are not overridden. Planning runs (`claude-plan.yml`) have no runner container and are unaffected.
 
 The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
 

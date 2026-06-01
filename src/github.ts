@@ -22,6 +22,13 @@ interface DispatchInputs {
   run_token?: string;
   /** Signed reusable token authorizing step progress POSTs. Empty when progress callback disabled. */
   run_progress_token?: string;
+  /**
+   * Overrides the runner container image the target workflow runs in. Only set
+   * when the orchestrator has an explicit image to pin (a per-repo
+   * `.ai-implement/image.yml` override, or an explicitly-set SESSION_IMAGE);
+   * otherwise omitted so the workflow keeps its own image resolution.
+   */
+  runner_image?: string;
 }
 
 interface DispatchResult {

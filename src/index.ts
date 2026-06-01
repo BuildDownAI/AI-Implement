@@ -23,7 +23,7 @@ import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } f
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { initReconciliationTable, getPendingReconciliations, updateReconciliationStatus } from "./reconciliation.js";
-import { resolveSessionImage } from "./repo-image.js";
+import { resolveSessionImage, selectRunnerImageInput } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerProgress, handleRunnerResult } from "./runner-callback.js";
@@ -45,6 +45,9 @@ import { listOpenReviewFindings } from "./review-ledger-store.js";
 
 // ---------- Configuration ----------
 
+/** Built-in fallback runner image when SESSION_IMAGE is unset. Mirrors the default in claude-implement.yml. */
+const DEFAULT_SESSION_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
+
 interface AppConfig {
   linearApiKey: string | null;
   githubAppId: string;
@@ -61,6 +64,8 @@ interface AppConfig {
   flyOrchestratorApp: string | null;
   tenantId: string | null;
   sessionImage: string;
+  /** True when SESSION_IMAGE was explicitly set (vs. falling back to the built-in default). */
+  sessionImageExplicit: boolean;
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   githubWebhookSecret: string | null;
@@ -136,7 +141,8 @@ function loadConfig(): AppConfig {
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
-    sessionImage: process.env.SESSION_IMAGE || "ghcr.io/builddownai/ai-implement-runner:latest",
+    sessionImage: process.env.SESSION_IMAGE || DEFAULT_SESSION_IMAGE,
+    sessionImageExplicit: Boolean(process.env.SESSION_IMAGE),
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
     githubWebhookSecret,
@@ -331,6 +337,34 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
 // ---------- Dispatch: GitHub Actions ----------
 
+/**
+ * Resolves the runner image to forward on an orchestrator-initiated workflow
+ * dispatch. Returns the value for the `runner_image` workflow_dispatch input,
+ * or undefined to leave the target workflow's own image resolution in place
+ * (its AI_IMPLEMENT_RUNNER_IMAGE variable, then built-in default).
+ *
+ * This is the GitHub Actions counterpart to the Fly Machines image resolution
+ * at the session-machine dispatch: both honor a per-repo `.ai-implement/image.yml`
+ * override and the orchestrator's SESSION_IMAGE, so a testing orchestrator
+ * pinned to `:next` dispatches `:next` workflows.
+ */
+async function resolveDispatchRunnerImage(
+  config: AppConfig,
+  mapping: RepoMapping,
+  ghToken: string,
+): Promise<string | undefined> {
+  const resolved = await resolveSessionImage({
+    owner: mapping.owner,
+    repo: mapping.repo,
+    token: ghToken,
+    defaultImage: config.sessionImage,
+  });
+  return selectRunnerImageInput({
+    resolved,
+    sessionImageExplicit: config.sessionImageExplicit,
+  });
+}
+
 async function dispatchGitHubActions(
   config: AppConfig,
   provider: TicketingProvider,
@@ -369,6 +403,8 @@ async function dispatchGitHubActions(
     runProgressToken = progressMinted.token;
   }
 
+  const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
+
   const result = await dispatchWorkflow(ghToken, mapping, {
     issue_id: issue.id,
     issue_identifier: issue.identifier,
@@ -379,6 +415,7 @@ async function dispatchGitHubActions(
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
     run_progress_token: runProgressToken,
+    ...(runnerImage ? { runner_image: runnerImage } : {}),
   });
 
   if (!result.success) {
@@ -398,6 +435,7 @@ async function dispatchGitHubActions(
     dispatchNumber: prior.count + 1,
     executionMode: "github-actions",
     runnerMode,
+    sessionImage: runnerImage ?? null,
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -1511,6 +1549,7 @@ async function processReconciliations(config: AppConfig): Promise<void> {
 
       // Dispatch a gap-fill run using the existing claude-implement.yml workflow,
       // passing the merged PR number so Claude checks out the right branch.
+      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
       const result = await dispatchWorkflow(ghToken, mapping, {
         issue_id: job.issueId,
         issue_identifier: job.issueIdentifier ?? job.issueId,
@@ -1519,6 +1558,7 @@ async function processReconciliations(config: AppConfig): Promise<void> {
         pr_number: String(job.prNumber),
         runner_phase: "gap-analysis",
         ...providerDispatchFields(mapping),
+        ...(runnerImage ? { runner_image: runnerImage } : {}),
       });
 
       if (result.success) {
@@ -1603,6 +1643,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
 
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
       const result = await dispatchWorkflow(ghToken, mapping, {
         issue_id: fix.issueId,
         issue_identifier: fix.issueIdentifier ?? fix.issueId,
@@ -1614,6 +1655,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         runner_callback_url: runnerCallbackUrl,
         run_token: runToken,
         run_progress_token: runProgressToken,
+        ...(runnerImage ? { runner_image: runnerImage } : {}),
       });
 
       if (!result.success) {
