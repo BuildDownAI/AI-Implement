@@ -38,7 +38,8 @@ export interface Job {
 export type LogEntry = Job;
 
 export function initLogTable(): void {
-  getDb().exec(`
+  const db = getDb();
+  db.exec(`
     CREATE TABLE IF NOT EXISTS dispatch_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       issue_id TEXT NOT NULL,
@@ -49,6 +50,13 @@ export function initLogTable(): void {
       dispatched_at INTEGER NOT NULL,
       dispatch_number INTEGER NOT NULL DEFAULT 1,
       issue_state TEXT
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stuck_attempts (
+      issue_id TEXT PRIMARY KEY,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at INTEGER
     )
   `);
   ensureLogColumns();
@@ -384,4 +392,35 @@ export function invalidateNonce(jobId: number): void {
   getDb()
     .prepare("UPDATE dispatch_log SET machine_nonce = NULL WHERE id = ?")
     .run(jobId);
+}
+
+/** Returns the current stuck-attempt count for an issue, or 0 if none. */
+export function getStuckAttempts(issueId: string): number {
+  const row = getDb()
+    .prepare("SELECT attempts FROM stuck_attempts WHERE issue_id = ?")
+    .get(issueId) as { attempts: number } | undefined;
+  return row?.attempts ?? 0;
+}
+
+/** Increments the stuck-attempt counter, stamps last_attempt_at, and returns the new count. */
+export function incrementStuckAttempts(issueId: string): number {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at)
+    VALUES (?, 1, ?)
+    ON CONFLICT(issue_id) DO UPDATE SET
+      attempts = attempts + 1,
+      last_attempt_at = excluded.last_attempt_at
+  `).run(issueId, Date.now());
+  const row = db
+    .prepare("SELECT attempts FROM stuck_attempts WHERE issue_id = ?")
+    .get(issueId) as { attempts: number };
+  return row.attempts;
+}
+
+/** Resets the stuck-attempt counter for an issue (call on success). */
+export function resetStuckAttempts(issueId: string): void {
+  getDb()
+    .prepare("DELETE FROM stuck_attempts WHERE issue_id = ?")
+    .run(issueId);
 }

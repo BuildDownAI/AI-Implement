@@ -144,6 +144,25 @@ export async function getWorkflowRunStatus(
 }
 
 /**
+ * Cancels a GitHub Actions workflow run.
+ * Returns true on 202 (accepted) or 409 (run not in a cancellable state — benign).
+ * Returns false on other non-OK HTTP statuses. Network-level errors (DNS, TCP
+ * reset, timeout) propagate as a rejected promise, consistent with the other
+ * helpers in this module.
+ */
+export async function cancelWorkflowRun(
+  token: string,
+  owner: string,
+  repo: string,
+  runId: number,
+): Promise<boolean> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/cancel`;
+  const res = await fetch(url, { method: "POST", headers: ghHeaders(token) });
+  if (res.status === 202 || res.status === 409) return true;
+  return false;
+}
+
+/**
  * Finds the PR URL from a workflow run's branch.
  * Looks for open PRs with a head branch matching the run.
  */
