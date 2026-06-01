@@ -9,7 +9,7 @@ vi.mock("node:child_process", () => ({
 
 import { spawnSync } from "node:child_process";
 
-function makeContext(): DefaultPipelineContext {
+function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
   return new DefaultPipelineContext({
     jobId: 1,
     issueId: "issue-1",
@@ -19,6 +19,7 @@ function makeContext(): DefaultPipelineContext {
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
     ticketingProvider: "linear",
+    ...overrides,
   });
 }
 
@@ -77,6 +78,26 @@ describe("pushStep", () => {
     expect(outputs.prNumber).toBe(7);
     expect(outputs.branchPushed).toBe(true);
     expect(outputs.commitSha).toBe("abc123");
+  });
+
+  it("uses the context branch as the PR base when baseBranch input is omitted", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext({ branch: "development" }),
+      { ...BASE_INPUTS, baseBranch: undefined },
+      new NoopStepReporter(),
+    );
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { base: string };
+    expect(body.base).toBe("development");
   });
 
   it("returns existing PR info on 422 (PR already open)", async () => {

@@ -32,7 +32,10 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
   ): Promise<PushOutputs> {
     const { workspaceDir, repoOwner, repoRepo, githubToken, branchName } = inputs;
     const { issueIdentifier, issueTitle } = context.data;
-    const baseBranch = String(inputs.baseBranch ?? "main");
+    const baseBranch = String(inputs.baseBranch ?? context.data.branch ?? "").trim();
+    if (!baseBranch) {
+      throw new Error("Missing base branch for PR creation");
+    }
     const prTitle = String(inputs.prTitle ?? `${issueIdentifier}: ${issueTitle || "AI implementation"}`);
 
     if (!branchName || branchName === baseBranch) {

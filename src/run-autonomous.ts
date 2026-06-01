@@ -1,4 +1,5 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
@@ -26,6 +27,31 @@ function requireEnv(n: string): string {
   const v = process.env[n];
   if (!v) throw new Error(`Missing required env var: ${n}`);
   return v;
+}
+
+function optionalEnv(n: string): string | null {
+  const v = process.env[n]?.trim();
+  return v ? v : null;
+}
+
+function currentGitBranch(workspaceDir: string): string | null {
+  const result = spawnSync("git", ["branch", "--show-current"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0) return null;
+  const branch = result.stdout.toString().trim();
+  return branch || null;
+}
+
+function resolveBranch(workspaceDir: string): string {
+  const branch =
+    optionalEnv("GITHUB_DEFAULT_BRANCH") ??
+    currentGitBranch(workspaceDir);
+  if (!branch) {
+    throw new Error("Missing GITHUB_DEFAULT_BRANCH and unable to resolve the checked-out branch");
+  }
+  return branch;
 }
 
 function buildDefaultImplementationPrompt(params: {
@@ -142,7 +168,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const githubRepo = requireEnv("GITHUB_REPO");
   const githubToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
   if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
-  const branch = process.env.GITHUB_DEFAULT_BRANCH || "main";
+  const branch = resolveBranch(workspaceDir);
   const prNumber = process.env.PR_NUMBER ?? "";
   const runnerPhase = resolveRunnerPhase(process.env.RUNNER_PHASE, prNumber);
 

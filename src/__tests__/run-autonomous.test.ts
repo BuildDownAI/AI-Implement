@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAutonomous } from "../run-autonomous.js";
@@ -41,6 +42,13 @@ function makeSingleStepPipeline(stepId: string, mod: StepModule): {
   return { pipeline, runner };
 }
 
+function git(args: string[], cwd: string): void {
+  const result = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+  }
+}
+
 describe("runAutonomous", () => {
   let workspaceDir: string;
 
@@ -53,6 +61,8 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "");
     vi.stubEnv("RUN_TOKEN", "");
     vi.stubEnv("CLAUDE_MODEL", "");
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv("GITHUB_REF_NAME", "");
     vi.stubEnv("PR_NUMBER", "");
   });
 
@@ -91,6 +101,32 @@ describe("runAutonomous", () => {
     });
 
     expect(result.exitCode).toBe(1);
+  });
+
+  it("uses the checked-out branch when GITHUB_DEFAULT_BRANCH is not set", async () => {
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "");
+    vi.stubEnv("GITHUB_REF_NAME", "orchestrator-branch");
+    git(["init"], workspaceDir);
+    git(["checkout", "-b", "development"], workspaceDir);
+
+    let capturedBranch: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedBranch = ctx.data.branch;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedBranch).toBe("development");
   });
 
   it("reads model from WORKFLOW.md front matter and passes it through context", async () => {

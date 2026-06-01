@@ -34,6 +34,7 @@ jobs:
       matched: ${{ steps.trigger.outputs.matched }}
       pr_number: ${{ steps.pr.outputs.pr_number }}
       issue_meta: ${{ steps.pr.outputs.issue_meta }}
+      default_branch: ${{ steps.pr.outputs.default_branch }}
       provider: ${{ steps.pr.outputs.provider }}
       aws_region: ${{ steps.pr.outputs.aws_region }}
       runner_image: ${{ steps.runner-image.outputs.runner_image }}
@@ -98,6 +99,8 @@ jobs:
             );
             core.setOutput("pr_number", String(context.payload.issue.number));
             core.setOutput("issue_meta", JSON.stringify(meta));
+            // The workflow runs in the target repo, so repository.default_branch is the target fallback.
+            core.setOutput("default_branch", pr.data.base.ref || context.payload.repository.default_branch || "");
             core.setOutput("provider", process.env.AI_IMPLEMENT_PROVIDER || "anthropic");
             core.setOutput("aws_region", process.env.AI_IMPLEMENT_AWS_REGION || "");
 
@@ -204,6 +207,7 @@ jobs:
       - name: Run pipeline (gap-fill)
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_DEFAULT_BRANCH: ${{ needs.check-trigger.outputs.default_branch }}
           PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
           RUNNER_PHASE: gap-analysis
           ISSUE_META: ${{ needs.check-trigger.outputs.issue_meta }}

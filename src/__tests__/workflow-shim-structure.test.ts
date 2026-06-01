@@ -159,6 +159,11 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
     });
+
+    it(`${f} passes the dispatched ref to the runner as GITHUB_DEFAULT_BRANCH`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*github\.ref_name\s*\}\}/);
+    });
   }
 
   it("comment trigger only runs implementation for an exact trimmed /ai-implement command", () => {
@@ -182,6 +187,13 @@ describe("GHA workflow shims", () => {
     expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
     expect(yaml).toMatch(/invalid characters for a container image reference/);
     expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
+  });
+
+  it("comment trigger passes the PR base branch to the runner as GITHUB_DEFAULT_BRANCH", () => {
+    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
+    expect(yaml).toMatch(/default_branch:\s*\$\{\{\s*steps\.pr\.outputs\.default_branch\s*\}\}/);
+    expect(yaml).toMatch(/core\.setOutput\("default_branch", pr\.data\.base\.ref/);
+    expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*needs\.check-trigger\.outputs\.default_branch\s*\}\}/);
   });
 
   it("documents and constrains the ISSUE_META eval trust boundary", () => {
