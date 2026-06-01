@@ -32,6 +32,7 @@ export interface Job {
   machineId: string | null;
   runnerMode: string | null;
   sessionImage: string | null;
+  phase: string;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -97,6 +98,9 @@ function ensureLogColumns(): void {
   if (!names.has("session_image")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN session_image TEXT");
   }
+  if (!names.has("phase")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN phase TEXT NOT NULL DEFAULT 'implementation'");
+  }
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -129,12 +133,13 @@ export function appendLog(entry: {
   machineId?: string;
   runnerMode?: string;
   sessionImage?: string | null;
+  phase?: string;
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId).count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -149,6 +154,7 @@ export function appendLog(entry: {
     entry.machineId ?? null,
     entry.runnerMode ?? null,
     entry.sessionImage ?? null,
+    entry.phase ?? "implementation",
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows
@@ -274,6 +280,7 @@ interface RawRow {
   machine_id: string | null;
   runner_mode: string | null;
   session_image: string | null;
+  phase: string | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -298,6 +305,7 @@ function mapRows(rows: RawRow[]): Job[] {
     machineId: row.machine_id ?? null,
     runnerMode: row.runner_mode ?? null,
     sessionImage: (row.session_image as string | null) ?? null,
+    phase: row.phase ?? "implementation",
   }));
 }
 
