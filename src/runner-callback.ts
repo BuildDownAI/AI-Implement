@@ -42,6 +42,14 @@ function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
 }
 
+function parseBearerToken(authorization: string | undefined): string | null {
+  if (!authorization || !authorization.startsWith("Bearer")) return null;
+  let i = "Bearer".length;
+  while (i < authorization.length && authorization.charCodeAt(i) <= 32) i += 1;
+  if (i === "Bearer".length || i === authorization.length) return null;
+  return authorization.slice(i);
+}
+
 function validateStepBody(body: unknown): Step | HandleRunnerResultOutput {
   const raw = body as { step?: unknown } | null | undefined;
   if (!raw || typeof raw !== "object") return bad(400, "invalid_body");
@@ -59,8 +67,8 @@ function validateStepBody(body: unknown): Step | HandleRunnerResultOutput {
 export async function handleRunnerResult(
   input: HandleRunnerResultInput,
 ): Promise<HandleRunnerResultOutput> {
-  const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
-  if (!auth) return bad(401, "missing_bearer");
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
 
   // Validate body shape BEFORE consuming the token. A malformed body would
   // otherwise burn a one-time-use token and lose any chance of retry from
@@ -102,7 +110,7 @@ export async function handleRunnerResult(
   // user-side retries, which we don't want to encourage. Operators monitor
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
-  const verified = verifyAndConsumeRunToken(auth[1], input.secret);
+  const verified = verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
     return verified.reason === "already_consumed"
       ? bad(409, "already_consumed")
@@ -209,10 +217,10 @@ function parsePrNumber(prUrl: string | null): number | null {
 export async function handleRunnerProgress(
   input: HandleRunnerProgressInput,
 ): Promise<HandleRunnerResultOutput> {
-  const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
-  if (!auth) return bad(401, "missing_bearer");
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
 
-  const verified = verifyRunToken(auth[1], input.secret, "progress", { consume: false });
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
 
   const stepOrError = validateStepBody(input.body);

@@ -30,6 +30,14 @@ function bad(status: number, error: string, extra: Record<string, unknown> = {})
   return { status, body: { error, ...extra } };
 }
 
+function parseBearerToken(authorization: string | undefined): string | null {
+  if (!authorization || !authorization.startsWith("Bearer")) return null;
+  let i = "Bearer".length;
+  while (i < authorization.length && authorization.charCodeAt(i) <= 32) i += 1;
+  if (i === "Bearer".length || i === authorization.length) return null;
+  return authorization.slice(i);
+}
+
 /**
  * Handles an authenticated POST from a target repo's comment-trigger workflow.
  *
@@ -48,10 +56,10 @@ export async function handleGapFillTrigger(
     return bad(501, "Gap fill trigger not configured");
   }
 
-  const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
-  if (!auth) return bad(401, "unauthorized");
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "unauthorized");
   // Constant-time compare to avoid timing oracles on the shared secret.
-  const provided = Buffer.from(auth[1]);
+  const provided = Buffer.from(bearerToken);
   const expected = Buffer.from(input.triggerSecret);
   if (
     provided.length !== expected.length ||
