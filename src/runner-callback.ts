@@ -209,10 +209,12 @@ function parsePrNumber(prUrl: string | null): number | null {
 export async function handleRunnerProgress(
   input: HandleRunnerProgressInput,
 ): Promise<HandleRunnerResultOutput> {
-  const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
-  if (!auth) return bad(401, "missing_bearer");
+  const authorization = input.authorization;
+  if (!authorization?.startsWith("Bearer ")) return bad(401, "missing_bearer");
+  const token = authorization.slice("Bearer ".length).trim();
+  if (!token) return bad(401, "missing_bearer");
 
-  const verified = verifyRunToken(auth[1], input.secret, "progress", { consume: false });
+  const verified = verifyRunToken(token, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
 
   const stepOrError = validateStepBody(input.body);

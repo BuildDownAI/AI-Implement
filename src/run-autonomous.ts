@@ -191,7 +191,6 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     await runner.run(pipeline, context, reporter);
     const pushOutputs = context.getOutputs("push");
     await postRunnerResult({
-      phase: "implementation",
       workspaceDir,
       phase: runnerPhase,
       outcome: "success",
@@ -202,7 +201,6 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   } catch (err) {
     console.error(`Pipeline failed: ${err}`);
     await postRunnerResult({
-      phase: "implementation",
       workspaceDir,
       phase: runnerPhase,
       outcome: "failure",
