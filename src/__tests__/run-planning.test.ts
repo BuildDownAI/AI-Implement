@@ -4,6 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runPlanning } from "../run-planning.js";
 
+type RunnerResultPayload = {
+  phase: "planning";
+  outcome: "success" | "failure";
+  comments: Array<{ body: string }>;
+  failureReason?: string;
+};
+
 function setEnv() {
   process.env.ISSUE_ID = "uuid-1";
   process.env.ISSUE_IDENTIFIER = "ENG-42";
@@ -44,10 +51,10 @@ describe("runPlanning", () => {
       );
       return { status: 0, stdout: "", stderr: "" };
     };
-    const posted: any[] = [];
-    const fakeFetch = async (_u: string, init: any) => {
-      posted.push(JSON.parse(init.body));
-      return { ok: true, text: async () => "" } as any;
+    const posted: RunnerResultPayload[] = [];
+    const fakeFetch = async (_u: string, init: RequestInit = {}) => {
+      posted.push(JSON.parse(String(init.body)) as RunnerResultPayload);
+      return { ok: true, text: async () => "" } as Response;
     };
     process.env.RUNNER_CALLBACK_URL = "http://orch";
     process.env.RUN_TOKEN = "tok";
@@ -55,7 +62,7 @@ describe("runPlanning", () => {
     const result = await runPlanning({
       workspaceDir: ws,
       executor: fakeExecutor,
-      fetchImpl: fakeFetch as any,
+      fetchImpl: fakeFetch,
     });
 
     expect(result.exitCode).toBe(0);
@@ -69,17 +76,17 @@ describe("runPlanning", () => {
 
   it("posts outcome=failure with a reason when the executor exits non-zero", async () => {
     writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: m\n---\nbody");
-    const posted: any[] = [];
+    const posted: RunnerResultPayload[] = [];
     process.env.RUNNER_CALLBACK_URL = "http://orch";
     process.env.RUN_TOKEN = "tok";
-    const fakeFetch = async (_u: string, init: any) => {
-      posted.push(JSON.parse(init.body));
-      return { ok: true, text: async () => "" } as any;
+    const fakeFetch = async (_u: string, init: RequestInit = {}) => {
+      posted.push(JSON.parse(String(init.body)) as RunnerResultPayload);
+      return { ok: true, text: async () => "" } as Response;
     };
     const result = await runPlanning({
       workspaceDir: ws,
       executor: () => ({ status: 1, stdout: "", stderr: "boom" }),
-      fetchImpl: fakeFetch as any,
+      fetchImpl: fakeFetch,
     });
     expect(result.exitCode).toBe(1);
     expect(posted[0]).toMatchObject({ phase: "planning", outcome: "failure" });

@@ -14,7 +14,6 @@ const defaultExecutor: PlanningExecutor = (prompt, args, cwd) => {
   const r = spawnSync("claude", [...args, "-p", prompt], {
     cwd,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env },
     maxBuffer: 100 * 1024 * 1024,
   });
   return {
