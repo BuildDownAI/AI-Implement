@@ -40,6 +40,120 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("**Merge readiness:** Ready to merge."))).toBe(true);
   });
 
+  it("submits a native APPROVE review when merge-ready", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewCalls: string[][] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        reviewCalls.push(args);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(reviewCalls[0]).toContain("event=APPROVE");
+    const bodyArg = reviewCalls[0].find((arg) => arg.startsWith("body="));
+    expect(bodyArg).toContain("<!-- ai-implement native-review -->");
+    expect(bodyArg).toContain("AI-Implement post-push review approved this PR.");
+  });
+
+  it("logs native review response details and PR context when submission fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        return {
+          stdout: JSON.stringify({ message: "Can not approve your own pull request" }),
+          stderr: "gh: Unprocessable Entity (HTTP 422)",
+          exitCode: 1,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) {
+        return {
+          stdout: JSON.stringify({
+            html_url: "https://github.com/eudoxus-ai/thrivable-survey-dashboard/pull/42",
+            state: "open",
+            draft: false,
+            user: { login: "ai-implement[bot]" },
+            head: {
+              ref: "ai-implement/aii-200-x",
+              sha: "abc1234567890",
+              user: { login: "ai-implement[bot]" },
+              repo: { full_name: "eudoxus-ai/thrivable-survey-dashboard" },
+            },
+            base: {
+              ref: "main",
+              sha: "def9876543210",
+              repo: { full_name: "eudoxus-ai/thrivable-survey-dashboard" },
+            },
+            mergeable: true,
+          }),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    let warnings = "";
+
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { report: vi.fn(async () => undefined) },
+      );
+      warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(warnings).toContain("stderr=gh: Unprocessable Entity (HTTP 422)");
+    expect(warnings).toContain("stdout={\"message\":\"Can not approve your own pull request\"}");
+    expect(warnings).toContain("event=APPROVE");
+    expect(warnings).toContain("bodyChars=");
+    expect(warnings).toContain("author=ai-implement[bot]");
+    expect(warnings).toContain("head=ai-implement/aii-200-x@abc1234");
+    expect(warnings).toContain("base=main@def9876");
+  });
+
+  it("submits a native REQUEST_CHANGES review when blockers remain", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{ title: "Fix validation", problem: "Null owners pass.", required_fix: "Reject null owners." }],
+      score: 4,
+      progress_delta: 0,
+      feedback: "Not ready.",
+    });
+    const reviewCalls: string[][] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        reviewCalls.push(args);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(reviewCalls[0]).toContain("event=REQUEST_CHANGES");
+    expect(reviewCalls[0].find((arg) => arg.startsWith("body="))).toContain("Fix validation");
+  });
+
   it("loops to cap then posts ⚠️ comment", async () => {
     const notApproved = JSON.stringify({ approved: false, issues: ["bug"], feedback: "fix the bug", score: 4, progress_delta: 0 });
     const ghComments: string[] = [];
@@ -1336,5 +1450,125 @@ describe("postPushReviewStep", () => {
     expect(fixComment).toContain("Verification:");
     expect(fixComment).toContain("CSS-only class update");
     expect(fixComment).toContain("Notes:\nNo behavior changes.");
+  });
+
+  it("waits for the external review check to complete before approving and ingests its late findings", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    let checkProbes = 0;
+    let checkCompleted = false;
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        checkProbes++;
+        // First probe: still running. Second probe: completed.
+        if (checkProbes >= 2) checkCompleted = true;
+        return {
+          stdout: JSON.stringify({
+            check_runs: [{ name: "claude-review", status: checkCompleted ? "completed" : "in_progress", conclusion: checkCompleted ? "success" : null }],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        // Findings only become visible once the external review check has finished.
+        return {
+          stdout: checkCompleted
+            ? JSON.stringify([[{ state: "CHANGES_REQUESTED", body: "Eager createVersion accumulates orphan drafts.", user: { login: "claude" } }]])
+            : "[]",
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalled();
+    expect(checkProbes).toBeGreaterThanOrEqual(2);
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Eager createVersion accumulates orphan drafts.");
+  });
+
+  it("does not auto-approve when the external review check never finishes (fail-closed)", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    const ghComments: string[] = [];
+    const reviewCalls: string[][] = [];
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "in_progress", conclusion: null }] }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        reviewCalls.push(args);
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(reviewCalls.some((call) => call.includes("event=APPROVE"))).toBe(false);
+    expect(ghComments.some((c) => c.includes("did not complete") && c.includes("Manual review required"))).toBe(true);
+  });
+
+  it("fails open and approves when no external review check exists for the head SHA", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    let checkRunsQueried = false;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        checkRunsQueried = true;
+        return { stdout: JSON.stringify({ check_runs: [] }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(checkRunsQueried).toBe(true);
+    expect(sleep).not.toHaveBeenCalled();
   });
 });

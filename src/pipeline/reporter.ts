@@ -52,6 +52,50 @@ export class HttpStepReporter implements StepReporter {
   }
 }
 
+export class TokenStepReporter implements StepReporter {
+  private readonly fetchImpl: typeof fetch;
+  private readonly retryDelaysMs: number[];
+
+  constructor(
+    private readonly callbackUrl: string,
+    private readonly progressToken: string,
+    options: HttpStepReporterOptions = {},
+  ) {
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.retryDelaysMs = options.retryDelaysMs ?? [250, 1000, 2500];
+  }
+
+  async report(step: Step): Promise<void> {
+    const url = `${this.callbackUrl.replace(/\/$/, "")}/runner/progress`;
+    const attempts = this.retryDelaysMs.length + 1;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const res = await this.fetchImpl(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.progressToken}`,
+          },
+          body: JSON.stringify({ step }),
+        });
+        if (res.ok) return;
+        if (!isRetryableStatus(res.status) || attempt === attempts) {
+          console.error(`[StepReporter] ${step.id} (${step.status}): HTTP ${res.status}`);
+          return;
+        }
+      } catch (err) {
+        if (attempt === attempts) {
+          console.error(`[StepReporter] Failed to report step ${step.id} after ${attempts} attempts: ${errorSummary(err)}`);
+          return;
+        }
+      }
+
+      await sleep(this.retryDelaysMs[attempt - 1] ?? 0);
+    }
+  }
+}
+
 export class NoopStepReporter implements StepReporter {
   async report(_step: Step): Promise<void> {}
 }

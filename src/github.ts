@@ -10,6 +10,8 @@ interface DispatchInputs {
   dependencies?: string;
   /** When set, the workflow checks out the existing PR branch (gap-fill run). */
   pr_number?: string;
+  /** Explicit callback phase reported by the runner. */
+  runner_phase?: "implementation" | "gap-analysis";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */
@@ -18,6 +20,8 @@ interface DispatchInputs {
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
   run_token?: string;
+  /** Signed reusable token authorizing step progress POSTs. Empty when progress callback disabled. */
+  run_progress_token?: string;
 }
 
 interface DispatchResult {
@@ -144,6 +148,25 @@ export async function getWorkflowRunStatus(
     conclusion: data.conclusion,
     html_url: data.html_url,
   };
+}
+
+/**
+ * Cancels a GitHub Actions workflow run.
+ * Returns true on 202 (accepted) or 409 (run not in a cancellable state — benign).
+ * Returns false on other non-OK HTTP statuses. Network-level errors (DNS, TCP
+ * reset, timeout) propagate as a rejected promise, consistent with the other
+ * helpers in this module.
+ */
+export async function cancelWorkflowRun(
+  token: string,
+  owner: string,
+  repo: string,
+  runId: number,
+): Promise<boolean> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/cancel`;
+  const res = await fetch(url, { method: "POST", headers: ghHeaders(token) });
+  if (res.status === 202 || res.status === 409) return true;
+  return false;
 }
 
 /**

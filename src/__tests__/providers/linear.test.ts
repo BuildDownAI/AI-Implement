@@ -232,33 +232,65 @@ describe("LinearProvider.markPlanningStarted", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it("ensures AI-Planning label, adds it to the issue, and transitions to In Progress when movable", async () => {
-    // 1. getTeamIdByKey
-    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
-    // 2. ensureTeamLabel — find existing AI-Planning label
-    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-planning" }] } });
-    // 3. addLabelToIssue — fetch current labels
+  it("uses the issue's Linear team when the provided scope key points elsewhere", async () => {
+    // 1. getTeamKeyForIssue
+    mockJsonOnce({ issue: { team: { key: "THR2" } } });
+    // 2. getTeamIdByKey for the issue team, not the caller-provided scope key
+    mockJsonOnce({ teams: { nodes: [{ id: "team-thr2", key: "THR2" }] } });
+    // 3. ensureTeamLabel: same label exists on another team only, so create one for THR2
+    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-other-team", team: { id: "team-other" } }] } });
+    // 4. ensureTeamLabel: create team-scoped label
+    mockJsonOnce({ issueLabelCreate: { issueLabel: { id: "label-thr2-planning" } } });
+    // 5. addLabelToIssue: fetch current labels
     mockJsonOnce({ issue: { labels: { nodes: [] } } });
-    // 4. addLabelToIssue — issueUpdate
+    // 6. addLabelToIssue: issueUpdate
     mockJsonOnce({ issueUpdate: { success: true } });
-    // 5. transitionToInProgressIfMovable — fetch state.type (movable)
+    // 7. transitionToInProgressIfMovable — non-movable, so no state update
+    mockJsonOnce({ issue: { state: { type: "started" } } });
+
+    const p = new LinearProvider({ linearApiKey: "k" });
+    await p.markPlanningStarted("issue-1", "AII");
+
+    const teamLookupBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
+    expect(teamLookupBody.variables).toEqual({ key: "THR2" });
+
+    const createBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
+    expect(createBody.variables).toEqual({ teamId: "team-thr2", name: "AI-Planning", color: "#8B5CF6" });
+
+    const addBody = JSON.parse(vi.mocked(fetch).mock.calls[5][1]?.body as string);
+    expect(addBody.variables).toEqual({ issueId: "issue-1", labelIds: ["label-thr2-planning"] });
+  });
+
+  it("ensures AI-Planning label, adds it to the issue, and transitions to In Progress when movable", async () => {
+    // 1. getTeamKeyForIssue
+    mockJsonOnce({ issue: { team: { key: "ENG" } } });
+    // 2. getTeamIdByKey
+    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
+    // 3. ensureTeamLabel — find existing AI-Planning label
+    mockJsonOnce({ issueLabels: { nodes: [{ id: "label-planning" }] } });
+    // 4. addLabelToIssue — fetch current labels
+    mockJsonOnce({ issue: { labels: { nodes: [] } } });
+    // 5. addLabelToIssue — issueUpdate
+    mockJsonOnce({ issueUpdate: { success: true } });
+    // 6. transitionToInProgressIfMovable — fetch state.type (movable)
     mockJsonOnce({ issue: { state: { type: "unstarted" } } });
-    // 6. getInProgressStateId — workflowStates query (team id is cached)
+    // 7. getInProgressStateId — workflowStates query (team id is cached)
     mockJsonOnce({
       workflowStates: { nodes: [{ id: "state-inprog", name: "In Progress", type: "started" }] },
     });
-    // 7. updateIssueState
+    // 8. updateIssueState
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
     await p.markPlanningStarted("issue-1", "ENG");
 
-    expect(fetch).toHaveBeenCalledTimes(7);
-    const lastBody = JSON.parse(vi.mocked(fetch).mock.calls[6][1]?.body as string);
+    expect(fetch).toHaveBeenCalledTimes(8);
+    const lastBody = JSON.parse(vi.mocked(fetch).mock.calls[7][1]?.body as string);
     expect(lastBody.variables).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
   });
 
   it("does not transition state when issue is in a non-movable state", async () => {
+    mockJsonOnce({ issue: { team: { key: "ENG" } } });
     mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
     mockJsonOnce({ issueLabels: { nodes: [{ id: "label-planning" }] } });
     mockJsonOnce({ issue: { labels: { nodes: [] } } });
@@ -269,10 +301,11 @@ describe("LinearProvider.markPlanningStarted", () => {
     const p = new LinearProvider({ linearApiKey: "k" });
     await p.markPlanningStarted("issue-1", "ENG");
 
-    expect(fetch).toHaveBeenCalledTimes(5);
+    expect(fetch).toHaveBeenCalledTimes(6);
   });
 
   it("creates AI-Planning label with #8B5CF6 color when not found", async () => {
+    mockJsonOnce({ issue: { team: { key: "ENG" } } });
     mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
     // ensureTeamLabel: search returns empty → create
     mockJsonOnce({ issueLabels: { nodes: [] } });
@@ -289,7 +322,7 @@ describe("LinearProvider.markPlanningStarted", () => {
     const p = new LinearProvider({ linearApiKey: "k" });
     await p.markPlanningStarted("issue-1", "ENG");
 
-    const createBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
+    const createBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
     expect(createBody.variables).toEqual({ teamId: "team-uuid", name: "AI-Planning", color: "#8B5CF6" });
   });
 });
@@ -330,6 +363,7 @@ describe("LinearProvider.markImplementing", () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
   it("ensures AI-Working label and adds it to the issue (no state transition when not movable)", async () => {
+    mockJsonOnce({ issue: { team: { key: "ENG" } } });
     mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
     mockJsonOnce({ issueLabels: { nodes: [{ id: "label-aw" }] } });
     mockJsonOnce({ issue: { labels: { nodes: [] } } });
@@ -340,12 +374,13 @@ describe("LinearProvider.markImplementing", () => {
     const p = new LinearProvider({ linearApiKey: "k" });
     await p.markImplementing("issue-1", "ENG");
 
-    expect(fetch).toHaveBeenCalledTimes(5);
-    const addBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
+    expect(fetch).toHaveBeenCalledTimes(6);
+    const addBody = JSON.parse(vi.mocked(fetch).mock.calls[4][1]?.body as string);
     expect(addBody.variables).toEqual({ issueId: "issue-1", labelIds: ["label-aw"] });
   });
 
   it("does not transition state when issue is in a non-movable state", async () => {
+    mockJsonOnce({ issue: { team: { key: "ENG" } } });
     mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
     mockJsonOnce({ issueLabels: { nodes: [{ id: "label-aw" }] } });
     mockJsonOnce({ issue: { labels: { nodes: [] } } });
@@ -357,10 +392,11 @@ describe("LinearProvider.markImplementing", () => {
     await p.markImplementing("issue-1", "ENG");
 
     // 4 setup/label fetches + 1 state.type query, but no getInProgressStateId/updateIssueState
-    expect(fetch).toHaveBeenCalledTimes(5);
+    expect(fetch).toHaveBeenCalledTimes(6);
   });
 
   it("transitions state to In Progress when issue is in a movable state", async () => {
+    mockJsonOnce({ issue: { team: { key: "ENG" } } });
     mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
     mockJsonOnce({ issueLabels: { nodes: [{ id: "label-aw" }] } });
     mockJsonOnce({ issue: { labels: { nodes: [] } } });
@@ -377,12 +413,13 @@ describe("LinearProvider.markImplementing", () => {
     const p = new LinearProvider({ linearApiKey: "k" });
     await p.markImplementing("issue-1", "ENG");
 
-    expect(fetch).toHaveBeenCalledTimes(7);
-    const lastBody = JSON.parse(vi.mocked(fetch).mock.calls[6][1]?.body as string);
+    expect(fetch).toHaveBeenCalledTimes(8);
+    const lastBody = JSON.parse(vi.mocked(fetch).mock.calls[7][1]?.body as string);
     expect(lastBody.variables).toEqual({ issueId: "issue-1", stateId: "state-inprog" });
   });
 
   it("creates AI-Working label with #F59E0B color when not found", async () => {
+    mockJsonOnce({ issue: { team: { key: "ENG" } } });
     mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
     mockJsonOnce({ issueLabels: { nodes: [] } });
     mockJsonOnce({ issueLabelCreate: { issueLabel: { id: "new-label" } } });
@@ -394,7 +431,7 @@ describe("LinearProvider.markImplementing", () => {
     const p = new LinearProvider({ linearApiKey: "k" });
     await p.markImplementing("issue-1", "ENG");
 
-    const createBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
+    const createBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
     expect(createBody.variables).toEqual({ teamId: "team-uuid", name: "AI-Working", color: "#F59E0B" });
   });
 });

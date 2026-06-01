@@ -45,6 +45,11 @@ on:
         required: false
         type: string
         default: ""
+      runner_phase:
+        description: "Runner callback phase: implementation or gap-analysis (empty keeps legacy PR_NUMBER inference)"
+        required: false
+        type: string
+        default: ""
       provider:
         description: "Claude provider: 'anthropic' (default) or 'bedrock'"
         required: false
@@ -62,6 +67,11 @@ on:
         default: ""
       run_token:
         description: "HMAC bearer token authorizing the result POST; empty skips callback"
+        required: false
+        type: string
+        default: ""
+      run_progress_token:
+        description: "HMAC bearer token authorizing progress POSTs; empty skips progress callback"
         required: false
         type: string
         default: ""
@@ -163,6 +173,15 @@ jobs:
           aws-region: ${{ inputs.aws_region }}
           role-session-duration: 14400
 
+      - name: Mask runner callback tokens
+        run: |
+          if [ -n "${{ inputs.run_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_token }}"
+          fi
+          if [ -n "${{ inputs.run_progress_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_progress_token }}"
+          fi
+
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -172,6 +191,7 @@ jobs:
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          RUNNER_PHASE: ${{ inputs.runner_phase }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -179,4 +199,5 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUN_TOKEN: ${{ inputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
         run: /opt/ai-implement/entrypoint.sh
