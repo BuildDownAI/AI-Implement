@@ -147,6 +147,12 @@ After your changes are pushed, write a short note about what you addressed
 to `ai-output/comments/01-gap-fill-summary.md`. The orchestrator reads
 this file and posts it back to the ticketing issue.
 
+External review tools should communicate findings through native GitHub
+review surfaces: submit `CHANGES_REQUESTED` for blocking feedback, use inline
+PR review comments for file-specific issues, or post a structured PR review
+summary comment. Do not ask Copilot or another bot to fix the PR in comments;
+AI-Implement ingests GitHub review events and dispatches its own gap-fill run.
+
 ---
 
 ## Issue

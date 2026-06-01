@@ -1,5 +1,10 @@
-import { verifyAndConsumeRunToken } from "./runner-tokens.js";
+import { getJobByDispatchId, updateJobPrUrl } from "./log.js";
+import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
+import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
+import { upsertStepRecord } from "./step-log.js";
+import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
+import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
 
@@ -23,8 +28,32 @@ export interface HandleRunnerResultOutput {
   body: Record<string, unknown>;
 }
 
+export interface RunnerProgressBody {
+  step: Step;
+}
+
+export interface HandleRunnerProgressInput {
+  authorization: string | undefined;
+  body: RunnerProgressBody;
+  secret: string;
+}
+
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
+}
+
+function validateStepBody(body: unknown): Step | HandleRunnerResultOutput {
+  const raw = body as { step?: unknown } | null | undefined;
+  if (!raw || typeof raw !== "object") return bad(400, "invalid_body");
+  if (!raw.step || typeof raw.step !== "object") return bad(400, "step_required");
+
+  const s = raw.step as Record<string, unknown>;
+  if (!s.id || typeof s.id !== "string") return bad(400, "invalid_step_id");
+  if (!s.type || typeof s.type !== "string") return bad(400, "invalid_step_type");
+  if (!s.status || typeof s.status !== "string") return bad(400, "invalid_step_status");
+  if (!s.started_at || typeof s.started_at !== "string") return bad(400, "invalid_step_started_at");
+
+  return raw.step as Step;
 }
 
 export async function handleRunnerResult(
@@ -150,8 +179,48 @@ export async function handleRunnerResult(
     } catch (err) {
       warn("markPrReady", err);
     }
+    const job = getJobByDispatchId(claims.dispatchId);
+    if (job) {
+      updateJobPrUrl(job.id, input.body.prUrl!);
+    }
+  } else if (input.body.phase === "gap-analysis") {
+    const job = getJobByDispatchId(claims.dispatchId);
+    const prNumber = parsePrNumber(job?.prUrl ?? null);
+    if (job?.repo && prNumber !== null) {
+      const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
+      if (snapshot) {
+        markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds);
+      } else {
+        markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
+      }
+    }
   }
   // gap-analysis success: no status transition
 
   return { status: 200, body: { acknowledged: true, warnings } };
+}
+
+function parsePrNumber(prUrl: string | null): number | null {
+  if (!prUrl) return null;
+  const match = prUrl.match(/\/pull\/(\d+)(?:$|[?#])/);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+export async function handleRunnerProgress(
+  input: HandleRunnerProgressInput,
+): Promise<HandleRunnerResultOutput> {
+  const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
+  if (!auth) return bad(401, "missing_bearer");
+
+  const verified = verifyRunToken(auth[1], input.secret, "progress", { consume: false });
+  if (!verified.ok) return bad(401, verified.reason);
+
+  const stepOrError = validateStepBody(input.body);
+  if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+
+  const job = getJobByDispatchId(verified.claims.dispatchId);
+  if (!job) return bad(404, "job_not_found");
+
+  upsertStepRecord(job.id, stepOrError);
+  return { status: 200, body: { acknowledged: true } };
 }

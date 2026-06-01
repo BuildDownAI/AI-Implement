@@ -7,13 +7,17 @@
     "type": "git",
     "url": "https://github.com/BuildDownAI/AI-Implement.git"
   },
+  "engines": {
+    "node": ">=24 <25"
+  },
   "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
+    "check:node": "node scripts/check-node-version.mjs",
+    "dev": "npm run check:node && tsx src/index.ts",
     "build:runner:local": "docker build -f Dockerfile.session -t ai-implement-runner:local .",
-    "dev:local": "npm run build:runner:local && RUNNER_MODE=local LOCAL_RUNNER_IMAGE=ai-implement-runner:local tsx src/index.ts",
+    "dev:local": "npm run check:node && npm run build:runner:local && RUNNER_MODE=local LOCAL_RUNNER_IMAGE=ai-implement-runner:local tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -25,7 +29,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/jsdom": "^28.0.1",
-    "@types/node": "^22.0.0",
+    "@types/node": "^24.12.4",
     "jsdom": "^29.1.0",
     "tsx": "^4.0.0",
     "typescript": "^5.7.0",

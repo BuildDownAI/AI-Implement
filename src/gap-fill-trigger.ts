@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { RepoMapping } from "./config.js";
 import type { TicketingProvider } from "./providers/types.js";
-import { mintRunToken, GAP_ANALYSIS_TTL_SECONDS } from "./runner-tokens.js";
+import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { dispatchWorkflow, providerDispatchFields } from "./github.js";
 
 export interface GapFillTriggerBody {
@@ -93,16 +93,31 @@ export async function handleGapFillTrigger(
 
   let runnerCallbackUrl = "";
   let runToken = "";
+  let runProgressToken = "";
   if (input.runnerCallbackBaseUrl && input.runnerTokenSecret) {
+    // Gap-fill dispatches run the implementation workflow and can take as
+    // long as the initial implementation, even though they report back as
+    // gap-analysis so ticket status does not regress.
     const minted = mintRunToken({
       issueId: owningIssueId,
       mappingTeamKey: owningScopeKey,
       phase: "gap-analysis",
-      ttlSeconds: GAP_ANALYSIS_TTL_SECONDS,
+      audience: "result",
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+      secret: input.runnerTokenSecret,
+    });
+    const progressMinted = mintRunToken({
+      issueId: owningIssueId,
+      mappingTeamKey: owningScopeKey,
+      phase: "gap-analysis",
+      audience: "progress",
+      dispatchId: minted.dispatchId,
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
       secret: input.runnerTokenSecret,
     });
     runnerCallbackUrl = input.runnerCallbackBaseUrl;
     runToken = minted.token;
+    runProgressToken = progressMinted.token;
   }
 
   const ghToken = await input.getInstallationToken(owningMapping.owner);
@@ -124,9 +139,11 @@ export async function handleGapFillTrigger(
     issue_title: "(gap-fill triggered from PR comment)",
     issue_description: "(gap-fill triggered from PR comment)",
     pr_number: String(prNumber),
+    runner_phase: "gap-analysis",
     ...providerDispatchFields(owningMapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
+    run_progress_token: runProgressToken,
   });
 
   if (!dispatchRes.success) {

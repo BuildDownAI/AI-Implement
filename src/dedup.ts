@@ -10,8 +10,8 @@ function resolveDbPath(): string {
     mkdirSync(dirname(configured), { recursive: true });
     return configured;
   } catch (err: any) {
-    if (err.code !== "EACCES") throw err;
-    console.warn(`[db] Cannot create ${dirname(configured)} (EACCES), falling back to ${FALLBACK_DB_PATH}`);
+    if (!["EACCES", "ENOENT", "EPERM", "EROFS"].includes(err.code)) throw err;
+    console.warn(`[db] Cannot create ${dirname(configured)} (${err.code}), falling back to ${FALLBACK_DB_PATH}`);
     return FALLBACK_DB_PATH;
   }
 }
@@ -32,6 +32,73 @@ function ensureDispatchedColumns(): void {
   }
 }
 
+function createRunnerTokensTable(): void {
+  if (!db) return;
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS runner_tokens (
+      dispatch_id      TEXT NOT NULL,
+      audience         TEXT NOT NULL DEFAULT 'result',
+      issue_id         TEXT NOT NULL,
+      phase            TEXT NOT NULL,
+      expires_at       INTEGER NOT NULL,
+      consumed_at      INTEGER,
+      mapping_team_key TEXT NOT NULL,
+      PRIMARY KEY (dispatch_id, audience)
+    )
+  `);
+}
+
+function ensureRunnerTokensTable(): void {
+  if (!db) return;
+
+  const info = db.prepare("PRAGMA table_info(runner_tokens)").all() as Array<{
+    name: string;
+    pk: number;
+  }>;
+  const names = new Set(info.map((c) => c.name));
+  if (info.length > 0 && !names.has("mapping_team_key")) {
+    console.warn("[db] runner_tokens table is missing mapping_team_key column — dropping and recreating (outstanding tokens will be invalidated)");
+    db.exec("DROP TABLE runner_tokens");
+    createRunnerTokensTable();
+    return;
+  }
+
+  if (info.length === 0) {
+    createRunnerTokensTable();
+    return;
+  }
+
+  const hasAudience = names.has("audience");
+  const dispatchIdPkOnly =
+    info.find((c) => c.name === "dispatch_id")?.pk === 1 &&
+    info.find((c) => c.name === "audience")?.pk !== 2;
+
+  if (!hasAudience || dispatchIdPkOnly) {
+    db.exec(`
+      CREATE TABLE runner_tokens_new (
+        dispatch_id      TEXT NOT NULL,
+        audience         TEXT NOT NULL DEFAULT 'result',
+        issue_id         TEXT NOT NULL,
+        phase            TEXT NOT NULL,
+        expires_at       INTEGER NOT NULL,
+        consumed_at      INTEGER,
+        mapping_team_key TEXT NOT NULL,
+        PRIMARY KEY (dispatch_id, audience)
+      )
+    `);
+    const audienceExpr = hasAudience ? "audience" : "'result'";
+    db.exec(`
+      INSERT OR REPLACE INTO runner_tokens_new
+        (dispatch_id, audience, issue_id, phase, expires_at, consumed_at, mapping_team_key)
+      SELECT dispatch_id, ${audienceExpr}, issue_id, phase, expires_at, consumed_at, mapping_team_key
+      FROM runner_tokens
+    `);
+    db.exec("DROP TABLE runner_tokens");
+    db.exec("ALTER TABLE runner_tokens_new RENAME TO runner_tokens");
+  }
+  createRunnerTokensTable();
+}
+
 export function getDb(): Database.Database {
   if (!db) {
     db = new Database(DB_PATH);
@@ -45,27 +112,77 @@ export function getDb(): Database.Database {
     ensureDispatchedColumns();
     // runner_tokens migration:
     // The fork's pre-reset schema had columns provider_id + issue_json instead of
-    // mapping_team_key. If we detect that old shape (or any shape missing the
-    // mapping_team_key column), drop and recreate. Outstanding tokens are lost,
-    // but they're short-lived (30min–2hr) and one-time-use — acceptable on a
-    // schema migration boundary.
-    const runnerTokensInfo = db.prepare("PRAGMA table_info(runner_tokens)").all() as Array<{ name: string }>;
-    if (runnerTokensInfo.length > 0 && !runnerTokensInfo.some((c) => c.name === "mapping_team_key")) {
-      console.warn("[db] runner_tokens table is missing mapping_team_key column — dropping and recreating (outstanding tokens will be invalidated)");
-      db.exec("DROP TABLE runner_tokens");
-    }
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS runner_tokens (
-        dispatch_id      TEXT PRIMARY KEY,
-        issue_id         TEXT NOT NULL,
-        phase            TEXT NOT NULL,
-        expires_at       INTEGER NOT NULL,
-        consumed_at      INTEGER,
-        mapping_team_key TEXT NOT NULL
-      )
-    `);
+    // mapping_team_key. If we detect that old shape, drop and recreate.
+    // The callback architecture also now supports multiple scoped tokens per
+    // dispatch id, keyed by audience.
+    ensureRunnerTokensTable();
     db.exec(`CREATE INDEX IF NOT EXISTS idx_runner_tokens_issue ON runner_tokens(issue_id)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_runner_tokens_expires ON runner_tokens(expires_at)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_findings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        finding_key TEXT NOT NULL,
+        source TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        body TEXT NOT NULL,
+        path TEXT,
+        line INTEGER,
+        url TEXT,
+        status TEXT NOT NULL DEFAULT 'open',
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        UNIQUE (repo, pr_number, finding_key)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_findings_open ON review_findings(repo, pr_number, status)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id TEXT NOT NULL,
+        issue_identifier TEXT,
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        dispatched_at INTEGER,
+        UNIQUE (repo, pr_number)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_queue_status ON review_fix_queue(status, created_at)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        queue_id INTEGER NOT NULL,
+        issue_id TEXT NOT NULL,
+        issue_identifier TEXT,
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        source_url TEXT,
+        actor TEXT,
+        finding_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_events_queue ON review_fix_events(queue_id, created_at)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_events_pr ON review_fix_events(repo, pr_number, created_at)`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS review_fix_dispatches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        queue_id INTEGER NOT NULL,
+        dispatch_id TEXT NOT NULL UNIQUE,
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        finding_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_dispatches_pr ON review_fix_dispatches(repo, pr_number, created_at)`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS admin_sessions (
         token TEXT PRIMARY KEY,
