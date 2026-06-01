@@ -36,6 +36,11 @@ function adfToPlainText(adf: unknown): string {
   return out.join("").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function jqlFieldRef(fieldId: string): string {
+  const match = /^customfield_(\d+)$/.exec(fieldId);
+  return match ? `cf[${match[1]}]` : fieldId;
+}
+
 export interface JiraProviderConstructor {
   client: JiraClient;
   /** Per-instance cache scope label; typically the cloud ID. */
@@ -145,8 +150,11 @@ export class JiraProvider implements TicketingProvider {
       // Reference the status field by its resolved customfield id, not a hardcoded
       // display name. Jira instances often name the field differently than
       // "AI-Implement Status" (e.g. "ai-implement-status" or "AI-Implement-Status"),
-      // and JQL's quoted-name lookup requires an exact match.
-      const bucketJql = `(${cfg.jql}) AND ${fieldIds.statusFieldId} in (Ready, "Plan Approved")`;
+      // and JQL's quoted-name lookup requires an exact match. REST uses
+      // customfield_N ids; JQL on some instances requires cf[N], so transform
+      // before interpolating.
+      const statusJqlField = jqlFieldRef(fieldIds.statusFieldId);
+      const bucketJql = `(${cfg.jql}) AND ${statusJqlField} in (Ready, "Plan Approved")`;
       const bucketIssues = await this.client.searchJql(bucketJql, fieldsToFetch);
 
       for (const raw of bucketIssues) {
@@ -168,7 +176,7 @@ export class JiraProvider implements TicketingProvider {
         // else: orchestrator picked it up between query and our processing; skip.
       }
 
-      const capacityJql = `(${cfg.jql}) AND ${fieldIds.statusFieldId} in (Planning, Implementing)`;
+      const capacityJql = `(${cfg.jql}) AND ${statusJqlField} in (Planning, Implementing)`;
       const capacityIssues = await this.client.searchJql(capacityJql, ["summary"]);
       inProgressCountsByScope[scopeKey] = capacityIssues.length;
     }

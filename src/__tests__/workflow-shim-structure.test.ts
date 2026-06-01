@@ -15,10 +15,68 @@ const PLANNING_WORKFLOWS = [
   ".github/workflows/claude-plan.yml",
 ];
 const FILES = [...IMPLEMENT_WORKFLOWS, ...COMMENT_TRIGGER_WORKFLOWS];
+const SYNCED_WORKFLOW_FILES = [...IMPLEMENT_WORKFLOWS, ...COMMENT_TRIGGER_WORKFLOWS, ...PLANNING_WORKFLOWS];
 
 describe("GHA workflow shims", () => {
   it("ships workflow templates in the orchestrator image for admin-triggered syncs", () => {
     expect(readFileSync("Dockerfile", "utf-8")).toMatch(/COPY workflows\/ \.\/workflows\//);
+  });
+
+  it("publishes runner image channels from the correct source branches", () => {
+    const yaml = readFileSync(".github/workflows/build-runner.yml", "utf-8");
+    const doc = parse(yaml) as any;
+    const steps = doc.jobs.build.steps as any[];
+    const buildStep = steps.find((step) => step.name === "Build and push");
+    const smokeStep = steps.find((step) => String(step.name).startsWith("Smoke-test"));
+    const promoteStep = steps.find((step) => String(step.name).startsWith("Promote"));
+
+    expect(doc.on.push.branches).toEqual(["main", "testing"]);
+    expect(doc.on.workflow_dispatch.inputs.channel.type).toBe("choice");
+    expect(doc.on.workflow_dispatch.inputs.channel.description).toContain("main -> latest, testing -> next");
+    expect(doc.on.workflow_dispatch.inputs.channel.default).toBeUndefined();
+    expect(doc.on.workflow_dispatch.inputs.channel.options).toEqual(["next", "latest"]);
+    expect(doc.concurrency.group).toBe("build-runner-${{ github.ref_name }}");
+    expect(doc.concurrency["cancel-in-progress"]).toBe(true);
+    expect(yaml).toContain('owner="${GITHUB_REPOSITORY_OWNER,,}"');
+    expect(yaml).toMatch(/main\)\s+expected_channel="latest"/);
+    expect(yaml).toMatch(/testing\)\s+expected_channel="next"/);
+    expect(yaml).toMatch(/does not match selected channel/);
+    expect(yaml).toMatch(/date_tag=base-\$\{channel\}-v\$\(date -u \+%Y%m%d\)-\$\{GITHUB_SHA::12\}/);
+
+    expect(buildStep).toBeDefined();
+    expect(buildStep.id).toBe("build");
+    expect(buildStep.with.tags.trim()).toBe("${{ steps.meta.outputs.image }}:${{ github.sha }}");
+    expect(buildStep.with.tags).not.toContain("${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}");
+    expect(buildStep.with.tags).not.toContain("${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}");
+
+    expect(smokeStep).toBeDefined();
+    expect(smokeStep.name).toContain("built digest");
+    expect(smokeStep.run).toContain('digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"');
+    expect(smokeStep.run).toContain('docker pull "$digest_ref"');
+    expect(smokeStep.run).toContain('"$digest_ref"');
+    expect(smokeStep.run).not.toContain("steps.meta.outputs.image }}:${{ github.sha");
+    expect(smokeStep.run).not.toContain("steps.meta.outputs.channel");
+
+    expect(promoteStep).toBeDefined();
+    expect(promoteStep.name).toContain("tested digest");
+    expect(promoteStep.run).toContain("set -euo pipefail");
+    expect(promoteStep.run).toContain('digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"');
+    expect(promoteStep.run).toContain('git ls-remote origin "refs/heads/$GITHUB_REF_NAME"');
+    expect(promoteStep.run).not.toContain('refs/heads/${{ github.ref_name }}');
+    expect(promoteStep.run).toContain("Could not verify current head");
+    expect(promoteStep.run).toContain("re-test and promote the digest image");
+    expect(promoteStep.run).toContain('if [ "$current_sha" != "${{ github.sha }}" ]; then');
+    expect(promoteStep.run).toContain("Skipping channel promotion");
+    expect(promoteStep.run).toContain("Re-pull immediately before tagging");
+    expect(promoteStep.run).toContain('docker pull "$digest_ref"');
+    expect(promoteStep.run).toContain(
+      'docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"',
+    );
+    expect(promoteStep.run).toContain(
+      'docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"',
+    );
+    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"');
+    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"');
   });
 
   it("keeps the canonical and synced dispatch workflows byte-for-byte identical", () => {
@@ -38,6 +96,17 @@ describe("GHA workflow shims", () => {
       readFileSync("workflows/claude-plan.yml", "utf-8"),
     );
   });
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} pins external actions to full commit SHAs`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const actionRefs = [...yaml.matchAll(/^\s*uses:\s*([^\s#]+@[^\s#]+)/gm)].map((m) => m[1]);
+      expect(actionRefs.length).toBeGreaterThan(0);
+      for (const ref of actionRefs) {
+        expect(ref).toMatch(/@[0-9a-f]{40}$/);
+      }
+    });
+  }
 
   for (const f of FILES) {
     it(`${f} uses a resolved runner image for its container job`, () => {
@@ -80,9 +149,20 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/validate-runner-image:/);
       expect(yaml).toMatch(/needs:\s*validate-runner-image/);
       expect(yaml).toMatch(/image:\s*\$\{\{\s*needs\.validate-runner-image\.outputs\.runner_image\s*\}\}/);
-      expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:next/);
+      expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
       expect(yaml).toMatch(/invalid characters for a container image reference/);
       expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
+    });
+
+    it(`${f} masks runner progress tokens before the container step uses them`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
+    });
+
+    it(`${f} passes the dispatched ref to the runner as GITHUB_DEFAULT_BRANCH`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*github\.ref_name\s*\}\}/);
     });
   }
 
@@ -107,6 +187,13 @@ describe("GHA workflow shims", () => {
     expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
     expect(yaml).toMatch(/invalid characters for a container image reference/);
     expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
+  });
+
+  it("comment trigger passes the PR base branch to the runner as GITHUB_DEFAULT_BRANCH", () => {
+    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
+    expect(yaml).toMatch(/default_branch:\s*\$\{\{\s*steps\.pr\.outputs\.default_branch\s*\}\}/);
+    expect(yaml).toMatch(/core\.setOutput\("default_branch", pr\.data\.base\.ref/);
+    expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*needs\.check-trigger\.outputs\.default_branch\s*\}\}/);
   });
 
   it("documents and constrains the ISSUE_META eval trust boundary", () => {
@@ -143,6 +230,24 @@ describe("GHA workflow shims", () => {
   });
 
   for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} accepts related-issue context as dispatch inputs`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/parent:\n\s+description:\s*"Related parent issue summary/);
+      expect(yaml).toMatch(/siblings:\n\s+description:\s*"Related sibling issues summary/);
+      expect(yaml).toMatch(/dependencies:\n\s+description:\s*"Related dependency issues summary/);
+      expect(yaml).toMatch(/PARENT:\s*\$\{\{\s*inputs\.parent\s*\}\}/);
+      expect(yaml).toMatch(/SIBLINGS:\s*\$\{\{\s*inputs\.siblings\s*\}\}/);
+      expect(yaml).toMatch(/DEPENDENCIES:\s*\$\{\{\s*inputs\.dependencies\s*\}\}/);
+    });
+
+    it(`${f} does not call Linear directly from the workflow`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/api\.linear\.app\/graphql/);
+      expect(yaml).not.toMatch(/LINEAR_API_KEY/);
+      expect(yaml).not.toMatch(/Update Linear labels/);
+      expect(yaml).toMatch(/runner\/result/);
+    });
+
     it(`${f} does not allow Claude to curl Linear directly`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).not.toMatch(/Bash\(curl\*api\.linear\.app\/graphql\*\)/);

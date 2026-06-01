@@ -11,6 +11,10 @@ function makeCtx(execMock: any) {
   } as any;
 }
 
+function countOccurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
 describe("postPushReviewStep", () => {
   it("approves on first iteration, posts ✅ comment, returns approved=true", async () => {
     const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
@@ -34,6 +38,120 @@ describe("postPushReviewStep", () => {
     expect(out.iterations).toBe(1);
     expect(ghComments.some((c) => c.includes("✅"))).toBe(true);
     expect(ghComments.some((c) => c.includes("**Merge readiness:** Ready to merge."))).toBe(true);
+  });
+
+  it("submits a native APPROVE review when merge-ready", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewCalls: string[][] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        reviewCalls.push(args);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(reviewCalls[0]).toContain("event=APPROVE");
+    const bodyArg = reviewCalls[0].find((arg) => arg.startsWith("body="));
+    expect(bodyArg).toContain("<!-- ai-implement native-review -->");
+    expect(bodyArg).toContain("AI-Implement post-push review approved this PR.");
+  });
+
+  it("logs native review response details and PR context when submission fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        return {
+          stdout: JSON.stringify({ message: "Can not approve your own pull request" }),
+          stderr: "gh: Unprocessable Entity (HTTP 422)",
+          exitCode: 1,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42")) {
+        return {
+          stdout: JSON.stringify({
+            html_url: "https://github.com/eudoxus-ai/thrivable-survey-dashboard/pull/42",
+            state: "open",
+            draft: false,
+            user: { login: "ai-implement[bot]" },
+            head: {
+              ref: "ai-implement/aii-200-x",
+              sha: "abc1234567890",
+              user: { login: "ai-implement[bot]" },
+              repo: { full_name: "eudoxus-ai/thrivable-survey-dashboard" },
+            },
+            base: {
+              ref: "main",
+              sha: "def9876543210",
+              repo: { full_name: "eudoxus-ai/thrivable-survey-dashboard" },
+            },
+            mergeable: true,
+          }),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    let warnings = "";
+
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { report: vi.fn(async () => undefined) },
+      );
+      warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(warnings).toContain("stderr=gh: Unprocessable Entity (HTTP 422)");
+    expect(warnings).toContain("stdout={\"message\":\"Can not approve your own pull request\"}");
+    expect(warnings).toContain("event=APPROVE");
+    expect(warnings).toContain("bodyChars=");
+    expect(warnings).toContain("author=ai-implement[bot]");
+    expect(warnings).toContain("head=ai-implement/aii-200-x@abc1234");
+    expect(warnings).toContain("base=main@def9876");
+  });
+
+  it("submits a native REQUEST_CHANGES review when blockers remain", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{ title: "Fix validation", problem: "Null owners pass.", required_fix: "Reject null owners." }],
+      score: 4,
+      progress_delta: 0,
+      feedback: "Not ready.",
+    });
+    const reviewCalls: string[][] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        reviewCalls.push(args);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(reviewCalls[0]).toContain("event=REQUEST_CHANGES");
+    expect(reviewCalls[0].find((arg) => arg.startsWith("body="))).toContain("Fix validation");
   });
 
   it("loops to cap then posts ⚠️ comment", async () => {
@@ -153,7 +271,335 @@ describe("postPushReviewStep", () => {
     expect(invoke.mock.calls[1][0].prompt).toContain("1. Escape quoted user input");
   });
 
-  it("runs a fix pass when approved feedback contains actionable language but issues is empty", async () => {
+  it("runs a fix pass when an external changes-requested review blocks internal approval", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Missing UUID validation on path params.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Required external review findings");
+    expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("External review findings are blocking this PR.");
+    expect(reviewComment).not.toContain("Missing UUID validation on path params.");
+  });
+
+  it("runs a fix pass when a Claude issue comment has blocking findings and internal review approves", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            {
+              user: { login: "claude" },
+              body: "### Code Review\n\n## Blocking\n- Validate path params before database access.",
+              html_url: "https://example.com/claude-comment",
+            },
+          ]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Required external review findings");
+    expect(fixPrompt).toContain("Validate path params before database access.");
+    expect(ghSpawn).toHaveBeenCalledWith([
+      "api",
+      "--paginate",
+      "--slurp",
+      "repos/:owner/:repo/issues/42/comments?per_page=100",
+    ]);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("External review findings are blocking this PR.");
+  });
+
+  it("preserves opportunistic external collection when reviewProviders is undefined", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Fix UUID validation.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(ghSpawn).toHaveBeenCalledWith([
+      "api",
+      "--paginate",
+      "--slurp",
+      "repos/:owner/:repo/pulls/42/reviews?per_page=100",
+    ]);
+  });
+
+  it("skips external collection when reviewProviders is an empty array", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Fix UUID validation.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(ghSpawn).not.toHaveBeenCalledWith([
+      "api",
+      "--paginate",
+      "--slurp",
+      "repos/:owner/:repo/pulls/42/reviews?per_page=100",
+    ]);
+  });
+
+  it("collects external findings when github-claude-code-review is configured", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Configured provider blocker.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 2,
+        ghSpawn,
+        gitSpawn,
+        reviewProviders: ["github-claude-code-review"],
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(ghSpawn).toHaveBeenCalledWith([
+      "api",
+      "--paginate",
+      "--slurp",
+      "repos/:owner/:repo/pulls/42/reviews?per_page=100",
+    ]);
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Required external review findings");
+    expect(fixPrompt).toContain("Configured provider blocker.");
+  });
+
+  it("deduplicates internal issues that repeat external review findings", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      issues: ["Missing UUID validation on path params."],
+      feedback: "External blocker is still unresolved.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Missing UUID validation on path params.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(0);
+  });
+
+  it("suppresses duplicate feedback that repeats external review findings", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Missing UUID validation on path params.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Missing UUID validation on path params.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Required external review findings");
+    expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).not.toContain("Reviewer summary:");
+    expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(0);
+  });
+
+  it("does not run a fix pass when approved feedback contains actionable language but issues is empty", async () => {
     const approvedWithFeedback = JSON.stringify({
       approved: true,
       issues: [],
@@ -178,9 +624,9 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(false);
-    expect(invoke).toHaveBeenCalledTimes(2);
-    expect(invoke.mock.calls[1][0].prompt).toContain("Two minor issues worth addressing");
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
   });
 
   it("does not run a fix pass for deferred future-task concerns", async () => {
@@ -237,11 +683,11 @@ describe("postPushReviewStep", () => {
     expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
   });
 
-  it("approves malformed not-ready reviews when no actionable blocker is present", async () => {
+  it("requires structured issues when reviewer marks a PR not ready", async () => {
     const notReadyWithoutBlocker = JSON.stringify({
       approved: false,
-      issues: ["Clean resolution of the cosmetic note. All core requirements remain correctly in place. No regressions observed."],
-      feedback: "Clean resolution of the cosmetic note. All core requirements remain correctly in place. No regressions observed.",
+      issues: [],
+      feedback: "There is a bug in the timer restart flow, so this is not ready.",
       score: 9,
       progress_delta: 0,
     });
@@ -263,10 +709,11 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(true);
+    expect(out.approved).toBe(false);
     expect(invoke).toHaveBeenCalledTimes(1);
-    expect(ghComments.some((comment) => comment.includes("Ready to merge"))).toBe(true);
-    expect(ghComments.some((comment) => comment.includes("Not ready to merge"))).toBe(false);
+    expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
+    expect(ghComments.some((comment) => comment.includes("invalid structured review output"))).toBe(true);
+    expect(ghComments.some((comment) => comment.includes("Manual review required"))).toBe(true);
   });
 
   it("does not treat benign should-pass approval language as actionable", async () => {
@@ -283,6 +730,33 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const invoke = vi.fn(async () => ({ stdout: approvedWithShouldPass, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(gitSpawn).not.toHaveBeenCalledWith(["status", "--porcelain"]);
+  });
+
+  it("does not treat resolved prior blockers in approval feedback as actionable", async () => {
+    const approvedWithResolvedBlockers = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Both Review 1 blockers are resolved. The expired-timer restart bug is fixed and the regression test covers it. Merge readiness: ready to merge.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: approvedWithResolvedBlockers, exitCode: 0, tokensUsed: 100 }));
     const ctx = makeCtx(invoke);
 
     const out = await postPushReviewStep.run(
@@ -325,11 +799,53 @@ describe("postPushReviewStep", () => {
     expect(report).toHaveBeenCalledWith(expect.objectContaining({
       id: "post-push-review.1",
       status: "failed",
+      outputs: expect.objectContaining({
+        issues: [expect.stringContaining("claude auth temporarily unavailable")],
+        blockingIssues: [expect.objectContaining({
+          rawText: expect.stringContaining("claude auth temporarily unavailable"),
+        })],
+      }),
     }));
     expect(ghComments.some((comment) => comment.includes("review-failed"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("No actionable code feedback was produced"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Manual review required; automated review did not complete"))).toBe(true);
     expect(ghComments.some((comment) => comment.includes("Not ready to merge until manually reviewed"))).toBe(false);
+  });
+
+  it("reports invalid non-JSON reviewer output with structured blocking issue outputs", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const report = vi.fn(async () => undefined);
+    const ctx = makeCtx(vi.fn(async () => ({
+      stdout: "this is not json",
+      exitCode: 0,
+      tokensUsed: 100,
+    })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn() },
+      { report },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(report).toHaveBeenCalledWith(expect.objectContaining({
+      id: "post-push-review.1",
+      status: "failed",
+      outputs: expect.objectContaining({
+        issues: [expect.stringContaining("Reviewer returned non-JSON output")],
+        blockingIssues: [expect.objectContaining({
+          rawText: expect.stringContaining("Reviewer returned non-JSON output"),
+        })],
+      }),
+    }));
+    expect(ghComments.some((comment) => comment.includes("review-invalid"))).toBe(true);
   });
 
   it("does not fail the job when a post-push fix-pass LLM exits non-zero", async () => {
@@ -417,6 +933,51 @@ describe("postPushReviewStep", () => {
     expect(noChangesComment).toContain("completed with no file changes");
     expect(noChangesComment).toContain("Not ready to merge");
     expect(noChangesComment).not.toContain("Outstanding feedback");
+  });
+
+  it("reports unresolved external findings when an externally blocked fix pass makes no changes", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return {
+          stdout: JSON.stringify([
+            [{ state: "CHANGES_REQUESTED", body: "Fix UUID validation.", user: { login: "reviewer" } }],
+          ]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.forcePushedRevisions).toBe(0);
+    const noChangesComment = ghComments.find((comment) => comment.includes("no-changes"));
+    expect(noChangesComment).toContain("Unresolved external review findings");
+    expect(noChangesComment).toContain("Fix UUID validation.");
+    expect(noChangesComment).toContain("Not ready to merge");
   });
 
   it("skips empty JSON preamble objects when parsing reviewer output", async () => {
@@ -567,14 +1128,243 @@ describe("postPushReviewStep", () => {
     const secondReviewPrompt = invoke.mock.calls[2][0].prompt;
     expect(firstReviewPrompt).toContain("complete merge-readiness review");
     expect(firstReviewPrompt).toContain("Do not stop after the first issue");
-    expect(firstReviewPrompt).toContain("Every issues[] entry must be self-contained");
+    expect(firstReviewPrompt).toContain("Every blocking_issues[] entry must be self-contained");
     expect(secondReviewPrompt).toContain("Review 1:");
     expect(secondReviewPrompt).toContain("1. Fix auth flow");
     expect(secondReviewPrompt).toContain("first verify every previous issue is fixed");
     expect(invoke.mock.calls[1][0]).toEqual(expect.objectContaining({ maxTurns: 45 }));
   });
 
-  it("omits duplicate review summaries and compacts long blocking issues in PR comments", async () => {
+  it("includes structured issue details in follow-up review history", async () => {
+    const requiredFix = "Move the sessionStorage read into the hydrated effect and keep the dismissed flag synchronized when the first-visit panel is closed.";
+    const firstReview = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "First-visit hydration state is unsafe",
+        location: "src/app/page.tsx",
+        problem: "The first render can decide panel visibility before browser-only sessionStorage state is available.",
+        required_fix: requiredFix,
+      }],
+      feedback: "The first-visit state handling still needs one fix.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const secondReview = JSON.stringify({
+      approved: true,
+      blocking_issues: [],
+      feedback: "Looks good.",
+      score: 9,
+      progress_delta: 1,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M src/app/page.tsx\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "codex/structured-review-feedback\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/codex/structured-review-feedback\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tsrc/app/page.tsx\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn()
+      .mockResolvedValueOnce({ stdout: firstReview, exitCode: 0, tokensUsed: 100 })
+      .mockResolvedValueOnce({ stdout: "", exitCode: 0, tokensUsed: 100 })
+      .mockResolvedValueOnce({ stdout: secondReview, exitCode: 0, tokensUsed: 100 });
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    const secondReviewPrompt = invoke.mock.calls[2][0].prompt;
+    expect(secondReviewPrompt).toContain("Review 1:");
+    expect(secondReviewPrompt).toContain("1. First-visit hydration state is unsafe");
+    expect(secondReviewPrompt).toContain("Location: src/app/page.tsx");
+    expect(secondReviewPrompt).toContain("Problem: The first render can decide panel visibility before browser-only sessionStorage state is available.");
+    expect(secondReviewPrompt).toContain(`Required fix: ${requiredFix}`);
+  });
+
+  it("posts full structured blocking issues in PR comments and fix prompts", async () => {
+    const requiredFix = "Read sessionStorage only after the component has mounted, keep the dismissed flag in sync when the user dismisses the first-visit panel, and preserve the isHydrated guard so server-rendered markup cannot diverge from client-rendered markup.";
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "First-visit detection is incomplete",
+        location: "src/app/page.tsx",
+        problem: "The implementation renders the first-visit panel from a default client value before sessionStorage has been checked, which can show the wrong state during hydration and can re-open a dismissed panel.",
+        required_fix: requiredFix,
+      }],
+      feedback: "The review found one blocker.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("**First-visit detection is incomplete**");
+    expect(reviewComment).toContain("Location: `src/app/page.tsx`");
+    expect(reviewComment).toContain(requiredFix);
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("First-visit detection is incomplete");
+    expect(fixPrompt).not.toContain("**First-visit detection is incomplete**");
+    expect(fixPrompt).toContain(requiredFix);
+    expect(fixPrompt).not.toContain(`${requiredFix.slice(0, 80)}...`);
+  });
+
+  it("renders text-only blocking issue objects like legacy string issues", async () => {
+    const issueText = "The reviewer returned a legacy text-only object that should stay flat in comments and prompts.";
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{ text: issueText }],
+      feedback: issueText,
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain(`Blocking issues:\n1. ${issueText}`);
+    expect(reviewComment).not.toContain("**Blocking issue**");
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain(`Issues:\n1. ${issueText}`);
+    expect(fixPrompt).not.toContain("**Blocking issue**");
+  });
+
+  it("escapes markdown control characters in structured issue fields", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "Fix **unsafe** label",
+        location: "src/app/`weird`.tsx",
+        problem: "Do not render [click me](https://example.com) as a link.",
+        required_fix: "Escape *markdown* before posting.",
+      }],
+      feedback: "Structured fields contain markdown.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("**Fix \\*\\*unsafe\\*\\* label**");
+    expect(reviewComment).toContain("Location: `src/app/'weird'.tsx`");
+    expect(reviewComment).toContain("Do not render \\[click me\\]\\(https://example.com\\) as a link.");
+    expect(reviewComment).toContain("Escape \\*markdown\\* before posting.");
+
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Fix **unsafe** label");
+    expect(fixPrompt).toContain("src/app/`weird`.tsx");
+    expect(fixPrompt).toContain("Do not render [click me](https://example.com) as a link.");
+    expect(fixPrompt).toContain("Escape *markdown* before posting.");
+    expect(fixPrompt).not.toContain("\\[click me\\]\\(https://example.com\\)");
+  });
+
+  it("includes unresolved structured issues when a fix pass makes no file changes", async () => {
+    const requiredFix = "Persist the dismissed state to sessionStorage before hiding the panel and ensure the initial render waits for the hydrated guard before deciding whether to show the first-visit UI.";
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{
+        title: "Dismissed first-visit state is lost",
+        location: "src/app/page.tsx",
+        problem: "The fix pass must not stop with a generic message because reviewers need the unresolved blocker in the terminal PR comment.",
+        required_fix: requiredFix,
+      }],
+      feedback: "Not ready until the first-visit state is fixed.",
+      score: 4,
+      progress_delta: 0,
+    });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    const noChangesComment = ghComments.find((comment) => comment.includes("no-changes"));
+    expect(noChangesComment).toContain("Unresolved blocking issues:");
+    expect(noChangesComment).toContain("Dismissed first-visit state is lost");
+    expect(noChangesComment).toContain(requiredFix);
+  });
+
+  it("omits duplicate review summaries without truncating legacy blocking issues in PR comments", async () => {
     const longIssue = "The parse API error path is missing user-visible error handling in app/page.tsx, so failed parse requests leave the user stuck on the input surface without feedback or a retry path. Add an error state, render it near OpenInput, and reset loading after failures.";
     const notApproved = JSON.stringify({
       approved: false,
@@ -605,9 +1395,8 @@ describe("postPushReviewStep", () => {
     );
 
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
-    expect(reviewComment).toContain("Blocking issues:\n1. The parse API error path is missing user-visible error handling");
+    expect(reviewComment).toContain(`Blocking issues:\n1. ${longIssue}`);
     expect(reviewComment).not.toContain("Reviewer summary:");
-    expect(reviewComment!.length).toBeLessThan(longIssue.length * 2);
   });
 
   it("posts a concrete fix summary when the fixer reports one", async () => {
@@ -661,5 +1450,125 @@ describe("postPushReviewStep", () => {
     expect(fixComment).toContain("Verification:");
     expect(fixComment).toContain("CSS-only class update");
     expect(fixComment).toContain("Notes:\nNo behavior changes.");
+  });
+
+  it("waits for the external review check to complete before approving and ingests its late findings", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    let checkProbes = 0;
+    let checkCompleted = false;
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        checkProbes++;
+        // First probe: still running. Second probe: completed.
+        if (checkProbes >= 2) checkCompleted = true;
+        return {
+          stdout: JSON.stringify({
+            check_runs: [{ name: "claude-review", status: checkCompleted ? "completed" : "in_progress", conclusion: checkCompleted ? "success" : null }],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        // Findings only become visible once the external review check has finished.
+        return {
+          stdout: checkCompleted
+            ? JSON.stringify([[{ state: "CHANGES_REQUESTED", body: "Eager createVersion accumulates orphan drafts.", user: { login: "claude" } }]])
+            : "[]",
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(sleep).toHaveBeenCalled();
+    expect(checkProbes).toBeGreaterThanOrEqual(2);
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Eager createVersion accumulates orphan drafts.");
+  });
+
+  it("does not auto-approve when the external review check never finishes (fail-closed)", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    const ghComments: string[] = [];
+    const reviewCalls: string[][] = [];
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        return { stdout: JSON.stringify({ check_runs: [{ name: "claude-review", status: "in_progress", conclusion: null }] }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        reviewCalls.push(args);
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep, reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(reviewCalls.some((call) => call.includes("event=APPROVE"))).toBe(false);
+    expect(ghComments.some((c) => c.includes("did not complete") && c.includes("Manual review required"))).toBe(true);
+  });
+
+  it("fails open and approves when no external review check exists for the head SHA", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    let checkRunsQueried = false;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        checkRunsQueried = true;
+        return { stdout: JSON.stringify({ check_runs: [] }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(checkRunsQueried).toBe(true);
+    expect(sleep).not.toHaveBeenCalled();
   });
 });

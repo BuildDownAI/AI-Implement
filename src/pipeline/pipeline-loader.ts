@@ -152,6 +152,7 @@ function applyWiring(step: YamlStep): StepDefinition {
         inputs: (ctx: PipelineContext) => ({
           prNumber: String(ctx.getOutputs("push").prNumber ?? ""),
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          reviewProviders: ctx.getOutputs("install").reviewProviders,
         }),
         skip: (ctx: PipelineContext) => {
           const pushOutputs = ctx.getOutputs("push");

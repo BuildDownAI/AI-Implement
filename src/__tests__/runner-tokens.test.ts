@@ -47,6 +47,58 @@ describe("mintRunToken", () => {
     expect(row?.phase).toBe("planning");
     expect(row?.mapping_team_key).toBe("ENG");
   });
+
+  it("mints result tokens with audience=result by default", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const row = dedup
+      .getDb()
+      .prepare("SELECT audience FROM runner_tokens WHERE dispatch_id = ?")
+      .get(dispatchId) as { audience: string } | undefined;
+    expect(row?.audience).toBe("result");
+
+    const result = runnerTokens.verifyAndConsumeRunToken(token, SECRET);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.claims.audience).toBe("result");
+  });
+
+  it("can mint result and progress tokens for the same dispatch id", () => {
+    const dispatchId = "dispatch-shared";
+    runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "result",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const rows = dedup
+      .getDb()
+      .prepare("SELECT audience FROM runner_tokens WHERE dispatch_id = ? ORDER BY audience")
+      .all(dispatchId) as Array<{ audience: string }>;
+    expect(rows.map((row) => row.audience)).toEqual(["progress", "result"]);
+
+    const result = runnerTokens.verifyRunToken(token, SECRET, "progress", { consume: false });
+    expect(result.ok).toBe(true);
+  });
 });
 
 describe("verifyAndConsumeRunToken", () => {
@@ -127,5 +179,36 @@ describe("verifyAndConsumeRunToken", () => {
     const result = runnerTokens.verifyAndConsumeRunToken(token, SECRET);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("malformed");
+  });
+
+  it("allows progress tokens to be verified repeatedly without consuming them", () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const first = runnerTokens.verifyRunToken(token, SECRET, "progress", { consume: false });
+    const second = runnerTokens.verifyRunToken(token, SECRET, "progress", { consume: false });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+  });
+
+  it("rejects using a result token as a progress token", () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "result",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const result = runnerTokens.verifyRunToken(token, SECRET, "progress", { consume: false });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("wrong_audience");
   });
 });

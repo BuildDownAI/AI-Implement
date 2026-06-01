@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAutonomous } from "../run-autonomous.js";
@@ -41,6 +42,13 @@ function makeSingleStepPipeline(stepId: string, mod: StepModule): {
   return { pipeline, runner };
 }
 
+function git(args: string[], cwd: string): void {
+  const result = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+  }
+}
+
 describe("runAutonomous", () => {
   let workspaceDir: string;
 
@@ -53,6 +61,8 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "");
     vi.stubEnv("RUN_TOKEN", "");
     vi.stubEnv("CLAUDE_MODEL", "");
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv("GITHUB_REF_NAME", "");
     vi.stubEnv("PR_NUMBER", "");
   });
 
@@ -91,6 +101,32 @@ describe("runAutonomous", () => {
     });
 
     expect(result.exitCode).toBe(1);
+  });
+
+  it("uses the checked-out branch when GITHUB_DEFAULT_BRANCH is not set", async () => {
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "");
+    vi.stubEnv("GITHUB_REF_NAME", "orchestrator-branch");
+    git(["init"], workspaceDir);
+    git(["checkout", "-b", "development"], workspaceDir);
+
+    let capturedBranch: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedBranch = ctx.data.branch;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedBranch).toBe("development");
   });
 
   it("reads model from WORKFLOW.md front matter and passes it through context", async () => {
@@ -511,6 +547,47 @@ describe("runAutonomous", () => {
     expect(body.comments).toEqual([{ body: "first" }, { body: "second" }]);
   });
 
+  it("uses token-backed progress reporting when a progress token is present", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "progress-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = {
+      run: vi.fn(async (_ctx, _inputs, reporter) => {
+        await reporter.report({
+          id: "do-work",
+          type: "custom",
+          status: "running",
+          started_at: "2026-05-27T00:00:00.000Z",
+          ended_at: null,
+          parent_step_id: null,
+          inputs: {},
+          outputs: {},
+          logs_url: null,
+        });
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://orchestrator.example/runner/progress",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer progress-token" }),
+      }),
+    );
+  });
+
   it("posts implementation failure callback when pipeline fails", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example/");
     vi.stubEnv("RUN_TOKEN", "run-token");
@@ -538,6 +615,66 @@ describe("runAutonomous", () => {
       phase: "implementation",
       outcome: "failure",
       failureReason: "push failed",
+    });
+  });
+
+  it("posts gap-analysis callback phase for PR_NUMBER runs", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "gap-analysis");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+    };
+    expect(body).toMatchObject({
+      phase: "gap-analysis",
+      outcome: "success",
+    });
+  });
+
+  it("uses RUNNER_PHASE instead of inferring callback phase from PR_NUMBER", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_PHASE", "implementation");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/99" }) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+    };
+    expect(body).toMatchObject({
+      phase: "implementation",
+      outcome: "success",
     });
   });
 

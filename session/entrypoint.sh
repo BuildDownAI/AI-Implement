@@ -46,7 +46,13 @@ else
 fi
 
 # ── 4. Git config + clone ────────────────────────────────────────────────────
-GITHUB_DEFAULT_BRANCH="${GITHUB_DEFAULT_BRANCH:-main}"
+if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then
+  if [ -n "${GITHUB_REF_NAME:-}" ]; then
+    GITHUB_DEFAULT_BRANCH="${GITHUB_REF_NAME}"
+  else
+    GITHUB_DEFAULT_BRANCH="$(gh api "repos/${GITHUB_OWNER}/${GITHUB_REPO}" --jq ".default_branch")"
+  fi
+fi
 export GITHUB_DEFAULT_BRANCH
 git config --global user.name "ai-implement-bot"
 git config --global user.email "ai-implement-bot@users.noreply.github.com"

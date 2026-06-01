@@ -45,6 +45,11 @@ on:
         required: false
         type: string
         default: ""
+      runner_phase:
+        description: "Runner callback phase: implementation or gap-analysis (empty keeps legacy PR_NUMBER inference)"
+        required: false
+        type: string
+        default: ""
       provider:
         description: "Claude provider: 'anthropic' (default) or 'bedrock'"
         required: false
@@ -62,6 +67,11 @@ on:
         default: ""
       run_token:
         description: "HMAC bearer token authorizing the result POST; empty skips callback"
+        required: false
+        type: string
+        default: ""
+      run_progress_token:
+        description: "HMAC bearer token authorizing progress POSTs; empty skips progress callback"
         required: false
         type: string
         default: ""
@@ -97,7 +107,7 @@ jobs:
             runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
           fi
           if [ -z "$runner_image" ]; then
-            runner_image="ghcr.io/builddownai/ai-implement-runner:next"
+            runner_image="ghcr.io/builddownai/ai-implement-runner:latest"
           fi
 
           case "$runner_image" in
@@ -150,27 +160,38 @@ jobs:
     steps:
       - name: Generate GitHub App token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
 
       - name: Configure AWS credentials (Bedrock)
         if: inputs.provider == 'bedrock'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
           role-session-duration: 14400
 
+      - name: Mask runner callback tokens
+        run: |
+          if [ -n "${{ inputs.run_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_token }}"
+          fi
+          if [ -n "${{ inputs.run_progress_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_progress_token }}"
+          fi
+
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_DEFAULT_BRANCH: ${{ github.ref_name }}
           ISSUE_ID: ${{ inputs.issue_id }}
           ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          RUNNER_PHASE: ${{ inputs.runner_phase }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -178,4 +199,5 @@ jobs:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUN_TOKEN: ${{ inputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
         run: /opt/ai-implement/entrypoint.sh

@@ -5,8 +5,13 @@ interface DispatchInputs {
   issue_identifier: string;
   issue_title: string;
   issue_description: string;
+  parent?: string;
+  siblings?: string;
+  dependencies?: string;
   /** When set, the workflow checks out the existing PR branch (gap-fill run). */
   pr_number?: string;
+  /** Explicit callback phase reported by the runner. */
+  runner_phase?: "implementation" | "gap-analysis";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */
@@ -15,6 +20,8 @@ interface DispatchInputs {
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
   run_token?: string;
+  /** Signed reusable token authorizing step progress POSTs. Empty when progress callback disabled. */
+  run_progress_token?: string;
 }
 
 interface DispatchResult {

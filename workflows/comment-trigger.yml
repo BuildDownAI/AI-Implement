@@ -34,13 +34,14 @@ jobs:
       matched: ${{ steps.trigger.outputs.matched }}
       pr_number: ${{ steps.pr.outputs.pr_number }}
       issue_meta: ${{ steps.pr.outputs.issue_meta }}
+      default_branch: ${{ steps.pr.outputs.default_branch }}
       provider: ${{ steps.pr.outputs.provider }}
       aws_region: ${{ steps.pr.outputs.aws_region }}
       runner_image: ${{ steps.runner-image.outputs.runner_image }}
     steps:
       - name: Check trigger command
         id: trigger
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         with:
           script: |
             const body = context.payload.comment.body ?? "";
@@ -52,7 +53,7 @@ jobs:
 
       - name: Auth check (write, maintain, or admin)
         if: steps.trigger.outputs.matched == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         with:
           script: |
             const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
@@ -64,7 +65,7 @@ jobs:
 
       - name: Acknowledge trigger
         if: steps.trigger.outputs.matched == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         with:
           script: |
             await github.rest.reactions.createForIssueComment({
@@ -77,7 +78,7 @@ jobs:
       - name: Extract PR metadata
         if: steps.trigger.outputs.matched == 'true'
         id: pr
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         env:
           AI_IMPLEMENT_PROVIDER: ${{ vars.AI_IMPLEMENT_PROVIDER }}
           AI_IMPLEMENT_AWS_REGION: ${{ vars.AI_IMPLEMENT_AWS_REGION }}
@@ -98,6 +99,8 @@ jobs:
             );
             core.setOutput("pr_number", String(context.payload.issue.number));
             core.setOutput("issue_meta", JSON.stringify(meta));
+            // The workflow runs in the target repo, so repository.default_branch is the target fallback.
+            core.setOutput("default_branch", pr.data.base.ref || context.payload.repository.default_branch || "");
             core.setOutput("provider", process.env.AI_IMPLEMENT_PROVIDER || "anthropic");
             core.setOutput("aws_region", process.env.AI_IMPLEMENT_AWS_REGION || "");
 
@@ -171,7 +174,7 @@ jobs:
     steps:
       - name: Generate GitHub App token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
@@ -195,7 +198,7 @@ jobs:
 
       - name: Configure AWS credentials (Bedrock)
         if: needs.check-trigger.outputs.provider == 'bedrock'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: ${{ needs.check-trigger.outputs.aws_region }}
@@ -204,7 +207,9 @@ jobs:
       - name: Run pipeline (gap-fill)
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GITHUB_DEFAULT_BRANCH: ${{ needs.check-trigger.outputs.default_branch }}
           PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
+          RUNNER_PHASE: gap-analysis
           ISSUE_META: ${{ needs.check-trigger.outputs.issue_meta }}
           PROVIDER: ${{ needs.check-trigger.outputs.provider }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
