@@ -53,6 +53,8 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "");
     vi.stubEnv("RUN_TOKEN", "");
     vi.stubEnv("CLAUDE_MODEL", "");
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv("GITHUB_REF_NAME", "");
     vi.stubEnv("PR_NUMBER", "");
   });
 
@@ -91,6 +93,30 @@ describe("runAutonomous", () => {
     });
 
     expect(result.exitCode).toBe(1);
+  });
+
+  it("uses GITHUB_REF_NAME as the branch when GITHUB_DEFAULT_BRANCH is not set", async () => {
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "");
+    vi.stubEnv("GITHUB_REF_NAME", "development");
+
+    let capturedBranch: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedBranch = ctx.data.branch;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedBranch).toBe("development");
   });
 
   it("reads model from WORKFLOW.md front matter and passes it through context", async () => {

@@ -30,9 +30,15 @@ describe("new-project stepper", () => {
   });
 
   it("declares the input ids the script reads", () => {
-    for (const id of ["np-teamKey", "np-owner", "np-repo", "np-sessionMode", "np-awsRegion", "np-maxAi"]) {
+    for (const id of ["np-teamKey", "np-owner", "np-repo", "np-defaultBranch", "np-sessionMode", "np-awsRegion", "np-maxAi"]) {
       expect(stepperHtml).toContain(`id="${id}"`);
     }
+  });
+
+  it("collects and submits the configured default branch", () => {
+    expect(stepperScript).toContain("defaultBranch:");
+    expect(stepperScript).toContain("np-defaultBranch");
+    expect(stepperScript).toContain("defaultBranch: data.defaultBranch");
   });
 
   it("exposes navigation handlers on window", () => {

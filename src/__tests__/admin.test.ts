@@ -101,7 +101,21 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
 }
 
 async function request(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
-  const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
+  let requestBody = body;
+  if (
+    url === "/api/mappings" &&
+    method === "POST" &&
+    requestBody &&
+    typeof requestBody === "object" &&
+    !Array.isArray(requestBody) &&
+    "teamKey" in requestBody &&
+    "owner" in requestBody &&
+    "repo" in requestBody &&
+    !("defaultBranch" in requestBody)
+  ) {
+    requestBody = { defaultBranch: "main", ...requestBody };
+  }
+  const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, requestBody === undefined ? undefined : JSON.stringify(requestBody));
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
   await res.done;
@@ -203,6 +217,19 @@ describe("admin mappings", () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "APP" }, token);
     expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects mapping creation without a default branch", async () => {
+    const token = await login("secret");
+    const res = await request(
+      "/api/mappings",
+      "POST",
+      "secret",
+      { teamKey: "APP", owner: "org", repo: "app", defaultBranch: "" },
+      token,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("defaultBranch");
   });
 
   it("updates the cap via PATCH", async () => {
