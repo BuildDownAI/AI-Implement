@@ -446,7 +446,7 @@ async function dispatchGitHubActions(
 
   await postDispatch(config, provider, issue, mapping, ghToken, jobId, "github-actions");
 
-  console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (github-actions)`);
+  console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (github-actions, image: ${runnerImage ?? "workflow-default"})`);
 }
 
 // ---------- Dispatch: Planning ----------
@@ -1564,7 +1564,7 @@ async function processReconciliations(config: AppConfig): Promise<void> {
       if (result.success) {
         updateReconciliationStatus(job.id, "dispatched");
         console.log(
-          `[reconcile] Dispatched gap-fill for ${job.issueIdentifier} (PR #${job.prNumber} in ${job.repo})`,
+          `[reconcile] Dispatched gap-fill for ${job.issueIdentifier} (PR #${job.prNumber} in ${job.repo}, image: ${runnerImage ?? "workflow-default"})`,
         );
       } else {
         console.error(
@@ -1688,7 +1688,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       }
       suppressStaleNotifications(fix.issueId, jobId);
       updateReviewFixStatus(fix.id, "dispatched");
-      console.log(`[review-fix] Dispatched review fix for ${fix.issueIdentifier ?? fix.issueId} (PR #${fix.prNumber} in ${fix.repo})`);
+      console.log(`[review-fix] Dispatched review fix for ${fix.issueIdentifier ?? fix.issueId} (PR #${fix.prNumber} in ${fix.repo}, image: ${runnerImage ?? "workflow-default"})`);
     } catch (err) {
       console.error(`[review-fix] Error processing review fix #${fix.id}:`, err);
     }
