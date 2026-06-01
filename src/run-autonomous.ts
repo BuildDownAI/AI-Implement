@@ -47,7 +47,6 @@ function currentGitBranch(workspaceDir: string): string | null {
 function resolveBranch(workspaceDir: string): string {
   const branch =
     optionalEnv("GITHUB_DEFAULT_BRANCH") ??
-    optionalEnv("GITHUB_REF_NAME") ??
     currentGitBranch(workspaceDir);
   if (!branch) {
     throw new Error("Missing GITHUB_DEFAULT_BRANCH and unable to resolve the checked-out branch");

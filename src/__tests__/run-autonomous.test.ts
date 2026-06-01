@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAutonomous } from "../run-autonomous.js";
@@ -39,6 +40,13 @@ function makeSingleStepPipeline(stepId: string, mod: StepModule): {
   };
   const runner = new PipelineRunner().register(stepId, mod);
   return { pipeline, runner };
+}
+
+function git(args: string[], cwd: string): void {
+  const result = spawnSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+  }
 }
 
 describe("runAutonomous", () => {
@@ -95,9 +103,11 @@ describe("runAutonomous", () => {
     expect(result.exitCode).toBe(1);
   });
 
-  it("uses GITHUB_REF_NAME as the branch when GITHUB_DEFAULT_BRANCH is not set", async () => {
+  it("uses the checked-out branch when GITHUB_DEFAULT_BRANCH is not set", async () => {
     vi.stubEnv("GITHUB_DEFAULT_BRANCH", "");
-    vi.stubEnv("GITHUB_REF_NAME", "development");
+    vi.stubEnv("GITHUB_REF_NAME", "orchestrator-branch");
+    git(["init"], workspaceDir);
+    git(["checkout", "-b", "development"], workspaceDir);
 
     let capturedBranch: string | undefined;
     const mod: StepModule = {

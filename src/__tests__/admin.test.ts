@@ -113,9 +113,14 @@ async function request(url: string, method: string, accessCode: string, body?: u
     "repo" in requestBody &&
     !("defaultBranch" in requestBody)
   ) {
+    // Existing mapping tests pre-date the required defaultBranch field; keep them focused on their original assertions.
     requestBody = { defaultBranch: "main", ...requestBody };
   }
-  const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, requestBody === undefined ? undefined : JSON.stringify(requestBody));
+  return requestRaw(url, method, accessCode, requestBody, token);
+}
+
+async function requestRaw(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
+  const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
   await res.done;
@@ -230,6 +235,30 @@ describe("admin mappings", () => {
     );
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("defaultBranch");
+  });
+
+  it("preserves an existing mapping defaultBranch when an upsert omits it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DEV",
+      owner: "org",
+      repo: "app",
+      defaultBranch: "development",
+    }, token);
+    expect(create.statusCode).toBe(200);
+
+    const update = await requestRaw("/api/mappings", "POST", "secret", {
+      teamKey: "DEV",
+      owner: "org",
+      repo: "app-renamed",
+    }, token);
+    expect(update.statusCode).toBe(200);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).DEV).toMatchObject({
+      repo: "app-renamed",
+      defaultBranch: "development",
+    });
   });
 
   it("updates the cap via PATCH", async () => {

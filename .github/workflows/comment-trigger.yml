@@ -99,6 +99,7 @@ jobs:
             );
             core.setOutput("pr_number", String(context.payload.issue.number));
             core.setOutput("issue_meta", JSON.stringify(meta));
+            // The workflow runs in the target repo, so repository.default_branch is the target fallback.
             core.setOutput("default_branch", pr.data.base.ref || context.payload.repository.default_branch || "");
             core.setOutput("provider", process.env.AI_IMPLEMENT_PROVIDER || "anthropic");
             core.setOutput("aws_region", process.env.AI_IMPLEMENT_AWS_REGION || "");
