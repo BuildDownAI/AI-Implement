@@ -46,9 +46,11 @@ export function runHookScript(
       stdio: ["ignore", "inherit", "inherit"],
     });
 
-    mergeGithubEnv(githubEnvFile);
-
+    // Surface a spawn-level failure (e.g. bash missing) before merging — a
+    // failed spawn leaves no meaningful env to merge.
     if (proc.error) throw proc.error;
+
+    mergeGithubEnv(githubEnvFile);
     return { exitCode: proc.status ?? 1 };
   } finally {
     rmSync(envDir, { recursive: true, force: true });

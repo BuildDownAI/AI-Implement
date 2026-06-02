@@ -122,9 +122,9 @@ export const projectsHtml = `
           <div class="md-field"><label>Workflow File</label><input id="md-wf" value="claude-implement.yml"></div>
           <div class="md-field"><label>Default Branch</label><input id="md-branch" placeholder="development"></div>
           <div class="md-field"><label>Max AI Issues</label><input id="md-max-ai" type="number" min="1" value="3"></div>
-          <div class="md-field"><label>Max Turns <span class="text-tertiary" style="font-size:0.85em">(blank = 50)</span></label><input id="md-max-turns" type="number" min="1" placeholder="50"></div>
-          <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" placeholder="3"></div>
-          <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" placeholder="90"></div>
+          <div class="md-field"><label>Max Turns <span class="text-tertiary" style="font-size:0.85em">(blank = 50)</span></label><input id="md-max-turns" type="number" min="1" step="1" placeholder="50"></div>
+          <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" step="1" placeholder="3"></div>
+          <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>

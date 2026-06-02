@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, capDispatchFields, cancelWorkflowRun } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, capDispatchFields, capRunnerEnv, cancelWorkflowRun } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -154,6 +154,31 @@ describe("capDispatchFields", () => {
 
   it("omits caps left null", () => {
     expect(capDispatchFields(makeMapping({ maxTurns: 40 }))).toEqual({ max_turns: "40" });
+  });
+});
+
+describe("capRunnerEnv", () => {
+  it("returns empty object when no caps are set", () => {
+    expect(capRunnerEnv(makeMapping({}))).toEqual({});
+  });
+
+  it("includes turn/iteration caps as env vars (strings) when set", () => {
+    expect(capRunnerEnv(makeMapping({ maxTurns: 40, maxIterations: 2 }))).toEqual({
+      AI_IMPLEMENT_MAX_TURNS: "40",
+      AI_IMPLEMENT_MAX_ITERATIONS: "2",
+    });
+  });
+
+  it("omits job timeout (GHA-only, not a runner env var)", () => {
+    expect(capRunnerEnv(makeMapping({ maxTurns: 40, maxJobMinutes: 30 }))).toEqual({
+      AI_IMPLEMENT_MAX_TURNS: "40",
+    });
+  });
+
+  it("omits caps left null", () => {
+    expect(capRunnerEnv(makeMapping({ maxIterations: 3 }))).toEqual({
+      AI_IMPLEMENT_MAX_ITERATIONS: "3",
+    });
   });
 });
 

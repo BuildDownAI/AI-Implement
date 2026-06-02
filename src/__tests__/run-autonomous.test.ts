@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -733,5 +733,62 @@ describe("runAutonomous", () => {
     await expect(
       runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter() }),
     ).rejects.toThrow("Missing required env var: ISSUE_ID");
+  });
+
+  it("runs the teardown hook even when the pipeline fails", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\n');
+    const { pipeline, runner } = makeSingleStepPipeline("bad-step", {
+      run: vi.fn().mockRejectedValue(new Error("step exploded")),
+    });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+
+  it("runs the teardown hook on a successful run", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\n');
+    const { pipeline, runner } = makeSingleStepPipeline("ok-step", { run: vi.fn().mockResolvedValue({}) });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+
+  it("a failing teardown does not mask the run outcome or throw", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
+    // Teardown runs (marker) but exits non-zero — its failure must not change the
+    // pipeline's exitCode 1 nor surface as an unhandled rejection.
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\nexit 1\n');
+    const { pipeline, runner } = makeSingleStepPipeline("bad-step", {
+      run: vi.fn().mockRejectedValue(new Error("step exploded")),
+    });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
   });
 });
