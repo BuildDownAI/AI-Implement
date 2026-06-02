@@ -71,7 +71,7 @@ on:
         type: string
         default: ""
       job_timeout_minutes:
-        description: "Per-project job timeout in minutes (empty = 90)"
+        description: "Per-project job timeout in minutes, must be a positive integer (empty = 90)"
         required: false
         type: string
         default: ""

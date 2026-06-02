@@ -1590,6 +1590,9 @@ async function processReconciliations(config: AppConfig): Promise<void> {
 
       // Dispatch a gap-fill run using the existing claude-implement.yml workflow,
       // passing the merged PR number so Claude checks out the right branch.
+      // Reconciliation/gap-fill and review-fix re-dispatches always go through
+      // GitHub Actions (this dispatchWorkflow path), so caps ride capDispatchFields
+      // here — there is no Fly/local gap-fill path needing capRunnerEnv.
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
       const result = await dispatchWorkflow(ghToken, mapping, {
         issue_id: job.issueId,

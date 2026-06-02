@@ -26,4 +26,18 @@ describe("runHookScript", () => {
   it("throws a clear error when the script path does not exist", () => {
     expect(() => runHookScript("setup", "missing.sh", dir)).toThrow(/missing\.sh/);
   });
+
+  it("ignores GHA heredoc multiline values (only KEY=value is supported)", () => {
+    // A heredoc opener (KEY<<EOF) must NOT be parsed as an env var; the simple
+    // line on the same file is still merged.
+    writeFileSync(
+      join(dir, "multi.sh"),
+      'printf "MULTI_TEST_VAR<<EOF\\nl1\\nl2\\nEOF\\nSIMPLE_TEST_VAR=ok\\n" >> "$GITHUB_ENV"\n',
+    );
+    const result = runHookScript("setup", "multi.sh", dir);
+    expect(result.exitCode).toBe(0);
+    expect(process.env.MULTI_TEST_VAR).toBeUndefined();
+    expect(process.env.SIMPLE_TEST_VAR).toBe("ok");
+    delete process.env.SIMPLE_TEST_VAR;
+  });
 });

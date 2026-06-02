@@ -308,6 +308,54 @@ describe("loadPipelineDefinition", () => {
     expect(step.skip?.(ctxMissingPr)).toBe(true);
   });
 
+  it("skips setup when no setup hook, runs it (with scriptPath) when present", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "setup")!;
+
+    const ctxNoHook = makeContext();
+    ctxNoHook.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    expect(step.skip?.(ctxNoHook)).toBe(true);
+
+    const ctxWithHook = makeContext({ hooks: { setup: "scripts/setup.sh" } });
+    ctxWithHook.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    expect(step.skip?.(ctxWithHook)).toBe(false);
+    const inputs = ctxWithHook.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.scriptPath).toBe("scripts/setup.sh");
+  });
+
+  it("skips verify when no verify hook, or when feedback-loop not approved", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "verify")!;
+
+    // No hook -> skip even if approved.
+    const ctxNoHook = makeContext();
+    ctxNoHook.setOutputs("feedback-loop", { approved: true });
+    expect(step.skip?.(ctxNoHook)).toBe(true);
+
+    // Hook present but loop not approved -> skip.
+    const ctxNotApproved = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctxNotApproved.setOutputs("feedback-loop", { approved: false });
+    expect(step.skip?.(ctxNotApproved)).toBe(true);
+
+    // Hook present and approved -> run, with scriptPath wired.
+    const ctxRun = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctxRun.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctxRun.setOutputs("feedback-loop", { approved: true });
+    expect(step.skip?.(ctxRun)).toBe(false);
+    const inputs = ctxRun.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.scriptPath).toBe("scripts/verify.sh");
+  });
+
   it("custom pipeline with extra step is used by the pipeline runner", async () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: (p) => p.includes("custom"),
