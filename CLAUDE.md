@@ -155,7 +155,7 @@ Neither workflow validates model IDs — whatever `model:` says in front matter 
 
 ### Using AWS Bedrock
 
-To run a target repo against AWS Bedrock instead of the Anthropic API:
+To run a target repo against AWS Bedrock instead of the Anthropic API, use the GitHub Actions execution mode. Bedrock is not supported on Fly Machines or local Docker because those backends do not have a role-assumption mechanism equivalent to GitHub OIDC.
 
 1. **In the orchestrator admin UI (`/admin`)**, edit the repo's mapping:
    - Set **Provider** to `bedrock`
@@ -181,7 +181,7 @@ IAM trust policy shape (use the `sub` condition to restrict to this specific rep
 }
 ```
 
-The workflow re-runs `aws-actions/configure-aws-credentials` before each Bedrock action step (once before the main implementation run, once before gap analysis) so the STS session token doesn't expire during long runs. Only OIDC is supported — there is no static-key path.
+The workflow runs `aws-actions/configure-aws-credentials` once before the containerized runner step with a 4-hour session duration, covering implementation and gap-analysis runs. Only GitHub OIDC is supported — there is no static-key path.
 
 ## Custom extensions
 

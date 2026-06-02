@@ -22,7 +22,7 @@ export AI_IMPLEMENT_MODE
 # ── 2. Env validation ────────────────────────────────────────────────────────
 PROVIDER="${PROVIDER:-anthropic}"
 case "$PROVIDER" in
-  bedrock) require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1 ;;
+  bedrock) [ "$AI_IMPLEMENT_MODE" = "gha" ] || fail "provider=bedrock is supported only in GHA mode"; require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1 ;;
   anthropic) require_one_of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ;;
   *) fail "Unsupported provider: $PROVIDER" ;;
 esac

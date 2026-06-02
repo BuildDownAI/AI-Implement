@@ -29,7 +29,7 @@ describe("session/entrypoint.sh", () => {
   it("routes auth validation by provider and enables Claude Code Bedrock mode", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toMatch(/PROVIDER="\$\{PROVIDER:-anthropic\}"/);
-    expect(content).toMatch(/bedrock\) require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1/);
+    expect(content).toMatch(/bedrock\) \[ "\$AI_IMPLEMENT_MODE" = "gha" \] \|\| fail "provider=bedrock is supported only in GHA mode"; require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1/);
     expect(content).toMatch(/anthropic\) require_one_of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN/);
     expect(content.indexOf("CLAUDE_CODE_USE_BEDROCK=1")).toBeLessThan(content.indexOf("su -p coder"));
   });
