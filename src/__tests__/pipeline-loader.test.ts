@@ -29,6 +29,9 @@ steps:
     type: clone
   - id: install
     type: install
+  - id: setup
+    type: custom
+    moduleId: setup
   - id: feedback-loop
     type: custom
     moduleId: feedback-loop
@@ -36,6 +39,9 @@ steps:
     type: preflight
   - id: push
     type: push
+  - id: verify
+    type: custom
+    moduleId: verify
   - id: post-push-review
     type: custom
     moduleId: post-push-review
@@ -70,9 +76,11 @@ describe("loadPipelineDefinition", () => {
     expect(pipeline.steps.map((s) => s.id)).toEqual([
       "clone",
       "install",
+      "setup",
       "feedback-loop",
       "preflight",
       "push",
+      "verify",
       "post-push-review",
     ]);
   });
