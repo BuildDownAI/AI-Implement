@@ -60,6 +60,21 @@ on:
         required: false
         type: string
         default: ""
+      max_turns:
+        description: "Cap on Claude turns per implement pass (empty = runner default)"
+        required: false
+        type: string
+        default: ""
+      max_iterations:
+        description: "Cap on implement/review iterations (empty = provider default)"
+        required: false
+        type: string
+        default: ""
+      job_timeout_minutes:
+        description: "Per-project job timeout in minutes (empty = 90)"
+        required: false
+        type: string
+        default: ""
       runner_callback_url:
         description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
         required: false
@@ -154,7 +169,7 @@ jobs:
   implement:
     needs: validate-runner-image
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: ${{ inputs.job_timeout_minutes && fromJSON(inputs.job_timeout_minutes) || 90 }}
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}
     steps:
@@ -211,6 +226,8 @@ jobs:
           RUNNER_PHASE: ${{ inputs.runner_phase }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}
+          AI_IMPLEMENT_MAX_TURNS: ${{ inputs.max_turns }}
+          AI_IMPLEMENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
