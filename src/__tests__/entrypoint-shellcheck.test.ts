@@ -14,9 +14,13 @@ describe("session/entrypoint.sh", () => {
     expect(content.split("\n").length).toBeLessThan(100);
   });
 
-  it("exec's node /app/dist/run-autonomous.js as the final step", () => {
+  it("exec's the selected TS runner entry (node /app/dist/$RUNNER_ENTRY) as the final step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toMatch(/exec\s+(.*\s+)?node\s+\/app\/dist\/run-autonomous\.js/);
+    // The entrypoint picks the entry by phase, then execs it as the final step.
+    expect(content).toMatch(/exec\s+(.*\s+)?node\s+\/app\/dist\/\$\{?RUNNER_ENTRY\}?/);
+    // planning -> run-planning.js; implementation/gap-analysis -> run-autonomous.js
+    expect(content).toMatch(/RUNNER_ENTRY="run-planning\.js"/);
+    expect(content).toMatch(/RUNNER_ENTRY="run-autonomous\.js"/);
   });
 
   it("detects GHA mode by GITHUB_ACTIONS=true", () => {
