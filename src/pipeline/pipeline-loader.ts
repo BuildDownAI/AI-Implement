@@ -12,12 +12,6 @@ const VALID_STEP_TYPES = new Set<StepType>([
   "preflight",
   "push",
   "await_ci",
-  "explore-codebase",
-  "architecture-analysis",
-  "test-plan",
-  "work-unit-decomposition",
-  "cross-story-context",
-  "post-to-ticketing",
   "custom",
 ]);
 

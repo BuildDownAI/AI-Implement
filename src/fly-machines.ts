@@ -343,6 +343,7 @@ export interface SessionMachineInput {
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
+  phase?: "implementation" | "planning";
   region?: string;
   cpus?: number;
   memoryMb?: number;
@@ -372,6 +373,7 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
     SESSION_MODE: input.sessionMode ?? "autonomous",
+    RUNNER_PHASE: input.phase ?? "implementation",
   };
 
   if (input.linearApiKey) {
