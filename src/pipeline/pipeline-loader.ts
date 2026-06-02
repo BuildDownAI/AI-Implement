@@ -111,6 +111,9 @@ function applyWiring(step: YamlStep): StepDefinition {
             planningContext: ctx.data.planningContext,
             repoImplementModel: repoModels?.implement,
             repoReviewModel: repoModels?.review,
+            provider: ctx.data.provider,
+            maxTurns: ctx.data.maxTurns,
+            maxIterations: ctx.data.maxIterations,
           };
         },
       };

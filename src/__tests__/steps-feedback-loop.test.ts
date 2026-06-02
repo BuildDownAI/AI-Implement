@@ -410,3 +410,66 @@ describe("feedbackLoopStep", () => {
     expect(reviewStep_?.inputs).toMatchObject({ model: "claude-haiku-4-5-20251001" });
   });
 });
+
+describe("feedbackLoopStep caps", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValue(APPROVED_REVIEW);
+    mockDiff();
+  });
+
+  it("passes maxTurns=50 by default to the implement invocation", async () => {
+    await feedbackLoopStep.run(makeContext(), { ...BASE_INPUTS }, new NoopStepReporter());
+
+    const implementCall = vi.mocked(implementStep.run).mock.calls[0];
+    expect(implementCall[1]).toMatchObject({ maxTurns: 50 });
+  });
+
+  it("honors an explicit maxTurns input", async () => {
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, maxTurns: 25 },
+      new NoopStepReporter(),
+    );
+
+    const implementCall = vi.mocked(implementStep.run).mock.calls[0];
+    expect(implementCall[1]).toMatchObject({ maxTurns: 25 });
+  });
+
+  it("defaults to 2 maxIterations when provider=bedrock", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, provider: "bedrock" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.iterations).toBe(2);
+  });
+
+  it("defaults to 3 maxIterations when provider is not bedrock", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, provider: "anthropic" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.iterations).toBe(3);
+  });
+
+  it("honors an explicit maxIterations even when provider=bedrock", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, provider: "bedrock", maxIterations: 5 },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.iterations).toBe(5);
+  });
+});

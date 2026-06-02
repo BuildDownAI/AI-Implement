@@ -21,6 +21,8 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   /** Repo-level review model from .ai-implement/config.yml, injected by the install step. */
   repoReviewModel?: string;
   maxIterations?: number;
+  maxTurns?: number;
+  provider?: string;
   planningContext?: string;
   implementationPrompt?: string;
   parentStepId?: string;
@@ -72,8 +74,9 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
   ): Promise<FeedbackLoopOutputs> {
     const parentStepId =
       typeof inputs.parentStepId === "string" ? inputs.parentStepId : "feedback-loop";
-    const maxIterations =
-      typeof inputs.maxIterations === "number" ? inputs.maxIterations : DEFAULT_MAX_ITERATIONS;
+    const effectiveMaxIterations =
+      inputs.maxIterations ?? (inputs.provider === "bedrock" ? 2 : DEFAULT_MAX_ITERATIONS);
+    const effectiveMaxTurns = inputs.maxTurns ?? 50;
 
     // Fallback hierarchy: explicit per-step > unified `model` input > repo config > tenant default > hard default
     const tenantModel = context.data.model;
@@ -94,7 +97,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     let approved = false;
     let feedback = "";
 
-    while (iteration < maxIterations && !approved) {
+    while (iteration < effectiveMaxIterations && !approved) {
       iteration++;
 
       const implementPrompt = buildImplementPrompt(
@@ -117,6 +120,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           workspaceDir: inputs.workspaceDir,
           prompt: implementPrompt,
           model: resolvedImplementModel,
+          maxTurns: effectiveMaxTurns,
           planningContext: inputs.planningContext,
         },
         outputs: {},
@@ -131,6 +135,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             workspaceDir: String(inputs.workspaceDir),
             prompt: implementPrompt,
             model: resolvedImplementModel,
+            maxTurns: effectiveMaxTurns,
             planningContext:
               inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined,
           },
