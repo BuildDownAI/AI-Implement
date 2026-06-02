@@ -87,6 +87,18 @@ export function capDispatchFields(
   return fields;
 }
 
+/**
+ * Cap env vars for the runner process (Fly/local execution modes), where caps
+ * arrive via container env rather than workflow inputs. Job timeout is omitted
+ * because it controls the GitHub Actions job, not the runner.
+ */
+export function capRunnerEnv(mapping: RepoMapping): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (mapping.maxTurns != null) env.AI_IMPLEMENT_MAX_TURNS = String(mapping.maxTurns);
+  if (mapping.maxIterations != null) env.AI_IMPLEMENT_MAX_ITERATIONS = String(mapping.maxIterations);
+  return env;
+}
+
 export async function dispatchWorkflow(
   token: string,
   mapping: RepoMapping,
