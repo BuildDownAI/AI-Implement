@@ -30,6 +30,9 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     ticketingConfig: { kind: "linear" },
     awsRegion: null,
     paused: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
     ...overrides,
   };
 }
@@ -470,6 +473,20 @@ describe("config", () => {
 
     config.initMappingsTable();
     expect(config.getMappings().LEG.paused).toBe(false);
+  });
+
+  it("round-trips maxTurns, maxIterations, maxJobMinutes (including null)", () => {
+    config.initMappingsTable();
+    config.upsertMapping("CAPS", mapping({ owner: "org", repo: "repo", maxTurns: 40, maxIterations: 2, maxJobMinutes: 30 }));
+    config.upsertMapping("NULLS", mapping({ owner: "org", repo: "repo", maxTurns: null, maxIterations: null, maxJobMinutes: null }));
+
+    const all = config.getMappings();
+    expect(all.CAPS.maxTurns).toBe(40);
+    expect(all.CAPS.maxIterations).toBe(2);
+    expect(all.CAPS.maxJobMinutes).toBe(30);
+    expect(all.NULLS.maxTurns).toBeNull();
+    expect(all.NULLS.maxIterations).toBeNull();
+    expect(all.NULLS.maxJobMinutes).toBeNull();
   });
 
   it("getMappings falls back to {} when extra_env contains invalid JSON", () => {
