@@ -134,11 +134,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     issueDescription,
     prNumber,
   });
-  // WORKFLOW.md (and therefore the hook paths, incl. teardown) is read once here
-  // from `workspaceDir`. This is the runner's single workspace for the whole run
-  // in every execution mode: GHA pre-clones into it, and on Fly/local the pipeline's
-  // `clone` step clones into this same path. So the teardown path captured now is
-  // still valid at `finally` time, even though clone runs later in the pipeline.
+  // WORKFLOW.md (and therefore the hook paths, incl. teardown) is read once here,
+  // before the pipeline runs. In GHA mode the repo is already checked out into
+  // `workspaceDir`, so the hooks resolve and the captured teardown path stays valid
+  // through `finally`. In Fly/local modes the `clone` step runs later in the
+  // pipeline, so `workspaceDir` is empty at this point — WORKFLOW.md isn't found and
+  // all hooks resolve to undefined (hooks are effectively GHA-only; see WORKFLOW.md).
   const wfPath = join(workspaceDir, "WORKFLOW.md");
   if (existsSync(wfPath)) {
     const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {

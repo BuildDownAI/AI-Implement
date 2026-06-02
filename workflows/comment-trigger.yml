@@ -10,6 +10,12 @@
 #   AI_IMPLEMENT_PROVIDER    - Set to "bedrock" to route through AWS Bedrock.
 #   AI_IMPLEMENT_AWS_REGION  - AWS region (required when provider=bedrock).
 #
+# Optional repository variables (per-project run caps — mirror the orchestrator
+# admin UI mapping so /ai-implement comment runs get the same caps):
+#   AI_IMPLEMENT_MAX_TURNS       - Cap on Claude turns per implement pass (default 50).
+#   AI_IMPLEMENT_MAX_ITERATIONS  - Cap on implement/review iterations (default: bedrock 2 / anthropic 3).
+#   AI_IMPLEMENT_MAX_JOB_MINUTES - Per-project job timeout in minutes (default 90).
+#
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
@@ -37,6 +43,9 @@ jobs:
       default_branch: ${{ steps.pr.outputs.default_branch }}
       provider: ${{ steps.pr.outputs.provider }}
       aws_region: ${{ steps.pr.outputs.aws_region }}
+      max_turns: ${{ steps.pr.outputs.max_turns }}
+      max_iterations: ${{ steps.pr.outputs.max_iterations }}
+      max_job_minutes: ${{ steps.pr.outputs.max_job_minutes }}
       runner_image: ${{ steps.runner-image.outputs.runner_image }}
     steps:
       - name: Check trigger command
@@ -82,6 +91,9 @@ jobs:
         env:
           AI_IMPLEMENT_PROVIDER: ${{ vars.AI_IMPLEMENT_PROVIDER }}
           AI_IMPLEMENT_AWS_REGION: ${{ vars.AI_IMPLEMENT_AWS_REGION }}
+          AI_IMPLEMENT_MAX_TURNS: ${{ vars.AI_IMPLEMENT_MAX_TURNS }}
+          AI_IMPLEMENT_MAX_ITERATIONS: ${{ vars.AI_IMPLEMENT_MAX_ITERATIONS }}
+          AI_IMPLEMENT_MAX_JOB_MINUTES: ${{ vars.AI_IMPLEMENT_MAX_JOB_MINUTES }}
         with:
           script: |
             const pr = await github.rest.pulls.get({
@@ -103,6 +115,9 @@ jobs:
             core.setOutput("default_branch", pr.data.base.ref || context.payload.repository.default_branch || "");
             core.setOutput("provider", process.env.AI_IMPLEMENT_PROVIDER || "anthropic");
             core.setOutput("aws_region", process.env.AI_IMPLEMENT_AWS_REGION || "");
+            core.setOutput("max_turns", process.env.AI_IMPLEMENT_MAX_TURNS || "");
+            core.setOutput("max_iterations", process.env.AI_IMPLEMENT_MAX_ITERATIONS || "");
+            core.setOutput("max_job_minutes", process.env.AI_IMPLEMENT_MAX_JOB_MINUTES || "");
 
       - name: Resolve and validate runner image
         if: steps.trigger.outputs.matched == 'true'
@@ -163,7 +178,7 @@ jobs:
     needs: check-trigger
     if: needs.check-trigger.outputs.matched == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: ${{ needs.check-trigger.outputs.max_job_minutes && fromJSON(needs.check-trigger.outputs.max_job_minutes) || 90 }}
     permissions:
       contents: write
       pull-requests: write
@@ -212,6 +227,8 @@ jobs:
           RUNNER_PHASE: gap-analysis
           ISSUE_META: ${{ needs.check-trigger.outputs.issue_meta }}
           PROVIDER: ${{ needs.check-trigger.outputs.provider }}
+          AI_IMPLEMENT_MAX_TURNS: ${{ needs.check-trigger.outputs.max_turns }}
+          AI_IMPLEMENT_MAX_ITERATIONS: ${{ needs.check-trigger.outputs.max_iterations }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}

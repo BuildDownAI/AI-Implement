@@ -6,7 +6,14 @@ import { runHookScript } from "../pipeline/steps/hooks.js";
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "hook-")); });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+  // Clean up env the hook scripts export, so a failing assertion mid-test can't
+  // leak a var into other tests sharing this Vitest worker's process.env.
+  for (const k of ["FOO_TEST_VAR", "SIMPLE_TEST_VAR", "MULTI_TEST_VAR"]) {
+    delete process.env[k];
+  }
+});
 
 describe("runHookScript", () => {
   it("runs the script and merges GITHUB_ENV exports into process.env", () => {
@@ -14,7 +21,6 @@ describe("runHookScript", () => {
     const result = runHookScript("setup", "setup.sh", dir);
     expect(result.exitCode).toBe(0);
     expect(process.env.FOO_TEST_VAR).toBe("bar123");
-    delete process.env.FOO_TEST_VAR;
   });
 
   it("returns a non-zero exit code when the script fails", () => {
@@ -38,6 +44,5 @@ describe("runHookScript", () => {
     expect(result.exitCode).toBe(0);
     expect(process.env.MULTI_TEST_VAR).toBeUndefined();
     expect(process.env.SIMPLE_TEST_VAR).toBe("ok");
-    delete process.env.SIMPLE_TEST_VAR;
   });
 });

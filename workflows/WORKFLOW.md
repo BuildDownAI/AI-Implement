@@ -52,6 +52,10 @@ model: claude-sonnet-4-6
     teardown   Path to a shell script that runs AFTER Claude, even on failure.
                Use this to stop containers or clean up resources.
 
+    NOTE: Hooks run only in GitHub Actions execution mode. On Fly/local modes the
+    workspace is empty when WORKFLOW.md is read (the repo is cloned later), so
+    setup/verify/teardown are silently skipped.
+
   SETUP AND TEARDOWN HOOKS
   ------------------------
   Repos that need a database or other services should define scripts instead of
