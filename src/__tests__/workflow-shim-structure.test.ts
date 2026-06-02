@@ -164,6 +164,14 @@ describe("GHA workflow shims", () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*github\.ref_name\s*\}\}/);
     });
+
+    it(`${f} validates Bedrock config before configuring AWS credentials`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/Validate Bedrock inputs/);
+      expect(yaml).toMatch(/provider=bedrock but aws_region dispatch input is empty/);
+      expect(yaml).toMatch(/provider=bedrock but AWS_BEDROCK_ROLE_ARN repo secret is not set/);
+      expect(yaml.indexOf("Validate Bedrock inputs")).toBeLessThan(yaml.indexOf("Configure AWS credentials (Bedrock)"));
+    });
   }
 
   it("comment trigger only runs implementation for an exact trimmed /ai-implement command", () => {
