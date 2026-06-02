@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, cancelWorkflowRun } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, capDispatchFields, cancelWorkflowRun } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -22,6 +22,9 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     ticketingConfig: { kind: "linear" },
     awsRegion: null,
     paused: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
     ...overrides,
   };
 }
@@ -135,6 +138,22 @@ describe("providerDispatchFields", () => {
     expect(
       providerDispatchFields(makeMapping({ provider: "bedrock", awsRegion: null })),
     ).toEqual({ provider: "bedrock" });
+  });
+});
+
+describe("capDispatchFields", () => {
+  it("returns empty object when no caps are set", () => {
+    expect(capDispatchFields(makeMapping({}))).toEqual({});
+  });
+
+  it("includes only the caps that are set, as strings", () => {
+    expect(
+      capDispatchFields(makeMapping({ maxTurns: 40, maxIterations: 2, maxJobMinutes: 30 })),
+    ).toEqual({ max_turns: "40", max_iterations: "2", job_timeout_minutes: "30" });
+  });
+
+  it("omits caps left null", () => {
+    expect(capDispatchFields(makeMapping({ maxTurns: 40 }))).toEqual({ max_turns: "40" });
   });
 });
 
