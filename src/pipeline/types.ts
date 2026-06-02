@@ -52,6 +52,14 @@ export interface PipelineContextData {
   githubToken?: string;
   /** Autonomous runner: base branch to clone. Implementation branches are derived per issue. */
   branch?: string;
+  /** Autonomous runner: Claude provider ("anthropic" | "bedrock"), from PROVIDER env. */
+  provider?: string;
+  /** Autonomous runner: cap on Claude turns per implement pass (from env). */
+  maxTurns?: number;
+  /** Autonomous runner: cap on implement/review iterations (from env). */
+  maxIterations?: number;
+  /** Autonomous runner: WORKFLOW.md hook script paths (relative to repo root). */
+  hooks?: { setup?: string; verify?: string; teardown?: string };
 }
 
 export interface PipelineContext {

@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv } from "./github.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
@@ -410,6 +410,7 @@ async function dispatchGitHubActions(
     issue_description: issue.description || issue.title,
     runner_phase: "implementation",
     ...providerDispatchFields(mapping),
+    ...capDispatchFields(mapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
     run_progress_token: runProgressToken,
@@ -743,7 +744,10 @@ async function dispatchFlyMachine(
         orchestratorApp: config.flyOrchestratorApp ?? undefined,
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
-        extraEnv: Object.keys(mapping.extraEnv).length > 0 ? mapping.extraEnv : undefined,
+        extraEnv: (() => {
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping) };
+          return Object.keys(merged).length > 0 ? merged : undefined;
+        })(),
       });
 
       const machine = await createMachine(flyToken, flyApp, machineConfig);
@@ -814,7 +818,10 @@ async function dispatchLocalDocker(
         orchestratorUrl: localOrchestratorUrl,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
-        extraEnv: Object.keys(mapping.extraEnv).length > 0 ? mapping.extraEnv : undefined,
+        extraEnv: (() => {
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping) };
+          return Object.keys(merged).length > 0 ? merged : undefined;
+        })(),
       });
 
       return {
@@ -1583,6 +1590,9 @@ async function processReconciliations(config: AppConfig): Promise<void> {
 
       // Dispatch a gap-fill run using the existing claude-implement.yml workflow,
       // passing the merged PR number so Claude checks out the right branch.
+      // Reconciliation/gap-fill and review-fix re-dispatches always go through
+      // GitHub Actions (this dispatchWorkflow path), so caps ride capDispatchFields
+      // here — there is no Fly/local gap-fill path needing capRunnerEnv.
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
       const result = await dispatchWorkflow(ghToken, mapping, {
         issue_id: job.issueId,
@@ -1592,6 +1602,7 @@ async function processReconciliations(config: AppConfig): Promise<void> {
         pr_number: String(job.prNumber),
         runner_phase: "gap-analysis",
         ...providerDispatchFields(mapping),
+        ...capDispatchFields(mapping),
         ...(runnerImage ? { runner_image: runnerImage } : {}),
       });
 
@@ -1686,6 +1697,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         pr_number: String(fix.prNumber),
         runner_phase: "gap-analysis",
         ...providerDispatchFields(mapping),
+        ...capDispatchFields(mapping),
         runner_callback_url: runnerCallbackUrl,
         run_token: runToken,
         run_progress_token: runProgressToken,

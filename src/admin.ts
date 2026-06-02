@@ -963,6 +963,9 @@ async function handleUpsertMapping(
       ticketingProvider?: string;
       ticketingConfig?: unknown;
       paused?: boolean;
+      maxTurns?: number | null;
+      maxIterations?: number | null;
+      maxJobMinutes?: number | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1062,6 +1065,29 @@ async function handleUpsertMapping(
       return;
     }
 
+    const resolveCap = (
+      name: string,
+      value: number | null | undefined,
+    ): number | null => {
+      if (value === undefined || value === null) return null;
+      if (!Number.isInteger(value) || value < 1) {
+        throw new Error(`${name} must be a positive integer or null`);
+      }
+      return value;
+    };
+
+    let maxTurns: number | null;
+    let maxIterations: number | null;
+    let maxJobMinutes: number | null;
+    try {
+      maxTurns = resolveCap("maxTurns", body.maxTurns);
+      maxIterations = resolveCap("maxIterations", body.maxIterations);
+      maxJobMinutes = resolveCap("maxJobMinutes", body.maxJobMinutes);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -1085,6 +1111,9 @@ async function handleUpsertMapping(
       paused: body.paused !== undefined
         ? body.paused === true
         : (existingMapping?.paused ?? false),
+      maxTurns,
+      maxIterations,
+      maxJobMinutes,
     };
 
     upsertMapping(body.teamKey, mapping);

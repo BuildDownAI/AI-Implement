@@ -7,6 +7,7 @@ import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
 import type { LLMExecutor, PipelineDefinition, StepReporter } from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
+import { runHookScript } from "./pipeline/steps/hooks.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContext } from "./linear-planning-fetch.js";
 import { postRunnerResult } from "./runner-result.js";
@@ -124,12 +125,21 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     : "";
 
   let workflowModel: string | undefined;
+  let setupHook: string | undefined;
+  let verifyHook: string | undefined;
+  let teardownHook: string | undefined;
   let implementationPrompt = buildDefaultImplementationPrompt({
     issueIdentifier,
     issueTitle,
     issueDescription,
     prNumber,
   });
+  // WORKFLOW.md (and therefore the hook paths, incl. teardown) is read once here,
+  // before the pipeline runs. In GHA mode the repo is already checked out into
+  // `workspaceDir`, so the hooks resolve and the captured teardown path stays valid
+  // through `finally`. In Fly/local modes the `clone` step runs later in the
+  // pipeline, so `workspaceDir` is empty at this point — WORKFLOW.md isn't found and
+  // all hooks resolve to undefined (hooks are effectively GHA-only; see WORKFLOW.md).
   const wfPath = join(workspaceDir, "WORKFLOW.md");
   if (existsSync(wfPath)) {
     const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {
@@ -141,10 +151,26 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       PLANNING_CONTEXT: planningContext,
     });
     workflowModel = parsed.frontMatter.model;
+    setupHook = parsed.frontMatter.setup;
+    verifyHook = parsed.frontMatter.verify;
+    teardownHook = parsed.frontMatter.teardown;
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
   implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
   const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
+  const provider = process.env.PROVIDER || "anthropic";
+  const parseEnvInt = (raw: string | undefined, name: string): number | undefined => {
+    if (!raw) return undefined;
+    const n = parseInt(raw, 10);
+    if (Number.isInteger(n) && n > 0) return n;
+    // The orchestrator validates caps before dispatch, so this only happens on a
+    // manual GHA dispatch with a bad value. Warn so "my cap isn't taking effect"
+    // is diagnosable rather than a silent fallback to the default.
+    console.warn(`[runner] Ignoring invalid ${name}="${raw}" (must be a positive integer); using default`);
+    return undefined;
+  };
+  const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS, "AI_IMPLEMENT_MAX_TURNS");
+  const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS, "AI_IMPLEMENT_MAX_ITERATIONS");
 
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
@@ -181,6 +207,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       githubRepo,
       githubToken,
       branch,
+      provider,
+      maxTurns,
+      maxIterations,
+      hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,
   );
@@ -208,6 +238,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
+  } finally {
+    if (teardownHook) {
+      try {
+        const result = runHookScript("teardown", teardownHook, workspaceDir);
+        if (result.exitCode !== 0) {
+          console.error(`teardown hook exited with code ${result.exitCode}`);
+        }
+      } catch (teardownErr) {
+        console.error(`teardown hook error: ${teardownErr}`);
+      }
+    }
   }
 }
 
