@@ -69,7 +69,6 @@ interface AppConfig {
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   githubWebhookSecret: string | null;
-  orchestratorUrl: string | null;
   reaperDryRun: boolean;
   reaperAlertThreshold: number;
   runnerCallbackBaseUrl: string | null;
@@ -146,7 +145,6 @@ function loadConfig(): AppConfig {
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
     githubWebhookSecret,
-    orchestratorUrl: process.env.ORCHESTRATOR_URL || null,
     reaperDryRun: process.env.REAPER_DRY_RUN === "true",
     reaperAlertThreshold: parseInt(process.env.REAPER_ALERT_THRESHOLD || "10", 10),
     runnerCallbackBaseUrl,
@@ -739,7 +737,7 @@ async function dispatchFlyMachine(
         teamKey: issue.scopeKey,
         teamSecretNames: allSecretNames,
         minSecretsVersion: minSecretsVersion ?? undefined,
-        orchestratorUrl: config.orchestratorUrl ?? undefined,
+        orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
         orchestratorApp: config.flyOrchestratorApp ?? undefined,
@@ -793,7 +791,7 @@ async function dispatchLocalDocker(
     backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
       const localOrchestratorUrl =
         config.localRunnerOrchestratorUrl ??
-        config.orchestratorUrl ??
+        config.runnerCallbackBaseUrl ??
         `http://host.docker.internal:${config.healthPort}`;
 
       const container = await startLocalRunnerContainer({
