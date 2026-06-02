@@ -10,12 +10,6 @@ export type StepType =
   | "preflight"
   | "push"
   | "await_ci"
-  | "explore-codebase"
-  | "architecture-analysis"
-  | "test-plan"
-  | "work-unit-decomposition"
-  | "cross-story-context"
-  | "post-to-ticketing"
   | "custom";
 
 export interface Step {
@@ -40,12 +34,6 @@ export interface PipelineContextData {
   orchestratorUrl: string;
   /** Ticketing provider for the runner to use when posting comments. */
   ticketingProvider: ProviderId;
-  /** Planning pipeline: parent issue as "- IDENTIFIER: Title" or "None" */
-  parent?: string;
-  /** Planning pipeline: sibling stories, newline-separated or "None" */
-  siblings?: string;
-  /** Planning pipeline: related issues as "- [type] IDENTIFIER: Title", newline-separated or "None" */
-  dependencies?: string;
   /** Optional model override for Claude invocations (e.g. "claude-opus-4-5"). */
   model?: string;
   /** Autonomous runner: absolute path to the cloned workspace. */

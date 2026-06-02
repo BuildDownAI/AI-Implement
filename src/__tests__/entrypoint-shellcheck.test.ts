@@ -14,9 +14,11 @@ describe("session/entrypoint.sh", () => {
     expect(content.split("\n").length).toBeLessThan(100);
   });
 
-  it("exec's node /app/dist/run-autonomous.js as the final step", () => {
+  it("exec's the selected TS entrypoint as the final step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toMatch(/exec\s+(.*\s+)?node\s+\/app\/dist\/run-autonomous\.js/);
+    expect(content).toContain('RUNNER_ENTRY="run-autonomous.js"');
+    expect(content).toContain('RUNNER_ENTRY="run-planning.js"');
+    expect(content).toMatch(/exec\s+(.*\s+)?node\s+\/app\/dist\/\$RUNNER_ENTRY/);
   });
 
   it("detects GHA mode by GITHUB_ACTIONS=true", () => {
@@ -26,8 +28,10 @@ describe("session/entrypoint.sh", () => {
 
   it("exports GITHUB_DEFAULT_BRANCH for the TS runner", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\{GITHUB_DEFAULT_BRANCH:-main\}"/);
+    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\{GITHUB_REF_NAME\}"/);
+    expect(content).toMatch(/gh api "repos\/\$\{GITHUB_OWNER\}\/\$\{GITHUB_REPO\}"/);
     expect(content).toMatch(/export GITHUB_DEFAULT_BRANCH/);
+    expect(content).not.toContain("GITHUB_DEFAULT_BRANCH:-main");
   });
 
   it("preserves the checked-out gap-fill PR branch for the TS clone step", () => {

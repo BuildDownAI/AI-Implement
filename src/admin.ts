@@ -970,6 +970,15 @@ async function handleUpsertMapping(
       return;
     }
 
+    const existingMapping = getMappings()[body.teamKey];
+    const defaultBranch = typeof body.defaultBranch === "string"
+      ? body.defaultBranch.trim()
+      : (existingMapping?.defaultBranch ?? "");
+    if (!defaultBranch) {
+      json(res, 400, { error: "defaultBranch is required" });
+      return;
+    }
+
     const maxInProgressAiIssues =
       body.maxInProgressAiIssues ?? DEFAULT_MAX_IN_PROGRESS_AI_ISSUES;
     if (!Number.isInteger(maxInProgressAiIssues) || maxInProgressAiIssues < 1) {
@@ -1057,7 +1066,7 @@ async function handleUpsertMapping(
       owner: body.owner,
       repo: body.repo,
       workflowFile: body.workflowFile || "claude-implement.yml",
-      defaultBranch: body.defaultBranch || "main",
+      defaultBranch,
       maxInProgressAiIssues,
       executionMode,
       sessionMode,
@@ -1075,7 +1084,7 @@ async function handleUpsertMapping(
       // so an Edit form that omits `paused` doesn't silently resume the project.
       paused: body.paused !== undefined
         ? body.paused === true
-        : (getMappings()[body.teamKey]?.paused ?? false),
+        : (existingMapping?.paused ?? false),
     };
 
     upsertMapping(body.teamKey, mapping);

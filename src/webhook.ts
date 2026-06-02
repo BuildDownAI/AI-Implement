@@ -3,6 +3,9 @@ import http from "node:http";
 import { listLog } from "./log.js";
 import { enqueueReconciliation } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+import { enqueueReviewFix } from "./review-fix-queue.js";
+import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings } from "./pipeline/review-ledger.js";
+import { upsertReviewFinding } from "./review-ledger-store.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -42,6 +45,69 @@ interface PullRequestPayload {
   };
 }
 
+interface ReviewPayload {
+  action?: string;
+  review?: {
+    state?: string;
+    body?: string | null;
+    html_url?: string;
+    user?: { login?: string };
+  };
+  pull_request?: {
+    number?: number;
+    html_url?: string;
+    head?: { ref?: string };
+  };
+  repository?: {
+    full_name?: string;
+  };
+}
+
+interface ReviewCommentPayload {
+  action?: string;
+  comment?: {
+    body?: string;
+    html_url?: string;
+    path?: string;
+    line?: number | null;
+    original_line?: number | null;
+    user?: { login?: string };
+  };
+  pull_request?: {
+    number?: number;
+    html_url?: string;
+    head?: { ref?: string };
+  };
+  repository?: {
+    full_name?: string;
+  };
+}
+
+interface IssueCommentPayload {
+  action?: string;
+  comment?: {
+    body?: string;
+    html_url?: string;
+    user?: { login?: string };
+  };
+  issue?: {
+    number?: number;
+    html_url?: string;
+    pull_request?: unknown;
+  };
+  repository?: {
+    full_name?: string;
+  };
+}
+
+const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
+  "ai-implement",
+  "ai-implement[bot]",
+  "claude",
+  "claude[bot]",
+  "claude-code[bot]",
+]);
+
 /**
  * Finds a dispatch log entry that matches the merged PR.
  *
@@ -50,17 +116,18 @@ interface PullRequestPayload {
  * 2. Branch naming: legacy `{issueIdentifier}/...` or current
  *    `ai-implement/{issueIdentifier}-...`.
  */
-function findMatchingDispatch(repo: string, branch: string, prUrl: string) {
+function findMatchingDispatch(repo: string, branch?: string, prUrl?: string, prNumber?: number) {
   const jobs = listLog(500);
 
   for (const job of jobs) {
     if (job.repo !== repo) continue;
 
     // Strategy 1: match by stored PR URL
-    if (job.prUrl && job.prUrl === prUrl) return job;
+    if (prUrl && job.prUrl && job.prUrl === prUrl) return job;
+    if (prNumber && job.prUrl && job.prUrl.endsWith(`/pull/${prNumber}`)) return job;
 
     // Strategy 2: match by implementation branch naming.
-    if (branchMatchesIssueIdentifier(branch, job.issueIdentifier ?? undefined)) {
+    if (branch && branchMatchesIssueIdentifier(branch, job.issueIdentifier ?? undefined)) {
       return job;
     }
   }
@@ -90,18 +157,38 @@ export async function handleGitHubWebhook(
 
   const event = req.headers["x-github-event"] as string | undefined;
 
-  if (event !== "pull_request") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true }));
-    return;
-  }
-
   let payload: PullRequestPayload;
   try {
     payload = JSON.parse(body.toString()) as PullRequestPayload;
   } catch {
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Invalid JSON payload" }));
+    return;
+  }
+
+  if (event === "pull_request_review") {
+    handleReviewWebhook(payload as ReviewPayload, res);
+    return;
+  }
+
+  if (event === "pull_request_review_comment") {
+    handleReviewCommentWebhook(payload as ReviewCommentPayload, res);
+    return;
+  }
+
+  if (event === "issue_comment") {
+    handleIssueCommentWebhook(payload as IssueCommentPayload, res);
+    return;
+  }
+
+  if (event !== "pull_request") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  if (payload.action === "synchronize") {
+    handlePullRequestSynchronize(payload, res);
     return;
   }
 
@@ -124,7 +211,7 @@ export async function handleGitHubWebhook(
     return;
   }
 
-  const match = findMatchingDispatch(repoFullName, branch, prUrl);
+  const match = findMatchingDispatch(repoFullName, branch, prUrl, prNumber);
 
   if (!match) {
     // Not an AI-created PR — ignore silently
@@ -147,4 +234,204 @@ export async function handleGitHubWebhook(
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ queued: true, reconciliationId }));
+}
+
+function handleReviewWebhook(payload: ReviewPayload, res: http.ServerResponse): void {
+  if (payload.action !== "submitted" || payload.review?.state?.toUpperCase() !== "CHANGES_REQUESTED") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  const prNumber = payload.pull_request?.number;
+  const prUrl = payload.pull_request?.html_url;
+  const branch = payload.pull_request?.head?.ref;
+  const repoFullName = payload.repository?.full_name;
+  if (!prNumber || !prUrl || !repoFullName) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_review_fields" }));
+    return;
+  }
+
+  const match = findMatchingDispatch(repoFullName, branch, prUrl, prNumber);
+  if (!match) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "no matching dispatch" }));
+    return;
+  }
+
+  const body = payload.review?.body?.trim() || "Changes requested.";
+  if (isAiImplementNativeReviewBody(body)) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "self_review" }));
+    return;
+  }
+
+  const findingId = upsertReviewFinding({
+    repo: repoFullName,
+    prNumber,
+    source: "github-review",
+    severity: "blocking",
+    body,
+    ...(payload.review?.html_url ? { url: payload.review.html_url } : {}),
+  });
+  const reviewFixId = enqueueReviewFix({
+    issueId: match.issueId,
+    issueIdentifier: match.issueIdentifier,
+    repo: repoFullName,
+    prNumber,
+    reason: "changes_requested",
+    sourceUrl: payload.review?.html_url,
+    actor: payload.review?.user?.login,
+    findingIds: [findingId],
+  });
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ queued: true, findingId, reviewFixId }));
+}
+
+function handleReviewCommentWebhook(payload: ReviewCommentPayload, res: http.ServerResponse): void {
+  if (payload.action !== "created") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  const prNumber = payload.pull_request?.number;
+  const prUrl = payload.pull_request?.html_url;
+  const branch = payload.pull_request?.head?.ref;
+  const repoFullName = payload.repository?.full_name;
+  const body = payload.comment?.body?.trim();
+  if (!prNumber || !prUrl || !repoFullName || !body) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_review_comment_fields" }));
+    return;
+  }
+
+  const match = findMatchingDispatch(repoFullName, branch, prUrl, prNumber);
+  if (!match) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "no matching dispatch" }));
+    return;
+  }
+
+  const line = typeof payload.comment?.line === "number"
+    ? payload.comment.line
+    : typeof payload.comment?.original_line === "number"
+      ? payload.comment.original_line
+      : undefined;
+  // The review comment webhook does not carry the parent review state, so an inline
+  // comment alone cannot be assumed to block. Record it as non-blocking context; a
+  // genuine "changes requested" verdict arrives separately via handleReviewWebhook
+  // (state=CHANGES_REQUESTED), which records the blocking finding. This keeps tool
+  // feedback flowing to the fixer without overriding an approving reviewer.
+  const findingId = upsertReviewFinding({
+    repo: repoFullName,
+    prNumber,
+    source: "github-review-thread",
+    severity: "medium",
+    body,
+    ...(payload.comment?.path ? { path: payload.comment.path } : {}),
+    ...(typeof line === "number" ? { line } : {}),
+    ...(payload.comment?.html_url ? { url: payload.comment.html_url } : {}),
+  });
+  const reviewFixId = enqueueReviewFix({
+    issueId: match.issueId,
+    issueIdentifier: match.issueIdentifier,
+    repo: repoFullName,
+    prNumber,
+    reason: "review_comment",
+    sourceUrl: payload.comment?.html_url,
+    actor: payload.comment?.user?.login,
+    findingIds: [findingId],
+  });
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ queued: true, findingId, reviewFixId }));
+}
+
+function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.ServerResponse): void {
+  const prNumber = payload.pull_request?.number;
+  const prUrl = payload.pull_request?.html_url;
+  const branch = payload.pull_request?.head?.ref;
+  const repoFullName = payload.repository?.full_name;
+  if (!prNumber || !prUrl || !repoFullName) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_pr_fields" }));
+    return;
+  }
+
+  const match = findMatchingDispatch(repoFullName, branch, prUrl, prNumber);
+  if (!match) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "no matching dispatch" }));
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ acknowledged: true, reason: "awaiting_gap_analysis_result" }));
+}
+
+function handleIssueCommentWebhook(payload: IssueCommentPayload, res: http.ServerResponse): void {
+  if (payload.action !== "created") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+  if (!payload.issue?.pull_request) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  const login = payload.comment?.user?.login?.toLowerCase() ?? "";
+  if (!TRUSTED_REVIEW_COMMENT_AUTHORS.has(login)) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  const prNumber = payload.issue.number;
+  const prUrl = payload.issue.html_url;
+  const repoFullName = payload.repository?.full_name;
+  const body = payload.comment?.body?.trim();
+  if (!prNumber || !prUrl || !repoFullName || !body) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_issue_comment_fields" }));
+    return;
+  }
+
+  const findings = extractClaudeSummaryFindings(body, payload.comment?.html_url);
+  if (findings.length === 0) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  const match = findMatchingDispatch(repoFullName, undefined, prUrl, prNumber);
+  if (!match) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "no matching dispatch" }));
+    return;
+  }
+
+  const findingIds = findings.map((finding) => upsertReviewFinding({ repo: repoFullName, prNumber, ...finding }));
+  const reviewFixId = enqueueReviewFix({
+    issueId: match.issueId,
+    issueIdentifier: match.issueIdentifier,
+    repo: repoFullName,
+    prNumber,
+    reason: "claude_review_summary",
+    sourceUrl: payload.comment?.html_url,
+    actor: payload.comment?.user?.login,
+    findingIds,
+  });
+
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ queued: true, findingIds, reviewFixId }));
+}
+
+function isAiImplementNativeReviewBody(body: string): boolean {
+  return body.includes(AI_IMPLEMENT_NATIVE_REVIEW_MARKER) ||
+    body.replace(/\s+/g, " ").trim().startsWith("AI-Implement post-push review");
 }

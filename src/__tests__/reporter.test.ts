@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { HttpStepReporter } from "../pipeline/reporter.js";
+import { HttpStepReporter, TokenStepReporter } from "../pipeline/reporter.js";
 import type { Step } from "../pipeline/types.js";
 
 const STEP: Step = {
@@ -57,5 +57,28 @@ describe("HttpStepReporter", () => {
     await reporter.report(STEP);
 
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TokenStepReporter", () => {
+  it("posts step reports with a bearer progress token", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const reporter = new TokenStepReporter("https://orchestrator.example", "progress-token", {
+      fetchImpl: async (url, init) => {
+        calls.push({ url: String(url), init: init! });
+        return response(200);
+      },
+      retryDelaysMs: [],
+    });
+
+    await reporter.report(STEP);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://orchestrator.example/runner/progress");
+    expect(calls[0].init.headers).toEqual({
+      "Content-Type": "application/json",
+      Authorization: "Bearer progress-token",
+    });
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({ step: STEP });
   });
 });

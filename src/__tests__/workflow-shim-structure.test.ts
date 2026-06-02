@@ -144,12 +144,12 @@ describe("GHA workflow shims", () => {
   }
 
   for (const f of IMPLEMENT_WORKFLOWS) {
-    it(`${f} accepts a base_branch input wired to GITHUB_DEFAULT_BRANCH`, () => {
+    it(`${f} accepts a base_branch input that can override GITHUB_DEFAULT_BRANCH`, () => {
       const yaml = readFileSync(f, "utf-8");
       const doc = parse(yaml) as any;
       expect(doc.on.workflow_dispatch.inputs.base_branch).toBeDefined();
       expect(doc.on.workflow_dispatch.inputs.base_branch.default).toBe("");
-      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*inputs\.base_branch\s*\}\}/);
+      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*inputs\.base_branch\s*\|\|\s*github\.ref_name\s*\}\}/);
     });
 
     it(`${f} validates the runner image before the container job starts`, () => {
@@ -160,6 +160,17 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
       expect(yaml).toMatch(/invalid characters for a container image reference/);
       expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
+    });
+
+    it(`${f} masks runner progress tokens before the container step uses them`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
+    });
+
+    it(`${f} falls back to the dispatched ref when base_branch is omitted`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*inputs\.base_branch\s*\|\|\s*github\.ref_name\s*\}\}/);
     });
   }
 
@@ -184,6 +195,13 @@ describe("GHA workflow shims", () => {
     expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
     expect(yaml).toMatch(/invalid characters for a container image reference/);
     expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
+  });
+
+  it("comment trigger passes the PR base branch to the runner as GITHUB_DEFAULT_BRANCH", () => {
+    const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
+    expect(yaml).toMatch(/default_branch:\s*\$\{\{\s*steps\.pr\.outputs\.default_branch\s*\}\}/);
+    expect(yaml).toMatch(/core\.setOutput\("default_branch", pr\.data\.base\.ref/);
+    expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*needs\.check-trigger\.outputs\.default_branch\s*\}\}/);
   });
 
   it("documents and constrains the ISSUE_META eval trust boundary", () => {
