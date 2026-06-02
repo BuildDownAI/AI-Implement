@@ -7,6 +7,7 @@ import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
 import type { LLMExecutor, PipelineDefinition, StepReporter } from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
+import { runHookScript } from "./pipeline/steps/hooks.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContext } from "./linear-planning-fetch.js";
 import { postRunnerResult } from "./runner-result.js";
@@ -226,6 +227,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
+  } finally {
+    if (teardownHook) {
+      try {
+        const result = runHookScript("teardown", teardownHook, workspaceDir);
+        if (result.exitCode !== 0) {
+          console.error(`teardown hook exited with code ${result.exitCode}`);
+        }
+      } catch (teardownErr) {
+        console.error(`teardown hook error: ${teardownErr}`);
+      }
+    }
   }
 }
 
