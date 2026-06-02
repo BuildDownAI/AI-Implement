@@ -11,7 +11,7 @@ export function collectRunnerComments(workspaceDir: string): Array<{ body: strin
 }
 
 export async function postRunnerResult(params: {
-  phase: "planning" | "implementation";
+  phase: "planning" | "implementation" | "gap-analysis";
   workspaceDir: string;
   outcome: "success" | "failure";
   prUrl?: string;
