@@ -14,9 +14,11 @@ describe("session/entrypoint.sh", () => {
     expect(content.split("\n").length).toBeLessThan(100);
   });
 
-  it("exec's node /app/dist/run-autonomous.js as the final step", () => {
+  it("exec's the phase-selected TS runner as the final step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toMatch(/exec\s+(.*\s+)?node\s+\/app\/dist\/run-autonomous\.js/);
+    expect(content).toContain('RUNNER_ENTRY="run-planning.js"');
+    expect(content).toContain('RUNNER_ENTRY="run-autonomous.js"');
+    expect(content).toContain('exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"');
   });
 
   it("detects GHA mode by GITHUB_ACTIONS=true", () => {
