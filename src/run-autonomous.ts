@@ -124,6 +124,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     : "";
 
   let workflowModel: string | undefined;
+  let setupHook: string | undefined;
+  let verifyHook: string | undefined;
+  let teardownHook: string | undefined;
   let implementationPrompt = buildDefaultImplementationPrompt({
     issueIdentifier,
     issueTitle,
@@ -141,10 +144,21 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       PLANNING_CONTEXT: planningContext,
     });
     workflowModel = parsed.frontMatter.model;
+    setupHook = parsed.frontMatter.setup;
+    verifyHook = parsed.frontMatter.verify;
+    teardownHook = parsed.frontMatter.teardown;
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
   implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
   const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
+  const provider = process.env.PROVIDER || "anthropic";
+  const parseEnvInt = (raw: string | undefined): number | undefined => {
+    if (!raw) return undefined;
+    const n = parseInt(raw, 10);
+    return Number.isInteger(n) && n > 0 ? n : undefined;
+  };
+  const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS);
+  const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS);
 
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
@@ -181,6 +195,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       githubRepo,
       githubToken,
       branch,
+      provider,
+      maxTurns,
+      maxIterations,
+      hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,
   );
