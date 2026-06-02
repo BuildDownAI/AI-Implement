@@ -90,6 +90,23 @@ describe("dispatchWorkflow", () => {
     expect(body.inputs.aws_region).toBeUndefined();
   });
 
+  it("forwards runner_image when present in inputs", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    await dispatchWorkflow("gh-token", mockMapping, {
+      ...mockInputs,
+      runner_image: "ghcr.io/builddownai/ai-implement-runner:next",
+    });
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    expect(body.inputs.runner_image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
+  });
+
+  it("omits runner_image when not provided", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    await dispatchWorkflow("gh-token", mockMapping, mockInputs);
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    expect(body.inputs.runner_image).toBeUndefined();
+  });
+
   it("forwards provider and aws_region in inputs for bedrock mappings", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
     const bedrockMapping = makeMapping({ provider: "bedrock", awsRegion: "us-west-2" });
