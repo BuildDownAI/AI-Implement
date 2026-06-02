@@ -1599,6 +1599,7 @@ async function processReconciliations(config: AppConfig): Promise<void> {
         pr_number: String(job.prNumber),
         runner_phase: "gap-analysis",
         ...providerDispatchFields(mapping),
+        ...capDispatchFields(mapping),
         ...(runnerImage ? { runner_image: runnerImage } : {}),
       });
 
@@ -1693,6 +1694,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         pr_number: String(fix.prNumber),
         runner_phase: "gap-analysis",
         ...providerDispatchFields(mapping),
+        ...capDispatchFields(mapping),
         runner_callback_url: runnerCallbackUrl,
         run_token: runToken,
         run_progress_token: runProgressToken,
