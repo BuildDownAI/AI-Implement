@@ -134,6 +134,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     issueDescription,
     prNumber,
   });
+  // WORKFLOW.md (and therefore the hook paths, incl. teardown) is read once here
+  // from `workspaceDir`. This is the runner's single workspace for the whole run
+  // in every execution mode: GHA pre-clones into it, and on Fly/local the pipeline's
+  // `clone` step clones into this same path. So the teardown path captured now is
+  // still valid at `finally` time, even though clone runs later in the pipeline.
   const wfPath = join(workspaceDir, "WORKFLOW.md");
   if (existsSync(wfPath)) {
     const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {
@@ -153,13 +158,18 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
   const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
   const provider = process.env.PROVIDER || "anthropic";
-  const parseEnvInt = (raw: string | undefined): number | undefined => {
+  const parseEnvInt = (raw: string | undefined, name: string): number | undefined => {
     if (!raw) return undefined;
     const n = parseInt(raw, 10);
-    return Number.isInteger(n) && n > 0 ? n : undefined;
+    if (Number.isInteger(n) && n > 0) return n;
+    // The orchestrator validates caps before dispatch, so this only happens on a
+    // manual GHA dispatch with a bad value. Warn so "my cap isn't taking effect"
+    // is diagnosable rather than a silent fallback to the default.
+    console.warn(`[runner] Ignoring invalid ${name}="${raw}" (must be a positive integer); using default`);
+    return undefined;
   };
-  const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS);
-  const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS);
+  const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS, "AI_IMPLEMENT_MAX_TURNS");
+  const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS, "AI_IMPLEMENT_MAX_ITERATIONS");
 
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
