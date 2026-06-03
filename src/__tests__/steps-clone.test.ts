@@ -41,7 +41,6 @@ function makeContext(): DefaultPipelineContext {
     issueDescription: "Desc",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
   });
 }
 

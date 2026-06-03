@@ -60,7 +60,6 @@ function makeContext(overrides: Partial<PipelineContextData> = {}): DefaultPipel
     issueDescription: "Desc",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
     ...overrides,
   });
 }

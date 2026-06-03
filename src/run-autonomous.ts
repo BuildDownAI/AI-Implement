@@ -201,7 +201,6 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       issueDescription,
       nonce,
       orchestratorUrl: orchestratorUrl ?? "",
-      ticketingProvider: "linear",
       model,
       workspaceDir,
       planningContext,
