@@ -4,7 +4,7 @@
 #
 # Required secrets:
 #   AI_IMPLEMENT_APP_ID, AI_IMPLEMENT_PRIVATE_KEY
-#   ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, LINEAR_API_KEY
+#   ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN
 #
 # Optional repository variables (Bedrock-enabled repos only):
 #   AI_IMPLEMENT_PROVIDER    - Set to "bedrock" to route through AWS Bedrock.
@@ -231,7 +231,6 @@ jobs:
           AI_IMPLEMENT_MAX_ITERATIONS: ${{ needs.check-trigger.outputs.max_iterations }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
           # ISSUE_META is parsed from the PR body. The JavaScript parser only emits
           # lower_snake_case keys, jq allows only expected metadata keys here, and
