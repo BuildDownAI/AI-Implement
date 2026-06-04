@@ -228,6 +228,7 @@ jobs:
           AWS_REGION: ${{ inputs.aws_region }}
           AI_IMPLEMENT_MAX_TURNS: ${{ inputs.max_turns }}
           AI_IMPLEMENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
+          AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
