@@ -138,6 +138,30 @@ describe("reviewStep", () => {
     expect(outputs.tokensUsed).toBe(200);
   });
 
+  it("truncates an oversized diff so the prompt stays within the model context window", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+    // A regenerated-codegen diff can be hundreds of KB — far past the model's
+    // input limit. The review prompt must cap it rather than embed it verbatim.
+    const hugeDiff = "+".repeat(500_000);
+
+    await reviewStep.run(makeContext(executor), { diff: hugeDiff }, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt.length).toBeLessThan(hugeDiff.length);
+    expect(call.prompt).toContain("diff truncated");
+  });
+
+  it("does not truncate a normal-sized diff", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+    const smallDiff = "diff --git a/foo.ts\n+added line";
+
+    await reviewStep.run(makeContext(executor), { diff: smallDiff }, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt).toContain("added line");
+    expect(call.prompt).not.toContain("diff truncated");
+  });
+
   it("correctly extracts JSON when preamble contains stray braces", async () => {
     // Greedy regex would match from first '{' in preamble to last '}' → invalid JSON.
     // Balanced-brace scanner skips the empty preamble '{}' and finds the real object.

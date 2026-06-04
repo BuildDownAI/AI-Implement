@@ -59,6 +59,19 @@ function extractFirstJsonObject(text: string): object | null {
   return null;
 }
 
+/**
+ * Hard cap on diff characters embedded in the review prompt. A regenerated
+ * codegen diff can be hundreds of KB; without a cap the prompt exceeds the
+ * model's input limit and the whole invocation fails ("Prompt is too long").
+ * ~200k chars ≈ 50k tokens, leaving ample headroom in a 200k-token window.
+ */
+const MAX_REVIEW_DIFF_CHARS = 200_000;
+
+function capDiff(diff: string): string {
+  if (diff.length <= MAX_REVIEW_DIFF_CHARS) return diff;
+  return `${diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n\n... [diff truncated: showing first ${MAX_REVIEW_DIFF_CHARS} of ${diff.length} characters] ...`;
+}
+
 const REVIEW_PROMPT = (
   issueTitle: string | undefined,
   issueDescription: string | undefined,
@@ -69,7 +82,7 @@ const REVIEW_PROMPT = (
 
   if (issueTitle) prompt += `\n\nIssue: ${issueTitle}`;
   if (issueDescription) prompt += `\n\nDescription:\n${issueDescription}`;
-  if (diff) prompt += `\n\n## Implementation Diff\n\`\`\`diff\n${diff}\n\`\`\``;
+  if (diff) prompt += `\n\n## Implementation Diff\n\`\`\`diff\n${capDiff(diff)}\n\`\`\``;
 
   prompt += `\n\nRespond with a JSON object only:
 {
