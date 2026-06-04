@@ -62,9 +62,9 @@ function buildImplementPrompt(
 const REVIEW_DIFF_EXCLUDES = [
   ":(exclude,glob)**/__generated__/**",
   ":(exclude,glob)**/generated/**",
-  ":(exclude)pnpm-lock.yaml",
-  ":(exclude)package-lock.json",
-  ":(exclude)yarn.lock",
+  ":(exclude,glob)**/pnpm-lock.yaml",
+  ":(exclude,glob)**/package-lock.json",
+  ":(exclude,glob)**/yarn.lock",
 ];
 
 export function getDiff(workspaceDir: string): string {

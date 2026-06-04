@@ -25,10 +25,14 @@ describe("getDiff generated-file exclusion", () => {
     git(repo, ["config", "user.name", "t"]);
     mkdirSync(join(repo, "client/src/__generated__"), { recursive: true });
     mkdirSync(join(repo, "server/src/graphql/generated"), { recursive: true });
+    mkdirSync(join(repo, "packages/api"), { recursive: true });
     writeFileSync(join(repo, "schema.sql"), "CREATE TABLE accounts (id INT);\n");
     writeFileSync(join(repo, "client/src/__generated__/Big.graphql.ts"), "export const a = 1;\n");
     writeFileSync(join(repo, "server/src/graphql/generated/types.ts"), "export const b = 1;\n");
     writeFileSync(join(repo, "pnpm-lock.yaml"), "lockfileVersion: 9\n");
+    writeFileSync(join(repo, "package-lock.json"), '{"lockfileVersion": 3}\n');
+    writeFileSync(join(repo, "yarn.lock"), "# yarn lockfile v1\n");
+    writeFileSync(join(repo, "packages/api/pnpm-lock.yaml"), "lockfileVersion: 9\n");
     git(repo, ["add", "-A"]);
     git(repo, ["commit", "-qm", "seed"]);
   });
@@ -56,8 +60,18 @@ describe("getDiff generated-file exclusion", () => {
     expect(diff).not.toContain("generated/types.ts");
   });
 
-  it("excludes lockfiles", () => {
+  it("excludes lockfiles at the repo root", () => {
     writeFileSync(join(repo, "pnpm-lock.yaml"), "lockfileVersion: 9\n" + "dep\n".repeat(5000));
+    writeFileSync(join(repo, "package-lock.json"), '{"lockfileVersion": 3, "x": 1}\n');
+    writeFileSync(join(repo, "yarn.lock"), "# yarn lockfile v1\nfoo@1:\n");
+    const diff = getDiff(repo);
+    expect(diff).not.toContain("pnpm-lock.yaml");
+    expect(diff).not.toContain("package-lock.json");
+    expect(diff).not.toContain("yarn.lock");
+  });
+
+  it("excludes lockfiles nested in workspace packages (monorepo)", () => {
+    writeFileSync(join(repo, "packages/api/pnpm-lock.yaml"), "lockfileVersion: 9\n" + "dep\n".repeat(5000));
     const diff = getDiff(repo);
     expect(diff).not.toContain("pnpm-lock.yaml");
   });

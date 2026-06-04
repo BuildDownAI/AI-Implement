@@ -69,7 +69,9 @@ const MAX_REVIEW_DIFF_CHARS = 200_000;
 
 function capDiff(diff: string): string {
   if (diff.length <= MAX_REVIEW_DIFF_CHARS) return diff;
-  return `${diff.slice(0, MAX_REVIEW_DIFF_CHARS)}\n\n... [diff truncated: showing first ${MAX_REVIEW_DIFF_CHARS} of ${diff.length} characters] ...`;
+  const cut = diff.lastIndexOf("\n", MAX_REVIEW_DIFF_CHARS);
+  const boundary = cut > 0 ? cut : MAX_REVIEW_DIFF_CHARS;
+  return `${diff.slice(0, boundary)}\n\n... [diff truncated: showing first ${boundary} of ${diff.length} characters] ...`;
 }
 
 const REVIEW_PROMPT = (
