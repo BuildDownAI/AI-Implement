@@ -5,7 +5,7 @@ import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
-import type { LLMExecutor, PipelineDefinition, StepReporter } from "./pipeline/types.js";
+import type { LLMExecutor, LogLevel, PipelineDefinition, StepReporter } from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
 import { parseWorkflowMd } from "./workflow-md.js";
@@ -102,6 +102,10 @@ The AI-Implement pipeline will create the implementation commit, push an issue-s
 
 
 
+export function resolveLogLevel(raw: string | undefined): LogLevel {
+  return raw === "stream" ? "stream" : "summary";
+}
+
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
   const issueId = requireEnv("ISSUE_ID");
@@ -172,7 +176,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS, "AI_IMPLEMENT_MAX_TURNS");
   const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS, "AI_IMPLEMENT_MAX_ITERATIONS");
 
-  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
+  const logLevel = resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL);
+  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
   const callbackUrl = process.env.RUNNER_CALLBACK_URL;
