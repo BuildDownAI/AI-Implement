@@ -54,6 +54,12 @@ describe("finalText", () => {
   it("returns empty string for an empty event list", () => {
     expect(finalText([])).toBe("");
   });
+  it("preserves an embedded JSON object in the result text (review/fix consumers depend on this)", () => {
+    const text = 'Here is my review.\n{"approved":true,"score":95}';
+    const events: StreamEvent[] = [{ type: "result", subtype: "success", result: text }];
+    expect(finalText(events)).toBe(text);
+    expect(finalText(events)).toContain('{"approved":true,"score":95}');
+  });
 });
 
 describe("extractTelemetry", () => {
