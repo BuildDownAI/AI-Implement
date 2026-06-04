@@ -103,8 +103,23 @@ describe("formatEvent", () => {
   it("truncates long tool input", () => {
     const long = "x".repeat(500);
     const out = formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Edit", input: { command: long } }] } });
-    expect(out!.length).toBeLessThan(220);
+    expect(out!.length).toBeLessThanOrEqual(180);
     expect(out!.endsWith("…")).toBe(true);
+  });
+  it("uses file_path for tools like Read", () => {
+    expect(
+      formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "src/app.ts" } }] } }),
+    ).toBe("[claude] tool Read src/app.ts");
+  });
+  it("renders a tool with no input without a trailing space", () => {
+    expect(
+      formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "ListMcp", input: {} }] } }),
+    ).toBe("[claude] tool ListMcp {}");
+  });
+  it("renders a tool with null input without a trailing space", () => {
+    expect(
+      formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash" }] } }),
+    ).toBe("[claude] tool Bash");
   });
   it("returns null for a result event (summary handles it)", () => {
     expect(formatEvent({ type: "result", subtype: "success" })).toBeNull();
@@ -127,6 +142,6 @@ describe("summaryLine", () => {
   });
   it("shows max_turns outcome at summary level", () => {
     expect(summaryLine({ outcome: "max_turns", numTurns: 50, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null }))
-      .toContain("result=max_turns");
+      .toBe("[claude] result=max_turns turns=50");
   });
 });

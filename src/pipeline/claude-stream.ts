@@ -72,6 +72,14 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : `${s.slice(0, max)}…`;
 }
 
+function safeStringify(obj: Record<string, unknown>): string {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return "[unserializable]";
+  }
+}
+
 function summarizeToolInput(input: unknown): string {
   if (input == null) return "";
   if (typeof input === "object") {
@@ -81,7 +89,7 @@ function summarizeToolInput(input: unknown): string {
       (typeof obj.file_path === "string" && obj.file_path) ||
       (typeof obj.path === "string" && obj.path) ||
       (typeof obj.pattern === "string" && obj.pattern) ||
-      JSON.stringify(obj);
+      safeStringify(obj);
     return truncate(String(candidate), TOOL_INPUT_MAX);
   }
   return truncate(String(input), TOOL_INPUT_MAX);
@@ -132,6 +140,7 @@ export function summaryLine(t: RunTelemetry): string {
   const parts = [`[claude] result=${t.outcome}`];
   if (t.numTurns != null) parts.push(`turns=${t.numTurns}`);
   if (t.durationMs != null) parts.push(`duration=${humanizeMs(t.durationMs)}`);
+  // Omit cost when absent or zero (Bedrock typically reports no cost).
   if (t.costUsd != null && t.costUsd > 0) parts.push(`cost=$${t.costUsd.toFixed(2)}`);
   if (t.tokensIn != null || t.tokensOut != null) {
     parts.push(`tokens=${kfmt(t.tokensIn)}/${kfmt(t.tokensOut)} (in/out)`);
