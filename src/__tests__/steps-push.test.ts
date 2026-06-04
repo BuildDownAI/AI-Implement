@@ -18,7 +18,6 @@ function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineCo
     issueDescription: "Desc",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
     ...overrides,
   });
 }

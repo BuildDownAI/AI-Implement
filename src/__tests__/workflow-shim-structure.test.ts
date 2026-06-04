@@ -127,6 +127,13 @@ describe("GHA workflow shims", () => {
       expect(yaml).not.toMatch(/curl.*claude\.ai\/install/);
     });
 
+    it(`${f} is ticketing-agnostic — no Linear references`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/LINEAR_API_KEY/);
+      expect(yaml).not.toMatch(/api\.linear\.app/);
+      expect(yaml).not.toMatch(/Linear issue/);
+    });
+
     it(`${f} has at most one configure-aws-credentials step`, () => {
       const yaml = readFileSync(f, "utf-8");
       const awsCount = (yaml.match(/configure-aws-credentials/g) ?? []).length;

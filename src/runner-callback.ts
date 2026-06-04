@@ -38,6 +38,12 @@ export interface HandleRunnerProgressInput {
   secret: string;
 }
 
+export interface HandleRunnerPlanningContextInput {
+  authorization: string | undefined;
+  secret: string;
+  resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
+}
+
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
 }
@@ -231,4 +237,41 @@ export async function handleRunnerProgress(
 
   upsertStepRecord(job.id, stepOrError);
   return { status: 200, body: { acknowledged: true } };
+}
+
+/**
+ * Serves the planning context for a run to the runner, provider-agnostically.
+ * The runner authenticates with its reusable progress token (it never holds a
+ * ticketing-system API key), and the orchestrator resolves the right provider
+ * from the token's mapping. Planning context is best-effort: a missing mapping
+ * or a provider error returns 200 with an empty string rather than failing the
+ * implementation run.
+ */
+export async function handleRunnerPlanningContext(
+  input: HandleRunnerPlanningContextInput,
+): Promise<HandleRunnerResultOutput> {
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
+
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
+  if (!verified.ok) return bad(401, verified.reason);
+
+  const provider = await input.resolveProvider(verified.mappingTeamKey);
+  if (!provider) {
+    console.warn(
+      `[runner-planning-context] mapping deleted between mint and fetch: ${verified.mappingTeamKey}`,
+    );
+    return { status: 200, body: { planningContext: "" } };
+  }
+
+  try {
+    const planningContext = await provider.fetchPlanningContext(verified.claims.issueId);
+    return { status: 200, body: { planningContext } };
+  } catch (err) {
+    console.error(
+      `[runner-planning-context] fetchPlanningContext failed for issueId=${verified.claims.issueId}:`,
+      err,
+    );
+    return { status: 200, body: { planningContext: "" } };
+  }
 }

@@ -67,6 +67,49 @@ describe("LinearProvider.postComment", () => {
   });
 });
 
+describe("LinearProvider.fetchPlanningContext", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("returns the issue's planning comments, authenticated with the provider's api key", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            comments: {
+              nodes: [
+                { body: "## 🏗️ AI Planning: Architecture Analysis\nUse the widget pattern.", createdAt: "2026-01-01T00:00:00Z" },
+                { body: "just a regular human comment", createdAt: "2026-01-02T00:00:00Z" },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    } as Response);
+
+    const p = new LinearProvider({ linearApiKey: "test-key" });
+    const ctx = await p.fetchPlanningContext("issue-uuid-1");
+
+    expect(ctx).toContain("Use the widget pattern.");
+    expect(ctx).not.toContain("just a regular human comment");
+    expect(fetch).toHaveBeenCalledWith(
+      "https://api.linear.app/graphql",
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "test-key" }),
+      }),
+    );
+  });
+
+  it("returns empty string (never throws) when Linear is unreachable", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500 } as Response);
+
+    const p = new LinearProvider({ linearApiKey: "test-key" });
+    await expect(p.fetchPlanningContext("issue-uuid-1")).resolves.toBe("");
+  });
+});
+
 describe("LinearProvider.fetchLifecycleStates", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });

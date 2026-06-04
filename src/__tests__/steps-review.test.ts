@@ -20,7 +20,6 @@ function makeContext(executor?: LLMExecutor): DefaultPipelineContext {
       issueDescription: "Description",
       nonce: "nonce",
       orchestratorUrl: "http://localhost:8080",
-      ticketingProvider: "linear",
     },
     executor,
   );

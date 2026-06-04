@@ -11,7 +11,7 @@ import type { LLMExecutor } from "../pipeline/types.js";
 const noopExec: LLMExecutor = { async invoke() { return { stdout: "", exitCode: 0, tokensUsed: 0 }; } };
 function ctx() {
   return new DefaultPipelineContext(
-    { jobId: 1, issueId: "i", issueIdentifier: "ENG-1", issueTitle: "T", issueDescription: "D", nonce: "n", orchestratorUrl: "", ticketingProvider: "linear" },
+    { jobId: 1, issueId: "i", issueIdentifier: "ENG-1", issueTitle: "T", issueDescription: "D", nonce: "n", orchestratorUrl: "" },
     noopExec,
   );
 }

@@ -264,6 +264,12 @@ export class JiraProvider implements TicketingProvider {
     await this.client.addComment(issueId, adfParagraph(body));
   }
 
+  async fetchPlanningContext(_issueId: string): Promise<string> {
+    // Jira planning-context extraction is not implemented yet; the
+    // implementation run proceeds without it (best-effort context).
+    return "";
+  }
+
   issueUrl(issue: TicketIssue): string {
     return `${this.siteUrl}/browse/${issue.identifier}`;
   }
