@@ -100,6 +100,7 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `DEDUP_DB_PATH` | No | SQLite path (default `/data/dedup.sqlite`) |
 | `POLL_INTERVAL_MS` | No | Poll interval ms (default `60000`) |
 | `PORT` | No | HTTP port (default `8080`) |
+| `AI_IMPLEMENT_LOG_LEVEL` | No | Runner log verbosity: `summary` (default) or `stream`. `stream` tees per-turn tool activity to the log. Telemetry (turns/cost/tokens/outcome) is captured at both levels. |
 
 ## Adding a new target repo
 
@@ -158,6 +159,14 @@ Each project's mapping carries three optional caps, editable in the `/admin` Pro
 `maxTurns`/`maxIterations` reach the runner as `workflow_dispatch` inputs (GHA) or runner env (Fly/local); `maxJobMinutes` is a GHA-only `job_timeout_minutes` dispatch input. The orchestrator only **sends** a cap input when it is set on the mapping, so a project's target repo must have **re-synced `claude-implement.yml`** before you set caps — otherwise GitHub rejects the dispatch with "unexpected inputs". Caps also apply to gap-fill and review-feedback re-dispatches, not just the initial run.
 
 `/ai-implement` comment-triggered gap-fill runs bypass the orchestrator, so they read caps from target-repo **variables** instead (mirroring `AI_IMPLEMENT_PROVIDER`): set `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, and `AI_IMPLEMENT_MAX_JOB_MINUTES` (Settings → Secrets and variables → Actions → Variables) to cap those runs too.
+
+### Runner log verbosity
+
+`AI_IMPLEMENT_LOG_LEVEL` controls how much the runner logs during an implement pass:
+- `summary` (default): logs a single result line per Claude invocation — outcome (incl. `max_turns`), turns, duration, cost (when reported), tokens.
+- `stream`: additionally tees each per-turn tool call (name + truncated input; not tool output) to the log.
+
+Set it as a repository or organization **variable** (Settings → Secrets and variables → Actions → Variables), mirroring `AI_IMPLEMENT_PROVIDER`. It is read inside the runner container, so it applies to both orchestrator-initiated and `/ai-implement` comment-triggered runs **after the target repo has re-synced `claude-implement.yml`**. It is not a per-project admin field and not a dispatch input.
 
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
