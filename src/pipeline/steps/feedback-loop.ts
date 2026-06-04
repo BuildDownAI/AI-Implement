@@ -76,7 +76,15 @@ export function getDiff(workspaceDir: string): string {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
-  if (result.status !== 0) return "";
+  if (result.status !== 0) {
+    // A non-zero exit means the reviewer sees an empty diff and may spuriously
+    // approve. Behaviour is unchanged (still return ""), but surface it so the
+    // failure is observable in the runner logs rather than silent.
+    console.warn(
+      `[getDiff] git diff failed (exit ${result.status ?? "null"}): ${result.stderr?.toString().trim() ?? ""}`,
+    );
+    return "";
+  }
   return result.stdout.toString();
 }
 

@@ -76,6 +76,15 @@ describe("getDiff generated-file exclusion", () => {
     expect(diff).not.toContain("pnpm-lock.yaml");
   });
 
+  it("returns an empty string when git diff fails (non-git directory)", () => {
+    const notARepo = mkdtempSync(join(tmpdir(), "diff-nogit-"));
+    try {
+      expect(getDiff(notARepo)).toBe("");
+    } finally {
+      rmSync(notARepo, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a real source change while dropping a regenerated file in the same diff", () => {
     writeFileSync(join(repo, "schema.sql"), "CREATE TABLE accounts (id INT, timezone VARCHAR(64));\n");
     writeFileSync(join(repo, "server/src/graphql/generated/types.ts"), "z".repeat(50_000) + "\n");

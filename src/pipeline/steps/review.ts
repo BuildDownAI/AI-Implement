@@ -70,6 +70,9 @@ const MAX_REVIEW_DIFF_CHARS = 200_000;
 function capDiff(diff: string): string {
   if (diff.length <= MAX_REVIEW_DIFF_CHARS) return diff;
   const cut = diff.lastIndexOf("\n", MAX_REVIEW_DIFF_CHARS);
+  // `> 0` (not `!== -1`) on purpose: fall back to the hard cap both when no
+  // newline precedes the boundary (-1) and in the degenerate case where the
+  // only one is at index 0, which would otherwise slice to an empty diff.
   const boundary = cut > 0 ? cut : MAX_REVIEW_DIFF_CHARS;
   return `${diff.slice(0, boundary)}\n\n... [diff truncated: showing first ${boundary} of ${diff.length} characters] ...`;
 }
