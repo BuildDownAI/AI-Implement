@@ -10,7 +10,9 @@ export function parseLine(line: string): StreamEvent | null {
   const trimmed = line.trim();
   if (!trimmed) return null;
   try {
-    return JSON.parse(trimmed) as StreamEvent;
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as StreamEvent;
   } catch {
     return null;
   }

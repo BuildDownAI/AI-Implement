@@ -35,6 +35,11 @@ describe("parseLine", () => {
   it("returns null for a blank line", () => {
     expect(parseLine("   ")).toBeNull();
   });
+  it("returns null for valid JSON that is not an object", () => {
+    expect(parseLine('"just a string"')).toBeNull();
+    expect(parseLine("42")).toBeNull();
+    expect(parseLine("[1,2,3]")).toBeNull();
+  });
 });
 
 describe("finalText", () => {
@@ -43,6 +48,9 @@ describe("finalText", () => {
   });
   it("falls back to concatenated assistant text when no result event", () => {
     expect(finalText([initEvent, textEvent])).toBe("All done.");
+  });
+  it("returns empty string for an empty event list", () => {
+    expect(finalText([])).toBe("");
   });
 });
 
