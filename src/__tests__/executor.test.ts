@@ -37,8 +37,21 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function installFakeClaudeNoTrailingNewline(stdoutLines: string[], code = 0): void {
+  // printf '%b' interprets \n as a real newline; no trailing \n — exercises the close-handler flush.
+  const joined = stdoutLines.join("\\n");
+  const script = `#!/usr/bin/env bash
+printf '%b' "${joined.replace(/"/g, '\\"')}"
+exit ${code}
+`;
+  const path = join(binDir, "claude");
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
 describe("ClaudeCliExecutor", () => {
   it("returns the result event's text as stdout (compat) plus telemetry", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
     installFakeClaude(SUCCESS_LINES, 0);
     const exec = new ClaudeCliExecutor("/tmp", "summary");
     const result = await exec.invoke({ prompt: "do it", model: "claude-x" });
@@ -71,10 +84,20 @@ describe("ClaudeCliExecutor", () => {
   });
 
   it("propagates a non-zero exit code and degrades telemetry to unknown", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
     installFakeClaude(["not even json"], 1);
     const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
     expect(result.exitCode).toBe(1);
     expect(result.telemetry?.outcome).toBe("unknown");
     expect(result.stdout).toBe("");
+  });
+
+  it("parses a final line that has no trailing newline", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installFakeClaudeNoTrailingNewline(SUCCESS_LINES, 0);
+    const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    expect(result.stdout).toBe("Done implementing.");
+    expect(result.telemetry?.outcome).toBe("success");
+    expect(result.telemetry?.numTurns).toBe(4);
   });
 });

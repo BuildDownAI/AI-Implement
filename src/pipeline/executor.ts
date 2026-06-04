@@ -51,6 +51,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
       const events: StreamEvent[] = [];
       const stderrChunks: Buffer[] = [];
       let buf = "";
+      let settled = false;
 
       const handleLine = (line: string) => {
         const event = parseLine(line);
@@ -73,6 +74,8 @@ export class ClaudeCliExecutor implements LLMExecutor {
       proc.stderr.on("data", (d: Buffer) => stderrChunks.push(d));
 
       proc.on("close", (code) => {
+        if (settled) return;
+        settled = true;
         if (buf.trim()) handleLine(buf); // flush trailing partial line
         const telemetry = extractTelemetry(events);
         console.log(summaryLine(telemetry));
@@ -85,7 +88,10 @@ export class ClaudeCliExecutor implements LLMExecutor {
         });
       });
 
-      proc.on("error", reject);
+      proc.on("error", (err) => {
+        settled = true;
+        reject(err);
+      });
     });
   }
 }
