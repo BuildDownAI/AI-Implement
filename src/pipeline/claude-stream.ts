@@ -65,3 +65,76 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
     tokensOut: num(usage.output_tokens),
   };
 }
+
+const TOOL_INPUT_MAX = 160;
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : `${s.slice(0, max)}…`;
+}
+
+function summarizeToolInput(input: unknown): string {
+  if (input == null) return "";
+  if (typeof input === "object") {
+    const obj = input as Record<string, unknown>;
+    const candidate =
+      (typeof obj.command === "string" && obj.command) ||
+      (typeof obj.file_path === "string" && obj.file_path) ||
+      (typeof obj.path === "string" && obj.path) ||
+      (typeof obj.pattern === "string" && obj.pattern) ||
+      JSON.stringify(obj);
+    return truncate(String(candidate), TOOL_INPUT_MAX);
+  }
+  return truncate(String(input), TOOL_INPUT_MAX);
+}
+
+export function formatEvent(event: StreamEvent): string | null {
+  switch (event.type) {
+    case "system":
+      if (event.subtype === "init") {
+        const model = typeof event.model === "string" ? event.model : "?";
+        const cwd = typeof event.cwd === "string" ? event.cwd : "?";
+        return `[claude] init model=${model} cwd=${cwd}`;
+      }
+      return null;
+    case "assistant": {
+      const msg = event.message as { content?: Array<Record<string, unknown>> } | undefined;
+      const lines: string[] = [];
+      for (const block of msg?.content ?? []) {
+        if (block.type === "tool_use") {
+          const name = typeof block.name === "string" ? block.name : "tool";
+          lines.push(`[claude] tool ${name} ${summarizeToolInput(block.input)}`.trimEnd());
+        } else if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+          lines.push(`[claude] assistant: ${truncate(block.text.trim(), TOOL_INPUT_MAX)}`);
+        }
+      }
+      return lines.length ? lines.join("\n") : null;
+    }
+    case "user":
+      return "[claude] tool_result";
+    default:
+      return null;
+  }
+}
+
+function humanizeMs(ms: number): string {
+  const s = Math.round(ms / 1000);
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return m > 0 ? `${m}m${rem.toString().padStart(2, "0")}s` : `${rem}s`;
+}
+
+function kfmt(n: number | null): string {
+  if (n == null) return "?";
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+export function summaryLine(t: RunTelemetry): string {
+  const parts = [`[claude] result=${t.outcome}`];
+  if (t.numTurns != null) parts.push(`turns=${t.numTurns}`);
+  if (t.durationMs != null) parts.push(`duration=${humanizeMs(t.durationMs)}`);
+  if (t.costUsd != null && t.costUsd > 0) parts.push(`cost=$${t.costUsd.toFixed(2)}`);
+  if (t.tokensIn != null || t.tokensOut != null) {
+    parts.push(`tokens=${kfmt(t.tokensIn)}/${kfmt(t.tokensOut)} (in/out)`);
+  }
+  return parts.join(" ");
+}

@@ -3,6 +3,8 @@ import {
   parseLine,
   finalText,
   extractTelemetry,
+  formatEvent,
+  summaryLine,
   type StreamEvent,
 } from "../pipeline/claude-stream.js";
 
@@ -85,5 +87,46 @@ describe("extractTelemetry", () => {
     const t = extractTelemetry([{ type: "result", subtype: "success", num_turns: 3, usage: { input_tokens: 10, output_tokens: 2 } }]);
     expect(t.costUsd).toBeNull();
     expect(t.outcome).toBe("success");
+  });
+});
+
+describe("formatEvent", () => {
+  it("formats an init event", () => {
+    expect(formatEvent({ type: "system", subtype: "init", model: "claude-x", cwd: "/workspace" }))
+      .toBe("[claude] init model=claude-x cwd=/workspace");
+  });
+  it("formats a tool_use as tool name + command", () => {
+    expect(
+      formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pnpm check" } }] } }),
+    ).toBe("[claude] tool Bash pnpm check");
+  });
+  it("truncates long tool input", () => {
+    const long = "x".repeat(500);
+    const out = formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Edit", input: { command: long } }] } });
+    expect(out!.length).toBeLessThan(220);
+    expect(out!.endsWith("…")).toBe(true);
+  });
+  it("returns null for a result event (summary handles it)", () => {
+    expect(formatEvent({ type: "result", subtype: "success" })).toBeNull();
+  });
+  it("returns null for an unknown event type", () => {
+    expect(formatEvent({ type: "whatever" })).toBeNull();
+  });
+});
+
+describe("summaryLine", () => {
+  it("renders a full success summary", () => {
+    expect(
+      summaryLine({ outcome: "success", numTurns: 12, durationMs: 372000, costUsd: 0.83, tokensIn: 182000, tokensOut: 4100 }),
+    ).toBe("[claude] result=success turns=12 duration=6m12s cost=$0.83 tokens=182.0k/4.1k (in/out)");
+  });
+  it("omits cost when null", () => {
+    const line = summaryLine({ outcome: "success", numTurns: 3, durationMs: 5000, costUsd: null, tokensIn: 10, tokensOut: 2 });
+    expect(line).not.toContain("cost=");
+    expect(line).toContain("result=success");
+  });
+  it("shows max_turns outcome at summary level", () => {
+    expect(summaryLine({ outcome: "max_turns", numTurns: 50, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null }))
+      .toContain("result=max_turns");
   });
 });
