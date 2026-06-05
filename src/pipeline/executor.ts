@@ -52,13 +52,18 @@ export class ClaudeCliExecutor implements LLMExecutor {
         env: { ...process.env },
       });
 
-      proc.stdin.on("error", reject);
-      proc.stdin.end(params.prompt);
-
       const events: StreamEvent[] = [];
       const stderrChunks: Buffer[] = [];
       let buf = "";
       let settled = false;
+
+      proc.stdin.on("error", (err) => {
+        // EPIPE here means the child exited before consuming the prompt. Mark
+        // settled so the close handler doesn't log a phantom success summary.
+        settled = true;
+        reject(err);
+      });
+      proc.stdin.end(params.prompt);
 
       const handleLine = (line: string) => {
         const event = parseLine(line);
@@ -84,11 +89,15 @@ export class ClaudeCliExecutor implements LLMExecutor {
         if (settled) return;
         settled = true;
         if (buf.trim()) handleLine(buf); // flush trailing partial line
+        const stderr = Buffer.concat(stderrChunks).toString();
+        // Surface CLI stderr (auth failures, bad model IDs, rate limits) — it is
+        // otherwise invisible in GHA logs at any log level.
+        if (stderr.trim()) console.error("[claude] stderr:", stderr.trim());
         const telemetry = extractTelemetry(events);
         console.log(summaryLine(telemetry));
         resolve({
           stdout: finalText(events),
-          stderr: Buffer.concat(stderrChunks).toString(),
+          stderr,
           exitCode: code ?? 1,
           tokensUsed: (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0),
           telemetry,

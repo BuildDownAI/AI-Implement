@@ -19,6 +19,18 @@ exit ${code}
   chmodSync(path, 0o755);
 }
 
+// A fake `claude` that writes a message to stderr (e.g. an auth/model error)
+// and exits non-zero, with no JSONL on stdout.
+function installFakeClaudeStderr(message: string, code = 1): void {
+  const script = `#!/usr/bin/env bash
+printf '%s\\n' '${message.replace(/'/g, `'\\''`)}' >&2
+exit ${code}
+`;
+  const path = join(binDir, "claude");
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
 // A fake `claude` that records the argv it was invoked with and whatever arrived
 // on stdin, then emits a single valid result line so the stream executor settles
 // cleanly. This exercises the actual spawn + stdio plumbing — the only thing that
@@ -128,6 +140,18 @@ describe("ClaudeCliExecutor", () => {
     expect(result.stdout).toBe("Done implementing.");
     expect(result.telemetry?.outcome).toBe("success");
     expect(result.telemetry?.numTurns).toBe(4);
+  });
+
+  it("surfaces non-empty CLI stderr via console.error and returns it", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    installFakeClaudeStderr("Authentication failed: invalid API key", 1);
+    const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("Authentication failed");
+    const errLines = err.mock.calls.map((c) => c.join(" "));
+    expect(errLines.some((l) => l.includes("[claude] stderr:") && l.includes("Authentication failed"))).toBe(true);
   });
 
   it("delivers the prompt over stdin, never as a command-line argument", async () => {
