@@ -127,6 +127,16 @@ describe("formatEvent", () => {
       formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash" }] } }),
     ).toBe("[claude] tool Bash");
   });
+  it("renders a user event carrying a tool_result as tool_result", () => {
+    expect(
+      formatEvent({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } }),
+    ).toBe("[claude] tool_result");
+  });
+  it("returns null for the initial user prompt turn (no tool_result)", () => {
+    expect(
+      formatEvent({ type: "user", message: { content: [{ type: "text", text: "implement the thing" }] } }),
+    ).toBeNull();
+  });
   it("returns null for a result event (summary handles it)", () => {
     expect(formatEvent({ type: "result", subtype: "success" })).toBeNull();
   });

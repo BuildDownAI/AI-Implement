@@ -62,10 +62,15 @@ afterEach(() => {
 });
 
 function installFakeClaudeNoTrailingNewline(stdoutLines: string[], code = 0): void {
-  // printf '%b' interprets \n as a real newline; no trailing \n — exercises the close-handler flush.
-  const joined = stdoutLines.join("\\n");
+  // Emit every line but the last via a quoted heredoc, then the final line with
+  // `printf '%s'` so there is NO trailing newline — exercises the close-handler
+  // flush. Quoted heredoc + single-quoted printf arg means `$`/backtick in JSON
+  // values are never interpreted by the shell.
+  const lines = [...stdoutLines];
+  const last = (lines.pop() ?? "").replace(/'/g, `'\\''`);
+  const head = lines.length ? `cat <<'JSONL'\n${lines.join("\n")}\nJSONL\n` : "";
   const script = `#!/usr/bin/env bash
-printf '%b' "${joined.replace(/"/g, '\\"')}"
+${head}printf '%s' '${last}'
 exit ${code}
 `;
   const path = join(binDir, "claude");

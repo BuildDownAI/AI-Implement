@@ -117,8 +117,16 @@ export function formatEvent(event: StreamEvent): string | null {
       }
       return lines.length ? lines.join("\n") : null;
     }
-    case "user":
-      return "[claude] tool_result";
+    case "user": {
+      // A `user` event is either a tool_result echo or the initial prompt turn.
+      // Only the former should surface as tool_result; the initial prompt (plain
+      // text, no tool_use_id) would otherwise print a misleading first line.
+      const msg = event.message as { content?: Array<Record<string, unknown>> } | undefined;
+      const hasToolResult = (msg?.content ?? []).some(
+        (block) => block.type === "tool_result" || typeof block.tool_use_id === "string",
+      );
+      return hasToolResult ? "[claude] tool_result" : null;
+    }
     default:
       return null;
   }
