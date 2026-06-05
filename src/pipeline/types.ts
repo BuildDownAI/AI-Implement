@@ -82,11 +82,23 @@ export interface StepModule<
   run(context: PipelineContext, inputs: I, reporter: StepReporter): Promise<O>;
 }
 
+export type LogLevel = "summary" | "stream";
+
+export interface RunTelemetry {
+  outcome: "success" | "max_turns" | "error" | "unknown";
+  numTurns: number | null;
+  durationMs: number | null;
+  costUsd: number | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+}
+
 export interface LLMResult {
   stdout: string;
   stderr?: string;
   exitCode: number;
   tokensUsed: number;
+  telemetry?: RunTelemetry;
 }
 
 export interface LLMExecutor {

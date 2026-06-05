@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runAutonomous } from "../run-autonomous.js";
+import { runAutonomous, resolveLogLevel } from "../run-autonomous.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
@@ -796,5 +796,17 @@ describe("runAutonomous", () => {
 
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+});
+
+describe("resolveLogLevel", () => {
+  it("returns stream when set to stream", () => {
+    expect(resolveLogLevel("stream")).toBe("stream");
+  });
+  it("defaults to summary when unset", () => {
+    expect(resolveLogLevel(undefined)).toBe("summary");
+  });
+  it("defaults to summary for an unrecognized value", () => {
+    expect(resolveLogLevel("loud")).toBe("summary");
   });
 });

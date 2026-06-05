@@ -1,13 +1,26 @@
 import { spawn } from "node:child_process";
-import type { LLMExecutor, LLMResult } from "./types.js";
+import type { LLMExecutor, LLMResult, LogLevel } from "./types.js";
+import {
+  parseLine,
+  formatEvent,
+  finalText,
+  extractTelemetry,
+  summaryLine,
+  type StreamEvent,
+} from "./claude-stream.js";
 
 /**
- * Shells out to the Claude Code CLI installed in the session image.
- * Used on Fly Machines where the CLI is present in the runner image.
- * Other runtimes (GitHub Actions, direct API) inject a different executor.
+ * Shells out to the Claude Code CLI in stream-json mode. Each JSONL event is
+ * parsed for live logging (when logLevel="stream") and accumulated for final
+ * telemetry. The CLI's final `result` text is returned as `stdout` so existing
+ * consumers (e.g. review-step JSON extraction) are unaffected by the format
+ * change. A one-line summary is always logged.
  */
 export class ClaudeCliExecutor implements LLMExecutor {
-  constructor(private readonly workspaceDir: string) {}
+  constructor(
+    private readonly workspaceDir: string,
+    private readonly logLevel: LogLevel = "summary",
+  ) {}
 
   invoke(params: {
     prompt: string;
@@ -16,7 +29,12 @@ export class ClaudeCliExecutor implements LLMExecutor {
     tools?: string[];
   }): Promise<LLMResult> {
     return new Promise((resolve, reject) => {
-      const args: string[] = ["--dangerously-skip-permissions"];
+      const args: string[] = [
+        "--dangerously-skip-permissions",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+      ];
       if (params.model) args.push("--model", params.model);
       if (params.maxTurns != null) args.push("--max-turns", String(params.maxTurns));
       if (params.tools && params.tools.length > 0) {
@@ -34,26 +52,62 @@ export class ClaudeCliExecutor implements LLMExecutor {
         env: { ...process.env },
       });
 
-      proc.stdin.on("error", reject);
+      const events: StreamEvent[] = [];
+      const stderrChunks: Buffer[] = [];
+      let buf = "";
+      let settled = false;
+
+      proc.stdin.on("error", (err) => {
+        // EPIPE here means the child exited before consuming the prompt. Mark
+        // settled so the close handler doesn't log a phantom success summary.
+        settled = true;
+        reject(err);
+      });
       proc.stdin.end(params.prompt);
 
-      const chunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
-      proc.stdout.on("data", (d: Buffer) => chunks.push(d));
+      const handleLine = (line: string) => {
+        const event = parseLine(line);
+        if (!event) return;
+        events.push(event);
+        if (this.logLevel === "stream") {
+          const formatted = formatEvent(event);
+          if (formatted) console.log(formatted);
+        }
+      };
+
+      proc.stdout.on("data", (d: Buffer) => {
+        buf += d.toString();
+        let idx: number;
+        while ((idx = buf.indexOf("\n")) !== -1) {
+          handleLine(buf.slice(0, idx));
+          buf = buf.slice(idx + 1);
+        }
+      });
       proc.stderr.on("data", (d: Buffer) => stderrChunks.push(d));
 
       proc.on("close", (code) => {
-        // tokensUsed is not available from Claude CLI stdout; budget enforcement
-        // should rely on the orchestrator's own token tracking.
+        if (settled) return;
+        settled = true;
+        if (buf.trim()) handleLine(buf); // flush trailing partial line
+        const stderr = Buffer.concat(stderrChunks).toString();
+        // Surface CLI stderr (auth failures, bad model IDs, rate limits) — it is
+        // otherwise invisible in GHA logs at any log level.
+        if (stderr.trim()) console.error("[claude] stderr:", stderr.trim());
+        const telemetry = extractTelemetry(events);
+        console.log(summaryLine(telemetry));
         resolve({
-          stdout: Buffer.concat(chunks).toString(),
-          stderr: Buffer.concat(stderrChunks).toString(),
+          stdout: finalText(events),
+          stderr,
           exitCode: code ?? 1,
-          tokensUsed: 0,
+          tokensUsed: (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0),
+          telemetry,
         });
       });
 
-      proc.on("error", reject);
+      proc.on("error", (err) => {
+        settled = true;
+        reject(err);
+      });
     });
   }
 }
