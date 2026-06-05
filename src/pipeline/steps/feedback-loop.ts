@@ -52,12 +52,39 @@ function buildImplementPrompt(
   return basePrompt;
 }
 
-function getDiff(workspaceDir: string): string {
-  const result = spawnSync("git", ["diff", "HEAD"], {
-    cwd: workspaceDir,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.status !== 0) return "";
+/**
+ * Pathspecs excluded from the review diff. Generated artifacts (relay
+ * `__generated__`, codegen `generated/` dirs) and lockfiles can each be
+ * hundreds of KB after a `db:sync` / codegen run, blowing the reviewer's
+ * prompt past the model context window. They are committed by the push step
+ * regardless — this only controls what the reviewer is shown.
+ */
+const REVIEW_DIFF_EXCLUDES = [
+  ":(exclude,glob)**/__generated__/**",
+  ":(exclude,glob)**/generated/**",
+  ":(exclude,glob)**/pnpm-lock.yaml",
+  ":(exclude,glob)**/package-lock.json",
+  ":(exclude,glob)**/yarn.lock",
+];
+
+export function getDiff(workspaceDir: string): string {
+  const result = spawnSync(
+    "git",
+    ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
+    {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.status !== 0) {
+    // A non-zero exit means the reviewer sees an empty diff and may spuriously
+    // approve. Behaviour is unchanged (still return ""), but surface it so the
+    // failure is observable in the runner logs rather than silent.
+    console.warn(
+      `[getDiff] git diff failed (exit ${result.status ?? "null"}): ${result.stderr?.toString().trim() ?? ""}`,
+    );
+    return "";
+  }
   return result.stdout.toString();
 }
 
@@ -196,11 +223,21 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         approved = reviewOutputs.approved;
         feedback = reviewOutputs.feedback;
       } catch (err) {
+        // A review failure (e.g. "Prompt is too long", a transient API error)
+        // is NOT actionable feedback and must not discard a successful
+        // implementation. Record the failure, stop the loop, and let the
+        // pipeline push the working tree — retrying implementation would only
+        // burn another pass producing the same un-reviewable diff.
         reviewSubStep.status = "failed";
         reviewSubStep.ended_at = new Date().toISOString();
         reviewSubStep.outputs = { error: String(err) };
         await reporter.report(reviewSubStep);
-        throw err;
+        console.warn(
+          `[feedback-loop] Review step failed on iteration ${iteration}; skipping review and proceeding to push: ${String(err)}`,
+        );
+        approved = false;
+        feedback = `Review step failed and was skipped: ${String(err)}`;
+        break;
       }
     }
 

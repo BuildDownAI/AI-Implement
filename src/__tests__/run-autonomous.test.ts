@@ -348,16 +348,13 @@ describe("runAutonomous", () => {
     expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-sonnet-4-6");
   });
 
-  it("fetches planning context when LINEAR_API_KEY is set", async () => {
-    vi.stubEnv("LINEAR_API_KEY", "lin_api_test");
+  it("fetches planning context from the orchestrator using the progress token", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orch.example.com");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({
-        data: {
-          issue: { comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } },
-        },
-      }),
+      json: async () => ({ planningContext: "" }),
     });
 
     const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
@@ -373,30 +370,39 @@ describe("runAutonomous", () => {
     });
 
     expect(mockFetch).toHaveBeenCalledWith(
-      "https://api.linear.app/graphql",
-      expect.objectContaining({ method: "POST" }),
+      "https://orch.example.com/runner/planning-context",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({ Authorization: "Bearer ptok" }),
+      }),
     );
   });
 
+  it("does not fetch planning context when no callback token is present", async () => {
+    const mockFetch = vi.fn();
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+    const { pipeline, runner } = makeSingleStepPipeline("noop", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("stores fetched planning context on the pipeline context", async () => {
-    vi.stubEnv("LINEAR_API_KEY", "lin_api_test");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orch.example.com");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
-        data: {
-          issue: {
-            comments: {
-              nodes: [
-                {
-                  body: "## 🏗️ AI Planning: Architecture Analysis\nUse the service layer",
-                  createdAt: "2026-05-15T00:00:00.000Z",
-                },
-              ],
-              pageInfo: { hasNextPage: false, endCursor: null },
-            },
-          },
-        },
+        planningContext: "## Planning Context\n\nUse the service layer",
       }),
     });
 

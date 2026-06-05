@@ -9,8 +9,7 @@ import type { LLMExecutor, LogLevel, PipelineDefinition, StepReporter } from "./
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
 import { parseWorkflowMd } from "./workflow-md.js";
-import { fetchPlanningContext } from "./linear-planning-fetch.js";
-import { postRunnerResult } from "./runner-result.js";
+import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 
 export interface RunAutonomousOptions {
   workspaceDir?: string;
@@ -120,10 +119,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const prNumber = process.env.PR_NUMBER ?? "";
   const runnerPhase = resolveRunnerPhase(process.env.RUNNER_PHASE, prNumber);
 
-  const planningContext = process.env.LINEAR_API_KEY
-    ? await fetchPlanningContext({
-        issueId,
-        linearApiKey: process.env.LINEAR_API_KEY,
+  const callbackUrl = optionalEnv("RUNNER_CALLBACK_URL");
+  const progressToken = optionalEnv("RUN_PROGRESS_TOKEN");
+
+  // Planning context is fetched from the orchestrator's provider-agnostic
+  // endpoint using the reusable progress token — the runner never calls the
+  // ticketing system directly. Absent a callback URL/token (e.g. a
+  // comment-triggered gap-fill), the run proceeds without planning context.
+  const planningContext = callbackUrl && progressToken
+    ? await fetchPlanningContextFromOrchestrator({
+        callbackUrl,
+        progressToken,
         fetchImpl: opts.fetchImpl,
       })
     : "";
@@ -180,8 +186,6 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
-  const callbackUrl = process.env.RUNNER_CALLBACK_URL;
-  const progressToken = process.env.RUN_PROGRESS_TOKEN;
   if (orchestratorUrl && !nonce) {
     console.warn("ORCHESTRATOR_URL is set but MACHINE_NONCE is empty — step reports will be rejected (403).");
   }
@@ -202,7 +206,6 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       issueDescription,
       nonce,
       orchestratorUrl: orchestratorUrl ?? "",
-      ticketingProvider: "linear",
       model,
       workspaceDir,
       planningContext,

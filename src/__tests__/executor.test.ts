@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
@@ -13,6 +13,30 @@ cat <<'JSONL'
 ${stdoutLines.join("\n")}
 JSONL
 exit ${code}
+`;
+  const path = join(binDir, "claude");
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
+// A fake `claude` that records the argv it was invoked with and whatever arrived
+// on stdin, then emits a single valid result line so the stream executor settles
+// cleanly. This exercises the actual spawn + stdio plumbing — the only thing that
+// meaningfully proves the E2BIG fix (prompt delivered on stdin, not as argv).
+function installArgvRecordingClaude(): void {
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    result: "ok",
+    num_turns: 1,
+    duration_ms: 1,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const script = `#!/usr/bin/env bash
+printf '%s\\n' "$@" > "${binDir}/argv.txt"
+cat > "${binDir}/stdin.txt"
+printf '%s\\n' '${resultLine}'
+exit 0
 `;
   const path = join(binDir, "claude");
   writeFileSync(path, script);
@@ -99,5 +123,45 @@ describe("ClaudeCliExecutor", () => {
     expect(result.stdout).toBe("Done implementing.");
     expect(result.telemetry?.outcome).toBe("success");
     expect(result.telemetry?.numTurns).toBe(4);
+  });
+
+  it("delivers the prompt over stdin, never as a command-line argument", async () => {
+    // A prompt larger than Linux MAX_ARG_STRLEN (128 KiB) trips spawn E2BIG when
+    // passed as a single argv element. Delivering it on stdin sidesteps that.
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installArgvRecordingClaude();
+    const bigPrompt = "X".repeat(200_000);
+
+    const result = await new ClaudeCliExecutor(binDir, "summary").invoke({
+      prompt: bigPrompt,
+      model: "claude-sonnet-4-6",
+    });
+
+    expect(result.exitCode).toBe(0);
+
+    const argv = readFileSync(join(binDir, "argv.txt"), "utf-8");
+    const stdin = readFileSync(join(binDir, "stdin.txt"), "utf-8");
+
+    // The prompt must arrive via stdin...
+    expect(stdin).toContain(bigPrompt);
+    // ...and must NOT appear in argv (that is what causes E2BIG).
+    expect(argv).not.toContain(bigPrompt);
+  });
+
+  it("still passes model and flags as arguments", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installArgvRecordingClaude();
+    await new ClaudeCliExecutor(binDir, "summary").invoke({
+      prompt: "hello",
+      model: "claude-sonnet-4-6",
+      maxTurns: 7,
+    });
+
+    const argv = readFileSync(join(binDir, "argv.txt"), "utf-8");
+    expect(argv).toContain("--dangerously-skip-permissions");
+    expect(argv).toContain("--model");
+    expect(argv).toContain("claude-sonnet-4-6");
+    expect(argv).toContain("--max-turns");
+    expect(argv).toContain("7");
   });
 });

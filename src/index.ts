@@ -26,7 +26,7 @@ import { initReconciliationTable, getPendingReconciliations, updateReconciliatio
 import { resolveSessionImage, selectRunnerImageInput } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
-import { handleRunnerProgress, handleRunnerResult } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
@@ -1848,6 +1848,37 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[runner-callback] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Runner planning-context fetch — reusable progress token authenticated.
+    // Lets the runner pull planning context provider-agnostically instead of
+    // calling the ticketing system directly with an API key.
+    if (url === "/runner/planning-context" && req.method === "GET") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const result = await handleRunnerPlanningContext({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          resolveProvider: async (mappingTeamKey) => {
+            const mapping = getMappings()[mappingTeamKey];
+            if (!mapping) return null;
+            return await registry.forMapping(mapping);
+          },
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[runner-planning-context] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

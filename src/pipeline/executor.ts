@@ -40,13 +40,20 @@ export class ClaudeCliExecutor implements LLMExecutor {
       if (params.tools && params.tools.length > 0) {
         args.push("--allowed-tools", params.tools.join(","));
       }
-      args.push("-p", params.prompt);
+      // Pass the prompt on stdin rather than as an argv element. A large prompt
+      // (e.g. one carrying full planning context) can exceed the OS single-argument
+      // limit — MAX_ARG_STRLEN, 128 KiB on Linux — which makes spawn fail with E2BIG.
+      // `claude -p` reads the prompt from stdin, so there is no size ceiling.
+      args.push("-p");
 
       const proc = spawn("claude", args, {
         cwd: this.workspaceDir,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
       });
+
+      proc.stdin.on("error", reject);
+      proc.stdin.end(params.prompt);
 
       const events: StreamEvent[] = [];
       const stderrChunks: Buffer[] = [];

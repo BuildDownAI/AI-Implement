@@ -1,5 +1,3 @@
-import type { ProviderId } from "../providers/types.js";
-
 export type StepStatus = "running" | "passed" | "failed" | "skipped" | "cancelled";
 
 export type StepType =
@@ -32,8 +30,6 @@ export interface PipelineContextData {
   issueDescription: string;
   nonce: string;
   orchestratorUrl: string;
-  /** Ticketing provider for the runner to use when posting comments. */
-  ticketingProvider: ProviderId;
   /** Optional model override for Claude invocations (e.g. "claude-opus-4-5"). */
   model?: string;
   /** Autonomous runner: absolute path to the cloned workspace. */

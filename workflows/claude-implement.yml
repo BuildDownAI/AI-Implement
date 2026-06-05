@@ -7,7 +7,6 @@
 #   AI_IMPLEMENT_PRIVATE_KEY - GitHub App PEM private key
 #   ANTHROPIC_API_KEY        - Anthropic API key
 #   CLAUDE_CODE_OAUTH_TOKEN  - Claude Code OAuth token (preferred over API key)
-#   LINEAR_API_KEY           - Linear API key for status updates
 #
 # Additional secret (Bedrock provider):
 #   AWS_BEDROCK_ROLE_ARN     - IAM role ARN trusted to GitHub OIDC; needs bedrock:InvokeModel
@@ -25,19 +24,19 @@ on:
   workflow_dispatch:
     inputs:
       issue_id:
-        description: "Linear issue UUID"
+        description: "Ticketing-system issue ID"
         required: true
         type: string
       issue_identifier:
-        description: "Linear issue identifier (e.g., ENG-123)"
+        description: "Ticketing-system issue identifier (e.g., ENG-123)"
         required: true
         type: string
       issue_title:
-        description: "Linear issue title"
+        description: "Ticketing-system issue title"
         required: true
         type: string
       issue_description:
-        description: "Linear issue description"
+        description: "Ticketing-system issue description"
         required: true
         type: string
       pr_number:
@@ -231,7 +230,6 @@ jobs:
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}

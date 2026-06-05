@@ -368,6 +368,85 @@ describe("handleRunnerProgress", () => {
   });
 });
 
+describe("handleRunnerPlanningContext", () => {
+  function mintProgress(issueId: string, mappingTeamKey: string) {
+    return runnerTokens.mintRunToken({
+      issueId,
+      mappingTeamKey,
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+  }
+
+  it("returns 401 when the bearer token is missing or invalid", async () => {
+    const res = await runnerCallback.handleRunnerPlanningContext({
+      authorization: "Bearer nope",
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects a one-shot result token (wrong audience)", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "result",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const res = await runnerCallback.handleRunnerPlanningContext({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("returns the provider's planning context for the token's issue", async () => {
+    const { token } = mintProgress("issue-xyz", "ENG");
+    const provider = new FakeProvider({ planningContext: "## Planning Context\n\nUse the widget pattern." });
+    const spy = vi.spyOn(provider, "fetchPlanningContext");
+
+    const res = await runnerCallback.handleRunnerPlanningContext({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
+      resolveProvider: makeResolve(provider),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.planningContext).toContain("Use the widget pattern.");
+    expect(spy).toHaveBeenCalledWith("issue-xyz");
+  });
+
+  it("does not consume the token — it can be fetched more than once", async () => {
+    const { token } = mintProgress("issue-xyz", "ENG");
+    const provider = new FakeProvider({ planningContext: "ctx" });
+    const call = () =>
+      runnerCallback.handleRunnerPlanningContext({
+        authorization: `Bearer ${token}`,
+        secret: SECRET,
+        resolveProvider: makeResolve(provider),
+      });
+    expect((await call()).status).toBe(200);
+    expect((await call()).status).toBe(200);
+  });
+
+  it("returns empty context (200) when the mapping was deleted", async () => {
+    const { token } = mintProgress("issue-xyz", "ENG");
+    const res = await runnerCallback.handleRunnerPlanningContext({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
+      resolveProvider: makeResolve(null),
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.planningContext).toBe("");
+  });
+});
+
 describe("handleRunnerResult — gap-analysis", () => {
   it("posts comments but skips status transition on success", async () => {
     const { token } = runnerTokens.mintRunToken({
