@@ -217,7 +217,19 @@ describe("feedbackLoopStep", () => {
     expect(failedStep?.type).toBe("implement");
   });
 
-  it("propagates review step error and reports the sub-step as failed", async () => {
+  it("does not throw when the review step fails, so the pipeline can still push", async () => {
+    vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
+
+    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    // A review failure must not discard a successful implementation. The loop
+    // ends, approved stays false, and the reason is surfaced in finalFeedback.
+    expect(outputs.approved).toBe(false);
+    expect(outputs.finalFeedback).toContain("Prompt is too long");
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the review sub-step as failed and stops the loop when review throws", async () => {
     vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("review failed"));
 
     const reportedSteps: Step[] = [];
@@ -227,13 +239,18 @@ describe("feedbackLoopStep", () => {
       }),
     };
 
-    await expect(
-      feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter),
-    ).rejects.toThrow("review failed");
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, maxIterations: 3 },
+      reporter,
+    );
 
     const failedStep = reportedSteps.find((s) => s.status === "failed");
     expect(failedStep).toBeDefined();
     expect(failedStep?.type).toBe("review");
+    // The loop must not retry implementation after an infrastructure-level
+    // review failure — retrying would burn another implement pass for nothing.
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
   });
 
   it("passes issueTitle and issueDescription to review step", async () => {
