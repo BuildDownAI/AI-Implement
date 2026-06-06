@@ -13,6 +13,10 @@ vi.mock("node:fs", () => ({
   },
 }));
 
+vi.mock("../pipeline/steps/workspace-excludes.js", () => ({
+  ensureRunnerExcludes: vi.fn(),
+}));
+
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 

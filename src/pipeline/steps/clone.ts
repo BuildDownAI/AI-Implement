@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { ensureRunnerExcludes } from "./workspace-excludes.js";
 
 interface CloneInputs extends Record<string, unknown> {
   repoOwner: string;
@@ -69,6 +70,10 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
 
       cloneMethod = "fresh";
     }
+
+    // Reserve the runner's transient output paths (e.g. ai-output/) so the
+    // commit steps never stage them into the PR.
+    ensureRunnerExcludes(workspaceDir);
 
     const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
       cwd: workspaceDir,
