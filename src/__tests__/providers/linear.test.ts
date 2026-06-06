@@ -514,32 +514,53 @@ describe("LinearProvider.clearWorkingState", () => {
   it("removes the AI-Working label from the issue", async () => {
     mockJsonOnce({ issue: { labels: { nodes: [{ id: "lw", name: "AI-Working" }, { id: "lo", name: "Other" }] } } });
     mockJsonOnce({ issueUpdate: { success: true } });
-
-    const p = new LinearProvider({ linearApiKey: "k" });
-    await p.clearWorkingState("issue-1");
-
-    expect(fetch).toHaveBeenCalledTimes(2);
-    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
-    expect(updateBody.variables).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
-  });
-
-  it("no-ops (no mutation) when AI-Working label is absent", async () => {
+    // second removeLabelByName call for AI-Planning — not present, no mutation
     mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
     await p.clearWorkingState("issue-1");
 
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
+    expect(updateBody.variables).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+  });
+
+  it("removes the AI-Planning label from the issue", async () => {
+    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } });
+    // AI-Working absent — no mutation
+    // second removeLabelByName call for AI-Planning
+    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lp", name: "AI-Planning" }, { id: "lo", name: "Other" }] } } });
+    mockJsonOnce({ issueUpdate: { success: true } });
+
+    const p = new LinearProvider({ linearApiKey: "k" });
+    await p.clearWorkingState("issue-1");
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
+    expect(updateBody.variables).toEqual({ issueId: "issue-1", labelIds: ["lo"] });
+  });
+
+  it("no-ops (no mutation) when AI-Working label is absent", async () => {
+    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
+    // second removeLabelByName call for AI-Planning — also absent
+    mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
+
+    const p = new LinearProvider({ linearApiKey: "k" });
+    await p.clearWorkingState("issue-1");
+
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("no-ops when the issue has no labels at all", async () => {
+    mockJsonOnce({ issue: { labels: { nodes: [] } } });
+    // second removeLabelByName call for AI-Planning — also empty
     mockJsonOnce({ issue: { labels: { nodes: [] } } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
     await p.clearWorkingState("issue-1");
 
-    // Only the labels-fetch query runs; no update mutation when there's nothing to remove
-    expect(fetch).toHaveBeenCalledTimes(1);
+    // Two labels-fetch queries run; no update mutation when there's nothing to remove
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -249,6 +249,28 @@ describe("remediateStuckJob", () => {
     });
   });
 
+  describe("planning job handling", () => {
+    it("calls clearWorkingState for a stuck planning job (requeue path)", async () => {
+      vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+      const provider = makeProvider();
+      const job = makeJob({ executionMode: "planning" });
+
+      await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+    });
+
+    it("calls clearWorkingState for a stuck planning job (hard-stop path)", async () => {
+      vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
+      const provider = makeProvider();
+      const job = makeJob({ executionMode: "planning" });
+
+      await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+    });
+  });
+
   describe("edge cases", () => {
     it("returns early when issueId is missing", async () => {
       vi.mocked(incrementStuckAttempts).mockReturnValue(1);
