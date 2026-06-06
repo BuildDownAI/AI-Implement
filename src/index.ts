@@ -519,6 +519,7 @@ async function dispatchPlanning(
     issueState: issue.nativeStatus,
     dispatchId,
     executionMode: "planning",
+    phase: "planning",
   });
 
   if (config.notifyWebhookUrl) {
