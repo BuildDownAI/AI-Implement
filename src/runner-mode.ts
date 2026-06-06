@@ -69,6 +69,20 @@ export function resolveExecutionPath(
   return mappingMode;
 }
 
+/**
+ * Planning-specific execution path resolution. Identical to resolveExecutionPath
+ * except shadow ("both") collapses to "github-actions": planning posts user-visible
+ * Linear comments, so a shadow second backend would double-post.
+ */
+export function resolvePlanningExecutionPath(
+  runnerMode: RunnerMode,
+  mappingMode: "github-actions" | "fly-machines",
+): "github-actions" | "fly-machines" | "local-docker" {
+  const path = resolveExecutionPath(runnerMode, mappingMode);
+  if (path === "both") return "github-actions";
+  return path;
+}
+
 /** Persists the runner mode to the DB. Env var override is unaffected. */
 export function setRunnerMode(mode: RunnerMode): void {
   getDb()

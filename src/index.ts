@@ -20,7 +20,7 @@ import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
-import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath } from "./runner-mode.js";
+import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { initReconciliationTable, getPendingReconciliations, updateReconciliationStatus } from "./reconciliation.js";
 import { resolveSessionImage, selectRunnerImageInput } from "./repo-image.js";
@@ -452,8 +452,11 @@ async function dispatchGitHubActions(
 
 /**
  * Dispatch the planning workflow for an issue that needs planning.
- * Uses AI-Planning label as the in-progress marker (no dedup entry so the
- * issue can be re-dispatched for implementation once Plan-Complete is added).
+ * Routes via resolveExecutionPath: GHA (primary, also handles shadow to avoid
+ * double-posting Linear comments), Fly Machines, or local Docker. Uses
+ * AI-Planning label as the in-progress marker and intentionally does NOT call
+ * markDispatched() so the dedup table stays clear for the subsequent
+ * implementation dispatch.
  */
 async function dispatchPlanning(
   config: AppConfig,
@@ -468,6 +471,194 @@ async function dispatchPlanning(
     return;
   }
 
+  const { mode: runnerMode } = getRunnerMode();
+  // Shadow collapses to GHA-only: planning posts user-visible Linear comments,
+  // so a shadow second backend would double-post.
+  const execPath = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
+
+  // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) for all execution paths.
+  const planningContextInputs = await buildPlanningContextInputs({
+    issue,
+    linearApiKey: config.linearApiKey,
+    ticketingProviderId: provider.id,
+  });
+
+  if (execPath === "fly-machines" || execPath === "local-docker") {
+    // Bedrock is not supported on container runners.
+    if (mapping.provider === "bedrock") {
+      console.error(
+        `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: provider=bedrock is not supported on fly-machines/local-docker`,
+      );
+      return;
+    }
+
+    if (!config.anthropicApiKey && !config.claudeOAuthToken) {
+      console.error(
+        `[poll] Cannot dispatch planning for ${issue.identifier} via ${execPath}: neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set`,
+      );
+      return;
+    }
+
+    if (execPath === "fly-machines" && (!config.flySessionsToken || !config.flySessionsApp)) {
+      console.error(
+        `[poll] Cannot dispatch planning for ${issue.identifier} via Fly Machines: FLY_SESSIONS_TOKEN or FLY_SESSIONS_APP not set`,
+      );
+      return;
+    }
+
+    // Capture at call time so non-null assertions inside the backend closure are sound.
+    const flyToken = config.flySessionsToken;
+    const flyApp = config.flySessionsApp;
+
+    const prior = countPriorDispatches(issue.id);
+
+    await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
+      phase: "planning",
+      tokenTtlSeconds: PLANNING_TTL_SECONDS,
+      doMarkDispatched: false,
+      shadow: false,
+      backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
+        const planningEnv = {
+          PARENT: planningContextInputs.parent,
+          SIBLINGS: planningContextInputs.siblings,
+          DEPENDENCIES: planningContextInputs.dependencies,
+        };
+
+        if (execPath === "fly-machines") {
+          const minSecretsVersion = getFlySecretsMinVersion();
+          let allSecretNames: string[] = [];
+          try {
+            const secrets = await listAppSecrets(flyToken!, flyApp!);
+            allSecretNames = secrets.map((s) => s.name);
+          } catch (err) {
+            console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
+          }
+
+          const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
+            owner: mapping.owner,
+            repo: mapping.repo,
+            token: ghToken,
+            defaultImage: config.sessionImage,
+          });
+
+          const machineConfig = buildSessionMachineConfig({
+            image: resolvedImage,
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+            issueTitle: issue.title,
+            issueDescription: issue.description || issue.title,
+            owner: mapping.owner,
+            repo: mapping.repo,
+            defaultBranch: mapping.defaultBranch,
+            // No linearApiKey: planning runner does not post to Linear directly
+            anthropicApiKey: config.anthropicApiKey ?? undefined,
+            claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            sessionToken,
+            machineNonce,
+            phase: "planning",
+            sessionMode: mapping.sessionMode,
+            region: config.flySessionsRegion ?? undefined,
+            cpus: mapping.machineCpus,
+            memoryMb: mapping.machineMemoryMb,
+            teamKey: issue.scopeKey,
+            teamSecretNames: allSecretNames,
+            minSecretsVersion: minSecretsVersion ?? undefined,
+            orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken: runToken || undefined,
+            orchestratorApp: config.flyOrchestratorApp ?? undefined,
+            tenantId: config.tenantId ?? undefined,
+            expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
+            extraEnv: (() => {
+              const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv };
+              return Object.keys(merged).length > 0 ? merged : undefined;
+            })(),
+          });
+
+          const machine = await createMachine(flyToken!, flyApp!, machineConfig);
+          const machineLogsUrl = `https://fly.io/apps/${flyApp}/machines/${machine.id}`;
+          console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (fly-machines, machine: ${machine.id}, image: ${resolvedImage} [${imageSource}])`);
+          return {
+            machineId: machine.id,
+            sessionImage: resolvedImage,
+            ghToken,
+            executionMode: "fly-machines" as const,
+            statusComment: { machineName: machine.name, logsUrl: machineLogsUrl },
+          };
+        } else {
+          // local-docker
+          const localOrchestratorUrl =
+            config.localRunnerOrchestratorUrl ??
+            config.runnerCallbackBaseUrl ??
+            `http://host.docker.internal:${config.healthPort}`;
+
+          const container = await startLocalRunnerContainer({
+            image: config.localRunnerImage,
+            issueId: issue.id,
+            issueIdentifier: issue.identifier,
+            issueTitle: issue.title,
+            issueDescription: issue.description || issue.title,
+            owner: mapping.owner,
+            repo: mapping.repo,
+            defaultBranch: mapping.defaultBranch,
+            // No linearApiKey: planning runner does not post to Linear directly
+            anthropicApiKey: config.anthropicApiKey ?? undefined,
+            claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            sessionToken,
+            machineNonce,
+            phase: "planning",
+            sessionMode: mapping.sessionMode,
+            orchestratorUrl: localOrchestratorUrl,
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken: runToken || undefined,
+            extraEnv: (() => {
+              const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv };
+              return Object.keys(merged).length > 0 ? merged : undefined;
+            })(),
+          });
+
+          return {
+            machineId: container.containerId,
+            sessionImage: config.localRunnerImage,
+            ghToken: "",
+            executionMode: "local-docker" as const,
+            statusComment: {
+              machineName: container.containerName || container.containerId.slice(0, 12),
+            },
+            dispatchedLogLine: `[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (local-docker, container: ${container.containerId}, image: ${config.localRunnerImage})`,
+          };
+        }
+      },
+      onPostDispatch: async (_cfg, _prov, _iss, _map, _ghToken, _jobId, _mode) => {
+        if (config.notifyWebhookUrl) {
+          notify(config.notifyType, config.notifyWebhookUrl, {
+            issueIdentifier: issue.identifier,
+            issueTitle: issue.title,
+            issueUrl: provider.issueUrl(issue),
+            repoFullName: `${mapping.owner}/${mapping.repo}`,
+          }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
+        }
+        // Intentionally do NOT call markDispatched() — dedup table stays clear
+        // for the subsequent implementation dispatch.
+        try {
+          await provider.markPlanningStarted(issue.id, issue.scopeKey);
+        } catch (err) {
+          console.warn(
+            `[poll] Planning workflow dispatched for ${issue.identifier} but failed to mark planning started — next poll may re-dispatch planning:`,
+            err,
+          );
+        }
+      },
+    });
+    return;
+  }
+
+  // ---------- GHA path (also handles shadow → GHA-only via resolvePlanningExecutionPath) ----------
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
   const planningMapping = { ...mapping, workflowFile: mapping.planningWorkflowFile };
 
@@ -487,12 +678,6 @@ async function dispatchPlanning(
     runnerCallbackUrl = config.runnerCallbackBaseUrl;
     runToken = minted.token;
   }
-
-  const planningContextInputs = await buildPlanningContextInputs({
-    issue,
-    linearApiKey: config.linearApiKey,
-    ticketingProviderId: provider.id,
-  });
 
   const result = await dispatchWorkflow(ghToken, planningMapping, {
     issue_id: issue.id,
@@ -518,7 +703,8 @@ async function dispatchPlanning(
     repo: `${mapping.owner}/${mapping.repo}`,
     issueState: issue.nativeStatus,
     dispatchId,
-    executionMode: "planning",
+    executionMode: "github-actions",
+    phase: "planning",
   });
 
   if (config.notifyWebhookUrl) {
@@ -530,15 +716,11 @@ async function dispatchPlanning(
     }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
   }
 
-  // Mark planning started — this adds the AI-Planning label and moves the
-  // issue to In Progress (where applicable). Intentionally do NOT call
-  // markDispatched() so the dedup table stays clear for the subsequent
-  // implementation dispatch.
+  // Intentionally do NOT call markDispatched() so the dedup table stays clear
+  // for the subsequent implementation dispatch.
   try {
     await provider.markPlanningStarted(issue.id, issue.scopeKey);
   } catch (err) {
-    // The planning workflow was already dispatched — log a warning so the operator
-    // knows the next poll may re-dispatch planning for this issue.
     console.warn(
       `[poll] Planning workflow dispatched for ${issue.identifier} but failed to mark planning started — next poll may re-dispatch planning:`,
       err,
@@ -628,6 +810,7 @@ async function dispatchSession(
     machineId: result.machineId,
     runnerMode,
     sessionImage: result.sessionImage,
+    phase: opts.phase,
   });
 
   if (!opts.shadow) {
