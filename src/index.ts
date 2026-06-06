@@ -11,8 +11,10 @@ import type { TicketingProvider, IssueLifecycleState } from "./providers/types.j
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion } from "./notify.js";
+import { remediateStuckJob } from "./stuck-watchdog.js";
+import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { handleTokenRequest } from "./token-vending.js";
@@ -900,6 +902,9 @@ const RUN_ID_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 /** Maximum age (ms) for a Fly Machine job before it's considered timed out. */
 const FLY_MACHINE_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
 
+/** Maximum age (ms) for a GHA job (once a run ID is bound) before it's considered stuck. */
+const STUCK_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
+
 /** Maximum characters to include in a Linear "Session Logs" comment. */
 const LOG_MAX_CHARS = 5_000;
 
@@ -1014,7 +1019,7 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
         }
         await monitorLocalDockerJob(config, provider, job);
       } else {
-        await monitorGitHubActionsJob(config, job, teamRepoMap, claimedRunIds);
+        await monitorGitHubActionsJob(config, job, teamRepoMap, claimedRunIds, registry);
       }
     } catch (err) {
       console.error(`[monitor] Error checking job ${job.id}:`, err);
@@ -1030,6 +1035,7 @@ async function monitorGitHubActionsJob(
   job: Job,
   teamRepoMap: Record<string, RepoMapping>,
   claimedRunIds: Set<number>,
+  registry: ProviderRegistry,
 ): Promise<void> {
   const repoFullName = job.repo;
   if (!repoFullName) return;
@@ -1038,6 +1044,13 @@ async function monitorGitHubActionsJob(
   if (!owner || !repo) return;
 
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+
+  const watchdogConfig: StuckWatchdogConfig = {
+    githubAppId: config.githubAppId,
+    githubAppPrivateKey: config.githubAppPrivateKey,
+    notifyType: config.notifyType,
+    notifyWebhookUrl: config.notifyWebhookUrl,
+  };
 
   // If we don't have a run ID yet, try to find it
   if (!job.runId) {
@@ -1067,8 +1080,9 @@ async function monitorGitHubActionsJob(
       job.runId = runId;
       console.log(`[monitor] Found run ID ${runId} for job ${job.id} (${job.issueIdentifier})`);
     } else if (Date.now() - job.dispatchedAt > RUN_ID_TIMEOUT_MS) {
-      updateJobStatus(job.id, "timed_out", "run_not_found");
       console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) timed out waiting for run ID`);
+      const provider = await providerForJob(registry, job);
+      await remediateStuckJob(watchdogConfig, provider, job, "run_not_found");
       return;
     } else {
       return; // Still waiting
@@ -1078,6 +1092,17 @@ async function monitorGitHubActionsJob(
   // Check run status
   const runStatus = await getWorkflowRunStatus(ghToken, owner, repo, job.runId);
   if (!runStatus) return;
+
+  // Detect stuck: non-terminal past the wall-clock cap
+  if (runStatus.status !== "completed" && Date.now() - job.dispatchedAt > STUCK_TIMEOUT_MS) {
+    const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck in ${runStatus.status} after ${elapsedMin}m`,
+    );
+    const provider = await providerForJob(registry, job);
+    await remediateStuckJob(watchdogConfig, provider, job, runStatus.status);
+    return;
+  }
 
   if (runStatus.status === "completed") {
     let jobStatus: JobStatus;
@@ -1369,11 +1394,12 @@ async function monitorLocalDockerJob(
   }
 }
 
-/** Mark a Linear issue as Ready for Review after a successful Fly machine job. */
+/** Mark a Linear issue as Ready for Review after a successful job. */
 async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: string): Promise<void> {
   if (!job.issueId) return;
   try {
     await provider.markPrReady(job.issueId, prUrl);
+    if (job.issueId) resetStuckAttempts(job.issueId);
     console.log(`[monitor] Marked ${job.issueIdentifier} as Ready for Review (PR: ${prUrl})`);
   } catch (err) {
     console.error(`[monitor] Failed to mark ${job.issueIdentifier} as Ready for Review:`, err);
@@ -1404,6 +1430,14 @@ async function sendCompletionNotifications(config: AppConfig, registry: Provider
   const mappings = getMappings();
   for (const job of terminalJobs) {
     try {
+      // Suppress ordinary completion notice for stuck conclusions — stuck_giveup
+      // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
+      // requeue that will produce its own dispatch notice on the next cycle.
+      if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
+        markJobNotified(job.id);
+        continue;
+      }
+
       const repoFullName = job.repo || "unknown";
       const [owner, repo] = (job.repo || "").split("/");
 
