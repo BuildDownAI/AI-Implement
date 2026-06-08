@@ -256,6 +256,10 @@ async function ensureSyncBranch(params: {
   });
 }
 
+// NOTE: this matches only the CURRENT sync branch name. If a project's branchPrefix
+// changes (e.g. "pr" -> none, or "pr" -> "client/pr"), a sync PR previously opened on
+// the old branch name will not be found here and remains open; it must be closed
+// manually. Re-syncing always operates on the branch for the mapping's current prefix.
 async function findSyncPr(
   gh: GitHubClient,
   repo: string,

@@ -24,6 +24,10 @@ const mapping: RepoMapping = {
   ticketingConfig: { kind: "linear" },
   awsRegion: null,
   paused: false,
+  maxTurns: null,
+  maxIterations: null,
+  maxJobMinutes: null,
+  branchPrefix: null,
 };
 
 let tempRoot: string | null = null;

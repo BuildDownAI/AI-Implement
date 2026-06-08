@@ -93,6 +93,12 @@ describe("normalizeBranchPrefix", () => {
   it("rejects a path segment that starts with a dot", () => {
     expect(() => normalizeBranchPrefix("foo/.hidden")).toThrow();
   });
+
+  it("rejects segments ending with '.' or '.lock'", () => {
+    expect(() => normalizeBranchPrefix("foo.")).toThrow();
+    expect(() => normalizeBranchPrefix("foo.lock")).toThrow();
+    expect(() => normalizeBranchPrefix("team/foo.lock")).toThrow();
+  });
 });
 
 describe("branchMatchesIssueIdentifier with prefix", () => {

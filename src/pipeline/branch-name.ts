@@ -36,6 +36,9 @@ export function normalizeBranchPrefix(raw: string | null | undefined): string | 
         "branchPrefix segments may contain only letters, digits, '.', '_', '-' and must each start with a letter or digit",
       );
     }
+    if (segment.endsWith(".") || segment.endsWith(".lock")) {
+      throw new Error("branchPrefix segments must not end with '.' or '.lock'");
+    }
   }
   return value;
 }
