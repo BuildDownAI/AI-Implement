@@ -8,6 +8,7 @@ import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeli
 import type { LLMExecutor, LogLevel, PipelineDefinition, StepReporter } from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
+import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 
@@ -181,6 +182,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   };
   const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS, "AI_IMPLEMENT_MAX_TURNS");
   const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS, "AI_IMPLEMENT_MAX_ITERATIONS");
+  const branchPrefix = (() => {
+    try {
+      return normalizeBranchPrefix(process.env.AI_IMPLEMENT_BRANCH_PREFIX) ?? undefined;
+    } catch (err) {
+      // The orchestrator validates the prefix before dispatch, so this only
+      // happens on a manual dispatch with a bad value. Warn rather than fail the
+      // run, and fall back to the default (no prefix).
+      console.warn(`[runner] Ignoring invalid AI_IMPLEMENT_BRANCH_PREFIX: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  })();
 
   const logLevel = resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL);
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
@@ -218,6 +230,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       provider,
       maxTurns,
       maxIterations,
+      branchPrefix,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,
