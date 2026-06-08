@@ -121,6 +121,11 @@ class GitHubClient {
   }
 }
 
+function buildSyncBranchName(prefix: string | null | undefined): string {
+  const cleaned = (prefix ?? "").trim().replace(/^\/+|\/+$/g, "");
+  return cleaned ? `${cleaned}/sync/ai-implement` : "sync/ai-implement";
+}
+
 function repoPath(mapping: RepoMapping): string {
   return `${mapping.owner}/${mapping.repo}`;
 }
@@ -311,7 +316,7 @@ export async function syncWorkflowTemplates(
 ): Promise<WorkflowSyncResult> {
   const mapping = options.mapping;
   const targetRepo = repoPath(mapping);
-  const syncBranch = options.syncBranch ?? "sync/ai-implement";
+  const syncBranch = options.syncBranch ?? buildSyncBranchName(mapping.branchPrefix);
   const templatesRoot = options.templatesRoot ?? packageRoot();
   const getToken = options.getInstallationTokenImpl ?? getInstallationToken;
   const token = await getToken(options.githubAppId, options.githubAppPrivateKey, mapping.owner);

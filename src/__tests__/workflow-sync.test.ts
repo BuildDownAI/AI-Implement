@@ -359,4 +359,55 @@ describe("syncWorkflowTemplates", () => {
       getInstallationTokenImpl: async () => "token",
     })).rejects.toThrow("Missing workflow template: workflows/claude-plan.yml");
   });
+
+  it("prefixes the sync branch when the mapping sets a branchPrefix", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch();
+
+    const result = await syncWorkflowTemplates({
+      mapping: { ...mapping, branchPrefix: "pr" },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.syncBranch).toBe("pr/sync/ai-implement");
+    expect(fake.branches["pr/sync/ai-implement"]).toBeDefined();
+    expect(fake.pulls[0].head).toBe("pr/sync/ai-implement");
+  });
+
+  it("uses the unprefixed sync branch when the mapping has no branchPrefix", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch();
+
+    const result = await syncWorkflowTemplates({
+      mapping: { ...mapping, branchPrefix: null },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.syncBranch).toBe("sync/ai-implement");
+  });
+
+  it("does not prefix an explicitly provided syncBranch", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch();
+
+    const result = await syncWorkflowTemplates({
+      mapping: { ...mapping, branchPrefix: "pr" },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      syncBranch: "sync/ai-implement",
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.syncBranch).toBe("sync/ai-implement");
+  });
 });
