@@ -246,15 +246,14 @@ async function ensureSyncBranch(params: {
     return;
   }
 
-  const compare = await gh.maybeRequest<{ ahead_by: number }>(
-    `/repos/${repo}/compare/${encodeRefPath(baseBranch)}...${encodeRefPath(syncBranch)}`,
-  );
-  if ((compare?.ahead_by ?? 0) === 0) {
-    await gh.request(`/repos/${repo}/git/refs/heads/${encodeRefPath(syncBranch)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ sha: base.object.sha, force: true }),
-    });
-  }
+  // The sync branch is orchestrator-owned and disposable: always force-reset it to the
+  // current base so each re-sync produces a clean diff (base + freshly regenerated
+  // templates) and never layers onto stale state from a prior sync PR — whether that
+  // branch is ahead of, behind, or lingering after a merge.
+  await gh.request(`/repos/${repo}/git/refs/heads/${encodeRefPath(syncBranch)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ sha: base.object.sha, force: true }),
+  });
 }
 
 async function findSyncPr(

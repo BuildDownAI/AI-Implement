@@ -323,16 +323,23 @@ describe("syncWorkflowTemplates", () => {
     expect(result.changedFiles).toEqual([]);
   });
 
-  it("preserves an existing sync branch that is ahead of base", async () => {
+  it("force-resets a stale sync branch that is ahead of base to produce a clean diff", async () => {
     const templatesRoot = makeTemplatesRoot();
     const fake = makeGithubFetch({
       syncFiles: {
-        "operator-note.txt": "keep me\n",
+        ".github/workflows/claude-implement.yml": "OLD-implement\n",
+        "stale-leftover.txt": "stale\n",
       },
       syncAheadBy: 2,
+      existingPr: {
+        number: 55,
+        html_url: "https://github.com/acme/app/pull/55",
+        head: "sync/ai-implement",
+        base: { ref: "main" },
+      },
     });
 
-    await syncWorkflowTemplates({
+    const result = await syncWorkflowTemplates({
       mapping,
       githubAppId: "app-id",
       githubAppPrivateKey: "private-key",
@@ -341,8 +348,25 @@ describe("syncWorkflowTemplates", () => {
       getInstallationTokenImpl: async () => "token",
     });
 
-    expect(fake.branches["sync/ai-implement"].files["operator-note.txt"]).toBe("keep me\n");
-    expect(fake.calls.some((call) => call.method === "PATCH" && call.path.includes("/git/refs/heads/"))).toBe(false);
+    // The existing open PR is reused, not duplicated.
+    expect(result.status).toBe("pr-updated");
+    expect(result.prNumber).toBe(55);
+    expect(fake.pulls).toHaveLength(1);
+
+    // The branch was force-reset to the current base before templates were applied.
+    expect(
+      fake.calls.some(
+        (call) =>
+          call.method === "PATCH" &&
+          call.path.includes("/git/refs/heads/") &&
+          (call.body as { sha?: string; force?: boolean }).sha === "base-sha" &&
+          (call.body as { sha?: string; force?: boolean }).force === true,
+      ),
+    ).toBe(true);
+
+    // Stale non-template leftover is gone; current template content is present.
+    expect(fake.branches["sync/ai-implement"].files["stale-leftover.txt"]).toBeUndefined();
+    expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-implement.yml"]).toBe("implement-yml\n");
   });
 
   it("throws when an always-synced workflow template is missing", async () => {
