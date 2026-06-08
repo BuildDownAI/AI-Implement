@@ -38,8 +38,22 @@ export interface HandleRunnerProgressInput {
   secret: string;
 }
 
+export interface HandleRunnerPlanningContextInput {
+  authorization: string | undefined;
+  secret: string;
+  resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
+}
+
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
+}
+
+function parseBearerToken(authorization: string | undefined): string | null {
+  if (!authorization || !authorization.startsWith("Bearer")) return null;
+  let i = "Bearer".length;
+  while (i < authorization.length && authorization.charCodeAt(i) <= 32) i += 1;
+  if (i === "Bearer".length || i === authorization.length) return null;
+  return authorization.slice(i);
 }
 
 function validateStepBody(body: unknown): Step | HandleRunnerResultOutput {
@@ -59,8 +73,8 @@ function validateStepBody(body: unknown): Step | HandleRunnerResultOutput {
 export async function handleRunnerResult(
   input: HandleRunnerResultInput,
 ): Promise<HandleRunnerResultOutput> {
-  const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
-  if (!auth) return bad(401, "missing_bearer");
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
 
   // Validate body shape BEFORE consuming the token. A malformed body would
   // otherwise burn a one-time-use token and lose any chance of retry from
@@ -102,7 +116,7 @@ export async function handleRunnerResult(
   // user-side retries, which we don't want to encourage. Operators monitor
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
-  const verified = verifyAndConsumeRunToken(auth[1], input.secret);
+  const verified = verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
     return verified.reason === "already_consumed"
       ? bad(409, "already_consumed")
@@ -209,12 +223,10 @@ function parsePrNumber(prUrl: string | null): number | null {
 export async function handleRunnerProgress(
   input: HandleRunnerProgressInput,
 ): Promise<HandleRunnerResultOutput> {
-  const authorization = input.authorization;
-  if (!authorization?.startsWith("Bearer ")) return bad(401, "missing_bearer");
-  const token = authorization.slice("Bearer ".length).trim();
-  if (!token) return bad(401, "missing_bearer");
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
 
-  const verified = verifyRunToken(token, input.secret, "progress", { consume: false });
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
 
   const stepOrError = validateStepBody(input.body);
@@ -225,4 +237,41 @@ export async function handleRunnerProgress(
 
   upsertStepRecord(job.id, stepOrError);
   return { status: 200, body: { acknowledged: true } };
+}
+
+/**
+ * Serves the planning context for a run to the runner, provider-agnostically.
+ * The runner authenticates with its reusable progress token (it never holds a
+ * ticketing-system API key), and the orchestrator resolves the right provider
+ * from the token's mapping. Planning context is best-effort: a missing mapping
+ * or a provider error returns 200 with an empty string rather than failing the
+ * implementation run.
+ */
+export async function handleRunnerPlanningContext(
+  input: HandleRunnerPlanningContextInput,
+): Promise<HandleRunnerResultOutput> {
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
+
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
+  if (!verified.ok) return bad(401, verified.reason);
+
+  const provider = await input.resolveProvider(verified.mappingTeamKey);
+  if (!provider) {
+    console.warn(
+      `[runner-planning-context] mapping deleted between mint and fetch: ${verified.mappingTeamKey}`,
+    );
+    return { status: 200, body: { planningContext: "" } };
+  }
+
+  try {
+    const planningContext = await provider.fetchPlanningContext(verified.claims.issueId);
+    return { status: 200, body: { planningContext } };
+  } catch (err) {
+    console.error(
+      `[runner-planning-context] fetchPlanningContext failed for issueId=${verified.claims.issueId}:`,
+      err,
+    );
+    return { status: 200, body: { planningContext: "" } };
+  }
 }

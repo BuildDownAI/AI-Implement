@@ -22,12 +22,25 @@ interface DispatchInputs {
   provider?: string;
   /** AWS region for Bedrock. Only forwarded when provider='bedrock'. */
   aws_region?: string;
+  /** Cap on Claude turns per implement pass. Only forwarded when set on the mapping. */
+  max_turns?: string;
+  /** Cap on implement/review iterations. Only forwarded when set on the mapping. */
+  max_iterations?: string;
+  /** Per-project GitHub Actions job timeout in minutes. Only forwarded when set. */
+  job_timeout_minutes?: string;
   /** Public base URL the runner should POST results back to. Empty when callback disabled. */
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
   run_token?: string;
   /** Signed reusable token authorizing step progress POSTs. Empty when progress callback disabled. */
   run_progress_token?: string;
+  /**
+   * Overrides the runner container image the target workflow runs in. Only set
+   * when the orchestrator has an explicit image to pin (a per-repo
+   * `.ai-implement/image.yml` override, or an explicitly-set SESSION_IMAGE);
+   * otherwise omitted so the workflow keeps its own image resolution.
+   */
+  runner_image?: string;
 }
 
 interface DispatchResult {
@@ -62,6 +75,34 @@ export function providerDispatchFields(
     };
   }
   return {};
+}
+
+/**
+ * Returns the cap-related dispatch inputs for a mapping. Each field is only
+ * included when set on the mapping (non-null), so default repos keep
+ * dispatching to workflow templates that haven't been re-synced with the new
+ * inputs. Values are stringified because workflow_dispatch inputs are strings.
+ */
+export function capDispatchFields(
+  mapping: RepoMapping,
+): Pick<DispatchInputs, "max_turns" | "max_iterations" | "job_timeout_minutes"> {
+  const fields: Pick<DispatchInputs, "max_turns" | "max_iterations" | "job_timeout_minutes"> = {};
+  if (mapping.maxTurns != null) fields.max_turns = String(mapping.maxTurns);
+  if (mapping.maxIterations != null) fields.max_iterations = String(mapping.maxIterations);
+  if (mapping.maxJobMinutes != null) fields.job_timeout_minutes = String(mapping.maxJobMinutes);
+  return fields;
+}
+
+/**
+ * Cap env vars for the runner process (Fly/local execution modes), where caps
+ * arrive via container env rather than workflow inputs. Job timeout is omitted
+ * because it controls the GitHub Actions job, not the runner.
+ */
+export function capRunnerEnv(mapping: RepoMapping): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (mapping.maxTurns != null) env.AI_IMPLEMENT_MAX_TURNS = String(mapping.maxTurns);
+  if (mapping.maxIterations != null) env.AI_IMPLEMENT_MAX_ITERATIONS = String(mapping.maxIterations);
+  return env;
 }
 
 export async function dispatchWorkflow(

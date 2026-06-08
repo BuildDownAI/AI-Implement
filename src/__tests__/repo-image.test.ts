@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveSessionImage, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { resolveSessionImage, selectRunnerImageInput, __clearRepoImageCacheForTests } from "../repo-image.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -169,5 +169,32 @@ describe("resolveSessionImage", () => {
       fetchImpl,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
+  });
+});
+
+describe("selectRunnerImageInput", () => {
+  it("forwards a per-repo override regardless of whether SESSION_IMAGE is set", () => {
+    const resolved = { image: "ghcr.io/acme/my-runner:v3", source: "override" as const };
+    expect(selectRunnerImageInput({ resolved, sessionImageExplicit: false })).toBe(
+      "ghcr.io/acme/my-runner:v3",
+    );
+    expect(selectRunnerImageInput({ resolved, sessionImageExplicit: true })).toBe(
+      "ghcr.io/acme/my-runner:v3",
+    );
+  });
+
+  it("forwards the orchestrator default when SESSION_IMAGE is explicitly set", () => {
+    const resolved = { image: "ghcr.io/builddownai/ai-implement-runner:next", source: "default" as const };
+    expect(selectRunnerImageInput({ resolved, sessionImageExplicit: true })).toBe(
+      "ghcr.io/builddownai/ai-implement-runner:next",
+    );
+  });
+
+  it("forwards nothing when the image is the implicit default (SESSION_IMAGE unset, no override)", () => {
+    // Leaving runner_image unset lets the target workflow keep its own resolution
+    // (AI_IMPLEMENT_RUNNER_IMAGE repo variable, then the built-in default), so
+    // repos that pin via that variable are not silently overridden.
+    const resolved = { image: DEFAULT_IMAGE, source: "default" as const };
+    expect(selectRunnerImageInput({ resolved, sessionImageExplicit: false })).toBeUndefined();
   });
 });

@@ -6,6 +6,7 @@ import type {
   ProviderConfig,
 } from "./types.js";
 import { MissingProviderConfigError } from "./types.js";
+import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
 
 interface GraphQLResponse<T> {
   data?: T;
@@ -65,6 +66,10 @@ export class LinearProvider implements TicketingProvider {
       scopeKey: node.team.key,
       nativeStatus: `${node.state.name} (${node.state.type})`,
     };
+  }
+
+  async fetchPlanningContext(issueId: string): Promise<string> {
+    return fetchLinearPlanningContext({ issueId, linearApiKey: this.apiKey });
   }
 
   private async linearMutation<T>(

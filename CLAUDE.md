@@ -106,6 +106,7 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `DEDUP_DB_PATH` | No | SQLite path (default `/data/dedup.sqlite`) |
 | `POLL_INTERVAL_MS` | No | Poll interval ms (default `60000`) |
 | `PORT` | No | HTTP port (default `8080`) |
+| `AI_IMPLEMENT_LOG_LEVEL` | No | Runner log verbosity: `summary` (default) or `stream`. `stream` tees per-turn tool activity to the log. Telemetry (turns/cost/tokens/outcome) is captured at both levels. |
 
 ## Adding a new target repo
 
@@ -149,6 +150,29 @@ The 14 not-yet-implemented routes (`overview`, `issues`, `pulls`, `blockers`, `p
 - **Gap analysis** — secondary Claude invocation after each PR
 - **Comment trigger** — `/ai-implement` on a PR kicks off a gap-fill run
 - **Triple auth** — bedrock (when orchestrator sets `provider=bedrock`), OAuth (`CLAUDE_CODE_OAUTH_TOKEN`), or API key (`ANTHROPIC_API_KEY`)
+- **setup / verify / teardown hooks** — `WORKFLOW.md` front-matter keys `setup:` / `verify:` / `teardown:` are paths (relative to repo root) to shell scripts that the runner now executes: `setup` before the implement loop (its failure aborts the run early), `verify` after a successful push, and `teardown` always (even on failure, via a `finally` in the runner). Scripts run with `set -euo pipefail`; env vars a setup script appends via `echo "VAR=value" >> "$GITHUB_ENV"` are visible to Claude and to the verify/teardown scripts (the runner manages `$GITHUB_ENV` across all execution modes). Repos with no hooks behave exactly as before.
+
+### Per-project run caps (admin UI)
+
+Each project's mapping carries three optional caps, editable in the `/admin` Projects edit dialog (blank = use the default):
+
+| Field | Default when blank | Applies to |
+|-------|--------------------|------------|
+| **Max Turns** | `50` | Claude turns per implement pass (both providers) |
+| **Max Iterations** | bedrock `2`, anthropic `3` | implement/review cycles in the feedback loop |
+| **Job Timeout (min)** | `90` | GitHub Actions job `timeout-minutes` (GHA mode only) |
+
+`maxTurns`/`maxIterations` reach the runner as `workflow_dispatch` inputs (GHA) or runner env (Fly/local); `maxJobMinutes` is a GHA-only `job_timeout_minutes` dispatch input. The orchestrator only **sends** a cap input when it is set on the mapping, so a project's target repo must have **re-synced `claude-implement.yml`** before you set caps — otherwise GitHub rejects the dispatch with "unexpected inputs". Caps also apply to gap-fill and review-feedback re-dispatches, not just the initial run.
+
+`/ai-implement` comment-triggered gap-fill runs bypass the orchestrator, so they read caps from target-repo **variables** instead (mirroring `AI_IMPLEMENT_PROVIDER`): set `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, and `AI_IMPLEMENT_MAX_JOB_MINUTES` (Settings → Secrets and variables → Actions → Variables) to cap those runs too.
+
+### Runner log verbosity
+
+`AI_IMPLEMENT_LOG_LEVEL` controls how much the runner logs during an implement pass:
+- `summary` (default): logs a single result line per Claude invocation — outcome (incl. `max_turns`), turns, duration, cost (when reported), tokens.
+- `stream`: additionally tees each per-turn tool call (name + truncated input; not tool output) to the log.
+
+Set it as a repository or organization **variable** (Settings → Secrets and variables → Actions → Variables), mirroring `AI_IMPLEMENT_PROVIDER`. It is read inside the runner container, so it applies to both orchestrator-initiated and `/ai-implement` comment-triggered runs **after the target repo has re-synced `claude-implement.yml`**. It is not a per-project admin field and not a dispatch input.
 
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
@@ -161,7 +185,7 @@ Neither workflow validates model IDs — whatever `model:` says in front matter 
 
 ### Using AWS Bedrock
 
-To run a target repo against AWS Bedrock instead of the Anthropic API:
+To run a target repo against AWS Bedrock instead of the Anthropic API, use the GitHub Actions execution mode. Bedrock is not supported on Fly Machines or local Docker because those backends do not have a role-assumption mechanism equivalent to GitHub OIDC.
 
 1. **In the orchestrator admin UI (`/admin`)**, edit the repo's mapping:
    - Set **Provider** to `bedrock`
@@ -187,7 +211,7 @@ IAM trust policy shape (use the `sub` condition to restrict to this specific rep
 }
 ```
 
-The workflow re-runs `aws-actions/configure-aws-credentials` before each Bedrock action step (once before the main implementation run, once before gap analysis) so the STS session token doesn't expire during long runs. Only OIDC is supported — there is no static-key path.
+The workflow runs `aws-actions/configure-aws-credentials` once before the containerized runner step with a 4-hour session duration, covering implementation and gap-analysis runs. Only GitHub OIDC is supported — there is no static-key path.
 
 ## Custom extensions
 
@@ -219,13 +243,15 @@ Both check `custom/<path>` (relative to `process.cwd()`) first, then fall back t
 
 ## Per-repo runner image override
 
-A target repo can boot its Fly Machine session on a custom runner image by committing `.ai-implement/image.yml` at the default branch:
+A target repo can boot its runner on a custom image by committing `.ai-implement/image.yml` at the default branch:
 
 ```yaml
 image: ghcr.io/your-org/your-runner:v1
 ```
 
 The image must be publicly pullable. The customer owns building and publishing it. If the file is absent, malformed, or points at an unreachable reference, the orchestrator falls back to the default runner (`SESSION_IMAGE` env var, or `ghcr.io/builddownai/ai-implement-runner:latest`).
+
+This resolution applies to **both** execution modes. On the Fly Machines path the orchestrator boots the session machine on the resolved image directly. On the GitHub Actions path the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-implement.yml` (which runs it as the job's `container.image`) — but only when the choice is explicit: a per-repo `.ai-implement/image.yml` override, or an explicitly-set `SESSION_IMAGE`. When neither is set the orchestrator sends no `runner_image`, so the workflow keeps its own resolution order (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in `:latest` default) and repos that pin via that variable are not overridden. Planning runs (`claude-plan.yml`) have no runner container and are unaffected.
 
 The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
 

@@ -96,6 +96,16 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "setup":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          scriptPath: ctx.data.hooks?.setup,
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.hooks?.setup,
+      };
+
     case "feedback-loop":
       return {
         ...step,
@@ -111,6 +121,9 @@ function applyWiring(step: YamlStep): StepDefinition {
             planningContext: ctx.data.planningContext,
             repoImplementModel: repoModels?.implement,
             repoReviewModel: repoModels?.review,
+            provider: ctx.data.provider,
+            maxTurns: ctx.data.maxTurns,
+            maxIterations: ctx.data.maxIterations,
           };
         },
       };
@@ -138,6 +151,19 @@ function applyWiring(step: YamlStep): StepDefinition {
           prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
         }),
         skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
+      };
+
+    case "verify":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          scriptPath: ctx.data.hooks?.verify,
+        }),
+        skip: (ctx: PipelineContext) => {
+          if (!ctx.data.hooks?.verify) return true;
+          return ctx.getOutputs("feedback-loop").approved !== true;
+        },
       };
 
     case "post-push-review":

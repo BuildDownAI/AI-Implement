@@ -10,6 +10,34 @@ export function collectRunnerComments(workspaceDir: string): Array<{ body: strin
     .map((n) => ({ body: readFileSync(join(dir, n), "utf-8") }));
 }
 
+/**
+ * Pull planning context from the orchestrator's provider-agnostic endpoint using
+ * the run's reusable progress token. The runner never holds a ticketing-system
+ * API key. Best-effort: any failure yields "" so the implementation run proceeds.
+ */
+export async function fetchPlanningContextFromOrchestrator(params: {
+  callbackUrl: string;
+  progressToken: string;
+  fetchImpl?: typeof fetch;
+}): Promise<string> {
+  const fetchFn = params.fetchImpl ?? fetch;
+  try {
+    const res = await fetchFn(`${params.callbackUrl.replace(/\/$/, "")}/runner/planning-context`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${params.progressToken}` },
+    });
+    if (!res.ok) {
+      console.warn(`[runner] planning-context fetch failed HTTP ${res.status}; proceeding without it.`);
+      return "";
+    }
+    const data = (await res.json()) as { planningContext?: unknown };
+    return typeof data.planningContext === "string" ? data.planningContext : "";
+  } catch (err) {
+    console.warn("[runner] planning-context fetch failed; proceeding without it:", err);
+    return "";
+  }
+}
+
 export async function postRunnerResult(params: {
   phase: "planning" | "implementation" | "gap-analysis";
   workspaceDir: string;

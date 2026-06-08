@@ -127,6 +127,13 @@ describe("GHA workflow shims", () => {
       expect(yaml).not.toMatch(/curl.*claude\.ai\/install/);
     });
 
+    it(`${f} is ticketing-agnostic — no Linear references`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/LINEAR_API_KEY/);
+      expect(yaml).not.toMatch(/api\.linear\.app/);
+      expect(yaml).not.toMatch(/Linear issue/);
+    });
+
     it(`${f} has at most one configure-aws-credentials step`, () => {
       const yaml = readFileSync(f, "utf-8");
       const awsCount = (yaml.match(/configure-aws-credentials/g) ?? []).length;
@@ -171,6 +178,14 @@ describe("GHA workflow shims", () => {
     it(`${f} falls back to the dispatched ref when base_branch is omitted`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*inputs\.base_branch\s*\|\|\s*github\.ref_name\s*\}\}/);
+    });
+
+    it(`${f} validates Bedrock config before configuring AWS credentials`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/Validate Bedrock inputs/);
+      expect(yaml).toMatch(/provider=bedrock but aws_region dispatch input is empty/);
+      expect(yaml).toMatch(/provider=bedrock but AWS_BEDROCK_ROLE_ARN repo secret is not set/);
+      expect(yaml.indexOf("Validate Bedrock inputs")).toBeLessThan(yaml.indexOf("Configure AWS credentials (Bedrock)"));
     });
   }
 

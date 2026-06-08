@@ -44,11 +44,17 @@ model: claude-sonnet-4-6
     setup      Path (relative to repo root) to a shell script that runs BEFORE Claude.
                Use this to start services, install dependencies, and run migrations.
                Export env vars via `echo "VAR=value" >> "$GITHUB_ENV"` — they persist
-               to Claude and all subsequent steps.
+               to Claude and all subsequent steps. Only the simple `VAR=value` form
+               is supported; GitHub Actions' heredoc multiline syntax (`VAR<<EOF`) is
+               NOT — such lines are ignored with a warning.
     verify     Path to a shell script that runs AFTER Claude, only on success.
                Use this to run tests or smoke checks.
     teardown   Path to a shell script that runs AFTER Claude, even on failure.
                Use this to stop containers or clean up resources.
+
+    NOTE: Hooks run only in GitHub Actions execution mode. On Fly/local modes the
+    workspace is empty when WORKFLOW.md is read (the repo is cloned later), so
+    setup/verify/teardown are silently skipped.
 
   SETUP AND TEARDOWN HOOKS
   ------------------------

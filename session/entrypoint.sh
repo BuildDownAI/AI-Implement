@@ -20,7 +20,13 @@ log "Execution mode: $AI_IMPLEMENT_MODE"
 export AI_IMPLEMENT_MODE
 
 # ── 2. Env validation ────────────────────────────────────────────────────────
-require_one_of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
+PROVIDER="${PROVIDER:-anthropic}"
+case "$PROVIDER" in
+  bedrock) [ "$AI_IMPLEMENT_MODE" = "gha" ] || fail "provider=bedrock is supported only in GHA mode"; require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1; export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 ;;
+  anthropic) require_one_of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ;;
+  *) fail "Unsupported provider: $PROVIDER" ;;
+esac
+export PROVIDER
 require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
 
 if [ "$AI_IMPLEMENT_MODE" = "gha" ]; then

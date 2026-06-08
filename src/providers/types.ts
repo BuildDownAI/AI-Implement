@@ -52,6 +52,11 @@ export interface TicketingProvider {
   // Communication
   postComment(issueId: string, body: string): Promise<void>;
 
+  /** Planning context produced during the planning phase, formatted for injection
+   *  into the implementation prompt. Returns "" when there is none (or on any
+   *  fetch error — this is best-effort context, never a hard dependency). */
+  fetchPlanningContext(issueId: string): Promise<string>;
+
   /** Stable user-facing URL for the issue. */
   issueUrl(issue: TicketIssue): string;
 

@@ -7,7 +7,6 @@
 #   AI_IMPLEMENT_PRIVATE_KEY - GitHub App PEM private key
 #   ANTHROPIC_API_KEY        - Anthropic API key
 #   CLAUDE_CODE_OAUTH_TOKEN  - Claude Code OAuth token (preferred over API key)
-#   LINEAR_API_KEY           - Linear API key for status updates
 #
 # Additional secret (Bedrock provider):
 #   AWS_BEDROCK_ROLE_ARN     - IAM role ARN trusted to GitHub OIDC; needs bedrock:InvokeModel
@@ -25,19 +24,19 @@ on:
   workflow_dispatch:
     inputs:
       issue_id:
-        description: "Linear issue UUID"
+        description: "Ticketing-system issue ID"
         required: true
         type: string
       issue_identifier:
-        description: "Linear issue identifier (e.g., ENG-123)"
+        description: "Ticketing-system issue identifier (e.g., ENG-123)"
         required: true
         type: string
       issue_title:
-        description: "Linear issue title"
+        description: "Ticketing-system issue title"
         required: true
         type: string
       issue_description:
-        description: "Linear issue description"
+        description: "Ticketing-system issue description"
         required: true
         type: string
       pr_number:
@@ -62,6 +61,21 @@ on:
         default: "anthropic"
       aws_region:
         description: "AWS region for Bedrock (required when provider=bedrock)"
+        required: false
+        type: string
+        default: ""
+      max_turns:
+        description: "Cap on Claude turns per implement pass (empty = runner default)"
+        required: false
+        type: string
+        default: ""
+      max_iterations:
+        description: "Cap on implement/review iterations (empty = provider default)"
+        required: false
+        type: string
+        default: ""
+      job_timeout_minutes:
+        description: "Per-project job timeout in minutes, must be a positive integer (empty = 90)"
         required: false
         type: string
         default: ""
@@ -159,7 +173,7 @@ jobs:
   implement:
     needs: validate-runner-image
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: ${{ inputs.job_timeout_minutes && fromJSON(inputs.job_timeout_minutes) || 90 }}
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}
     steps:
@@ -169,6 +183,23 @@ jobs:
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
+
+      - name: Validate Bedrock inputs
+        if: inputs.provider == 'bedrock'
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_REGION" ]; then
+            echo "::error::provider=bedrock but aws_region dispatch input is empty."
+            echo "::error::Set awsRegion on this team's mapping in the orchestrator admin UI."
+            exit 1
+          fi
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::provider=bedrock but AWS_BEDROCK_ROLE_ARN repo secret is not set."
+            echo "::error::Add the IAM role ARN trusted to GitHub OIDC with bedrock:InvokeModel permission."
+            exit 1
+          fi
 
       - name: Configure AWS credentials (Bedrock)
         if: inputs.provider == 'bedrock'
@@ -199,9 +230,11 @@ jobs:
           RUNNER_PHASE: ${{ inputs.runner_phase }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}
+          AI_IMPLEMENT_MAX_TURNS: ${{ inputs.max_turns }}
+          AI_IMPLEMENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
+          AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}

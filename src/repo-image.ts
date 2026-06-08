@@ -108,3 +108,27 @@ async function fetchImage(
 
   return { image: candidate, source: "override" };
 }
+
+/**
+ * Decides whether a resolved image should be forwarded to a target workflow as
+ * the `runner_image` workflow_dispatch input.
+ *
+ * We only forward when the image represents an *explicit* choice:
+ *   - a per-repo `.ai-implement/image.yml` override (source === "override"), or
+ *   - an explicitly-set SESSION_IMAGE on the orchestrator.
+ *
+ * When neither is true the resolved image is just the built-in fallback, so we
+ * return `undefined` and let the target workflow keep its own resolution
+ * (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in
+ * default). This keeps repos that pin via that variable from being silently
+ * overridden by the orchestrator's default.
+ */
+export function selectRunnerImageInput(opts: {
+  resolved: ResolveSessionImageResult;
+  sessionImageExplicit: boolean;
+}): string | undefined {
+  if (opts.resolved.source === "override" || opts.sessionImageExplicit) {
+    return opts.resolved.image;
+  }
+  return undefined;
+}

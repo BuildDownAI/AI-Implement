@@ -526,6 +526,65 @@ describe("admin mappings", () => {
     expect(JSON.parse(res.body).error).toMatch(/bedrock.*fly-machines/);
   });
 
+  it("creates a mapping with maxTurns/maxIterations/maxJobMinutes and round-trips them", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPS", owner: "org", repo: "caps-repo",
+      maxTurns: 40, maxIterations: 2, maxJobMinutes: 30,
+    }, token);
+    expect(create.statusCode).toBe(200);
+    const body = JSON.parse(create.body);
+    expect(body.maxTurns).toBe(40);
+    expect(body.maxIterations).toBe(2);
+    expect(body.maxJobMinutes).toBe(30);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    const m = JSON.parse(list.body).CAPS;
+    expect(m.maxTurns).toBe(40);
+    expect(m.maxIterations).toBe(2);
+    expect(m.maxJobMinutes).toBe(30);
+  });
+
+  it("defaults maxTurns/maxIterations/maxJobMinutes to null when omitted", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPD", owner: "org", repo: "capd-repo",
+    }, token);
+    expect(create.statusCode).toBe(200);
+    const body = JSON.parse(create.body);
+    expect(body.maxTurns).toBeNull();
+    expect(body.maxIterations).toBeNull();
+    expect(body.maxJobMinutes).toBeNull();
+  });
+
+  it("rejects maxTurns:0 with 400 mentioning maxTurns", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad", maxTurns: 0,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/maxTurns/);
+  });
+
+  it("rejects maxIterations:-1 with 400 mentioning maxIterations", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad", maxIterations: -1,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/maxIterations/);
+  });
+
+  it("accepts null maxTurns explicitly and stores null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPN", owner: "org", repo: "capn-repo",
+      maxTurns: null,
+    }, token);
+    expect(create.statusCode).toBe(200);
+    expect(JSON.parse(create.body).maxTurns).toBeNull();
+  });
+
   it("upsertMapping accepts a Jira ticketingProvider with valid config", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {

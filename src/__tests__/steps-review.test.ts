@@ -20,7 +20,6 @@ function makeContext(executor?: LLMExecutor): DefaultPipelineContext {
       issueDescription: "Description",
       nonce: "nonce",
       orchestratorUrl: "http://localhost:8080",
-      ticketingProvider: "linear",
     },
     executor,
   );
@@ -136,6 +135,50 @@ describe("reviewStep", () => {
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     expect(outputs.tokensUsed).toBe(200);
+  });
+
+  it("truncates an oversized diff so the prompt stays within the model context window", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+    // A regenerated-codegen diff can be hundreds of KB — far past the model's
+    // input limit. The review prompt must cap it rather than embed it verbatim.
+    const hugeDiff = "+".repeat(500_000);
+
+    await reviewStep.run(makeContext(executor), { diff: hugeDiff }, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt.length).toBeLessThan(hugeDiff.length);
+    expect(call.prompt).toContain("diff truncated");
+  });
+
+  it("truncates an oversized diff at a clean line boundary when one precedes the cap", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+    // Oversized diff whose only newline sits before the 200k char cap, so the
+    // cut should land on that newline (the `cut > 0` branch) rather than the
+    // hard cap. Lengths chosen so the boundary is unambiguous: 150_000.
+    // Distinct head/tail chars so the tail assertion is meaningful (a run of
+    // "+" would be a substring of an all-"+" head).
+    const head = "+".repeat(150_000);
+    const tail = "x".repeat(100_000);
+    const diff = `${head}\n${tail}`;
+
+    await reviewStep.run(makeContext(executor), { diff }, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    // Marker reports the line-boundary cut (150_000), not the hard cap (200_000).
+    expect(call.prompt).toContain(`showing first 150000 of ${diff.length} characters`);
+    // The tail past the newline must not be embedded.
+    expect(call.prompt).not.toContain("x");
+  });
+
+  it("does not truncate a normal-sized diff", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+    const smallDiff = "diff --git a/foo.ts\n+added line";
+
+    await reviewStep.run(makeContext(executor), { diff: smallDiff }, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt).toContain("added line");
+    expect(call.prompt).not.toContain("diff truncated");
   });
 
   it("correctly extracts JSON when preamble contains stray braces", async () => {

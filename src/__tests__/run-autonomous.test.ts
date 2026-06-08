@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runAutonomous } from "../run-autonomous.js";
+import { runAutonomous, resolveLogLevel } from "../run-autonomous.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
@@ -348,16 +348,13 @@ describe("runAutonomous", () => {
     expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-sonnet-4-6");
   });
 
-  it("fetches planning context when LINEAR_API_KEY is set", async () => {
-    vi.stubEnv("LINEAR_API_KEY", "lin_api_test");
+  it("fetches planning context from the orchestrator using the progress token", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orch.example.com");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({
-        data: {
-          issue: { comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } },
-        },
-      }),
+      json: async () => ({ planningContext: "" }),
     });
 
     const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
@@ -373,30 +370,39 @@ describe("runAutonomous", () => {
     });
 
     expect(mockFetch).toHaveBeenCalledWith(
-      "https://api.linear.app/graphql",
-      expect.objectContaining({ method: "POST" }),
+      "https://orch.example.com/runner/planning-context",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({ Authorization: "Bearer ptok" }),
+      }),
     );
   });
 
+  it("does not fetch planning context when no callback token is present", async () => {
+    const mockFetch = vi.fn();
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
+    const { pipeline, runner } = makeSingleStepPipeline("noop", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("stores fetched planning context on the pipeline context", async () => {
-    vi.stubEnv("LINEAR_API_KEY", "lin_api_test");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orch.example.com");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "ptok");
 
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
-        data: {
-          issue: {
-            comments: {
-              nodes: [
-                {
-                  body: "## 🏗️ AI Planning: Architecture Analysis\nUse the service layer",
-                  createdAt: "2026-05-15T00:00:00.000Z",
-                },
-              ],
-              pageInfo: { hasNextPage: false, endCursor: null },
-            },
-          },
-        },
+        planningContext: "## Planning Context\n\nUse the service layer",
       }),
     });
 
@@ -733,5 +739,74 @@ describe("runAutonomous", () => {
     await expect(
       runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter() }),
     ).rejects.toThrow("Missing required env var: ISSUE_ID");
+  });
+
+  it("runs the teardown hook even when the pipeline fails", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\n');
+    const { pipeline, runner } = makeSingleStepPipeline("bad-step", {
+      run: vi.fn().mockRejectedValue(new Error("step exploded")),
+    });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+
+  it("runs the teardown hook on a successful run", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\n');
+    const { pipeline, runner } = makeSingleStepPipeline("ok-step", { run: vi.fn().mockResolvedValue({}) });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+
+  it("a failing teardown does not mask the run outcome or throw", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
+    // Teardown runs (marker) but exits non-zero — its failure must not change the
+    // pipeline's exitCode 1 nor surface as an unhandled rejection.
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\nexit 1\n');
+    const { pipeline, runner } = makeSingleStepPipeline("bad-step", {
+      run: vi.fn().mockRejectedValue(new Error("step exploded")),
+    });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
+});
+
+describe("resolveLogLevel", () => {
+  it("returns stream when set to stream", () => {
+    expect(resolveLogLevel("stream")).toBe("stream");
+  });
+  it("defaults to summary when unset", () => {
+    expect(resolveLogLevel(undefined)).toBe("summary");
+  });
+  it("defaults to summary for an unrecognized value", () => {
+    expect(resolveLogLevel("loud")).toBe("summary");
   });
 });

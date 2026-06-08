@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, cancelWorkflowRun } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, cancelWorkflowRun } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -22,6 +22,9 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     ticketingConfig: { kind: "linear" },
     awsRegion: null,
     paused: false,
+    maxTurns: null,
+    maxIterations: null,
+    maxJobMinutes: null,
     ...overrides,
   };
 }
@@ -88,6 +91,23 @@ describe("dispatchWorkflow", () => {
     const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
     expect(body.inputs.provider).toBeUndefined();
     expect(body.inputs.aws_region).toBeUndefined();
+  });
+
+  it("forwards runner_image when present in inputs", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    await dispatchWorkflow("gh-token", mockMapping, {
+      ...mockInputs,
+      runner_image: "ghcr.io/builddownai/ai-implement-runner:next",
+    });
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    expect(body.inputs.runner_image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
+  });
+
+  it("omits runner_image when not provided", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    await dispatchWorkflow("gh-token", mockMapping, mockInputs);
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+    expect(body.inputs.runner_image).toBeUndefined();
   });
 
   it("forwards provider and aws_region in inputs for bedrock mappings", async () => {
@@ -200,6 +220,47 @@ describe("providerDispatchFields", () => {
     expect(
       providerDispatchFields(makeMapping({ provider: "bedrock", awsRegion: null })),
     ).toEqual({ provider: "bedrock" });
+  });
+});
+
+describe("capDispatchFields", () => {
+  it("returns empty object when no caps are set", () => {
+    expect(capDispatchFields(makeMapping({}))).toEqual({});
+  });
+
+  it("includes only the caps that are set, as strings", () => {
+    expect(
+      capDispatchFields(makeMapping({ maxTurns: 40, maxIterations: 2, maxJobMinutes: 30 })),
+    ).toEqual({ max_turns: "40", max_iterations: "2", job_timeout_minutes: "30" });
+  });
+
+  it("omits caps left null", () => {
+    expect(capDispatchFields(makeMapping({ maxTurns: 40 }))).toEqual({ max_turns: "40" });
+  });
+});
+
+describe("capRunnerEnv", () => {
+  it("returns empty object when no caps are set", () => {
+    expect(capRunnerEnv(makeMapping({}))).toEqual({});
+  });
+
+  it("includes turn/iteration caps as env vars (strings) when set", () => {
+    expect(capRunnerEnv(makeMapping({ maxTurns: 40, maxIterations: 2 }))).toEqual({
+      AI_IMPLEMENT_MAX_TURNS: "40",
+      AI_IMPLEMENT_MAX_ITERATIONS: "2",
+    });
+  });
+
+  it("omits job timeout (GHA-only, not a runner env var)", () => {
+    expect(capRunnerEnv(makeMapping({ maxTurns: 40, maxJobMinutes: 30 }))).toEqual({
+      AI_IMPLEMENT_MAX_TURNS: "40",
+    });
+  });
+
+  it("omits caps left null", () => {
+    expect(capRunnerEnv(makeMapping({ maxIterations: 3 }))).toEqual({
+      AI_IMPLEMENT_MAX_ITERATIONS: "3",
+    });
   });
 });
 
