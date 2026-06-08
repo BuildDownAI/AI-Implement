@@ -857,6 +857,33 @@ git commit -m "docs: document per-project branch prefix"
 
 ---
 
+## Task 11: Apply the prefix to the Sync Workflows PR branch
+
+**Files:**
+- Modify: `src/workflow-sync.ts`
+- Test: `src/__tests__/workflow-sync.test.ts`
+
+The admin "Sync Workflows" action (`syncWorkflowTemplates`) opens a PR in the target repo
+on the hardcoded branch `sync/ai-implement`. Apply the per-project prefix there too so a
+repo with a blanket "all PR branches start with `<prefix>`" policy is satisfied.
+
+- [ ] Add a module-private helper that mirrors `buildIssueBranchName`'s defensive
+      trim/slash-strip:
+
+```typescript
+function buildSyncBranchName(prefix: string | null | undefined): string {
+  const cleaned = (prefix ?? "").trim().replace(/^\/+|\/+$/g, "");
+  return cleaned ? `${cleaned}/sync/ai-implement` : "sync/ai-implement";
+}
+```
+
+- [ ] Change `const syncBranch = options.syncBranch ?? "sync/ai-implement";` to
+      `const syncBranch = options.syncBranch ?? buildSyncBranchName(mapping.branchPrefix);`
+      so an explicit `options.syncBranch` is still used verbatim and only the default is prefixed.
+- [ ] Tests: prefix applied (`pr` → `pr/sync/ai-implement`, branch created, opened PR head
+      matches), null prefix → `sync/ai-implement`, explicit `syncBranch` bypasses the prefix.
+- [ ] Commit: `feat(sync): apply per-project branch prefix to Sync Workflows PR branch`
+
 ## Task 10: Full verification
 
 - [ ] **Step 1: Typecheck**

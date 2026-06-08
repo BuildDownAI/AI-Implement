@@ -21,6 +21,11 @@ for every existing project).
   Claude not to create a new branch, and `appendPipelineOwnedGitInstructions` skips the
   pipeline-owned push for gap-fill). They therefore need no prefix plumbing — no
   `comment-trigger.yml` changes and no target-repo variable, unlike the run-caps.
+- **Sync Workflows PR branch too.** The admin "Sync Workflows" action opens a PR in
+  the target repo on the branch `sync/ai-implement` (`src/workflow-sync.ts`). The prefix
+  is also prepended there (`pr/sync/ai-implement`), so a repo with a blanket "all PR
+  branches start with `<prefix>`" policy is satisfied for sync PRs as well. An explicitly
+  passed `syncBranch` override is used verbatim (not prefixed).
 
 ## Semantics & validation
 
