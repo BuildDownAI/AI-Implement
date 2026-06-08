@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, capDispatchFields, capRunnerEnv, cancelWorkflowRun } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, cancelWorkflowRun } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -25,6 +25,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxTurns: null,
     maxIterations: null,
     maxJobMinutes: null,
+    branchPrefix: null,
     ...overrides,
   };
 }
@@ -211,5 +212,30 @@ describe("cancelWorkflowRun", () => {
   it("returns false on 404 without throwing", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({ status: 404, ok: false } as Response);
     await expect(cancelWorkflowRun("token", "owner", "repo", 1)).resolves.toBe(false);
+  });
+});
+
+describe("branchPrefixDispatchFields", () => {
+  it("returns empty object when no prefix is set", () => {
+    expect(branchPrefixDispatchFields(makeMapping({}))).toEqual({});
+    expect(branchPrefixDispatchFields(makeMapping({ branchPrefix: null }))).toEqual({});
+  });
+
+  it("includes branch_prefix when set", () => {
+    expect(branchPrefixDispatchFields(makeMapping({ branchPrefix: "pr" }))).toEqual({
+      branch_prefix: "pr",
+    });
+  });
+});
+
+describe("branchPrefixRunnerEnv", () => {
+  it("returns empty object when no prefix is set", () => {
+    expect(branchPrefixRunnerEnv(makeMapping({}))).toEqual({});
+  });
+
+  it("includes AI_IMPLEMENT_BRANCH_PREFIX when set", () => {
+    expect(branchPrefixRunnerEnv(makeMapping({ branchPrefix: "pr" }))).toEqual({
+      AI_IMPLEMENT_BRANCH_PREFIX: "pr",
+    });
   });
 });
