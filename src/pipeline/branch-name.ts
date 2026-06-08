@@ -1,6 +1,6 @@
 const MAX_BRANCH_SUMMARY_LENGTH = 48;
 const MAX_BRANCH_PREFIX_LENGTH = 64;
-const BRANCH_PREFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const BRANCH_PREFIX_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function slugify(value: string | undefined, fallback: string): string {
   const slug = (value ?? "")
@@ -30,10 +30,12 @@ export function normalizeBranchPrefix(raw: string | null | undefined): string | 
   if (value.includes("..") || value.includes("//")) {
     throw new Error("branchPrefix must not contain '..' or '//'");
   }
-  if (!BRANCH_PREFIX_PATTERN.test(value)) {
-    throw new Error(
-      "branchPrefix may contain only letters, digits, '.', '_', '-', '/' and must start with a letter or digit",
-    );
+  for (const segment of value.split("/")) {
+    if (!BRANCH_PREFIX_SEGMENT_PATTERN.test(segment)) {
+      throw new Error(
+        "branchPrefix segments may contain only letters, digits, '.', '_', '-' and must each start with a letter or digit",
+      );
+    }
   }
   return value;
 }

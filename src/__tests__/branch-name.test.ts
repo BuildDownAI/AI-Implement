@@ -85,6 +85,14 @@ describe("normalizeBranchPrefix", () => {
     expect(() => normalizeBranchPrefix(".hidden")).toThrow();
     expect(() => normalizeBranchPrefix("x".repeat(65))).toThrow();
   });
+
+  it("accepts a prefix at the max length boundary", () => {
+    expect(normalizeBranchPrefix("x".repeat(64))).toBe("x".repeat(64));
+  });
+
+  it("rejects a path segment that starts with a dot", () => {
+    expect(() => normalizeBranchPrefix("foo/.hidden")).toThrow();
+  });
 });
 
 describe("branchMatchesIssueIdentifier with prefix", () => {
