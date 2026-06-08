@@ -739,6 +739,7 @@ git commit -m "feat(orchestrator): send branch_prefix on initial implementation 
 
 **Files:**
 - Modify: `.github/workflows/claude-implement.yml`
+- Modify: `workflows/claude-implement.yml` (the canonical synced template — `workflow-shim-structure.test.ts` enforces that these two files are byte-for-byte identical, so apply the SAME edits to both)
 
 - [ ] **Step 1: Add the workflow_dispatch input**
 
