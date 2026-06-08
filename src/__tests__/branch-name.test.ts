@@ -113,4 +113,18 @@ describe("branchMatchesIssueIdentifier with prefix", () => {
   it("still rejects longer issue keys sharing a prefix", () => {
     expect(branchMatchesIssueIdentifier("pr/ai-implement/gen-650-task-2", "GEN-65")).toBe(false);
   });
+
+  it("matches when a prefix segment embeds the marker substring", () => {
+    expect(branchMatchesIssueIdentifier(
+      "foo-ai-implement/gen-65-extra/ai-implement/gen-65-task",
+      "GEN-65",
+    )).toBe(true);
+  });
+
+  it("matches when the real marker is first and a longer-key marker is last", () => {
+    expect(branchMatchesIssueIdentifier(
+      "ai-implement/gen-65-foo/ai-implement/gen-650-bar",
+      "GEN-65",
+    )).toBe(true);
+  });
 });

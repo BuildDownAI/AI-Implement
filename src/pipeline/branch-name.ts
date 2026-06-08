@@ -66,15 +66,12 @@ export function branchMatchesIssueIdentifier(branchRef: string | undefined, issu
     // Legacy bare-identifier branches: "gen-65" or "gen-65/...".
     if (ref === identifier || ref.startsWith(`${identifier}/`)) return true;
 
-    // ai-implement/<identifier>, optionally preceded by a prefix path segment
-    // (e.g. "pr/ai-implement/gen-65-..."). The marker must sit at a segment
-    // boundary and be followed by end, '-' or '/' so "gen-65" never matches
-    // "gen-650".
-    const marker = `ai-implement/${identifier}`;
-    const idx = ref.indexOf(marker);
-    if (idx === -1) return false;
-    if (idx !== 0 && ref[idx - 1] !== "/") return false;
-    const after = ref[idx + marker.length];
-    return after === undefined || after === "-" || after === "/";
+    // ai-implement/<identifier> at a path-segment boundary, optionally preceded
+    // by a prefix path (e.g. "pr/ai-implement/gen-65-..."), followed by end, '-'
+    // or '/' so "gen-65" never matches "gen-650". A regex (rather than
+    // indexOf/lastIndexOf) so a prefix that itself embeds an
+    // "ai-implement/<key>" substring can't shadow the real trailing marker.
+    const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|/)ai-implement/${escaped}(-|/|$)`).test(ref);
   });
 }
