@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { qualifiesForFeatureBranch, resolveBaseBranch, MIN_CHILDREN_FOR_FEATURE_BRANCH } from "../feature-branch.js";
+import { resolveBaseBranch } from "../feature-branch.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
 
@@ -27,7 +27,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   };
 }
 
-function makeIssue(parentRef?: TicketIssue["parentRef"]): TicketIssue {
+function makeIssue(featureBranchChain?: string[]): TicketIssue {
   return {
     id: "child-uuid",
     identifier: "OOL-87",
@@ -35,39 +35,54 @@ function makeIssue(parentRef?: TicketIssue["parentRef"]): TicketIssue {
     description: null,
     scopeKey: "OOL",
     nativeStatus: "Todo (unstarted)",
-    ...(parentRef ? { parentRef } : {}),
+    ...(featureBranchChain ? { featureBranchChain } : {}),
   };
 }
-
-const parent = { identifier: "OOL-78", childCount: 3 };
-
-describe("qualifiesForFeatureBranch", () => {
-  it("is true only for a parent with >= MIN children", () => {
-    expect(MIN_CHILDREN_FOR_FEATURE_BRANCH).toBe(2);
-    expect(qualifiesForFeatureBranch(makeIssue({ ...parent, childCount: 2 }))).toBe(true);
-    expect(qualifiesForFeatureBranch(makeIssue({ ...parent, childCount: 1 }))).toBe(false);
-    expect(qualifiesForFeatureBranch(makeIssue(undefined))).toBe(false);
-  });
-});
 
 describe("resolveBaseBranch", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it("returns the feature branch and ensures it from defaultBranch when qualifying", async () => {
+  it("returns the feature branch and ensures it from defaultBranch for a single-entry chain", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce({ ok: false, status: 404 } as Response)                               // feature branch missing
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "base-sha" } }) } as Response) // base head
       .mockResolvedValueOnce({ ok: true, status: 201 } as Response);                                // create ref
 
-    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(parent), mapping: makeMapping() });
+    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(["OOL-78"]), mapping: makeMapping() });
 
     expect(base).toBe("ai-implement/feature/ool-78");
     const createBody = JSON.parse((vi.mocked(fetch).mock.calls[2][1] as RequestInit).body as string);
     expect(createBody).toEqual({ ref: "refs/heads/ai-implement/feature/ool-78", sha: "base-sha" });
   });
 
-  it("returns defaultBranch and creates nothing when not qualifying", async () => {
+  it("cascades a multi-entry chain: each branch cut from the previous one", async () => {
+    vi.mocked(fetch)
+      // ensure OOL-78 (missing → cut from testing)
+      .mockResolvedValueOnce({ ok: false, status: 404 } as Response)
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "testing-sha" } }) } as Response)
+      .mockResolvedValueOnce({ ok: true, status: 201 } as Response)
+      // ensure OOL-96 (missing → cut from OOL-78 branch)
+      .mockResolvedValueOnce({ ok: false, status: 404 } as Response)
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "f78-sha" } }) } as Response)
+      .mockResolvedValueOnce({ ok: true, status: 201 } as Response);
+
+    const base = await resolveBaseBranch({
+      ghToken: "t",
+      issue: makeIssue(["OOL-78", "OOL-96"]),
+      mapping: makeMapping(),
+    });
+
+    expect(base).toBe("ai-implement/feature/ool-96");
+    // The OOL-78 branch is read from refs/heads/testing; the OOL-96 branch is cut from the OOL-78 branch head.
+    const f78Sha = JSON.parse((vi.mocked(fetch).mock.calls[2][1] as RequestInit).body as string).sha;
+    expect(f78Sha).toBe("testing-sha");
+    const f96Sha = JSON.parse((vi.mocked(fetch).mock.calls[5][1] as RequestInit).body as string).sha;
+    expect(f96Sha).toBe("f78-sha");
+    expect(vi.mocked(fetch).mock.calls[4][0]).toContain("ai-implement/feature/ool-78");
+  });
+
+  it("returns defaultBranch and creates nothing when there is no chain", async () => {
     const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(undefined), mapping: makeMapping() });
     expect(base).toBe("testing");
     expect(vi.mocked(fetch).mock.calls.length).toBe(0);
@@ -77,7 +92,7 @@ describe("resolveBaseBranch", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response);
 
-    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(parent), mapping: makeMapping() });
+    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(["OOL-78"]), mapping: makeMapping() });
 
     expect(base).toBe("testing");
     expect(warn).toHaveBeenCalled();

@@ -15,12 +15,23 @@ export interface TicketIssue {
   /** Free-form, for logging only. Never branched on. */
   nativeStatus: string;
   /**
-   * Parent issue, when this issue is a child of a parent that has children.
-   * Populated by the Linear provider only; undefined for other providers.
-   * Drives feature-branch grouping (see src/feature-branch.ts). `identifier` names the
-   * shared branch; `childCount` is the parent's child count (capped at the query's page size).
+   * Immediate parent identifier, when this issue has a parent. Logging/informational only.
+   * Populated by the Linear provider; undefined for other providers.
    */
-  parentRef?: { identifier: string; childCount: number };
+  parentRef?: { identifier: string };
+  /**
+   * Feature-branch grouping chain, set by the Linear provider for dispatchable issues.
+   *
+   * An ordered list of issue identifiers (base-most first). Each names a feature branch
+   * `ai-implement/feature/<id>` that must exist before this issue dispatches; each branch
+   * is cut from the previous entry's branch (or mapping.defaultBranch for the first). This
+   * issue's PR targets the LAST entry's branch. Absent/empty → PR targets mapping.defaultBranch.
+   *
+   * For a leaf the chain ends at its nearest feature-node ancestor; for a feature-node parent
+   * whose AI-Implement children are all complete, the chain ends at the parent itself (its
+   * closing work lands on its own feature branch). See src/feature-branch.ts.
+   */
+  featureBranchChain?: string[];
 }
 
 export interface AIImplementSnapshot {

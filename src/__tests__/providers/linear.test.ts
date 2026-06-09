@@ -153,6 +153,17 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
+  type Ancestor = { identifier: string; labels?: string[]; parent?: Ancestor | null };
+  type Child = { labels?: string[]; stateType?: string };
+
+  function labelNodes(names: string[] | undefined) {
+    return { nodes: (names ?? []).map((name) => ({ name })) };
+  }
+  function ancestorNode(a: Ancestor | null | undefined): unknown {
+    if (!a) return null;
+    return { identifier: a.identifier, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
+  }
+
   function makeIssue(overrides: {
     id?: string;
     identifier?: string;
@@ -163,7 +174,8 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     stateType?: string;
     labels?: string[];
     inverseRelations?: Array<{ type: string; issue: { state: { type: string } } }>;
-    parent?: { identifier: string; childCount: number } | null;
+    parent?: Ancestor | null;
+    children?: Child[];
   } = {}) {
     return {
       id: overrides.id ?? "uuid-1",
@@ -178,12 +190,14 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       },
       labels: { nodes: (overrides.labels ?? []).map((name, i) => ({ id: `l${i}`, name })) },
       inverseRelations: { nodes: overrides.inverseRelations ?? [] },
-      parent: overrides.parent
-        ? {
-            identifier: overrides.parent.identifier,
-            children: { nodes: Array.from({ length: overrides.parent.childCount }, (_, i) => ({ id: `c${i}` })) },
-          }
-        : null,
+      children: {
+        nodes: (overrides.children ?? []).map((c, i) => ({
+          identifier: `${overrides.identifier ?? "ENG-1"}-c${i}`,
+          state: { type: c.stateType ?? "unstarted" },
+          labels: labelNodes(c.labels),
+        })),
+      },
+      parent: ancestorNode(overrides.parent),
     };
   }
 
@@ -217,13 +231,13 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     expect(snap.readyForImplementation[0].nativeStatus).toBe("Todo (unstarted)");
   });
 
-  it("maps parentRef with childCount when the issue has a parent; omits it otherwise", async () => {
+  it("maps parentRef when the issue has a parent; omits it otherwise", async () => {
     mockSinglePage([
       makeIssue({
         id: "child",
         identifier: "ENG-2",
         labels: ["AI-Implement", "Plan-Complete"],
-        parent: { identifier: "ENG-1", childCount: 3 },
+        parent: { identifier: "ENG-1", labels: ["AI-Implement"] },
       }),
       makeIssue({ id: "orphan", identifier: "ENG-9", labels: ["AI-Implement", "Plan-Complete"] }),
     ]);
@@ -232,9 +246,107 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     const snap = await p.fetchAIImplementSnapshot();
 
     const child = snap.readyForImplementation.find((i) => i.id === "child")!;
-    expect(child.parentRef).toEqual({ identifier: "ENG-1", childCount: 3 });
+    expect(child.parentRef).toEqual({ identifier: "ENG-1" });
     const orphan = snap.readyForImplementation.find((i) => i.id === "orphan")!;
     expect(orphan.parentRef).toBeUndefined();
+  });
+
+  describe("feature-branch grouping", () => {
+    it("a leaf under a labeled parent targets the parent's feature-branch chain", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-96",
+          labels: ["AI-Implement", "Plan-Complete"],
+          parent: { identifier: "OOL-78", labels: ["AI-Implement"] },
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const leaf = snap.readyForImplementation.find((i) => i.id === "leaf")!;
+      expect(leaf.featureBranchChain).toEqual(["OOL-78"]);
+    });
+
+    it("a leaf under an UNlabeled parent gets no chain (PRs to base)", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-50",
+          labels: ["AI-Implement"],
+          parent: { identifier: "OOL-40", labels: ["Improvement"] },
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const leaf = snap.needsPlanning.find((i) => i.id === "leaf")!;
+      expect(leaf.featureBranchChain).toBeUndefined();
+    });
+
+    it("cascades the chain through labeled grandparents", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-99",
+          labels: ["AI-Implement"],
+          parent: {
+            identifier: "OOL-96",
+            labels: ["AI-Implement"],
+            parent: { identifier: "OOL-78", labels: ["AI-Implement"] },
+          },
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const leaf = snap.needsPlanning.find((i) => i.id === "leaf")!;
+      // base-most first
+      expect(leaf.featureBranchChain).toEqual(["OOL-78", "OOL-96"]);
+    });
+
+    it("skips a feature-node parent while any AI-Implement child is in flight", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+            { labels: ["AI-Implement"], stateType: "started" }, // still in flight
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
+    });
+
+    it("dispatches a feature-node parent once all AI-Implement children are terminal, onto its own branch", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+            { labels: ["AI-Implement"], stateType: "canceled" },
+            { labels: ["Improvement"], stateType: "started" }, // non-AI child does not gate
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
+      expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+    });
+
+    it("skips a labeled parent whose children are not yet AI-Implement (race guard)", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          children: [{ labels: ["Improvement"], stateType: "unstarted" }],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
+    });
   });
 
   it("counts AI-Working / AI-Planning issues by scope and excludes them from buckets", async () => {

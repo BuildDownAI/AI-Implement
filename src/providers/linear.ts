@@ -13,6 +13,36 @@ interface GraphQLResponse<T> {
   errors?: Array<{ message: string }>;
 }
 
+const AI_IMPLEMENT_LABEL = "AI-Implement";
+
+/** A node in the ancestor chain: identifier + labels, with a nullable parent. */
+type AncestorNode = {
+  identifier: string;
+  labels?: { nodes: Array<{ name: string }> };
+  parent?: AncestorNode | null;
+} | null;
+
+/**
+ * Walks up the ancestor chain from `parent` while each ancestor carries the AI-Implement
+ * label, returning the contiguous run of labeled-ancestor identifiers base-most first.
+ *
+ * Because this issue is itself an AI-Implement child, any labeled ancestor in this run is a
+ * feature node (it has >=1 AI-Implement child), so the run is exactly the nest of feature
+ * branches this issue's PR should cascade through. The walk stops at the first unlabeled
+ * ancestor (its child cuts from the base branch, not a feature branch).
+ */
+function labeledAncestorChain(parent: AncestorNode): string[] {
+  const collected: string[] = [];
+  let node = parent;
+  while (node) {
+    const hasLabel = (node.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
+    if (!hasLabel) break;
+    collected.push(node.identifier);
+    node = node.parent ?? null;
+  }
+  return collected.reverse();
+}
+
 export class LinearProvider implements TicketingProvider {
   readonly id = "linear";
   private static readonly MOVABLE_STATE_TYPES = new Set(["triage", "backlog", "unstarted"]);
@@ -125,10 +155,37 @@ export class LinearProvider implements TicketingProvider {
             inverseRelations(first: 50) {
               nodes { type issue { state { type } } }
             }
+            # This issue's direct children, with labels + state — drives feature-node vs.
+            # leaf classification and the "parent waits for all AI children" gate.
+            # first:50 caps the count; parents with >50 children degrade gracefully.
+            children(first: 50) {
+              nodes {
+                identifier
+                state { type }
+                labels { nodes { name } }
+              }
+            }
+            # Ancestor chain (labels only) — used to build the cascading feature-branch
+            # chain. Nested to a fixed depth; deeper ancestries cut from the base branch.
             parent {
               identifier
-              # first:50 caps childCount; harmless for the >=2 grouping threshold
-              children(first: 50) { nodes { id } }
+              labels { nodes { name } }
+              parent {
+                identifier
+                labels { nodes { name } }
+                parent {
+                  identifier
+                  labels { nodes { name } }
+                  parent {
+                    identifier
+                    labels { nodes { name } }
+                    parent {
+                      identifier
+                      labels { nodes { name } }
+                    }
+                  }
+                }
+              }
             }
           }
           pageInfo {
@@ -139,6 +196,13 @@ export class LinearProvider implements TicketingProvider {
       }
     `;
 
+    type LinearLabelNodes = { nodes: Array<{ name: string }> };
+    type LinearAncestor = {
+      identifier: string;
+      labels: LinearLabelNodes;
+      parent: LinearAncestor | null;
+    };
+
     type LinearIssueResponse = {
       id: string;
       identifier: string;
@@ -148,10 +212,8 @@ export class LinearProvider implements TicketingProvider {
       state: { id: string; name: string; type: string };
       labels: { nodes: Array<{ id: string; name: string }> };
       inverseRelations: { nodes: Array<{ type: string; issue: { state: { type: string } } }> };
-      parent: {
-        identifier: string;
-        children: { nodes: Array<{ id: string }> };
-      } | null;
+      children: { nodes: Array<{ identifier: string; state: { type: string }; labels: LinearLabelNodes }> };
+      parent: LinearAncestor | null;
     };
 
     type IssuePage = {
@@ -210,6 +272,39 @@ export class LinearProvider implements TicketingProvider {
         continue;
       }
 
+      // Feature-branch grouping (see src/feature-branch.ts). An AI-Implement issue is one of:
+      //   - leaf (no children)            → implement now; PR targets nearest feature-node
+      //                                      ancestor branch (or base).
+      //   - feature-node (>=1 AI child)   → its own work waits until ALL its AI-Implement
+      //                                      children reach a terminal state, then implements
+      //                                      onto its OWN feature branch. While children are in
+      //                                      flight the parent is skipped (its branch is cut
+      //                                      lazily when the first child dispatches).
+      //   - waiting parent (children but  → skipped (race guard: the parent was labeled before
+      //     none AI-Implement yet)          its children were, so let it sit).
+      const children = issue.children?.nodes ?? [];
+      const aiChildren = children.filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL));
+      const ancestorChain = labeledAncestorChain(issue.parent);
+
+      let featureBranchChain: string[] | undefined;
+      if (children.length === 0) {
+        // Leaf.
+        featureBranchChain = ancestorChain.length > 0 ? ancestorChain : undefined;
+      } else if (aiChildren.length > 0) {
+        const allAIChildrenTerminal = aiChildren.every(
+          (c) => c.state?.type === "completed" || c.state?.type === "canceled",
+        );
+        if (!allAIChildrenTerminal) {
+          console.log(`[linear] Skipping ${issue.identifier}: feature-node parent waiting on in-flight AI-Implement children`);
+          continue;
+        }
+        // All AI-Implement children done — implement the parent's closing work onto its own branch.
+        featureBranchChain = [...ancestorChain, issue.identifier];
+      } else {
+        console.log(`[linear] Skipping ${issue.identifier}: parent labeled but no child has AI-Implement set yet`);
+        continue;
+      }
+
       const ticketIssue: TicketIssue = {
         id: issue.id,
         identifier: issue.identifier,
@@ -217,14 +312,8 @@ export class LinearProvider implements TicketingProvider {
         description: issue.description,
         scopeKey: issue.team.key,
         nativeStatus: `${issue.state.name} (${issue.state.type})`,
-        ...(issue.parent
-          ? {
-              parentRef: {
-                identifier: issue.parent.identifier,
-                childCount: issue.parent.children?.nodes?.length ?? 0,
-              },
-            }
-          : {}),
+        ...(issue.parent ? { parentRef: { identifier: issue.parent.identifier } } : {}),
+        ...(featureBranchChain ? { featureBranchChain } : {}),
       };
 
       if (labelNames.has("Plan-Complete")) {
