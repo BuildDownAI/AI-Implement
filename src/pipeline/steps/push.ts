@@ -67,20 +67,31 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     const expectedRemoteSha = await span("git-ls-remote", async () =>
       resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken),
     );
-    const pushResult = await span("git-push", async () =>
-      spawnSync(
-        "git",
-        [
-          "push",
-          remote,
-          `HEAD:${remoteRef}`,
-          `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
-        ],
-        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
-      ),
+    const tracePush = process.env.AI_IMPLEMENT_LOG_LEVEL === "stream";
+    const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
+      remote,
+      remoteRef,
+      expectedRemoteSha,
+      tracePush,
     );
+    const pushResult = await span("git-push", async () =>
+      spawnSync("git", pushArgs, {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: pushEnv,
+      }),
+    );
+    if (tracePush) {
+      // Diagnostic for slow pushes: GIT_TRACE2_PERF region timings (pack-objects
+      // vs send-pack vs server wait) + --verbose object counts. Redact the token
+      // with replaceAll — the tokenized remote URL can recur many times here.
+      const trace = `${pushResult.stdout?.toString() ?? ""}${pushResult.stderr?.toString() ?? ""}`
+        .replaceAll(githubToken, "***")
+        .trim();
+      if (trace) console.error(`[git-push trace]\n${trace}`);
+    }
     if (pushResult.status !== 0) {
-      const stderr = (pushResult.stderr?.toString() ?? "").replace(githubToken, "***");
+      const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(githubToken, "***");
       throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
     }
 
@@ -158,6 +169,29 @@ async function createOrFindPullRequest(
 
   const body = await prRes.text().catch(() => "");
   throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
+}
+
+/**
+ * Build the `git push` argv and spawn env. When `trace` is true (driven by
+ * AI_IMPLEMENT_LOG_LEVEL=stream), it adds `--verbose` and `GIT_TRACE2_PERF=1`
+ * so a slow push can be diagnosed — region timings (pack-objects vs send-pack
+ * vs server wait) plus object counts land on the captured stderr.
+ */
+export function buildGitPushInvocation(
+  remote: string,
+  remoteRef: string,
+  expectedRemoteSha: string | null,
+  trace: boolean,
+): { args: string[]; env: NodeJS.ProcessEnv } {
+  const args = [
+    "push",
+    ...(trace ? ["--verbose"] : []),
+    remote,
+    `HEAD:${remoteRef}`,
+    `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
+  ];
+  const env = trace ? { ...process.env, GIT_TRACE2_PERF: "1" } : process.env;
+  return { args, env };
 }
 
 function buildCommitMessage(issueIdentifier: string, issueTitle: string): string {
