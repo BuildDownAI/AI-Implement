@@ -401,6 +401,46 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   });
 });
 
+describe("LinearProvider.fetchFeatureNodeRollUps", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  function mockResponse(nodes: unknown[]) {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ data: { issues: { nodes } } }),
+    } as Response);
+  }
+  const labels = (...names: string[]) => ({ nodes: names.map((name) => ({ name })) });
+
+  it("returns feature nodes with parent target; non-feature parent → null (base)", async () => {
+    mockResponse([
+      { identifier: "OOL-107", team: { key: "OOL" },
+        children: { nodes: [{ labels: labels("AI-Implement") }] },
+        parent: { identifier: "OOL-106", labels: labels("AI-Implement") } },
+      { identifier: "OOL-106", team: { key: "OOL" },
+        children: { nodes: [{ labels: labels("AI-Implement") }] },
+        parent: null },
+    ]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([
+      { identifier: "OOL-107", scopeKey: "OOL", parentIdentifier: "OOL-106" },
+      { identifier: "OOL-106", scopeKey: "OOL", parentIdentifier: null },
+    ]);
+  });
+
+  it("excludes completed issues that are not feature nodes (no AI-Implement child)", async () => {
+    mockResponse([
+      { identifier: "OOL-50", team: { key: "OOL" },
+        children: { nodes: [{ labels: labels("Improvement") }] }, parent: null },
+      { identifier: "OOL-51", team: { key: "OOL" },
+        children: { nodes: [] }, parent: null },
+    ]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([]);
+  });
+});
+
 // ----- Lifecycle verb tests -----
 
 function mockJsonOnce(data: unknown) {

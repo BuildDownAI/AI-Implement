@@ -1,5 +1,6 @@
 import type {
   AIImplementSnapshot,
+  FeatureNodeRollUp,
   IssueLifecycleState,
   TicketIssue,
   TicketingProvider,
@@ -14,6 +15,9 @@ interface GraphQLResponse<T> {
 }
 
 const AI_IMPLEMENT_LABEL = "AI-Implement";
+
+/** How far back to scan completed feature nodes for roll-up (bounds the query). */
+const ROLLUP_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 
 /** A node in the ancestor chain: identifier + labels, with a nullable parent. */
 type AncestorNode = {
@@ -325,6 +329,61 @@ export class LinearProvider implements TicketingProvider {
 
     return { needsPlanning, readyForImplementation, inProgressCountsByScope };
   }
+
+  async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {
+    // Recently-completed AI-Implement issues that are feature nodes (>=1 AI-Implement
+    // child) need their feature branch rolled up into the parent. Bound the scan to a
+    // recent window so the set stays small; the merge-up step skips already-merged
+    // branches cheaply via a branch comparison. A completed feature node implies its
+    // own closing work merged and all its children done.
+    const since = new Date(Date.now() - ROLLUP_LOOKBACK_MS).toISOString();
+    const data = await this.linearMutation<{
+      issues: {
+        nodes: Array<{
+          identifier: string;
+          team: { key: string };
+          children: { nodes: Array<{ labels: { nodes: Array<{ name: string }> } }> };
+          parent: { identifier: string; labels: { nodes: Array<{ name: string }> } } | null;
+        }>;
+      };
+    }>(
+      `query($since: DateTimeOrDuration!) {
+        issues(
+          first: 100
+          filter: {
+            labels: { name: { eq: "AI-Implement" } }
+            state: { type: { eq: "completed" } }
+            updatedAt: { gt: $since }
+          }
+        ) {
+          nodes {
+            identifier
+            team { key }
+            children(first: 50) { nodes { labels { nodes { name } } } }
+            parent { identifier labels { nodes { name } } }
+          }
+        }
+      }`,
+      { since },
+    );
+
+    const rollUps: FeatureNodeRollUp[] = [];
+    for (const node of data.issues?.nodes ?? []) {
+      const isFeatureNode = (node.children?.nodes ?? []).some((c) =>
+        (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
+      );
+      if (!isFeatureNode) continue;
+      const parentIsFeatureNode =
+        !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
+      rollUps.push({
+        identifier: node.identifier,
+        scopeKey: node.team.key,
+        parentIdentifier: parentIsFeatureNode ? node.parent!.identifier : null,
+      });
+    }
+    return rollUps;
+  }
+
   async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {
     if (issueIds.length === 0) return new Map();
     const data = await this.linearMutation<{ issues: { nodes: Array<{ id: string; state: { type: string } }> } }>(

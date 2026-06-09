@@ -302,3 +302,99 @@ export async function findPrForRun(
   const prs = (await prRes.json()) as Array<{ html_url: string }>;
   return prs.length > 0 ? prs[0].html_url : null;
 }
+
+// ---------- Feature-branch roll-up (merge-up) helpers ----------
+
+/**
+ * Returns how many commits `head` is ahead of `base` (i.e. commits on head not yet
+ * in base). 0 means head is fully merged into base — nothing to roll up. Returns null
+ * if either ref is missing (404).
+ */
+export async function compareBranches(
+  token: string,
+  owner: string,
+  repo: string,
+  base: string,
+  head: string,
+): Promise<number | null> {
+  // basehead path segments may contain slashes (feature/ool-78); encode each segment.
+  const enc = (b: string) => b.split("/").map(encodeURIComponent).join("/");
+  const url = `https://api.github.com/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`compareBranches(${base}...${head}) failed: HTTP ${res.status}: ${body}`);
+  }
+  const data = (await res.json()) as { ahead_by?: unknown };
+  return typeof data.ahead_by === "number" ? data.ahead_by : 0;
+}
+
+/** Finds an open PR for the given head→base pair; returns its number/url or null. */
+export async function findOpenPullRequest(
+  token: string,
+  owner: string,
+  repo: string,
+  head: string,
+  base: string,
+): Promise<{ number: number; url: string } | null> {
+  const url =
+    `https://api.github.com/repos/${owner}/${repo}/pulls` +
+    `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&state=open&per_page=1`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) return null;
+  const prs = (await res.json()) as Array<{ number: number; html_url: string }>;
+  return prs.length > 0 ? { number: prs[0].number, url: prs[0].html_url } : null;
+}
+
+/**
+ * Opens a PR head→base. Returns the created PR, or an existing open one if GitHub
+ * reports a duplicate (422). Throws on other failures.
+ */
+export async function createPullRequest(
+  token: string,
+  owner: string,
+  repo: string,
+  opts: { head: string; base: string; title: string; body: string },
+): Promise<{ number: number; url: string }> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ head: opts.head, base: opts.base, title: opts.title, body: opts.body }),
+  });
+  if (res.status === 201) {
+    const data = (await res.json()) as { number: number; html_url: string };
+    return { number: data.number, url: data.html_url };
+  }
+  const body = await res.text().catch(() => "");
+  // 422 with "A pull request already exists" — fetch and return the existing one.
+  if (res.status === 422 && /already exists/i.test(body)) {
+    const existing = await findOpenPullRequest(token, owner, repo, opts.head, opts.base);
+    if (existing) return existing;
+  }
+  throw new Error(`createPullRequest(${opts.head}->${opts.base}) failed: HTTP ${res.status}: ${body}`);
+}
+
+/**
+ * Merges a PR. Returns true if merged, false if GitHub refuses (e.g. conflicts /
+ * not mergeable — 405/409) so the caller can leave it for a human. Throws on other errors.
+ */
+export async function mergePullRequest(
+  token: string,
+  owner: string,
+  repo: string,
+  number: number,
+  mergeMethod: "merge" | "squash" | "rebase" = "merge",
+): Promise<boolean> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${number}/merge`, {
+    method: "PUT",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ merge_method: mergeMethod }),
+  });
+  if (res.ok) return true;
+  // 405 (not mergeable) / 409 (head changed / conflict) — surface as "not merged" so the
+  // caller leaves the PR open for a human rather than crashing the poll loop.
+  if (res.status === 405 || res.status === 409) return false;
+  const body = await res.text().catch(() => "");
+  throw new Error(`mergePullRequest(#${number}) failed: HTTP ${res.status}: ${body}`);
+}

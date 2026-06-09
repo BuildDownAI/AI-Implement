@@ -40,6 +40,25 @@ export interface AIImplementSnapshot {
   inProgressCountsByScope: Record<string, number>;
 }
 
+/**
+ * A completed feature-node issue whose feature branch should be rolled up into its
+ * parent (see src/merge-up.ts). Produced by the provider from recently-completed
+ * AI-Implement issues that have at least one AI-Implement child.
+ */
+export interface FeatureNodeRollUp {
+  /** The feature node's identifier → branch `ai-implement/feature/<identifier>`. */
+  identifier: string;
+  /** Capacity/scope bucket (team key) — used to resolve the repo mapping. */
+  scopeKey: string;
+  /**
+   * Parent identifier when the parent is itself a feature node (the parent has the
+   * AI-Implement label) → roll into `ai-implement/feature/<parent>` and auto-merge.
+   * null when there is no feature-node parent → roll into the mapping's base branch
+   * via a human-reviewed PR (never auto-merged).
+   */
+  parentIdentifier: string | null;
+}
+
 export type IssueLifecycleState = "active" | "completed" | "cancelled";
 
 export type ProviderId = "linear" | "jira" | (string & {});
@@ -50,6 +69,9 @@ export interface TicketingProvider {
   // Discovery
   fetchAIImplementSnapshot(): Promise<AIImplementSnapshot>;
   fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>>;
+  /** Recently-completed feature-node issues whose branch should roll up into its
+   *  parent (feature-branch grouping merge-up). Linear-only; others return []. */
+  fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]>;
 
   // Lifecycle verbs
   markPlanningStarted(issueId: string, scopeKey: string): Promise<void>;

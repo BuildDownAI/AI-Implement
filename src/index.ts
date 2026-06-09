@@ -7,7 +7,7 @@ import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv } from "./github.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
-import type { TicketingProvider, IssueLifecycleState } from "./providers/types.js";
+import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion } from "./notify.js";
@@ -41,6 +41,7 @@ import {
 import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { resolveBaseBranch } from "./feature-branch.js";
+import { runMergeUps } from "./merge-up.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 
@@ -238,6 +239,34 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         continue;
       }
       teamRepoMap[k] = m;
+    }
+
+    // Feature-branch roll-up: merge each completed feature-node branch into its parent
+    // (auto-merge for internal levels; a human PR at the feature→base top). Runs before
+    // dispatch so a parent's own closing work clones a branch that already contains its
+    // children's merged work. Best-effort — never blocks the poll.
+    if (providers.length > 0) {
+      try {
+        const rollUps = (
+          await Promise.all(
+            providers.map((p) =>
+              p.fetchFeatureNodeRollUps().catch((err) => {
+                console.error("[merge-up] Provider fetchFeatureNodeRollUps failed:", err);
+                return [] as FeatureNodeRollUp[];
+              }),
+            ),
+          )
+        ).flat();
+        if (rollUps.length > 0) {
+          await runMergeUps(rollUps, {
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
+          });
+        }
+      } catch (err) {
+        console.error("[merge-up] roll-up step failed:", err);
+      }
     }
 
     // Implementation issues have priority over planning issues for slot allocation.
