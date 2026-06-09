@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
+import { span } from "../timing.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -63,16 +64,20 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     // stdout/stderr. Token is redacted from any error messages.
     const remote = `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`;
     const remoteRef = `refs/heads/${branchName}`;
-    const expectedRemoteSha = resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken);
-    const pushResult = spawnSync(
-      "git",
-      [
-        "push",
-        remote,
-        `HEAD:${remoteRef}`,
-        `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
-      ],
-      { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+    const expectedRemoteSha = await span("git-ls-remote", async () =>
+      resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken),
+    );
+    const pushResult = await span("git-push", async () =>
+      spawnSync(
+        "git",
+        [
+          "push",
+          remote,
+          `HEAD:${remoteRef}`,
+          `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
+        ],
+        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+      ),
     );
     if (pushResult.status !== 0) {
       const stderr = (pushResult.stderr?.toString() ?? "").replace(githubToken, "***");
@@ -80,9 +85,8 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     }
 
     // Create PR, tolerating 422 (already exists)
-    const prRes = await fetch(
-      `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`,
-      {
+    const prRes = await span("pr-create", async () =>
+      fetch(`https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${githubToken}`,
@@ -94,7 +98,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
           base: baseBranch,
           body: prBody,
         }),
-      },
+      }),
     );
 
     if (prRes.ok) {
