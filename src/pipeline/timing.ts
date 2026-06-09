@@ -66,7 +66,9 @@ export function formatSummary(collector: TimingCollector, identifier: string): s
   ];
 
   for (const step of topLevel) {
-    const mark = step === dominant ? "   ⚠ dominant" : "";
+    // Only flag a dominant step when there's more than one to compare against;
+    // a single-step run has nothing to be "dominant" over.
+    const mark = topLevel.length > 1 && step === dominant ? "   ⚠ dominant" : "";
     lines.push(`${PREFIX}   ${step.label.padEnd(18)} ${formatDuration(step.ms).padStart(7)}${mark}`);
     const children = records.filter((r) => r.parentId === step.label);
     children.forEach((child, i) => {
@@ -99,6 +101,11 @@ export function runWithTiming<T>(collector: TimingCollector, fn: () => Promise<T
  * collector and current step id come from the run scope (set by
  * TimingStepReporter on each "running" report). A transparent pass-through when
  * no run scope is active (e.g. a unit test calling a step directly).
+ *
+ * Call span() only after the enclosing step has reported "running" (the runner
+ * does this before invoking a step's run()). A span recorded before then has a
+ * null parentId and is silently dropped from formatSummary, which only nests
+ * spans under a known step id.
  */
 export async function span<T>(label: string, fn: () => Promise<T>): Promise<T> {
   const scope = timingStore.getStore();

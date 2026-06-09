@@ -75,6 +75,22 @@ describe("formatSummary", () => {
     expect(gitPushIdx).toBeGreaterThan(pushIdx);
     expect(lines[gitPushIdx]).toMatch(/├|└/);
   });
+
+  it("omits the dominant marker when there is only one top-level step", () => {
+    const c = new TimingCollector("summary");
+    c.record({ label: "clone", parentId: null, ms: 2100, kind: "step" });
+    const out = formatSummary(c, "ACC-465");
+    expect(out).not.toContain("⚠ dominant");
+    expect(out).toContain("clone");
+  });
+
+  it("emits just a header without throwing when no steps were recorded", () => {
+    const c = new TimingCollector("summary");
+    const out = formatSummary(c, "ACC-465");
+    expect(out.split("\n")).toHaveLength(1);
+    expect(out).toContain("ACC-465");
+    expect(out).toContain("total 0.0s");
+  });
 });
 
 describe("TimingStepReporter", () => {
