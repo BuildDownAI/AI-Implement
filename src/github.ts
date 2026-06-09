@@ -376,25 +376,35 @@ export async function createPullRequest(
 }
 
 /**
- * Merges a PR. Returns true if merged, false if GitHub refuses (e.g. conflicts /
- * not mergeable — 405/409) so the caller can leave it for a human. Throws on other errors.
+ * Directly merges `head` into `base` via the Git merges API — no pull request.
+ *
+ * Used for internal feature-branch roll-ups: a PR's base branch name and title would
+ * let Linear's GitHub integration auto-link it to the parent issue (the branch encodes
+ * the identifier) and falsely mark that issue Done on merge, before its own closing work
+ * runs. A plain merge commit carrying no issue identifiers / magic words avoids that.
+ *
+ * Returns:
+ *   "merged"   — created a merge commit (201)
+ *   "noop"     — nothing to merge; head already contained in base (204)
+ *   "conflict" — merge conflict; needs a human (409)
+ * Throws on other failures.
  */
-export async function mergePullRequest(
+export async function mergeBranch(
   token: string,
   owner: string,
   repo: string,
-  number: number,
-  mergeMethod: "merge" | "squash" | "rebase" = "merge",
-): Promise<boolean> {
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${number}/merge`, {
-    method: "PUT",
+  base: string,
+  head: string,
+  commitMessage: string,
+): Promise<"merged" | "noop" | "conflict"> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/merges`, {
+    method: "POST",
     headers: ghHeaders(token),
-    body: JSON.stringify({ merge_method: mergeMethod }),
+    body: JSON.stringify({ base, head, commit_message: commitMessage }),
   });
-  if (res.ok) return true;
-  // 405 (not mergeable) / 409 (head changed / conflict) — surface as "not merged" so the
-  // caller leaves the PR open for a human rather than crashing the poll loop.
-  if (res.status === 405 || res.status === 409) return false;
+  if (res.status === 201) return "merged";
+  if (res.status === 204) return "noop"; // already up to date
+  if (res.status === 409) return "conflict";
   const body = await res.text().catch(() => "");
-  throw new Error(`mergePullRequest(#${number}) failed: HTTP ${res.status}: ${body}`);
+  throw new Error(`mergeBranch(${head} -> ${base}) failed: HTTP ${res.status}: ${body}`);
 }
