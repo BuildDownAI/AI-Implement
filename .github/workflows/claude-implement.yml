@@ -17,6 +17,7 @@
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
+#   AI_IMPLEMENT_RUNNER_LABEL                    - runs-on label for the implement job (default ubuntu-latest); set to a larger-runner label to speed up CPU-bound test suites.
 
 name: Claude AI Implementation
 
@@ -172,7 +173,10 @@ jobs:
 
   implement:
     needs: validate-runner-image
-    runs-on: ubuntu-latest
+    # Default GitHub-hosted runners are 2 vCPU; the test suites Claude runs are
+    # CPU-bound and scale ~linearly with cores. Set AI_IMPLEMENT_RUNNER_LABEL to
+    # a larger-runner label (e.g. ubuntu-latest-4-cores) to speed those up.
+    runs-on: ${{ vars.AI_IMPLEMENT_RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: ${{ inputs.job_timeout_minutes && fromJSON(inputs.job_timeout_minutes) || 90 }}
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}

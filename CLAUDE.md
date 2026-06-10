@@ -174,6 +174,12 @@ The prefix only affects the **initial orchestrator-driven run** — `/ai-impleme
 
 Set it as a repository or organization **variable** (Settings → Secrets and variables → Actions → Variables), mirroring `AI_IMPLEMENT_PROVIDER`. It is read inside the runner container, so it applies to both orchestrator-initiated and `/ai-implement` comment-triggered runs **after the target repo has re-synced `claude-implement.yml`**. It is not a per-project admin field and not a dispatch input.
 
+### Runner label (GHA mode)
+
+`AI_IMPLEMENT_RUNNER_LABEL` overrides the `runs-on` label for the `implement` job, defaulting to `ubuntu-latest`. Default GitHub-hosted runners are 2 vCPU; the test suites Claude runs during implement (and the verify-hook gauntlet) are CPU-bound and scale ~linearly with cores, so pointing this at a larger-runner label (e.g. `ubuntu-latest-4-cores`) roughly halves the implement job's wall-clock.
+
+Set it as a repository or organization **variable** (Settings → Secrets and variables → Actions → Variables), like `AI_IMPLEMENT_LOG_LEVEL`. It only affects the GitHub Actions execution mode and only after the target repo has re-synced `claude-implement.yml`. It takes a single label string, not a label array. Granting write access to this variable lets the holder retarget the job to an arbitrary (e.g. self-hosted) runner that would see the job's secrets — the same threat model as any org-variable-controlled `runs-on`.
+
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
 
