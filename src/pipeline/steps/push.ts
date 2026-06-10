@@ -67,20 +67,35 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     const expectedRemoteSha = await span("git-ls-remote", async () =>
       resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken),
     );
-    const pushResult = await span("git-push", async () =>
-      spawnSync(
-        "git",
-        [
-          "push",
-          remote,
-          `HEAD:${remoteRef}`,
-          `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
-        ],
-        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
-      ),
+    const tracePush = process.env.AI_IMPLEMENT_LOG_LEVEL === "stream";
+    const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
+      remote,
+      remoteRef,
+      expectedRemoteSha,
+      tracePush,
     );
+    const pushResult = await span("git-push", async () =>
+      spawnSync("git", pushArgs, {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: pushEnv,
+      }),
+    );
+    if (tracePush) {
+      // Diagnostic for slow pushes: GIT_TRACE2_PERF region timings (pack-objects
+      // vs send-pack vs server wait) + --verbose object counts. Redact the token
+      // with replaceAll — the tokenized remote URL can recur many times here.
+      // Trim each stream and join with a newline so partial-line stdout doesn't
+      // run onto the first byte of stderr.
+      const trace = [pushResult.stdout?.toString() ?? "", pushResult.stderr?.toString() ?? ""]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join("\n")
+        .replaceAll(githubToken, "***");
+      if (trace) console.error(`[git-push trace]\n${trace}`);
+    }
     if (pushResult.status !== 0) {
-      const stderr = (pushResult.stderr?.toString() ?? "").replace(githubToken, "***");
+      const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(githubToken, "***");
       throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
     }
 
@@ -160,6 +175,29 @@ async function createOrFindPullRequest(
   throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
 }
 
+/**
+ * Build the `git push` argv and spawn env. When `trace` is true (driven by
+ * AI_IMPLEMENT_LOG_LEVEL=stream), it adds `--verbose` and `GIT_TRACE2_PERF=1`
+ * so a slow push can be diagnosed — region timings (pack-objects vs send-pack
+ * vs server wait) plus object counts land on the captured stderr.
+ */
+export function buildGitPushInvocation(
+  remote: string,
+  remoteRef: string,
+  expectedRemoteSha: string | null,
+  trace: boolean,
+): { args: string[]; env: NodeJS.ProcessEnv } {
+  const args = [
+    "push",
+    ...(trace ? ["--verbose"] : []),
+    remote,
+    `HEAD:${remoteRef}`,
+    `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
+  ];
+  const env = trace ? { ...process.env, GIT_TRACE2_PERF: "1" } : process.env;
+  return { args, env };
+}
+
 function buildCommitMessage(issueIdentifier: string, issueTitle: string): string {
   const title = (issueTitle || "AI implementation").replace(/\s+/g, " ").trim();
   return `${issueIdentifier}: ${title}`.slice(0, 120);
@@ -214,7 +252,7 @@ function summarizeCommittedChanges(workspaceDir: string, githubToken: string): s
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`git show failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
 
@@ -232,7 +270,7 @@ function runGit(
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`${label} failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
 }
@@ -243,7 +281,7 @@ function hasWorkingTreeChanges(workspaceDir: string, githubToken: string): boole
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`git status failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
   return result.stdout.toString().trim().length > 0;
@@ -281,7 +319,7 @@ function resolveRemoteBranchSha(
       return line.split("\t")[0] || null;
     }
 
-    lastError = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    lastError = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     if (attempt < LS_REMOTE_MAX_ATTEMPTS) {
       sleepSync(LS_REMOTE_RETRY_DELAYS_MS[attempt - 1] ?? 1000);
     }
