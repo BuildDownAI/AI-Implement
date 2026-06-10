@@ -85,9 +85,13 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       // Diagnostic for slow pushes: GIT_TRACE2_PERF region timings (pack-objects
       // vs send-pack vs server wait) + --verbose object counts. Redact the token
       // with replaceAll — the tokenized remote URL can recur many times here.
-      const trace = `${pushResult.stdout?.toString() ?? ""}${pushResult.stderr?.toString() ?? ""}`
-        .replaceAll(githubToken, "***")
-        .trim();
+      // Trim each stream and join with a newline so partial-line stdout doesn't
+      // run onto the first byte of stderr.
+      const trace = [pushResult.stdout?.toString() ?? "", pushResult.stderr?.toString() ?? ""]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join("\n")
+        .replaceAll(githubToken, "***");
       if (trace) console.error(`[git-push trace]\n${trace}`);
     }
     if (pushResult.status !== 0) {
@@ -248,7 +252,7 @@ function summarizeCommittedChanges(workspaceDir: string, githubToken: string): s
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`git show failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
 
@@ -266,7 +270,7 @@ function runGit(
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`${label} failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
 }
@@ -277,7 +281,7 @@ function hasWorkingTreeChanges(workspaceDir: string, githubToken: string): boole
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`git status failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
   return result.stdout.toString().trim().length > 0;
@@ -315,7 +319,7 @@ function resolveRemoteBranchSha(
       return line.split("\t")[0] || null;
     }
 
-    lastError = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    lastError = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     if (attempt < LS_REMOTE_MAX_ATTEMPTS) {
       sleepSync(LS_REMOTE_RETRY_DELAYS_MS[attempt - 1] ?? 1000);
     }
