@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
+import { span } from "../timing.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -63,76 +64,101 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     // stdout/stderr. Token is redacted from any error messages.
     const remote = `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`;
     const remoteRef = `refs/heads/${branchName}`;
-    const expectedRemoteSha = resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken);
-    const pushResult = spawnSync(
-      "git",
-      [
-        "push",
-        remote,
-        `HEAD:${remoteRef}`,
-        `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
-      ],
-      { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+    const expectedRemoteSha = await span("git-ls-remote", async () =>
+      resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken),
+    );
+    const pushResult = await span("git-push", async () =>
+      spawnSync(
+        "git",
+        [
+          "push",
+          remote,
+          `HEAD:${remoteRef}`,
+          `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
+        ],
+        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+      ),
     );
     if (pushResult.status !== 0) {
       const stderr = (pushResult.stderr?.toString() ?? "").replace(githubToken, "***");
       throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
     }
 
-    // Create PR, tolerating 422 (already exists)
-    const prRes = await fetch(
-      `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${githubToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          title: prTitle,
-          head: branchName,
-          base: baseBranch,
-          body: prBody,
-        }),
-      },
+    // Span covers the POST and the 422 list-open-PRs fallback so re-runs (which
+    // hit 422 and pay an extra round-trip) are timed in full, not just the POST.
+    const pr = await span("pr-create", async () =>
+      createOrFindPullRequest({ repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody }),
     );
-
-    if (prRes.ok) {
-      const pr = (await prRes.json()) as { html_url?: unknown; number?: unknown };
-      if (typeof pr.html_url !== "string" || typeof pr.number !== "number") {
-        throw new Error("Unexpected PR creation response shape from GitHub API");
-      }
-      return { prUrl: pr.html_url, prNumber: pr.number, branchPushed: true, commitSha };
-    }
-
-    if (prRes.status === 422) {
-      // PR already open — find it
-      const listRes = await fetch(
-        `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls?head=${repoOwner}:${branchName}&state=open`,
-        { headers: { Authorization: `Bearer ${githubToken}` } },
-      );
-      if (!listRes.ok) {
-        const listBody = await listRes.text().catch(() => "");
-        throw new Error(
-          `PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`,
-        );
-      }
-      const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown }>;
-      if (prs.length > 0) {
-        const existing = prs[0];
-        if (typeof existing.html_url === "string" && typeof existing.number === "number") {
-          return { prUrl: existing.html_url, prNumber: existing.number, branchPushed: true, commitSha };
-        }
-      }
-      throw new Error(
-        `PR already exists (422) but no open PR found for branch ${branchName}`,
-      );
-    }
-
-    const body = await prRes.text().catch(() => "");
-    throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
+    return { prUrl: pr.url, prNumber: pr.number, branchPushed: true, commitSha };
   },
 };
+
+interface CreatePrInputs {
+  repoOwner: string;
+  repoRepo: string;
+  githubToken: string;
+  prTitle: string;
+  branchName: string;
+  baseBranch: string;
+  prBody: string;
+}
+
+/** Create the PR, tolerating 422 (already exists) by finding the open PR. */
+async function createOrFindPullRequest(
+  { repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody }: CreatePrInputs,
+): Promise<{ url: string; number: number }> {
+  const prRes = await fetch(
+    `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: prTitle,
+        head: branchName,
+        base: baseBranch,
+        body: prBody,
+      }),
+    },
+  );
+
+  if (prRes.ok) {
+    const pr = (await prRes.json()) as { html_url?: unknown; number?: unknown };
+    if (typeof pr.html_url !== "string" || typeof pr.number !== "number") {
+      throw new Error("Unexpected PR creation response shape from GitHub API");
+    }
+    return { url: pr.html_url, number: pr.number };
+  }
+
+  if (prRes.status === 422) {
+    // PR already open — find it
+    const listRes = await fetch(
+      `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls?head=${repoOwner}:${branchName}&state=open`,
+      { headers: { Authorization: `Bearer ${githubToken}` } },
+    );
+    if (!listRes.ok) {
+      const listBody = await listRes.text().catch(() => "");
+      throw new Error(
+        `PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`,
+      );
+    }
+    const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown }>;
+    if (prs.length > 0) {
+      const existing = prs[0];
+      if (typeof existing.html_url === "string" && typeof existing.number === "number") {
+        return { url: existing.html_url, number: existing.number };
+      }
+    }
+    throw new Error(
+      `PR already exists (422) but no open PR found for branch ${branchName}`,
+    );
+  }
+
+  const body = await prRes.text().catch(() => "");
+  throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
+}
 
 function buildCommitMessage(issueIdentifier: string, issueTitle: string): string {
   const title = (issueTitle || "AI implementation").replace(/\s+/g, " ").trim();

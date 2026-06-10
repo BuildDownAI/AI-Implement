@@ -28,6 +28,8 @@ interface DispatchInputs {
   max_iterations?: string;
   /** Per-project GitHub Actions job timeout in minutes. Only forwarded when set. */
   job_timeout_minutes?: string;
+  /** Per-project branch-name prefix. Only forwarded when set on the mapping. */
+  branch_prefix?: string;
   /** Public base URL the runner should POST results back to. Empty when callback disabled. */
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
@@ -103,6 +105,25 @@ export function capRunnerEnv(mapping: RepoMapping): Record<string, string> {
   if (mapping.maxTurns != null) env.AI_IMPLEMENT_MAX_TURNS = String(mapping.maxTurns);
   if (mapping.maxIterations != null) env.AI_IMPLEMENT_MAX_ITERATIONS = String(mapping.maxIterations);
   return env;
+}
+
+/**
+ * Branch-prefix dispatch input for a mapping. Only included when the mapping
+ * configures a prefix, so default repos keep dispatching to workflow templates
+ * that haven't been re-synced with the new input.
+ */
+export function branchPrefixDispatchFields(
+  mapping: RepoMapping,
+): Pick<DispatchInputs, "branch_prefix"> {
+  return mapping.branchPrefix ? { branch_prefix: mapping.branchPrefix } : {};
+}
+
+/**
+ * Branch-prefix env var for the runner process (Fly/local execution modes),
+ * where the prefix arrives via container env rather than a workflow input.
+ */
+export function branchPrefixRunnerEnv(mapping: RepoMapping): Record<string, string> {
+  return mapping.branchPrefix ? { AI_IMPLEMENT_BRANCH_PREFIX: mapping.branchPrefix } : {};
 }
 
 export async function dispatchWorkflow(
