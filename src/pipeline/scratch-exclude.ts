@@ -44,12 +44,21 @@ export function prepareScratchExclusion(workspaceDir: string): void {
   }
 
   // Untrack scratch paths a prior run committed; `--ignore-unmatch` makes this a
-  // no-op when nothing matches, so it's safe to run unconditionally.
+  // no-op when nothing matches, so it's safe to run unconditionally. A non-zero
+  // exit means a real failure (bad repo state, wrong cwd) left the files tracked
+  // — non-fatal (the exclude above still blocks re-staging) but never silent.
   for (const p of SCRATCH_PATHS) {
     const pathspec = p.replace(/\/$/, "");
-    spawnSync("git", ["rm", "-r", "--cached", "--ignore-unmatch", pathspec], {
+    const result = spawnSync("git", ["rm", "-r", "--cached", "--ignore-unmatch", pathspec], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    if (result.status !== 0) {
+      const stderr = (result.stderr?.toString() ?? "").trim();
+      console.warn(
+        `[scratch-exclude] git rm --cached ${pathspec} exited ${result.status ?? "null"}; ` +
+          `previously-committed files may remain tracked: ${stderr}`,
+      );
+    }
   }
 }

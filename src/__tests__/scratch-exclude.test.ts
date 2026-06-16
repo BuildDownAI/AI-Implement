@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -59,6 +59,22 @@ describe("prepareScratchExclusion", () => {
 
     expect(git(dir, ["ls-files"]).stdout).not.toContain("ai-output");
     expect(git(dir, ["diff", "--cached", "--name-only"]).stdout).toContain("real.ts");
+  });
+
+  it("logs a warning when git rm --cached fails instead of swallowing it", () => {
+    // A directory that is not a valid git repo: the exclude file still gets
+    // seeded, but `git rm --cached` fails — which must not be silent.
+    const nonRepo = fs.mkdtempSync(path.join(os.tmpdir(), "scratch-nonrepo-"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      prepareScratchExclusion(nonRepo);
+
+      expect(warn).toHaveBeenCalled();
+      expect(warn.mock.calls.flat().join(" ")).toMatch(/scratch-exclude/);
+    } finally {
+      warn.mockRestore();
+      fs.rmSync(nonRepo, { recursive: true, force: true });
+    }
   });
 
   it("is idempotent — does not duplicate the exclude entry across runs", () => {
