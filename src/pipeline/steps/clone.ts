@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { prepareScratchExclusion } from "../scratch-exclude.js";
 
 interface CloneInputs extends Record<string, unknown> {
   repoOwner: string;
@@ -69,6 +70,10 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
 
       cloneMethod = "fresh";
     }
+
+    // Working tree now exists (fresh or incremental). Make orchestrator scratch
+    // paths (e.g. ai-output/) uncommittable before any downstream `git add`.
+    prepareScratchExclusion(workspaceDir);
 
     const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
       cwd: workspaceDir,
