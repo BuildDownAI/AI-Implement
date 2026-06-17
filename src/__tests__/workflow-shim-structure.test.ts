@@ -156,7 +156,9 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/validate-runner-image:/);
       expect(yaml).toMatch(/needs:\s*validate-runner-image/);
       expect(yaml).toMatch(/image:\s*\$\{\{\s*needs\.validate-runner-image\.outputs\.runner_image\s*\}\}/);
-      expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
+      // The default runner image is derived from the repo owner, not hardcoded.
+      expect(yaml).toContain('owner="${GITHUB_REPOSITORY_OWNER,,}"');
+      expect(yaml).toMatch(/ghcr\.io\/\$\{owner\}\/ai-implement-runner:latest/);
       expect(yaml).toMatch(/invalid characters for a container image reference/);
       expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
     });
@@ -199,7 +201,9 @@ describe("GHA workflow shims", () => {
     expect(yaml).toMatch(/runner_image:\s*\$\{\{\s*steps\.runner-image\.outputs\.runner_image\s*\}\}/);
     expect(yaml).toMatch(/image:\s*\$\{\{\s*needs\.check-trigger\.outputs\.runner_image\s*\}\}/);
     expect(yaml).toMatch(/AI_IMPLEMENT_RUNNER_IMAGE/);
-    expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
+    // The default runner image is derived from the repo owner, not hardcoded.
+    expect(yaml).toContain('owner="${GITHUB_REPOSITORY_OWNER,,}"');
+    expect(yaml).toMatch(/ghcr\.io\/\$\{owner\}\/ai-implement-runner:latest/);
     expect(yaml).toMatch(/invalid characters for a container image reference/);
     expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
   });

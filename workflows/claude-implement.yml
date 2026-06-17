@@ -1,5 +1,6 @@
 # Synced to target repos by sync-workflow.yml.
-# All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
+# All pipeline logic lives in the runner image (ghcr.io/<owner>/ai-implement-runner,
+# where <owner> is this repository's org).
 # Do not edit in target repos.
 #
 # Required secrets:
@@ -16,7 +17,7 @@
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
-#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to this repo's own ghcr.io/<owner>/.
 #   AI_IMPLEMENT_RUNNER_LABEL                    - runs-on label for the implement job (default ubuntu-latest); set to a larger-runner label to speed up CPU-bound test suites.
 
 name: Claude AI Implementation
@@ -96,7 +97,7 @@ on:
         type: string
         default: ""
       runner_image:
-        description: "Override the default runner image (must match ghcr.io/builddownai/* or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
+        description: "Override the default runner image (must match this repo's own ghcr.io/<owner>/* or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
         default: ""
@@ -122,12 +123,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Default the runner image to this repository's own org so forks
+          # resolve their own published image instead of a hardcoded one.
+          # Mirrors the owner-derivation already used by build-runner.yml.
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+
           runner_image="${REQUESTED_RUNNER_IMAGE:-}"
           if [ -z "$runner_image" ]; then
             runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
           fi
           if [ -z "$runner_image" ]; then
-            runner_image="ghcr.io/builddownai/ai-implement-runner:latest"
+            runner_image="ghcr.io/${owner}/ai-implement-runner:latest"
           fi
 
           case "$runner_image" in
@@ -137,7 +143,7 @@ jobs:
               ;;
           esac
 
-          allowed_prefixes="ghcr.io/builddownai/"
+          allowed_prefixes="ghcr.io/${owner}/"
           if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
             allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
           fi

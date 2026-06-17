@@ -1,5 +1,6 @@
 # Synced to target repos. /ai-implement on a PR → gap-fill run.
-# All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
+# All pipeline logic lives in the runner image (ghcr.io/<owner>/ai-implement-runner,
+# where <owner> is this repository's org).
 # Do not edit in target repos.
 #
 # Required secrets:
@@ -18,8 +19,8 @@
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
-#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
-# The default runner image uses the public ghcr.io/builddownai/ai-implement-runner:latest tag.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to this repo's own ghcr.io/<owner>/.
+# The default runner image uses this repo's own public ghcr.io/<owner>/ai-implement-runner:latest tag.
 
 name: AI Implementation Comment Trigger
 
@@ -128,9 +129,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Default the runner image to this repository's own org so forks
+          # resolve their own published image instead of a hardcoded one.
+          # Mirrors the owner-derivation already used by build-runner.yml.
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+
           runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
           if [ -z "$runner_image" ]; then
-            runner_image="ghcr.io/builddownai/ai-implement-runner:latest"
+            runner_image="ghcr.io/${owner}/ai-implement-runner:latest"
           fi
 
           case "$runner_image" in
@@ -140,7 +146,7 @@ jobs:
               ;;
           esac
 
-          allowed_prefixes="ghcr.io/builddownai/"
+          allowed_prefixes="ghcr.io/${owner}/"
           if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
             allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
           fi
