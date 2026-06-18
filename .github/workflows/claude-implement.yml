@@ -104,7 +104,7 @@ jobs:
           if [ -z "$runner_image" ]; then
             if raw="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.ai-implement/image.yml" \
                   -H "Accept: application/vnd.github.raw+json" 2>/dev/null)"; then
-              runner_image="$(printf '%s\n' "$raw" | sed -n 's/^image:[[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' | head -n1)"
+              runner_image="$(printf '%s\n' "$raw" | sed -n 's/^image:[[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' | head -n1)" || true
             fi
           fi
 
