@@ -7,7 +7,7 @@ import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv } from "./github.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
-import type { TicketingProvider, IssueLifecycleState } from "./providers/types.js";
+import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion } from "./notify.js";
@@ -40,6 +40,8 @@ import {
 } from "./local-docker.js";
 import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+import { resolveBaseBranch } from "./feature-branch.js";
+import { runMergeUps } from "./merge-up.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 
@@ -239,6 +241,34 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       teamRepoMap[k] = m;
     }
 
+    // Feature-branch roll-up: merge each completed feature-node branch into its parent
+    // (auto-merge for internal levels; a human PR at the feature→base top). Runs before
+    // dispatch so a parent's own closing work clones a branch that already contains its
+    // children's merged work. Best-effort — never blocks the poll.
+    if (providers.length > 0) {
+      try {
+        const rollUps = (
+          await Promise.all(
+            providers.map((p) =>
+              p.fetchFeatureNodeRollUps().catch((err) => {
+                console.error("[merge-up] Provider fetchFeatureNodeRollUps failed:", err);
+                return [] as FeatureNodeRollUp[];
+              }),
+            ),
+          )
+        ).flat();
+        if (rollUps.length > 0) {
+          await runMergeUps(rollUps, {
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
+          });
+        }
+      } catch (err) {
+        console.error("[merge-up] roll-up step failed:", err);
+      }
+    }
+
     // Implementation issues have priority over planning issues for slot allocation.
     // Both consume slots from the same per-team capacity pool.
     const allCandidates = [...readyForImplementation, ...needsPlanning];
@@ -285,16 +315,24 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
           const { mode: runnerMode } = getRunnerMode();
           const execPath = resolveExecutionPath(runnerMode, mapping.executionMode);
+
+          // Resolve the base branch once per issue (feature-branch grouping). Doing it
+          // here — before the exec-path switch — guarantees the "both" shadow path's two
+          // dispatches agree on one base, and never creates the branch twice. The token
+          // is per-owner cached, so the in-dispatch-fn fetches below are cache hits.
+          const baseGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const baseBranch = await resolveBaseBranch({ ghToken: baseGhToken, issue, mapping });
+
           if (execPath === "both") {
             // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, true);
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, true);
           } else if (execPath === "local-docker") {
-            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode);
+            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
           } else if (execPath === "fly-machines") {
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
           } else {
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
           }
         }
       } catch (err) {
@@ -370,6 +408,7 @@ async function dispatchGitHubActions(
   mapping: RepoMapping,
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
+  baseBranch: string,
 ): Promise<void> {
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
@@ -410,6 +449,10 @@ async function dispatchGitHubActions(
     issue_description: issue.description || issue.title,
     runner_phase: "implementation",
     ...providerDispatchFields(mapping),
+    // Only forward base_branch when grouping moved it off the repo default: GitHub
+    // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
+    // re-synced the workflow keep working for the common (non-grouped) path.
+    ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
     ...capDispatchFields(mapping),
     ...branchPrefixDispatchFields(mapping),
     runner_callback_url: runnerCallbackUrl,
@@ -664,6 +707,7 @@ async function dispatchFlyMachine(
   mapping: RepoMapping,
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
+  baseBranch: string,
   shadow = false,
 ): Promise<void> {
   if (mapping.provider === "bedrock") {
@@ -724,7 +768,7 @@ async function dispatchFlyMachine(
         issueDescription: issue.description || issue.title,
         owner: mapping.owner,
         repo: mapping.repo,
-        defaultBranch: mapping.defaultBranch,
+        defaultBranch: baseBranch,
         linearApiKey: config.linearApiKey ?? undefined,
         anthropicApiKey: config.anthropicApiKey ?? undefined,
         claudeOAuthToken: config.claudeOAuthToken ?? undefined,
@@ -777,6 +821,7 @@ async function dispatchLocalDocker(
   mapping: RepoMapping,
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
+  baseBranch: string,
 ): Promise<void> {
   if (mapping.provider === "bedrock") {
     console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: provider=bedrock is not supported on container runners`);
@@ -807,7 +852,7 @@ async function dispatchLocalDocker(
         issueDescription: issue.description || issue.title,
         owner: mapping.owner,
         repo: mapping.repo,
-        defaultBranch: mapping.defaultBranch,
+        defaultBranch: baseBranch,
         linearApiKey: config.linearApiKey ?? undefined,
         anthropicApiKey: config.anthropicApiKey ?? undefined,
         claudeOAuthToken: config.claudeOAuthToken ?? undefined,

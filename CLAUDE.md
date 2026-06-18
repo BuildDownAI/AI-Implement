@@ -53,6 +53,12 @@ scripts/
   sync-workflow.yml  — sync workflow templates to target repos
   claude-review.yml  — Claude reviews PRs (auto for same-repo, /claude-review for forks)
   build-runner.yml   — build and push the session runner image to GHCR
+
+docs/
+  plans/      — implementation plans (decision artifacts; progress derived from git)
+  solutions/  — documented solutions to past problems (bugs, best practices, workflow
+                patterns), by category with YAML frontmatter (module, tags, problem_type);
+                relevant when implementing or debugging in documented areas
 ```
 
 ## Running locally
@@ -218,6 +224,16 @@ IAM trust policy shape (use the `sub` condition to restrict to this specific rep
 ```
 
 The workflow runs `aws-actions/configure-aws-credentials` once before the containerized runner step with a 4-hour session duration, covering implementation and gap-analysis runs. Only GitHub OIDC is supported — there is no static-key path.
+
+## Feature-branch grouping (parent/child issues)
+
+A Linear **parent issue** tagged `AI-Implement` that has `AI-Implement` children becomes a **feature node**: it owns a long-running branch `ai-implement/feature/<issue-key>`, its labelled children PR **into that branch** (not the repo base), and the tree cascades recursively. A parent's own work is deferred until its children finish, then runs onto its own branch; completed feature branches **roll up** into their parent automatically (internal levels via a direct merge, the top of the tree as a human-reviewed `feature → base` PR).
+
+Key labels: `AI-Implement` (trigger) → `AI-Planning` (planning in flight) → `Plan-Complete` (ready to implement) → `AI-Working` (implementing) → `Ready for Review` (PR open); merging the PR is what moves the issue to Done (Linear's GitHub integration). A parent labelled before its children is left alone until a child is labelled (race guard).
+
+Parts: classification + roll-up discovery in `src/providers/linear.ts`; `TicketIssue.featureBranchChain` / `FeatureNodeRollUp` in `src/providers/types.ts`; cascade branch creation in `src/feature-branch.ts` (`resolveBaseBranch`); roll-up in `src/merge-up.ts`; GitHub helpers in `src/github.ts`; `Plan-Complete` via `src/runner-callback.ts`; wired into the poll loop in `src/index.ts`. Linear-only (Jira PRs to base). **Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
+
+Operational requirements: re-sync `claude-implement.yml` to the target repo (for the `base_branch` input); a **publicly reachable** runner callback (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`) so planning auto-advances and the cascade self-drives; and pair the runner image with the orchestrator channel (testing → `SESSION_IMAGE=…:next`).
 
 ## Custom extensions
 

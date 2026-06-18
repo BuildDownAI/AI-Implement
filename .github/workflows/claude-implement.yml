@@ -45,6 +45,11 @@ on:
         required: false
         type: string
         default: ""
+      base_branch:
+        description: "Branch the runner clones and the PR targets (feature-branch grouping). Empty = repo default."
+        required: false
+        type: string
+        default: ""
       runner_phase:
         description: "Runner callback phase: implementation or gap-analysis (empty keeps legacy PR_NUMBER inference)"
         required: false
@@ -225,12 +230,12 @@ jobs:
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-          GITHUB_DEFAULT_BRANCH: ${{ github.ref_name }}
           ISSUE_ID: ${{ inputs.issue_id }}
           ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_DEFAULT_BRANCH: ${{ inputs.base_branch || github.ref_name }}
           RUNNER_PHASE: ${{ inputs.runner_phase }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}

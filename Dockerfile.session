@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ---------- Build stage ----------
 FROM node:24-bookworm-slim AS builder
 

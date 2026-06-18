@@ -151,6 +151,14 @@ describe("GHA workflow shims", () => {
   }
 
   for (const f of IMPLEMENT_WORKFLOWS) {
+    it(`${f} accepts a base_branch input that can override GITHUB_DEFAULT_BRANCH`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      expect(doc.on.workflow_dispatch.inputs.base_branch).toBeDefined();
+      expect(doc.on.workflow_dispatch.inputs.base_branch.default).toBe("");
+      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*inputs\.base_branch\s*\|\|\s*github\.ref_name\s*\}\}/);
+    });
+
     it(`${f} validates the runner image before the container job starts`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).toMatch(/validate-runner-image:/);
@@ -167,9 +175,9 @@ describe("GHA workflow shims", () => {
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
     });
 
-    it(`${f} passes the dispatched ref to the runner as GITHUB_DEFAULT_BRANCH`, () => {
+    it(`${f} falls back to the dispatched ref when base_branch is omitted`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*github\.ref_name\s*\}\}/);
+      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*inputs\.base_branch\s*\|\|\s*github\.ref_name\s*\}\}/);
     });
 
     it(`${f} validates Bedrock config before configuring AWS credentials`, () => {
