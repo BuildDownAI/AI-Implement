@@ -111,6 +111,28 @@ Single-repo override (either mode): commit `.ai-implement/image.yml` with `image
 
 This makes PR #84 unnecessary; it can be closed in favor of this design.
 
+## Documentation
+
+Three doc surfaces change so the new model is discoverable and consistent:
+
+1. **`README.md` — new short section "Choosing the runner image."** User-facing summary of the ladder and where to set each knob. Draft:
+
+   > ### Choosing the runner image
+   >
+   > Every implementation job runs in a runner image. Resolution is the same in both execution modes, highest priority first:
+   >
+   > | Where | Scope | Use it for |
+   > |---|---|---|
+   > | `.ai-implement/image.yml` (committed in the target repo) | one repo | "this repo needs a special image" |
+   > | `AI_IMPLEMENT_RUNNER_IMAGE` | org-wide or per-repo | "my org's default image" — set as a GitHub **org** variable (`github-actions` mode) or an orchestrator env var (`fly-machines` mode) |
+   > | *(none set)* | — | falls back to the published BuildDownAI image |
+   >
+   > The first one set wins. A fork that publishes its own image typically sets `AI_IMPLEMENT_RUNNER_IMAGE` once at the org level — no workflow edits, and the allowlist trusts your org's `ghcr.io/<owner>/` namespace automatically. In `github-actions` mode a manual `runner_image` dispatch input overrides everything for that single run.
+
+2. **`CLAUDE.md` — update the existing "Per-repo runner image override" section** to describe the full ladder (not just `.ai-implement/image.yml`), and update the **Key environment variables** table: add `AI_IMPLEMENT_RUNNER_IMAGE`, mark `SESSION_IMAGE` deprecated (back-compat alias).
+
+3. **Workflow header comments** in `claude-implement.yml` / `comment-trigger.yml` and the `runner_image` input `description:` — reflect the owner-auto-trust and that `.ai-implement/image.yml` is now read.
+
 ## Testing
 
 - `src/__tests__/workflow-shim-structure.test.ts` — assert the owner-augmented allowlist (`ghcr.io/builddownai/` + owner-derived) and that the **default** remains the `builddownai` literal; assert the workflow reads `.ai-implement/image.yml`.
