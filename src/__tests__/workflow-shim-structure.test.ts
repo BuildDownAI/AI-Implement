@@ -89,6 +89,8 @@ describe("GHA workflow shims", () => {
       // Reads the per-repo override file from the default branch (no ?ref= → no PR-head read).
       expect(yaml).toMatch(/contents\/\.ai-implement\/image\.yml/);
       expect(yaml).not.toMatch(/image\.yml\?ref=/);
+      // The image.yml parse must not abort the job under `set -euo pipefail` (SIGPIPE on multi-match).
+      expect(yaml).toMatch(/head -n1\)" \|\| true/);
     });
   }
 
@@ -117,6 +119,8 @@ describe("GHA workflow shims", () => {
     expect(yaml).toMatch(/ghcr\.io\/\$\{owner\}\//);
     expect(yaml).toMatch(/contents\/\.ai-implement\/image\.yml/);
     expect(yaml).not.toMatch(/image\.yml\?ref=/);
+    // The image.yml parse must not abort the job under `set -euo pipefail` (SIGPIPE on multi-match).
+    expect(yaml).toMatch(/head -n1\)" \|\| true/);
   });
 
   it("documents and constrains the ISSUE_META eval trust boundary", () => {
