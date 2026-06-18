@@ -85,9 +85,13 @@ So an operator who wants all their repos on their own image sets one value at th
 
 The `validate-runner-image` job changes in three ways:
 
+**Current state:** `.ai-implement/image.yml` is **silently ignored** in `github-actions` mode today. `DispatchInputs` (`src/github.ts`) has no `runner_image` field, the dispatch path never calls `resolveSessionImage`, and `validate-runner-image` only reads the `runner_image` input (always empty from the orchestrator) → `vars.AI_IMPLEMENT_RUNNER_IMAGE` → hardcoded default. The input *mechanism* exists and is validated; nothing populates it from the file. This change wires the file in.
+
 1. **Default stays upstream.** The hardcoded fallback remains `ghcr.io/builddownai/ai-implement-runner:next` (unchanged from today). PR #84's owner-derived default is **not** adopted.
-2. **Read `.ai-implement/image.yml`** from the target repo (GitHub contents API / `gh api`, mirroring `src/repo-image.ts`) and slot it **above** `AI_IMPLEMENT_RUNNER_IMAGE` in the ladder, **below** the `runner_image` dispatch input. Same `image:` key parsing and image-reference format validation as `repo-image.ts`.
-3. **Allowlist auto-trusts the owner.** Seed `allowed_prefixes` with `ghcr.io/builddownai/` **and** `ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/` (this is the safe half of PR #84), plus `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` as before. The allowlist is applied to whatever image the ladder resolves.
+2. **Read `.ai-implement/image.yml` in the workflow itself.** Add a step in `validate-runner-image` that fetches the file via `gh api repos/<owner>/<repo>/contents/.ai-implement/image.yml`, base64-decodes, extracts the `image:` key, and applies the same image-reference format validation as `src/repo-image.ts`. Slot the result **above** `AI_IMPLEMENT_RUNNER_IMAGE`, **below** the `runner_image` dispatch input.
+   - **Both workflows self-resolve** — `claude-implement.yml` *and* `comment-trigger.yml`. We do **not** have the orchestrator resolve-and-pass `runner_image`, because `comment-trigger.yml` is fired by a `/ai-implement` PR comment (not orchestrator-driven) and would otherwise ignore the file. Self-resolution in the workflow covers both triggers with one mechanism and needs no orchestrator/`DispatchInputs` change.
+   - **Read from the default branch only — never the PR head.** A gap-fill run (`comment-trigger.yml`) operates on a PR branch with the repo's privileged secrets. Reading `image.yml` from the PR head would let a PR author choose the image their privileged run executes in. Always fetch from the repo's default branch (the contents API default ref); the allowlist is the secondary backstop, default-branch read is the primary defense.
+3. **Allowlist auto-trusts the owner.** Seed `allowed_prefixes` with `ghcr.io/builddownai/` **and** `ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/` (this is the safe half of PR #84), plus `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` as before. The allowlist is applied to whatever image the ladder resolves — including the value read from `image.yml`.
 
 Both the canonical `.github/workflows/` copies and the synced `workflows/` templates change together, preserving the byte-for-byte parity enforced by `workflow-shim-structure.test.ts`.
 
@@ -135,7 +139,7 @@ Three doc surfaces change so the new model is discoverable and consistent:
 
 ## Testing
 
-- `src/__tests__/workflow-shim-structure.test.ts` — assert the owner-augmented allowlist (`ghcr.io/builddownai/` + owner-derived) and that the **default** remains the `builddownai` literal; assert the workflow reads `.ai-implement/image.yml`.
+- `src/__tests__/workflow-shim-structure.test.ts` — assert the owner-augmented allowlist (`ghcr.io/builddownai/` + owner-derived) and that the **default** remains the `builddownai` literal; assert both workflows include the `.ai-implement/image.yml` fetch step and that the fetch targets the default branch (no PR-head ref). Holds for both the canonical `.github/workflows/` copies and the synced `workflows/` templates (parity).
 - `src/__tests__/repo-image.test.ts` — unchanged behavior; add coverage that the Fly default now derives from `AI_IMPLEMENT_RUNNER_IMAGE` with `SESSION_IMAGE` fallback.
 - New/extended orchestrator config test — `AI_IMPLEMENT_RUNNER_IMAGE` wins over `SESSION_IMAGE`; `SESSION_IMAGE`-only still works and emits the deprecation warning; neither set falls back to the `builddownai` literal.
 - `npm run typecheck` + full `vitest` suite green.
