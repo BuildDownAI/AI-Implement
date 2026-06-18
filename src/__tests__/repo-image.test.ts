@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSessionImage, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { resolveDefaultRunnerImage } from "../repo-image.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -169,5 +170,28 @@ describe("resolveSessionImage", () => {
       fetchImpl,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
+  });
+});
+
+describe("resolveDefaultRunnerImage", () => {
+  it("prefers AI_IMPLEMENT_RUNNER_IMAGE over SESSION_IMAGE", () => {
+    const r = resolveDefaultRunnerImage({
+      AI_IMPLEMENT_RUNNER_IMAGE: "ghcr.io/acme/ai-implement-runner:v3",
+      SESSION_IMAGE: "ghcr.io/old/legacy:latest",
+    });
+    expect(r.image).toBe("ghcr.io/acme/ai-implement-runner:v3");
+    expect(r.sessionImageDeprecated).toBe(true);
+  });
+
+  it("falls back to SESSION_IMAGE and flags it deprecated", () => {
+    const r = resolveDefaultRunnerImage({ SESSION_IMAGE: "ghcr.io/acme/runner:1" });
+    expect(r.image).toBe("ghcr.io/acme/runner:1");
+    expect(r.sessionImageDeprecated).toBe(true);
+  });
+
+  it("falls back to the upstream image when neither is set", () => {
+    const r = resolveDefaultRunnerImage({});
+    expect(r.image).toBe("ghcr.io/builddownai/ai-implement-runner:latest");
+    expect(r.sessionImageDeprecated).toBe(false);
   });
 });

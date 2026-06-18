@@ -23,7 +23,7 @@ import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } f
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { initReconciliationTable, getPendingReconciliations, updateReconciliationStatus } from "./reconciliation.js";
-import { resolveSessionImage } from "./repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerResult } from "./runner-callback.js";
@@ -133,7 +133,7 @@ function loadConfig(): AppConfig {
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
-    sessionImage: process.env.SESSION_IMAGE || "ghcr.io/builddownai/ai-implement-runner:latest",
+    sessionImage: resolveDefaultRunnerImage(process.env).image,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
     githubWebhookSecret,
@@ -1711,6 +1711,11 @@ async function main(): Promise<void> {
     console.log(`[main] Per-team runners: ${teamRunners || "(none configured)"}`);
   }
   console.log(`[main] Poll interval: ${config.pollIntervalMs}ms`);
+  if (resolveDefaultRunnerImage(process.env).sessionImageDeprecated) {
+    console.warn(
+      "[main] SESSION_IMAGE is deprecated; rename it to AI_IMPLEMENT_RUNNER_IMAGE (same value). SESSION_IMAGE still works for now.",
+    );
+  }
   console.log(`[main] Mapped teams: ${Object.keys(teamRepoMap).join(", ")}`);
   console.log(`[main] Notification type: ${config.notifyType}`);
   if (initialRunnerMode === "local") {

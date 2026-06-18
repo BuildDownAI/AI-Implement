@@ -1,3 +1,12 @@
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      AI_IMPLEMENT_RUNNER_IMAGE?: string;
+      SESSION_IMAGE?: string;
+    }
+  }
+}
+
 const CACHE_TTL_MS = 60_000;
 const IMAGE_KEY_RE = /^image:\s*(\S+)\s*$/m;
 // Registry ref: host/name(/subpath)* followed by either ":tag" or "@digest".
@@ -107,4 +116,26 @@ async function fetchImage(
   }
 
   return { image: candidate, source: "override" };
+}
+
+const DEFAULT_RUNNER_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
+
+export interface DefaultRunnerImageResult {
+  image: string;
+  /** True whenever SESSION_IMAGE is set, even if AI_IMPLEMENT_RUNNER_IMAGE supersedes it. */
+  sessionImageDeprecated: boolean;
+}
+
+/**
+ * Resolves the orchestrator-wide default runner image, preferring the
+ * mode-agnostic AI_IMPLEMENT_RUNNER_IMAGE and falling back to the legacy
+ * (deprecated) SESSION_IMAGE, then the upstream BuildDownAI image.
+ */
+export function resolveDefaultRunnerImage(
+  env: Pick<NodeJS.ProcessEnv, "AI_IMPLEMENT_RUNNER_IMAGE" | "SESSION_IMAGE">,
+): DefaultRunnerImageResult {
+  return {
+    image: env.AI_IMPLEMENT_RUNNER_IMAGE || env.SESSION_IMAGE || DEFAULT_RUNNER_IMAGE,
+    sessionImageDeprecated: Boolean(env.SESSION_IMAGE),
+  };
 }
