@@ -23,7 +23,7 @@ import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } f
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { initReconciliationTable, getPendingReconciliations, updateReconciliationStatus } from "./reconciliation.js";
-import { resolveSessionImage, selectRunnerImageInput } from "./repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult } from "./runner-callback.js";
@@ -47,9 +47,6 @@ import { listOpenReviewFindings } from "./review-ledger-store.js";
 
 // ---------- Configuration ----------
 
-/** Built-in fallback runner image when SESSION_IMAGE is unset. Mirrors the default in claude-implement.yml. */
-const DEFAULT_SESSION_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
-
 interface AppConfig {
   linearApiKey: string | null;
   githubAppId: string;
@@ -66,8 +63,10 @@ interface AppConfig {
   flyOrchestratorApp: string | null;
   tenantId: string | null;
   sessionImage: string;
-  /** True when SESSION_IMAGE was explicitly set (vs. falling back to the built-in default). */
-  sessionImageExplicit: boolean;
+  /** Deprecation state of SESSION_IMAGE, used for the startup warning. */
+  sessionImageStatus: SessionImageStatus;
+  /** True when an explicit orchestrator-wide default image was set (either runner-image env var); drives GHA dispatch forwarding. */
+  runnerImageExplicit: boolean;
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   githubWebhookSecret: string | null;
@@ -108,6 +107,9 @@ function loadConfig(): AppConfig {
   const runnerTokenSecret = process.env.RUNNER_TOKEN_SECRET || null;
   const gapFillTriggerSecret = process.env.GAP_FILL_TRIGGER_SECRET || null;
 
+  // Resolve the default runner image once; main() reads the status for the deprecation warning.
+  const defaultRunner = resolveDefaultRunnerImage(process.env);
+
   if (!runnerCallbackBaseUrl || !runnerTokenSecret) {
     console.warn("[main] runner callback path disabled (RUNNER_CALLBACK_BASE_URL or RUNNER_TOKEN_SECRET not set)");
   }
@@ -142,8 +144,9 @@ function loadConfig(): AppConfig {
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
-    sessionImage: process.env.SESSION_IMAGE || DEFAULT_SESSION_IMAGE,
-    sessionImageExplicit: Boolean(process.env.SESSION_IMAGE),
+    sessionImage: defaultRunner.image,
+    sessionImageStatus: defaultRunner.sessionImageStatus,
+    runnerImageExplicit: defaultRunner.explicit,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
     githubWebhookSecret,
@@ -397,7 +400,7 @@ async function resolveDispatchRunnerImage(
   });
   return selectRunnerImageInput({
     resolved,
-    sessionImageExplicit: config.sessionImageExplicit,
+    runnerImageExplicit: config.runnerImageExplicit,
   });
 }
 
@@ -2080,6 +2083,15 @@ async function main(): Promise<void> {
     console.log(`[main] Per-team runners: ${teamRunners || "(none configured)"}`);
   }
   console.log(`[main] Poll interval: ${config.pollIntervalMs}ms`);
+  if (config.sessionImageStatus === "active") {
+    console.warn(
+      "[main] SESSION_IMAGE is deprecated; rename it to AI_IMPLEMENT_RUNNER_IMAGE (same value). SESSION_IMAGE still works for now.",
+    );
+  } else if (config.sessionImageStatus === "shadowed") {
+    console.warn(
+      "[main] SESSION_IMAGE is set but ignored because AI_IMPLEMENT_RUNNER_IMAGE takes precedence. Remove SESSION_IMAGE.",
+    );
+  }
   console.log(`[main] Mapped teams: ${Object.keys(teamRepoMap).join(", ")}`);
   console.log(`[main] Notification type: ${config.notifyType}`);
   if (initialRunnerMode === "local") {

@@ -16,7 +16,7 @@
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
-#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
 #   AI_IMPLEMENT_RUNNER_LABEL                    - runs-on label for the implement job (default ubuntu-latest); set to a larger-runner label to speed up CPU-bound test suites.
 
 name: Claude AI Implementation
@@ -101,7 +101,7 @@ on:
         type: string
         default: ""
       runner_image:
-        description: "Override the default runner image (must match ghcr.io/builddownai/* or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
+        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
         default: ""
@@ -124,10 +124,29 @@ jobs:
           REQUESTED_RUNNER_IMAGE: ${{ inputs.runner_image }}
           CONFIGURED_RUNNER_IMAGE: ${{ vars.AI_IMPLEMENT_RUNNER_IMAGE }}
           EXTRA_ALLOWED_PREFIXES: ${{ vars.AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [ -z "$owner" ]; then
+            echo "::error::GITHUB_REPOSITORY_OWNER is empty; cannot derive the owner image prefix." >&2
+            exit 1
+          fi
+
+          # Resolution ladder: dispatch input > .ai-implement/image.yml > repo/org var > upstream default.
           runner_image="${REQUESTED_RUNNER_IMAGE:-}"
+
+          # Read the per-repo override from the DEFAULT branch only — never a PR head — so a
+          # pull request cannot choose the image its privileged run executes in. `gh api` with
+          # no ?ref= resolves the default branch; mirrors src/repo-image.ts parsing.
+          if [ -z "$runner_image" ]; then
+            if raw="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.ai-implement/image.yml" \
+                  -H "Accept: application/vnd.github.raw+json" 2>/dev/null)"; then
+              runner_image="$(printf '%s\n' "$raw" | sed -n 's/^image:[[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' | head -n1)" || true
+            fi
+          fi
+
           if [ -z "$runner_image" ]; then
             runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
           fi
@@ -142,7 +161,7 @@ jobs:
               ;;
           esac
 
-          allowed_prefixes="ghcr.io/builddownai/"
+          allowed_prefixes="ghcr.io/builddownai/,ghcr.io/${owner}/"
           if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
             allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
           fi
@@ -152,12 +171,12 @@ jobs:
           for raw_prefix in "${prefixes[@]}"; do
             prefix="$(echo "$raw_prefix" | xargs)"
             [ -z "$prefix" ] && continue
-            case "$runner_image" in
-              "$prefix"*)
-                allowed=true
-                break
-                ;;
-            esac
+            # Literal prefix match — quote "$prefix" so glob metacharacters in an
+            # operator-supplied AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES can't widen it.
+            if [[ "$runner_image" == "$prefix"* ]]; then
+              allowed=true
+              break
+            fi
           done
 
           if [ "$allowed" != "true" ]; then
