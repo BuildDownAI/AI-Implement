@@ -74,20 +74,6 @@ npm run dev:local          # rebuilds the runner image, then starts RUNNER_MODE=
 
 Docker must be running. Local mode still opens real GitHub PRs; it just avoids deploying the orchestrator or publishing a runner image while you test changes.
 
-## Choosing the runner image
-
-Every implementation job runs inside a runner image. Resolution is the same in both execution modes, highest priority first:
-
-| Where | Scope | Use it for |
-|---|---|---|
-| `.ai-implement/image.yml` (committed in the target repo, default branch) | one repo | "this repo needs a special image" |
-| `AI_IMPLEMENT_RUNNER_IMAGE` | org-wide or per-repo | "my org's default image" — a GitHub **org** variable in `github-actions` mode, or an orchestrator env var in `fly-machines` mode |
-| *(nothing set)* | — | falls back to the published BuildDownAI image |
-
-The first one set wins. A fork that publishes its own image typically sets `AI_IMPLEMENT_RUNNER_IMAGE` once at the org level — no workflow edits, and the allowlist trusts your org's `ghcr.io/<owner>/` namespace automatically. In `github-actions` mode, a manual `runner_image` dispatch input overrides everything for that single run. `.ai-implement/image.yml` is always read from the default branch, so a pull request can't change the image its own run executes in.
-
-`SESSION_IMAGE` is the deprecated former name of the orchestrator's `AI_IMPLEMENT_RUNNER_IMAGE` env var; it still works but logs a warning at startup.
-
 The full architecture, env-var reference, SQLite schema, multi-client deploy model, and Bedrock setup live in [`CLAUDE.md`](CLAUDE.md).
 
 ## Layout

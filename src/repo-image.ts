@@ -1,12 +1,3 @@
-declare global {
-  namespace NodeJS {
-    interface ProcessEnv {
-      AI_IMPLEMENT_RUNNER_IMAGE?: string;
-      SESSION_IMAGE?: string;
-    }
-  }
-}
-
 const CACHE_TTL_MS = 60_000;
 const IMAGE_KEY_RE = /^image:\s*(\S+)\s*$/m;
 // Registry ref: host/name(/subpath)* followed by either ":tag" or "@digest".
@@ -116,42 +107,4 @@ async function fetchImage(
   }
 
   return { image: candidate, source: "override" };
-}
-
-const DEFAULT_RUNNER_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
-
-/**
- * State of the deprecated SESSION_IMAGE env var relative to its replacement:
- * - `unused`   — SESSION_IMAGE is not set; nothing to warn about.
- * - `active`   — SESSION_IMAGE is set and in use (AI_IMPLEMENT_RUNNER_IMAGE unset).
- * - `shadowed` — both are set, so SESSION_IMAGE is ignored in favour of the new var.
- */
-export type SessionImageStatus = "unused" | "active" | "shadowed";
-
-export interface DefaultRunnerImageResult {
-  image: string;
-  sessionImageStatus: SessionImageStatus;
-}
-
-/**
- * Resolves the orchestrator-wide default runner image, preferring the
- * mode-agnostic AI_IMPLEMENT_RUNNER_IMAGE and falling back to the legacy
- * (deprecated) SESSION_IMAGE, then the upstream BuildDownAI image. The
- * returned status lets the caller emit a deprecation warning whose wording
- * distinguishes "rename it" (active) from "it's ignored" (shadowed).
- */
-export function resolveDefaultRunnerImage(
-  env: Pick<NodeJS.ProcessEnv, "AI_IMPLEMENT_RUNNER_IMAGE" | "SESSION_IMAGE">,
-): DefaultRunnerImageResult {
-  const hasNew = Boolean(env.AI_IMPLEMENT_RUNNER_IMAGE);
-  const hasLegacy = Boolean(env.SESSION_IMAGE);
-  const sessionImageStatus: SessionImageStatus = !hasLegacy
-    ? "unused"
-    : hasNew
-      ? "shadowed"
-      : "active";
-  return {
-    image: env.AI_IMPLEMENT_RUNNER_IMAGE || env.SESSION_IMAGE || DEFAULT_RUNNER_IMAGE,
-    sessionImageStatus,
-  };
 }
