@@ -101,6 +101,25 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
 }
 
 async function request(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
+  let requestBody = body;
+  if (
+    url === "/api/mappings" &&
+    method === "POST" &&
+    requestBody &&
+    typeof requestBody === "object" &&
+    !Array.isArray(requestBody) &&
+    "teamKey" in requestBody &&
+    "owner" in requestBody &&
+    "repo" in requestBody &&
+    !("defaultBranch" in requestBody)
+  ) {
+    // Existing mapping tests pre-date the required defaultBranch field; keep them focused on their original assertions.
+    requestBody = { defaultBranch: "main", ...requestBody };
+  }
+  return requestRaw(url, method, accessCode, requestBody, token);
+}
+
+async function requestRaw(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
@@ -203,6 +222,43 @@ describe("admin mappings", () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "APP" }, token);
     expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects mapping creation without a default branch", async () => {
+    const token = await login("secret");
+    const res = await request(
+      "/api/mappings",
+      "POST",
+      "secret",
+      { teamKey: "APP", owner: "org", repo: "app", defaultBranch: "" },
+      token,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("defaultBranch");
+  });
+
+  it("preserves an existing mapping defaultBranch when an upsert omits it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DEV",
+      owner: "org",
+      repo: "app",
+      defaultBranch: "development",
+    }, token);
+    expect(create.statusCode).toBe(200);
+
+    const update = await requestRaw("/api/mappings", "POST", "secret", {
+      teamKey: "DEV",
+      owner: "org",
+      repo: "app-renamed",
+    }, token);
+    expect(update.statusCode).toBe(200);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).DEV).toMatchObject({
+      repo: "app-renamed",
+      defaultBranch: "development",
+    });
   });
 
   it("updates the cap via PATCH", async () => {
@@ -470,6 +526,65 @@ describe("admin mappings", () => {
     expect(JSON.parse(res.body).error).toMatch(/bedrock.*fly-machines/);
   });
 
+  it("creates a mapping with maxTurns/maxIterations/maxJobMinutes and round-trips them", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPS", owner: "org", repo: "caps-repo",
+      maxTurns: 40, maxIterations: 2, maxJobMinutes: 30,
+    }, token);
+    expect(create.statusCode).toBe(200);
+    const body = JSON.parse(create.body);
+    expect(body.maxTurns).toBe(40);
+    expect(body.maxIterations).toBe(2);
+    expect(body.maxJobMinutes).toBe(30);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    const m = JSON.parse(list.body).CAPS;
+    expect(m.maxTurns).toBe(40);
+    expect(m.maxIterations).toBe(2);
+    expect(m.maxJobMinutes).toBe(30);
+  });
+
+  it("defaults maxTurns/maxIterations/maxJobMinutes to null when omitted", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPD", owner: "org", repo: "capd-repo",
+    }, token);
+    expect(create.statusCode).toBe(200);
+    const body = JSON.parse(create.body);
+    expect(body.maxTurns).toBeNull();
+    expect(body.maxIterations).toBeNull();
+    expect(body.maxJobMinutes).toBeNull();
+  });
+
+  it("rejects maxTurns:0 with 400 mentioning maxTurns", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad", maxTurns: 0,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/maxTurns/);
+  });
+
+  it("rejects maxIterations:-1 with 400 mentioning maxIterations", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad", maxIterations: -1,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/maxIterations/);
+  });
+
+  it("accepts null maxTurns explicitly and stores null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPN", owner: "org", repo: "capn-repo",
+      maxTurns: null,
+    }, token);
+    expect(create.statusCode).toBe(200);
+    expect(JSON.parse(create.body).maxTurns).toBeNull();
+  });
+
   it("upsertMapping accepts a Jira ticketingProvider with valid config", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {
@@ -505,6 +620,45 @@ describe("admin mappings", () => {
     }, token);
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toMatch(/kind/);
+  });
+
+  it("persists a valid branchPrefix and returns it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX", owner: "org", repo: "app", branchPrefix: "pr",
+    }, token);
+    expect(create.statusCode).toBe(200);
+    expect(JSON.parse(create.body).branchPrefix).toBe("pr");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).PFX.branchPrefix).toBe("pr");
+  });
+
+  it("normalizes surrounding slashes on branchPrefix", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX2", owner: "org", repo: "app", branchPrefix: "/pr/",
+    }, token);
+    expect(create.statusCode).toBe(200);
+    expect(JSON.parse(create.body).branchPrefix).toBe("pr");
+  });
+
+  it("treats a blank branchPrefix as null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX3", owner: "org", repo: "app", branchPrefix: "  ",
+    }, token);
+    expect(create.statusCode).toBe(200);
+    expect(JSON.parse(create.body).branchPrefix).toBeNull();
+  });
+
+  it("rejects an invalid branchPrefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFXBAD", owner: "org", repo: "app", branchPrefix: "has space",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("branchPrefix");
   });
 });
 

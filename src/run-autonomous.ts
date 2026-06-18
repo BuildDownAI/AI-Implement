@@ -1,13 +1,17 @@
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
-import type { LLMExecutor, PipelineDefinition, StepReporter } from "./pipeline/types.js";
-import { HttpStepReporter, NoopStepReporter } from "./pipeline/reporter.js";
+import type { LLMExecutor, LogLevel, PipelineDefinition, StepReporter } from "./pipeline/types.js";
+import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
+import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } from "./pipeline/timing.js";
+import { runHookScript } from "./pipeline/steps/hooks.js";
+import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
-import { fetchPlanningContext } from "./linear-planning-fetch.js";
+import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 
 export interface RunAutonomousOptions {
   workspaceDir?: string;
@@ -26,6 +30,31 @@ function requireEnv(n: string): string {
   const v = process.env[n];
   if (!v) throw new Error(`Missing required env var: ${n}`);
   return v;
+}
+
+function optionalEnv(n: string): string | null {
+  const v = process.env[n]?.trim();
+  return v ? v : null;
+}
+
+function currentGitBranch(workspaceDir: string): string | null {
+  const result = spawnSync("git", ["branch", "--show-current"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0) return null;
+  const branch = result.stdout.toString().trim();
+  return branch || null;
+}
+
+function resolveBranch(workspaceDir: string): string {
+  const branch =
+    optionalEnv("GITHUB_DEFAULT_BRANCH") ??
+    currentGitBranch(workspaceDir);
+  if (!branch) {
+    throw new Error("Missing GITHUB_DEFAULT_BRANCH and unable to resolve the checked-out branch");
+  }
+  return branch;
 }
 
 function buildDefaultImplementationPrompt(params: {
@@ -72,63 +101,10 @@ Modify files only in the current checkout and leave the working tree changes uns
 The AI-Implement pipeline will create the implementation commit, push an issue-scoped branch, and open the PR after review passes.`;
 }
 
-function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
-  const commentsDir = join(workspaceDir, "ai-output", "comments");
-  if (!existsSync(commentsDir)) return [];
-  return readdirSync(commentsDir)
-    .filter((name) => name.endsWith(".md"))
-    .sort()
-    .map((name) => ({ body: readFileSync(join(commentsDir, name), "utf-8") }));
-}
 
-async function postRunnerResult(params: {
-  workspaceDir: string;
-  outcome: "success" | "failure";
-  prUrl?: string;
-  failureReason?: string;
-  fetchImpl?: typeof fetch;
-}): Promise<void> {
-  const callbackUrl = process.env.RUNNER_CALLBACK_URL;
-  const runToken = process.env.RUN_TOKEN;
-  if (!callbackUrl || !runToken) return;
 
-  if (params.outcome === "success" && !params.prUrl) {
-    console.warn("RUNNER_CALLBACK_URL is set but no PR URL was produced; skipping runner result callback.");
-    return;
-  }
-
-  let comments: Array<{ body: string }> = [];
-  try {
-    comments = collectRunnerComments(params.workspaceDir);
-  } catch (err) {
-    console.warn("[runner-callback] Failed to collect runner comments; continuing with no comments:", err);
-  }
-
-  const body: Record<string, unknown> = {
-    phase: "implementation",
-    outcome: params.outcome,
-    comments,
-  };
-  if (params.prUrl) body.prUrl = params.prUrl;
-  if (params.failureReason) body.failureReason = params.failureReason;
-
-  const fetchFn = params.fetchImpl ?? fetch;
-  try {
-    const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${runToken}`,
-      },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(`[runner-callback] POST /runner/result failed with HTTP ${res.status}: ${text}`);
-    }
-  } catch (err) {
-    console.error("[runner-callback] POST /runner/result failed:", err);
-  }
+export function resolveLogLevel(raw: string | undefined): LogLevel {
+  return raw === "stream" ? "stream" : "summary";
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
@@ -141,24 +117,41 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   const githubRepo = requireEnv("GITHUB_REPO");
   const githubToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
   if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
-  const branch = process.env.GITHUB_DEFAULT_BRANCH || "main";
+  const branch = resolveBranch(workspaceDir);
   const prNumber = process.env.PR_NUMBER ?? "";
+  const runnerPhase = resolveRunnerPhase(process.env.RUNNER_PHASE, prNumber);
 
-  const planningContext = process.env.LINEAR_API_KEY
-    ? await fetchPlanningContext({
-        issueId,
-        linearApiKey: process.env.LINEAR_API_KEY,
+  const callbackUrl = optionalEnv("RUNNER_CALLBACK_URL");
+  const progressToken = optionalEnv("RUN_PROGRESS_TOKEN");
+
+  // Planning context is fetched from the orchestrator's provider-agnostic
+  // endpoint using the reusable progress token — the runner never calls the
+  // ticketing system directly. Absent a callback URL/token (e.g. a
+  // comment-triggered gap-fill), the run proceeds without planning context.
+  const planningContext = callbackUrl && progressToken
+    ? await fetchPlanningContextFromOrchestrator({
+        callbackUrl,
+        progressToken,
         fetchImpl: opts.fetchImpl,
       })
     : "";
 
   let workflowModel: string | undefined;
+  let setupHook: string | undefined;
+  let verifyHook: string | undefined;
+  let teardownHook: string | undefined;
   let implementationPrompt = buildDefaultImplementationPrompt({
     issueIdentifier,
     issueTitle,
     issueDescription,
     prNumber,
   });
+  // WORKFLOW.md (and therefore the hook paths, incl. teardown) is read once here,
+  // before the pipeline runs. In GHA mode the repo is already checked out into
+  // `workspaceDir`, so the hooks resolve and the captured teardown path stays valid
+  // through `finally`. In Fly/local modes the `clone` step runs later in the
+  // pipeline, so `workspaceDir` is empty at this point — WORKFLOW.md isn't found and
+  // all hooks resolve to undefined (hooks are effectively GHA-only; see WORKFLOW.md).
   const wfPath = join(workspaceDir, "WORKFLOW.md");
   if (existsSync(wfPath)) {
     const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {
@@ -170,22 +163,55 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       PLANNING_CONTEXT: planningContext,
     });
     workflowModel = parsed.frontMatter.model;
+    setupHook = parsed.frontMatter.setup;
+    verifyHook = parsed.frontMatter.verify;
+    teardownHook = parsed.frontMatter.teardown;
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
   implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
   const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
+  const provider = process.env.PROVIDER || "anthropic";
+  const parseEnvInt = (raw: string | undefined, name: string): number | undefined => {
+    if (!raw) return undefined;
+    const n = parseInt(raw, 10);
+    if (Number.isInteger(n) && n > 0) return n;
+    // The orchestrator validates caps before dispatch, so this only happens on a
+    // manual GHA dispatch with a bad value. Warn so "my cap isn't taking effect"
+    // is diagnosable rather than a silent fallback to the default.
+    console.warn(`[runner] Ignoring invalid ${name}="${raw}" (must be a positive integer); using default`);
+    return undefined;
+  };
+  const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS, "AI_IMPLEMENT_MAX_TURNS");
+  const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS, "AI_IMPLEMENT_MAX_ITERATIONS");
+  const branchPrefix = (() => {
+    try {
+      return normalizeBranchPrefix(process.env.AI_IMPLEMENT_BRANCH_PREFIX) ?? undefined;
+    } catch (err) {
+      // The orchestrator validates the prefix before dispatch, so this only
+      // happens on a manual dispatch with a bad value. Warn rather than fail the
+      // run, and fall back to the default (no prefix).
+      console.warn(`[runner] Ignoring invalid AI_IMPLEMENT_BRANCH_PREFIX: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  })();
 
-  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir);
+  const logLevel = resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL);
+  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
   if (orchestratorUrl && !nonce) {
     console.warn("ORCHESTRATOR_URL is set but MACHINE_NONCE is empty — step reports will be rejected (403).");
   }
-  const reporter: StepReporter =
+  const baseReporter: StepReporter =
     opts.reporter ??
-    (orchestratorUrl && nonce
+    (callbackUrl && progressToken
+      ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
+      : orchestratorUrl && nonce
       ? new HttpStepReporter(orchestratorUrl, nonce)
       : new NoopStepReporter());
+
+  const timing = new TimingCollector(logLevel);
+  const reporter: StepReporter = new TimingStepReporter(baseReporter, timing);
 
   const context = new DefaultPipelineContext(
     {
@@ -196,7 +222,6 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       issueDescription,
       nonce,
       orchestratorUrl: orchestratorUrl ?? "",
-      ticketingProvider: "linear",
       model,
       workspaceDir,
       planningContext,
@@ -206,6 +231,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       githubRepo,
       githubToken,
       branch,
+      provider,
+      maxTurns,
+      maxIterations,
+      branchPrefix,
+      hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,
   );
@@ -213,10 +243,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
     const runner = opts.runner ?? (await createDefaultRunner());
-    await runner.run(pipeline, context, reporter);
+    await runWithTiming(timing, () => runner.run(pipeline, context, reporter));
     const pushOutputs = context.getOutputs("push");
     await postRunnerResult({
       workspaceDir,
+      phase: runnerPhase,
       outcome: "success",
       prUrl: typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined,
       fetchImpl: opts.fetchImpl,
@@ -226,12 +257,37 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     console.error(`Pipeline failed: ${err}`);
     await postRunnerResult({
       workspaceDir,
+      phase: runnerPhase,
       outcome: "failure",
       failureReason: err instanceof Error ? err.message : String(err),
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
+  } finally {
+    try {
+      if (timing.records().length > 0) {
+        console.error(formatSummary(timing, issueIdentifier));
+      }
+    } catch (summaryErr) {
+      console.error(`timing summary failed: ${summaryErr}`);
+    }
+    if (teardownHook) {
+      try {
+        const result = runHookScript("teardown", teardownHook, workspaceDir);
+        if (result.exitCode !== 0) {
+          console.error(`teardown hook exited with code ${result.exitCode}`);
+        }
+      } catch (teardownErr) {
+        console.error(`teardown hook error: ${teardownErr}`);
+      }
+    }
   }
+}
+
+function resolveRunnerPhase(rawPhase: string | undefined, prNumber: string): "implementation" | "gap-analysis" {
+  if (!rawPhase) return prNumber ? "gap-analysis" : "implementation";
+  if (rawPhase === "implementation" || rawPhase === "gap-analysis") return rawPhase;
+  throw new Error(`Invalid RUNNER_PHASE: ${rawPhase}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

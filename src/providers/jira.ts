@@ -1,5 +1,6 @@
 import type {
   AIImplementSnapshot,
+  FeatureNodeRollUp,
   IssueLifecycleState,
   ProviderConfig,
   TicketIssue,
@@ -34,6 +35,11 @@ function adfToPlainText(adf: unknown): string {
   }
   walk(adf);
   return out.join("").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function jqlFieldRef(fieldId: string): string {
+  const match = /^customfield_(\d+)$/.exec(fieldId);
+  return match ? `cf[${match[1]}]` : fieldId;
 }
 
 export interface JiraProviderConstructor {
@@ -145,8 +151,11 @@ export class JiraProvider implements TicketingProvider {
       // Reference the status field by its resolved customfield id, not a hardcoded
       // display name. Jira instances often name the field differently than
       // "AI-Implement Status" (e.g. "ai-implement-status" or "AI-Implement-Status"),
-      // and JQL's quoted-name lookup requires an exact match.
-      const bucketJql = `(${cfg.jql}) AND ${fieldIds.statusFieldId} in (Ready, "Plan Approved")`;
+      // and JQL's quoted-name lookup requires an exact match. REST uses
+      // customfield_N ids; JQL on some instances requires cf[N], so transform
+      // before interpolating.
+      const statusJqlField = jqlFieldRef(fieldIds.statusFieldId);
+      const bucketJql = `(${cfg.jql}) AND ${statusJqlField} in (Ready, "Plan Approved")`;
       const bucketIssues = await this.client.searchJql(bucketJql, fieldsToFetch);
 
       for (const raw of bucketIssues) {
@@ -168,7 +177,7 @@ export class JiraProvider implements TicketingProvider {
         // else: orchestrator picked it up between query and our processing; skip.
       }
 
-      const capacityJql = `(${cfg.jql}) AND ${fieldIds.statusFieldId} in (Planning, Implementing)`;
+      const capacityJql = `(${cfg.jql}) AND ${statusJqlField} in (Planning, Implementing)`;
       const capacityIssues = await this.client.searchJql(capacityJql, ["summary"]);
       inProgressCountsByScope[scopeKey] = capacityIssues.length;
     }
@@ -198,6 +207,11 @@ export class JiraProvider implements TicketingProvider {
       nativeStatus: statusOption?.value ?? "",
     };
   }
+  async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {
+    // Feature-branch grouping (and thus roll-up) is Linear-only for now.
+    return [];
+  }
+
   async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {
     if (issueIds.length === 0) return new Map();
     // Use JQL `id in (...)` to fetch the relevant issues. Jira accepts numeric
@@ -254,6 +268,12 @@ export class JiraProvider implements TicketingProvider {
   }
   async postComment(issueId: string, body: string): Promise<void> {
     await this.client.addComment(issueId, adfParagraph(body));
+  }
+
+  async fetchPlanningContext(_issueId: string): Promise<string> {
+    // Jira planning-context extraction is not implemented yet; the
+    // implementation run proceeds without it (best-effort context).
+    return "";
   }
 
   issueUrl(issue: TicketIssue): string {

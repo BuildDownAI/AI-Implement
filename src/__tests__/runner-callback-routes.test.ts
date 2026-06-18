@@ -108,6 +108,37 @@ async function callGapFillRoute(opts: {
   });
 }
 
+/**
+ * Mirror of the GET /runner/planning-context route wrapper in src/index.ts.
+ */
+async function callPlanningContextRoute(opts: {
+  runnerTokenSecret: string | null;
+  authorization?: string;
+  resolveProvider?: (key: string) => Promise<TicketingProvider | null>;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  if (!opts.runnerTokenSecret) {
+    return { status: 501, body: { error: "Runner callback not configured" } };
+  }
+  return runnerCallback.handleRunnerPlanningContext({
+    authorization: opts.authorization,
+    secret: opts.runnerTokenSecret,
+    resolveProvider: opts.resolveProvider ?? (async () => new FakeProvider()),
+  });
+}
+
+describe("/runner/planning-context route wrapper", () => {
+  it("returns 501 when RUNNER_TOKEN_SECRET is unset", async () => {
+    const res = await callPlanningContextRoute({ runnerTokenSecret: null });
+    expect(res.status).toBe(501);
+    expect(res.body.error).toBe("Runner callback not configured");
+  });
+
+  it("returns 401 when bearer is missing", async () => {
+    const res = await callPlanningContextRoute({ runnerTokenSecret: "secret" });
+    expect(res.status).toBe(401);
+  });
+});
+
 describe("/runner/result route wrapper", () => {
   it("returns 501 when RUNNER_TOKEN_SECRET is unset", async () => {
     const res = await callRunnerResultRoute({

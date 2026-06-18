@@ -32,6 +32,7 @@ export interface LocalRunnerInput {
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
+  phase?: "implementation" | "planning";
   orchestratorUrl?: string;
   runnerCallbackUrl?: string;
   runToken?: string;
@@ -63,6 +64,7 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
     SESSION_MODE: input.sessionMode ?? "autonomous",
+    RUNNER_PHASE: input.phase ?? "implementation",
   };
 
   if (input.linearApiKey) env.LINEAR_API_KEY = input.linearApiKey;

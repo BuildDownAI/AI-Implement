@@ -29,6 +29,9 @@ steps:
     type: clone
   - id: install
     type: install
+  - id: setup
+    type: custom
+    moduleId: setup
   - id: feedback-loop
     type: custom
     moduleId: feedback-loop
@@ -36,6 +39,9 @@ steps:
     type: preflight
   - id: push
     type: push
+  - id: verify
+    type: custom
+    moduleId: verify
   - id: post-push-review
     type: custom
     moduleId: post-push-review
@@ -54,7 +60,6 @@ function makeContext(overrides: Partial<PipelineContextData> = {}): DefaultPipel
     issueDescription: "Desc",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
     ...overrides,
   });
 }
@@ -70,9 +75,11 @@ describe("loadPipelineDefinition", () => {
     expect(pipeline.steps.map((s) => s.id)).toEqual([
       "clone",
       "install",
+      "setup",
       "feedback-loop",
       "preflight",
       "push",
+      "verify",
       "post-push-review",
     ]);
   });
@@ -269,12 +276,14 @@ describe("loadPipelineDefinition", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("install", { reviewProviders: ["github-claude-code-review"] });
     ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
 
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
     const inputs = ctx.resolveInputs(step.inputs);
     expect(inputs.workspaceDir).toBe("/tmp/repo");
     expect(inputs.prNumber).toBe("42");
+    expect(inputs.reviewProviders).toEqual(["github-claude-code-review"]);
   });
 
   it("applies post-push-review skip condition based on push output", () => {
@@ -296,6 +305,54 @@ describe("loadPipelineDefinition", () => {
     const ctxMissingPr = makeContext();
     ctxMissingPr.setOutputs("push", { branchPushed: true, prNumber: null });
     expect(step.skip?.(ctxMissingPr)).toBe(true);
+  });
+
+  it("skips setup when no setup hook, runs it (with scriptPath) when present", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "setup")!;
+
+    const ctxNoHook = makeContext();
+    ctxNoHook.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    expect(step.skip?.(ctxNoHook)).toBe(true);
+
+    const ctxWithHook = makeContext({ hooks: { setup: "scripts/setup.sh" } });
+    ctxWithHook.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    expect(step.skip?.(ctxWithHook)).toBe(false);
+    const inputs = ctxWithHook.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.scriptPath).toBe("scripts/setup.sh");
+  });
+
+  it("skips verify when no verify hook, or when feedback-loop not approved", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "verify")!;
+
+    // No hook -> skip even if approved.
+    const ctxNoHook = makeContext();
+    ctxNoHook.setOutputs("feedback-loop", { approved: true });
+    expect(step.skip?.(ctxNoHook)).toBe(true);
+
+    // Hook present but loop not approved -> skip.
+    const ctxNotApproved = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctxNotApproved.setOutputs("feedback-loop", { approved: false });
+    expect(step.skip?.(ctxNotApproved)).toBe(true);
+
+    // Hook present and approved -> run, with scriptPath wired.
+    const ctxRun = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctxRun.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctxRun.setOutputs("feedback-loop", { approved: true });
+    expect(step.skip?.(ctxRun)).toBe(false);
+    const inputs = ctxRun.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.scriptPath).toBe("scripts/verify.sh");
   });
 
   it("custom pipeline with extra step is used by the pipeline runner", async () => {

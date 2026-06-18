@@ -1,5 +1,10 @@
-import { verifyAndConsumeRunToken } from "./runner-tokens.js";
+import { getJobByDispatchId, updateJobPrUrl } from "./log.js";
+import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
+import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
+import { upsertStepRecord } from "./step-log.js";
+import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
+import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
 
@@ -23,15 +28,53 @@ export interface HandleRunnerResultOutput {
   body: Record<string, unknown>;
 }
 
+export interface RunnerProgressBody {
+  step: Step;
+}
+
+export interface HandleRunnerProgressInput {
+  authorization: string | undefined;
+  body: RunnerProgressBody;
+  secret: string;
+}
+
+export interface HandleRunnerPlanningContextInput {
+  authorization: string | undefined;
+  secret: string;
+  resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
+}
+
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
+}
+
+function parseBearerToken(authorization: string | undefined): string | null {
+  if (!authorization || !authorization.startsWith("Bearer")) return null;
+  let i = "Bearer".length;
+  while (i < authorization.length && authorization.charCodeAt(i) <= 32) i += 1;
+  if (i === "Bearer".length || i === authorization.length) return null;
+  return authorization.slice(i);
+}
+
+function validateStepBody(body: unknown): Step | HandleRunnerResultOutput {
+  const raw = body as { step?: unknown } | null | undefined;
+  if (!raw || typeof raw !== "object") return bad(400, "invalid_body");
+  if (!raw.step || typeof raw.step !== "object") return bad(400, "step_required");
+
+  const s = raw.step as Record<string, unknown>;
+  if (!s.id || typeof s.id !== "string") return bad(400, "invalid_step_id");
+  if (!s.type || typeof s.type !== "string") return bad(400, "invalid_step_type");
+  if (!s.status || typeof s.status !== "string") return bad(400, "invalid_step_status");
+  if (!s.started_at || typeof s.started_at !== "string") return bad(400, "invalid_step_started_at");
+
+  return raw.step as Step;
 }
 
 export async function handleRunnerResult(
   input: HandleRunnerResultInput,
 ): Promise<HandleRunnerResultOutput> {
-  const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
-  if (!auth) return bad(401, "missing_bearer");
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
 
   // Validate body shape BEFORE consuming the token. A malformed body would
   // otherwise burn a one-time-use token and lose any chance of retry from
@@ -73,7 +116,7 @@ export async function handleRunnerResult(
   // user-side retries, which we don't want to encourage. Operators monitor
   // the orchestrator logs for warnings[] entries and re-dispatch manually
   // if a provider outage caused dropped comments.
-  const verified = verifyAndConsumeRunToken(auth[1], input.secret);
+  const verified = verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
     return verified.reason === "already_consumed"
       ? bad(409, "already_consumed")
@@ -150,8 +193,85 @@ export async function handleRunnerResult(
     } catch (err) {
       warn("markPrReady", err);
     }
+    const job = getJobByDispatchId(claims.dispatchId);
+    if (job) {
+      updateJobPrUrl(job.id, input.body.prUrl!);
+    }
+  } else if (input.body.phase === "gap-analysis") {
+    const job = getJobByDispatchId(claims.dispatchId);
+    const prNumber = parsePrNumber(job?.prUrl ?? null);
+    if (job?.repo && prNumber !== null) {
+      const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
+      if (snapshot) {
+        markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds);
+      } else {
+        markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
+      }
+    }
   }
   // gap-analysis success: no status transition
 
   return { status: 200, body: { acknowledged: true, warnings } };
+}
+
+function parsePrNumber(prUrl: string | null): number | null {
+  if (!prUrl) return null;
+  const match = prUrl.match(/\/pull\/(\d+)(?:$|[?#])/);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+
+export async function handleRunnerProgress(
+  input: HandleRunnerProgressInput,
+): Promise<HandleRunnerResultOutput> {
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
+
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
+  if (!verified.ok) return bad(401, verified.reason);
+
+  const stepOrError = validateStepBody(input.body);
+  if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+
+  const job = getJobByDispatchId(verified.claims.dispatchId);
+  if (!job) return bad(404, "job_not_found");
+
+  upsertStepRecord(job.id, stepOrError);
+  return { status: 200, body: { acknowledged: true } };
+}
+
+/**
+ * Serves the planning context for a run to the runner, provider-agnostically.
+ * The runner authenticates with its reusable progress token (it never holds a
+ * ticketing-system API key), and the orchestrator resolves the right provider
+ * from the token's mapping. Planning context is best-effort: a missing mapping
+ * or a provider error returns 200 with an empty string rather than failing the
+ * implementation run.
+ */
+export async function handleRunnerPlanningContext(
+  input: HandleRunnerPlanningContextInput,
+): Promise<HandleRunnerResultOutput> {
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
+
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
+  if (!verified.ok) return bad(401, verified.reason);
+
+  const provider = await input.resolveProvider(verified.mappingTeamKey);
+  if (!provider) {
+    console.warn(
+      `[runner-planning-context] mapping deleted between mint and fetch: ${verified.mappingTeamKey}`,
+    );
+    return { status: 200, body: { planningContext: "" } };
+  }
+
+  try {
+    const planningContext = await provider.fetchPlanningContext(verified.claims.issueId);
+    return { status: 200, body: { planningContext } };
+  } catch (err) {
+    console.error(
+      `[runner-planning-context] fetchPlanningContext failed for issueId=${verified.claims.issueId}:`,
+      err,
+    );
+    return { status: 200, body: { planningContext: "" } };
+  }
 }

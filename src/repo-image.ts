@@ -130,6 +130,13 @@ export type SessionImageStatus = "unused" | "active" | "shadowed";
 
 export interface DefaultRunnerImageResult {
   image: string;
+  /**
+   * True when an explicit orchestrator-wide default was set via either env var
+   * (AI_IMPLEMENT_RUNNER_IMAGE or the legacy SESSION_IMAGE), vs the built-in
+   * fallback. Drives whether the resolved image is forwarded to GitHub Actions
+   * dispatches (see {@link selectRunnerImageInput}).
+   */
+  explicit: boolean;
   sessionImageStatus: SessionImageStatus;
 }
 
@@ -152,6 +159,32 @@ export function resolveDefaultRunnerImage(
       : "active";
   return {
     image: env.AI_IMPLEMENT_RUNNER_IMAGE || env.SESSION_IMAGE || DEFAULT_RUNNER_IMAGE,
+    explicit: hasNew || hasLegacy,
     sessionImageStatus,
   };
+}
+
+/**
+ * Decides whether a resolved image should be forwarded to a target workflow as
+ * the `runner_image` workflow_dispatch input.
+ *
+ * We only forward when the image represents an *explicit* choice:
+ *   - a per-repo `.ai-implement/image.yml` override (source === "override"), or
+ *   - an explicit orchestrator-wide default (AI_IMPLEMENT_RUNNER_IMAGE or the
+ *     legacy SESSION_IMAGE), surfaced as `runnerImageExplicit`.
+ *
+ * When neither is true the resolved image is just the built-in fallback, so we
+ * return `undefined` and let the target workflow keep its own resolution
+ * (its own `.ai-implement/image.yml`, the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org
+ * variable, then its built-in default). This keeps repos that pin via that
+ * variable from being silently overridden by the orchestrator's default.
+ */
+export function selectRunnerImageInput(opts: {
+  resolved: ResolveSessionImageResult;
+  runnerImageExplicit: boolean;
+}): string | undefined {
+  if (opts.resolved.source === "override" || opts.runnerImageExplicit) {
+    return opts.resolved.image;
+  }
+  return undefined;
 }

@@ -14,9 +14,11 @@ describe("session/entrypoint.sh", () => {
     expect(content.split("\n").length).toBeLessThan(100);
   });
 
-  it("exec's node /app/dist/run-autonomous.js as the final step", () => {
+  it("exec's the phase-selected TS runner as the final step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toMatch(/exec\s+(.*\s+)?node\s+\/app\/dist\/run-autonomous\.js/);
+    expect(content).toContain('RUNNER_ENTRY="run-planning.js"');
+    expect(content).toContain('RUNNER_ENTRY="run-autonomous.js"');
+    expect(content).toContain('exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"');
   });
 
   it("detects GHA mode by GITHUB_ACTIONS=true", () => {
@@ -24,10 +26,24 @@ describe("session/entrypoint.sh", () => {
     expect(content).toMatch(/GITHUB_ACTIONS.*=.*"true"/);
   });
 
+  it("routes auth validation by provider and enables Claude Code Bedrock mode", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    expect(content).toMatch(/PROVIDER="\$\{PROVIDER:-anthropic\}"/);
+    expect(content).toMatch(/bedrock\) \[ "\$AI_IMPLEMENT_MODE" = "gha" \] \|\| fail "provider=bedrock is supported only in GHA mode"; require_env AWS_REGION; export CLAUDE_CODE_USE_BEDROCK=1/);
+    // Bedrock must also disable experimental betas — Bedrock rejects the
+    // cache_control.scope field, which breaks prompt caching. Assert explicitly
+    // so removing or misspelling the export fails CI.
+    expect(content).toContain("export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1");
+    expect(content).toMatch(/anthropic\) require_one_of ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN/);
+    expect(content.indexOf("CLAUDE_CODE_USE_BEDROCK=1")).toBeLessThan(content.indexOf("su -p coder"));
+  });
+
   it("exports GITHUB_DEFAULT_BRANCH for the TS runner", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\{GITHUB_DEFAULT_BRANCH:-main\}"/);
+    expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\{GITHUB_REF_NAME\}"/);
+    expect(content).toMatch(/gh api "repos\/\$\{GITHUB_OWNER\}\/\$\{GITHUB_REPO\}"/);
     expect(content).toMatch(/export GITHUB_DEFAULT_BRANCH/);
+    expect(content).not.toContain("GITHUB_DEFAULT_BRANCH:-main");
   });
 
   it("preserves the checked-out gap-fill PR branch for the TS clone step", () => {

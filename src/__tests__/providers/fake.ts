@@ -18,6 +18,8 @@ export interface FakeProviderOptions {
   latencyMs?: number;
   /** If true, lifecycle verb invocations are recorded for assertions. */
   recordCalls?: boolean;
+  /** Planning context returned by fetchPlanningContext. Default "". */
+  planningContext?: string;
 }
 
 export interface RecordedCall {
@@ -121,6 +123,11 @@ export class FakeProvider implements TicketingProvider {
   async postComment(issueId: string, body: string): Promise<void> {
     await this.tick("postComment", [issueId, body]);
     this.appendComment(issueId, body);
+  }
+
+  async fetchPlanningContext(issueId: string): Promise<string> {
+    await this.tick("fetchPlanningContext", [issueId]);
+    return this.opts.planningContext ?? "";
   }
 
   issueUrl(issue: TicketIssue): string {

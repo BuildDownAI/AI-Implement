@@ -40,6 +40,7 @@ import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
 import { syncWorkflowTemplates } from "./workflow-sync.js";
+import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -963,10 +964,23 @@ async function handleUpsertMapping(
       ticketingProvider?: string;
       ticketingConfig?: unknown;
       paused?: boolean;
+      maxTurns?: number | null;
+      maxIterations?: number | null;
+      maxJobMinutes?: number | null;
+      branchPrefix?: string | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
       json(res, 400, { error: "teamKey, owner, and repo are required" });
+      return;
+    }
+
+    const existingMapping = getMappings()[body.teamKey];
+    const defaultBranch = typeof body.defaultBranch === "string"
+      ? body.defaultBranch.trim()
+      : (existingMapping?.defaultBranch ?? "");
+    if (!defaultBranch) {
+      json(res, 400, { error: "defaultBranch is required" });
       return;
     }
 
@@ -1053,11 +1067,42 @@ async function handleUpsertMapping(
       return;
     }
 
+    const resolveCap = (
+      name: string,
+      value: number | null | undefined,
+    ): number | null => {
+      if (value === undefined || value === null) return null;
+      if (!Number.isInteger(value) || value < 1) {
+        throw new Error(`${name} must be a positive integer or null`);
+      }
+      return value;
+    };
+
+    let maxTurns: number | null;
+    let maxIterations: number | null;
+    let maxJobMinutes: number | null;
+    try {
+      maxTurns = resolveCap("maxTurns", body.maxTurns);
+      maxIterations = resolveCap("maxIterations", body.maxIterations);
+      maxJobMinutes = resolveCap("maxJobMinutes", body.maxJobMinutes);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+
+    let branchPrefix: string | null;
+    try {
+      branchPrefix = normalizeBranchPrefix(body.branchPrefix);
+    } catch (err) {
+      json(res, 400, { error: `branchPrefix invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
       workflowFile: body.workflowFile || "claude-implement.yml",
-      defaultBranch: body.defaultBranch || "main",
+      defaultBranch,
       maxInProgressAiIssues,
       executionMode,
       sessionMode,
@@ -1075,7 +1120,11 @@ async function handleUpsertMapping(
       // so an Edit form that omits `paused` doesn't silently resume the project.
       paused: body.paused !== undefined
         ? body.paused === true
-        : (getMappings()[body.teamKey]?.paused ?? false),
+        : (existingMapping?.paused ?? false),
+      maxTurns,
+      maxIterations,
+      maxJobMinutes,
+      branchPrefix,
     };
 
     upsertMapping(body.teamKey, mapping);

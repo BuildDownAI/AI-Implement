@@ -7,7 +7,6 @@
 #   AI_IMPLEMENT_PRIVATE_KEY - GitHub App PEM private key
 #   ANTHROPIC_API_KEY        - Anthropic API key
 #   CLAUDE_CODE_OAUTH_TOKEN  - Claude Code OAuth token (preferred over API key)
-#   LINEAR_API_KEY           - Linear API key for status updates
 #
 # Additional secret (Bedrock provider):
 #   AWS_BEDROCK_ROLE_ARN     - IAM role ARN trusted to GitHub OIDC; needs bedrock:InvokeModel
@@ -18,6 +17,7 @@
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
+#   AI_IMPLEMENT_RUNNER_LABEL                    - runs-on label for the implement job (default ubuntu-latest); set to a larger-runner label to speed up CPU-bound test suites.
 
 name: Claude AI Implementation
 
@@ -25,23 +25,33 @@ on:
   workflow_dispatch:
     inputs:
       issue_id:
-        description: "Linear issue UUID"
+        description: "Ticketing-system issue ID"
         required: true
         type: string
       issue_identifier:
-        description: "Linear issue identifier (e.g., ENG-123)"
+        description: "Ticketing-system issue identifier (e.g., ENG-123)"
         required: true
         type: string
       issue_title:
-        description: "Linear issue title"
+        description: "Ticketing-system issue title"
         required: true
         type: string
       issue_description:
-        description: "Linear issue description"
+        description: "Ticketing-system issue description"
         required: true
         type: string
       pr_number:
         description: "Existing PR number for gap-fill runs (leave empty for new implementation)"
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        description: "Branch the runner clones and the PR targets (feature-branch grouping). Empty = repo default."
+        required: false
+        type: string
+        default: ""
+      runner_phase:
+        description: "Runner callback phase: implementation or gap-analysis (empty keeps legacy PR_NUMBER inference)"
         required: false
         type: string
         default: ""
@@ -55,6 +65,26 @@ on:
         required: false
         type: string
         default: ""
+      max_turns:
+        description: "Cap on Claude turns per implement pass (empty = runner default)"
+        required: false
+        type: string
+        default: ""
+      max_iterations:
+        description: "Cap on implement/review iterations (empty = provider default)"
+        required: false
+        type: string
+        default: ""
+      job_timeout_minutes:
+        description: "Per-project job timeout in minutes, must be a positive integer (empty = 90)"
+        required: false
+        type: string
+        default: ""
+      branch_prefix:
+        description: "Optional branch-name prefix prepended as a path segment (empty = no prefix)"
+        required: false
+        type: string
+        default: ""
       runner_callback_url:
         description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
         required: false
@@ -62,6 +92,11 @@ on:
         default: ""
       run_token:
         description: "HMAC bearer token authorizing the result POST; empty skips callback"
+        required: false
+        type: string
+        default: ""
+      run_progress_token:
+        description: "HMAC bearer token authorizing progress POSTs; empty skips progress callback"
         required: false
         type: string
         default: ""
@@ -116,7 +151,7 @@ jobs:
             runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
           fi
           if [ -z "$runner_image" ]; then
-            runner_image="ghcr.io/builddownai/ai-implement-runner:next"
+            runner_image="ghcr.io/builddownai/ai-implement-runner:latest"
           fi
 
           case "$runner_image" in
@@ -162,25 +197,54 @@ jobs:
 
   implement:
     needs: validate-runner-image
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Default GitHub-hosted runners are 2 vCPU; the test suites Claude runs are
+    # CPU-bound and scale ~linearly with cores. Set AI_IMPLEMENT_RUNNER_LABEL to
+    # a larger-runner label (e.g. ubuntu-latest-4-cores) to speed those up.
+    runs-on: ${{ vars.AI_IMPLEMENT_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: ${{ inputs.job_timeout_minutes && fromJSON(inputs.job_timeout_minutes) || 90 }}
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}
     steps:
       - name: Generate GitHub App token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
 
+      - name: Validate Bedrock inputs
+        if: inputs.provider == 'bedrock'
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+          ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_REGION" ]; then
+            echo "::error::provider=bedrock but aws_region dispatch input is empty."
+            echo "::error::Set awsRegion on this team's mapping in the orchestrator admin UI."
+            exit 1
+          fi
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::provider=bedrock but AWS_BEDROCK_ROLE_ARN repo secret is not set."
+            echo "::error::Add the IAM role ARN trusted to GitHub OIDC with bedrock:InvokeModel permission."
+            exit 1
+          fi
+
       - name: Configure AWS credentials (Bedrock)
         if: inputs.provider == 'bedrock'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
           role-session-duration: 14400
+
+      - name: Mask runner callback tokens
+        run: |
+          if [ -n "${{ inputs.run_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_token }}"
+          fi
+          if [ -n "${{ inputs.run_progress_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_progress_token }}"
+          fi
 
       - name: Run pipeline
         env:
@@ -190,11 +254,17 @@ jobs:
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_DEFAULT_BRANCH: ${{ inputs.base_branch || github.ref_name }}
+          RUNNER_PHASE: ${{ inputs.runner_phase }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}
+          AI_IMPLEMENT_MAX_TURNS: ${{ inputs.max_turns }}
+          AI_IMPLEMENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
+          AI_IMPLEMENT_BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+          AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUN_TOKEN: ${{ inputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
         run: /opt/ai-implement/entrypoint.sh

@@ -49,6 +49,14 @@ export interface RepoMapping {
   awsRegion: string | null;
   /** When true, the poller and gap-fill trigger skip this mapping. In-flight runs (runner callbacks) are unaffected. */
   paused: boolean;
+  /** Maximum number of Claude turns per run. NULL means use Claude's built-in default. */
+  maxTurns: number | null;
+  /** Maximum number of feedback-loop iterations per run. NULL means use the pipeline's built-in default. */
+  maxIterations: number | null;
+  /** Maximum wall-clock minutes for a job before it is forcibly terminated. NULL means use the runner's built-in default. */
+  maxJobMinutes: number | null;
+  /** Optional branch-name prefix prepended as a path segment (e.g. "pr" -> pr/ai-implement/...). NULL means no prefix. */
+  branchPrefix: string | null;
 }
 
 // Seed mappings are only applied on first run (empty DB).
@@ -111,6 +119,18 @@ function ensureMappingsColumns(): void {
   if (!names.has("paused")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN paused INTEGER NOT NULL DEFAULT 0`);
   }
+  if (!names.has("max_turns")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN max_turns INTEGER`);
+  }
+  if (!names.has("max_iterations")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN max_iterations INTEGER`);
+  }
+  if (!names.has("max_job_minutes")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN max_job_minutes INTEGER`);
+  }
+  if (!names.has("branch_prefix")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN branch_prefix TEXT`);
+  }
 }
 
 export function initMappingsTable(): void {
@@ -135,7 +155,11 @@ export function initMappingsTable(): void {
       ticketing_provider TEXT NOT NULL DEFAULT '${DEFAULT_TICKETING_PROVIDER}',
       ticketing_config TEXT NOT NULL DEFAULT '{"kind":"linear"}',
       aws_region TEXT,
-      paused INTEGER NOT NULL DEFAULT 0
+      paused INTEGER NOT NULL DEFAULT 0,
+      max_turns INTEGER,
+      max_iterations INTEGER,
+      max_job_minutes INTEGER,
+      branch_prefix TEXT
     )
   `);
   ensureMappingsColumns();
@@ -144,10 +168,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -156,7 +180,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -178,6 +202,10 @@ export function getMappings(): Record<string, RepoMapping> {
       ticketing_config: string;
       aws_region: string | null;
       paused: number;
+      max_turns: number | null;
+      max_iterations: number | null;
+      max_job_minutes: number | null;
+      branch_prefix: string | null;
     }>;
 
   const result: Record<string, RepoMapping> = {};
@@ -211,6 +239,10 @@ export function getMappings(): Record<string, RepoMapping> {
       ticketingConfig,
       awsRegion: row.aws_region,
       paused: Boolean(row.paused),
+      maxTurns: row.max_turns,
+      maxIterations: row.max_iterations,
+      maxJobMinutes: row.max_job_minutes,
+      branchPrefix: row.branch_prefix,
     };
   }
   return result;
@@ -219,7 +251,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -241,6 +273,10 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       JSON.stringify(mapping.ticketingConfig),
       mapping.awsRegion,
       mapping.paused ? 1 : 0,
+      mapping.maxTurns,
+      mapping.maxIterations,
+      mapping.maxJobMinutes,
+      mapping.branchPrefix,
     );
 }
 

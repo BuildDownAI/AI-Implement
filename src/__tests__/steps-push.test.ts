@@ -9,7 +9,7 @@ vi.mock("node:child_process", () => ({
 
 import { spawnSync } from "node:child_process";
 
-function makeContext(): DefaultPipelineContext {
+function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
   return new DefaultPipelineContext({
     jobId: 1,
     issueId: "issue-1",
@@ -18,7 +18,7 @@ function makeContext(): DefaultPipelineContext {
     issueDescription: "Desc",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
+    ...overrides,
   });
 }
 
@@ -77,6 +77,26 @@ describe("pushStep", () => {
     expect(outputs.prNumber).toBe(7);
     expect(outputs.branchPushed).toBe(true);
     expect(outputs.commitSha).toBe("abc123");
+  });
+
+  it("uses the context branch as the PR base when baseBranch input is omitted", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext({ branch: "development" }),
+      { ...BASE_INPUTS, baseBranch: undefined },
+      new NoopStepReporter(),
+    );
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { base: string };
+    expect(body.base).toBe("development");
   });
 
   it("returns existing PR info on 422 (PR already open)", async () => {
@@ -383,5 +403,54 @@ describe("pushStep", () => {
       ),
     ).rejects.toThrow(/Refusing to push implementation branch/);
     expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("logs a token-redacted push trace at stream log level", async () => {
+    const prev = process.env.AI_IMPLEMENT_LOG_LEVEL;
+    process.env.AI_IMPLEMENT_LOG_LEVEL = "stream";
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Trace output echoes the tokenized remote URL on both streams; stdout has
+      // no trailing newline so the separator fix is exercised too.
+      const tokenizedUrl = `https://x-access-token:gh-token@github.com/acme/app.git`;
+      vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+        const gitArgs = args as string[];
+        if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+        if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+        if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+        if (gitArgs[0] === "ls-remote") {
+          return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        }
+        if (gitArgs[0] === "push") {
+          return spawnResult(
+            0,
+            `Pushing to ${tokenizedUrl}`,
+            `region_enter send-pack ${tokenizedUrl}\n`,
+          );
+        }
+        return spawnResult(0);
+      });
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+        text: async () => "",
+      } as Response);
+
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      const traceCall = errorSpy.mock.calls
+        .map((c) => String(c[0]))
+        .find((msg) => msg.includes("[git-push trace]"));
+      expect(traceCall).toBeDefined();
+      expect(traceCall).not.toContain("gh-token");
+      expect(traceCall).toContain("***");
+      // stdout and stderr are separated by a newline, not run together.
+      expect(traceCall).toMatch(/Pushing to[^\n]*\nregion_enter/);
+    } finally {
+      errorSpy.mockRestore();
+      if (prev === undefined) delete process.env.AI_IMPLEMENT_LOG_LEVEL;
+      else process.env.AI_IMPLEMENT_LOG_LEVEL = prev;
+    }
   });
 });

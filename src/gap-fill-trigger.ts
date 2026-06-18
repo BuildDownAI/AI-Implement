@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { RepoMapping } from "./config.js";
 import type { TicketingProvider } from "./providers/types.js";
-import { mintRunToken, GAP_ANALYSIS_TTL_SECONDS } from "./runner-tokens.js";
+import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { dispatchWorkflow, providerDispatchFields } from "./github.js";
 
 export interface GapFillTriggerBody {
@@ -30,6 +30,14 @@ function bad(status: number, error: string, extra: Record<string, unknown> = {})
   return { status, body: { error, ...extra } };
 }
 
+function parseBearerToken(authorization: string | undefined): string | null {
+  if (!authorization || !authorization.startsWith("Bearer")) return null;
+  let i = "Bearer".length;
+  while (i < authorization.length && authorization.charCodeAt(i) <= 32) i += 1;
+  if (i === "Bearer".length || i === authorization.length) return null;
+  return authorization.slice(i);
+}
+
 /**
  * Handles an authenticated POST from a target repo's comment-trigger workflow.
  *
@@ -48,10 +56,10 @@ export async function handleGapFillTrigger(
     return bad(501, "Gap fill trigger not configured");
   }
 
-  const auth = input.authorization?.match(/^Bearer\s+(.+)$/);
-  if (!auth) return bad(401, "unauthorized");
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "unauthorized");
   // Constant-time compare to avoid timing oracles on the shared secret.
-  const provided = Buffer.from(auth[1]);
+  const provided = Buffer.from(bearerToken);
   const expected = Buffer.from(input.triggerSecret);
   if (
     provided.length !== expected.length ||
@@ -93,16 +101,31 @@ export async function handleGapFillTrigger(
 
   let runnerCallbackUrl = "";
   let runToken = "";
+  let runProgressToken = "";
   if (input.runnerCallbackBaseUrl && input.runnerTokenSecret) {
+    // Gap-fill dispatches run the implementation workflow and can take as
+    // long as the initial implementation, even though they report back as
+    // gap-analysis so ticket status does not regress.
     const minted = mintRunToken({
       issueId: owningIssueId,
       mappingTeamKey: owningScopeKey,
       phase: "gap-analysis",
-      ttlSeconds: GAP_ANALYSIS_TTL_SECONDS,
+      audience: "result",
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+      secret: input.runnerTokenSecret,
+    });
+    const progressMinted = mintRunToken({
+      issueId: owningIssueId,
+      mappingTeamKey: owningScopeKey,
+      phase: "gap-analysis",
+      audience: "progress",
+      dispatchId: minted.dispatchId,
+      ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
       secret: input.runnerTokenSecret,
     });
     runnerCallbackUrl = input.runnerCallbackBaseUrl;
     runToken = minted.token;
+    runProgressToken = progressMinted.token;
   }
 
   const ghToken = await input.getInstallationToken(owningMapping.owner);
@@ -124,9 +147,11 @@ export async function handleGapFillTrigger(
     issue_title: "(gap-fill triggered from PR comment)",
     issue_description: "(gap-fill triggered from PR comment)",
     pr_number: String(prNumber),
+    runner_phase: "gap-analysis",
     ...providerDispatchFields(owningMapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
+    run_progress_token: runProgressToken,
   });
 
   if (!dispatchRes.success) {

@@ -21,6 +21,8 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   /** Repo-level review model from .ai-implement/config.yml, injected by the install step. */
   repoReviewModel?: string;
   maxIterations?: number;
+  maxTurns?: number;
+  provider?: string;
   planningContext?: string;
   implementationPrompt?: string;
   parentStepId?: string;
@@ -50,12 +52,39 @@ function buildImplementPrompt(
   return basePrompt;
 }
 
-function getDiff(workspaceDir: string): string {
-  const result = spawnSync("git", ["diff", "HEAD"], {
-    cwd: workspaceDir,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.status !== 0) return "";
+/**
+ * Pathspecs excluded from the review diff. Generated artifacts (relay
+ * `__generated__`, codegen `generated/` dirs) and lockfiles can each be
+ * hundreds of KB after a `db:sync` / codegen run, blowing the reviewer's
+ * prompt past the model context window. They are committed by the push step
+ * regardless — this only controls what the reviewer is shown.
+ */
+const REVIEW_DIFF_EXCLUDES = [
+  ":(exclude,glob)**/__generated__/**",
+  ":(exclude,glob)**/generated/**",
+  ":(exclude,glob)**/pnpm-lock.yaml",
+  ":(exclude,glob)**/package-lock.json",
+  ":(exclude,glob)**/yarn.lock",
+];
+
+export function getDiff(workspaceDir: string): string {
+  const result = spawnSync(
+    "git",
+    ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
+    {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.status !== 0) {
+    // A non-zero exit means the reviewer sees an empty diff and may spuriously
+    // approve. Behaviour is unchanged (still return ""), but surface it so the
+    // failure is observable in the runner logs rather than silent.
+    console.warn(
+      `[getDiff] git diff failed (exit ${result.status ?? "null"}): ${result.stderr?.toString().trim() ?? ""}`,
+    );
+    return "";
+  }
   return result.stdout.toString();
 }
 
@@ -72,8 +101,9 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
   ): Promise<FeedbackLoopOutputs> {
     const parentStepId =
       typeof inputs.parentStepId === "string" ? inputs.parentStepId : "feedback-loop";
-    const maxIterations =
-      typeof inputs.maxIterations === "number" ? inputs.maxIterations : DEFAULT_MAX_ITERATIONS;
+    const effectiveMaxIterations =
+      inputs.maxIterations ?? (inputs.provider === "bedrock" ? 2 : DEFAULT_MAX_ITERATIONS);
+    const effectiveMaxTurns = inputs.maxTurns ?? 50;
 
     // Fallback hierarchy: explicit per-step > unified `model` input > repo config > tenant default > hard default
     const tenantModel = context.data.model;
@@ -94,7 +124,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     let approved = false;
     let feedback = "";
 
-    while (iteration < maxIterations && !approved) {
+    while (iteration < effectiveMaxIterations && !approved) {
       iteration++;
 
       const implementPrompt = buildImplementPrompt(
@@ -117,6 +147,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           workspaceDir: inputs.workspaceDir,
           prompt: implementPrompt,
           model: resolvedImplementModel,
+          maxTurns: effectiveMaxTurns,
           planningContext: inputs.planningContext,
         },
         outputs: {},
@@ -131,6 +162,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             workspaceDir: String(inputs.workspaceDir),
             prompt: implementPrompt,
             model: resolvedImplementModel,
+            maxTurns: effectiveMaxTurns,
             planningContext:
               inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined,
           },
@@ -191,11 +223,21 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         approved = reviewOutputs.approved;
         feedback = reviewOutputs.feedback;
       } catch (err) {
+        // A review failure (e.g. "Prompt is too long", a transient API error)
+        // is NOT actionable feedback and must not discard a successful
+        // implementation. Record the failure, stop the loop, and let the
+        // pipeline push the working tree — retrying implementation would only
+        // burn another pass producing the same un-reviewable diff.
         reviewSubStep.status = "failed";
         reviewSubStep.ended_at = new Date().toISOString();
         reviewSubStep.outputs = { error: String(err) };
         await reporter.report(reviewSubStep);
-        throw err;
+        console.warn(
+          `[feedback-loop] Review step failed on iteration ${iteration}; skipping review and proceeding to push: ${String(err)}`,
+        );
+        approved = false;
+        feedback = `Review step failed and was skipped: ${String(err)}`;
+        break;
       }
     }
 

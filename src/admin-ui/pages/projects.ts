@@ -120,8 +120,12 @@ export const projectsHtml = `
           <div class="md-field"><label>Owner</label><input id="md-owner" placeholder="acme-corp"></div>
           <div class="md-field"><label>Repo</label><input id="md-repo" placeholder="backend"></div>
           <div class="md-field"><label>Workflow File</label><input id="md-wf" value="claude-implement.yml"></div>
-          <div class="md-field"><label>Default Branch</label><input id="md-branch" value="main"></div>
+          <div class="md-field"><label>Default Branch</label><input id="md-branch" placeholder="development"></div>
           <div class="md-field"><label>Max AI Issues</label><input id="md-max-ai" type="number" min="1" value="3"></div>
+          <div class="md-field"><label>Max Turns <span class="text-tertiary" style="font-size:0.85em">(blank = 50)</span></label><input id="md-max-turns" type="number" min="1" step="1" placeholder="50"></div>
+          <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" step="1" placeholder="3"></div>
+          <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
+          <div class="md-field"><label>Branch Prefix <span class="text-tertiary" style="font-size:0.85em">(blank = none)</span></label><input id="md-branch-prefix" placeholder="pr"></div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -255,7 +259,7 @@ export const projectsScript = `
     document.getElementById('md-owner').value = m.owner || '';
     document.getElementById('md-repo').value = m.repo || '';
     document.getElementById('md-wf').value = m.workflowFile || 'claude-implement.yml';
-    document.getElementById('md-branch').value = m.defaultBranch || 'main';
+    document.getElementById('md-branch').value = m.defaultBranch || '';
     document.getElementById('md-max-ai').value = String(m.maxInProgressAiIssues ?? 3);
     document.getElementById('md-exec-mode').value = m.executionMode || 'github-actions';
     document.getElementById('md-session-mode').value = m.sessionMode || 'autonomous';
@@ -267,6 +271,10 @@ export const projectsScript = `
     document.getElementById('md-planning-wf').value = m.planningWorkflowFile || 'claude-plan.yml';
     document.getElementById('md-provider').value = m.provider || 'anthropic';
     document.getElementById('md-aws-region').value = m.awsRegion || '';
+    document.getElementById('md-max-turns').value = m.maxTurns == null ? '' : String(m.maxTurns);
+    document.getElementById('md-max-iter').value = m.maxIterations == null ? '' : String(m.maxIterations);
+    document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
+    document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -540,13 +548,19 @@ export const projectsScript = `
     const origKey = document.getElementById('md-team-key-orig').value;
     const isNew = !origKey;
     const teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
+    const defaultBranch = document.getElementById('md-branch').value.trim();
+    if (!defaultBranch) {
+      errEl.textContent = 'Default Branch is required.';
+      errEl.classList.remove('hidden');
+      return;
+    }
 
     const body = {
       teamKey,
       owner: document.getElementById('md-owner').value.trim(),
       repo: document.getElementById('md-repo').value.trim(),
       workflowFile: document.getElementById('md-wf').value.trim(),
-      defaultBranch: document.getElementById('md-branch').value.trim(),
+      defaultBranch,
       maxInProgressAiIssues: parseInt(document.getElementById('md-max-ai').value, 10),
       executionMode: document.getElementById('md-exec-mode').value,
       sessionMode: document.getElementById('md-session-mode').value,
@@ -558,6 +572,10 @@ export const projectsScript = `
       extraEnv: parseEnvText(document.getElementById('md-env').value),
       provider: document.getElementById('md-provider').value,
       awsRegion: document.getElementById('md-aws-region').value.trim() || null,
+      maxTurns: (function(){ var v = document.getElementById('md-max-turns').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      maxIterations: (function(){ var v = document.getElementById('md-max-iter').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;

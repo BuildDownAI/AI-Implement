@@ -19,7 +19,6 @@ function makeContext(overrides: Partial<Parameters<typeof DefaultPipelineContext
     issueDescription: "Description",
     nonce: "test-nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
     ...overrides,
   });
 }

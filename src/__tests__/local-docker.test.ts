@@ -52,6 +52,16 @@ describe("buildLocalRunnerEnv", () => {
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
   });
 
+  it("defaults RUNNER_PHASE to implementation", () => {
+    const env = buildLocalRunnerEnv(baseInput);
+    expect(env.RUNNER_PHASE).toBe("implementation");
+  });
+
+  it("sets RUNNER_PHASE=planning when phase is planning", () => {
+    const env = buildLocalRunnerEnv({ ...baseInput, phase: "planning" });
+    expect(env.RUNNER_PHASE).toBe("planning");
+  });
+
   it("lets mapping extraEnv override defaults", () => {
     const env = buildLocalRunnerEnv({
       ...baseInput,
