@@ -83,6 +83,12 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:next/);
       expect(yaml).toMatch(/invalid characters for a container image reference/);
       expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
+      // Owner-derived allowlist (safe half of PR #84): trusts the repo's own GHCR namespace.
+      expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER/);
+      expect(yaml).toMatch(/ghcr\.io\/\$\{owner\}\//);
+      // Reads the per-repo override file from the default branch (no ?ref= → no PR-head read).
+      expect(yaml).toMatch(/contents\/\.ai-implement\/image\.yml/);
+      expect(yaml).not.toMatch(/image\.yml\?ref=/);
     });
   }
 
