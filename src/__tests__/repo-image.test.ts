@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSessionImage, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { resolveDefaultRunnerImage } from "../repo-image.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -169,5 +170,34 @@ describe("resolveSessionImage", () => {
       fetchImpl,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
+  });
+});
+
+describe("resolveDefaultRunnerImage", () => {
+  it("prefers AI_IMPLEMENT_RUNNER_IMAGE over SESSION_IMAGE and reports SESSION_IMAGE as shadowed", () => {
+    const r = resolveDefaultRunnerImage({
+      AI_IMPLEMENT_RUNNER_IMAGE: "ghcr.io/acme/ai-implement-runner:v3",
+      SESSION_IMAGE: "ghcr.io/old/legacy:latest",
+    });
+    expect(r.image).toBe("ghcr.io/acme/ai-implement-runner:v3");
+    expect(r.sessionImageStatus).toBe("shadowed");
+  });
+
+  it("falls back to SESSION_IMAGE and reports it active when AI_IMPLEMENT_RUNNER_IMAGE is unset", () => {
+    const r = resolveDefaultRunnerImage({ SESSION_IMAGE: "ghcr.io/acme/runner:1" });
+    expect(r.image).toBe("ghcr.io/acme/runner:1");
+    expect(r.sessionImageStatus).toBe("active");
+  });
+
+  it("uses AI_IMPLEMENT_RUNNER_IMAGE with no SESSION_IMAGE warning", () => {
+    const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_RUNNER_IMAGE: "ghcr.io/acme/runner:2" });
+    expect(r.image).toBe("ghcr.io/acme/runner:2");
+    expect(r.sessionImageStatus).toBe("unused");
+  });
+
+  it("falls back to the upstream image when neither is set", () => {
+    const r = resolveDefaultRunnerImage({});
+    expect(r.image).toBe("ghcr.io/builddownai/ai-implement-runner:latest");
+    expect(r.sessionImageStatus).toBe("unused");
   });
 });

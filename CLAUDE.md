@@ -211,15 +211,25 @@ Both check `custom/<path>` (relative to `process.cwd()`) first, then fall back t
 - When implementing client-specific behaviour, **always place new files in `custom/`** rather than modifying built-in modules — this keeps the fork rebasing cleanly on upstream changes.
 - A `custom/` file that exists but has no `default` export produces a warning and falls back to the built-in rather than silently misbehaving.
 
-## Per-repo runner image override
+## Runner image resolution
 
-A target repo can boot its Fly Machine session on a custom runner image by committing `.ai-implement/image.yml` at the default branch:
+Both execution modes resolve the runner image with the same ladder, highest priority first:
 
-```yaml
-image: ghcr.io/your-org/your-runner:v1
-```
+1. **`.ai-implement/image.yml`** at the target repo's default branch — per-repo override:
 
-The image must be publicly pullable. The customer owns building and publishing it. If the file is absent, malformed, or points at an unreachable reference, the orchestrator falls back to the default runner (`SESSION_IMAGE` env var, or `ghcr.io/builddownai/ai-implement-runner:latest`).
+   ```yaml
+   image: ghcr.io/your-org/your-runner:v1
+   ```
+
+   In `fly-machines` mode the orchestrator reads it via the GitHub contents API (`src/repo-image.ts`); in `github-actions` mode the `claude-implement.yml` / `comment-trigger.yml` workflows read it with `gh api` from the **default branch only** (never a PR head, so a PR can't choose its own privileged image).
+
+2. **`AI_IMPLEMENT_RUNNER_IMAGE`** — the operator/org default. A GitHub repo/org **variable** in `github-actions` mode (org-level applies to every repo); an orchestrator **env var** in `fly-machines` mode. `SESSION_IMAGE` is the deprecated former name of the env var — still honored, but the orchestrator logs a deprecation warning at startup.
+
+3. **Upstream fallback** — `ghcr.io/builddownai/ai-implement-runner:latest` (orchestrator / comment-trigger) or `:next` (claude-implement). In `github-actions` mode a manual `runner_image` dispatch input overrides everything for that one run.
+
+The `github-actions` allowlist auto-trusts `ghcr.io/builddownai/` and the repo owner's own `ghcr.io/<owner>/` namespace, so a fork using its own published image needs no extra config; `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is only for third-party registries. The `fly-machines` path validates image-reference format but has no allowlist.
+
+The image must be publicly pullable. The customer owns building and publishing it. If `.ai-implement/image.yml` is absent, malformed, or points at an unreachable reference, resolution falls through to the next ladder rung.
 
 The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
 
