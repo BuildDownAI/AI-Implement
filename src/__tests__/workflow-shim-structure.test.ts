@@ -91,6 +91,9 @@ describe("GHA workflow shims", () => {
       expect(yaml).not.toMatch(/image\.yml\?ref=/);
       // The image.yml parse must not abort the job under `set -euo pipefail` (SIGPIPE on multi-match).
       expect(yaml).toMatch(/head -n1\)" \|\| true/);
+      // Allowlist match must be literal — quoted "$prefix" so glob chars in an operator prefix can't widen it.
+      expect(yaml).toMatch(/\[\[ "\$runner_image" == "\$prefix"\* \]\]/);
+      expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER is empty/);
     });
   }
 
@@ -121,6 +124,9 @@ describe("GHA workflow shims", () => {
     expect(yaml).not.toMatch(/image\.yml\?ref=/);
     // The image.yml parse must not abort the job under `set -euo pipefail` (SIGPIPE on multi-match).
     expect(yaml).toMatch(/head -n1\)" \|\| true/);
+    // Allowlist match must be literal — quoted "$prefix" so glob chars in an operator prefix can't widen it.
+    expect(yaml).toMatch(/\[\[ "\$runner_image" == "\$prefix"\* \]\]/);
+    expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER is empty/);
   });
 
   it("documents and constrains the ISSUE_META eval trust boundary", () => {
