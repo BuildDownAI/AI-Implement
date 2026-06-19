@@ -22,7 +22,8 @@ import { createMachine, getMachine, listMachines, destroyMachine, generateSessio
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
-import { initReconciliationTable, getPendingReconciliations, updateReconciliationStatus } from "./reconciliation.js";
+import { initReconciliationTable } from "./reconciliation.js";
+import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
@@ -364,7 +365,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   });
 
   // Process any pending reconciliation jobs triggered by merged PRs
-  await processReconciliations(config);
+  await processReconciliations(config, registry);
 
   // Process pending late review feedback that arrived after the original run.
   await processReviewFixQueue(config);
@@ -1596,79 +1597,15 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
 // ---------- Reconciliation ----------
 
 /**
- * Processes pending reconciliation jobs enqueued by the webhook handler.
- * For each pending job, dispatches a gap-fill run of claude-implement.yml
- * with the merged PR number so Claude can review what still needs to be done.
+ * Thin wrapper: adapts registry + mappings to runReconciliations.
  */
-async function processReconciliations(config: AppConfig): Promise<void> {
-  const pending = getPendingReconciliations();
-  if (pending.length === 0) return;
-
-  console.log(`[reconcile] Processing ${pending.length} pending reconciliation(s)`);
-
+async function processReconciliations(_config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const teamRepoMap = getMappings();
-
-  for (const job of pending) {
-    try {
-      const mapping = Object.values(teamRepoMap).find(
-        (m) => `${m.owner}/${m.repo}` === job.repo,
-      );
-
-      if (!mapping) {
-        console.warn(
-          `[reconcile] No mapping found for repo ${job.repo}, skipping reconciliation #${job.id}`,
-        );
-        updateReconciliationStatus(job.id, "skipped");
-        continue;
-      }
-
-      if (mapping.paused) {
-        console.log(
-          `[reconcile] Project ${mapping.owner}/${mapping.repo} is paused, skipping reconciliation #${job.id}`,
-        );
-        updateReconciliationStatus(job.id, "skipped");
-        continue;
-      }
-
-      const [owner] = job.repo.split("/");
-      const ghToken = await getInstallationToken(
-        config.githubAppId,
-        config.githubAppPrivateKey,
-        owner,
-      );
-
-      // Dispatch a gap-fill run using the existing claude-implement.yml workflow,
-      // passing the merged PR number so Claude checks out the right branch.
-      // Reconciliation/gap-fill and review-fix re-dispatches always go through
-      // GitHub Actions (this dispatchWorkflow path), so caps ride capDispatchFields
-      // here — there is no Fly/local gap-fill path needing capRunnerEnv.
-      const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-      const result = await dispatchWorkflow(ghToken, mapping, {
-        issue_id: job.issueId,
-        issue_identifier: job.issueIdentifier ?? job.issueId,
-        issue_title: `Reconciliation for PR #${job.prNumber}`,
-        issue_description: `Gap-fill after PR #${job.prNumber} was merged (${job.mergeCommitSha})`,
-        pr_number: String(job.prNumber),
-        runner_phase: "gap-analysis",
-        ...providerDispatchFields(mapping),
-        ...capDispatchFields(mapping),
-        ...(runnerImage ? { runner_image: runnerImage } : {}),
-      });
-
-      if (result.success) {
-        updateReconciliationStatus(job.id, "dispatched");
-        console.log(
-          `[reconcile] Dispatched gap-fill for ${job.issueIdentifier} (PR #${job.prNumber} in ${job.repo}, image: ${runnerImage ?? "workflow-default"})`,
-        );
-      } else {
-        console.error(
-          `[reconcile] Failed to dispatch reconciliation #${job.id}: ${result.status} ${result.error}`,
-        );
-      }
-    } catch (err) {
-      console.error(`[reconcile] Error processing reconciliation #${job.id}:`, err);
-    }
-  }
+  await runReconciliations({
+    mappingForRepo: (repo) =>
+      Object.values(teamRepoMap).find((m) => `${m.owner}/${m.repo}` === repo),
+    resolveProvider: (mapping) => registry.forMapping(mapping),
+  });
 }
 
 // ---------- Late Review Fix Queue ----------
