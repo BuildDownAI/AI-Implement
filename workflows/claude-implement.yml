@@ -111,6 +111,9 @@ permissions:
   pull-requests: write
   issues: write
   id-token: write
+  # Lets the implement job's container pull a private runner image from the
+  # same org's GHCR (e.g. ghcr.io/<owner>/...). Public images don't need it.
+  packages: read
 
 jobs:
   validate-runner-image:

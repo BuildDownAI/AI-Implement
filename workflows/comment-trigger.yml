@@ -203,6 +203,9 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
+      # Lets this job's container pull a private runner image from the same
+      # org's GHCR (e.g. ghcr.io/<owner>/...). Public images don't need it.
+      packages: read
     container:
       image: ${{ needs.check-trigger.outputs.runner_image }}
     steps:
