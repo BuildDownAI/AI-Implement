@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { listLog } from "./log.js";
-import { enqueueReconciliation } from "./reconciliation.js";
+import { enqueueReconciliation, hasReconciliationForPr } from "./reconciliation.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { enqueueReviewFix } from "./review-fix-queue.js";
 import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings } from "./pipeline/review-ledger.js";
@@ -217,6 +217,12 @@ export async function handleGitHubWebhook(
     // Not an AI-created PR — ignore silently
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true, reason: "no matching dispatch" }));
+    return;
+  }
+
+  if (hasReconciliationForPr(repoFullName, prNumber)) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "already queued" }));
     return;
   }
 
