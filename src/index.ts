@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, getPullRequestState } from "./github.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
@@ -45,6 +45,7 @@ import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
+import { detectMergedPrs } from "./poll-merged-prs.js";
 
 // ---------- Configuration ----------
 
@@ -362,6 +363,16 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       if (provider) await postSessionLogs(config, provider, job, context);
     },
     findPrForIssue: (repo, issueIdentifier) => findPrForIssue(config, repo, issueIdentifier),
+  });
+
+  // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
+  // for merged PRs the webhook may have missed.
+  await detectMergedPrs({
+    mappingForRepo: (repo) =>
+      Object.values(getMappings()).find((m) => `${m.owner}/${m.repo}` === repo),
+    tokenForOwner: (owner) =>
+      getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+    getPullRequestState,
   });
 
   // Process any pending reconciliation jobs triggered by merged PRs
