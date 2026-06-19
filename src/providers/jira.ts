@@ -42,6 +42,22 @@ function jqlFieldRef(fieldId: string): string {
   return match ? `cf[${match[1]}]` : fieldId;
 }
 
+/**
+ * Read the repo-field value regardless of how the custom field is typed in
+ * Jira. Single-select option fields serialize as { value: string }; plain
+ * text (short-text) fields serialize as a bare string. Both are legitimate
+ * ways to hold the repo identifier, so support either rather than assuming
+ * an option field (which silently reads "" for text fields and drops the
+ * issue as a mismatch).
+ */
+function readRepoFieldValue(raw: unknown): string {
+  if (typeof raw === "string") return raw.trim();
+  if (raw && typeof raw === "object" && typeof (raw as { value?: unknown }).value === "string") {
+    return (raw as { value: string }).value;
+  }
+  return "";
+}
+
 export interface JiraProviderConstructor {
   client: JiraClient;
   /** Per-instance cache scope label; typically the cloud ID. */
@@ -117,7 +133,7 @@ export class JiraProvider implements TicketingProvider {
     if (jiraEntries.length === 1) return jiraEntries[0][0];
     const repoFieldId = (await this.fields(jiraEntries[0][0])).repoFieldId;
     const issue = await this.client.getIssue(issueId, [repoFieldId]);
-    const repoValue = (issue.fields[repoFieldId] as { value?: string } | null)?.value ?? "";
+    const repoValue = readRepoFieldValue(issue.fields[repoFieldId]);
     const match = jiraEntries.find(
       ([, m]) => m.ticketingConfig.kind === "jira" && m.ticketingConfig.repoFieldValue === repoValue,
     );
@@ -159,8 +175,7 @@ export class JiraProvider implements TicketingProvider {
       const bucketIssues = await this.client.searchJql(bucketJql, fieldsToFetch);
 
       for (const raw of bucketIssues) {
-        const repoOption = raw.fields[fieldIds.repoFieldId] as { value?: string } | null;
-        const actualRepo = repoOption?.value ?? "";
+        const actualRepo = readRepoFieldValue(raw.fields[fieldIds.repoFieldId]);
         if (actualRepo !== cfg.repoFieldValue) {
           const mismatchKey = `${scopeKey}::${raw.key}`;
           if (!this.notifiedMismatches.has(mismatchKey)) {

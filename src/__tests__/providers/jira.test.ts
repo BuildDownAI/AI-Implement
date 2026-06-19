@@ -293,6 +293,31 @@ describe("JiraProvider lifecycle status setters", () => {
     expectStatusBody(lastCall, "Plan Approved");
   });
 
+  it("multi-mapping scopeKey lookup handles a plain-text (bare-string) repo field", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          id: "10001",
+          key: "PROJ-1",
+          fields: { customfield_10101: "acme/y" }, // text field: bare string
+        }),
+      } as Response) // getIssue
+      .mockResolvedValueOnce(okEmpty()); // setField
+    const p = makeProvider({
+      cacheScope: "c8-text",
+      mappings: {
+        "acme/x": jiraMapping({ repoFieldValue: "acme/x" }),
+        "acme/y": jiraMapping({ repoFieldValue: "acme/y" }),
+      },
+    });
+    await p.markPlanComplete("10001");
+    const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
+    expect(String(lastCall[0])).toMatch(/\/issue\/10001/);
+    expectStatusBody(lastCall, "Plan Approved");
+  });
+
   it("scopeKeyForIssue throws when no mapping matches the issue's repo field", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields
@@ -453,6 +478,35 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-20"]);
     expect(onRepoFieldMismatch).toHaveBeenCalledTimes(1);
     expect(onRepoFieldMismatch).toHaveBeenCalledWith("acme/x", "P-21", "acme/wrong");
+  });
+
+  it("matches a plain-text repo field that serializes as a bare string (not an option object)", async () => {
+    // Text custom fields come back as a bare string, unlike single-select
+    // option fields which come back as { value: string }.
+    const textIssue = (id: string, key: string, status: string, repo: string) => ({
+      id, key,
+      fields: {
+        summary: `summary-${key}`, description: null,
+        customfield_10100: { value: status },
+        customfield_10101: repo,
+      },
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([textIssue("50001", "P-40", "Ready", "acme/x")]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const onRepoFieldMismatch = vi.fn();
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-text" }),
+      cacheScope: "c-text", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+      onRepoFieldMismatch,
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-40"]);
+    expect(onRepoFieldMismatch).not.toHaveBeenCalled();
   });
 
   it("does not double-fire onRepoFieldMismatch on second snapshot for the same issue", async () => {
