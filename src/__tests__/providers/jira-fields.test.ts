@@ -112,7 +112,7 @@ describe("STATUS_VALUES", () => {
   it("contains every state in the locked machine", () => {
     expect(Object.values(STATUS_VALUES)).toEqual([
       "Ready", "Planning", "Awaiting Approval", "Plan Approved",
-      "Implementing", "PR Ready", "Planning Failed", "Implementation Failed",
+      "Implementing", "PR Ready", "Merged", "Planning Failed", "Implementation Failed",
     ]);
   });
 });

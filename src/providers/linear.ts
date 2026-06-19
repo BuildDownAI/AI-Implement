@@ -60,6 +60,7 @@ export class LinearProvider implements TicketingProvider {
   private readyForReviewLabelId: string | null = null;
   private teamIdByKey = new Map<string, string>();
   private inProgressStateByTeamKey = new Map<string, string>();
+  private completedStateByTeamKey = new Map<string, string>();
 
   constructor(config: ProviderConfig) {
     if (!config.linearApiKey) {
@@ -532,6 +533,30 @@ export class LinearProvider implements TicketingProvider {
     return state.id;
   }
 
+  private async getCompletedStateId(teamKey: string): Promise<string> {
+    const cached = this.completedStateByTeamKey.get(teamKey);
+    if (cached) return cached;
+    const teamId = await this.getTeamIdByKey(teamKey);
+    const data = await this.linearMutation<{
+      workflowStates: { nodes: Array<{ id: string; name: string; type: string }> };
+    }>(
+      `query($teamId: ID!) {
+        workflowStates(filter: { team: { id: { eq: $teamId } }, type: { eq: "completed" } }) {
+          nodes { id name type }
+        }
+      }`,
+      { teamId },
+    );
+    const state =
+      data.workflowStates.nodes.find((s) => s.name.toLowerCase() === "done") ??
+      data.workflowStates.nodes[0];
+    if (!state) {
+      throw new Error(`No "completed" workflow state found for team ${teamId}`);
+    }
+    this.completedStateByTeamKey.set(teamKey, state.id);
+    return state.id;
+  }
+
   private async updateIssueState(issueId: string, stateId: string): Promise<void> {
     await this.linearMutation<{ issueUpdate: { success: boolean } }>(
       `mutation($issueId: String!, $stateId: String!) {
@@ -690,6 +715,40 @@ export class LinearProvider implements TicketingProvider {
     );
 
     await this.postComment(issueId, `AI implementation PR: ${prUrl}`);
+  }
+
+  async markMerged(issueId: string): Promise<void> {
+    const data = await this.linearMutation<{
+      issue: {
+        state: { type: string };
+        team: { key: string };
+        labels: { nodes: Array<{ id: string; name: string }> };
+      } | null;
+    }>(
+      `query($id: String!) {
+        issue(id: $id) {
+          state { type }
+          team { key }
+          labels { nodes { id name } }
+        }
+      }`,
+      { id: issueId },
+    );
+    const issue = data.issue;
+    if (!issue) return;
+    if (issue.state.type === "completed" || issue.state.type === "canceled") return;
+    const stateId = await this.getCompletedStateId(issue.team.key);
+    const labelIds = issue.labels.nodes
+      .filter((l) => l.name !== "Ready for Review")
+      .map((l) => l.id);
+    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
+      `mutation($issueId: String!, $stateId: String!, $labelIds: [String!]!) {
+        issueUpdate(id: $issueId, input: { stateId: $stateId, labelIds: $labelIds }) {
+          success
+        }
+      }`,
+      { issueId, stateId, labelIds },
+    );
   }
 
   async markImplementationFailed(issueId: string, reason: string): Promise<void> {
