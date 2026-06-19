@@ -266,6 +266,10 @@ export class JiraProvider implements TicketingProvider {
     const scopeKey = await this.scopeKeyForIssue(issueId);
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
   }
+  async markMerged(issueId: string): Promise<void> {
+    const scopeKey = await this.scopeKeyForIssue(issueId);
+    await this.setStatus(issueId, scopeKey, STATUS_VALUES.MERGED);
+  }
   async postComment(issueId: string, body: string): Promise<void> {
     await this.client.addComment(issueId, adfParagraph(body));
   }
