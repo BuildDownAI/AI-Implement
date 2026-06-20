@@ -530,6 +530,135 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
 
     expect(onRepoFieldMismatch).toHaveBeenCalledTimes(1);
   });
+
+  // --- Blocking relations (mirrors the Linear "blocks" inverse-relation skip) ---
+
+  // A Jira "Blocks" issue link, as it appears in the blocked issue's `issuelinks`:
+  // `inwardIssue` present ⇒ this issue "is blocked by" that issue.
+  const blockedByLink = (statusCategoryKey: string) => ({
+    type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+    inwardIssue: { key: "BLK-1", fields: { status: { statusCategory: { key: statusCategoryKey } } } },
+  });
+
+  // The other direction: this issue blocks something else (it is not itself blocked).
+  const blocksOtherLink = () => ({
+    type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+    outwardIssue: { key: "OTH-1", fields: { status: { statusCategory: { key: "new" } } } },
+  });
+
+  const withLinks = (
+    iss: ReturnType<typeof issue>,
+    links: unknown[],
+  ) => ({ ...iss, fields: { ...iss.fields, issuelinks: links } });
+
+  it("requests the issuelinks field in the bucket search", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-links-field" }),
+      cacheScope: "c-links-field", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    await p.fetchAIImplementSnapshot();
+
+    const bucketBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
+    expect(bucketBody.fields).toContain("issuelinks");
+  });
+
+  it("skips an issue blocked by an incomplete issue", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([
+        withLinks(issue("50001", "P-40", "Ready", "acme/x"), [blockedByLink("indeterminate")]),
+        issue("50002", "P-41", "Ready", "acme/x"),
+      ]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-blocked" }),
+      cacheScope: "c-blocked", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-41"]);
+  });
+
+  it("includes an issue whose blocker is already done", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([
+        withLinks(issue("50003", "P-42", "Ready", "acme/x"), [blockedByLink("done")]),
+      ]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-blk-done" }),
+      cacheScope: "c-blk-done", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-42"]);
+  });
+
+  it("includes an issue that blocks others but is not itself blocked", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([
+        withLinks(issue("50004", "P-43", "Ready", "acme/x"), [blocksOtherLink()]),
+      ]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-blocks-other" }),
+      cacheScope: "c-blocks-other", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-43"]);
+  });
+
+  it("includes an issue with no issuelinks field", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([issue("50005", "P-44", "Ready", "acme/x")]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-no-links" }),
+      cacheScope: "c-no-links", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-44"]);
+  });
+
+  it("skips an issue with a mix of done and incomplete blockers", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([
+        withLinks(issue("50006", "P-45", "Ready", "acme/x"), [
+          blockedByLink("done"),
+          blockedByLink("indeterminate"),
+        ]),
+      ]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-blk-mix" }),
+      cacheScope: "c-blk-mix", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning).toEqual([]);
+  });
 });
 
 describe("JiraProvider.fetchLifecycleStates", () => {

@@ -58,6 +58,33 @@ function readRepoFieldValue(raw: unknown): string {
   return "";
 }
 
+/** Shape of a single entry in an issue's `issuelinks` field. A `Blocks` link with
+ *  an `inwardIssue` means "this issue is blocked by inwardIssue". */
+interface JiraIssueLink {
+  type?: { name?: string };
+  inwardIssue?: { key?: string; fields?: { status?: { statusCategory?: { key?: string } } } };
+  outwardIssue?: { key?: string; fields?: { status?: { statusCategory?: { key?: string } } } };
+}
+
+/**
+ * True when the issue has an open "Blocks" link pointing inward (it is blocked by an
+ * issue whose status category is not terminal). Mirrors the Linear provider's
+ * inverse-relation "blocks" skip. A blocker in the `done` category never blocks.
+ *
+ * NOTE: the link type is matched on the default name "Blocks". A Jira instance that
+ * renames this link type will fail open here (the issue dispatches as if unblocked).
+ * Making the name per-mapping configurable is the follow-up if that becomes a need.
+ */
+function isBlockedByIncomplete(issuelinks: unknown): boolean {
+  if (!Array.isArray(issuelinks)) return false;
+  return (issuelinks as JiraIssueLink[]).some(
+    (l) =>
+      l.type?.name === "Blocks" &&
+      l.inwardIssue != null &&
+      l.inwardIssue.fields?.status?.statusCategory?.key !== "done",
+  );
+}
+
 export interface JiraProviderConstructor {
   client: JiraClient;
   /** Per-instance cache scope label; typically the cloud ID. */
@@ -160,6 +187,7 @@ export class JiraProvider implements TicketingProvider {
       const fieldsToFetch = [
         "summary",
         "description",
+        "issuelinks",
         fieldIds.statusFieldId,
         fieldIds.repoFieldId,
       ];
@@ -182,6 +210,10 @@ export class JiraProvider implements TicketingProvider {
             this.notifiedMismatches.add(mismatchKey);
             this.onRepoFieldMismatch(scopeKey, raw.key, actualRepo);
           }
+          continue;
+        }
+        if (isBlockedByIncomplete(raw.fields.issuelinks)) {
+          console.log(`[jira] Skipping ${raw.key}: blocked by an incomplete issue`);
           continue;
         }
         const statusOption = raw.fields[fieldIds.statusFieldId] as { value?: string } | null;
