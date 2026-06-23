@@ -5,9 +5,9 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv } from "./github.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
-import type { TicketingProvider, IssueLifecycleState } from "./providers/types.js";
+import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion } from "./notify.js";
@@ -23,7 +23,7 @@ import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } f
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { initReconciliationTable, getPendingReconciliations, updateReconciliationStatus } from "./reconciliation.js";
-import { resolveSessionImage, selectRunnerImageInput } from "./repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult } from "./runner-callback.js";
@@ -40,13 +40,12 @@ import {
 } from "./local-docker.js";
 import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+import { resolveBaseBranch } from "./feature-branch.js";
+import { runMergeUps } from "./merge-up.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 
 // ---------- Configuration ----------
-
-/** Built-in fallback runner image when SESSION_IMAGE is unset. Mirrors the default in claude-implement.yml. */
-const DEFAULT_SESSION_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
 interface AppConfig {
   linearApiKey: string | null;
@@ -64,8 +63,10 @@ interface AppConfig {
   flyOrchestratorApp: string | null;
   tenantId: string | null;
   sessionImage: string;
-  /** True when SESSION_IMAGE was explicitly set (vs. falling back to the built-in default). */
-  sessionImageExplicit: boolean;
+  /** Deprecation state of SESSION_IMAGE, used for the startup warning. */
+  sessionImageStatus: SessionImageStatus;
+  /** True when an explicit orchestrator-wide default image was set (either runner-image env var); drives GHA dispatch forwarding. */
+  runnerImageExplicit: boolean;
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   githubWebhookSecret: string | null;
@@ -106,6 +107,9 @@ function loadConfig(): AppConfig {
   const runnerTokenSecret = process.env.RUNNER_TOKEN_SECRET || null;
   const gapFillTriggerSecret = process.env.GAP_FILL_TRIGGER_SECRET || null;
 
+  // Resolve the default runner image once; main() reads the status for the deprecation warning.
+  const defaultRunner = resolveDefaultRunnerImage(process.env);
+
   if (!runnerCallbackBaseUrl || !runnerTokenSecret) {
     console.warn("[main] runner callback path disabled (RUNNER_CALLBACK_BASE_URL or RUNNER_TOKEN_SECRET not set)");
   }
@@ -140,8 +144,9 @@ function loadConfig(): AppConfig {
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
-    sessionImage: process.env.SESSION_IMAGE || DEFAULT_SESSION_IMAGE,
-    sessionImageExplicit: Boolean(process.env.SESSION_IMAGE),
+    sessionImage: defaultRunner.image,
+    sessionImageStatus: defaultRunner.sessionImageStatus,
+    runnerImageExplicit: defaultRunner.explicit,
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
     claudeOAuthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN || null,
     githubWebhookSecret,
@@ -239,6 +244,34 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       teamRepoMap[k] = m;
     }
 
+    // Feature-branch roll-up: merge each completed feature-node branch into its parent
+    // (auto-merge for internal levels; a human PR at the feature→base top). Runs before
+    // dispatch so a parent's own closing work clones a branch that already contains its
+    // children's merged work. Best-effort — never blocks the poll.
+    if (providers.length > 0) {
+      try {
+        const rollUps = (
+          await Promise.all(
+            providers.map((p) =>
+              p.fetchFeatureNodeRollUps().catch((err) => {
+                console.error("[merge-up] Provider fetchFeatureNodeRollUps failed:", err);
+                return [] as FeatureNodeRollUp[];
+              }),
+            ),
+          )
+        ).flat();
+        if (rollUps.length > 0) {
+          await runMergeUps(rollUps, {
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
+          });
+        }
+      } catch (err) {
+        console.error("[merge-up] roll-up step failed:", err);
+      }
+    }
+
     // Implementation issues have priority over planning issues for slot allocation.
     // Both consume slots from the same per-team capacity pool.
     const allCandidates = [...readyForImplementation, ...needsPlanning];
@@ -285,16 +318,24 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
           const { mode: runnerMode } = getRunnerMode();
           const execPath = resolveExecutionPath(runnerMode, mapping.executionMode);
+
+          // Resolve the base branch once per issue (feature-branch grouping). Doing it
+          // here — before the exec-path switch — guarantees the "both" shadow path's two
+          // dispatches agree on one base, and never creates the branch twice. The token
+          // is per-owner cached, so the in-dispatch-fn fetches below are cache hits.
+          const baseGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+          const baseBranch = await resolveBaseBranch({ ghToken: baseGhToken, issue, mapping });
+
           if (execPath === "both") {
             // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, true);
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, true);
           } else if (execPath === "local-docker") {
-            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode);
+            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
           } else if (execPath === "fly-machines") {
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
           } else {
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode);
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
           }
         }
       } catch (err) {
@@ -359,7 +400,7 @@ async function resolveDispatchRunnerImage(
   });
   return selectRunnerImageInput({
     resolved,
-    sessionImageExplicit: config.sessionImageExplicit,
+    runnerImageExplicit: config.runnerImageExplicit,
   });
 }
 
@@ -370,6 +411,7 @@ async function dispatchGitHubActions(
   mapping: RepoMapping,
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
+  baseBranch: string,
 ): Promise<void> {
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
@@ -410,7 +452,12 @@ async function dispatchGitHubActions(
     issue_description: issue.description || issue.title,
     runner_phase: "implementation",
     ...providerDispatchFields(mapping),
+    // Only forward base_branch when grouping moved it off the repo default: GitHub
+    // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
+    // re-synced the workflow keep working for the common (non-grouped) path.
+    ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
     ...capDispatchFields(mapping),
+    ...branchPrefixDispatchFields(mapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
     run_progress_token: runProgressToken,
@@ -846,6 +893,7 @@ async function dispatchFlyMachine(
   mapping: RepoMapping,
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
+  baseBranch: string,
   shadow = false,
 ): Promise<void> {
   if (mapping.provider === "bedrock") {
@@ -906,7 +954,7 @@ async function dispatchFlyMachine(
         issueDescription: issue.description || issue.title,
         owner: mapping.owner,
         repo: mapping.repo,
-        defaultBranch: mapping.defaultBranch,
+        defaultBranch: baseBranch,
         linearApiKey: config.linearApiKey ?? undefined,
         anthropicApiKey: config.anthropicApiKey ?? undefined,
         claudeOAuthToken: config.claudeOAuthToken ?? undefined,
@@ -928,7 +976,7 @@ async function dispatchFlyMachine(
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -959,6 +1007,7 @@ async function dispatchLocalDocker(
   mapping: RepoMapping,
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
+  baseBranch: string,
 ): Promise<void> {
   if (mapping.provider === "bedrock") {
     console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: provider=bedrock is not supported on container runners`);
@@ -989,7 +1038,7 @@ async function dispatchLocalDocker(
         issueDescription: issue.description || issue.title,
         owner: mapping.owner,
         repo: mapping.repo,
-        defaultBranch: mapping.defaultBranch,
+        defaultBranch: baseBranch,
         linearApiKey: config.linearApiKey ?? undefined,
         anthropicApiKey: config.anthropicApiKey ?? undefined,
         claudeOAuthToken: config.claudeOAuthToken ?? undefined,
@@ -1002,7 +1051,7 @@ async function dispatchLocalDocker(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -2217,6 +2266,15 @@ async function main(): Promise<void> {
     console.log(`[main] Per-team runners: ${teamRunners || "(none configured)"}`);
   }
   console.log(`[main] Poll interval: ${config.pollIntervalMs}ms`);
+  if (config.sessionImageStatus === "active") {
+    console.warn(
+      "[main] SESSION_IMAGE is deprecated; rename it to AI_IMPLEMENT_RUNNER_IMAGE (same value). SESSION_IMAGE still works for now.",
+    );
+  } else if (config.sessionImageStatus === "shadowed") {
+    console.warn(
+      "[main] SESSION_IMAGE is set but ignored because AI_IMPLEMENT_RUNNER_IMAGE takes precedence. Remove SESSION_IMAGE.",
+    );
+  }
   console.log(`[main] Mapped teams: ${Object.keys(teamRepoMap).join(", ")}`);
   console.log(`[main] Notification type: ${config.notifyType}`);
   if (initialRunnerMode === "local") {

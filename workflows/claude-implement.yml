@@ -16,7 +16,8 @@
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
-#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
+#   AI_IMPLEMENT_RUNNER_LABEL                    - runs-on label for the implement job (default ubuntu-latest); set to a larger-runner label to speed up CPU-bound test suites.
 
 name: Claude AI Implementation
 
@@ -41,6 +42,11 @@ on:
         type: string
       pr_number:
         description: "Existing PR number for gap-fill runs (leave empty for new implementation)"
+        required: false
+        type: string
+        default: ""
+      base_branch:
+        description: "Branch the runner clones and the PR targets (feature-branch grouping). Empty = repo default."
         required: false
         type: string
         default: ""
@@ -74,6 +80,11 @@ on:
         required: false
         type: string
         default: ""
+      branch_prefix:
+        description: "Optional branch-name prefix prepended as a path segment (empty = no prefix)"
+        required: false
+        type: string
+        default: ""
       runner_callback_url:
         description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
         required: false
@@ -90,7 +101,7 @@ on:
         type: string
         default: ""
       runner_image:
-        description: "Override the default runner image (must match ghcr.io/builddownai/* or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
+        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
         default: ""
@@ -113,10 +124,29 @@ jobs:
           REQUESTED_RUNNER_IMAGE: ${{ inputs.runner_image }}
           CONFIGURED_RUNNER_IMAGE: ${{ vars.AI_IMPLEMENT_RUNNER_IMAGE }}
           EXTRA_ALLOWED_PREFIXES: ${{ vars.AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [ -z "$owner" ]; then
+            echo "::error::GITHUB_REPOSITORY_OWNER is empty; cannot derive the owner image prefix." >&2
+            exit 1
+          fi
+
+          # Resolution ladder: dispatch input > .ai-implement/image.yml > repo/org var > upstream default.
           runner_image="${REQUESTED_RUNNER_IMAGE:-}"
+
+          # Read the per-repo override from the DEFAULT branch only — never a PR head — so a
+          # pull request cannot choose the image its privileged run executes in. `gh api` with
+          # no ?ref= resolves the default branch; mirrors src/repo-image.ts parsing.
+          if [ -z "$runner_image" ]; then
+            if raw="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.ai-implement/image.yml" \
+                  -H "Accept: application/vnd.github.raw+json" 2>/dev/null)"; then
+              runner_image="$(printf '%s\n' "$raw" | sed -n 's/^image:[[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' | head -n1)" || true
+            fi
+          fi
+
           if [ -z "$runner_image" ]; then
             runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
           fi
@@ -131,7 +161,7 @@ jobs:
               ;;
           esac
 
-          allowed_prefixes="ghcr.io/builddownai/"
+          allowed_prefixes="ghcr.io/builddownai/,ghcr.io/${owner}/"
           if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
             allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
           fi
@@ -141,12 +171,12 @@ jobs:
           for raw_prefix in "${prefixes[@]}"; do
             prefix="$(echo "$raw_prefix" | xargs)"
             [ -z "$prefix" ] && continue
-            case "$runner_image" in
-              "$prefix"*)
-                allowed=true
-                break
-                ;;
-            esac
+            # Literal prefix match — quote "$prefix" so glob metacharacters in an
+            # operator-supplied AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES can't widen it.
+            if [[ "$runner_image" == "$prefix"* ]]; then
+              allowed=true
+              break
+            fi
           done
 
           if [ "$allowed" != "true" ]; then
@@ -167,7 +197,10 @@ jobs:
 
   implement:
     needs: validate-runner-image
-    runs-on: ubuntu-latest
+    # Default GitHub-hosted runners are 2 vCPU; the test suites Claude runs are
+    # CPU-bound and scale ~linearly with cores. Set AI_IMPLEMENT_RUNNER_LABEL to
+    # a larger-runner label (e.g. ubuntu-latest-4-cores) to speed those up.
+    runs-on: ${{ vars.AI_IMPLEMENT_RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: ${{ inputs.job_timeout_minutes && fromJSON(inputs.job_timeout_minutes) || 90 }}
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}
@@ -216,17 +249,18 @@ jobs:
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-          GITHUB_DEFAULT_BRANCH: ${{ github.ref_name }}
           ISSUE_ID: ${{ inputs.issue_id }}
           ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
           ISSUE_TITLE: ${{ inputs.issue_title }}
           ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          GITHUB_DEFAULT_BRANCH: ${{ inputs.base_branch || github.ref_name }}
           RUNNER_PHASE: ${{ inputs.runner_phase }}
           PROVIDER: ${{ inputs.provider }}
           AWS_REGION: ${{ inputs.aws_region }}
           AI_IMPLEMENT_MAX_TURNS: ${{ inputs.max_turns }}
           AI_IMPLEMENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
+          AI_IMPLEMENT_BRANCH_PREFIX: ${{ inputs.branch_prefix }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

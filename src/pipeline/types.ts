@@ -54,6 +54,8 @@ export interface PipelineContextData {
   maxTurns?: number;
   /** Autonomous runner: cap on implement/review iterations (from env). */
   maxIterations?: number;
+  /** Autonomous runner: optional branch-name prefix (from AI_IMPLEMENT_BRANCH_PREFIX). */
+  branchPrefix?: string;
   /** Autonomous runner: WORKFLOW.md hook script paths (relative to repo root). */
   hooks?: { setup?: string; verify?: string; teardown?: string };
 }

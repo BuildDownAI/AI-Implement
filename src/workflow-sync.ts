@@ -121,6 +121,11 @@ class GitHubClient {
   }
 }
 
+function buildSyncBranchName(prefix: string | null | undefined): string {
+  const cleaned = (prefix ?? "").trim().replace(/^\/+|\/+$/g, "");
+  return cleaned ? `${cleaned}/sync/ai-implement` : "sync/ai-implement";
+}
+
 function repoPath(mapping: RepoMapping): string {
   return `${mapping.owner}/${mapping.repo}`;
 }
@@ -241,17 +246,20 @@ async function ensureSyncBranch(params: {
     return;
   }
 
-  const compare = await gh.maybeRequest<{ ahead_by: number }>(
-    `/repos/${repo}/compare/${encodeRefPath(baseBranch)}...${encodeRefPath(syncBranch)}`,
-  );
-  if ((compare?.ahead_by ?? 0) === 0) {
-    await gh.request(`/repos/${repo}/git/refs/heads/${encodeRefPath(syncBranch)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ sha: base.object.sha, force: true }),
-    });
-  }
+  // The sync branch is orchestrator-owned and disposable: always force-reset it to the
+  // current base so each re-sync produces a clean diff (base + freshly regenerated
+  // templates) and never layers onto stale state from a prior sync PR — whether that
+  // branch is ahead of, behind, or lingering after a merge.
+  await gh.request(`/repos/${repo}/git/refs/heads/${encodeRefPath(syncBranch)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ sha: base.object.sha, force: true }),
+  });
 }
 
+// NOTE: this matches only the CURRENT sync branch name. If a project's branchPrefix
+// changes (e.g. "pr" -> none, or "pr" -> "client/pr"), a sync PR previously opened on
+// the old branch name will not be found here and remains open; it must be closed
+// manually. Re-syncing always operates on the branch for the mapping's current prefix.
 async function findSyncPr(
   gh: GitHubClient,
   repo: string,
@@ -311,7 +319,7 @@ export async function syncWorkflowTemplates(
 ): Promise<WorkflowSyncResult> {
   const mapping = options.mapping;
   const targetRepo = repoPath(mapping);
-  const syncBranch = options.syncBranch ?? "sync/ai-implement";
+  const syncBranch = options.syncBranch ?? buildSyncBranchName(mapping.branchPrefix);
   const templatesRoot = options.templatesRoot ?? packageRoot();
   const getToken = options.getInstallationTokenImpl ?? getInstallationToken;
   const token = await getToken(options.githubAppId, options.githubAppPrivateKey, mapping.owner);

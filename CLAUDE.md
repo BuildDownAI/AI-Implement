@@ -53,6 +53,12 @@ scripts/
   sync-workflow.yml  — sync workflow templates to target repos
   claude-review.yml  — Claude reviews PRs (auto for same-repo, /claude-review for forks)
   build-runner.yml   — build and push the session runner image to GHCR
+
+docs/
+  plans/      — implementation plans (decision artifacts; progress derived from git)
+  solutions/  — documented solutions to past problems (bugs, best practices, workflow
+                patterns), by category with YAML frontmatter (module, tags, problem_type);
+                relevant when implementing or debugging in documented areas
 ```
 
 ## Running locally
@@ -160,6 +166,12 @@ Each project's mapping carries three optional caps, editable in the `/admin` Pro
 
 `/ai-implement` comment-triggered gap-fill runs bypass the orchestrator, so they read caps from target-repo **variables** instead (mirroring `AI_IMPLEMENT_PROVIDER`): set `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, and `AI_IMPLEMENT_MAX_JOB_MINUTES` (Settings → Secrets and variables → Actions → Variables) to cap those runs too.
 
+### Per-project branch prefix (admin UI)
+
+Each project's mapping carries an optional **Branch Prefix** (blank = none, the default). When set, it is prepended as a path segment to the implementation branch name: with prefix `pr`, a branch that would be `ai-implement/PROJ-123-add-login` becomes `pr/ai-implement/PROJ-123-add-login`. Each `/`-separated segment of the prefix must start with a letter or digit and may otherwise contain only letters, digits, `.`, `_`, `-` (no `..` or `//`, ≤ 64 chars); the admin API rejects anything else.
+
+The prefix only affects the **initial orchestrator-driven run** — `/ai-implement` comment-triggered gap-fill runs commit to the existing PR branch and are unaffected. Like the run-caps, the prefix reaches the runner as the `branch_prefix` dispatch input (GitHub Actions) or `AI_IMPLEMENT_BRANCH_PREFIX` env var (Fly/local), and is only sent when set — so a project that sets a prefix must have **re-synced `claude-implement.yml`** to its target repo first, otherwise GitHub rejects the dispatch with "unexpected inputs".
+
 ### Runner log verbosity
 
 `AI_IMPLEMENT_LOG_LEVEL` controls how much the runner logs during an implement pass:
@@ -167,6 +179,12 @@ Each project's mapping carries three optional caps, editable in the `/admin` Pro
 - `stream`: additionally tees each per-turn tool call (name + truncated input; not tool output) to the log.
 
 Set it as a repository or organization **variable** (Settings → Secrets and variables → Actions → Variables), mirroring `AI_IMPLEMENT_PROVIDER`. It is read inside the runner container, so it applies to both orchestrator-initiated and `/ai-implement` comment-triggered runs **after the target repo has re-synced `claude-implement.yml`**. It is not a per-project admin field and not a dispatch input.
+
+### Runner label (GHA mode)
+
+`AI_IMPLEMENT_RUNNER_LABEL` overrides the `runs-on` label for the `implement` job, defaulting to `ubuntu-latest`. Default GitHub-hosted runners are 2 vCPU; the test suites Claude runs during implement (and the verify-hook gauntlet) are CPU-bound and scale ~linearly with cores, so pointing this at a larger-runner label (e.g. `ubuntu-latest-4-cores`) roughly halves the implement job's wall-clock.
+
+Set it as a repository or organization **variable** (Settings → Secrets and variables → Actions → Variables), like `AI_IMPLEMENT_LOG_LEVEL`. It only affects the GitHub Actions execution mode and only after the target repo has re-synced `claude-implement.yml`. It takes a single label string, not a label array. Granting write access to this variable lets the holder retarget the job to an arbitrary (e.g. self-hosted) runner that would see the job's secrets — the same threat model as any org-variable-controlled `runs-on`.
 
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
@@ -207,6 +225,16 @@ IAM trust policy shape (use the `sub` condition to restrict to this specific rep
 
 The workflow runs `aws-actions/configure-aws-credentials` once before the containerized runner step with a 4-hour session duration, covering implementation and gap-analysis runs. Only GitHub OIDC is supported — there is no static-key path.
 
+## Feature-branch grouping (parent/child issues)
+
+A Linear **parent issue** tagged `AI-Implement` that has `AI-Implement` children becomes a **feature node**: it owns a long-running branch `ai-implement/feature/<issue-key>`, its labelled children PR **into that branch** (not the repo base), and the tree cascades recursively. A parent's own work is deferred until its children finish, then runs onto its own branch; completed feature branches **roll up** into their parent automatically (internal levels via a direct merge, the top of the tree as a human-reviewed `feature → base` PR).
+
+Key labels: `AI-Implement` (trigger) → `AI-Planning` (planning in flight) → `Plan-Complete` (ready to implement) → `AI-Working` (implementing) → `Ready for Review` (PR open); merging the PR is what moves the issue to Done (Linear's GitHub integration). A parent labelled before its children is left alone until a child is labelled (race guard).
+
+Parts: classification + roll-up discovery in `src/providers/linear.ts`; `TicketIssue.featureBranchChain` / `FeatureNodeRollUp` in `src/providers/types.ts`; cascade branch creation in `src/feature-branch.ts` (`resolveBaseBranch`); roll-up in `src/merge-up.ts`; GitHub helpers in `src/github.ts`; `Plan-Complete` via `src/runner-callback.ts`; wired into the poll loop in `src/index.ts`. Linear-only (Jira PRs to base). **Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
+
+Operational requirements: re-sync `claude-implement.yml` to the target repo (for the `base_branch` input); a **publicly reachable** runner callback (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`) so planning auto-advances and the cascade self-drives; and pair the runner image with the orchestrator channel (testing → `SESSION_IMAGE=…:next`).
+
 ## Custom extensions
 
 Client forks can override built-in behaviour without touching upstream code by placing files under `custom/`. A file at `custom/<path>` takes precedence over the corresponding built-in.
@@ -235,15 +263,25 @@ Both check `custom/<path>` (relative to `process.cwd()`) first, then fall back t
 - When implementing client-specific behaviour, **always place new files in `custom/`** rather than modifying built-in modules — this keeps the fork rebasing cleanly on upstream changes.
 - A `custom/` file that exists but has no `default` export produces a warning and falls back to the built-in rather than silently misbehaving.
 
-## Per-repo runner image override
+## Runner image resolution
 
-A target repo can boot its runner on a custom image by committing `.ai-implement/image.yml` at the default branch:
+Both execution modes resolve the runner image with the same ladder, highest priority first:
 
-```yaml
-image: ghcr.io/your-org/your-runner:v1
-```
+1. **`.ai-implement/image.yml`** at the target repo's default branch — per-repo override:
 
-The image must be publicly pullable. The customer owns building and publishing it. If the file is absent, malformed, or points at an unreachable reference, the orchestrator falls back to the default runner (`SESSION_IMAGE` env var, or `ghcr.io/builddownai/ai-implement-runner:latest`).
+   ```yaml
+   image: ghcr.io/your-org/your-runner:v1
+   ```
+
+   In `fly-machines` mode the orchestrator reads it via the GitHub contents API (`src/repo-image.ts`); in `github-actions` mode the `claude-implement.yml` / `comment-trigger.yml` workflows read it with `gh api` from the **default branch only** (never a PR head, so a PR can't choose its own privileged image).
+
+2. **`AI_IMPLEMENT_RUNNER_IMAGE`** — the operator/org default. A GitHub repo/org **variable** in `github-actions` mode (org-level applies to every repo); an orchestrator **env var** in `fly-machines` mode. `SESSION_IMAGE` is the deprecated former name of the env var — still honored, but the orchestrator logs a deprecation warning at startup.
+
+3. **Upstream fallback** — `ghcr.io/builddownai/ai-implement-runner:latest` (orchestrator / comment-trigger) or `:next` (claude-implement). In `github-actions` mode a manual `runner_image` dispatch input overrides everything for that one run.
+
+The `github-actions` allowlist auto-trusts `ghcr.io/builddownai/` and the repo owner's own `ghcr.io/<owner>/` namespace, so a fork using its own published image needs no extra config; `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is only for third-party registries. The `fly-machines` path validates image-reference format but has no allowlist.
+
+The image must be publicly pullable. The customer owns building and publishing it. If `.ai-implement/image.yml` is absent, malformed, or points at an unreachable reference, resolution falls through to the next ladder rung.
 
 This resolution applies to **both** execution modes. On the Fly Machines path the orchestrator boots the session machine on the resolved image directly. On the GitHub Actions path the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-implement.yml` (which runs it as the job's `container.image`) — but only when the choice is explicit: a per-repo `.ai-implement/image.yml` override, or an explicitly-set `SESSION_IMAGE`. When neither is set the orchestrator sends no `runner_image`, so the workflow keeps its own resolution order (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in `:latest` default) and repos that pin via that variable are not overridden. Planning runs (`claude-plan.yml`) have no runner container and are unaffected.
 

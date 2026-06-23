@@ -125,6 +125,7 @@ export const projectsHtml = `
           <div class="md-field"><label>Max Turns <span class="text-tertiary" style="font-size:0.85em">(blank = 50)</span></label><input id="md-max-turns" type="number" min="1" step="1" placeholder="50"></div>
           <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" step="1" placeholder="3"></div>
           <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
+          <div class="md-field"><label>Branch Prefix <span class="text-tertiary" style="font-size:0.85em">(blank = none)</span></label><input id="md-branch-prefix" placeholder="pr"></div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -273,6 +274,7 @@ export const projectsScript = `
     document.getElementById('md-max-turns').value = m.maxTurns == null ? '' : String(m.maxTurns);
     document.getElementById('md-max-iter').value = m.maxIterations == null ? '' : String(m.maxIterations);
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
+    document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -573,6 +575,7 @@ export const projectsScript = `
       maxTurns: (function(){ var v = document.getElementById('md-max-turns').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
       maxIterations: (function(){ var v = document.getElementById('md-max-iter').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
       maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
