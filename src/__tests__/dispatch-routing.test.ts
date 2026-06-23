@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveExecutionPath } from "../runner-mode.js";
+import { resolveExecutionPath, resolvePlanningExecutionPath } from "../runner-mode.js";
 
 describe("resolveExecutionPath", () => {
   describe("shadow mode", () => {
@@ -49,6 +49,58 @@ describe("resolveExecutionPath", () => {
 
     it("returns fly-machines when mapping is fly-machines", () => {
       expect(resolveExecutionPath("default", "fly-machines")).toBe("fly-machines");
+    });
+  });
+});
+
+describe("resolvePlanningExecutionPath", () => {
+  describe("shadow mode — collapses to GHA-only (no double-posting Linear comments)", () => {
+    it("returns github-actions for shadow + github-actions mapping", () => {
+      expect(resolvePlanningExecutionPath("shadow", "github-actions")).toBe("github-actions");
+    });
+
+    it("returns github-actions for shadow + fly-machines mapping", () => {
+      expect(resolvePlanningExecutionPath("shadow", "fly-machines")).toBe("github-actions");
+    });
+  });
+
+  describe("gha override", () => {
+    it("returns github-actions for gha + github-actions mapping", () => {
+      expect(resolvePlanningExecutionPath("gha", "github-actions")).toBe("github-actions");
+    });
+
+    it("returns github-actions for gha + fly-machines mapping (override)", () => {
+      expect(resolvePlanningExecutionPath("gha", "fly-machines")).toBe("github-actions");
+    });
+  });
+
+  describe("fly override", () => {
+    it("returns fly-machines for fly + github-actions mapping (override)", () => {
+      expect(resolvePlanningExecutionPath("fly", "github-actions")).toBe("fly-machines");
+    });
+
+    it("returns fly-machines for fly + fly-machines mapping", () => {
+      expect(resolvePlanningExecutionPath("fly", "fly-machines")).toBe("fly-machines");
+    });
+  });
+
+  describe("local override", () => {
+    it("returns local-docker for local + github-actions mapping", () => {
+      expect(resolvePlanningExecutionPath("local", "github-actions")).toBe("local-docker");
+    });
+
+    it("returns local-docker for local + fly-machines mapping", () => {
+      expect(resolvePlanningExecutionPath("local", "fly-machines")).toBe("local-docker");
+    });
+  });
+
+  describe("default mode — respects per-team executionMode", () => {
+    it("returns github-actions when mapping is github-actions", () => {
+      expect(resolvePlanningExecutionPath("default", "github-actions")).toBe("github-actions");
+    });
+
+    it("returns fly-machines when mapping is fly-machines", () => {
+      expect(resolvePlanningExecutionPath("default", "fly-machines")).toBe("fly-machines");
     });
   });
 });
