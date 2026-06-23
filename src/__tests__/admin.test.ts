@@ -621,6 +621,45 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toMatch(/kind/);
   });
+
+  it("persists a valid branchPrefix and returns it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX", owner: "org", repo: "app", branchPrefix: "pr",
+    }, token);
+    expect(create.statusCode).toBe(200);
+    expect(JSON.parse(create.body).branchPrefix).toBe("pr");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).PFX.branchPrefix).toBe("pr");
+  });
+
+  it("normalizes surrounding slashes on branchPrefix", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX2", owner: "org", repo: "app", branchPrefix: "/pr/",
+    }, token);
+    expect(create.statusCode).toBe(200);
+    expect(JSON.parse(create.body).branchPrefix).toBe("pr");
+  });
+
+  it("treats a blank branchPrefix as null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX3", owner: "org", repo: "app", branchPrefix: "  ",
+    }, token);
+    expect(create.statusCode).toBe(200);
+    expect(JSON.parse(create.body).branchPrefix).toBeNull();
+  });
+
+  it("rejects an invalid branchPrefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFXBAD", owner: "org", repo: "app", branchPrefix: "has space",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("branchPrefix");
+  });
 });
 
 describe("admin runner-mode", () => {

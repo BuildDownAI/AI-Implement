@@ -146,7 +146,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           repoOwner: ctx.getOutputs("clone").repoOwner,
           repoRepo: ctx.getOutputs("clone").repoRepo,
           githubToken: ctx.getOutputs("clone").githubToken,
-          branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle),
+          branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
           baseBranch: ctx.getOutputs("clone").branch,
           prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
         }),

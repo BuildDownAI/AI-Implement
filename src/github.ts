@@ -10,6 +10,12 @@ interface DispatchInputs {
   dependencies?: string;
   /** When set, the workflow checks out the existing PR branch (gap-fill run). */
   pr_number?: string;
+  /**
+   * Base branch the runner clones and the child PR targets. Only forwarded when it
+   * differs from the workflow's declared default (feature-branch grouping); omitted
+   * otherwise so target repos that haven't re-synced the workflow input don't 422.
+   */
+  base_branch?: string;
   /** Explicit callback phase reported by the runner. */
   runner_phase?: "implementation" | "gap-analysis";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
@@ -22,6 +28,8 @@ interface DispatchInputs {
   max_iterations?: string;
   /** Per-project GitHub Actions job timeout in minutes. Only forwarded when set. */
   job_timeout_minutes?: string;
+  /** Per-project branch-name prefix. Only forwarded when set on the mapping. */
+  branch_prefix?: string;
   /** Public base URL the runner should POST results back to. Empty when callback disabled. */
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
@@ -99,6 +107,25 @@ export function capRunnerEnv(mapping: RepoMapping): Record<string, string> {
   return env;
 }
 
+/**
+ * Branch-prefix dispatch input for a mapping. Only included when the mapping
+ * configures a prefix, so default repos keep dispatching to workflow templates
+ * that haven't been re-synced with the new input.
+ */
+export function branchPrefixDispatchFields(
+  mapping: RepoMapping,
+): Pick<DispatchInputs, "branch_prefix"> {
+  return mapping.branchPrefix ? { branch_prefix: mapping.branchPrefix } : {};
+}
+
+/**
+ * Branch-prefix env var for the runner process (Fly/local execution modes),
+ * where the prefix arrives via container env rather than a workflow input.
+ */
+export function branchPrefixRunnerEnv(mapping: RepoMapping): Record<string, string> {
+  return mapping.branchPrefix ? { AI_IMPLEMENT_BRANCH_PREFIX: mapping.branchPrefix } : {};
+}
+
 export async function dispatchWorkflow(
   token: string,
   mapping: RepoMapping,
@@ -121,6 +148,67 @@ export async function dispatchWorkflow(
 
   const body = await res.text();
   return { success: false, status: res.status, error: body };
+}
+
+/**
+ * Returns the commit SHA a branch points at, or null if the branch does not exist.
+ */
+export async function getBranchSha(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<string | null> {
+  // Encode each path segment but preserve the "/" separators — feature branch names
+  // like "ai-implement/feature/ool-78" are multi-segment refs; encodeURIComponent on
+  // the whole string would turn the slashes into %2F and the ref lookup would 404.
+  const encodedBranch = branch.split("/").map(encodeURIComponent).join("/");
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodedBranch}`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`getBranchSha(${branch}) failed: HTTP ${res.status}: ${body}`);
+  }
+  const data = (await res.json()) as { object?: { sha?: unknown } };
+  const sha = data.object?.sha;
+  if (typeof sha !== "string") {
+    throw new Error(`getBranchSha(${branch}) returned an unexpected shape`);
+  }
+  return sha;
+}
+
+/**
+ * Ensures `branch` exists on the remote, creating it from `fromBranch`'s current
+ * head if missing. Idempotent: a no-op when the branch already exists, and tolerant
+ * of a 422 race (another caller created it between the check and the create).
+ */
+export async function ensureBranchExists(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  fromBranch: string,
+): Promise<void> {
+  const existing = await getBranchSha(token, owner, repo, branch);
+  if (existing !== null) return;
+
+  const fromSha = await getBranchSha(token, owner, repo, fromBranch);
+  if (fromSha === null) {
+    throw new Error(`ensureBranchExists: base branch "${fromBranch}" does not exist in ${owner}/${repo}`);
+  }
+
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs`, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: fromSha }),
+  });
+  if (res.status === 201) return;
+  const body = await res.text().catch(() => "");
+  // 422 with "Reference already exists" = lost a creation race — treat as success.
+  // Any other 422 (invalid SHA, malformed ref) is a real error and must surface.
+  if (res.status === 422 && /already exists/i.test(body)) return;
+  throw new Error(`ensureBranchExists: creating "${branch}" failed: HTTP ${res.status}: ${body}`);
 }
 
 /**
@@ -234,4 +322,110 @@ export async function findPrForRun(
 
   const prs = (await prRes.json()) as Array<{ html_url: string }>;
   return prs.length > 0 ? prs[0].html_url : null;
+}
+
+// ---------- Feature-branch roll-up (merge-up) helpers ----------
+
+/**
+ * Returns how many commits `head` is ahead of `base` (i.e. commits on head not yet
+ * in base). 0 means head is fully merged into base — nothing to roll up. Returns null
+ * if either ref is missing (404).
+ */
+export async function compareBranches(
+  token: string,
+  owner: string,
+  repo: string,
+  base: string,
+  head: string,
+): Promise<number | null> {
+  // basehead path segments may contain slashes (feature/ool-78); encode each segment.
+  const enc = (b: string) => b.split("/").map(encodeURIComponent).join("/");
+  const url = `https://api.github.com/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`compareBranches(${base}...${head}) failed: HTTP ${res.status}: ${body}`);
+  }
+  const data = (await res.json()) as { ahead_by?: unknown };
+  return typeof data.ahead_by === "number" ? data.ahead_by : 0;
+}
+
+/** Finds an open PR for the given head→base pair; returns its number/url or null. */
+export async function findOpenPullRequest(
+  token: string,
+  owner: string,
+  repo: string,
+  head: string,
+  base: string,
+): Promise<{ number: number; url: string } | null> {
+  const url =
+    `https://api.github.com/repos/${owner}/${repo}/pulls` +
+    `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&state=open&per_page=1`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) return null;
+  const prs = (await res.json()) as Array<{ number: number; html_url: string }>;
+  return prs.length > 0 ? { number: prs[0].number, url: prs[0].html_url } : null;
+}
+
+/**
+ * Opens a PR head→base. Returns the created PR, or an existing open one if GitHub
+ * reports a duplicate (422). Throws on other failures.
+ */
+export async function createPullRequest(
+  token: string,
+  owner: string,
+  repo: string,
+  opts: { head: string; base: string; title: string; body: string },
+): Promise<{ number: number; url: string }> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ head: opts.head, base: opts.base, title: opts.title, body: opts.body }),
+  });
+  if (res.status === 201) {
+    const data = (await res.json()) as { number: number; html_url: string };
+    return { number: data.number, url: data.html_url };
+  }
+  const body = await res.text().catch(() => "");
+  // 422 with "A pull request already exists" — fetch and return the existing one.
+  if (res.status === 422 && /already exists/i.test(body)) {
+    const existing = await findOpenPullRequest(token, owner, repo, opts.head, opts.base);
+    if (existing) return existing;
+  }
+  throw new Error(`createPullRequest(${opts.head}->${opts.base}) failed: HTTP ${res.status}: ${body}`);
+}
+
+/**
+ * Directly merges `head` into `base` via the Git merges API — no pull request.
+ *
+ * Used for internal feature-branch roll-ups: a PR's base branch name and title would
+ * let Linear's GitHub integration auto-link it to the parent issue (the branch encodes
+ * the identifier) and falsely mark that issue Done on merge, before its own closing work
+ * runs. A plain merge commit carrying no issue identifiers / magic words avoids that.
+ *
+ * Returns:
+ *   "merged"   — created a merge commit (201)
+ *   "noop"     — nothing to merge; head already contained in base (204)
+ *   "conflict" — merge conflict; needs a human (409)
+ * Throws on other failures.
+ */
+export async function mergeBranch(
+  token: string,
+  owner: string,
+  repo: string,
+  base: string,
+  head: string,
+  commitMessage: string,
+): Promise<"merged" | "noop" | "conflict"> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/merges`, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ base, head, commit_message: commitMessage }),
+  });
+  if (res.status === 201) return "merged";
+  if (res.status === 204) return "noop"; // already up to date
+  if (res.status === 409) return "conflict";
+  const body = await res.text().catch(() => "");
+  throw new Error(`mergeBranch(${head} -> ${base}) failed: HTTP ${res.status}: ${body}`);
 }

@@ -13,8 +13,14 @@ vi.mock("node:fs", () => ({
   },
 }));
 
+vi.mock("../pipeline/scratch-exclude.js", () => ({
+  prepareScratchExclusion: vi.fn(),
+  SCRATCH_PATHS: ["ai-output/"],
+}));
+
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { prepareScratchExclusion } from "../pipeline/scratch-exclude.js";
 
 function mockSpawn(calls: Array<{ status: number; stdout?: string; stderr?: string }>) {
   let call = 0;
@@ -117,6 +123,24 @@ describe("cloneStep", () => {
     await expect(
       cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/git rev-parse HEAD failed/);
+  });
+
+  it("seeds scratch exclusion for the workspace on a fresh clone", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockSpawn([{ status: 0 }, { status: 0, stdout: "sha1\n" }]);
+
+    await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(prepareScratchExclusion).toHaveBeenCalledWith("/tmp/workspace");
+  });
+
+  it("seeds scratch exclusion for the workspace on an incremental fetch", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    mockSpawn([{ status: 0 }, { status: 0 }, { status: 0, stdout: "sha2\n" }]);
+
+    await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(prepareScratchExclusion).toHaveBeenCalledWith("/tmp/workspace");
   });
 
   it("passes through repoOwner, repoRepo, branch, githubToken in outputs", async () => {

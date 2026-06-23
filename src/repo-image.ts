@@ -1,3 +1,12 @@
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      AI_IMPLEMENT_RUNNER_IMAGE?: string;
+      SESSION_IMAGE?: string;
+    }
+  }
+}
+
 const CACHE_TTL_MS = 60_000;
 const IMAGE_KEY_RE = /^image:\s*(\S+)\s*$/m;
 // Registry ref: host/name(/subpath)* followed by either ":tag" or "@digest".
@@ -109,25 +118,72 @@ async function fetchImage(
   return { image: candidate, source: "override" };
 }
 
+const DEFAULT_RUNNER_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
+
+/**
+ * State of the deprecated SESSION_IMAGE env var relative to its replacement:
+ * - `unused`   — SESSION_IMAGE is not set; nothing to warn about.
+ * - `active`   — SESSION_IMAGE is set and in use (AI_IMPLEMENT_RUNNER_IMAGE unset).
+ * - `shadowed` — both are set, so SESSION_IMAGE is ignored in favour of the new var.
+ */
+export type SessionImageStatus = "unused" | "active" | "shadowed";
+
+export interface DefaultRunnerImageResult {
+  image: string;
+  /**
+   * True when an explicit orchestrator-wide default was set via either env var
+   * (AI_IMPLEMENT_RUNNER_IMAGE or the legacy SESSION_IMAGE), vs the built-in
+   * fallback. Drives whether the resolved image is forwarded to GitHub Actions
+   * dispatches (see {@link selectRunnerImageInput}).
+   */
+  explicit: boolean;
+  sessionImageStatus: SessionImageStatus;
+}
+
+/**
+ * Resolves the orchestrator-wide default runner image, preferring the
+ * mode-agnostic AI_IMPLEMENT_RUNNER_IMAGE and falling back to the legacy
+ * (deprecated) SESSION_IMAGE, then the upstream BuildDownAI image. The
+ * returned status lets the caller emit a deprecation warning whose wording
+ * distinguishes "rename it" (active) from "it's ignored" (shadowed).
+ */
+export function resolveDefaultRunnerImage(
+  env: Pick<NodeJS.ProcessEnv, "AI_IMPLEMENT_RUNNER_IMAGE" | "SESSION_IMAGE">,
+): DefaultRunnerImageResult {
+  const hasNew = Boolean(env.AI_IMPLEMENT_RUNNER_IMAGE);
+  const hasLegacy = Boolean(env.SESSION_IMAGE);
+  const sessionImageStatus: SessionImageStatus = !hasLegacy
+    ? "unused"
+    : hasNew
+      ? "shadowed"
+      : "active";
+  return {
+    image: env.AI_IMPLEMENT_RUNNER_IMAGE || env.SESSION_IMAGE || DEFAULT_RUNNER_IMAGE,
+    explicit: hasNew || hasLegacy,
+    sessionImageStatus,
+  };
+}
+
 /**
  * Decides whether a resolved image should be forwarded to a target workflow as
  * the `runner_image` workflow_dispatch input.
  *
  * We only forward when the image represents an *explicit* choice:
  *   - a per-repo `.ai-implement/image.yml` override (source === "override"), or
- *   - an explicitly-set SESSION_IMAGE on the orchestrator.
+ *   - an explicit orchestrator-wide default (AI_IMPLEMENT_RUNNER_IMAGE or the
+ *     legacy SESSION_IMAGE), surfaced as `runnerImageExplicit`.
  *
  * When neither is true the resolved image is just the built-in fallback, so we
  * return `undefined` and let the target workflow keep its own resolution
- * (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in
- * default). This keeps repos that pin via that variable from being silently
- * overridden by the orchestrator's default.
+ * (its own `.ai-implement/image.yml`, the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org
+ * variable, then its built-in default). This keeps repos that pin via that
+ * variable from being silently overridden by the orchestrator's default.
  */
 export function selectRunnerImageInput(opts: {
   resolved: ResolveSessionImageResult;
-  sessionImageExplicit: boolean;
+  runnerImageExplicit: boolean;
 }): string | undefined {
-  if (opts.resolved.source === "override" || opts.sessionImageExplicit) {
+  if (opts.resolved.source === "override" || opts.runnerImageExplicit) {
     return opts.resolved.image;
   }
   return undefined;

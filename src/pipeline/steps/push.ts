@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
+import { span } from "../timing.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -63,76 +64,139 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     // stdout/stderr. Token is redacted from any error messages.
     const remote = `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`;
     const remoteRef = `refs/heads/${branchName}`;
-    const expectedRemoteSha = resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken);
-    const pushResult = spawnSync(
-      "git",
-      [
-        "push",
-        remote,
-        `HEAD:${remoteRef}`,
-        `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
-      ],
-      { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+    const expectedRemoteSha = await span("git-ls-remote", async () =>
+      resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken),
     );
+    const tracePush = process.env.AI_IMPLEMENT_LOG_LEVEL === "stream";
+    const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
+      remote,
+      remoteRef,
+      expectedRemoteSha,
+      tracePush,
+    );
+    const pushResult = await span("git-push", async () =>
+      spawnSync("git", pushArgs, {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: pushEnv,
+      }),
+    );
+    if (tracePush) {
+      // Diagnostic for slow pushes: GIT_TRACE2_PERF region timings (pack-objects
+      // vs send-pack vs server wait) + --verbose object counts. Redact the token
+      // with replaceAll — the tokenized remote URL can recur many times here.
+      // Trim each stream and join with a newline so partial-line stdout doesn't
+      // run onto the first byte of stderr.
+      const trace = [pushResult.stdout?.toString() ?? "", pushResult.stderr?.toString() ?? ""]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join("\n")
+        .replaceAll(githubToken, "***");
+      if (trace) console.error(`[git-push trace]\n${trace}`);
+    }
     if (pushResult.status !== 0) {
-      const stderr = (pushResult.stderr?.toString() ?? "").replace(githubToken, "***");
+      const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(githubToken, "***");
       throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
     }
 
-    // Create PR, tolerating 422 (already exists)
-    const prRes = await fetch(
-      `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${githubToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          title: prTitle,
-          head: branchName,
-          base: baseBranch,
-          body: prBody,
-        }),
-      },
+    // Span covers the POST and the 422 list-open-PRs fallback so re-runs (which
+    // hit 422 and pay an extra round-trip) are timed in full, not just the POST.
+    const pr = await span("pr-create", async () =>
+      createOrFindPullRequest({ repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody }),
     );
-
-    if (prRes.ok) {
-      const pr = (await prRes.json()) as { html_url?: unknown; number?: unknown };
-      if (typeof pr.html_url !== "string" || typeof pr.number !== "number") {
-        throw new Error("Unexpected PR creation response shape from GitHub API");
-      }
-      return { prUrl: pr.html_url, prNumber: pr.number, branchPushed: true, commitSha };
-    }
-
-    if (prRes.status === 422) {
-      // PR already open — find it
-      const listRes = await fetch(
-        `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls?head=${repoOwner}:${branchName}&state=open`,
-        { headers: { Authorization: `Bearer ${githubToken}` } },
-      );
-      if (!listRes.ok) {
-        const listBody = await listRes.text().catch(() => "");
-        throw new Error(
-          `PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`,
-        );
-      }
-      const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown }>;
-      if (prs.length > 0) {
-        const existing = prs[0];
-        if (typeof existing.html_url === "string" && typeof existing.number === "number") {
-          return { prUrl: existing.html_url, prNumber: existing.number, branchPushed: true, commitSha };
-        }
-      }
-      throw new Error(
-        `PR already exists (422) but no open PR found for branch ${branchName}`,
-      );
-    }
-
-    const body = await prRes.text().catch(() => "");
-    throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
+    return { prUrl: pr.url, prNumber: pr.number, branchPushed: true, commitSha };
   },
 };
+
+interface CreatePrInputs {
+  repoOwner: string;
+  repoRepo: string;
+  githubToken: string;
+  prTitle: string;
+  branchName: string;
+  baseBranch: string;
+  prBody: string;
+}
+
+/** Create the PR, tolerating 422 (already exists) by finding the open PR. */
+async function createOrFindPullRequest(
+  { repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody }: CreatePrInputs,
+): Promise<{ url: string; number: number }> {
+  const prRes = await fetch(
+    `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${githubToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: prTitle,
+        head: branchName,
+        base: baseBranch,
+        body: prBody,
+      }),
+    },
+  );
+
+  if (prRes.ok) {
+    const pr = (await prRes.json()) as { html_url?: unknown; number?: unknown };
+    if (typeof pr.html_url !== "string" || typeof pr.number !== "number") {
+      throw new Error("Unexpected PR creation response shape from GitHub API");
+    }
+    return { url: pr.html_url, number: pr.number };
+  }
+
+  if (prRes.status === 422) {
+    // PR already open — find it
+    const listRes = await fetch(
+      `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls?head=${repoOwner}:${branchName}&state=open`,
+      { headers: { Authorization: `Bearer ${githubToken}` } },
+    );
+    if (!listRes.ok) {
+      const listBody = await listRes.text().catch(() => "");
+      throw new Error(
+        `PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`,
+      );
+    }
+    const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown }>;
+    if (prs.length > 0) {
+      const existing = prs[0];
+      if (typeof existing.html_url === "string" && typeof existing.number === "number") {
+        return { url: existing.html_url, number: existing.number };
+      }
+    }
+    throw new Error(
+      `PR already exists (422) but no open PR found for branch ${branchName}`,
+    );
+  }
+
+  const body = await prRes.text().catch(() => "");
+  throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
+}
+
+/**
+ * Build the `git push` argv and spawn env. When `trace` is true (driven by
+ * AI_IMPLEMENT_LOG_LEVEL=stream), it adds `--verbose` and `GIT_TRACE2_PERF=1`
+ * so a slow push can be diagnosed — region timings (pack-objects vs send-pack
+ * vs server wait) plus object counts land on the captured stderr.
+ */
+export function buildGitPushInvocation(
+  remote: string,
+  remoteRef: string,
+  expectedRemoteSha: string | null,
+  trace: boolean,
+): { args: string[]; env: NodeJS.ProcessEnv } {
+  const args = [
+    "push",
+    ...(trace ? ["--verbose"] : []),
+    remote,
+    `HEAD:${remoteRef}`,
+    `--force-with-lease=${remoteRef}:${expectedRemoteSha ?? ""}`,
+  ];
+  const env = trace ? { ...process.env, GIT_TRACE2_PERF: "1" } : process.env;
+  return { args, env };
+}
 
 function buildCommitMessage(issueIdentifier: string, issueTitle: string): string {
   const title = (issueTitle || "AI implementation").replace(/\s+/g, " ").trim();
@@ -188,7 +252,7 @@ function summarizeCommittedChanges(workspaceDir: string, githubToken: string): s
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`git show failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
 
@@ -206,7 +270,7 @@ function runGit(
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`${label} failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
 }
@@ -217,7 +281,7 @@ function hasWorkingTreeChanges(workspaceDir: string, githubToken: string): boole
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
-    const stderr = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     throw new Error(`git status failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
   return result.stdout.toString().trim().length > 0;
@@ -255,7 +319,7 @@ function resolveRemoteBranchSha(
       return line.split("\t")[0] || null;
     }
 
-    lastError = (result.stderr?.toString() ?? "").replace(githubToken, "***");
+    lastError = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
     if (attempt < LS_REMOTE_MAX_ATTEMPTS) {
       sleepSync(LS_REMOTE_RETRY_DELAYS_MS[attempt - 1] ?? 1000);
     }
