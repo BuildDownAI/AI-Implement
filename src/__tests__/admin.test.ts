@@ -1390,6 +1390,27 @@ describe("admin pipelines-steps endpoint", () => {
   });
 });
 
+describe("admin log", () => {
+  it("GET /api/log includes phase defaulting to 'implementation'", async () => {
+    log.appendLog({ issueId: "LNR-1", issueIdentifier: "LNR-1", repo: "org/repo" });
+    const token = await login("secret");
+    const res = await request("/api/log", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data).toHaveLength(1);
+    expect(data[0].phase).toBe("implementation");
+  });
+
+  it("GET /api/log includes phase 'planning' when set", async () => {
+    log.appendLog({ issueId: "LNR-2", issueIdentifier: "LNR-2", repo: "org/repo", phase: "planning" });
+    const token = await login("secret");
+    const res = await request("/api/log", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data[0].phase).toBe("planning");
+  });
+});
+
 describe("classifyTemplate", () => {
   it("flags a body that curls api.linear.app/graphql with LINEAR_API_KEY as stale", async () => {
     const { classifyTemplate } = await import("../admin.js");
