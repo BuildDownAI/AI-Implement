@@ -124,9 +124,12 @@ export function classifySyncError(err: unknown): ClassifiedSyncError {
     // Never let a 401 fall through to the 404 "not installed" check below.
     if (err.status === 401) return classify("clock-skew-suspected", err.message);
     if (err.status === 403) return classify("permission-denied", err.message); // incl. missing `workflows` perm on .github/workflows PUT
+    
+    // Same status, different meaning by endpoint — disambiguate on the path.
     if (err.status === 404 && err.path) {
-      // Same status, different meaning by endpoint — disambiguate on the path.
       if (/\/installation$/.test(err.path)) return classify("app-not-installed", err.message);
+      // Matches ONLY the bare-repo existence probe (`/repos/owner/repo`, the first repo call in syncWorkflowTemplates).
+      // Intentionally narrow: deeper 404s (e.g. a missing base branch at /repos/owner/repo/git/ref/heads/...) are not "repo not found" and correctly fall to unknown.
       if (/^\/repos\/[^/]+\/[^/]+$/.test(err.path)) return classify("repo-not-found", err.message);
     }
     // A typed GitHub error whose status we don't categorize.

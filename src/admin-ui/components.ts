@@ -191,7 +191,6 @@ export const componentsCss = `
   line-height: 1.4;
 }
 .btn:disabled {
-  cursor: not-allowed;
   pointer-events: none;
   background: var(--bg-active);
   color: var(--fg-secondary);
