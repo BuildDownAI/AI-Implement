@@ -33,6 +33,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     maxTurns: null,
     maxIterations: null,
     maxJobMinutes: null,
+    branchPrefix: null,
     ...overrides,
   };
 }
@@ -487,6 +488,40 @@ describe("config", () => {
     expect(all.NULLS.maxTurns).toBeNull();
     expect(all.NULLS.maxIterations).toBeNull();
     expect(all.NULLS.maxJobMinutes).toBeNull();
+  });
+
+  it("round-trips branchPrefix (including null)", () => {
+    config.initMappingsTable();
+    config.upsertMapping("PFX", mapping({ owner: "org", repo: "repo", branchPrefix: "pr" }));
+    config.upsertMapping("NOPFX", mapping({ owner: "org", repo: "repo", branchPrefix: null }));
+
+    const all = config.getMappings();
+    expect(all.PFX.branchPrefix).toBe("pr");
+    expect(all.NOPFX.branchPrefix).toBeNull();
+  });
+
+  it("migrates a pre-existing mappings table to include the branch_prefix column (default null)", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.branchPrefix).toBeNull();
+
+    const reopened = new Database(dbPath);
+    const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
+    reopened.close();
+    expect(info.map((c) => c.name)).toContain("branch_prefix");
   });
 
   it("getMappings falls back to {} when extra_env contains invalid JSON", () => {

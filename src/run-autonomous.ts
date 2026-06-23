@@ -7,7 +7,9 @@ import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
 import type { LLMExecutor, LogLevel, PipelineDefinition, StepReporter } from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
+import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } from "./pipeline/timing.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
+import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 
@@ -181,6 +183,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   };
   const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS, "AI_IMPLEMENT_MAX_TURNS");
   const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS, "AI_IMPLEMENT_MAX_ITERATIONS");
+  const branchPrefix = (() => {
+    try {
+      return normalizeBranchPrefix(process.env.AI_IMPLEMENT_BRANCH_PREFIX) ?? undefined;
+    } catch (err) {
+      // The orchestrator validates the prefix before dispatch, so this only
+      // happens on a manual dispatch with a bad value. Warn rather than fail the
+      // run, and fall back to the default (no prefix).
+      console.warn(`[runner] Ignoring invalid AI_IMPLEMENT_BRANCH_PREFIX: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  })();
 
   const logLevel = resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL);
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
@@ -189,13 +202,16 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   if (orchestratorUrl && !nonce) {
     console.warn("ORCHESTRATOR_URL is set but MACHINE_NONCE is empty — step reports will be rejected (403).");
   }
-  const reporter: StepReporter =
+  const baseReporter: StepReporter =
     opts.reporter ??
     (callbackUrl && progressToken
       ? new TokenStepReporter(callbackUrl, progressToken, { fetchImpl: opts.fetchImpl })
       : orchestratorUrl && nonce
       ? new HttpStepReporter(orchestratorUrl, nonce)
       : new NoopStepReporter());
+
+  const timing = new TimingCollector(logLevel);
+  const reporter: StepReporter = new TimingStepReporter(baseReporter, timing);
 
   const context = new DefaultPipelineContext(
     {
@@ -218,6 +234,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       provider,
       maxTurns,
       maxIterations,
+      branchPrefix,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,
@@ -226,7 +243,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
     const runner = opts.runner ?? (await createDefaultRunner());
-    await runner.run(pipeline, context, reporter);
+    await runWithTiming(timing, () => runner.run(pipeline, context, reporter));
     const pushOutputs = context.getOutputs("push");
     await postRunnerResult({
       workspaceDir,
@@ -247,6 +264,13 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     });
     return { exitCode: 1 };
   } finally {
+    try {
+      if (timing.records().length > 0) {
+        console.error(formatSummary(timing, issueIdentifier));
+      }
+    } catch (summaryErr) {
+      console.error(`timing summary failed: ${summaryErr}`);
+    }
     if (teardownHook) {
       try {
         const result = runHookScript("teardown", teardownHook, workspaceDir);
