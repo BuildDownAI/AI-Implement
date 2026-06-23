@@ -190,6 +190,13 @@ export const componentsCss = `
   white-space: nowrap;
   line-height: 1.4;
 }
+.btn:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+  background: var(--bg-active);
+  color: var(--fg-secondary);
+  border-color: var(--border-default);
+}
 .btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
 .btn:active { transform: translateY(0.5px); }
 .btn:focus-visible { outline: none; box-shadow: var(--shadow-focus); }

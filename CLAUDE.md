@@ -41,6 +41,7 @@ workflows/          — templates synced to target repos
   claude-plan.yml   — planning workflow template (always synced)
   WORKFLOW.md       — Claude implementation prompt template (seeded once)
   PLANNING.md       — Claude planning prompt template (seeded once)
+  custom/           — repo-local override scaffold seeded once (README + .gitkeep placeholders)
 
 clients/            — one .toml per deployed client
   example-client.toml  — copy this to onboard a new client
@@ -110,13 +111,15 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 
 ## Adding a new target repo
 
-1. Add the team→repo mapping in the admin UI at `/admin`
-2. Install the GitHub App on the target repo
-3. Click **Sync workflows** on that project row — the orchestrator opens or updates a PR in the target repo with workflow files and starter prompt templates
-4. Merge the PR in the target repo
-5. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
+1. Install the GitHub App on the target repo **first** — saving the mapping immediately syncs workflows to it.
+2. Add the project mapping in the admin UI at `/admin` (the **New project** stepper, or **Edit** on an existing row). On save, the orchestrator automatically opens or updates a PR in the target repo with the workflow files and starter prompt templates, and the project row shows a **"Workflows synced — PR opened"** link. If the App isn't installed yet (or sync otherwise fails), the mapping still saves and an alert explains why — install the App, then re-save or use the row's **Sync workflows** button.
+3. Merge the PR in the target repo
+4. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
 
-The GitHub App must have **workflows** permission in addition to **contents** permission. GitHub rejects writes under `.github/workflows/` without it, so the Sync workflows action will fail before opening or updating the target-repo PR.
+The **Sync workflows** button on each project row re-runs the sync manually at any time, and `.github/workflows/sync-workflow.yml` remains as a manual/bulk fallback.
+
+The GitHub App must have **Workflows** permission in addition to **Contents** permission. GitHub rejects writes under `.github/workflows/` without it, so the sync will fail (surfaced as a "permission denied" message) before opening or updating the target-repo PR.
+
 
 ## admin-ui
 
@@ -189,7 +192,7 @@ Set it as a repository or organization **variable** (Settings → Secrets and va
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
 
-The Projects page **Sync workflows** action always syncs `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml` into the target repo. It seeds `WORKFLOW.md` and `PLANNING.md` once and never overwrites them (each repo owns its own prompt templates after initial setup). `.github/workflows/sync-workflow.yml` remains as a manual fallback, but normal distribution should happen from the orchestrator.
+The Projects page **Sync workflows** action always syncs `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml` into the target repo. It seeds `WORKFLOW.md`, `PLANNING.md`, and the `custom/` scaffold (`custom/README.md` plus `.gitkeep` placeholders for `custom/steps/`, `custom/pipelines/`, `custom/providers/`) once, and never overwrites them (each repo owns its prompt templates and customizations after initial setup). `.github/workflows/sync-workflow.yml` remains as a manual fallback, but normal distribution should happen from the orchestrator.
 
 ### Model IDs are passed through verbatim
 

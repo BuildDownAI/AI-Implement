@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { GitHubApiError } from "./github-errors.js";
 
 // Cache: org → { token, expiresAt }
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
@@ -108,24 +109,36 @@ export async function getInstallationToken(
   // Resolve installation ID for the owner (org or user account).
   // GitHub's `/orgs/{org}/installation` endpoint 404s on user accounts and
   // vice versa; try org first since that's the more common deployment shape.
-  let installRes = await fetch(`https://api.github.com/orgs/${owner}/installation`, { headers });
+  let installPath = `/orgs/${owner}/installation`;
+  let installRes = await fetch(`https://api.github.com${installPath}`, { headers });
   if (installRes.status === 404) {
-    installRes = await fetch(`https://api.github.com/users/${owner}/installation`, { headers });
+    installPath = `/users/${owner}/installation`;
+    installRes = await fetch(`https://api.github.com${installPath}`, { headers });
   }
   if (!installRes.ok) {
     const body = await installRes.text();
-    throw new Error(`GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`);
+    // `path` (…/installation) lets classifySyncError tell a 404-not-installed from a 404-repo-not-found
+    // `message` keeps the original wording so existing consumers are unchanged.
+    throw new GitHubApiError({
+      status: installRes.status,
+      path: installPath,
+      bodyText: body,
+      message: `GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`,
+    });
   }
   const install = await installRes.json() as { id: number };
 
   // Exchange for an installation access token
-  const tokenRes = await fetch(
-    `https://api.github.com/app/installations/${install.id}/access_tokens`,
-    { method: "POST", headers },
-  );
+  const tokenPath = `/app/installations/${install.id}/access_tokens`;
+  const tokenRes = await fetch(`https://api.github.com${tokenPath}`, { method: "POST", headers });
   if (!tokenRes.ok) {
     const body = await tokenRes.text();
-    throw new Error(`Failed to get installation token for owner "${owner}" (${tokenRes.status}): ${body}`);
+    throw new GitHubApiError({
+      status: tokenRes.status,
+      path: tokenPath,
+      bodyText: body,
+      message: `Failed to get installation token for owner "${owner}" (${tokenRes.status}): ${body}`,
+    });
   }
   const tokenData = await tokenRes.json() as { token: string; expires_at: string };
 

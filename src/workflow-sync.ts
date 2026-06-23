@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RepoMapping } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
+import { GitHubApiError } from "./github-errors.js";
 
 const GH_HEADERS = {
   Accept: "application/vnd.github+json",
@@ -41,6 +42,30 @@ const SEED_ONCE_FILES = [
     message: "Add PLANNING.md planning template (customise for this repo)",
     description: "Claude planning prompt template; customise this for your repo",
   },
+  {
+    local: "workflows/custom/README.md",
+    remote: "custom/README.md",
+    message: "Add custom/README.md (repo-local override guide)",
+    description: "Guide for repo-local step/pipeline overrides under custom/",
+  },
+  {
+    local: "workflows/custom/steps/.gitkeep",
+    remote: "custom/steps/.gitkeep",
+    message: "Seed custom/steps/ directory",
+    description: "custom/steps/ placeholder (override or add pipeline steps)",
+  },
+  {
+    local: "workflows/custom/pipelines/.gitkeep",
+    remote: "custom/pipelines/.gitkeep",
+    message: "Seed custom/pipelines/ directory",
+    description: "custom/pipelines/ placeholder (override pipeline definitions)",
+  },
+  {
+    local: "workflows/custom/providers/.gitkeep",
+    remote: "custom/providers/.gitkeep",
+    message: "Seed custom/providers/ directory",
+    description: "custom/providers/ placeholder (reserved for provider overrides)",
+  },
 ] as const;
 
 export interface WorkflowSyncOptions {
@@ -62,6 +87,60 @@ export interface WorkflowSyncResult {
   changedFiles: string[];
   prNumber: number | null;
   prUrl: string | null;
+}
+
+// ── Error classification ──────────────────────────────────────────────────
+// Sync can fail at several points, each throwing a differently-shaped Error.
+// classifySyncError() funnels them into a small set of user-facing categories so the admin UI can
+// show actionable guidance instead of a raw "GitHub 403 /repos/...: {...}" dump.
+// Reused by BOTH the auto-sync-on-save path and the manual /sync-workflows endpoint.
+
+export type SyncErrorCategory =
+  | "app-not-installed"
+  | "repo-not-found"
+  | "permission-denied"
+  | "clock-skew-suspected"
+  | "unknown";
+
+export interface ClassifiedSyncError {
+  category: SyncErrorCategory;
+  message: string;
+}
+
+const SYNC_ERROR_MESSAGES: Record<Exclude<SyncErrorCategory, "unknown">, string> = {
+  "app-not-installed":
+    "The GitHub App is not installed on the target repository's owner. Install it on the target repo, then re-save or click Sync workflows.",
+  "repo-not-found":
+    "The target repository was not found, or the GitHub App cannot see it. Check the owner/repo and that the App is installed there.",
+  "permission-denied":
+    "The GitHub App lacks the permissions needed to sync. It needs Contents, Pull requests, and Workflows write access on the target repo.",
+  "clock-skew-suspected":
+    "GitHub rejected the App credentials (401). If the App is installed, check the orchestrator host clock — a clock running ahead of GitHub invalidates the App token.",
+};
+
+export function classifySyncError(err: unknown): ClassifiedSyncError {
+  if (err instanceof GitHubApiError) {
+    // 401 first: a bad/expired App JWT (often host clock skew — the JWT currently has no forward-skew margin) 401s regardless of which endpoint was hit.
+    // Never let a 401 fall through to the 404 "not installed" check below.
+    if (err.status === 401) return classify("clock-skew-suspected", err.message);
+    if (err.status === 403) return classify("permission-denied", err.message); // incl. missing `workflows` perm on .github/workflows PUT
+    if (err.status === 404 && err.path) {
+      // Same status, different meaning by endpoint — disambiguate on the path.
+      if (/\/installation$/.test(err.path)) return classify("app-not-installed", err.message);
+      if (/^\/repos\/[^/]+\/[^/]+$/.test(err.path)) return classify("repo-not-found", err.message);
+    }
+    // A typed GitHub error whose status we don't categorize.
+    // Kept separate from the final catch-all (which handles non-GitHubApiError throws) so the two "unknown" cases can diverge later without silently affecting each other
+    return classify("unknown", err.message);
+  }
+  return classify("unknown", err instanceof Error ? err.message : String(err));
+}
+
+function classify(category: SyncErrorCategory, raw: string): ClassifiedSyncError {
+  return {
+    category,
+    message: category === "unknown" ? raw : SYNC_ERROR_MESSAGES[category],
+  };
 }
 
 interface RemoteFile {
@@ -96,7 +175,7 @@ class GitHubClient {
     });
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`GitHub ${res.status} ${path}: ${text.slice(0, 500)}`);
+      throw new GitHubApiError({ status: res.status, path, bodyText: text });
     }
     if (res.status === 204) return undefined as T;
     return await res.json() as T;
@@ -114,7 +193,7 @@ class GitHubClient {
     if (res.status === 404) return null;
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`GitHub ${res.status} ${path}: ${text.slice(0, 500)}`);
+      throw new GitHubApiError({ status: res.status, path, bodyText: text });
     }
     if (res.status === 204) return undefined as T;
     return await res.json() as T;

@@ -1,4 +1,5 @@
 import type { RepoMapping } from "./config.js";
+import { GitHubApiError } from "./github-errors.js";
 
 interface DispatchInputs {
   issue_id: string;
@@ -168,7 +169,12 @@ export async function getBranchSha(
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`getBranchSha(${branch}) failed: HTTP ${res.status}: ${body}`);
+    throw new GitHubApiError({
+      status: res.status,
+      path: `/repos/${owner}/${repo}/git/ref/heads/${encodedBranch}`,
+      bodyText: body,
+      message: `getBranchSha(${branch}) failed: HTTP ${res.status}: ${body}`,
+    });
   }
   const data = (await res.json()) as { object?: { sha?: unknown } };
   const sha = data.object?.sha;
@@ -208,7 +214,12 @@ export async function ensureBranchExists(
   // 422 with "Reference already exists" = lost a creation race — treat as success.
   // Any other 422 (invalid SHA, malformed ref) is a real error and must surface.
   if (res.status === 422 && /already exists/i.test(body)) return;
-  throw new Error(`ensureBranchExists: creating "${branch}" failed: HTTP ${res.status}: ${body}`);
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/git/refs`,
+    bodyText: body,
+    message: `ensureBranchExists: creating "${branch}" failed: HTTP ${res.status}: ${body}`,
+  });
 }
 
 /**
@@ -345,7 +356,12 @@ export async function compareBranches(
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`compareBranches(${base}...${head}) failed: HTTP ${res.status}: ${body}`);
+    throw new GitHubApiError({
+      status: res.status,
+      path: `/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`,
+      bodyText: body,
+      message: `compareBranches(${base}...${head}) failed: HTTP ${res.status}: ${body}`,
+    });
   }
   const data = (await res.json()) as { ahead_by?: unknown };
   return typeof data.ahead_by === "number" ? data.ahead_by : 0;
@@ -393,7 +409,12 @@ export async function createPullRequest(
     const existing = await findOpenPullRequest(token, owner, repo, opts.head, opts.base);
     if (existing) return existing;
   }
-  throw new Error(`createPullRequest(${opts.head}->${opts.base}) failed: HTTP ${res.status}: ${body}`);
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/pulls`,
+    bodyText: body,
+    message: `createPullRequest(${opts.head}->${opts.base}) failed: HTTP ${res.status}: ${body}`,
+  });
 }
 
 /**
@@ -427,5 +448,10 @@ export async function mergeBranch(
   if (res.status === 204) return "noop"; // already up to date
   if (res.status === 409) return "conflict";
   const body = await res.text().catch(() => "");
-  throw new Error(`mergeBranch(${head} -> ${base}) failed: HTTP ${res.status}: ${body}`);
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/merges`,
+    bodyText: body,
+    message: `mergeBranch(${head} -> ${base}) failed: HTTP ${res.status}: ${body}`,
+  });
 }
