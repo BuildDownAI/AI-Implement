@@ -328,13 +328,21 @@ Both execution modes resolve the runner image with the same ladder, highest prio
 
 The `github-actions` allowlist auto-trusts `ghcr.io/builddownai/` and the repo owner's own `ghcr.io/<owner>/` namespace, so a fork using its own published image needs no extra config; `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is only for third-party registries. The `fly-machines` path validates image-reference format but has no allowlist.
 
-The image must be publicly pullable. The customer owns building and publishing it. If `.ai-implement/image.yml` is absent, malformed, or points at an unreachable reference, resolution falls through to the next ladder rung.
+The image should be publicly pullable for the broadest compatibility (a private image restricts you to the GitHub Actions execution mode — see "Private runner images" below). The customer owns building and publishing it. If `.ai-implement/image.yml` is absent, malformed, or points at an unreachable reference, resolution falls through to the next ladder rung.
 
 This resolution applies to **both** execution modes. On the Fly Machines path the orchestrator boots the session machine on the resolved image directly. On the GitHub Actions path the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-implement.yml` (which runs it as the job's `container.image`) — but only when the choice is explicit: a per-repo `.ai-implement/image.yml` override, or an explicitly-set `SESSION_IMAGE`. When neither is set the orchestrator sends no `runner_image`, so the workflow keeps its own resolution order (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in `:latest` default) and repos that pin via that variable are not overridden.
 
 Planning runs (`claude-plan.yml`) now run on the same runner container and honor the **same** resolution: the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-plan.yml` under the identical "only when explicit" rule, so a testing orchestrator pinned to `:next` steers planning to `:next` and a per-repo `.ai-implement/image.yml` pin is honored for planning too. (Unlike `claude-implement.yml`, `claude-plan.yml`'s own validate step does not read `image.yml`, so orchestrator-forwarding is the only path by which GHA planning picks up either — and a target repo must have **re-synced `claude-plan.yml`** before the orchestrator will forward `runner_image` to it, otherwise GitHub rejects the dispatch with "unexpected inputs", the same caveat as the run-caps and branch-prefix inputs.)
 
 The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
+
+### Private runner images
+
+A private GHCR runner image is only usable in the **GitHub Actions execution mode**. The Fly Machines and local Docker backends pull the image anonymously (no credential mechanism), so a private image fails at machine-create time with `failed to get manifest ... unauthorized`. There is no workaround on those backends — choosing a private image is effectively choosing GHA mode.
+
+On the GitHub Actions path, `claude-implement.yml` and `comment-trigger.yml` authenticate the container pull with the job's `GITHUB_TOKEN`: each requests `packages: read` and passes the token through the container `credentials:` block. A bare `packages: read` is **not** enough on its own — GitHub Actions does not auto-authenticate a job-container image pull, so the `credentials:` block is what actually performs the authenticated pull.
+
+`GITHUB_TOKEN` can only read private packages owned by the **same org/account as the target repo**. So a private runner image must live in the target repo's own org — the realistic case is a customer pinning their own private image via `.ai-implement/image.yml` plus the `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` variable, and linking that GHCR package to the repo. The default `ghcr.io/builddownai/ai-implement-runner` image stays public precisely because a cross-org `GITHUB_TOKEN` cannot pull it; making it private would break every customer repo. A private image hosted in a *different* org requires swapping a PAT (with `read:packages` on that org) into the workflow's `credentials.password` in place of `GITHUB_TOKEN`.
 
 Runner image channels:
 
