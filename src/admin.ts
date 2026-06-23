@@ -40,6 +40,7 @@ import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
 import { syncWorkflowTemplates } from "./workflow-sync.js";
+import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -966,6 +967,7 @@ async function handleUpsertMapping(
       maxTurns?: number | null;
       maxIterations?: number | null;
       maxJobMinutes?: number | null;
+      branchPrefix?: string | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1088,6 +1090,14 @@ async function handleUpsertMapping(
       return;
     }
 
+    let branchPrefix: string | null;
+    try {
+      branchPrefix = normalizeBranchPrefix(body.branchPrefix);
+    } catch (err) {
+      json(res, 400, { error: `branchPrefix invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -1114,6 +1124,7 @@ async function handleUpsertMapping(
       maxTurns,
       maxIterations,
       maxJobMinutes,
+      branchPrefix,
     };
 
     upsertMapping(body.teamKey, mapping);

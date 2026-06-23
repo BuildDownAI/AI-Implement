@@ -1,5 +1,6 @@
 import type {
   AIImplementSnapshot,
+  FeatureNodeRollUp,
   IssueLifecycleState,
   ProviderConfig,
   TicketIssue,
@@ -206,6 +207,11 @@ export class JiraProvider implements TicketingProvider {
       nativeStatus: statusOption?.value ?? "",
     };
   }
+  async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {
+    // Feature-branch grouping (and thus roll-up) is Linear-only for now.
+    return [];
+  }
+
   async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {
     if (issueIds.length === 0) return new Map();
     // Use JQL `id in (...)` to fetch the relevant issues. Jira accepts numeric
