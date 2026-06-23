@@ -3,6 +3,16 @@ export interface ReaperBurstNotification {
   threshold: number;
 }
 
+export interface StuckGiveUpNotification {
+  issueIdentifier: string;
+  issueTitle: string;
+  issueUrl: string;
+  repoFullName: string;
+  runUrl: string | null;
+  attempts: number;
+  lastRunStatus: string; // "queued" | "in_progress" | "run_not_found"
+}
+
 export interface Notification {
   issueIdentifier: string;
   issueTitle: string;
@@ -20,6 +30,20 @@ export interface CompletionNotification {
   prUrl: string | null;
   runUrl: string | null;
   durationMs?: number | null;
+}
+
+export async function notifyStuckGiveUp(
+  type: string,
+  webhookUrl: string,
+  n: StuckGiveUpNotification,
+): Promise<void> {
+  switch (type.toLowerCase()) {
+    case "teams":
+      return notifyStuckGiveUpTeams(webhookUrl, n);
+    case "slack":
+    default:
+      return notifyStuckGiveUpSlack(webhookUrl, n);
+  }
 }
 
 export async function notifyReaperBurst(
@@ -227,6 +251,78 @@ async function notifyCompletionSlack(
 }
 
 // ---------- Reaper burst alerts ----------
+
+async function notifyStuckGiveUpSlack(
+  webhookUrl: string,
+  n: StuckGiveUpNotification,
+): Promise<void> {
+  let text = `:rotating_light: *AI Implementation Stuck — Needs Human*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\`\nAttempts: ${n.attempts}\nLast status: \`${n.lastRunStatus}\``;
+  if (n.runUrl) {
+    text += `\nRun: <${n.runUrl}|View Workflow Run>`;
+  }
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Slack webhook failed: ${res.status} — ${body}`);
+  }
+}
+
+async function notifyStuckGiveUpTeams(
+  webhookUrl: string,
+  n: StuckGiveUpNotification,
+): Promise<void> {
+  const facts: Array<{ title: string; value: string }> = [
+    { title: "Issue", value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})` },
+    { title: "Repo", value: n.repoFullName },
+    { title: "Attempts", value: String(n.attempts) },
+    { title: "Last status", value: n.lastRunStatus },
+  ];
+  if (n.runUrl) {
+    facts.push({ title: "Run", value: `[View Workflow Run](${n.runUrl})` });
+  }
+
+  const card = {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        content: {
+          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: [
+            {
+              type: "TextBlock",
+              text: "&#x1F6A8; AI Implementation Stuck \u2014 Needs Human",
+              weight: "Bolder",
+              size: "Medium",
+            },
+            { type: "FactSet", facts },
+          ],
+        },
+      },
+    ],
+  };
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(card),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Teams webhook failed: ${res.status} — ${body}`);
+  }
+}
 
 async function notifyReaperBurstSlack(
   webhookUrl: string,
