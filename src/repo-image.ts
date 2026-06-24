@@ -188,3 +188,34 @@ export function selectRunnerImageInput(opts: {
   }
   return undefined;
 }
+
+/**
+ * Resolves the runner image to forward on an orchestrator-initiated workflow
+ * dispatch: resolve the per-repo `.ai-implement/image.yml` override (falling
+ * back to the orchestrator default), then decide whether it should be forwarded
+ * as the `runner_image` workflow_dispatch input (only on an explicit override or
+ * an explicitly-set orchestrator default — see {@link selectRunnerImageInput}).
+ *
+ * Returns the image string to forward, or `undefined` to leave the target
+ * workflow's own image resolution in place. Both the implementation and planning
+ * GitHub Actions dispatch paths share this so a testing orchestrator pinned to
+ * `:next` steers both phases, and a per-repo image pin is honored for both.
+ */
+export async function resolveRunnerImageForDispatch(opts: {
+  owner: string;
+  repo: string;
+  token: string;
+  defaultImage: string;
+  runnerImageExplicit: boolean;
+  /** Injected for tests. Defaults to the global `fetch` via resolveSessionImage. */
+  fetchImpl?: typeof fetch;
+}): Promise<string | undefined> {
+  const resolved = await resolveSessionImage({
+    owner: opts.owner,
+    repo: opts.repo,
+    token: opts.token,
+    defaultImage: opts.defaultImage,
+    fetchImpl: opts.fetchImpl,
+  });
+  return selectRunnerImageInput({ resolved, runnerImageExplicit: opts.runnerImageExplicit });
+}

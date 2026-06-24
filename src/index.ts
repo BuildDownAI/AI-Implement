@@ -25,7 +25,7 @@ import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } f
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { initReconciliationTable, getPendingReconciliations, updateReconciliationStatus } from "./reconciliation.js";
-import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, type SessionImageStatus } from "./repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult } from "./runner-callback.js";
@@ -394,14 +394,11 @@ async function resolveDispatchRunnerImage(
   mapping: RepoMapping,
   ghToken: string,
 ): Promise<string | undefined> {
-  const resolved = await resolveSessionImage({
+  return resolveRunnerImageForDispatch({
     owner: mapping.owner,
     repo: mapping.repo,
     token: ghToken,
     defaultImage: config.sessionImage,
-  });
-  return selectRunnerImageInput({
-    resolved,
     runnerImageExplicit: config.runnerImageExplicit,
   });
 }
@@ -728,6 +725,15 @@ async function dispatchPlanning(
     runToken = minted.token;
   }
 
+  // Forward the resolved runner image so GHA planning honors the orchestrator's
+  // channel and per-repo `.ai-implement/image.yml` override, exactly as the
+  // implementation dispatch does. claude-plan.yml's validate-runner-image step
+  // does not read image.yml itself, so this is the only path by which GHA
+  // planning picks up either. Only sent when explicit (override or explicit
+  // SESSION_IMAGE/AI_IMPLEMENT_RUNNER_IMAGE), so repos that haven't re-synced
+  // claude-plan.yml are not rejected with a 422 "unexpected inputs".
+  const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
+
   const result = await dispatchWorkflow(ghToken, planningMapping, {
     issue_id: issue.id,
     issue_identifier: issue.identifier,
@@ -737,6 +743,7 @@ async function dispatchPlanning(
     ...providerDispatchFields(planningMapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
+    ...(runnerImage ? { runner_image: runnerImage } : {}),
   });
 
   if (!result.success) {
@@ -754,6 +761,7 @@ async function dispatchPlanning(
     dispatchId,
     executionMode: "github-actions",
     phase: "planning",
+    sessionImage: runnerImage ?? null,
   });
 
   if (config.notifyWebhookUrl) {
@@ -776,7 +784,7 @@ async function dispatchPlanning(
     );
   }
 
-  console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile})`);
+  console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${runnerImage ?? "workflow-default"})`);
 }
 
 // ---------- Shared session-dispatch core ----------
