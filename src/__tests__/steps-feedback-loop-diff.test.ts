@@ -93,3 +93,54 @@ describe("getDiff generated-file exclusion", () => {
     expect(diff).not.toContain("generated/types.ts");
   });
 });
+
+describe("getDiff untracked-file inclusion", () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "diff-untracked-test-"));
+    git(repo, ["init", "-q"]);
+    git(repo, ["config", "user.email", "t@t.com"]);
+    git(repo, ["config", "user.name", "t"]);
+    writeFileSync(join(repo, ".gitignore"), "settings.local.json\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "seed"]);
+  });
+
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("includes newly created untracked files as additions", () => {
+    // Simulate Claude creating a new file that has never been committed
+    mkdirSync(join(repo, "bd-project-setup"), { recursive: true });
+    writeFileSync(join(repo, "bd-project-setup/SKILL.md"), "# New skill\n");
+    const diff = getDiff(repo);
+    expect(diff).toContain("bd-project-setup/SKILL.md");
+    expect(diff).toContain("New skill");
+  });
+
+  it("includes untracked .mcp.json as an addition", () => {
+    writeFileSync(join(repo, ".mcp.json"), '{"mcpServers":{}}\n');
+    const diff = getDiff(repo);
+    expect(diff).toContain(".mcp.json");
+    expect(diff).toContain("mcpServers");
+  });
+
+  it("includes untracked files in nested directories alongside tracked changes", () => {
+    // Mix of tracked modification + untracked new file (the real BDS-2 scenario)
+    writeFileSync(join(repo, ".gitignore"), "settings.local.json\n*.log\n");
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    writeFileSync(join(repo, ".claude/settings.json"), '{"enabledMcpjsonServers":["linear"]}\n');
+    const diff = getDiff(repo);
+    expect(diff).toContain(".gitignore");         // tracked modification
+    expect(diff).toContain(".claude/settings.json"); // new untracked file
+    expect(diff).toContain("enabledMcpjsonServers");
+  });
+
+  it("does not include gitignored files", () => {
+    writeFileSync(join(repo, "settings.local.json"), '{"secret":"value"}\n');
+    const diff = getDiff(repo);
+    expect(diff).not.toContain("settings.local.json");
+  });
+});
