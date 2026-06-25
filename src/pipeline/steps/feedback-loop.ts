@@ -68,6 +68,16 @@ const REVIEW_DIFF_EXCLUDES = [
 ];
 
 export function getDiff(workspaceDir: string): string {
+  // Mark all untracked files as "intent to add" so git diff HEAD includes them
+  // as new-file additions. Without this, untracked files (e.g. newly created
+  // .mcp.json, .claude/settings.json) are invisible to the diff and the reviewer
+  // falsely rejects the implementation as "uncommitted". The push step runs
+  // git add -A unconditionally, so leaving intent-to-add markers is harmless.
+  spawnSync("git", ["add", "-N", "."], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
   const result = spawnSync(
     "git",
     ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
