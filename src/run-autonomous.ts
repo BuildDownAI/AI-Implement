@@ -12,6 +12,7 @@ import { runHookScript } from "./pipeline/steps/hooks.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
+import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 
 export interface RunAutonomousOptions {
   workspaceDir?: string;
@@ -260,6 +261,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       phase: runnerPhase,
       outcome: "failure",
       failureReason: err instanceof Error ? err.message : String(err),
+      failureCode: err instanceof SensitiveFilesError ? err.code : undefined,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };

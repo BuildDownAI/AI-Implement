@@ -91,6 +91,22 @@ export interface SensitiveFileMatch {
 }
 
 /**
+ * Thrown by the push step when one or more staged files match a sensitive
+ * pattern. The `code` property lets callers (e.g. the runner result handler)
+ * distinguish this from generic pipeline failures programmatically.
+ */
+export class SensitiveFilesError extends Error {
+  readonly code = "SENSITIVE_FILES_BLOCKED" as const;
+  readonly files: SensitiveFileMatch[];
+
+  constructor(hits: SensitiveFileMatch[]) {
+    super(formatSensitiveFilesError(hits));
+    this.name = "SensitiveFilesError";
+    this.files = hits;
+  }
+}
+
+/**
  * Returns every staged file that matches a sensitive pattern.
  * `stagedFiles` is a list of repo-relative paths (output of
  * `git diff --cached --name-only`).

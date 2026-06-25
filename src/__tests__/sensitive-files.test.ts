@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { findSensitiveFiles, formatSensitiveFilesError } from "../pipeline/sensitive-files.js";
+import { findSensitiveFiles, formatSensitiveFilesError, SensitiveFilesError } from "../pipeline/sensitive-files.js";
 
 // ── findSensitiveFiles ────────────────────────────────────────────────────────
 
@@ -183,5 +183,40 @@ describe("formatSensitiveFilesError", () => {
     expect(msg).toContain("server.pem");
     expect(msg).toContain("Push blocked");
     expect(msg).toContain(".gitignore");
+  });
+});
+
+// ── SensitiveFilesError ───────────────────────────────────────────────────────
+
+describe("SensitiveFilesError", () => {
+  it("has code SENSITIVE_FILES_BLOCKED", () => {
+    const hits = findSensitiveFiles([".env"]);
+    const err = new SensitiveFilesError(hits);
+    expect(err.code).toBe("SENSITIVE_FILES_BLOCKED");
+  });
+
+  it("is an instance of Error", () => {
+    const err = new SensitiveFilesError(findSensitiveFiles([".env"]));
+    expect(err).toBeInstanceOf(Error);
+  });
+
+  it("has a human-readable message that includes the blocked file paths", () => {
+    const hits = findSensitiveFiles([".env", "private.key"]);
+    const err = new SensitiveFilesError(hits);
+    expect(err.message).toContain(".env");
+    expect(err.message).toContain("private.key");
+    expect(err.message).toContain("Push blocked");
+  });
+
+  it("exposes the structured files list", () => {
+    const hits = findSensitiveFiles([".env", "server.pem"]);
+    const err = new SensitiveFilesError(hits);
+    expect(err.files).toHaveLength(2);
+    expect(err.files.map((f) => f.file)).toEqual(expect.arrayContaining([".env", "server.pem"]));
+  });
+
+  it("has name SensitiveFilesError", () => {
+    const err = new SensitiveFilesError(findSensitiveFiles([".env"]));
+    expect(err.name).toBe("SensitiveFilesError");
   });
 });
