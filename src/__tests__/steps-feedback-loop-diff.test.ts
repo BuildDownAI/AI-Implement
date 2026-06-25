@@ -127,15 +127,35 @@ describe("getDiff untracked-file inclusion", () => {
     expect(diff).toContain("mcpServers");
   });
 
-  it("includes untracked files in nested directories alongside tracked changes", () => {
-    // Mix of tracked modification + untracked new file (the real BDS-2 scenario)
+  it("includes both tracked modifications and untracked new files in the same diff", () => {
+    // This is the BDS-2 failure scenario: Claude modifies a tracked file AND creates
+    // several new files in the same pass. Before the git add -N fix, only the tracked
+    // modification appeared; the new files were invisible, causing the reviewer to
+    // reject every iteration with "files are not committed".
+
+    // Tracked modification: .gitignore already exists in HEAD
     writeFileSync(join(repo, ".gitignore"), "settings.local.json\n*.log\n");
+
+    // Untracked new files: never committed, not in HEAD at all
     mkdirSync(join(repo, ".claude"), { recursive: true });
     writeFileSync(join(repo, ".claude/settings.json"), '{"enabledMcpjsonServers":["linear"]}\n');
+    writeFileSync(join(repo, ".mcp.json"), '{"mcpServers":{"linear":{"type":"http","url":"https://mcp.linear.app/sse"}}}\n');
+    mkdirSync(join(repo, "bd-project-setup"), { recursive: true });
+    writeFileSync(join(repo, "bd-project-setup/SKILL.md"), "# BD Project Setup\n\nSets up the project.\n");
+
     const diff = getDiff(repo);
-    expect(diff).toContain(".gitignore");         // tracked modification
-    expect(diff).toContain(".claude/settings.json"); // new untracked file
+
+    // Tracked file must appear as a modification
+    expect(diff).toContain(".gitignore");
+    expect(diff).toContain("*.log");
+
+    // Each untracked file must appear as a new-file addition
+    expect(diff).toContain(".claude/settings.json");
     expect(diff).toContain("enabledMcpjsonServers");
+    expect(diff).toContain(".mcp.json");
+    expect(diff).toContain("mcp.linear.app");
+    expect(diff).toContain("bd-project-setup/SKILL.md");
+    expect(diff).toContain("BD Project Setup");
   });
 
   it("does not include gitignored files", () => {
