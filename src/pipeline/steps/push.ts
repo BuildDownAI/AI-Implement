@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { span } from "../timing.js";
+import { findSensitiveFiles, formatSensitiveFilesError } from "../sensitive-files.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -55,6 +56,15 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       "git config user.email",
     );
     runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+    const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only"], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stagedFiles = stagedResult.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
+    const sensitiveHits = findSensitiveFiles(stagedFiles);
+    if (sensitiveHits.length > 0) {
+      throw new Error(formatSensitiveFilesError(sensitiveHits));
+    }
     runGit(workspaceDir, ["commit", "-m", buildCommitMessage(issueIdentifier, issueTitle)], githubToken, "git commit");
     const commitSha = resolveCommitSha(workspaceDir);
     const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken);
