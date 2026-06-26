@@ -253,6 +253,11 @@ export function getInFlightJobs(): Job[] {
   );
 }
 
+/**
+ * Returns the issue IDs of every in-flight (dispatched/running) job. Used by the
+ * poll loop to tell which provider-reported in-progress issues actually have a
+ * live job behind them, versus ones stranded in that state with no run.
+ */
 export function getInFlightIssueIds(): Set<string> {
   const rows = getDb()
     .prepare(

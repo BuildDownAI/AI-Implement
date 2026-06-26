@@ -34,10 +34,28 @@ export interface TicketIssue {
   featureBranchChain?: string[];
 }
 
+/**
+ * An issue the provider currently reports as occupying a capacity slot —
+ * i.e. in a "Planning" or "Implementing" state. The orchestrator cross-checks
+ * these against its own in-flight jobs: an entry with no live job is stranded
+ * (a run that ended without a clean terminal transition) and must neither count
+ * toward the concurrency cap nor sit in that state forever.
+ */
+export interface InProgressIssue {
+  issueId: string;
+  scopeKey: string;
+  phase: "planning" | "implementing";
+}
+
 export interface AIImplementSnapshot {
   needsPlanning: TicketIssue[];
   readyForImplementation: TicketIssue[];
-  inProgressCountsByScope: Record<string, number>;
+  /**
+   * Issues the provider sees as occupying a slot. The raw length is NOT the
+   * concurrency count — the orchestrator gates these by its in-flight jobs (see
+   * countInProgressByTeam) so stranded states don't permanently fill the cap.
+   */
+  inProgress: InProgressIssue[];
 }
 
 /**

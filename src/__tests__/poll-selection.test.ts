@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { selectIssuesToDispatch, selectBlockers } from "../poll-selection.js";
+import { selectIssuesToDispatch, selectBlockers, countInProgressByTeam } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
-import type { TicketIssue } from "../providers/types.js";
+import type { InProgressIssue, TicketIssue } from "../providers/types.js";
 
 function makeIssue(id: string, identifier: string, teamKey: string): TicketIssue {
   return {
@@ -36,6 +36,37 @@ function makeMapping(maxInProgressAiIssues = 3): RepoMapping {
     paused: false,
   };
 }
+
+describe("countInProgressByTeam", () => {
+  const ip = (issueId: string, scopeKey: string): InProgressIssue => ({
+    issueId,
+    scopeKey,
+    phase: "implementing",
+  });
+
+  it("counts in-progress issues per scope when all are live", () => {
+    const counts = countInProgressByTeam(
+      [ip("a", "T1"), ip("b", "T1"), ip("c", "T2")],
+      () => true,
+    );
+    expect(counts).toEqual({ T1: 2, T2: 1 });
+  });
+
+  it("excludes issues with no live in-flight job (stranded slots don't count)", () => {
+    // 'b' is stranded in Implementing with no live job — it must not count.
+    const live = new Set(["a", "c"]);
+    const counts = countInProgressByTeam(
+      [ip("a", "T1"), ip("b", "T1"), ip("c", "T2")],
+      (id) => live.has(id),
+    );
+    expect(counts).toEqual({ T1: 1, T2: 1 });
+  });
+
+  it("returns no entry for a scope whose only in-progress issue is stranded", () => {
+    const counts = countInProgressByTeam([ip("a", "T1")], () => false);
+    expect(counts).toEqual({});
+  });
+});
 
 describe("selectIssuesToDispatch", () => {
   it("returns all issues when team has available slots", () => {
