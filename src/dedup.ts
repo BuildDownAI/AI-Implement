@@ -184,6 +184,18 @@ export function getDb(): Database.Database {
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_dispatches_pr ON review_fix_dispatches(repo, pr_number, created_at)`);
     db.exec(`
+      CREATE TABLE IF NOT EXISTS workflow_sync_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending',
+        result_json TEXT,
+        error_json TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_workflow_sync_queue_status ON workflow_sync_queue(status, created_at)`);
+    db.exec(`
       CREATE TABLE IF NOT EXISTS admin_sessions (
         token TEXT PRIMARY KEY,
         expires_at INTEGER NOT NULL

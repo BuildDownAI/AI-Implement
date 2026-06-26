@@ -10,6 +10,7 @@ import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as StepLogModule from "../step-log.js";
 import type * as WorkflowSyncModule from "../workflow-sync.js";
+import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketIssue } from "../providers/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
@@ -74,6 +75,7 @@ let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let stepLog: typeof StepLogModule;
 let workflowSync: typeof WorkflowSyncModule;
+let queue: typeof WorkflowSyncQueueModule;
 let provider: FakeProvider;
 
 beforeEach(async () => {
@@ -88,6 +90,7 @@ beforeEach(async () => {
   log = await import("../log.js");
   stepLog = await import("../step-log.js");
   workflowSync = await import("../workflow-sync.js");
+  queue = await import("../workflow-sync-queue.js");
   config.initMappingsTable();
   log.initLogTable();
   stepLog.initStepLogTable();
@@ -208,7 +211,7 @@ describe("admin mappings", () => {
   it("creates a mapping with custom maxInProgressAiIssues", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", maxInProgressAiIssues: 5 }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).maxInProgressAiIssues).toBe(5);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
@@ -218,7 +221,7 @@ describe("admin mappings", () => {
   it("defaults maxInProgressAiIssues to 3 when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "API", owner: "org", repo: "api" }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).maxInProgressAiIssues).toBe(3);
   });
 
@@ -256,14 +259,14 @@ describe("admin mappings", () => {
       repo: "app",
       defaultBranch: "development",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
 
     const update = await requestRaw("/api/mappings", "POST", "secret", {
       teamKey: "DEV",
       owner: "org",
       repo: "app-renamed",
     }, token);
-    expect(update.statusCode).toBe(200);
+    expect(update.statusCode).toBe(202);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).DEV).toMatchObject({
@@ -358,7 +361,7 @@ describe("admin mappings", () => {
       teamKey: "FLY", owner: "org", repo: "fly-repo",
       executionMode: "fly-machines", sessionMode: "hybrid", machineCpus: 4, machineMemoryMb: 8192,
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const data = JSON.parse(create.body);
     expect(data.executionMode).toBe("fly-machines");
     expect(data.sessionMode).toBe("hybrid");
@@ -374,7 +377,7 @@ describe("admin mappings", () => {
   it("defaults v2 fields when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "DEF", owner: "org", repo: "def-repo" }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const data = JSON.parse(create.body);
     expect(data.executionMode).toBe("github-actions");
     expect(data.sessionMode).toBe("autonomous");
@@ -416,7 +419,7 @@ describe("admin mappings", () => {
       teamKey: "AII", owner: "org", repo: "ai-implement",
       extraEnv: { DEDUP_DB_PATH: "/tmp/dedup.sqlite" },
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).extraEnv).toEqual({ DEDUP_DB_PATH: "/tmp/dedup.sqlite" });
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
@@ -426,7 +429,7 @@ describe("admin mappings", () => {
   it("defaults extraEnv to empty object when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "DEF", owner: "org", repo: "def" }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).extraEnv).toEqual({});
   });
 
@@ -435,7 +438,7 @@ describe("admin mappings", () => {
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "AAP", owner: "org", repo: "aap-repo", autoApprovePlans: false,
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).autoApprovePlans).toBe(false);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
@@ -445,7 +448,7 @@ describe("admin mappings", () => {
   it("defaults autoApprovePlans to true when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "AAPD", owner: "org", repo: "aapd-repo" }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).autoApprovePlans).toBe(true);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
@@ -476,7 +479,7 @@ describe("admin mappings", () => {
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "DEF", owner: "org", repo: "def",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const body = JSON.parse(create.body);
     expect(body.provider).toBe("anthropic");
     expect(body.awsRegion).toBeNull();
@@ -488,7 +491,7 @@ describe("admin mappings", () => {
       teamKey: "BED", owner: "org", repo: "bedrock-repo",
       provider: "bedrock", awsRegion: "us-west-2",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const body = JSON.parse(create.body);
     expect(body.provider).toBe("bedrock");
     expect(body.awsRegion).toBe("us-west-2");
@@ -543,7 +546,7 @@ describe("admin mappings", () => {
       teamKey: "CAPS", owner: "org", repo: "caps-repo",
       maxTurns: 40, maxIterations: 2, maxJobMinutes: 30,
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const body = JSON.parse(create.body);
     expect(body.maxTurns).toBe(40);
     expect(body.maxIterations).toBe(2);
@@ -561,7 +564,7 @@ describe("admin mappings", () => {
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "CAPD", owner: "org", repo: "capd-repo",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const body = JSON.parse(create.body);
     expect(body.maxTurns).toBeNull();
     expect(body.maxIterations).toBeNull();
@@ -592,7 +595,7 @@ describe("admin mappings", () => {
       teamKey: "CAPN", owner: "org", repo: "capn-repo",
       maxTurns: null,
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).maxTurns).toBeNull();
   });
 
@@ -607,7 +610,7 @@ describe("admin mappings", () => {
         repoFieldValue: "org/jira-app",
       },
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(list.statusCode).toBe(200);
     const entry = JSON.parse(list.body).JIRA1;
@@ -638,7 +641,7 @@ describe("admin mappings", () => {
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "PFX", owner: "org", repo: "app", branchPrefix: "pr",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).branchPrefix).toBe("pr");
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
@@ -650,7 +653,7 @@ describe("admin mappings", () => {
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "PFX2", owner: "org", repo: "app", branchPrefix: "/pr/",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).branchPrefix).toBe("pr");
   });
 
@@ -659,7 +662,7 @@ describe("admin mappings", () => {
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "PFX3", owner: "org", repo: "app", branchPrefix: "  ",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).branchPrefix).toBeNull();
   });
 
@@ -1458,45 +1461,97 @@ describe("classifyTemplate", () => {
   });
 });
 
-describe("auto-sync on mapping upsert", () => {
-  it("returns sync.ok with the result on success and persists the mapping", async () => {
+describe("async sync on mapping upsert", () => {
+  it("returns 202 with a syncJobId, no inline sync field, and persists the mapping", async () => {
     const token = await login("secret");
-    vi.mocked(workflowSync.syncWorkflowTemplates).mockResolvedValueOnce({
-      status: "pr-opened",
-      targetRepo: "org/app",
-      baseBranch: "main",
-      syncBranch: "sync/ai-implement",
-      changedFiles: [".github/workflows/claude-implement.yml"],
-      prNumber: 42,
-      prUrl: "https://github.com/org/app/pull/42",
-    });
-
     const res = await request("/api/mappings", "POST", "secret",
       { teamKey: "SYNCOK", owner: "org", repo: "app", defaultBranch: "main" }, token);
 
-    expect(res.statusCode).toBe(200);
+    // The save no longer waits on the sync — it returns 202 (Accepted) with a job id to poll.
+    expect(res.statusCode).toBe(202);
     const body = JSON.parse(res.body);
     expect(body.teamKey).toBe("SYNCOK");
-    expect(body.sync.ok).toBe(true);
-    expect(body.sync.result.prUrl).toBe("https://github.com/org/app/pull/42");
+    expect(typeof body.syncJobId).toBe("number");
+    expect(body.sync).toBeUndefined(); // the old inline blocking result is gone
 
     const list = JSON.parse((await request("/api/mappings", "GET", "secret", undefined, token)).body);
-    expect(list.SYNCOK).toBeDefined();
+    expect(list.SYNCOK).toBeDefined(); // mapping persisted regardless of the (background) sync outcome
   });
 
-  it("is non-fatal when sync throws: 200, sync.ok false, mapping still persisted", async () => {
+  it("manual sync-workflows returns 202 with a syncJobId", async () => {
     const token = await login("secret");
-    vi.mocked(workflowSync.syncWorkflowTemplates).mockRejectedValueOnce(new Error("App not installed"));
+    await request("/api/mappings", "POST", "secret",
+      { teamKey: "MAN", owner: "org", repo: "app", defaultBranch: "main" }, token);
 
-    const res = await request("/api/mappings", "POST", "secret",
-      { teamKey: "SYNCFAIL", owner: "org", repo: "app", defaultBranch: "main" }, token);
+    const res = await request("/api/mappings/MAN/sync-workflows", "POST", "secret", undefined, token);
+    expect(res.statusCode).toBe(202);
+    expect(typeof JSON.parse(res.body).syncJobId).toBe("number");
+  });
 
+  it("manual sync-workflows returns 404 for an unknown team", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings/NOPE/sync-workflows", "POST", "secret", undefined, token);
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+describe("sync-status endpoint", () => {
+  it("returns 401 without an auth token", async () => {
+    const res = await request("/api/mappings/ENG/sync-status/1", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 404 for an unknown job id", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings/ENG/sync-status/99999", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 404 when the job id belongs to a different team", async () => {
+    const token = await login("secret");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    // Same id, wrong team in the path -> the row-ownership guard rejects it.
+    const res = await request(`/api/mappings/OTHER/sync-status/${id}`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("reflects a completed job with its result (200, not an error status)", async () => {
+    const token = await login("secret");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "completed", {
+      result: {
+        status: "pr-opened",
+        targetRepo: "org/app",
+        baseBranch: "main",
+        syncBranch: "sync/ai-implement",
+        changedFiles: [".github/workflows/claude-implement.yml"],
+        prNumber: 42,
+        prUrl: "https://github.com/org/app/pull/42",
+      },
+    });
+
+    const res = await request(`/api/mappings/ENG/sync-status/${id}`, "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.sync.ok).toBe(false);
-    expect(body.sync.error.message).toBe("App not installed");
+    expect(JSON.parse(res.body)).toMatchObject({
+      id,
+      status: "completed",
+      result: { prUrl: "https://github.com/org/app/pull/42" },
+    });
+  });
 
-    const list = JSON.parse((await request("/api/mappings", "GET", "secret", undefined, token)).body);
-    expect(list.SYNCFAIL).toBeDefined();
+  it("reflects a failed job with its error as data (still 200)", async () => {
+    const token = await login("secret");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "failed", {
+      error: { category: "app-not-installed", message: "App not installed" },
+    });
+
+    const res = await request(`/api/mappings/ENG/sync-status/${id}`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({
+      id,
+      status: "failed",
+      error: { message: "App not installed" },
+    });
   });
 });

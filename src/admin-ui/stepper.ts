@@ -966,7 +966,7 @@ export const stepperScript = `
 
     const createBtn = document.getElementById('np-create');
     const origCreateLabel = createBtn ? createBtn.textContent : '';
-    if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Syncing...'; }
+    if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Creating...'; }
     
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
     let resData = {};
@@ -992,18 +992,12 @@ export const stepperScript = `
       }
     }
 
-    if (window.noteSyncResult) window.noteSyncResult(teamKey, resData.sync);
     closeNewProjectStepper();
     if (window.loadMappings) await window.loadMappings();
-    if (resData.sync && resData.sync.ok && !(resData.sync.result && resData.sync.result.prUrl)) {
-      if (window.flashRowSyncStatus) window.flashRowSyncStatus(teamKey, 'Up to date');
-    }
+    if (window.pollSyncStatus) window.pollSyncStatus(teamKey, resData.syncJobId);
 
-    // Project was created but some portions failed — warn but don't block
+    // Project was created but some secrets failed — warn but don't block.
     const notices = [];
-    if (resData.sync && resData.sync.ok === false) {
-      notices.push('Workflow sync did not complete: ' + ((resData.sync.error && resData.sync.error.message) || 'unknown error') + ' Retry with the Sync workflows button on the project row.');
-    }
     if (secretFailures > 0) {
       notices.push(secretFailures + ' secret(s) failed to save. Add them via the Secrets button on the Projects page.');
     }

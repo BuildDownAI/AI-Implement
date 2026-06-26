@@ -39,7 +39,7 @@ import { listCustomizations } from "./customizations.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
-import { syncWorkflowTemplates, classifySyncError, type WorkflowSyncResult, type ClassifiedSyncError } from "./workflow-sync.js";
+import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -173,12 +173,19 @@ export function handleAdminRequest(
     const workflowSyncMatch = url.match(/^\/api\/mappings\/([^/]+)\/sync-workflows$/);
     if (workflowSyncMatch && method === "POST") {
       const teamKey = decodeURIComponent(workflowSyncMatch[1]);
-      handleSyncWorkflows(res, config, teamKey).catch((err) => {
-        console.error(`[admin] workflow sync failed for ${teamKey}:`, err);
-        if (!res.headersSent) {
-          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-        }
-      });
+      handleSyncWorkflows(res, config, teamKey)
+      return true;
+    }
+
+    const syncStatusMatch = url.match(/^\/api\/mappings\/([^/]+)\/sync-status\/(\d+)$/);
+    if (syncStatusMatch && method === "GET") {
+      const teamKey = decodeURIComponent(syncStatusMatch[1]);
+      const jobId = Number.parseInt(syncStatusMatch[2], 10);
+      const job = getWorkflowSyncById(jobId);
+
+      // Require the job to belong to the team in the URL — so one team's status id can't be read via another team's path.
+      if (!job || job.teamKey !== teamKey) { json(res, 404, { error: "sync job not found" }); return true; }
+      json(res, 200, { id: job.id, status: job.status, result: job.result, error: job.error });
       return true;
     }
 
@@ -618,29 +625,22 @@ async function handlePatchMapping(
   }
 }
 
-async function handleSyncWorkflows(
+function handleSyncWorkflows(
   res: http.ServerResponse,
   config: AdminConfig,
   teamKey: string,
-): Promise<void> {
+): void {
   const mappings = getMappings();
   const mapping = mappings[teamKey];
   if (!mapping) {
     json(res, 404, { error: "Team not found" });
     return;
   }
-  try {
-    const result = await syncWorkflowTemplates({
-      mapping,
-      githubAppId: config.githubAppId,
-      githubAppPrivateKey: config.githubAppPrivateKey,
-    });
-    json(res, 200, result);
-  } catch (err) {
-    console.error(`[admin] workflow sync failed for ${teamKey}:`, err);
-    const { category, message } = classifySyncError(err);
-    json(res, 500, { error: message, category });
-  }
+  const { id } = enqueueWorkflowSync(teamKey);
+  void runWorkflowSync(id, config).catch((err) =>
+    console.error(`[admin] workflow sync failed for ${teamKey}:`, err)
+  );
+  json(res, 202, { teamKey, syncJobId: id });
 }
 
 async function handleListSecrets(
@@ -1137,22 +1137,15 @@ async function handleUpsertMapping(
     upsertMapping(body.teamKey, mapping);
     registry.invalidate();
 
-    // Auto-sync workflow templates to the target repo. Blocking but non-fatal:
-    // - the mapping is already persisted above, so a sync failure still returns 200 with the saved mapping
-    // - the categorized error rides along in `sync` for the UI to surface.
-    let sync: { ok: true; result: WorkflowSyncResult } | { ok: false; error: ClassifiedSyncError };
-    try {
-      const result = await syncWorkflowTemplates({
-        mapping,
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
-      });
-      sync = { ok: true, result };
-    } catch (err) {
-      console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err);
-      sync = { ok: false, error: classifySyncError(err) };
-    }
-    json(res, 200, { teamKey: body.teamKey, ...mapping, sync });
+    // Kick the workflow sync off in the background and return immediately
+    // - the client polls GET /api/mappings/:teamKey/sync-status/:id for the outcome
+    // - the mapping is already persisted above, so the save itself succeeds regardless of how the sync resolves
+    const { id } = enqueueWorkflowSync(body.teamKey);
+    void runWorkflowSync(id, config).catch((err) =>
+      console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
+    );
+
+    json(res, 202, { teamKey: body.teamKey, ...mapping, syncJobId: id });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
