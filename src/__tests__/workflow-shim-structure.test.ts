@@ -200,11 +200,18 @@ describe("GHA workflow shims", () => {
     });
   }
 
-  it("comment trigger only runs implementation for an exact trimmed /ai-implement command", () => {
+  it("comment trigger fires on a /ai-implement prefix and passes the remainder as an instruction", () => {
     const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
+    // Anchored prefix match — not a `contains()` check and not exact-equality.
     expect(yaml).not.toMatch(/contains\([^)]*\/ai-implement/);
-    expect(yaml).toMatch(/body\.trim\(\) === "\/ai-implement"/);
+    expect(yaml).not.toMatch(/body\.trim\(\) === "\/ai-implement"/);
+    expect(yaml).toContain("/^\\/ai-implement(?:\\s+([\\s\\S]*))?$/");
     expect(yaml).toMatch(/if:\s*needs\.check-trigger\.outputs\.matched == 'true'/);
+    // Remainder is base64-encoded and plumbed through to the runner.
+    expect(yaml).toContain('Buffer.from(instruction, "utf-8").toString("base64")');
+    expect(yaml).toMatch(/comment_instruction:\s*\$\{\{\s*steps\.trigger\.outputs\.comment_instruction\s*\}\}/);
+    expect(yaml).toMatch(/COMMENT_INSTRUCTION_B64:\s*\$\{\{\s*needs\.check-trigger\.outputs\.comment_instruction\s*\}\}/);
+    expect(yaml).toContain('export AI_IMPLEMENT_COMMENT_INSTRUCTION=$(echo "$COMMENT_INSTRUCTION_B64" | base64 -d)');
   });
 
   it("comment trigger allows maintainers and preserves the intended missing metadata error", () => {
