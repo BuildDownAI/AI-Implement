@@ -26,12 +26,12 @@ import {
 } from "./runner-mode.js";
 import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
+import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { selectBlockers } from "./poll-selection.js";
+import { selectBlockers, countInProgressByTeam } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
@@ -380,18 +380,13 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
   if (providers.length === 0) {
-    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {} };
+    return { needsPlanning: [], readyForImplementation: [], inProgress: [] };
   }
   const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
   return {
     needsPlanning: snapshots.flatMap((s) => s.needsPlanning),
     readyForImplementation: snapshots.flatMap((s) => s.readyForImplementation),
-    inProgressCountsByScope: snapshots.reduce<Record<string, number>>((acc, s) => {
-      for (const [k, v] of Object.entries(s.inProgressCountsByScope)) {
-        acc[k] = (acc[k] ?? 0) + v;
-      }
-      return acc;
-    }, {}),
+    inProgress: snapshots.flatMap((s) => s.inProgress),
   };
 }
 
@@ -404,10 +399,13 @@ async function handleListBlockers(
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
+    // Gate the capacity count by live in-flight jobs, mirroring the poll loop,
+    // so issues stranded in Planning/Implementing don't show a phantom cap.
+    const inFlight = getInFlightIssueIds();
     const blockers = selectBlockers(
       allIssues,
       teamRepoMap,
-      snapshot.inProgressCountsByScope,
+      countInProgressByTeam(snapshot.inProgress, (id) => inFlight.has(id)),
       (id) => dispatchedSet.has(id),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
@@ -432,9 +430,10 @@ async function handleListIssues(
       ...snapshot.readyForImplementation.map((i) => shapeIssue(i, "ready")),
       ...snapshot.needsPlanning.map((i) => shapeIssue(i, "needs-planning")),
     ].sort((a, b) => a.identifier.localeCompare(b.identifier));
+    const inFlight = getInFlightIssueIds();
     json(res, 200, {
       issues,
-      inProgressCountsByTeam: snapshot.inProgressCountsByScope,
+      inProgressCountsByTeam: countInProgressByTeam(snapshot.inProgress, (id) => inFlight.has(id)),
     });
   } catch (err) {
     json(res, 502, { error: err instanceof Error ? err.message : String(err) });

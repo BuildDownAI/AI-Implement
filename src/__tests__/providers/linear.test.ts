@@ -226,7 +226,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
 
     expect(snap.readyForImplementation.map((i) => i.id)).toEqual(["a"]);
     expect(snap.needsPlanning.map((i) => i.id)).toEqual(["b"]);
-    expect(snap.inProgressCountsByScope).toEqual({});
+    expect(snap.inProgress).toEqual([]);
     expect(snap.readyForImplementation[0].scopeKey).toBe("ENG");
     expect(snap.readyForImplementation[0].nativeStatus).toBe("Todo (unstarted)");
   });
@@ -349,7 +349,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     });
   });
 
-  it("counts AI-Working / AI-Planning issues by scope and excludes them from buckets", async () => {
+  it("reports AI-Working / AI-Planning issues as in-progress (with phase) and excludes them from buckets", async () => {
     mockSinglePage([
       makeIssue({ id: "a", teamKey: "T1", labels: ["AI-Implement", "AI-Working"] }),
       makeIssue({ id: "b", teamKey: "T2", labels: ["AI-Implement", "AI-Planning"] }),
@@ -358,7 +358,10 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     const p = new LinearProvider({ linearApiKey: "k" });
     const snap = await p.fetchAIImplementSnapshot();
 
-    expect(snap.inProgressCountsByScope).toEqual({ T1: 1, T2: 1 });
+    expect(snap.inProgress).toEqual([
+      { issueId: "a", scopeKey: "T1", phase: "implementing" },
+      { issueId: "b", scopeKey: "T2", phase: "planning" },
+    ]);
     expect(snap.needsPlanning).toEqual([]);
     expect(snap.readyForImplementation).toEqual([]);
   });
@@ -374,7 +377,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
 
     expect(snap.needsPlanning.map((i) => i.id)).toEqual(["b"]);
     expect(snap.readyForImplementation).toEqual([]);
-    expect(snap.inProgressCountsByScope).toEqual({});
+    expect(snap.inProgress).toEqual([]);
   });
 
   it("skips issues blocked by an open issue, includes ones whose blocker is completed", async () => {

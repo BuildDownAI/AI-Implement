@@ -1,5 +1,29 @@
 import type { RepoMapping } from "./config.js";
-import type { TicketIssue } from "./providers/types.js";
+import type { InProgressIssue, TicketIssue } from "./providers/types.js";
+
+/**
+ * Collapse the provider-reported in-progress issues into a per-team count,
+ * keeping only those the orchestrator still has a live job for (`isLive`).
+ *
+ * The providers report a slot as occupied purely from ticket state (Jira
+ * Planning/Implementing status, Linear AI-Planning/AI-Working labels). A run
+ * that ends without a clean terminal transition strands the ticket in that
+ * state, where it would otherwise consume a concurrency slot forever. Gating by
+ * the orchestrator's in-flight set means only issues *both* sides agree are
+ * active count toward the cap — robust to a stale ticket (not live → dropped)
+ * and a stale local job (not in the ticket query → dropped).
+ */
+export function countInProgressByTeam(
+  inProgress: InProgressIssue[],
+  isLive: (issueId: string) => boolean,
+): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const ip of inProgress) {
+    if (!isLive(ip.issueId)) continue;
+    counts[ip.scopeKey] = (counts[ip.scopeKey] ?? 0) + 1;
+  }
+  return counts;
+}
 
 export interface Blocker {
   issueId: string;

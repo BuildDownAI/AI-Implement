@@ -1,6 +1,7 @@
 import type {
   AIImplementSnapshot,
   FeatureNodeRollUp,
+  InProgressIssue,
   IssueLifecycleState,
   ProviderConfig,
   TicketIssue,
@@ -135,7 +136,7 @@ export class JiraProvider implements TicketingProvider {
 
     const needsPlanning: TicketIssue[] = [];
     const readyForImplementation: TicketIssue[] = [];
-    const inProgressCountsByScope: Record<string, number> = {};
+    const inProgress: InProgressIssue[] = [];
 
     for (const [scopeKey, m] of jiraEntries) {
       if (m.ticketingConfig.kind !== "jira") continue;
@@ -177,12 +178,23 @@ export class JiraProvider implements TicketingProvider {
         // else: orchestrator picked it up between query and our processing; skip.
       }
 
+      // Fetch the in-progress issues' IDs and status (not just a count) so the
+      // orchestrator can cross-check each against its live jobs and reset any
+      // that are stranded in Planning/Implementing with no run behind them.
       const capacityJql = `(${cfg.jql}) AND ${statusJqlField} in (Planning, Implementing)`;
-      const capacityIssues = await this.client.searchJql(capacityJql, ["summary"]);
-      inProgressCountsByScope[scopeKey] = capacityIssues.length;
+      const capacityIssues = await this.client.searchJql(capacityJql, [fieldIds.statusFieldId]);
+      for (const raw of capacityIssues) {
+        const statusValue =
+          (raw.fields[fieldIds.statusFieldId] as { value?: string } | null)?.value ?? "";
+        inProgress.push({
+          issueId: raw.id,
+          scopeKey,
+          phase: statusValue === STATUS_VALUES.PLANNING ? "planning" : "implementing",
+        });
+      }
     }
 
-    return { needsPlanning, readyForImplementation, inProgressCountsByScope };
+    return { needsPlanning, readyForImplementation, inProgress };
   }
 
   private toTicketIssue(

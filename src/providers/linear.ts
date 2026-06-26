@@ -247,16 +247,22 @@ export class LinearProvider implements TicketingProvider {
       }
     } while (cursor !== null);
 
-    const inProgressCountsByScope: Record<string, number> = {};
+    const inProgress: AIImplementSnapshot["inProgress"] = [];
     const needsPlanning: AIImplementSnapshot["needsPlanning"] = [];
     const readyForImplementation: AIImplementSnapshot["readyForImplementation"] = [];
 
     for (const issue of allNodes) {
       const labelNames = new Set(issue.labels?.nodes?.map((l) => l.name) ?? []);
 
-      // AI-Working or AI-Planning = slot is occupied; count against capacity
+      // AI-Working or AI-Planning = slot is occupied; count against capacity.
+      // Record the issue identity + phase so the orchestrator can detect a slot
+      // stranded with no live job behind it (AI-Planning → planning).
       if (labelNames.has("AI-Working") || labelNames.has("AI-Planning")) {
-        inProgressCountsByScope[issue.team.key] = (inProgressCountsByScope[issue.team.key] ?? 0) + 1;
+        inProgress.push({
+          issueId: issue.id,
+          scopeKey: issue.team.key,
+          phase: labelNames.has("AI-Working") ? "implementing" : "planning",
+        });
         continue;
       }
 
@@ -327,7 +333,7 @@ export class LinearProvider implements TicketingProvider {
       }
     }
 
-    return { needsPlanning, readyForImplementation, inProgressCountsByScope };
+    return { needsPlanning, readyForImplementation, inProgress };
   }
 
   async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {

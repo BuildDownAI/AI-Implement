@@ -1244,10 +1244,19 @@ describe("admin issues endpoint", () => {
       scopeKey: "CORE",
       nativeStatus: "Backlog (backlog)",
     };
+    // Two issues sit in-progress; both have live in-flight jobs, so the gated
+    // count is 2. A third in-progress issue with NO job is stranded and must be
+    // excluded — proving the count is gated by the orchestrator's in-flight set.
+    log.appendLog({ issueId: "core-a", issueIdentifier: "CORE-1", issueTitle: "", teamKey: "CORE", repo: "o/r" });
+    log.appendLog({ issueId: "core-b", issueIdentifier: "CORE-2", issueTitle: "", teamKey: "CORE", repo: "o/r" });
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [ready],
       needsPlanning: [needsPlan],
-      inProgressCountsByScope: { CORE: 2 },
+      inProgress: [
+        { issueId: "core-a", scopeKey: "CORE", phase: "implementing" },
+        { issueId: "core-b", scopeKey: "CORE", phase: "implementing" },
+        { issueId: "core-stranded", scopeKey: "CORE", phase: "implementing" },
+      ],
     });
     const token = await login("secret");
     const res = await request("/api/issues", "GET", "secret", undefined, token);
@@ -1343,7 +1352,7 @@ describe("admin blockers endpoint", () => {
     vi.spyOn(provider, "fetchAIImplementSnapshot").mockResolvedValueOnce({
       readyForImplementation: [issue],
       needsPlanning: [],
-      inProgressCountsByScope: {},
+      inProgress: [],
     });
     const token = await login("secret");
     // No mapping for CORE team → should produce a no-mapping blocker

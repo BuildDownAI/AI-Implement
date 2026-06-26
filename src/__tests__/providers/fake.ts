@@ -68,15 +68,15 @@ export class FakeProvider implements TicketingProvider {
     await this.tick("fetchAIImplementSnapshot", []);
     const needsPlanning: TicketIssue[] = [];
     const readyForImplementation: TicketIssue[] = [];
-    const inProgressCountsByScope: Record<string, number> = {};
+    const inProgress: AIImplementSnapshot["inProgress"] = [];
     for (const { issue, phase } of this.issues.values()) {
       if (phase === "needs_planning") needsPlanning.push(issue);
       else if (phase === "plan_complete") readyForImplementation.push(issue);
       if (phase === "planning" || phase === "implementing") {
-        inProgressCountsByScope[issue.scopeKey] = (inProgressCountsByScope[issue.scopeKey] ?? 0) + 1;
+        inProgress.push({ issueId: issue.id, scopeKey: issue.scopeKey, phase });
       }
     }
-    return { needsPlanning, readyForImplementation, inProgressCountsByScope };
+    return { needsPlanning, readyForImplementation, inProgress };
   }
 
   async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {

@@ -9,7 +9,8 @@ import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { selectIssuesToDispatch } from "./poll-selection.js";
+import { selectIssuesToDispatch, countInProgressByTeam } from "./poll-selection.js";
+import { resetStrandedIssues } from "./stranded-reset.js";
 import { notify, notifyCompletion } from "./notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
@@ -222,13 +223,20 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
     const needsPlanning = snapshots.flatMap((s) => s.needsPlanning);
     const readyForImplementation = snapshots.flatMap((s) => s.readyForImplementation);
-    const inProgressCountsByScope = snapshots.reduce<Record<string, number>>((acc, s) => {
-      for (const [k, v] of Object.entries(s.inProgressCountsByScope)) {
-        acc[k] = (acc[k] ?? 0) + v;
-      }
-      return acc;
-    }, {});
-    const inProgressCountsByTeam = inProgressCountsByScope;
+
+    // Reset issues stranded in Planning/Implementing with no live job behind
+    // them (e.g. a run that died before its terminal callback), then gate the
+    // capacity count by the orchestrator's in-flight set so phantom slots don't
+    // block dispatch. Runs before selection so freed slots are usable this poll.
+    const inFlightIssueIds = getInFlightIssueIds();
+    await resetStrandedIssues(snapshots, providers, {
+      isLive: (id) => inFlightIssueIds.has(id),
+      isDispatched: (id) => isAlreadyDispatched(id),
+    });
+    const inProgressCountsByTeam = countInProgressByTeam(
+      snapshots.flatMap((s) => s.inProgress),
+      (id) => inFlightIssueIds.has(id),
+    );
     console.log(`[poll] Found ${needsPlanning.length} needing planning, ${readyForImplementation.length} ready for implementation`);
 
     // Build the dispatch view of mappings: hide paused ones so the poller
@@ -279,7 +287,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const allCandidates = [...readyForImplementation, ...needsPlanning];
     const needsPlanningIds = new Set(needsPlanning.map((i) => i.id));
 
-    const inFlightIssueIds = getInFlightIssueIds();
+    // Reuses inFlightIssueIds captured above — no dispatch happens in between,
+    // so the in-flight set is unchanged.
     const isDispatchBlocked = (issueId: string) =>
       isAlreadyDispatched(issueId) || inFlightIssueIds.has(issueId);
 

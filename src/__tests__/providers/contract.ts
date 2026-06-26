@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
 import type { TicketIssue, TicketingProvider } from "../../providers/types.js";
+import { countInProgressByTeam } from "../../poll-selection.js";
+
+/** Raw per-scope in-progress counts (no in-flight gating) for contract assertions. */
+const countByScope = (snap: { inProgress: Parameters<typeof countInProgressByTeam>[0] }) =>
+  countInProgressByTeam(snap.inProgress, () => true);
 
 export interface ContractFactoryArgs {
   /** Pre-populate the provider's view of the world with these issues. */
@@ -44,7 +49,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         await provider.markImplementing("b", "TEAM_A");
         await provider.markImplementing("c", "TEAM_B");
         const snap = await provider.fetchAIImplementSnapshot();
-        expect(snap.inProgressCountsByScope).toEqual({ TEAM_A: 2, TEAM_B: 1 });
+        expect(countByScope(snap)).toEqual({ TEAM_A: 2, TEAM_B: 1 });
       });
     });
 
@@ -67,7 +72,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         await provider.markPlanningStarted("a", "TEAM");
         await provider.markPlanningStarted("a", "TEAM");
         const snap = await provider.fetchAIImplementSnapshot();
-        expect(snap.inProgressCountsByScope.TEAM).toBe(1);
+        expect(countByScope(snap).TEAM).toBe(1);
       });
 
       it("markImplementing twice does not double-apply state", async () => {
@@ -76,7 +81,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         await provider.markImplementing("a", "TEAM");
         await provider.markImplementing("a", "TEAM");
         const snap = await provider.fetchAIImplementSnapshot();
-        expect(snap.inProgressCountsByScope.TEAM).toBe(1);
+        expect(countByScope(snap).TEAM).toBe(1);
       });
     });
 
@@ -95,7 +100,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         await provider.markImplementing("a", "TEAM");
         await provider.clearWorkingState("a");
         const snap = await provider.fetchAIImplementSnapshot();
-        expect(snap.inProgressCountsByScope.TEAM ?? 0).toBe(0);
+        expect((countByScope(snap).TEAM ?? 0)).toBe(0);
       });
     });
 
@@ -109,7 +114,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
           provider.markPlanningStarted("b", "TEAM"),
         ]);
         const snap = await provider.fetchAIImplementSnapshot();
-        expect(snap.inProgressCountsByScope.TEAM).toBe(2);
+        expect(countByScope(snap).TEAM).toBe(2);
       });
     });
 

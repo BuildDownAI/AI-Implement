@@ -347,7 +347,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
 
     expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-1"]);
     expect(snap.readyForImplementation.map((i) => i.identifier)).toEqual(["P-2"]);
-    expect(snap.inProgressCountsByScope).toEqual({ "acme/x": 0 });
+    expect(snap.inProgress).toEqual([]);
     expect(snap.readyForImplementation[0].description).toBe("desc");
     expect(snap.needsPlanning[0].nativeStatus).toBe("Ready");
     expect(snap.needsPlanning[0].scopeKey).toBe("acme/x");
@@ -400,7 +400,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     expect(capacityBody.jql).toContain("status in (Planning");
   });
 
-  it("counts capacity from the in-flight query", async () => {
+  it("reports in-progress issues (id + phase) from the in-flight query", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
       .mockResolvedValueOnce(searchOk([]))
@@ -417,7 +417,11 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     });
     const snap = await p.fetchAIImplementSnapshot();
 
-    expect(snap.inProgressCountsByScope).toEqual({ "acme/x": 3 });
+    expect(snap.inProgress).toEqual([
+      { issueId: "20001", scopeKey: "acme/x", phase: "planning" },
+      { issueId: "20002", scopeKey: "acme/x", phase: "implementing" },
+      { issueId: "20003", scopeKey: "acme/x", phase: "planning" },
+    ]);
     expect(snap.needsPlanning).toEqual([]);
     expect(snap.readyForImplementation).toEqual([]);
   });
