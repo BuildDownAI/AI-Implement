@@ -102,7 +102,18 @@ Modify files only in the current checkout and leave the working tree changes uns
 The AI-Implement pipeline will create the implementation commit, push an issue-scoped branch, and open the PR after review passes.`;
 }
 
+function appendOperatorInstruction(prompt: string, instruction: string | null): string {
+  if (!instruction) return prompt;
+  return `${prompt.trimEnd()}
 
+## Operator instruction for this run (authoritative)
+
+The operator triggered this run with the instruction below. Treat it as the authoritative
+directive for this run: if it conflicts with the default gap-fill behavior above, follow
+this instruction.
+
+${instruction}`;
+}
 
 export function resolveLogLevel(raw: string | undefined): LogLevel {
   return raw === "stream" ? "stream" : "summary";
@@ -120,6 +131,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
   const branch = resolveBranch(workspaceDir);
   const prNumber = process.env.PR_NUMBER ?? "";
+  const commentInstruction = optionalEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION");
   const runnerPhase = resolveRunnerPhase(process.env.RUNNER_PHASE, prNumber);
 
   const callbackUrl = optionalEnv("RUNNER_CALLBACK_URL");
@@ -170,6 +182,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
   implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
+  implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
   const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
   const provider = process.env.PROVIDER || "anthropic";
   const parseEnvInt = (raw: string | undefined, name: string): number | undefined => {

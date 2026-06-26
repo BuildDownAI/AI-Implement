@@ -64,6 +64,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
     vi.stubEnv("GITHUB_REF_NAME", "");
     vi.stubEnv("PR_NUMBER", "");
+    vi.stubEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION", "");
   });
 
   afterEach(() => {
@@ -253,6 +254,33 @@ describe("runAutonomous", () => {
 
     expect(capturedPrompt).toContain("Gap-fill run");
     expect(capturedPrompt).not.toContain("Pipeline-owned Git and PR handling");
+    expect(capturedPrompt).not.toContain("Operator instruction for this run");
+  });
+
+  it("threads a non-empty operator instruction into the gap-fill prompt as an authoritative block", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION", "fix the implementation, do NOT weaken the test");
+
+    let capturedPrompt: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedPrompt = ctx.data.implementationPrompt;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-prompt", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedPrompt).toContain("Operator instruction for this run (authoritative)");
+    expect(capturedPrompt).toContain("fix the implementation, do NOT weaken the test");
+    expect(capturedPrompt).toContain("Gap-fill run");
   });
 
   it("does not duplicate pipeline-owned git instructions from custom prompts", async () => {
