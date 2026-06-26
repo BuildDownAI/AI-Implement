@@ -35,6 +35,7 @@ import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
+import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
@@ -361,6 +362,11 @@ export function handleAdminRequest(
         runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),
         gapFillTrigger: !!process.env.GAP_FILL_TRIGGER_SECRET,
       });
+      return true;
+    }
+
+    if (url.startsWith("/api/admin/github-install-state") && method === "GET") {
+      handleGithubInstallState(req, res, config);
       return true;
     }
 
@@ -1229,6 +1235,32 @@ async function handleListJiraFieldOptions(
       json(res, 200, []);
       return;
     }
+    json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleGithubInstallState(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  const query = new URL(req.url ?? "", "http://localhost").searchParams;
+  const owner = query.get("owner");
+  const repo = query.get("repo");
+  if (!owner || !repo) {
+    json(res, 400, { error: "owner and repo query params are required" });
+    return;
+  }
+  try {
+    const result = await probeInstallState({
+      appId: config.githubAppId,
+      privateKey: config.githubAppPrivateKey,
+      owner,
+      repo,
+    });
+    json(res, 200, result);
+  } catch (err) {
+    console.error(`[admin] install-state probe failed for ${owner}/${repo}:`, err);
     json(res, 500, { error: err instanceof Error ? err.message : String(err) });
   }
 }

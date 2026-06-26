@@ -9,7 +9,7 @@ import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as StepLogModule from "../step-log.js";
-import type * as WorkflowSyncModule from "../workflow-sync.js";
+import type * as InstallStateModule from "../github-install-state.js";
 import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketIssue } from "../providers/types.js";
@@ -21,6 +21,10 @@ vi.mock("../workflow-sync.js", () => ({
     category: "unknown",
     message: err instanceof Error ? err.message : String(err),
   }),
+}));
+
+vi.mock("../github-install-state.js", () => ({
+  probeInstallState: vi.fn(),
 }));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
@@ -74,7 +78,7 @@ let dedup: typeof DedupModule;
 let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let stepLog: typeof StepLogModule;
-let workflowSync: typeof WorkflowSyncModule;
+let installState: typeof InstallStateModule;
 let queue: typeof WorkflowSyncQueueModule;
 let provider: FakeProvider;
 
@@ -89,7 +93,7 @@ beforeEach(async () => {
   runnerMode = await import("../runner-mode.js");
   log = await import("../log.js");
   stepLog = await import("../step-log.js");
-  workflowSync = await import("../workflow-sync.js");
+  installState = await import("../github-install-state.js");
   queue = await import("../workflow-sync-queue.js");
   config.initMappingsTable();
   log.initLogTable();
@@ -1553,5 +1557,35 @@ describe("sync-status endpoint", () => {
       status: "failed",
       error: { message: "App not installed" },
     });
+  });
+});
+
+describe("github-install-state endpoint", () => {
+  it("returns 401 without an auth token", async () => {
+    const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 400 when owner or repo is missing", async () => {
+    const token = await login("secret");
+    const res = await request("/api/admin/github-install-state?owner=acme", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 200 with the probe result", async () => {
+    const token = await login("secret");
+    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready", installationId: 7 });
+
+    const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ state: "ready", installationId: 7 });
+  });
+
+  it("returns 500 when the probe throws (e.g. a rethrown credential error)", async () => {
+    const token = await login("secret");
+    vi.mocked(installState.probeInstallState).mockRejectedValueOnce(new Error("bad jwt"));
+
+    const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(500);
   });
 });

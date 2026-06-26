@@ -80,7 +80,11 @@ export const stepperHtml = `
           <div class="alert-icon">&#8505;</div>
           <div style="flex:1">
             <div class="alert-title">GitHub App required</div>
-            <div class="alert-desc">Make sure the AI-Implement GitHub App is installed on the target repository before creating this project.</div>
+            <div class="alert-desc">The AI-Implement GitHub App must be installed on the target repo before it can sync. Enter the owner and repo, then check the installation.</div>
+            <div id="np-install-state" style="margin-top:10px;font-size:12px"></div>
+            <div class="alert-actions" style="margin-top:10px">
+              <button type="button" class="btn btn-sm" id="np-install-check" onclick="checkInstallState()">Check installation</button>
+            </div>
           </div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
@@ -482,9 +486,63 @@ export const stepperScript = `
       const ow = (document.getElementById('np-owner') || {}).value || '';
       const rp = (document.getElementById('np-repo') || {}).value || '';
       if (!ow.trim() || !rp.trim()) ok = false;
+      resetInstallState();
     }
     if (ok) nextBtn.removeAttribute('disabled');
     else nextBtn.setAttribute('disabled', '');
+  }
+
+  async function checkInstallState() {
+    const owner = ((document.getElementById('np-owner') || {}).value || '').trim();
+    const repo = ((document.getElementById('np-repo') || {}).value || '').trim();
+    const out = document.getElementById('np-install-state');
+    const btn = document.getElementById('np-install-check');
+    if (!out || !btn) return;
+    if (!owner || !repo) {
+      out.innerHTML = '<span style="color:var(--fg-tertiary)">Enter owner and repo first.</span>';
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    out.innerHTML = '';
+    try {
+      const res = await window.api('/api/admin/github-install-state?owner=' + encodeURIComponent(owner) + '&repo=' + encodeURIComponent(repo));
+      const data = await res.json();
+      if (!res.ok) {
+        out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check: ' + window.esc(data.error || 'unknown error') + '</span>';
+        return;
+      }
+      out.innerHTML = renderInstallState(data);
+    } catch (_) {
+      out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check installation.</span>';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Re-check';
+    }
+  }
+  
+  function renderInstallState(data) {
+    const state = data.state;
+    if (state === 'ready') {
+      return '<span class="badge success">Ready</span> The App is installed and can access this repo.';
+    }
+    if (state === 'app-not-installed') {
+      return '<span class="badge warn">Action needed</span> The App is not installed on this owner. '
+        + '<a class="text-accent" href="' + window.esc(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Install the App &#8599;</a> then Re-check.';
+    }
+    if (state === 'repo-not-selected') {
+      return '<span class="badge warn">Action needed</span> The App is installed, but this repo is not in its selected repositories. '
+      + '<a class="text-accent" href="' + window.esc(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Add this repo &#8599;</a> then Re-check.';
+    }
+    return '';
+  }
+
+  // Clears a stale probe result when owner/repo change, so a "Ready" for the old repo can't linger.
+  function resetInstallState() {
+    const out = document.getElementById('np-install-state');
+    const btn = document.getElementById('np-install-check');
+    if (out) out.innerHTML = '';
+    if (btn) btn.textContent = 'Check installation';
   }
 
   function stepperBack() {
@@ -1020,5 +1078,6 @@ export const stepperScript = `
   window.onStepperRepoFieldChange = onStepperRepoFieldChange;
   window.stepperValidateJql = stepperValidateJql;
   window.updateStepperNextButton = updateStepperNextButton;
+  window.checkInstallState = checkInstallState;
 })();
 `;
