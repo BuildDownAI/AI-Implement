@@ -186,7 +186,7 @@ export const projectsHtml = `
       <div id="md-error" class="error hidden" style="margin-bottom:8px"></div>
       <div style="display:flex;gap:8px;justify-content:flex-end">
         <button class="btn btn-ghost" onclick="closeMappingDialog()">Cancel</button>
-        <button class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
+        <button id="md-save" class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
       </div>
     </div>
   </dialog>
@@ -199,6 +199,30 @@ export const projectsScript = `
   let currentSecretsTeam = null;
   let pendingJiraRepoFieldValue = '';
   let jiraFieldsLoaded = false;
+
+  // Ephemeral, in-memory record of the most recent auto-sync result per team
+  // - written when a mapping is created/edited AND syncing was successful
+  // - cleared on page refresh, so the row reverts to the normal button.
+  let recentSync = {};
+  window.noteSyncResult = function (teamKey, sync) {
+    if (sync && sync.ok && sync.result && sync.result.prUrl) {
+      recentSync[teamKey] = { prUrl: sync.result.prUrl, status: sync.result.status };
+    }
+  };
+  // Transiently label a project row's Sync button (mirrors the manual button's label-then-revert),
+  // - used after a create/edit that returned up-to-date (i.e. no PR to link to)
+  window.flashRowSyncStatus = function (teamKey, label) {
+    const buttons = document.querySelectorAll('#mappings-body button[data-sync-btn]');
+    for (const btn of buttons) {
+      if (btn.dataset.key !== teamKey) continue;
+      const original = btn.textContent;
+      btn.textContent = label;
+      btn.disabled = true;
+      setTimeout(function () { btn.textContent = original; btn.disabled = false; }, 4000);
+      break;
+    }
+  };
+
 
   async function loadMappings() {
     const res = await window.api('/api/mappings');
@@ -215,6 +239,10 @@ export const projectsScript = `
     for (const [key, m] of Object.entries(mappingsData)) {
       const tr = document.createElement('tr');
       const ek = window.esc(key);
+      const recent = recentSync[key];
+      const syncCell = (recent && recent.prUrl)
+        ? '<a class="btn btn-sm btn-ghost" href="' + window.esc(recent.prUrl) + '" target="_blank" rel="noopener noreferrer" title="Workflow sync PR (just created)">Workflows synced — PR opened &#8599;</a> '
+        : '<button class="btn btn-sm btn-ghost" data-sync-btn data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> ';
       const execBadge = m.executionMode === 'fly-machines'
         ? '<span class="badge info">fly</span>'
         : '<span class="badge neutral">gha</span>';
@@ -240,7 +268,7 @@ export const projectsScript = `
           + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
           + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
           + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
-          + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> '
+          + syncCell
           + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
         + '</td>';
       tbody.appendChild(tr);
@@ -624,15 +652,30 @@ export const projectsScript = `
       return;
     }
 
+    const saveBtn = document.getElementById('md-save');
+    const origSaveLabel = saveBtn ? saveBtn.textContent : '';
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Syncing...'; }
+
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
+    let data = {};
+    try { data = await res.json(); } catch (_) {}
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = origSaveLabel; }
     if (!res.ok) {
-      const msg = await res.text().catch(() => 'Unknown error');
-      errEl.textContent = 'Server error: ' + msg;
+      errEl.textContent = 'Server error: ' + (data.error || 'Unknown error');
       errEl.classList.remove('hidden');
       return;
     }
+    if (window.noteSyncResult) window.noteSyncResult(teamKey, data.sync);
     closeMappingDialog();
     await loadMappings();
+    if (data.sync && data.sync.ok && !(data.sync.result && data.sync.result.prUrl)) {
+      if (window.flashRowSyncStatus) window.flashRowSyncStatus(teamKey, 'Up to date');
+    }
+    if (data.sync && data.sync.ok === false) {
+      setTimeout(function () {
+        alert('Mapping saved, but workflow sync did not complete: ' + ((data.sync.error && data.sync.error.message) || 'unknown error') + ' Retry with the Sync workflows button on the project row.');
+      }, 100);
+    }
   }
   window.saveMappingDialog = saveMappingDialog;
 

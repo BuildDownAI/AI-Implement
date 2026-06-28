@@ -39,7 +39,7 @@ import { listCustomizations } from "./customizations.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
-import { syncWorkflowTemplates } from "./workflow-sync.js";
+import { syncWorkflowTemplates, classifySyncError, type WorkflowSyncResult, type ClassifiedSyncError } from "./workflow-sync.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -166,7 +166,7 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/mappings" && method === "POST") {
-      handleUpsertMapping(req, res, registry);
+      handleUpsertMapping(req, res, config, registry);
       return true;
     }
 
@@ -629,12 +629,18 @@ async function handleSyncWorkflows(
     json(res, 404, { error: "Team not found" });
     return;
   }
-  const result = await syncWorkflowTemplates({
-    mapping,
-    githubAppId: config.githubAppId,
-    githubAppPrivateKey: config.githubAppPrivateKey,
-  });
-  json(res, 200, result);
+  try {
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+    });
+    json(res, 200, result);
+  } catch (err) {
+    console.error(`[admin] workflow sync failed for ${teamKey}:`, err);
+    const { category, message } = classifySyncError(err);
+    json(res, 500, { error: message, category });
+  }
 }
 
 async function handleListSecrets(
@@ -941,6 +947,7 @@ async function handleUnsetGlobalSecret(
 async function handleUpsertMapping(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  config: AdminConfig,
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
@@ -1129,7 +1136,23 @@ async function handleUpsertMapping(
 
     upsertMapping(body.teamKey, mapping);
     registry.invalidate();
-    json(res, 200, { teamKey: body.teamKey, ...mapping });
+
+    // Auto-sync workflow templates to the target repo. Blocking but non-fatal:
+    // - the mapping is already persisted above, so a sync failure still returns 200 with the saved mapping
+    // - the categorized error rides along in `sync` for the UI to surface.
+    let sync: { ok: true; result: WorkflowSyncResult } | { ok: false; error: ClassifiedSyncError };
+    try {
+      const result = await syncWorkflowTemplates({
+        mapping,
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+      });
+      sync = { ok: true, result };
+    } catch (err) {
+      console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err);
+      sync = { ok: false, error: classifySyncError(err) };
+    }
+    json(res, 200, { teamKey: body.teamKey, ...mapping, sync });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }

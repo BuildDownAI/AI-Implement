@@ -9,9 +9,18 @@ import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as StepLogModule from "../step-log.js";
+import type * as WorkflowSyncModule from "../workflow-sync.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketIssue } from "../providers/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
+
+vi.mock("../workflow-sync.js", () => ({
+  syncWorkflowTemplates: vi.fn(),
+  classifySyncError: (err: unknown) => ({
+    category: "unknown",
+    message: err instanceof Error ? err.message : String(err),
+  }),
+}));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
@@ -64,6 +73,7 @@ let dedup: typeof DedupModule;
 let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let stepLog: typeof StepLogModule;
+let workflowSync: typeof WorkflowSyncModule;
 let provider: FakeProvider;
 
 beforeEach(async () => {
@@ -77,6 +87,7 @@ beforeEach(async () => {
   runnerMode = await import("../runner-mode.js");
   log = await import("../log.js");
   stepLog = await import("../step-log.js");
+  workflowSync = await import("../workflow-sync.js");
   config.initMappingsTable();
   log.initLogTable();
   stepLog.initStepLogTable();
@@ -1444,5 +1455,48 @@ describe("classifyTemplate", () => {
       Do NOT post to Linear directly.
     `;
     expect(classifyTemplate(body)).toBe("current");
+  });
+});
+
+describe("auto-sync on mapping upsert", () => {
+  it("returns sync.ok with the result on success and persists the mapping", async () => {
+    const token = await login("secret");
+    vi.mocked(workflowSync.syncWorkflowTemplates).mockResolvedValueOnce({
+      status: "pr-opened",
+      targetRepo: "org/app",
+      baseBranch: "main",
+      syncBranch: "sync/ai-implement",
+      changedFiles: [".github/workflows/claude-implement.yml"],
+      prNumber: 42,
+      prUrl: "https://github.com/org/app/pull/42",
+    });
+
+    const res = await request("/api/mappings", "POST", "secret",
+      { teamKey: "SYNCOK", owner: "org", repo: "app", defaultBranch: "main" }, token);
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.teamKey).toBe("SYNCOK");
+    expect(body.sync.ok).toBe(true);
+    expect(body.sync.result.prUrl).toBe("https://github.com/org/app/pull/42");
+
+    const list = JSON.parse((await request("/api/mappings", "GET", "secret", undefined, token)).body);
+    expect(list.SYNCOK).toBeDefined();
+  });
+
+  it("is non-fatal when sync throws: 200, sync.ok false, mapping still persisted", async () => {
+    const token = await login("secret");
+    vi.mocked(workflowSync.syncWorkflowTemplates).mockRejectedValueOnce(new Error("App not installed"));
+
+    const res = await request("/api/mappings", "POST", "secret",
+      { teamKey: "SYNCFAIL", owner: "org", repo: "app", defaultBranch: "main" }, token);
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.sync.ok).toBe(false);
+    expect(body.sync.error.message).toBe("App not installed");
+
+    const list = JSON.parse((await request("/api/mappings", "GET", "secret", undefined, token)).body);
+    expect(list.SYNCFAIL).toBeDefined();
   });
 });

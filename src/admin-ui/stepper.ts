@@ -964,10 +964,16 @@ export const stepperScript = `
         : { kind: 'linear' },
     };
 
+    const createBtn = document.getElementById('np-create');
+    const origCreateLabel = createBtn ? createBtn.textContent : '';
+    if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Syncing...'; }
+    
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
+    let resData = {};
+    try { resData = await res.json(); } catch (_) {}
+    if (createBtn) { createBtn.disabled = false; createBtn.textContent = origCreateLabel; }
     if (!res.ok) {
-      const msg = await res.text().catch(function () { return 'Unknown error'; });
-      showError('Failed to create project: ' + msg);
+      showError('Failed to create project: ' + (resData.error || 'Unknown error'));
       return;
     }
 
@@ -986,15 +992,25 @@ export const stepperScript = `
       }
     }
 
+    if (window.noteSyncResult) window.noteSyncResult(teamKey, resData.sync);
     closeNewProjectStepper();
-    if (secretFailures > 0) {
-      // Project was created but some secrets failed — warn but don't block
-      // Use a brief timeout so the modal closes first
-      setTimeout(function () {
-        alert('Project created, but ' + secretFailures + ' secret(s) failed to save. You can add them via the Secrets button on the Projects page.');
-      }, 100);
+    if (window.loadMappings) await window.loadMappings();
+    if (resData.sync && resData.sync.ok && !(resData.sync.result && resData.sync.result.prUrl)) {
+      if (window.flashRowSyncStatus) window.flashRowSyncStatus(teamKey, 'Up to date');
     }
-    if (window.loadMappings) window.loadMappings();
+
+    // Project was created but some portions failed — warn but don't block
+    const notices = [];
+    if (resData.sync && resData.sync.ok === false) {
+      notices.push('Workflow sync did not complete: ' + ((resData.sync.error && resData.sync.error.message) || 'unknown error') + ' Retry with the Sync workflows button on the project row.');
+    }
+    if (secretFailures > 0) {
+      notices.push(secretFailures + ' secret(s) failed to save. Add them via the Secrets button on the Projects page.');
+    }
+    if (notices.length) {
+      // Use a brief timeout so the modal closes first
+      setTimeout(function () { alert('Project created.\\n\\n' + notices.join('\\n\\n')); }, 100);
+    }
   }
 
   window.openNewProjectStepper = openNewProjectStepper;
