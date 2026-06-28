@@ -485,7 +485,8 @@ export const stepperScript = `
     } else if (step === 2) {
       const ow = (document.getElementById('np-owner') || {}).value || '';
       const rp = (document.getElementById('np-repo') || {}).value || '';
-      if (!ow.trim() || !rp.trim()) ok = false;
+      const br = (document.getElementById('np-defaultBranch') || {}).value || '';
+      if (!ow.trim() || !rp.trim() || !br.trim()) ok = false;
       resetInstallState();
     }
     if (ok) nextBtn.removeAttribute('disabled');

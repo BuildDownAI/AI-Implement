@@ -45,7 +45,7 @@ import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
-import { getPendingWorkflowSyncs, getStaleRunningWorkflowSyncs, runWorkflowSync } from "./workflow-sync-queue.js";
+import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 
 // ---------- Configuration ----------
@@ -2017,20 +2017,6 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
     } catch (err) {
       console.error(`[review-fix] Error processing review fix #${fix.id}:`, err);
     }
-  }
-}
-
-async function processPendingWorkflowSyncs(config: AppConfig): Promise<void> {
-  // pending = orphaned before their runner started; stale-running = runner died mid-sync.
-  const jobs = [...getPendingWorkflowSyncs(), ...getStaleRunningWorkflowSyncs()];
-  if (jobs.length === 0) return;
-
-  console.log(`[workflow-sync] Re-running ${jobs.length} orphaned/stale sync job(s)`);
-
-  // Sequential, not Promise.all: bound the safety net to one sync at a time
-  // so a backlog can't fan out into a burst of concurrent GitHub round-trips.
-  for (const job of jobs) {
-    await runWorkflowSync(job.id, config);
   }
 }
 

@@ -197,4 +197,50 @@ describe("runWorkflowSync executor", () => {
     expect(job?.status).toBe("failed");
     expect(job?.error?.message).toMatch(/deleted/i);
   });
+
+  it("bails without re-running when the job is already running and fresh (dedup guard)", async () => {
+    seedMapping("ENG");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "running"); // an in-flight sync owns this job
+
+    // A rapid re-enqueue dedups to the same id and the handler fires runWorkflowSync again — the guard
+    // must keep it from double-firing the sync.
+    await queue.runWorkflowSync(id, CREDS);
+
+    expect(workflowSync.syncWorkflowTemplates).not.toHaveBeenCalled();
+    expect(queue.getWorkflowSyncById(id)?.status).toBe("running"); // left untouched for the live runner
+  });
+});
+
+describe("processPendingWorkflowSyncs (crash-recovery safety net)", () => {
+  it("re-runs pending and stale-running jobs but leaves a fresh running job alone", async () => {
+    seedMapping("A");
+    seedMapping("B");
+    seedMapping("C");
+    vi.mocked(workflowSync.syncWorkflowTemplates).mockResolvedValue(RESULT);
+
+    const a = queue.enqueueWorkflowSync("A"); // pending — orphaned before its runner started
+
+    const b = queue.enqueueWorkflowSync("B"); // running but stale — runner died mid-sync
+    queue.updateWorkflowSyncStatus(b.id, "running");
+    dedup
+      .getDb()
+      .prepare("UPDATE workflow_sync_queue SET updated_at = ? WHERE id = ?")
+      .run(Date.now() - queue.STALE_RUNNING_MS - 1000, b.id);
+
+    const c = queue.enqueueWorkflowSync("C"); // running and fresh — a live runner owns it
+    queue.updateWorkflowSyncStatus(c.id, "running");
+
+    await queue.processPendingWorkflowSyncs(CREDS);
+
+    expect(queue.getWorkflowSyncById(a.id)?.status).toBe("completed");
+    expect(queue.getWorkflowSyncById(b.id)?.status).toBe("completed"); // stale -> reclaimed
+    expect(queue.getWorkflowSyncById(c.id)?.status).toBe("running"); // fresh -> untouched
+    expect(workflowSync.syncWorkflowTemplates).toHaveBeenCalledTimes(2); // A + B only, never C
+  });
+
+  it("is a no-op when nothing is pending or stale", async () => {
+    await queue.processPendingWorkflowSyncs(CREDS);
+    expect(workflowSync.syncWorkflowTemplates).not.toHaveBeenCalled();
+  });
 });

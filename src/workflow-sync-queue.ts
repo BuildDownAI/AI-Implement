@@ -104,7 +104,11 @@ export function updateWorkflowSyncStatus(
 export async function runWorkflowSync(jobId: number, creds: WorkflowSyncCreds): Promise<void> {
   const job = getWorkflowSyncById(jobId);
   if (!job) return; // row vanished — nothing to run
+  // A fresh `running` row means a live runner already owns this job. Bail rather than double-fire the sync.
+  // A `running` row past the stale window is fair game (the safety net reclaims a crashed run).
+  if (job.status === "running" && Date.now() - job.updatedAt < STALE_RUNNING_MS) return;
 
+  
   updateWorkflowSyncStatus(jobId, "running");
 
   // Re-read the mapping at RUN time, not enqueue time: 
@@ -128,6 +132,21 @@ export async function runWorkflowSync(jobId: number, creds: WorkflowSyncCreds): 
   } catch (err) {
     console.error(`[workflow-sync] sync failed for ${job.teamKey}:`, err);
     updateWorkflowSyncStatus(jobId, "failed", { error: classifySyncError(err) });
+  }
+}
+
+// Crash-recovery safety net: re-run jobs orphaned by a restart (pending) or wedged past the stale window (running).
+// NOT the primary trigger — the admin handlers fire runWorkflowSync immediately on save; this is the backstop, driven by the poll loop.
+export async function processPendingWorkflowSyncs(creds: WorkflowSyncCreds): Promise<void> {
+  const jobs = [...getPendingWorkflowSyncs(), ...getStaleRunningWorkflowSyncs()];
+  if (jobs.length === 0) return;
+
+  console.log(`[workflow-sync] Re-running ${jobs.length} orphaned/stale sync job(s)`);
+
+  // Sequential, not Promise.all: bound the safety net to one sync at a time so a backlog can't fan out
+  // into a burst of concurrent GitHub round-trips. Latency is not a concern on this path.
+  for (const job of jobs) {
+    await runWorkflowSync(job.id, creds);
   }
 }
 
