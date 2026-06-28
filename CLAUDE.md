@@ -111,12 +111,17 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 
 ## Adding a new target repo
 
-1. Install the GitHub App on the target repo **first** — saving the mapping immediately syncs workflows to it.
-2. Add the project mapping in the admin UI at `/admin` (the **New project** stepper, or **Edit** on an existing row). On save, the orchestrator automatically opens or updates a PR in the target repo with the workflow files and starter prompt templates, and the project row shows a **"Workflows synced — PR opened"** link. If the App isn't installed yet (or sync otherwise fails), the mapping still saves and an alert explains why — install the App, then re-save or use the row's **Sync workflows** button.
-3. Merge the PR in the target repo
+1. Add the project mapping in the admin UI at `/admin` — the **New project** stepper (or **Edit** on an existing row). On the **Source** step, enter the owner/repo and click **Check installation**: the stepper probes whether the GitHub App is installed and can see the repo, and links straight to the fix when it can't —
+   - **App not installed** → "Install the App" (GitHub's install flow; org members who aren't owners get GitHub's "request the owner to install" path),
+   - **Repo not selected** → "Add this repo" (same install flow — adjusts the install's selected-repositories set),
+   - **Ready** → green confirmation.
+
+   Use **Re-check** after installing/adding in the opened tab. The check is advisory — you can still save without it.
+2. **Save.** The mapping persists immediately, and the workflow sync runs in the background. The project row's Sync button shows **"Syncing…"**, then polls a status endpoint to a terminal state: **"Workflows synced — PR opened ↗"** (or a transient "Up to date"), or it reverts with an alert naming the failure (App not installed, permission denied, clock skew, …). The mapping is saved regardless of how the sync resolves.
+3. Merge the sync PR in the target repo
 4. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
 
-The **Sync workflows** button on each project row re-runs the sync manually at any time, and `.github/workflows/sync-workflow.yml` remains as a manual/bulk fallback.
+The **Sync workflows** button on each project row re-runs the sync manually at any time, and `.github/workflows/sync-workflow.yml` remains as a manual/bulk fallback. If the orchestrator restarts mid-sync, the poll loop reclaims the orphaned job after a short stale window and finishes it.
 
 The GitHub App must have **Workflows** permission in addition to **Contents** permission. GitHub rejects writes under `.github/workflows/` without it, so the sync will fail (surfaced as a "permission denied" message) before opening or updating the target-repo PR.
 

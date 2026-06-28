@@ -45,6 +45,7 @@ import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
+import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 
 // ---------- Configuration ----------
@@ -370,6 +371,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Process pending late review feedback that arrived after the original run.
   await processReviewFixQueue(config);
+
+  // Crash-recovery safety net for workflow syncs. (NOT the primary trigger. the admin handlers fire runWorkflowSync immediately on save) 
+  // this only re-runs jobs that lost their runner to a restart or a wedge.
+  await processPendingWorkflowSyncs(config);
 
   } finally {
     pollInProgress = false;

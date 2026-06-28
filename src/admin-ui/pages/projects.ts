@@ -200,30 +200,6 @@ export const projectsScript = `
   let pendingJiraRepoFieldValue = '';
   let jiraFieldsLoaded = false;
 
-  // Ephemeral, in-memory record of the most recent auto-sync result per team
-  // - written when a mapping is created/edited AND syncing was successful
-  // - cleared on page refresh, so the row reverts to the normal button.
-  let recentSync = {};
-  window.noteSyncResult = function (teamKey, sync) {
-    if (sync && sync.ok && sync.result && sync.result.prUrl) {
-      recentSync[teamKey] = { prUrl: sync.result.prUrl, status: sync.result.status };
-    }
-  };
-  // Transiently label a project row's Sync button (mirrors the manual button's label-then-revert),
-  // - used after a create/edit that returned up-to-date (i.e. no PR to link to)
-  window.flashRowSyncStatus = function (teamKey, label) {
-    const buttons = document.querySelectorAll('#mappings-body button[data-sync-btn]');
-    for (const btn of buttons) {
-      if (btn.dataset.key !== teamKey) continue;
-      const original = btn.textContent;
-      btn.textContent = label;
-      btn.disabled = true;
-      setTimeout(function () { btn.textContent = original; btn.disabled = false; }, 4000);
-      break;
-    }
-  };
-
-
   async function loadMappings() {
     const res = await window.api('/api/mappings');
     mappingsData = await res.json();
@@ -654,7 +630,7 @@ export const projectsScript = `
 
     const saveBtn = document.getElementById('md-save');
     const origSaveLabel = saveBtn ? saveBtn.textContent : '';
-    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Syncing...'; }
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
 
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
     let data = {};
@@ -665,17 +641,9 @@ export const projectsScript = `
       errEl.classList.remove('hidden');
       return;
     }
-    if (window.noteSyncResult) window.noteSyncResult(teamKey, data.sync);
     closeMappingDialog();
     await loadMappings();
-    if (data.sync && data.sync.ok && !(data.sync.result && data.sync.result.prUrl)) {
-      if (window.flashRowSyncStatus) window.flashRowSyncStatus(teamKey, 'Up to date');
-    }
-    if (data.sync && data.sync.ok === false) {
-      setTimeout(function () {
-        alert('Mapping saved, but workflow sync did not complete: ' + ((data.sync.error && data.sync.error.message) || 'unknown error') + ' Retry with the Sync workflows button on the project row.');
-      }, 100);
-    }
+    pollSyncStatus(teamKey, data.syncJobId);
   }
   window.saveMappingDialog = saveMappingDialog;
 
@@ -704,44 +672,106 @@ export const projectsScript = `
   }
   window.togglePause = togglePause;
 
+  let recentSync = {};
+  let syncPollTimers = {};
+  const SYNC_POLL_MS = 2000;
+  const SYNC_POLL_MAX_ATTEMPTS = 60; // ~2 min, then hand off to the background safety net
+
+  // Poll GET /api/mappings/:teamKey/sync-status/:jobId until the job is terminal
+  function pollSyncStatus(teamKey, jobId) {
+    if (!jobId) return;
+    stopSyncPoll(teamKey); // never run two pollers for one row
+
+    const initialBtn = findSyncBtn(teamKey);
+    if (initialBtn) { initialBtn.disabled = true; initialBtn.textContent = 'Syncing...'; }
+
+    let inFlight = false;
+    let attempts = 0;
+    syncPollTimers[teamKey] = setInterval(async function () {
+      if (inFlight) return; // a slow tick must not overlap the next one
+      inFlight = true;
+      try {
+        attempts++;
+        if (attempts > SYNC_POLL_MAX_ATTEMPTS) {
+          stopSyncPoll(teamKey);
+          await loadMappings();
+          flashRowSyncStatus(teamKey, 'Still syncing…');
+          return;
+        }
+        const res = await window.api('/api/mappings/' + encodeURIComponent(teamKey) + '/sync-status/' + jobId);
+        if (res.status === 404) { stopSyncPoll(teamKey); await loadMappings(); return; }
+        if (!res.ok) return; // transient server hiccup — retry next tick
+        const job = await res.json();
+        if (job.status === 'pending' || job.status === 'running') return; // keep waiting
+
+        stopSyncPoll(teamKey);
+        if (job.status === 'completed') {
+          noteSyncResult(teamKey, { ok: true, result: job.result });
+          await loadMappings();
+          if (!(job.result && job.result.prUrl)) flashRowSyncStatus(teamKey, 'Up to date');
+        } else { // failed
+          await loadMappings();
+          const msg = (job.error && job.error.message) || 'Workflow sync did not complete.';
+          alert(msg + ' Retry with the Sync workflows button on the project row.');
+        }
+      } catch (_) {
+        // network blip — leave the timer running for the next tick
+      } finally {
+        inFlight = false;
+      }
+    }, SYNC_POLL_MS);
+  }
+  window.pollSyncStatus = pollSyncStatus;
+  
   async function syncWorkflows(button) {
     const key = button.dataset.key;
-    const original = button.textContent;
     button.disabled = true;
     button.textContent = 'Syncing...';
     try {
-      const res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/sync-workflows', {
-        method: 'POST',
-      });
+      const res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/sync-workflows', { method: 'POST' });
       let data = {};
       try { data = await res.json(); } catch (_) {}
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to sync workflows');
-      }
-      const labels = {
-        'up-to-date': 'Up to date',
-        'pr-existing': 'PR exists',
-        'pr-opened': 'PR opened',
-        'pr-updated': 'PR updated',
-      };
-      button.textContent = labels[data.status] || 'Synced';
-      if (data.prUrl) {
-        button.dataset.prUrl = data.prUrl;
-        button.title = data.prUrl;
-        window.open(data.prUrl, '_blank', 'noopener,noreferrer');
-      }
-      setTimeout(function () {
-        button.textContent = original;
-        button.disabled = false;
-      }, 4000);
+      if (!res.ok) { throw new Error(data.error || 'Failed to start sync'); }
+      pollSyncStatus(key, data.syncJobId);
     } catch (err) {
       button.textContent = 'Sync failed';
       button.disabled = false;
       alert(err && err.message ? err.message : String(err));
-      setTimeout(function () { button.textContent = original; }, 4000);
+      setTimeout(function () { button.textContent = 'Sync workflows'; }, 4000);
     }
   }
   window.syncWorkflows = syncWorkflows;
+
+  // Ephemeral, in-memory record of the most recent auto-sync result per team
+  // - written when a mapping is created/edited AND syncing was successful
+  // - cleared on page refresh, so the row reverts to the normal button.
+  function noteSyncResult(teamKey, sync) {
+    if (sync && sync.ok && sync.result && sync.result.prUrl) {
+      recentSync[teamKey] = { prUrl: sync.result.prUrl, status: sync.result.status };
+    }
+  }
+
+  // Transiently label a project row's Sync button
+  // - used after a create/edit that returned up-to-date (i.e. no PR to link to)
+  function flashRowSyncStatus(teamKey, label) {
+    const syncButton = findSyncBtn(teamKey);
+    if (syncButton) {
+      const originalText = syncButton.textContent;
+      syncButton.textContent = label;
+      syncButton.disabled = true;
+      setTimeout(function () { syncButton.textContent = originalText; syncButton.disabled = false; }, 4000);
+    }
+  }
+
+  function findSyncBtn(teamKey) {
+    const buttons = document.querySelectorAll('#mappings-body button[data-sync-btn]');
+    for (const btn of buttons) { if (btn.dataset.key === teamKey) return btn; }
+    return null;
+  }
+
+  function stopSyncPoll(teamKey) {
+    if (syncPollTimers[teamKey]) { clearInterval(syncPollTimers[teamKey]); delete syncPollTimers[teamKey]; }
+  }
 
   async function showSecrets(teamKey) {
     currentSecretsTeam = teamKey;
