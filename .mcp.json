@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    "linear-eudoxus": { "type": "http", "url": "https://mcp.linear.app/mcp" },
+    "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/" }
+  }
+}
