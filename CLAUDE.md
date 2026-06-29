@@ -4,23 +4,6 @@
 
 A Node.js service that polls Linear for issues labeled "AI-Implement" and dispatches GitHub Actions workflows that run Claude Code to implement them. It also provides an admin UI and manages workflow templates synced to target repos.
 
-## Issue tracker — Linear (BuildDown skills)
-
-Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, etc.):
-
-- tracker.kind: linear
-- MCP server: `linear-eudoxus` (project `.mcp.json`; pre-approved in `.claude/settings.json`)
-- Workspace: `eudoxus` (bound at OAuth time)
-- Team: `AII`  ← issues filed/listed/searched against this team
-- Team URL: https://linear.app/eudoxus/team/AII/overview
-- GitHub repo (PRs land here): `BuildDownAI/AI-Implement`
-- Implement label: `AI-Implement` (orchestrator pickup trigger)
-- Agent mention (PR comment re-trigger): `/ai-implement`
-
-> Note: a separate global `claude.ai Linear` connector is authenticated to the **oolidata** workspace.
-> `linear-eudoxus` is a distinctly-named project server with its own token on **eudoxus**, so the two
-> never collide.
-
 ## Architecture
 
 ```
