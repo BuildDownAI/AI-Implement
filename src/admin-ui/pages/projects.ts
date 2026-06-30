@@ -127,7 +127,7 @@ export const projectsHtml = `
           <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
           <div class="md-field"><label>Branch Prefix <span class="text-tertiary" style="font-size:0.85em">(blank = none)</span></label><input id="md-branch-prefix" placeholder="pr"></div>
           <div class="md-field">
-            <label>Skills Repo (optional)</label>
+            <label>Skills Repo <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
             <input id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
