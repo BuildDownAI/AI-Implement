@@ -126,6 +126,11 @@ export const projectsHtml = `
           <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" step="1" placeholder="3"></div>
           <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
           <div class="md-field"><label>Branch Prefix <span class="text-tertiary" style="font-size:0.85em">(blank = none)</span></label><input id="md-branch-prefix" placeholder="pr"></div>
+          <div class="md-field">
+            <label>Skills Repo (optional)</label>
+            <input id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
+            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+          </div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -279,6 +284,7 @@ export const projectsScript = `
     document.getElementById('md-max-iter').value = m.maxIterations == null ? '' : String(m.maxIterations);
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
     document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
+    document.getElementById('md-skills-repo').value = m.skillsRepo || '';
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -580,6 +586,7 @@ export const projectsScript = `
       maxIterations: (function(){ var v = document.getElementById('md-max-iter').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
       maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
       branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
+      skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
