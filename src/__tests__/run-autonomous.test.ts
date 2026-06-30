@@ -60,6 +60,8 @@ describe("runAutonomous", () => {
     vi.stubEnv("MACHINE_NONCE", "");
     vi.stubEnv("RUNNER_CALLBACK_URL", "");
     vi.stubEnv("RUN_TOKEN", "");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "");
+    vi.stubEnv("RUNNER_PHASE", "");
     vi.stubEnv("CLAUDE_MODEL", "");
     vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
     vi.stubEnv("GITHUB_REF_NAME", "");
