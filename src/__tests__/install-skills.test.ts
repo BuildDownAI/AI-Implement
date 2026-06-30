@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -156,6 +156,22 @@ describe("installSkillsStep", () => {
 
     const leftover = readdirSync(tmpdir()).filter((n) => n.startsWith("ai-implement-skills-"));
     expect(leftover).toHaveLength(0);
+  });
+
+  it("converts owner/repo shorthand to https://github.com URL and attempts clone", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const out = await installSkillsStep.run(
+      ctx(),
+      { skillsRepoUrl: "acme/nonexistent-skills-repo-xyz", githubToken: "", homeDir },
+      new NoopStepReporter(),
+    );
+    const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+    warnSpy.mockRestore();
+
+    expect(out.skillsInstalled).toBe(0);
+    // Shorthand was converted to HTTPS — clone was attempted (and failed), not silently skipped
+    expect(warnings.every((w) => !w.includes("non-https"))).toBe(true);
+    expect(warnings.some((w) => w.includes("clone failed") || w.includes("install failed"))).toBe(true);
   });
 
   it("does not install dirs where SKILL.md is nested rather than at top level", async () => {
