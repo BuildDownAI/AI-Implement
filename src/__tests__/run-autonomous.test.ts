@@ -825,6 +825,50 @@ describe("runAutonomous", () => {
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
   });
+
+  it("reads AI_IMPLEMENT_SKILLS_REPO into context data skillsRepo", async () => {
+    vi.stubEnv("AI_IMPLEMENT_SKILLS_REPO", "https://github.com/org/skills");
+
+    let capturedSkillsRepo: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedSkillsRepo = ctx.data.skillsRepo;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-skills", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedSkillsRepo).toBe("https://github.com/org/skills");
+  });
+
+  it("leaves skillsRepo undefined when AI_IMPLEMENT_SKILLS_REPO is not set", async () => {
+    let capturedSkillsRepo: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedSkillsRepo = ctx.data.skillsRepo;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-skills", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedSkillsRepo).toBeUndefined();
+  });
 });
 
 describe("resolveLogLevel", () => {
