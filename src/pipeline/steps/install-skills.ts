@@ -77,22 +77,45 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
       const skillsRepoRef =
         revResult.status === 0 ? revResult.stdout.toString().trim() : null;
 
-      // Copy each top-level directory that contains a SKILL.md directly inside it.
-      const entries = fs.readdirSync(tmpDir, { withFileTypes: true });
-      const skillDirs = entries.filter(
-        (e) =>
-          e.isDirectory() &&
-          !e.name.startsWith(".") &&
-          fs.existsSync(path.join(tmpDir!, e.name, "SKILL.md")),
-      );
+      // Collect skill directories from the layouts real skills repos use. A
+      // directory is a skill iff it contains a SKILL.md *directly* inside it; we
+      // look for those one level under each of these roots:
+      //   <repo>/<name>/SKILL.md               — flat convention (e.g. BuildDownAI/skills)
+      //   <repo>/skills/<name>/SKILL.md         — Claude Code plugin layout (e.g. compound-engineering)
+      //   <repo>/.claude/skills/<name>/SKILL.md — project-scoped skills
+      // A repo may use more than one root; dedup by skill name (first root wins).
+      // Deeper/arbitrary nesting is intentionally NOT scanned — that keeps the
+      // copy deterministic and avoids pulling SKILL.md files out of test
+      // fixtures, vendored deps, or docs.
+      const searchRoots = [
+        tmpDir,
+        path.join(tmpDir, "skills"),
+        path.join(tmpDir, ".claude", "skills"),
+      ];
+      const seenSkillNames = new Set<string>();
+      const skillDirs: Array<{ name: string; src: string }> = [];
+      for (const root of searchRoots) {
+        let rootEntries: fs.Dirent[];
+        try {
+          rootEntries = fs.readdirSync(root, { withFileTypes: true });
+        } catch {
+          continue; // root doesn't exist in this repo — skip
+        }
+        for (const e of rootEntries) {
+          if (!e.isDirectory() || e.name.startsWith(".")) continue;
+          if (!fs.existsSync(path.join(root, e.name, "SKILL.md"))) continue;
+          if (seenSkillNames.has(e.name)) continue; // earlier root wins on a name collision
+          seenSkillNames.add(e.name);
+          skillDirs.push({ name: e.name, src: path.join(root, e.name) });
+        }
+      }
 
       const targetBase = path.join(homeDir, ".claude", "skills");
       let skillsInstalled = 0;
       for (const dir of skillDirs) {
-        const src = path.join(tmpDir, dir.name);
         const dest = path.join(targetBase, dir.name);
         fs.mkdirSync(dest, { recursive: true });
-        fs.cpSync(src, dest, { recursive: true, force: true });
+        fs.cpSync(dir.src, dest, { recursive: true, force: true });
         skillsInstalled++;
       }
 

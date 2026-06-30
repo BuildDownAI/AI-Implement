@@ -174,7 +174,7 @@ describe("installSkillsStep", () => {
     expect(warnings.some((w) => w.includes("clone failed") || w.includes("install failed"))).toBe(true);
   });
 
-  it("does not install dirs where SKILL.md is nested rather than at top level", async () => {
+  it("does not install dirs where SKILL.md is arbitrarily nested (not under a recognized root)", async () => {
     repoDir = makeSkillsRepo({
       "nested/subdir/SKILL.md": "# Nested",
     });
@@ -187,5 +187,63 @@ describe("installSkillsStep", () => {
 
     expect(out.skillsInstalled).toBe(0);
     expect(existsSync(join(homeDir, ".claude", "skills", "nested"))).toBe(false);
+  });
+
+  it("installs skills nested under a top-level skills/ dir (Claude Code plugin layout)", async () => {
+    repoDir = makeSkillsRepo({
+      "skills/ce-compound/SKILL.md": "# ce-compound",
+      "skills/ce-debug/SKILL.md": "# ce-debug",
+      ".claude-plugin/plugin.json": "{}",
+      "README.md": "plugin repo",
+    });
+
+    const out = await installSkillsStep.run(
+      ctx(),
+      { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
+      new NoopStepReporter(),
+    );
+
+    expect(out.skillsInstalled).toBe(2);
+    expect(existsSync(join(homeDir, ".claude", "skills", "ce-compound", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(homeDir, ".claude", "skills", "ce-debug", "SKILL.md"))).toBe(true);
+    // the skills/ container itself is not installed as a skill
+    expect(existsSync(join(homeDir, ".claude", "skills", "skills"))).toBe(false);
+  });
+
+  it("installs skills under a .claude/skills/ dir", async () => {
+    repoDir = makeSkillsRepo({
+      ".claude/skills/gamma/SKILL.md": "# gamma",
+    });
+
+    const out = await installSkillsStep.run(
+      ctx(),
+      { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
+      new NoopStepReporter(),
+    );
+
+    expect(out.skillsInstalled).toBe(1);
+    expect(existsSync(join(homeDir, ".claude", "skills", "gamma", "SKILL.md"))).toBe(true);
+  });
+
+  it("collects from multiple roots and dedups by skill name (top-level wins)", async () => {
+    repoDir = makeSkillsRepo({
+      "alpha/SKILL.md": "# top-level alpha",
+      "skills/beta/SKILL.md": "# beta under skills",
+      "skills/alpha/SKILL.md": "# duplicate alpha under skills (should be ignored)",
+      ".claude/skills/gamma/SKILL.md": "# gamma",
+    });
+
+    const out = await installSkillsStep.run(
+      ctx(),
+      { skillsRepoUrl: repoDir, githubToken: "x", homeDir },
+      new NoopStepReporter(),
+    );
+
+    // alpha (top-level), beta (skills/), gamma (.claude/skills/) — the duplicate
+    // alpha under skills/ is deduped, so 3 not 4.
+    expect(out.skillsInstalled).toBe(3);
+    expect(existsSync(join(homeDir, ".claude", "skills", "alpha", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(homeDir, ".claude", "skills", "beta", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(homeDir, ".claude", "skills", "gamma", "SKILL.md"))).toBe(true);
   });
 });
