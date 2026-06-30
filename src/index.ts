@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv } from "./github.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
@@ -462,6 +462,7 @@ async function dispatchGitHubActions(
     ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
     ...capDispatchFields(mapping),
     ...branchPrefixDispatchFields(mapping),
+    ...skillsRepoDispatchFields(mapping),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
     run_progress_token: runProgressToken,
@@ -991,7 +992,7 @@ async function dispatchFlyMachine(
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -1066,7 +1067,7 @@ async function dispatchLocalDocker(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });

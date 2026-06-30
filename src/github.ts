@@ -31,6 +31,8 @@ interface DispatchInputs {
   job_timeout_minutes?: string;
   /** Per-project branch-name prefix. Only forwarded when set on the mapping. */
   branch_prefix?: string;
+  /** Optional skills repo (owner/repo or git URL) forwarded to the runner. Only forwarded when set. */
+  skills_repo?: string;
   /** Public base URL the runner should POST results back to. Empty when callback disabled. */
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
@@ -125,6 +127,25 @@ export function branchPrefixDispatchFields(
  */
 export function branchPrefixRunnerEnv(mapping: RepoMapping): Record<string, string> {
   return mapping.branchPrefix ? { AI_IMPLEMENT_BRANCH_PREFIX: mapping.branchPrefix } : {};
+}
+
+/**
+ * Skills-repo dispatch input for a mapping. Only included when the mapping
+ * configures a skills repo, so default repos keep dispatching to workflow
+ * templates that haven't been re-synced with the new input.
+ */
+export function skillsRepoDispatchFields(
+  mapping: RepoMapping,
+): Pick<DispatchInputs, "skills_repo"> {
+  return mapping.skillsRepo ? { skills_repo: mapping.skillsRepo } : {};
+}
+
+/**
+ * Skills-repo env var for the runner process (Fly/local execution modes),
+ * where the value arrives via container env rather than a workflow input.
+ */
+export function skillsRepoRunnerEnv(mapping: RepoMapping): Record<string, string> {
+  return mapping.skillsRepo ? { AI_IMPLEMENT_SKILLS_REPO: mapping.skillsRepo } : {};
 }
 
 export async function dispatchWorkflow(
