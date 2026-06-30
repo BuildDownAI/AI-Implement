@@ -103,6 +103,11 @@ export const stepperHtml = `
             <input class="input mono" id="np-defaultBranch" placeholder="development" autocomplete="off" oninput="updateStepperNextButton()">
             <div class="field-hint">Branch used for workflow dispatches, runner clones, and implementation PR bases.</div>
           </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Skills Repo <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
+            <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
+            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+          </div>
         </div>
       </div>
 
@@ -237,6 +242,10 @@ export const stepperHtml = `
             <div data-review="defaultBranch" class="mono"></div>
           </div>
           <div class="np-review-row">
+            <div class="np-review-label">Skills Repo</div>
+            <div data-review="skillsRepo" class="mono"></div>
+          </div>
+          <div class="np-review-row">
             <div class="np-review-label">Runner</div>
             <div data-review="runner"></div>
           </div>
@@ -289,7 +298,7 @@ export const stepperScript = `
     jiraRepoFieldValue: '',
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
-    teamKey: '', owner: '', repo: '', defaultBranch: '',
+    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '',
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true,
@@ -310,6 +319,7 @@ export const stepperScript = `
     data.owner = '';
     data.repo = '';
     data.defaultBranch = '';
+    data.skillsRepo = '';
     data.executionMode = 'github-actions';
     data.machineCpus = 2;
     data.machineMemoryMb = 4096;
@@ -322,7 +332,7 @@ export const stepperScript = `
     data.secrets = [];
 
     // Clear inputs
-    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-awsRegion'];
+    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-skills-repo', 'np-awsRegion'];
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
@@ -584,9 +594,11 @@ export const stepperScript = `
       const owEl = document.getElementById('np-owner');
       const reEl = document.getElementById('np-repo');
       const brEl = document.getElementById('np-defaultBranch');
+      const srEl = document.getElementById('np-skills-repo');
       if (owEl) data.owner = owEl.value.trim();
       if (reEl) data.repo = reEl.value.trim();
       if (brEl) data.defaultBranch = brEl.value.trim();
+      if (srEl) data.skillsRepo = srEl.value.trim();
     } else if (n === 3) {
       const smEl = document.getElementById('np-sessionMode');
       const cpEl = document.getElementById('np-cpus');
@@ -696,6 +708,7 @@ export const stepperScript = `
     set('teamKey', window.esc(effectiveTeamKey()) || '&mdash;');
     set('repo', window.esc(data.owner) + '/' + window.esc(data.repo));
     set('defaultBranch', window.esc(data.defaultBranch) || '&mdash;');
+    set('skillsRepo', data.skillsRepo ? window.esc(data.skillsRepo) : '&mdash;');
 
     let runnerText = window.esc(data.executionMode);
     if (data.executionMode === 'fly-machines') {
@@ -1011,6 +1024,7 @@ export const stepperScript = `
       extraEnv: {},
       provider: data.provider,
       awsRegion: data.provider === 'bedrock' ? (data.awsRegion || null) : null,
+      skillsRepo: data.skillsRepo || null,
       ticketingProvider: data.ticketingProvider,
       ticketingConfig: data.ticketingProvider === 'jira'
         ? {

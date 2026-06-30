@@ -208,6 +208,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       return undefined;
     }
   })();
+  const skillsRepo = process.env.AI_IMPLEMENT_SKILLS_REPO?.trim() || undefined;
 
   const logLevel = resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL);
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
@@ -249,6 +250,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       maxTurns,
       maxIterations,
       branchPrefix,
+      skillsRepo,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,

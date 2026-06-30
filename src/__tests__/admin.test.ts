@@ -678,6 +678,106 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("branchPrefix");
   });
+
+  it("expands skillsRepo shorthand to GitHub HTTPS URL at storage time", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR1", owner: "org", repo: "app", skillsRepo: "acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SR1.skillsRepo).toBe("https://github.com/acme/skills");
+  });
+
+  it("persists a valid skillsRepo HTTPS URL and returns it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR2", owner: "org", repo: "app", skillsRepo: "https://github.com/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
+  });
+
+  it("rejects an SSH skillsRepo URL (the runner can only clone via https token)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR3", owner: "org", repo: "app", skillsRepo: "git@github.com:acme/skills.git",
+    }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toMatch(/skillsRepo/i);
+  });
+
+  it("treats a blank skillsRepo as null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR4", owner: "org", repo: "app", skillsRepo: "   ",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBeNull();
+  });
+
+  it("rejects an invalid skillsRepo", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRBAD", owner: "org", repo: "app", skillsRepo: "not a valid repo",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("skillsRepo");
+  });
+
+  it("rejects a non-string skillsRepo", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRBAD2", owner: "org", repo: "app", skillsRepo: 123,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("skillsRepo");
+  });
+
+  it("persists a non-github HTTPS skillsRepo URL (host-agnostic)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR5", owner: "org", repo: "app", skillsRepo: "https://gitlab.com/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://gitlab.com/acme/skills");
+  });
+
+  it("clears skillsRepo when an existing mapping is updated to null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRUPD", owner: "org", repo: "app", skillsRepo: "acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
+
+    const clear = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRUPD", owner: "org", repo: "app", skillsRepo: null,
+    }, token);
+    expect(clear.statusCode).toBe(202);
+    expect(JSON.parse(clear.body).skillsRepo).toBeNull();
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SRUPD.skillsRepo).toBeNull();
+  });
+
+  it("clears skillsRepo when an existing mapping is updated to blank", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRUPD2", owner: "org", repo: "app", skillsRepo: "acme/skills",
+    }, token);
+
+    const clear = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRUPD2", owner: "org", repo: "app", skillsRepo: "   ",
+    }, token);
+    expect(clear.statusCode).toBe(202);
+    expect(JSON.parse(clear.body).skillsRepo).toBeNull();
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SRUPD2.skillsRepo).toBeNull();
+  });
 });
 
 describe("admin runner-mode", () => {

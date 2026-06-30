@@ -27,6 +27,9 @@ const BUILTIN_PIPELINE_YAML = `id: autonomous-loop
 steps:
   - id: clone
     type: clone
+  - id: install-skills
+    type: custom
+    moduleId: install-skills
   - id: install
     type: install
   - id: setup
@@ -74,6 +77,7 @@ describe("loadPipelineDefinition", () => {
     expect(pipeline.id).toBe("autonomous-loop");
     expect(pipeline.steps.map((s) => s.id)).toEqual([
       "clone",
+      "install-skills",
       "install",
       "setup",
       "feedback-loop",
@@ -127,6 +131,27 @@ describe("loadPipelineDefinition", () => {
     });
 
     expect(resolvedPath).toBe("/app/pipelines/autonomous.yml");
+  });
+
+  it("skips install-skills when skillsRepo is unset, runs it when set", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "install-skills")!;
+
+    const ctxNoSkills = makeContext();
+    ctxNoSkills.setOutputs("clone", { githubToken: "tok" });
+    expect(step.skip?.(ctxNoSkills)).toBe(true);
+
+    const ctxWithSkills = makeContext({ skillsRepo: "https://github.com/org/skills" });
+    ctxWithSkills.setOutputs("clone", { githubToken: "tok" });
+    expect(step.skip?.(ctxWithSkills)).toBe(false);
+
+    const inputs = ctxWithSkills.resolveInputs(step.inputs);
+    expect(inputs.skillsRepoUrl).toBe("https://github.com/org/skills");
+    expect(inputs.githubToken).toBe("tok");
   });
 
   it("applies install input wiring from clone outputs", () => {
