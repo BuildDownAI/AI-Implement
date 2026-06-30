@@ -34,6 +34,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     maxIterations: null,
     maxJobMinutes: null,
     branchPrefix: null,
+    skillsRepo: null,
     ...overrides,
   };
 }
@@ -522,6 +523,40 @@ describe("config", () => {
     const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
     reopened.close();
     expect(info.map((c) => c.name)).toContain("branch_prefix");
+  });
+
+  it("round-trips skillsRepo (including null)", () => {
+    config.initMappingsTable();
+    config.upsertMapping("SR", mapping({ owner: "org", repo: "repo", skillsRepo: "owner/skills" }));
+    config.upsertMapping("NSR", mapping({ owner: "org", repo: "repo", skillsRepo: null }));
+
+    const all = config.getMappings();
+    expect(all.SR.skillsRepo).toBe("owner/skills");
+    expect(all.NSR.skillsRepo).toBeNull();
+  });
+
+  it("migrates a pre-existing mappings table to include the skills_repo column (default null)", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG.skillsRepo).toBeNull();
+
+    const reopened = new Database(dbPath);
+    const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
+    reopened.close();
+    expect(info.map((c) => c.name)).toContain("skills_repo");
   });
 
   it("getMappings falls back to {} when extra_env contains invalid JSON", () => {

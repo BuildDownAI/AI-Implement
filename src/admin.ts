@@ -43,6 +43,20 @@ import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js"
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 
+const SKILLS_REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+function normalizeSkillsRepo(raw: unknown): string | null {
+  if (raw == null) return null;
+  if (typeof raw !== "string") throw new Error("skillsRepo must be a string");
+  const v = raw.trim();
+  if (v === "") return null;
+  const ok = SKILLS_REPO_SHORTHAND.test(v)
+    || /^https:\/\/[^\s]+?\.git$/.test(v)
+    || /^https:\/\/github\.com\/[^\s]+$/.test(v)
+    || /^git@[^\s]+:[^\s]+\.git$/.test(v);
+  if (!ok) throw new Error("skillsRepo must be 'owner/repo' or a git URL");
+  return v;
+}
+
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 let _adminJiraClient: JiraClient | null = null;
@@ -981,6 +995,7 @@ async function handleUpsertMapping(
       maxIterations?: number | null;
       maxJobMinutes?: number | null;
       branchPrefix?: string | null;
+      skillsRepo?: string | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1111,6 +1126,14 @@ async function handleUpsertMapping(
       return;
     }
 
+    let skillsRepo: string | null;
+    try {
+      skillsRepo = normalizeSkillsRepo(body.skillsRepo);
+    } catch (err) {
+      json(res, 400, { error: `skillsRepo invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -1138,6 +1161,7 @@ async function handleUpsertMapping(
       maxIterations,
       maxJobMinutes,
       branchPrefix,
+      skillsRepo,
     };
 
     upsertMapping(body.teamKey, mapping);

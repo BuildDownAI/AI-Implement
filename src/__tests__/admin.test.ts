@@ -678,6 +678,63 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("branchPrefix");
   });
+
+  it("persists a valid skillsRepo shorthand and returns it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR1", owner: "org", repo: "app", skillsRepo: "acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("acme/skills");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SR1.skillsRepo).toBe("acme/skills");
+  });
+
+  it("persists a valid skillsRepo HTTPS URL and returns it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR2", owner: "org", repo: "app", skillsRepo: "https://github.com/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
+  });
+
+  it("persists a valid skillsRepo SSH URL and returns it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR3", owner: "org", repo: "app", skillsRepo: "git@github.com:acme/skills.git",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("git@github.com:acme/skills.git");
+  });
+
+  it("treats a blank skillsRepo as null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR4", owner: "org", repo: "app", skillsRepo: "   ",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBeNull();
+  });
+
+  it("rejects an invalid skillsRepo", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRBAD", owner: "org", repo: "app", skillsRepo: "not a valid repo",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("skillsRepo");
+  });
+
+  it("rejects a non-string skillsRepo", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRBAD2", owner: "org", repo: "app", skillsRepo: 123,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("skillsRepo");
+  });
 });
 
 describe("admin runner-mode", () => {
