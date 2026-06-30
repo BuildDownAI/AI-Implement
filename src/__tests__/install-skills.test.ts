@@ -103,6 +103,18 @@ describe("installSkillsStep", () => {
     expect(out.skillsRepoRef).toBeNull();
   });
 
+  it("returns skillsInstalled:0 for a non-https (SSH) URL without attempting a clone", async () => {
+    const out = await installSkillsStep.run(
+      ctx(),
+      { skillsRepoUrl: "git@github.com:org/skills.git", githubToken: "x", homeDir },
+      new NoopStepReporter(),
+    );
+
+    expect(out.skillsInstalled).toBe(0);
+    expect(out.skillsRepoRef).toBeNull();
+    expect(existsSync(join(homeDir, ".claude", "skills"))).toBe(false);
+  });
+
   it("returns skillsInstalled:0 for an empty skillsRepoUrl without throwing", async () => {
     const out = await installSkillsStep.run(
       ctx(),

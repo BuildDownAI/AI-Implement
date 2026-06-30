@@ -7,6 +7,7 @@ import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 interface InstallSkillsInputs extends Record<string, unknown> {
   skillsRepoUrl: string;
   githubToken: string;
+  /** Test-only injection point; production always falls back to os.homedir(). */
   homeDir?: string;
 }
 
@@ -23,6 +24,12 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
   ): Promise<InstallSkillsOutputs> {
     const { skillsRepoUrl, githubToken, homeDir = os.homedir() } = inputs;
 
+    // Redact every occurrence of the token before any value is logged (a single
+    // .replace() would miss repeats; guard the empty-token case so we don't splice
+    // "***" between every character).
+    const redactToken = (s: string): string =>
+      githubToken ? s.split(githubToken).join("***") : s;
+
     if (!skillsRepoUrl) {
       return { skillsInstalled: 0, skillsRepoRef: null };
     }
@@ -33,6 +40,15 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
 
       // Local paths (used in tests) pass through unchanged; remote URLs get the token embedded.
       const isLocalPath = skillsRepoUrl.startsWith("/") || skillsRepoUrl.startsWith("file://");
+      // Only https:// remotes are cloneable on the runner — auth is the orchestrator-minted
+      // token embedded in the URL. SSH (git@…) or http:// would need keys the runner lacks, so
+      // fail loudly here rather than letting git emit a confusing credential-less clone error.
+      if (!isLocalPath && !skillsRepoUrl.startsWith("https://")) {
+        console.warn(
+          "[skills] skillsRepoUrl must be an https:// URL (token auth) — got a non-https URL; skipping install",
+        );
+        return { skillsInstalled: 0, skillsRepoRef: null };
+      }
       const remote = isLocalPath
         ? skillsRepoUrl
         : skillsRepoUrl.replace("https://", `https://x-access-token:${githubToken}@`);
@@ -44,7 +60,7 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
       );
 
       if (cloneResult.status !== 0) {
-        const stderr = (cloneResult.stderr?.toString() ?? "").replace(githubToken, "***");
+        const stderr = redactToken(cloneResult.stderr?.toString() ?? "");
         console.warn(`[skills] clone failed: ${stderr}`);
         return { skillsInstalled: 0, skillsRepoRef: null };
       }
@@ -81,7 +97,7 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
       return { skillsInstalled, skillsRepoRef };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[skills] install failed: ${msg.replace(githubToken, "***")}`);
+      console.warn(`[skills] install failed: ${redactToken(msg)}`);
       return { skillsInstalled: 0, skillsRepoRef: null };
     } finally {
       if (tmpDir) {
