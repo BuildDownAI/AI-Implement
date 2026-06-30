@@ -56,6 +56,8 @@ export interface PipelineContextData {
   maxIterations?: number;
   /** Autonomous runner: optional branch-name prefix (from AI_IMPLEMENT_BRANCH_PREFIX). */
   branchPrefix?: string;
+  /** Autonomous runner: URL of the skills repo to clone and install into ~/.claude/skills/. */
+  skillsRepo?: string;
   /** Autonomous runner: WORKFLOW.md hook script paths (relative to repo root). */
   hooks?: { setup?: string; verify?: string; teardown?: string };
 }

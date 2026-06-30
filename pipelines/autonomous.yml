@@ -2,6 +2,9 @@ id: autonomous-loop
 steps:
   - id: clone
     type: clone
+  - id: install-skills
+    type: custom
+    moduleId: install-skills
   - id: install
     type: install
   - id: setup
