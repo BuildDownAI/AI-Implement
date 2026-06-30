@@ -15,6 +15,7 @@
 #   AI_IMPLEMENT_MAX_TURNS       - Cap on Claude turns per implement pass (default 50).
 #   AI_IMPLEMENT_MAX_ITERATIONS  - Cap on implement/review iterations (default: bedrock 2 / anthropic 3).
 #   AI_IMPLEMENT_MAX_JOB_MINUTES - Per-project job timeout in minutes (default 90).
+#   AI_IMPLEMENT_SKILLS_REPO     - Skills repo (owner/repo) to clone and install; mirrors the per-project admin UI skills field.
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
@@ -258,6 +259,7 @@ jobs:
           AI_IMPLEMENT_MAX_TURNS: ${{ needs.check-trigger.outputs.max_turns }}
           AI_IMPLEMENT_MAX_ITERATIONS: ${{ needs.check-trigger.outputs.max_iterations }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
+          AI_IMPLEMENT_SKILLS_REPO: ${{ vars.AI_IMPLEMENT_SKILLS_REPO }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
