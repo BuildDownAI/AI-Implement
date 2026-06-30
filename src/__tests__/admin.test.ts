@@ -679,16 +679,16 @@ describe("admin mappings", () => {
     expect(JSON.parse(res.body).error).toContain("branchPrefix");
   });
 
-  it("persists a valid skillsRepo shorthand and returns it", async () => {
+  it("expands skillsRepo shorthand to GitHub HTTPS URL at storage time", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "SR1", owner: "org", repo: "app", skillsRepo: "acme/skills",
     }, token);
     expect(create.statusCode).toBe(202);
-    expect(JSON.parse(create.body).skillsRepo).toBe("acme/skills");
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).SR1.skillsRepo).toBe("acme/skills");
+    expect(JSON.parse(list.body).SR1.skillsRepo).toBe("https://github.com/acme/skills");
   });
 
   it("persists a valid skillsRepo HTTPS URL and returns it", async () => {
@@ -751,7 +751,7 @@ describe("admin mappings", () => {
       teamKey: "SRUPD", owner: "org", repo: "app", skillsRepo: "acme/skills",
     }, token);
     expect(create.statusCode).toBe(202);
-    expect(JSON.parse(create.body).skillsRepo).toBe("acme/skills");
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
 
     const clear = await request("/api/mappings", "POST", "secret", {
       teamKey: "SRUPD", owner: "org", repo: "app", skillsRepo: null,

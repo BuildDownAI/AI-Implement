@@ -22,7 +22,7 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
     inputs: InstallSkillsInputs,
     _reporter: StepReporter,
   ): Promise<InstallSkillsOutputs> {
-    const { skillsRepoUrl, githubToken, homeDir = os.homedir() } = inputs;
+    let { skillsRepoUrl, githubToken, homeDir = os.homedir() } = inputs;
 
     // Redact every occurrence of the token before any value is logged (a single
     // .replace() would miss repeats; guard the empty-token case so we don't splice
@@ -32,6 +32,11 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
 
     if (!skillsRepoUrl) {
       return { skillsInstalled: 0, skillsRepoRef: null };
+    }
+
+    // owner/repo shorthand → https://github.com/owner/repo (handles AI_IMPLEMENT_SKILLS_REPO env var path)
+    if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(skillsRepoUrl)) {
+      skillsRepoUrl = `https://github.com/${skillsRepoUrl}`;
     }
 
     let tmpDir: string | undefined;

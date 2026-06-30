@@ -53,8 +53,8 @@ function normalizeSkillsRepo(raw: unknown): string | null {
   if (typeof raw !== "string") throw new Error("skillsRepo must be a string");
   const v = raw.trim();
   if (v === "") return null;
-  const ok = SKILLS_REPO_SHORTHAND.test(v)
-    || /^https:\/\/[^\s]+$/.test(v) // any https:// git URL, host-agnostic, with or without a trailing .git
+  if (SKILLS_REPO_SHORTHAND.test(v)) return `https://github.com/${v}`;
+  const ok = /^https:\/\/[^\s]+$/.test(v) // any https:// git URL, host-agnostic, with or without a trailing .git
     || /^git@[^\s]+:[^\s]+\.git$/.test(v); // git@host:path.git SSH form
   if (!ok) throw new Error("skillsRepo must be 'owner/repo', an https:// URL, or a git@ SSH URL");
   return v;

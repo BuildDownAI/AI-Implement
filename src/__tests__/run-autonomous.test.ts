@@ -67,6 +67,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("GITHUB_REF_NAME", "");
     vi.stubEnv("PR_NUMBER", "");
     vi.stubEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION", "");
+    vi.stubEnv("AI_IMPLEMENT_SKILLS_REPO", "");
   });
 
   afterEach(() => {
