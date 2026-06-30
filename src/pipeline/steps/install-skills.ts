@@ -61,12 +61,25 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
       const cloneResult = spawnSync(
         "git",
         ["clone", "--depth", "1", remote, tmpDir],
-        { stdio: ["ignore", "pipe", "pipe"] },
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+          // Bound the clone so a slow/hung remote (DNS, TCP, credential negotiation)
+          // can't block the runner's event loop for the entire job timeout. On hit,
+          // spawnSync kills the child and sets error.code === "ETIMEDOUT".
+          timeout: 60_000,
+          // Never wait on an interactive credential prompt — fail fast instead of
+          // hanging until the timeout when auth is missing/wrong.
+          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        },
       );
 
       if (cloneResult.status !== 0) {
-        const stderr = redactToken(cloneResult.stderr?.toString() ?? "");
-        console.warn(`[skills] clone failed: ${stderr}`);
+        const timedOut =
+          (cloneResult.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+        const reason = timedOut
+          ? "timed out after 60s"
+          : redactToken(cloneResult.stderr?.toString() ?? "");
+        console.warn(`[skills] clone failed: ${reason}`);
         return { skillsInstalled: 0, skillsRepoRef: null };
       }
 

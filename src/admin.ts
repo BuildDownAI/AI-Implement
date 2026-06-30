@@ -54,9 +54,13 @@ function normalizeSkillsRepo(raw: unknown): string | null {
   const v = raw.trim();
   if (v === "") return null;
   if (SKILLS_REPO_SHORTHAND.test(v)) return `https://github.com/${v}`;
-  const ok = /^https:\/\/[^\s]+$/.test(v) // any https:// git URL, host-agnostic, with or without a trailing .git
-    || /^git@[^\s]+:[^\s]+\.git$/.test(v); // git@host:path.git SSH form
-  if (!ok) throw new Error("skillsRepo must be 'owner/repo', an https:// URL, or a git@ SSH URL");
+  // Only https:// remotes (and the owner/repo shorthand handled above) are usable on
+  // the runner: clone auth is the orchestrator-minted token embedded in the URL. An
+  // SSH (git@…) URL would need keys the runner doesn't have, so the install step just
+  // warns and installs nothing — a silent no-op. Reject it here rather than storing a
+  // value that looks accepted but does nothing at dispatch.
+  const ok = /^https:\/\/[^\s]+$/.test(v); // any https:// git URL, host-agnostic, with or without a trailing .git
+  if (!ok) throw new Error("skillsRepo must be 'owner/repo' shorthand or an https:// URL (SSH git@ URLs are not supported — the runner clones via an https token)");
   return v;
 }
 

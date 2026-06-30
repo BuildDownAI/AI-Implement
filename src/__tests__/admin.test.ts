@@ -700,13 +700,13 @@ describe("admin mappings", () => {
     expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
   });
 
-  it("persists a valid skillsRepo SSH URL and returns it", async () => {
+  it("rejects an SSH skillsRepo URL (the runner can only clone via https token)", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "SR3", owner: "org", repo: "app", skillsRepo: "git@github.com:acme/skills.git",
     }, token);
-    expect(create.statusCode).toBe(202);
-    expect(JSON.parse(create.body).skillsRepo).toBe("git@github.com:acme/skills.git");
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toMatch(/skillsRepo/i);
   });
 
   it("treats a blank skillsRepo as null", async () => {
