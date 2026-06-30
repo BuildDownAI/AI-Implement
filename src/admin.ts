@@ -44,16 +44,19 @@ import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./wor
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 
 const SKILLS_REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+// NOTE: skillsRepo is *syntax*-validated only — it is NOT sanitised. Any code that
+// later feeds this value to a subprocess (e.g. the `git clone` in the runner) MUST
+// pass it as a separate argv element, never interpolated into a shell string, to
+// avoid command injection.
 function normalizeSkillsRepo(raw: unknown): string | null {
   if (raw == null) return null;
   if (typeof raw !== "string") throw new Error("skillsRepo must be a string");
   const v = raw.trim();
   if (v === "") return null;
   const ok = SKILLS_REPO_SHORTHAND.test(v)
-    || /^https:\/\/[^\s]+?\.git$/.test(v)
-    || /^https:\/\/github\.com\/[^\s]+$/.test(v)
-    || /^git@[^\s]+:[^\s]+\.git$/.test(v);
-  if (!ok) throw new Error("skillsRepo must be 'owner/repo' or a git URL");
+    || /^https:\/\/[^\s]+$/.test(v) // any https:// git URL, host-agnostic, with or without a trailing .git
+    || /^git@[^\s]+:[^\s]+\.git$/.test(v); // git@host:path.git SSH form
+  if (!ok) throw new Error("skillsRepo must be 'owner/repo', an https:// URL, or a git@ SSH URL");
   return v;
 }
 
