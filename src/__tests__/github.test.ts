@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, cancelWorkflowRun, getPullRequestState } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -361,5 +361,89 @@ describe("skillsRepoRunnerEnv", () => {
     expect(skillsRepoRunnerEnv(makeMapping({ skillsRepo: "org/skills" }))).toEqual({
       AI_IMPLEMENT_SKILLS_REPO: "org/skills",
     });
+  });
+});
+
+describe("deleteBranch", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("returns true on 204 No Content", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 204, ok: true } as Response);
+    expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      "https://api.github.com/repos/owner/repo/git/refs/heads/ai-implement/feature/foo-1",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("returns true on 404 (idempotent — branch already deleted)", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ status: 404, ok: false } as Response);
+    expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
+  });
+
+  it("throws on other non-success statuses", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      status: 403,
+      ok: false,
+      text: async () => "Forbidden",
+    } as unknown as Response);
+    await expect(deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).rejects.toThrow();
+  });
+});
+
+describe("findPullRequestByBranches", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("returns merged PR when merged_at is set", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ number: 5, html_url: "https://gh/pr/5", state: "closed", merged_at: "2026-06-30T12:00:00Z" }],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "head-branch", "base-branch")).toEqual({
+      number: 5, url: "https://gh/pr/5", state: "closed", merged: true,
+    });
+  });
+
+  it("returns open PR with merged=false", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ number: 3, html_url: "https://gh/pr/3", state: "open", merged_at: null }],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
+      number: 3, url: "https://gh/pr/3", state: "open", merged: false,
+    });
+  });
+
+  it("returns closed-unmerged PR with merged=false", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null }],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
+      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+    });
+  });
+
+  it("returns null when the PR list is empty", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toBeNull();
+  });
+
+  it("prefers a merged PR when multiple results are returned", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { number: 9, html_url: "https://gh/pr/9", state: "closed", merged_at: null },
+        { number: 8, html_url: "https://gh/pr/8", state: "closed", merged_at: "2026-06-30T12:00:00Z" },
+      ],
+    })));
+    const result = await findPullRequestByBranches("tok", "owner", "repo", "h", "b");
+    expect(result).toMatchObject({ number: 8, merged: true });
+  });
+
+  it("returns null on non-OK response", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toBeNull();
   });
 });
