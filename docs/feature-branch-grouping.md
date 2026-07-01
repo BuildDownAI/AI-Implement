@@ -49,9 +49,10 @@ testing                                  (repo base branch)
 | `AI-Working` | Implementation in flight. Counts against capacity; the issue is skipped while present. | Orchestrator on implementation dispatch |
 | `Ready for Review` | An implementation PR is open. The issue is skipped (waiting on the human to merge). | Orchestrator when the PR is detected |
 
-The merge of a PR moves the issue to **Done** — that's **Linear's GitHub integration**, not
-the orchestrator. The orchestrator only ever sets `Ready for Review`; "Done" is what unblocks
-the next step.
+When a PR merges, the orchestrator moves the issue to **Done** via `markMerged` — driven by
+a poll detector (guaranteed, runs every tick) and optionally accelerated by a webhook delivery
+(optimization, reduces latency). This complements any native Linear/Jira GitHub integration.
+"Done" is what unblocks the next step.
 
 ---
 
@@ -143,10 +144,10 @@ soft per roll-up. It scans only feature nodes completed in a recent window to st
 1. Label the tree `AI-Implement` (whole tree at once is fine — the gates sequence it).
 2. Leaves with no blockers dispatch: **plan → (auto-approve) → implement → PR** into their
    parent's feature branch. The cascade branches are created on the first leaf dispatch.
-3. A human merges each leaf PR → Linear marks the leaf **Done** → any blocked sibling
+3. A human merges each leaf PR → the orchestrator marks the leaf **Done** (via poll detector + webhook) → any blocked sibling
    unblocks and runs.
 4. When a feature node's children are all Done, its **own closing work** dispatches → PR
-   into its own feature branch → human merges → node Done.
+   into its own feature branch → human merges → orchestrator marks node Done.
 5. The **merge-up** rolls each completed feature node's branch up into its parent's branch
    (direct merge). The top node's branch is offered as a `feature → base` PR.
 6. A human reviews and merges that final PR. The whole tree lands on the base branch.

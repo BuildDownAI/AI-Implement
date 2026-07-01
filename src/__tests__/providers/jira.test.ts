@@ -257,6 +257,16 @@ describe("JiraProvider lifecycle status setters", () => {
     expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Plan Approved");
   });
 
+  it("markMerged sets status to Merged (single-mapping shortcut)", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(okEmpty());
+    const p = makeProvider({ cacheScope: "c-merged", mappings: { "acme/x": jiraMapping() } });
+    await p.markMerged("10001");
+    // The last fetch must be a PUT to the issue's field with value "Merged"
+    expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Merged");
+  });
+
   it("multi-mapping markPlanComplete looks up scopeKey from the issue's repo field", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields (first .fields() call)

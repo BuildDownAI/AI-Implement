@@ -81,6 +81,9 @@ export interface TicketingProvider {
   markPrReady(issueId: string, prUrl: string): Promise<void>;
   markImplementationFailed(issueId: string, reason: string): Promise<void>;
   clearWorkingState(issueId: string): Promise<void>;
+  /** Move the issue to a completed state after its PR merged. Idempotent:
+   *  no-op when the issue is already completed/cancelled. */
+  markMerged(issueId: string): Promise<void>;
 
   // Communication
   postComment(issueId: string, body: string): Promise<void>;

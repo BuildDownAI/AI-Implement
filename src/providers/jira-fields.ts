@@ -74,6 +74,7 @@ export const STATUS_VALUES = {
   APPROVED: "Plan Approved",
   IMPLEMENTING: "Implementing",
   PR_READY: "PR Ready",
+  MERGED: "Merged",
   PLANNING_FAILED: "Planning Failed",
   IMPLEMENTATION_FAILED: "Implementation Failed",
 } as const;

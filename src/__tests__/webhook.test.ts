@@ -337,6 +337,41 @@ describe("reconciliation enqueue", () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).queued).toBe(true);
   });
+
+  it("does not enqueue a second reconciliation row on a redelivered merged-PR webhook", async () => {
+    log.appendLog({ issueId: "issue-4", issueIdentifier: "AII-77", repo: "org/repo" });
+
+    const payload = {
+      action: "closed",
+      pull_request: {
+        number: 77,
+        merged: true,
+        html_url: "https://github.com/org/repo/pull/77",
+        head: { ref: "AII-77/add-feature" },
+        merge_commit_sha: "sha-dedup",
+      },
+      repository: { full_name: "org/repo" },
+    };
+
+    // First delivery — should enqueue
+    const { req: req1, res: res1 } = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(req1 as never, res1 as never, SECRET);
+    await res1.done;
+    expect(res1.statusCode).toBe(200);
+    expect(JSON.parse(res1.body).queued).toBe(true);
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
+
+    // Second delivery (redelivery) — should be ignored, no new row
+    const { req: req2, res: res2 } = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(req2 as never, res2 as never, SECRET);
+    await res2.done;
+    expect(res2.statusCode).toBe(200);
+    const body2 = JSON.parse(res2.body);
+    expect(body2.ignored).toBe(true);
+    expect(body2.reason).toBe("already queued");
+    // Queue must still have exactly one row
+    expect(reconciliation.getPendingReconciliations()).toHaveLength(1);
+  });
 });
 
 // ---------- Reconciliation queue ----------

@@ -797,6 +797,77 @@ describe("LinearProvider.markImplementationFailed", () => {
   });
 });
 
+describe("LinearProvider.markMerged", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it("moves a started issue to Done and drops the Ready for Review label", async () => {
+    // 1. fetch issue state, team key, and labels
+    mockJsonOnce({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }] } } });
+    // 2. getTeamIdByKey
+    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
+    // 3. getCompletedStateId: workflowStates query
+    mockJsonOnce({ workflowStates: { nodes: [{ id: "s-rel", name: "Released", type: "completed" }, { id: "s-done", name: "Done", type: "completed" }] } });
+    // 4. issueUpdate: move state + drop label
+    mockJsonOnce({ issueUpdate: { success: true } });
+
+    const p = new LinearProvider({ linearApiKey: "k", linearWorkspaceUrl: "https://linear.app/acme" });
+    await p.markMerged("issue-1");
+
+    expect(fetch).toHaveBeenCalledTimes(4);
+    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
+    expect(updateBody.variables).toMatchObject({ issueId: "issue-1", stateId: "s-done", labelIds: ["L2"] });
+  });
+
+  it("no-ops when the issue is already completed", async () => {
+    mockJsonOnce({ issue: { state: { type: "completed" }, team: { key: "ENG" }, labels: { nodes: [] } } });
+
+    const p = new LinearProvider({ linearApiKey: "k" });
+    await p.markMerged("issue-1");
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("no-ops when the issue is already canceled", async () => {
+    mockJsonOnce({ issue: { state: { type: "canceled" }, team: { key: "ENG" }, labels: { nodes: [] } } });
+
+    const p = new LinearProvider({ linearApiKey: "k" });
+    await p.markMerged("issue-1");
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the first completed state when none is named Done", async () => {
+    // 1. fetch issue state, team key, labels
+    mockJsonOnce({ issue: { state: { type: "unstarted" }, team: { key: "ENG" }, labels: { nodes: [] } } });
+    // 2. getTeamIdByKey
+    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
+    // 3. workflowStates — only "Shipped", no "Done"
+    mockJsonOnce({ workflowStates: { nodes: [{ id: "s-shipped", name: "Shipped", type: "completed" }] } });
+    // 4. issueUpdate
+    mockJsonOnce({ issueUpdate: { success: true } });
+
+    const p = new LinearProvider({ linearApiKey: "k" });
+    await p.markMerged("issue-1");
+
+    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
+    expect(updateBody.variables.stateId).toBe("s-shipped");
+  });
+
+  it("keeps all labels except Ready for Review", async () => {
+    mockJsonOnce({ issue: { state: { type: "started" }, team: { key: "ENG" }, labels: { nodes: [{ id: "L1", name: "Ready for Review" }, { id: "L2", name: "bug" }, { id: "L3", name: "AI-Implement" }] } } });
+    mockJsonOnce({ teams: { nodes: [{ id: "team-uuid", key: "ENG" }] } });
+    mockJsonOnce({ workflowStates: { nodes: [{ id: "s-done", name: "Done", type: "completed" }] } });
+    mockJsonOnce({ issueUpdate: { success: true } });
+
+    const p = new LinearProvider({ linearApiKey: "k" });
+    await p.markMerged("issue-1");
+
+    const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
+    expect(updateBody.variables.labelIds).toEqual(["L2", "L3"]);
+  });
+});
+
 describe("LinearProvider.issueUrl", () => {
   it("uses linearWorkspaceUrl when provided", () => {
     const p = new LinearProvider({ linearApiKey: "k", linearWorkspaceUrl: "https://linear.app/acme" });

@@ -50,6 +50,27 @@ export function enqueueReconciliation(entry: {
   return Number(result.lastInsertRowid);
 }
 
+export function hasReconciliationForPr(repo: string, prNumber: number): boolean {
+  const row = getDb()
+    .prepare("SELECT 1 FROM reconciliation_queue WHERE repo = ? AND pr_number = ? LIMIT 1")
+    .get(repo, prNumber);
+  return row !== undefined;
+}
+
+export function recordReconciliationTombstone(entry: {
+  issueId: string;
+  issueIdentifier: string | null;
+  prNumber: number;
+  repo: string;
+}): number {
+  const result = getDb()
+    .prepare(
+      "INSERT INTO reconciliation_queue (issue_id, issue_identifier, pr_number, repo, merge_commit_sha, status, created_at) VALUES (?, ?, ?, ?, '', 'skipped', ?)",
+    )
+    .run(entry.issueId, entry.issueIdentifier ?? null, entry.prNumber, entry.repo, Date.now());
+  return Number(result.lastInsertRowid);
+}
+
 export function getPendingReconciliations(): ReconciliationJob[] {
   return (
     getDb()
