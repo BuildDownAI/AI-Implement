@@ -30,6 +30,7 @@ function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false,
     planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
     ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
+    maxTurns: null, maxIterations: null, maxJobMinutes: null, branchPrefix: null, skillsRepo: null,
     ...overrides,
   };
 }
