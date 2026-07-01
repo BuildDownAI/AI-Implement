@@ -4,6 +4,23 @@
 
 A Node.js service that polls Linear for issues labeled "AI-Implement" and dispatches GitHub Actions workflows that run Claude Code to implement them. It also provides an admin UI and manages workflow templates synced to target repos.
 
+## Issue tracker — Linear (BuildDown skills)
+
+Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, etc.):
+
+- tracker.kind: linear
+- MCP server: `linear-eudoxus` (project `.mcp.json`; pre-approved in `.claude/settings.json`)
+- Workspace: `eudoxus` (bound at OAuth time)
+- Team: `AII`  ← issues filed/listed/searched against this team
+- Team URL: https://linear.app/eudoxus/team/AII/overview
+- GitHub repo (PRs land here): `BuildDownAI/AI-Implement`
+- Implement label: `AI-Implement` (orchestrator pickup trigger)
+- Agent mention (PR comment re-trigger): `/ai-implement`
+
+> Note: a separate global `claude.ai Linear` connector is authenticated to the **oolidata** workspace.
+> `linear-eudoxus` is a distinctly-named project server with its own token on **eudoxus**, so the two
+> never collide.
+
 ## Architecture
 
 ```
@@ -41,6 +58,7 @@ workflows/          — templates synced to target repos
   claude-plan.yml   — planning workflow template (always synced)
   WORKFLOW.md       — Claude implementation prompt template (seeded once)
   PLANNING.md       — Claude planning prompt template (seeded once)
+  custom/           — repo-local override scaffold seeded once (README + .gitkeep placeholders)
 
 clients/            — one .toml per deployed client
   example-client.toml  — copy this to onboard a new client
@@ -110,13 +128,20 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 
 ## Adding a new target repo
 
-1. Add the team→repo mapping in the admin UI at `/admin`
-2. Install the GitHub App on the target repo
-3. Click **Sync workflows** on that project row — the orchestrator opens or updates a PR in the target repo with workflow files and starter prompt templates
-4. Merge the PR in the target repo
-5. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
+1. Add the project mapping in the admin UI at `/admin` — the **New project** stepper (or **Edit** on an existing row). On the **Source** step, enter the owner/repo and click **Check installation**: the stepper probes whether the GitHub App is installed and can see the repo, and links straight to the fix when it can't —
+   - **App not installed** → "Install the App" (GitHub's install flow; org members who aren't owners get GitHub's "request the owner to install" path),
+   - **Repo not selected** → "Add this repo" (same install flow — adjusts the install's selected-repositories set),
+   - **Ready** → green confirmation.
 
-The GitHub App must have **workflows** permission in addition to **contents** permission. GitHub rejects writes under `.github/workflows/` without it, so the Sync workflows action will fail before opening or updating the target-repo PR.
+   Use **Re-check** after installing/adding in the opened tab. The check is advisory — you can still save without it.
+2. **Save.** The mapping persists immediately, and the workflow sync runs in the background. The project row's Sync button shows **"Syncing…"**, then polls a status endpoint to a terminal state: **"Workflows synced — PR opened ↗"** (or a transient "Up to date"), or it reverts with an alert naming the failure (App not installed, permission denied, clock skew, …). The mapping is saved regardless of how the sync resolves.
+3. Merge the sync PR in the target repo
+4. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
+
+The **Sync workflows** button on each project row re-runs the sync manually at any time, and `.github/workflows/sync-workflow.yml` remains as a manual/bulk fallback. If the orchestrator restarts mid-sync, the poll loop reclaims the orphaned job after a short stale window and finishes it.
+
+The GitHub App must have **Workflows** permission in addition to **Contents** permission. GitHub rejects writes under `.github/workflows/` without it, so the sync will fail (surfaced as a "permission denied" message) before opening or updating the target-repo PR.
+
 
 ## admin-ui
 
@@ -148,7 +173,7 @@ The 14 not-yet-implemented routes (`overview`, `issues`, `pulls`, `blockers`, `p
 `workflows/claude-implement.yml` is the main implementation workflow synced to target repos. It supports:
 - **WORKFLOW.md** — per-repo Claude prompt template; front matter carries `model:` (required for bedrock, defaults to `claude-sonnet-4-6` for anthropic) and optional `gap_analysis_model:`
 - **Gap analysis** — secondary Claude invocation after each PR
-- **Comment trigger** — `/ai-implement` on a PR kicks off a gap-fill run
+- **Comment trigger** — a PR comment that **starts with** `/ai-implement` kicks off a gap-fill run. Any text after the token (single- or multi-line) is forwarded to the run as an **authoritative operator instruction**: it is base64-passed through a `comment_instruction` workflow output to `AI_IMPLEMENT_COMMENT_INSTRUCTION`, and the runner appends it to the gap-fill prompt as an "Operator instruction for this run" block that takes precedence over the default gap-fill behavior where they conflict. Bare `/ai-implement` behaves exactly as before. `/ai-implementfoo` and comments that merely contain the token mid-text do not fire. Takes effect only after the target repo re-syncs `comment-trigger.yml` and runs an updated runner image.
 - **Triple auth** — bedrock (when orchestrator sets `provider=bedrock`), OAuth (`CLAUDE_CODE_OAUTH_TOKEN`), or API key (`ANTHROPIC_API_KEY`)
 - **setup / verify / teardown hooks** — `WORKFLOW.md` front-matter keys `setup:` / `verify:` / `teardown:` are paths (relative to repo root) to shell scripts that the runner now executes: `setup` before the implement loop (its failure aborts the run early), `verify` after a successful push, and `teardown` always (even on failure, via a `finally` in the runner). Scripts run with `set -euo pipefail`; env vars a setup script appends via `echo "VAR=value" >> "$GITHUB_ENV"` are visible to Claude and to the verify/teardown scripts (the runner manages `$GITHUB_ENV` across all execution modes). Repos with no hooks behave exactly as before.
 
@@ -164,7 +189,7 @@ Each project's mapping carries three optional caps, editable in the `/admin` Pro
 
 `maxTurns`/`maxIterations` reach the runner as `workflow_dispatch` inputs (GHA) or runner env (Fly/local); `maxJobMinutes` is a GHA-only `job_timeout_minutes` dispatch input. The orchestrator only **sends** a cap input when it is set on the mapping, so a project's target repo must have **re-synced `claude-implement.yml`** before you set caps — otherwise GitHub rejects the dispatch with "unexpected inputs". Caps also apply to gap-fill and review-feedback re-dispatches, not just the initial run.
 
-`/ai-implement` comment-triggered gap-fill runs bypass the orchestrator, so they read caps from target-repo **variables** instead (mirroring `AI_IMPLEMENT_PROVIDER`): set `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, and `AI_IMPLEMENT_MAX_JOB_MINUTES` (Settings → Secrets and variables → Actions → Variables) to cap those runs too.
+`/ai-implement` comment-triggered gap-fill runs bypass the orchestrator, so they read caps from target-repo **variables** instead (mirroring `AI_IMPLEMENT_PROVIDER`): set `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, and `AI_IMPLEMENT_MAX_JOB_MINUTES` (Settings → Secrets and variables → Actions → Variables) to cap those runs too. Set `AI_IMPLEMENT_SKILLS_REPO` (same location) to mirror the per-project admin UI skills field for `/ai-implement` gap-fill runs; takes effect only after the target repo re-syncs `comment-trigger.yml`.
 
 ### Per-project branch prefix (admin UI)
 
@@ -189,7 +214,7 @@ Set it as a repository or organization **variable** (Settings → Secrets and va
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
 
-The Projects page **Sync workflows** action always syncs `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml` into the target repo. It seeds `WORKFLOW.md` and `PLANNING.md` once and never overwrites them (each repo owns its own prompt templates after initial setup). `.github/workflows/sync-workflow.yml` remains as a manual fallback, but normal distribution should happen from the orchestrator.
+The Projects page **Sync workflows** action always syncs `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml` into the target repo. It seeds `WORKFLOW.md`, `PLANNING.md`, and the `custom/` scaffold (`custom/README.md` plus `.gitkeep` placeholders for `custom/steps/`, `custom/pipelines/`, `custom/providers/`) once, and never overwrites them (each repo owns its prompt templates and customizations after initial setup). `.github/workflows/sync-workflow.yml` remains as a manual fallback, but normal distribution should happen from the orchestrator.
 
 ### Model IDs are passed through verbatim
 
@@ -294,7 +319,9 @@ The `github-actions` allowlist auto-trusts `ghcr.io/builddownai/` and the repo o
 
 The image must be publicly pullable. The customer owns building and publishing it. If `.ai-implement/image.yml` is absent, malformed, or points at an unreachable reference, resolution falls through to the next ladder rung.
 
-This resolution applies to **both** execution modes. On the Fly Machines path the orchestrator boots the session machine on the resolved image directly. On the GitHub Actions path the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-implement.yml` (which runs it as the job's `container.image`) — but only when the choice is explicit: a per-repo `.ai-implement/image.yml` override, or an explicitly-set `SESSION_IMAGE`. When neither is set the orchestrator sends no `runner_image`, so the workflow keeps its own resolution order (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in `:latest` default) and repos that pin via that variable are not overridden. Planning runs (`claude-plan.yml`) have no runner container and are unaffected.
+This resolution applies to **both** execution modes. On the Fly Machines path the orchestrator boots the session machine on the resolved image directly. On the GitHub Actions path the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-implement.yml` (which runs it as the job's `container.image`) — but only when the choice is explicit: a per-repo `.ai-implement/image.yml` override, or an explicitly-set `SESSION_IMAGE`. When neither is set the orchestrator sends no `runner_image`, so the workflow keeps its own resolution order (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in `:latest` default) and repos that pin via that variable are not overridden.
+
+Planning runs (`claude-plan.yml`) now run on the same runner container and honor the **same** resolution: the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-plan.yml` under the identical "only when explicit" rule, so a testing orchestrator pinned to `:next` steers planning to `:next` and a per-repo `.ai-implement/image.yml` pin is honored for planning too. (Unlike `claude-implement.yml`, `claude-plan.yml`'s own validate step does not read `image.yml`, so orchestrator-forwarding is the only path by which GHA planning picks up either — and a target repo must have **re-synced `claude-plan.yml`** before the orchestrator will forward `runner_image` to it, otherwise GitHub rejects the dispatch with "unexpected inputs", the same caveat as the run-caps and branch-prefix inputs.)
 
 The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
 

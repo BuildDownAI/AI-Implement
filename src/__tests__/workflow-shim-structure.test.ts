@@ -200,11 +200,18 @@ describe("GHA workflow shims", () => {
     });
   }
 
-  it("comment trigger only runs implementation for an exact trimmed /ai-implement command", () => {
+  it("comment trigger fires on a /ai-implement prefix and passes the remainder as an instruction", () => {
     const yaml = readFileSync("workflows/comment-trigger.yml", "utf-8");
+    // Anchored prefix match — not a `contains()` check and not exact-equality.
     expect(yaml).not.toMatch(/contains\([^)]*\/ai-implement/);
-    expect(yaml).toMatch(/body\.trim\(\) === "\/ai-implement"/);
+    expect(yaml).not.toMatch(/body\.trim\(\) === "\/ai-implement"/);
+    expect(yaml).toContain("/^\\/ai-implement(?:\\s+([\\s\\S]*))?$/");
     expect(yaml).toMatch(/if:\s*needs\.check-trigger\.outputs\.matched == 'true'/);
+    // Remainder is base64-encoded and plumbed through to the runner.
+    expect(yaml).toContain('Buffer.from(instruction, "utf-8").toString("base64")');
+    expect(yaml).toMatch(/comment_instruction:\s*\$\{\{\s*steps\.trigger\.outputs\.comment_instruction\s*\}\}/);
+    expect(yaml).toMatch(/COMMENT_INSTRUCTION_B64:\s*\$\{\{\s*needs\.check-trigger\.outputs\.comment_instruction\s*\}\}/);
+    expect(yaml).toContain('export AI_IMPLEMENT_COMMENT_INSTRUCTION=$(echo "$COMMENT_INSTRUCTION_B64" | base64 -d)');
   });
 
   it("comment trigger allows maintainers and preserves the intended missing metadata error", () => {
@@ -294,15 +301,42 @@ describe("GHA workflow shims", () => {
     it(`${f} does not allow Claude to curl Linear directly`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).not.toMatch(/Bash\(curl\*api\.linear\.app\/graphql\*\)/);
-      expect(yaml).toMatch(/Do NOT post comments directly to the/);
+    });
+  }
+
+  for (const f of PLANNING_WORKFLOWS) {
+    it(`${f} has a validate-runner-image job that the plan job depends on`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/validate-runner-image:/);
+      expect(yaml).toMatch(/needs:\s*validate-runner-image/);
+      expect(yaml).toMatch(/image:\s*\$\{\{\s*needs\.validate-runner-image\.outputs\.runner_image\s*\}\}/);
+      expect(yaml).toMatch(/ghcr\.io\/builddownai\/ai-implement-runner:latest/);
+      expect(yaml).toMatch(/invalid characters for a container image reference/);
+      expect(yaml).toMatch(/AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>/);
     });
 
-    it(`${f} uses default bash pipefail and glob iteration for callback comments`, () => {
+    it(`${f} sets RUNNER_PHASE: planning in the entrypoint env and ends with entrypoint.sh`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).not.toMatch(/shell:\s*\/usr\/bin\/bash -e \{0\}/);
-      expect(yaml).toMatch(/shopt -s nullglob/);
-      expect(yaml).toMatch(/for f in ai-output\/comments\/\*\.md; do/);
-      expect(yaml).not.toMatch(/for f in \$\(ls ai-output\/comments\/\*\.md/);
+      expect(yaml).toMatch(/RUNNER_PHASE:\s*planning/);
+      expect(yaml).toMatch(/\/opt\/ai-implement\/entrypoint\.sh/);
+    });
+
+    it(`${f} contains no anthropics/claude-code-action`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/anthropics\/claude-code-action/);
+    });
+
+    it(`${f} wires runner_callback_url and run_token to the entrypoint env`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/RUNNER_CALLBACK_URL:\s*\$\{\{\s*inputs\.runner_callback_url\s*\}\}/);
+      expect(yaml).toMatch(/RUN_TOKEN:\s*\$\{\{\s*inputs\.run_token\s*\}\}/);
+    });
+
+    it(`${f} wires bedrock configure-aws-credentials guarded by provider == 'bedrock'`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/configure-aws-credentials/);
+      expect(yaml).toMatch(/if:\s*inputs\.provider == 'bedrock'/);
+      expect(yaml).toMatch(/role-session-duration:\s*14400/);
     });
   }
 });

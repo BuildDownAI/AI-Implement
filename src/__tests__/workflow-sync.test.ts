@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import type { RepoMapping } from "../config.js";
-import { syncWorkflowTemplates } from "../workflow-sync.js";
+import { syncWorkflowTemplates, classifySyncError } from "../workflow-sync.js";
+import { GitHubApiError } from "../github-errors.js";
 
 const mapping: RepoMapping = {
   owner: "acme",
@@ -46,6 +47,14 @@ function makeTemplatesRoot(): string {
   writeFileSync(join(tempRoot, "workflows/WORKFLOW.md"), "workflow-md\n");
   writeFileSync(join(tempRoot, "workflows/PLANNING.md"), "planning-md\n");
   return tempRoot;
+}
+
+function addCustomTemplates(root: string): void {
+  for (const dir of ["steps", "pipelines", "providers"]) {
+    mkdirSync(join(root, "workflows/custom", dir), { recursive: true });
+    writeFileSync(join(root, "workflows/custom", dir, ".gitkeep"), "");
+  }
+  writeFileSync(join(root, "workflows/custom/README.md"), "custom-readme\n");
 }
 
 interface FakePull {
@@ -437,5 +446,64 @@ describe("syncWorkflowTemplates", () => {
     });
 
     expect(result.syncBranch).toBe("sync/ai-implement");
+  });
+
+  it("seeds the custom/ scaffold (README + .gitkeep placeholders) on a fresh repo", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    addCustomTemplates(templatesRoot);
+    const fake = makeGithubFetch();
+
+    const result = await syncWorkflowTemplates({
+      mapping, githubAppId: "app-id", githubAppPrivateKey: "private-key",
+      templatesRoot, fetchImpl: fake.fetchImpl, getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.changedFiles).toContain("custom/README.md");
+    expect(result.changedFiles).toContain("custom/steps/.gitkeep");
+    expect(result.changedFiles).toContain("custom/pipelines/.gitkeep");
+    expect(result.changedFiles).toContain("custom/providers/.gitkeep");
+    expect(fake.branches["sync/ai-implement"].files["custom/README.md"]).toBe("custom-readme\n");
+  });
+
+  it("does not overwrite custom/README.md when it already exists on base", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    addCustomTemplates(templatesRoot);
+    const fake = makeGithubFetch({ mainFiles: { "custom/README.md": "repo-owned\n" } });
+
+    const result = await syncWorkflowTemplates({
+      mapping, githubAppId: "app-id", githubAppPrivateKey: "private-key",
+      templatesRoot, fetchImpl: fake.fetchImpl, getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.changedFiles).not.toContain("custom/README.md");
+    expect(fake.branches["sync/ai-implement"].files["custom/README.md"]).toBe("repo-owned\n");
+  });
+});
+
+describe("classifySyncError", () => {
+  it("repo-not-found for a 404 on the bare repo path", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 404, path: "/repos/acme/app" })).category).toBe("repo-not-found");
+  });
+
+  it("app-not-installed for a 404 on an installation path", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 404, path: "/users/acme/installation" })).category).toBe("app-not-installed");
+  });
+
+  it("clock-skew-suspected for a 401 (never app-not-installed)", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 401, path: "/orgs/acme/installation" })).category).toBe("clock-skew-suspected");
+  });
+
+  it("permission-denied for a 403 on a contents path", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 403, path: "/repos/acme/app/contents/.github/workflows/claude-implement.yml" })).category).toBe("permission-denied");
+  });
+
+  it("unknown for a 404 on a non-repo, non-installation path", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 404, path: "/repos/acme/app/contents/WORKFLOW.md" })).category).toBe("unknown");
+  });
+  
+  it("unknown with the raw message for a non-GitHubApiError", () => {
+    const r = classifySyncError(new Error("boom"));
+    expect(r.category).toBe("unknown");
+    expect(r.message).toBe("boom");
   });
 });

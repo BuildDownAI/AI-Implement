@@ -88,6 +88,16 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "install-skills":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          skillsRepoUrl: ctx.data.skillsRepo ?? "",
+          githubToken: ctx.getOutputs("clone").githubToken,
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.skillsRepo,
+      };
+
     case "install":
       return {
         ...step,

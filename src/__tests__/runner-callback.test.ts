@@ -8,6 +8,7 @@ import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import type * as StepLogModule from "../step-log.js";
 import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
+import { formatFailureComment } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { Step } from "../pipeline/types.js";
@@ -707,6 +708,95 @@ describe("handleRunnerResult — expired token", () => {
     });
     expect(res.status).toBe(401);
     expect(res.body.error).toBe("expired");
+  });
+});
+
+// ── formatFailureComment ──────────────────────────────────────────────────────
+
+describe("formatFailureComment", () => {
+  it("returns the raw reason when no failureCode is provided", () => {
+    expect(formatFailureComment(undefined, "tests fail")).toBe("tests fail");
+  });
+
+  it("returns 'unspecified' when both are undefined", () => {
+    expect(formatFailureComment(undefined, undefined)).toBe("unspecified");
+  });
+
+  it("formats SENSITIVE_FILES_BLOCKED with a structured comment", () => {
+    const msg = formatFailureComment("SENSITIVE_FILES_BLOCKED", "Push blocked: 1 sensitive file(s):\n  .env  (.env file)");
+    expect(msg).toContain("🔒");
+    expect(msg).toContain("Blocked by security guardrail");
+    expect(msg).toContain(".env");
+    expect(msg).toContain(".gitignore");
+  });
+
+  it("formats SENSITIVE_FILES_BLOCKED even when failureReason is undefined", () => {
+    const msg = formatFailureComment("SENSITIVE_FILES_BLOCKED", undefined);
+    expect(msg).toContain("🔒");
+    expect(msg).toContain("Blocked by security guardrail");
+  });
+
+  it("passes unknown failure codes through as raw reason", () => {
+    expect(formatFailureComment("SOME_OTHER_CODE", "some error")).toBe("some error");
+  });
+});
+
+describe("handleRunnerResult — SENSITIVE_FILES_BLOCKED failure code", () => {
+  it("formats the comment with the security guardrail message and passes it to markImplementationFailed", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "Push blocked: 1 sensitive file(s) would be committed:\n  .env  (.env file)",
+        failureCode: "SENSITIVE_FILES_BLOCKED",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
+    expect(call).toBeDefined();
+    const [issueId, comment] = call!.args as [string, string];
+    expect(issueId).toBe("i");
+    expect(comment).toContain("🔒");
+    expect(comment).toContain("Blocked by security guardrail");
+    expect(comment).toContain(".env");
+  });
+
+  it("does not use the security guardrail format for other failures without failureCode", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "compilation error",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
+    const [, comment] = call!.args as [string, string];
+    expect(comment).toBe("compilation error");
+    expect(comment).not.toContain("🔒");
   });
 });
 

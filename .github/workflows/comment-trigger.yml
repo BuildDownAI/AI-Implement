@@ -15,6 +15,7 @@
 #   AI_IMPLEMENT_MAX_TURNS       - Cap on Claude turns per implement pass (default 50).
 #   AI_IMPLEMENT_MAX_ITERATIONS  - Cap on implement/review iterations (default: bedrock 2 / anthropic 3).
 #   AI_IMPLEMENT_MAX_JOB_MINUTES - Per-project job timeout in minutes (default 90).
+#   AI_IMPLEMENT_SKILLS_REPO     - Skills repo (owner/repo) to clone and install; mirrors the per-project admin UI skills field.
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
@@ -38,6 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matched: ${{ steps.trigger.outputs.matched }}
+      comment_instruction: ${{ steps.trigger.outputs.comment_instruction }}
       pr_number: ${{ steps.pr.outputs.pr_number }}
       issue_meta: ${{ steps.pr.outputs.issue_meta }}
       default_branch: ${{ steps.pr.outputs.default_branch }}
@@ -53,11 +55,18 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
         with:
           script: |
-            const body = context.payload.comment.body ?? "";
-            const matched = body.trim() === "/ai-implement";
+            const body = (context.payload.comment.body ?? "").trim();
+            const m = body.match(/^\/ai-implement(?:\s+([\s\S]*))?$/);
+            const matched = m !== null;
             core.setOutput("matched", matched ? "true" : "false");
             if (!matched) {
-              core.info("Ignoring comment because it is not exactly /ai-implement");
+              core.info("Ignoring comment: does not start with /ai-implement");
+              core.setOutput("comment_instruction", "");
+            } else {
+              const instruction = (m[1] ?? "").trim();
+              // base64 so an arbitrary / multi-line instruction survives the job output,
+              // mirroring the issue_description_b64 technique used elsewhere in this workflow.
+              core.setOutput("comment_instruction", Buffer.from(instruction, "utf-8").toString("base64"));
             }
 
       - name: Auth check (write, maintain, or admin)
@@ -244,11 +253,13 @@ jobs:
           GITHUB_DEFAULT_BRANCH: ${{ needs.check-trigger.outputs.default_branch }}
           PR_NUMBER: ${{ needs.check-trigger.outputs.pr_number }}
           RUNNER_PHASE: gap-analysis
+          COMMENT_INSTRUCTION_B64: ${{ needs.check-trigger.outputs.comment_instruction }}
           ISSUE_META: ${{ needs.check-trigger.outputs.issue_meta }}
           PROVIDER: ${{ needs.check-trigger.outputs.provider }}
           AI_IMPLEMENT_MAX_TURNS: ${{ needs.check-trigger.outputs.max_turns }}
           AI_IMPLEMENT_MAX_ITERATIONS: ${{ needs.check-trigger.outputs.max_iterations }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
+          AI_IMPLEMENT_SKILLS_REPO: ${{ vars.AI_IMPLEMENT_SKILLS_REPO }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
@@ -257,4 +268,5 @@ jobs:
           # jq @sh quotes values before this eval.
           eval "$(echo "$ISSUE_META" | jq -r 'to_entries[] | select(.key | IN("issue_id", "issue_identifier", "issue_title", "issue_description_b64")) | "export \(.key | ascii_upcase)=\(.value | @sh)"')"
           export ISSUE_DESCRIPTION=$(echo "$ISSUE_DESCRIPTION_B64" | base64 -d)
+          export AI_IMPLEMENT_COMMENT_INSTRUCTION=$(echo "$COMMENT_INSTRUCTION_B64" | base64 -d)
           /opt/ai-implement/entrypoint.sh

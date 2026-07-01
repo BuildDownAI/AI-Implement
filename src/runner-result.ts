@@ -44,6 +44,8 @@ export async function postRunnerResult(params: {
   outcome: "success" | "failure";
   prUrl?: string;
   failureReason?: string;
+  /** Machine-readable code set when a known guardrail trips (e.g. "SENSITIVE_FILES_BLOCKED"). */
+  failureCode?: string;
   fetchImpl?: typeof fetch;
 }): Promise<void> {
   const callbackUrl = process.env.RUNNER_CALLBACK_URL;
@@ -62,6 +64,7 @@ export async function postRunnerResult(params: {
   const body: Record<string, unknown> = { phase: params.phase, outcome: params.outcome, comments };
   if (params.prUrl) body.prUrl = params.prUrl;
   if (params.failureReason) body.failureReason = params.failureReason;
+  if (params.failureCode) body.failureCode = params.failureCode;
   const fetchFn = params.fetchImpl ?? fetch;
   try {
     const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {

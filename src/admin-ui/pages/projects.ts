@@ -126,6 +126,11 @@ export const projectsHtml = `
           <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" step="1" placeholder="3"></div>
           <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
           <div class="md-field"><label>Branch Prefix <span class="text-tertiary" style="font-size:0.85em">(blank = none)</span></label><input id="md-branch-prefix" placeholder="pr"></div>
+          <div class="md-field">
+            <label>Skills Repo <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <input id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
+            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+          </div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -186,7 +191,7 @@ export const projectsHtml = `
       <div id="md-error" class="error hidden" style="margin-bottom:8px"></div>
       <div style="display:flex;gap:8px;justify-content:flex-end">
         <button class="btn btn-ghost" onclick="closeMappingDialog()">Cancel</button>
-        <button class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
+        <button id="md-save" class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
       </div>
     </div>
   </dialog>
@@ -215,6 +220,10 @@ export const projectsScript = `
     for (const [key, m] of Object.entries(mappingsData)) {
       const tr = document.createElement('tr');
       const ek = window.esc(key);
+      const recent = recentSync[key];
+      const syncCell = (recent && recent.prUrl)
+        ? '<a class="btn btn-sm btn-ghost" href="' + window.esc(recent.prUrl) + '" target="_blank" rel="noopener noreferrer" title="Workflow sync PR (just created)">Workflows synced — PR opened &#8599;</a> '
+        : '<button class="btn btn-sm btn-ghost" data-sync-btn data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> ';
       const execBadge = m.executionMode === 'fly-machines'
         ? '<span class="badge info">fly</span>'
         : '<span class="badge neutral">gha</span>';
@@ -240,7 +249,7 @@ export const projectsScript = `
           + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
           + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
           + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
-          + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> '
+          + syncCell
           + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
         + '</td>';
       tbody.appendChild(tr);
@@ -275,6 +284,7 @@ export const projectsScript = `
     document.getElementById('md-max-iter').value = m.maxIterations == null ? '' : String(m.maxIterations);
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
     document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
+    document.getElementById('md-skills-repo').value = m.skillsRepo || '';
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -576,6 +586,7 @@ export const projectsScript = `
       maxIterations: (function(){ var v = document.getElementById('md-max-iter').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
       maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
       branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
+      skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
@@ -624,15 +635,22 @@ export const projectsScript = `
       return;
     }
 
+    const saveBtn = document.getElementById('md-save');
+    const origSaveLabel = saveBtn ? saveBtn.textContent : '';
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
+
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
+    let data = {};
+    try { data = await res.json(); } catch (_) {}
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = origSaveLabel; }
     if (!res.ok) {
-      const msg = await res.text().catch(() => 'Unknown error');
-      errEl.textContent = 'Server error: ' + msg;
+      errEl.textContent = 'Server error: ' + (data.error || 'Unknown error');
       errEl.classList.remove('hidden');
       return;
     }
     closeMappingDialog();
     await loadMappings();
+    pollSyncStatus(teamKey, data.syncJobId);
   }
   window.saveMappingDialog = saveMappingDialog;
 
@@ -661,44 +679,106 @@ export const projectsScript = `
   }
   window.togglePause = togglePause;
 
+  let recentSync = {};
+  let syncPollTimers = {};
+  const SYNC_POLL_MS = 2000;
+  const SYNC_POLL_MAX_ATTEMPTS = 60; // ~2 min, then hand off to the background safety net
+
+  // Poll GET /api/mappings/:teamKey/sync-status/:jobId until the job is terminal
+  function pollSyncStatus(teamKey, jobId) {
+    if (!jobId) return;
+    stopSyncPoll(teamKey); // never run two pollers for one row
+
+    const initialBtn = findSyncBtn(teamKey);
+    if (initialBtn) { initialBtn.disabled = true; initialBtn.textContent = 'Syncing...'; }
+
+    let inFlight = false;
+    let attempts = 0;
+    syncPollTimers[teamKey] = setInterval(async function () {
+      if (inFlight) return; // a slow tick must not overlap the next one
+      inFlight = true;
+      try {
+        attempts++;
+        if (attempts > SYNC_POLL_MAX_ATTEMPTS) {
+          stopSyncPoll(teamKey);
+          await loadMappings();
+          flashRowSyncStatus(teamKey, 'Still syncing…');
+          return;
+        }
+        const res = await window.api('/api/mappings/' + encodeURIComponent(teamKey) + '/sync-status/' + jobId);
+        if (res.status === 404) { stopSyncPoll(teamKey); await loadMappings(); return; }
+        if (!res.ok) return; // transient server hiccup — retry next tick
+        const job = await res.json();
+        if (job.status === 'pending' || job.status === 'running') return; // keep waiting
+
+        stopSyncPoll(teamKey);
+        if (job.status === 'completed') {
+          noteSyncResult(teamKey, { ok: true, result: job.result });
+          await loadMappings();
+          if (!(job.result && job.result.prUrl)) flashRowSyncStatus(teamKey, 'Up to date');
+        } else { // failed
+          await loadMappings();
+          const msg = (job.error && job.error.message) || 'Workflow sync did not complete.';
+          alert(msg + ' Retry with the Sync workflows button on the project row.');
+        }
+      } catch (_) {
+        // network blip — leave the timer running for the next tick
+      } finally {
+        inFlight = false;
+      }
+    }, SYNC_POLL_MS);
+  }
+  window.pollSyncStatus = pollSyncStatus;
+  
   async function syncWorkflows(button) {
     const key = button.dataset.key;
-    const original = button.textContent;
     button.disabled = true;
     button.textContent = 'Syncing...';
     try {
-      const res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/sync-workflows', {
-        method: 'POST',
-      });
+      const res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/sync-workflows', { method: 'POST' });
       let data = {};
       try { data = await res.json(); } catch (_) {}
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to sync workflows');
-      }
-      const labels = {
-        'up-to-date': 'Up to date',
-        'pr-existing': 'PR exists',
-        'pr-opened': 'PR opened',
-        'pr-updated': 'PR updated',
-      };
-      button.textContent = labels[data.status] || 'Synced';
-      if (data.prUrl) {
-        button.dataset.prUrl = data.prUrl;
-        button.title = data.prUrl;
-        window.open(data.prUrl, '_blank', 'noopener,noreferrer');
-      }
-      setTimeout(function () {
-        button.textContent = original;
-        button.disabled = false;
-      }, 4000);
+      if (!res.ok) { throw new Error(data.error || 'Failed to start sync'); }
+      pollSyncStatus(key, data.syncJobId);
     } catch (err) {
       button.textContent = 'Sync failed';
       button.disabled = false;
       alert(err && err.message ? err.message : String(err));
-      setTimeout(function () { button.textContent = original; }, 4000);
+      setTimeout(function () { button.textContent = 'Sync workflows'; }, 4000);
     }
   }
   window.syncWorkflows = syncWorkflows;
+
+  // Ephemeral, in-memory record of the most recent auto-sync result per team
+  // - written when a mapping is created/edited AND syncing was successful
+  // - cleared on page refresh, so the row reverts to the normal button.
+  function noteSyncResult(teamKey, sync) {
+    if (sync && sync.ok && sync.result && sync.result.prUrl) {
+      recentSync[teamKey] = { prUrl: sync.result.prUrl, status: sync.result.status };
+    }
+  }
+
+  // Transiently label a project row's Sync button
+  // - used after a create/edit that returned up-to-date (i.e. no PR to link to)
+  function flashRowSyncStatus(teamKey, label) {
+    const syncButton = findSyncBtn(teamKey);
+    if (syncButton) {
+      const originalText = syncButton.textContent;
+      syncButton.textContent = label;
+      syncButton.disabled = true;
+      setTimeout(function () { syncButton.textContent = originalText; syncButton.disabled = false; }, 4000);
+    }
+  }
+
+  function findSyncBtn(teamKey) {
+    const buttons = document.querySelectorAll('#mappings-body button[data-sync-btn]');
+    for (const btn of buttons) { if (btn.dataset.key === teamKey) return btn; }
+    return null;
+  }
+
+  function stopSyncPoll(teamKey) {
+    if (syncPollTimers[teamKey]) { clearInterval(syncPollTimers[teamKey]); delete syncPollTimers[teamKey]; }
+  }
 
   async function showSecrets(teamKey) {
     currentSecretsTeam = teamKey;

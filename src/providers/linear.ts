@@ -758,6 +758,7 @@ export class LinearProvider implements TicketingProvider {
 
   async clearWorkingState(issueId: string): Promise<void> {
     await this.removeLabelByName(issueId, "AI-Working");
+    await this.removeLabelByName(issueId, "AI-Planning");
   }
   async postComment(issueId: string, body: string): Promise<void> {
     const query = `

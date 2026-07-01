@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, cancelWorkflowRun, getPullRequestState } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, cancelWorkflowRun, getPullRequestState } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -26,6 +26,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxIterations: null,
     maxJobMinutes: null,
     branchPrefix: null,
+    skillsRepo: null,
     ...overrides,
   };
 }
@@ -334,6 +335,31 @@ describe("branchPrefixRunnerEnv", () => {
   it("includes AI_IMPLEMENT_BRANCH_PREFIX when set", () => {
     expect(branchPrefixRunnerEnv(makeMapping({ branchPrefix: "pr" }))).toEqual({
       AI_IMPLEMENT_BRANCH_PREFIX: "pr",
+    });
+  });
+});
+
+describe("skillsRepoDispatchFields", () => {
+  it("returns empty object when no skills repo is set", () => {
+    expect(skillsRepoDispatchFields(makeMapping({}))).toEqual({});
+    expect(skillsRepoDispatchFields(makeMapping({ skillsRepo: null }))).toEqual({});
+  });
+
+  it("includes skills_repo when set", () => {
+    expect(skillsRepoDispatchFields(makeMapping({ skillsRepo: "org/skills" }))).toEqual({
+      skills_repo: "org/skills",
+    });
+  });
+});
+
+describe("skillsRepoRunnerEnv", () => {
+  it("returns empty object when no skills repo is set", () => {
+    expect(skillsRepoRunnerEnv(makeMapping({}))).toEqual({});
+  });
+
+  it("includes AI_IMPLEMENT_SKILLS_REPO when set", () => {
+    expect(skillsRepoRunnerEnv(makeMapping({ skillsRepo: "org/skills" }))).toEqual({
+      AI_IMPLEMENT_SKILLS_REPO: "org/skills",
     });
   });
 });

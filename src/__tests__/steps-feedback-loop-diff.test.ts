@@ -93,3 +93,74 @@ describe("getDiff generated-file exclusion", () => {
     expect(diff).not.toContain("generated/types.ts");
   });
 });
+
+describe("getDiff untracked-file inclusion", () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "diff-untracked-test-"));
+    git(repo, ["init", "-q"]);
+    git(repo, ["config", "user.email", "t@t.com"]);
+    git(repo, ["config", "user.name", "t"]);
+    writeFileSync(join(repo, ".gitignore"), "settings.local.json\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "seed"]);
+  });
+
+  afterEach(() => {
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("includes newly created untracked files as additions", () => {
+    // Simulate Claude creating a new file that has never been committed
+    mkdirSync(join(repo, "bd-project-setup"), { recursive: true });
+    writeFileSync(join(repo, "bd-project-setup/SKILL.md"), "# New skill\n");
+    const diff = getDiff(repo);
+    expect(diff).toContain("bd-project-setup/SKILL.md");
+    expect(diff).toContain("New skill");
+  });
+
+  it("includes untracked .mcp.json as an addition", () => {
+    writeFileSync(join(repo, ".mcp.json"), '{"mcpServers":{}}\n');
+    const diff = getDiff(repo);
+    expect(diff).toContain(".mcp.json");
+    expect(diff).toContain("mcpServers");
+  });
+
+  it("includes both tracked modifications and untracked new files in the same diff", () => {
+    // This is the BDS-2 failure scenario: Claude modifies a tracked file AND creates
+    // several new files in the same pass. Before the git add -N fix, only the tracked
+    // modification appeared; the new files were invisible, causing the reviewer to
+    // reject every iteration with "files are not committed".
+
+    // Tracked modification: .gitignore already exists in HEAD
+    writeFileSync(join(repo, ".gitignore"), "settings.local.json\n*.log\n");
+
+    // Untracked new files: never committed, not in HEAD at all
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    writeFileSync(join(repo, ".claude/settings.json"), '{"enabledMcpjsonServers":["linear"]}\n');
+    writeFileSync(join(repo, ".mcp.json"), '{"mcpServers":{"linear":{"type":"http","url":"https://mcp.linear.app/sse"}}}\n');
+    mkdirSync(join(repo, "bd-project-setup"), { recursive: true });
+    writeFileSync(join(repo, "bd-project-setup/SKILL.md"), "# BD Project Setup\n\nSets up the project.\n");
+
+    const diff = getDiff(repo);
+
+    // Tracked file must appear as a modification
+    expect(diff).toContain(".gitignore");
+    expect(diff).toContain("*.log");
+
+    // Each untracked file must appear as a new-file addition
+    expect(diff).toContain(".claude/settings.json");
+    expect(diff).toContain("enabledMcpjsonServers");
+    expect(diff).toContain(".mcp.json");
+    expect(diff).toContain("mcp.linear.app");
+    expect(diff).toContain("bd-project-setup/SKILL.md");
+    expect(diff).toContain("BD Project Setup");
+  });
+
+  it("does not include gitignored files", () => {
+    writeFileSync(join(repo, "settings.local.json"), '{"secret":"value"}\n');
+    const diff = getDiff(repo);
+    expect(diff).not.toContain("settings.local.json");
+  });
+});

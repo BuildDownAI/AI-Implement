@@ -12,6 +12,8 @@ export interface RunnerResultBody {
   phase: RunnerPhase;
   outcome: "success" | "failure";
   failureReason?: string;
+  /** Machine-readable error code set when a known guardrail trips (e.g. "SENSITIVE_FILES_BLOCKED"). */
+  failureCode?: string;
   comments: Array<{ body: string }>;
   prUrl?: string;
 }
@@ -46,6 +48,20 @@ export interface HandleRunnerPlanningContextInput {
 
 function bad(status: number, error: string): HandleRunnerResultOutput {
   return { status, body: { error } };
+}
+
+/**
+ * Formats the failure reason for the ticket comment. When the runner reports a
+ * known `failureCode`, uses a structured description so the ticket reader has
+ * actionable context. Falls back to the raw `failureReason` string for all
+ * other failures.
+ */
+export function formatFailureComment(failureCode: string | undefined, failureReason: string | undefined): string {
+  if (failureCode === "SENSITIVE_FILES_BLOCKED") {
+    const detail = failureReason ?? "sensitive files detected in staged changes";
+    return `🔒 Blocked by security guardrail\n\n${detail}\n\nRemove these files from the implementation or ensure they are excluded via .gitignore before re-running.`;
+  }
+  return failureReason ?? "unspecified";
 }
 
 function parseBearerToken(authorization: string | undefined): string | null {
@@ -174,7 +190,7 @@ export async function handleRunnerResult(
       try {
         await provider.markImplementationFailed(
           claims.issueId,
-          input.body.failureReason ?? "unspecified",
+          formatFailureComment(input.body.failureCode, input.body.failureReason),
         );
       } catch (err) {
         warn("markImplementationFailed", err);

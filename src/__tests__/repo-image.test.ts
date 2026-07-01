@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -229,5 +229,50 @@ describe("selectRunnerImageInput", () => {
     // built-in default), so repos that pin via that variable are not silently overridden.
     const resolved = { image: DEFAULT_IMAGE, source: "default" as const };
     expect(selectRunnerImageInput({ resolved, runnerImageExplicit: false })).toBeUndefined();
+  });
+});
+
+describe("resolveRunnerImageForDispatch", () => {
+  beforeEach(() => {
+    __clearRepoImageCacheForTests();
+  });
+
+  it("forwards a per-repo override even when the orchestrator default is implicit", async () => {
+    const fetchImpl = mockFetch(200, contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
+    const image = await resolveRunnerImageForDispatch({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: DEFAULT_IMAGE,
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+    expect(image).toBe("ghcr.io/acme/my-runner:v3");
+  });
+
+  it("forwards the orchestrator default when it is explicitly set (e.g. testing pinned to :next)", async () => {
+    const fetchImpl = mockFetch(404, null); // no per-repo override
+    const image = await resolveRunnerImageForDispatch({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
+      runnerImageExplicit: true,
+      fetchImpl,
+    });
+    expect(image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
+  });
+
+  it("forwards nothing when neither an override nor an explicit default is set", async () => {
+    const fetchImpl = mockFetch(404, null);
+    const image = await resolveRunnerImageForDispatch({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: DEFAULT_IMAGE,
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+    expect(image).toBeUndefined();
   });
 });

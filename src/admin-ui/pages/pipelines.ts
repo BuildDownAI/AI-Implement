@@ -68,10 +68,14 @@ export const pipelinesScript = `
         return makeBadge(statusClass[status] || 'neutral', label);
       }
       function execBadge(mode, runnerMode) {
-        const short = mode === 'fly-machines' ? 'fly' : mode === 'planning' ? 'plan' : 'gha';
+        const short = mode === 'fly-machines' ? 'fly' : 'gha';
         const cls = short === 'fly' ? 'info' : 'neutral';
         return makeBadge(cls, short)
-          + (short !== 'plan' && runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
+          + (runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
+      }
+      function phaseBadge(phase) {
+        const p = phase === 'planning' ? 'plan' : 'impl';
+        return makeBadge(p === 'plan' ? 'info' : 'neutral', p);
       }
 
       // Group planning + implement phases that belong to the same job:
@@ -81,12 +85,12 @@ export const pipelinesScript = `
       for (let i = 0; i < data.length; i++) {
         if (consumed.has(i)) continue;
         const e = data[i];
-        if (e.executionMode !== 'planning') {
+        if (e.phase !== 'planning') {
           const dn = e.dispatchNumber || 1;
           const planIdx = data.findIndex(function (p, j) {
             return !consumed.has(j) && j !== i &&
               p.issueId === e.issueId &&
-              p.executionMode === 'planning' &&
+              p.phase === 'planning' &&
               (p.dispatchNumber || 1) === dn - 1;
           });
           if (planIdx !== -1) {
@@ -116,7 +120,7 @@ export const pipelinesScript = `
           const dnBadge = isRedispatch
             ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn2 + '</span>'
             : '' + dn2;
-          const runnerCell = execBadge('planning') + ' <span style="color:#aaa">→</span> ' + execBadge(impl.executionMode, impl.runnerMode);
+          const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:#aaa">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
           const imageCell = impl.sessionImage
             ? '<td class="mono" title="' + window.esc(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
@@ -142,7 +146,7 @@ export const pipelinesScript = `
           const dnBadge = isRedispatch
             ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn3 + '</span>'
             : '' + dn3;
-          const runnerCell = execBadge(entry.executionMode, entry.runnerMode);
+          const runnerCell = phaseBadge(entry.phase) + ' ' + execBadge(entry.executionMode, entry.runnerMode);
           const imageCell = entry.sessionImage
             ? '<td class="mono" title="' + window.esc(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';

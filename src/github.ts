@@ -1,4 +1,5 @@
 import type { RepoMapping } from "./config.js";
+import { GitHubApiError } from "./github-errors.js";
 
 interface DispatchInputs {
   issue_id: string;
@@ -30,6 +31,8 @@ interface DispatchInputs {
   job_timeout_minutes?: string;
   /** Per-project branch-name prefix. Only forwarded when set on the mapping. */
   branch_prefix?: string;
+  /** Optional skills repo (owner/repo or git URL) forwarded to the runner. Only forwarded when set. */
+  skills_repo?: string;
   /** Public base URL the runner should POST results back to. Empty when callback disabled. */
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
@@ -126,6 +129,25 @@ export function branchPrefixRunnerEnv(mapping: RepoMapping): Record<string, stri
   return mapping.branchPrefix ? { AI_IMPLEMENT_BRANCH_PREFIX: mapping.branchPrefix } : {};
 }
 
+/**
+ * Skills-repo dispatch input for a mapping. Only included when the mapping
+ * configures a skills repo, so default repos keep dispatching to workflow
+ * templates that haven't been re-synced with the new input.
+ */
+export function skillsRepoDispatchFields(
+  mapping: RepoMapping,
+): Pick<DispatchInputs, "skills_repo"> {
+  return mapping.skillsRepo ? { skills_repo: mapping.skillsRepo } : {};
+}
+
+/**
+ * Skills-repo env var for the runner process (Fly/local execution modes),
+ * where the value arrives via container env rather than a workflow input.
+ */
+export function skillsRepoRunnerEnv(mapping: RepoMapping): Record<string, string> {
+  return mapping.skillsRepo ? { AI_IMPLEMENT_SKILLS_REPO: mapping.skillsRepo } : {};
+}
+
 export async function dispatchWorkflow(
   token: string,
   mapping: RepoMapping,
@@ -168,7 +190,12 @@ export async function getBranchSha(
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`getBranchSha(${branch}) failed: HTTP ${res.status}: ${body}`);
+    throw new GitHubApiError({
+      status: res.status,
+      path: `/repos/${owner}/${repo}/git/ref/heads/${encodedBranch}`,
+      bodyText: body,
+      message: `getBranchSha(${branch}) failed: HTTP ${res.status}: ${body}`,
+    });
   }
   const data = (await res.json()) as { object?: { sha?: unknown } };
   const sha = data.object?.sha;
@@ -208,7 +235,12 @@ export async function ensureBranchExists(
   // 422 with "Reference already exists" = lost a creation race — treat as success.
   // Any other 422 (invalid SHA, malformed ref) is a real error and must surface.
   if (res.status === 422 && /already exists/i.test(body)) return;
-  throw new Error(`ensureBranchExists: creating "${branch}" failed: HTTP ${res.status}: ${body}`);
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/git/refs`,
+    bodyText: body,
+    message: `ensureBranchExists: creating "${branch}" failed: HTTP ${res.status}: ${body}`,
+  });
 }
 
 /**
@@ -361,7 +393,12 @@ export async function compareBranches(
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`compareBranches(${base}...${head}) failed: HTTP ${res.status}: ${body}`);
+    throw new GitHubApiError({
+      status: res.status,
+      path: `/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`,
+      bodyText: body,
+      message: `compareBranches(${base}...${head}) failed: HTTP ${res.status}: ${body}`,
+    });
   }
   const data = (await res.json()) as { ahead_by?: unknown };
   return typeof data.ahead_by === "number" ? data.ahead_by : 0;
@@ -409,7 +446,12 @@ export async function createPullRequest(
     const existing = await findOpenPullRequest(token, owner, repo, opts.head, opts.base);
     if (existing) return existing;
   }
-  throw new Error(`createPullRequest(${opts.head}->${opts.base}) failed: HTTP ${res.status}: ${body}`);
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/pulls`,
+    bodyText: body,
+    message: `createPullRequest(${opts.head}->${opts.base}) failed: HTTP ${res.status}: ${body}`,
+  });
 }
 
 /**
@@ -443,5 +485,10 @@ export async function mergeBranch(
   if (res.status === 204) return "noop"; // already up to date
   if (res.status === 409) return "conflict";
   const body = await res.text().catch(() => "");
-  throw new Error(`mergeBranch(${head} -> ${base}) failed: HTTP ${res.status}: ${body}`);
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/merges`,
+    bodyText: body,
+    message: `mergeBranch(${head} -> ${base}) failed: HTTP ${res.status}: ${body}`,
+  });
 }

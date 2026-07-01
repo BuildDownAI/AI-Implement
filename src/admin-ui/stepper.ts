@@ -80,7 +80,11 @@ export const stepperHtml = `
           <div class="alert-icon">&#8505;</div>
           <div style="flex:1">
             <div class="alert-title">GitHub App required</div>
-            <div class="alert-desc">Make sure the AI-Implement GitHub App is installed on the target repository before creating this project.</div>
+            <div class="alert-desc">The AI-Implement GitHub App must be installed on the target repo before it can sync. Enter the owner and repo, then check the installation.</div>
+            <div id="np-install-state" style="margin-top:10px;font-size:12px"></div>
+            <div class="alert-actions" style="margin-top:10px">
+              <button type="button" class="btn btn-sm" id="np-install-check" onclick="checkInstallState()">Check installation</button>
+            </div>
           </div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
@@ -98,6 +102,11 @@ export const stepperHtml = `
             <label class="field-label">Default Branch</label>
             <input class="input mono" id="np-defaultBranch" placeholder="development" autocomplete="off" oninput="updateStepperNextButton()">
             <div class="field-hint">Branch used for workflow dispatches, runner clones, and implementation PR bases.</div>
+          </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Skills Repo <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
+            <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
+            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
         </div>
       </div>
@@ -233,6 +242,10 @@ export const stepperHtml = `
             <div data-review="defaultBranch" class="mono"></div>
           </div>
           <div class="np-review-row">
+            <div class="np-review-label">Skills Repo</div>
+            <div data-review="skillsRepo" class="mono"></div>
+          </div>
+          <div class="np-review-row">
             <div class="np-review-label">Runner</div>
             <div data-review="runner"></div>
           </div>
@@ -285,7 +298,7 @@ export const stepperScript = `
     jiraRepoFieldValue: '',
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
-    teamKey: '', owner: '', repo: '', defaultBranch: '',
+    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '',
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true,
@@ -306,6 +319,7 @@ export const stepperScript = `
     data.owner = '';
     data.repo = '';
     data.defaultBranch = '';
+    data.skillsRepo = '';
     data.executionMode = 'github-actions';
     data.machineCpus = 2;
     data.machineMemoryMb = 4096;
@@ -318,7 +332,7 @@ export const stepperScript = `
     data.secrets = [];
 
     // Clear inputs
-    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-awsRegion'];
+    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-skills-repo', 'np-awsRegion'];
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
@@ -481,10 +495,65 @@ export const stepperScript = `
     } else if (step === 2) {
       const ow = (document.getElementById('np-owner') || {}).value || '';
       const rp = (document.getElementById('np-repo') || {}).value || '';
-      if (!ow.trim() || !rp.trim()) ok = false;
+      const br = (document.getElementById('np-defaultBranch') || {}).value || '';
+      if (!ow.trim() || !rp.trim() || !br.trim()) ok = false;
+      resetInstallState();
     }
     if (ok) nextBtn.removeAttribute('disabled');
     else nextBtn.setAttribute('disabled', '');
+  }
+
+  async function checkInstallState() {
+    const owner = ((document.getElementById('np-owner') || {}).value || '').trim();
+    const repo = ((document.getElementById('np-repo') || {}).value || '').trim();
+    const out = document.getElementById('np-install-state');
+    const btn = document.getElementById('np-install-check');
+    if (!out || !btn) return;
+    if (!owner || !repo) {
+      out.innerHTML = '<span style="color:var(--fg-tertiary)">Enter owner and repo first.</span>';
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    out.innerHTML = '';
+    try {
+      const res = await window.api('/api/admin/github-install-state?owner=' + encodeURIComponent(owner) + '&repo=' + encodeURIComponent(repo));
+      const data = await res.json();
+      if (!res.ok) {
+        out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check: ' + window.esc(data.error || 'unknown error') + '</span>';
+        return;
+      }
+      out.innerHTML = renderInstallState(data);
+    } catch (_) {
+      out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check installation.</span>';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Re-check';
+    }
+  }
+  
+  function renderInstallState(data) {
+    const state = data.state;
+    if (state === 'ready') {
+      return '<span class="badge success">Ready</span> The App is installed and can access this repo.';
+    }
+    if (state === 'app-not-installed') {
+      return '<span class="badge warn">Action needed</span> The App is not installed on this owner. '
+        + '<a class="text-accent" href="' + window.esc(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Install the App &#8599;</a> then Re-check.';
+    }
+    if (state === 'repo-not-selected') {
+      return '<span class="badge warn">Action needed</span> The App is installed, but this repo is not in its selected repositories. '
+      + '<a class="text-accent" href="' + window.esc(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Add this repo &#8599;</a> then Re-check.';
+    }
+    return '';
+  }
+
+  // Clears a stale probe result when owner/repo change, so a "Ready" for the old repo can't linger.
+  function resetInstallState() {
+    const out = document.getElementById('np-install-state');
+    const btn = document.getElementById('np-install-check');
+    if (out) out.innerHTML = '';
+    if (btn) btn.textContent = 'Check installation';
   }
 
   function stepperBack() {
@@ -525,9 +594,11 @@ export const stepperScript = `
       const owEl = document.getElementById('np-owner');
       const reEl = document.getElementById('np-repo');
       const brEl = document.getElementById('np-defaultBranch');
+      const srEl = document.getElementById('np-skills-repo');
       if (owEl) data.owner = owEl.value.trim();
       if (reEl) data.repo = reEl.value.trim();
       if (brEl) data.defaultBranch = brEl.value.trim();
+      if (srEl) data.skillsRepo = srEl.value.trim();
     } else if (n === 3) {
       const smEl = document.getElementById('np-sessionMode');
       const cpEl = document.getElementById('np-cpus');
@@ -637,6 +708,7 @@ export const stepperScript = `
     set('teamKey', window.esc(effectiveTeamKey()) || '&mdash;');
     set('repo', window.esc(data.owner) + '/' + window.esc(data.repo));
     set('defaultBranch', window.esc(data.defaultBranch) || '&mdash;');
+    set('skillsRepo', data.skillsRepo ? window.esc(data.skillsRepo) : '&mdash;');
 
     let runnerText = window.esc(data.executionMode);
     if (data.executionMode === 'fly-machines') {
@@ -952,6 +1024,7 @@ export const stepperScript = `
       extraEnv: {},
       provider: data.provider,
       awsRegion: data.provider === 'bedrock' ? (data.awsRegion || null) : null,
+      skillsRepo: data.skillsRepo || null,
       ticketingProvider: data.ticketingProvider,
       ticketingConfig: data.ticketingProvider === 'jira'
         ? {
@@ -964,10 +1037,16 @@ export const stepperScript = `
         : { kind: 'linear' },
     };
 
+    const createBtn = document.getElementById('np-create');
+    const origCreateLabel = createBtn ? createBtn.textContent : '';
+    if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Creating...'; }
+    
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
+    let resData = {};
+    try { resData = await res.json(); } catch (_) {}
+    if (createBtn) { createBtn.disabled = false; createBtn.textContent = origCreateLabel; }
     if (!res.ok) {
-      const msg = await res.text().catch(function () { return 'Unknown error'; });
-      showError('Failed to create project: ' + msg);
+      showError('Failed to create project: ' + (resData.error || 'Unknown error'));
       return;
     }
 
@@ -987,14 +1066,18 @@ export const stepperScript = `
     }
 
     closeNewProjectStepper();
+    if (window.loadMappings) await window.loadMappings();
+    if (window.pollSyncStatus) window.pollSyncStatus(teamKey, resData.syncJobId);
+
+    // Project was created but some secrets failed — warn but don't block.
+    const notices = [];
     if (secretFailures > 0) {
-      // Project was created but some secrets failed — warn but don't block
-      // Use a brief timeout so the modal closes first
-      setTimeout(function () {
-        alert('Project created, but ' + secretFailures + ' secret(s) failed to save. You can add them via the Secrets button on the Projects page.');
-      }, 100);
+      notices.push(secretFailures + ' secret(s) failed to save. Add them via the Secrets button on the Projects page.');
     }
-    if (window.loadMappings) window.loadMappings();
+    if (notices.length) {
+      // Use a brief timeout so the modal closes first
+      setTimeout(function () { alert('Project created.\\n\\n' + notices.join('\\n\\n')); }, 100);
+    }
   }
 
   window.openNewProjectStepper = openNewProjectStepper;
@@ -1010,5 +1093,6 @@ export const stepperScript = `
   window.onStepperRepoFieldChange = onStepperRepoFieldChange;
   window.stepperValidateJql = stepperValidateJql;
   window.updateStepperNextButton = updateStepperNextButton;
+  window.checkInstallState = checkInstallState;
 })();
 `;

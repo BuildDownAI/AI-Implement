@@ -85,6 +85,11 @@ on:
         required: false
         type: string
         default: ""
+      skills_repo:
+        description: "Optional skills repo (owner/repo or git URL) cloned + installed into ~/.claude/skills (empty = none)"
+        required: false
+        type: string
+        default: ""
       runner_callback_url:
         description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
         required: false
@@ -261,6 +266,7 @@ jobs:
           AI_IMPLEMENT_MAX_TURNS: ${{ inputs.max_turns }}
           AI_IMPLEMENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
           AI_IMPLEMENT_BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+          AI_IMPLEMENT_SKILLS_REPO: ${{ inputs.skills_repo }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

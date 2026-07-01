@@ -35,12 +35,34 @@ import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
+import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
-import { syncWorkflowTemplates } from "./workflow-sync.js";
+import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
+
+const SKILLS_REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+// NOTE: skillsRepo is *syntax*-validated only — it is NOT sanitised. Any code that
+// later feeds this value to a subprocess (e.g. the `git clone` in the runner) MUST
+// pass it as a separate argv element, never interpolated into a shell string, to
+// avoid command injection.
+function normalizeSkillsRepo(raw: unknown): string | null {
+  if (raw == null) return null;
+  if (typeof raw !== "string") throw new Error("skillsRepo must be a string");
+  const v = raw.trim();
+  if (v === "") return null;
+  if (SKILLS_REPO_SHORTHAND.test(v)) return `https://github.com/${v}`;
+  // Only https:// remotes (and the owner/repo shorthand handled above) are usable on
+  // the runner: clone auth is the orchestrator-minted token embedded in the URL. An
+  // SSH (git@…) URL would need keys the runner doesn't have, so the install step just
+  // warns and installs nothing — a silent no-op. Reject it here rather than storing a
+  // value that looks accepted but does nothing at dispatch.
+  const ok = /^https:\/\/[^\s]+$/.test(v); // any https:// git URL, host-agnostic, with or without a trailing .git
+  if (!ok) throw new Error("skillsRepo must be 'owner/repo' shorthand or an https:// URL (SSH git@ URLs are not supported — the runner clones via an https token)");
+  return v;
+}
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -166,19 +188,26 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/mappings" && method === "POST") {
-      handleUpsertMapping(req, res, registry);
+      handleUpsertMapping(req, res, config, registry);
       return true;
     }
 
     const workflowSyncMatch = url.match(/^\/api\/mappings\/([^/]+)\/sync-workflows$/);
     if (workflowSyncMatch && method === "POST") {
       const teamKey = decodeURIComponent(workflowSyncMatch[1]);
-      handleSyncWorkflows(res, config, teamKey).catch((err) => {
-        console.error(`[admin] workflow sync failed for ${teamKey}:`, err);
-        if (!res.headersSent) {
-          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-        }
-      });
+      handleSyncWorkflows(res, config, teamKey)
+      return true;
+    }
+
+    const syncStatusMatch = url.match(/^\/api\/mappings\/([^/]+)\/sync-status\/(\d+)$/);
+    if (syncStatusMatch && method === "GET") {
+      const teamKey = decodeURIComponent(syncStatusMatch[1]);
+      const jobId = Number.parseInt(syncStatusMatch[2], 10);
+      const job = getWorkflowSyncById(jobId);
+
+      // Require the job to belong to the team in the URL — so one team's status id can't be read via another team's path.
+      if (!job || job.teamKey !== teamKey) { json(res, 404, { error: "sync job not found" }); return true; }
+      json(res, 200, { id: job.id, status: job.status, result: job.result, error: job.error });
       return true;
     }
 
@@ -354,6 +383,11 @@ export function handleAdminRequest(
         runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),
         gapFillTrigger: !!process.env.GAP_FILL_TRIGGER_SECRET,
       });
+      return true;
+    }
+
+    if (url.startsWith("/api/admin/github-install-state") && method === "GET") {
+      handleGithubInstallState(req, res, config);
       return true;
     }
 
@@ -618,23 +652,22 @@ async function handlePatchMapping(
   }
 }
 
-async function handleSyncWorkflows(
+function handleSyncWorkflows(
   res: http.ServerResponse,
   config: AdminConfig,
   teamKey: string,
-): Promise<void> {
+): void {
   const mappings = getMappings();
   const mapping = mappings[teamKey];
   if (!mapping) {
     json(res, 404, { error: "Team not found" });
     return;
   }
-  const result = await syncWorkflowTemplates({
-    mapping,
-    githubAppId: config.githubAppId,
-    githubAppPrivateKey: config.githubAppPrivateKey,
-  });
-  json(res, 200, result);
+  const { id } = enqueueWorkflowSync(teamKey);
+  void runWorkflowSync(id, config).catch((err) =>
+    console.error(`[admin] workflow sync failed for ${teamKey}:`, err)
+  );
+  json(res, 202, { teamKey, syncJobId: id });
 }
 
 async function handleListSecrets(
@@ -941,6 +974,7 @@ async function handleUnsetGlobalSecret(
 async function handleUpsertMapping(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  config: AdminConfig,
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
@@ -968,6 +1002,7 @@ async function handleUpsertMapping(
       maxIterations?: number | null;
       maxJobMinutes?: number | null;
       branchPrefix?: string | null;
+      skillsRepo?: string | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1098,6 +1133,14 @@ async function handleUpsertMapping(
       return;
     }
 
+    let skillsRepo: string | null;
+    try {
+      skillsRepo = normalizeSkillsRepo(body.skillsRepo);
+    } catch (err) {
+      json(res, 400, { error: `skillsRepo invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -1125,11 +1168,21 @@ async function handleUpsertMapping(
       maxIterations,
       maxJobMinutes,
       branchPrefix,
+      skillsRepo,
     };
 
     upsertMapping(body.teamKey, mapping);
     registry.invalidate();
-    json(res, 200, { teamKey: body.teamKey, ...mapping });
+
+    // Kick the workflow sync off in the background and return immediately
+    // - the client polls GET /api/mappings/:teamKey/sync-status/:id for the outcome
+    // - the mapping is already persisted above, so the save itself succeeds regardless of how the sync resolves
+    const { id } = enqueueWorkflowSync(body.teamKey);
+    void runWorkflowSync(id, config).catch((err) =>
+      console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
+    );
+
+    json(res, 202, { teamKey: body.teamKey, ...mapping, syncJobId: id });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
@@ -1213,6 +1266,32 @@ async function handleListJiraFieldOptions(
       json(res, 200, []);
       return;
     }
+    json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleGithubInstallState(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  const query = new URL(req.url ?? "", "http://localhost").searchParams;
+  const owner = query.get("owner");
+  const repo = query.get("repo");
+  if (!owner || !repo) {
+    json(res, 400, { error: "owner and repo query params are required" });
+    return;
+  }
+  try {
+    const result = await probeInstallState({
+      appId: config.githubAppId,
+      privateKey: config.githubAppPrivateKey,
+      owner,
+      repo,
+    });
+    json(res, 200, result);
+  } catch (err) {
+    console.error(`[admin] install-state probe failed for ${owner}/${repo}:`, err);
     json(res, 500, { error: err instanceof Error ? err.message : String(err) });
   }
 }
