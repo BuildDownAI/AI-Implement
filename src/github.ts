@@ -404,6 +404,59 @@ export async function compareBranches(
   return typeof data.ahead_by === "number" ? data.ahead_by : 0;
 }
 
+/**
+ * Deletes a git ref (branch). Idempotent: 204 (deleted) and 404 (already gone) both return
+ * true. Only ever called on orchestrator-owned `ai-implement/feature/*` branches.
+ */
+export async function deleteBranch(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<boolean> {
+  const enc = branch.split("/").map(encodeURIComponent).join("/");
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${enc}`,
+    { method: "DELETE", headers: ghHeaders(token) },
+  );
+  if (res.status === 204 || res.status === 404) return true;
+  const body = await res.text().catch(() => "");
+  console.error(`[github] deleteBranch(${branch}) failed: HTTP ${res.status}: ${body}`);
+  return false;
+}
+
+/**
+ * Finds the PR for the given head→base pair in ANY state, reporting whether it merged.
+ * GitHub's pulls list returns `merged_at` (null unless merged). Prefers a merged PR when
+ * several exist for the pair (e.g. a prior buggy re-open). Returns null when none exists
+ * or on a non-OK response (callers fall back to existing behavior).
+ */
+export async function findPullRequestByBranches(
+  token: string,
+  owner: string,
+  repo: string,
+  head: string,
+  base: string,
+): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean } | null> {
+  const url =
+    `https://api.github.com/repos/${owner}/${repo}/pulls` +
+    `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}` +
+    `&state=all&sort=updated&direction=desc&per_page=10`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) return null;
+  const prs = (await res.json()) as Array<{
+    number: number; html_url: string; state: string; merged_at: string | null;
+  }>;
+  if (prs.length === 0) return null;
+  const chosen = prs.find((p) => p.merged_at !== null) ?? prs[0];
+  return {
+    number: chosen.number,
+    url: chosen.html_url,
+    state: chosen.state === "open" ? "open" : "closed",
+    merged: chosen.merged_at !== null,
+  };
+}
+
 /** Finds an open PR for the given head→base pair; returns its number/url or null. */
 export async function findOpenPullRequest(
   token: string,

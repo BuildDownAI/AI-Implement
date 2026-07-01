@@ -48,6 +48,9 @@ export interface AIImplementSnapshot {
 export interface FeatureNodeRollUp {
   /** The feature node's identifier → branch `ai-implement/feature/<identifier>`. */
   identifier: string;
+  /** The feature node's Linear issue UUID — used to finalize (markMerged) without a
+   *  second lookup when its top-of-tree PR merges. */
+  issueId: string;
   /** Capacity/scope bucket (team key) — used to resolve the repo mapping. */
   scopeKey: string;
   /**

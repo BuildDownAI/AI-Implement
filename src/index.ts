@@ -254,26 +254,25 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     // dispatch so a parent's own closing work clones a branch that already contains its
     // children's merged work. Best-effort — never blocks the poll.
     if (providers.length > 0) {
-      try {
-        const rollUps = (
-          await Promise.all(
-            providers.map((p) =>
-              p.fetchFeatureNodeRollUps().catch((err) => {
-                console.error("[merge-up] Provider fetchFeatureNodeRollUps failed:", err);
-                return [] as FeatureNodeRollUp[];
-              }),
-            ),
-          )
-        ).flat();
-        if (rollUps.length > 0) {
-          await runMergeUps(rollUps, {
-            githubAppId: config.githubAppId,
-            githubAppPrivateKey: config.githubAppPrivateKey,
-            resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
+      // Per-provider so finalizeMerged binds markMerged to the provider that produced the
+      // roll-ups (a merged top-of-tree PR moves that provider's issue Done).
+      for (const provider of providers) {
+        try {
+          const rollUps = await provider.fetchFeatureNodeRollUps().catch((err) => {
+            console.error("[merge-up] Provider fetchFeatureNodeRollUps failed:", err);
+            return [] as FeatureNodeRollUp[];
           });
+          if (rollUps.length > 0) {
+            await runMergeUps(rollUps, {
+              githubAppId: config.githubAppId,
+              githubAppPrivateKey: config.githubAppPrivateKey,
+              resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
+              finalizeMerged: (issueId) => provider.markMerged(issueId),
+            });
+          }
+        } catch (err) {
+          console.error("[merge-up] roll-up step failed:", err);
         }
-      } catch (err) {
-        console.error("[merge-up] roll-up step failed:", err);
       }
     }
 

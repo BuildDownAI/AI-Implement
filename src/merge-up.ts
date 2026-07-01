@@ -2,7 +2,7 @@ import type { RepoMapping } from "./config.js";
 import type { FeatureNodeRollUp } from "./providers/types.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { buildFeatureBranchName } from "./pipeline/branch-name.js";
-import { compareBranches, createPullRequest, findOpenPullRequest, mergeBranch } from "./github.js";
+import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBranches, mergeBranch } from "./github.js";
 
 /**
  * Feature-branch roll-up (the merge-up half of feature-branch grouping).
@@ -28,6 +28,9 @@ export interface MergeUpDeps {
   githubAppPrivateKey: string;
   /** Resolve the repo mapping for a scope/team key, or null when unmapped/paused. */
   resolveMapping: (scopeKey: string) => RepoMapping | null;
+  /** Finalize a feature node whose top-of-tree PR merged: idempotently mark its issue Done
+   *  (drops Ready for Review). Wired to the Linear provider's markMerged (AII-166). */
+  finalizeMerged: (issueId: string) => Promise<void>;
 }
 
 export async function runMergeUps(rollUps: FeatureNodeRollUp[], deps: MergeUpDeps): Promise<void> {
@@ -52,12 +55,11 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
     ? buildFeatureBranchName(rollUp.parentIdentifier)
     : mapping.defaultBranch;
 
-  const ahead = await compareBranches(ghToken, owner, repo, target, branch);
-  if (ahead === null || ahead === 0) return; // branch missing, or already fully merged
-
   if (rollUp.parentIdentifier !== null) {
     // Internal roll-up → direct merge, no PR (avoids Linear linking the roll-up to the
     // parent issue). Commit message is intentionally free of issue identifiers / magic words.
+    const ahead = await compareBranches(ghToken, owner, repo, target, branch);
+    if (ahead === null || ahead === 0) return; // branch missing, or already fully merged
     const result = await mergeBranch(
       ghToken,
       owner,
@@ -76,10 +78,23 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
     return;
   }
 
-  // Top of the tree → feature → base PR for human review. Opened once, never auto-merged.
-  const existing = await findOpenPullRequest(ghToken, owner, repo, branch, target);
-  if (existing) return;
-  const pr = await createPullRequest(ghToken, owner, repo, {
+  // Top of the tree. Detect completion by the feature → base PR's MERGED state (robust to
+  // squash/rebase/merge-commit — git ancestry alone misreads squash/rebase as "unmerged").
+  const pr = await findPullRequestByBranches(ghToken, owner, repo, branch, target);
+  if (pr?.merged) {
+    await deleteBranch(ghToken, owner, repo, branch);
+    await deps.finalizeMerged(rollUp.issueId);
+    console.log(
+      `[merge-up] Top-of-tree PR #${pr.number} for ${rollUp.identifier} merged; deleted ${branch} + finalized`,
+    );
+    return;
+  }
+  if (pr?.state === "open") return; // awaiting human review
+
+  // No PR yet (or a closed-unmerged one) — open it only if the branch has commits to offer.
+  const ahead = await compareBranches(ghToken, owner, repo, target, branch);
+  if (ahead === null || ahead === 0) return;
+  const created = await createPullRequest(ghToken, owner, repo, {
     head: branch,
     base: target,
     title: "[ai-implement] Feature branch ready for review",
@@ -87,5 +102,5 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
       "Automated feature-branch grouping: this feature branch's work is complete and ready " +
       "to merge into the base branch. Opened for human review.",
   });
-  console.log(`[merge-up] Opened feature→base PR ${pr.url} for ${rollUp.identifier} (awaiting human merge)`);
+  console.log(`[merge-up] Opened feature→base PR ${created.url} for ${rollUp.identifier} (awaiting human merge)`);
 }

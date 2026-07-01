@@ -8,12 +8,13 @@ vi.mock("../github-app-auth.js", () => ({
 }));
 vi.mock("../github.js", () => ({
   compareBranches: vi.fn(),
-  findOpenPullRequest: vi.fn(async () => null),
   createPullRequest: vi.fn(async () => ({ number: 7, url: "https://gh/pr/7" })),
   mergeBranch: vi.fn(async () => "merged"),
+  deleteBranch: vi.fn(async () => true),
+  findPullRequestByBranches: vi.fn(async () => null),
 }));
 
-import { compareBranches, createPullRequest, mergeBranch, findOpenPullRequest } from "../github.js";
+import { compareBranches, createPullRequest, mergeBranch, deleteBranch, findPullRequestByBranches } from "../github.js";
 
 function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   return {
@@ -26,17 +27,21 @@ function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   };
 }
 
-const deps = (resolve: (k: string) => RepoMapping | null) => ({
-  githubAppId: "1", githubAppPrivateKey: "k", resolveMapping: resolve,
+const deps = (
+  resolve: (k: string) => RepoMapping | null,
+  finalizeMerged: (id: string) => Promise<void> = vi.fn(async () => {}),
+) => ({
+  githubAppId: "1", githubAppPrivateKey: "k", resolveMapping: resolve, finalizeMerged,
 });
 
 const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
-  identifier: "OOL-107", scopeKey: "OOL", parentIdentifier: "OOL-106", ...o,
+  identifier: "OOL-107", issueId: "u-107", scopeKey: "OOL", parentIdentifier: "OOL-106", ...o,
 });
 
 beforeEach(() => {
   vi.clearAllMocks();
-  vi.mocked(findOpenPullRequest).mockResolvedValue(null);
+  vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+  vi.mocked(deleteBranch).mockResolvedValue(true);
   vi.mocked(createPullRequest).mockResolvedValue({ number: 7, url: "https://gh/pr/7" });
   vi.mocked(mergeBranch).mockResolvedValue("merged");
 });
@@ -86,11 +91,28 @@ describe("runMergeUps", () => {
     expect(`${arg.title} ${arg.body}`).not.toMatch(/OOL-\d+/i);
   });
 
-  it("does not re-open the top-level PR when one already exists", async () => {
-    vi.mocked(compareBranches).mockResolvedValue(1);
-    vi.mocked(findOpenPullRequest).mockResolvedValue({ number: 42, url: "https://gh/pr/42" });
+  it("does not re-open the top-level PR when one is already open", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({ number: 42, url: "https://gh/pr/42", state: "open", merged: false });
     await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping()));
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+  });
+
+  it("deletes the branch and finalizes when the top-of-tree PR merged (any method)", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({ number: 8, url: "u", state: "closed", merged: true });
+    const finalizeMerged = vi.fn(async () => {});
+    await runMergeUps([rollUp({ identifier: "OOL-106", issueId: "u-106", parentIdentifier: null })], deps(() => mapping(), finalizeMerged));
+    expect(vi.mocked(deleteBranch)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
+    expect(finalizeMerged).toHaveBeenCalledWith("u-106");
+    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+    expect(vi.mocked(compareBranches)).not.toHaveBeenCalled(); // merged short-circuits before ancestry
+  });
+
+  it("is idempotent after deletion: no PR + compareBranches null → no re-open", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(null);
+    await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping()));
+    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+    expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
   });
 
   it("warns (does not crash) when the internal merge conflicts", async () => {

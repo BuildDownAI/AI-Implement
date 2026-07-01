@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, cancelWorkflowRun, getPullRequestState } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -361,5 +361,59 @@ describe("skillsRepoRunnerEnv", () => {
     expect(skillsRepoRunnerEnv(makeMapping({ skillsRepo: "org/skills" }))).toEqual({
       AI_IMPLEMENT_SKILLS_REPO: "org/skills",
     });
+  });
+});
+
+describe("deleteBranch", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("returns true on 204 (deleted)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 204, ok: true })));
+    expect(await deleteBranch("t", "o", "r", "ai-implement/feature/aii-1")).toBe(true);
+  });
+  it("returns true on 404 (already gone — idempotent)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 404, ok: false, text: async () => "" })));
+    expect(await deleteBranch("t", "o", "r", "ai-implement/feature/aii-1")).toBe(true);
+  });
+  it("returns false on other errors", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 403, ok: false, text: async () => "no" })));
+    expect(await deleteBranch("t", "o", "r", "ai-implement/feature/aii-1")).toBe(false);
+  });
+});
+
+describe("findPullRequestByBranches", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("reports a merged PR", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ number: 5, html_url: "u", state: "closed", merged_at: "2026-07-01T00:00:00Z" }],
+    })));
+    expect(await findPullRequestByBranches("t", "o", "r", "feat", "base"))
+      .toEqual({ number: 5, url: "u", state: "closed", merged: true });
+  });
+  it("prefers a merged PR when several exist for the pair", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { number: 9, html_url: "u9", state: "open", merged_at: null },
+        { number: 5, html_url: "u5", state: "closed", merged_at: "2026-07-01T00:00:00Z" },
+      ],
+    })));
+    expect((await findPullRequestByBranches("t", "o", "r", "feat", "base"))?.number).toBe(5);
+  });
+  it("reports an open unmerged PR", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [{ number: 7, html_url: "u", state: "open", merged_at: null }],
+    })));
+    expect(await findPullRequestByBranches("t", "o", "r", "feat", "base"))
+      .toEqual({ number: 7, url: "u", state: "open", merged: false });
+  });
+  it("returns null when no PR exists", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
+    expect(await findPullRequestByBranches("t", "o", "r", "feat", "base")).toBeNull();
+  });
+  it("returns null on a non-OK response", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 500 })));
+    expect(await findPullRequestByBranches("t", "o", "r", "feat", "base")).toBeNull();
   });
 });
