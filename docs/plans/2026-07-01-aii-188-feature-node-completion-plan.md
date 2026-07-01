@@ -321,56 +321,83 @@ Replace the flatten-then-single-`runMergeUps` block with a per-provider loop so
 
 - [ ] **Step 8: Merge-up behavior tests** (`src/__tests__/merge-up.test.ts`)
 
-Extend the `vi.mock("../github.js")` factory with `deleteBranch` + `findPullRequestByBranches`,
-add `finalizeMerged: vi.fn()` to the `deps` helper, and add:
+> **The rework REMOVES `findOpenPullRequest` from the top-of-tree path**, so the existing test
+> harness must be migrated, not just extended — otherwise the existing "does not re-open …"
+> test throws (the symbol is gone) and CI goes red. This is validated: all changes below make
+> `npm test` pass (1518 tests).
+
+**8a. Update the `vi.mock("../github.js")` factory** — drop `findOpenPullRequest`, add the two new helpers:
 
 ```ts
-// in vi.mock("../github.js") factory:
-//   deleteBranch: vi.fn(async () => true),
-//   findPullRequestByBranches: vi.fn(async () => null),
-import { deleteBranch, findPullRequestByBranches } from "../github.js";
+vi.mock("../github.js", () => ({
+  compareBranches: vi.fn(),
+  createPullRequest: vi.fn(async () => ({ number: 7, url: "https://gh/pr/7" })),
+  mergeBranch: vi.fn(async () => "merged"),
+  deleteBranch: vi.fn(async () => true),
+  findPullRequestByBranches: vi.fn(async () => null),
+}));
+import { compareBranches, createPullRequest, mergeBranch, deleteBranch, findPullRequestByBranches } from "../github.js";
+```
 
-const depsF = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn(async () => {})) => ({
+**8b. Update the shared `deps` and `rollUp` helpers** (`finalizeMerged` on deps, `issueId` on rollUp):
+
+```ts
+const deps = (
+  resolve: (k: string) => RepoMapping | null,
+  finalizeMerged: (id: string) => Promise<void> = vi.fn(async () => {}),
+) => ({
   githubAppId: "1", githubAppPrivateKey: "k", resolveMapping: resolve, finalizeMerged,
 });
 
-describe("runMergeUps — top-of-tree merged-state completion", () => {
-  const topRollUp = () => rollUp({ identifier: "OOL-106", issueId: "uuid-106", parentIdentifier: null });
-
-  it("deletes the branch and finalizes when the top PR merged (squash/rebase/merge-commit)", async () => {
-    vi.mocked(findPullRequestByBranches).mockResolvedValue({ number: 8, url: "u", state: "closed", merged: true });
-    const finalizeMerged = vi.fn(async () => {});
-    await runMergeUps([topRollUp()], depsF(() => mapping(), finalizeMerged));
-    expect(vi.mocked(deleteBranch)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
-    expect(finalizeMerged).toHaveBeenCalledWith("uuid-106");
-    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
-  });
-
-  it("does nothing when the top PR is still open", async () => {
-    vi.mocked(findPullRequestByBranches).mockResolvedValue({ number: 8, url: "u", state: "open", merged: false });
-    await runMergeUps([topRollUp()], depsF(() => mapping()));
-    expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
-    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
-  });
-
-  it("opens the PR when none exists and the branch is ahead", async () => {
-    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
-    vi.mocked(compareBranches).mockResolvedValue(3);
-    await runMergeUps([topRollUp()], depsF(() => mapping()));
-    expect(vi.mocked(createPullRequest)).toHaveBeenCalled();
-  });
-
-  it("is idempotent: once the branch is gone, compareBranches null → no re-open", async () => {
-    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
-    vi.mocked(compareBranches).mockResolvedValue(null); // branch deleted
-    await runMergeUps([topRollUp()], depsF(() => mapping()));
-    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
-  });
+const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
+  identifier: "OOL-107", issueId: "u-107", scopeKey: "OOL", parentIdentifier: "OOL-106", ...o,
 });
 ```
 
-(Add `deleteBranch`/`findPullRequestByBranches` resets to the existing `beforeEach`:
-`vi.mocked(findPullRequestByBranches).mockResolvedValue(null); vi.mocked(deleteBranch).mockResolvedValue(true);`)
+**8c. Update `beforeEach`** — reset the new mocks (drop the `findOpenPullRequest` reset):
+
+```ts
+beforeEach(() => {
+  vi.clearAllMocks();
+  vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+  vi.mocked(deleteBranch).mockResolvedValue(true);
+  vi.mocked(createPullRequest).mockResolvedValue({ number: 7, url: "https://gh/pr/7" });
+  vi.mocked(mergeBranch).mockResolvedValue("merged");
+});
+```
+
+**8d. REWRITE the existing "does not re-open the top-level PR when one already exists" test**
+(it referenced `findOpenPullRequest`) and add the merged/idempotent cases:
+
+```ts
+  it("does not re-open the top-level PR when one is already open", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({ number: 42, url: "https://gh/pr/42", state: "open", merged: false });
+    await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping()));
+    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+  });
+
+  it("deletes the branch and finalizes when the top-of-tree PR merged (any method)", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({ number: 8, url: "u", state: "closed", merged: true });
+    const finalizeMerged = vi.fn(async () => {});
+    await runMergeUps([rollUp({ identifier: "OOL-106", issueId: "u-106", parentIdentifier: null })], deps(() => mapping(), finalizeMerged));
+    expect(vi.mocked(deleteBranch)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
+    expect(finalizeMerged).toHaveBeenCalledWith("u-106");
+    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+    expect(vi.mocked(compareBranches)).not.toHaveBeenCalled(); // merged short-circuits before ancestry
+  });
+
+  it("is idempotent after deletion: no PR + compareBranches null → no re-open", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(null);
+    await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping()));
+    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+    expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
+  });
+```
+
+> The existing "opens a human PR … for the top-level feature→base roll-up" test (compareBranches
+> = 3) still passes unchanged: `findPullRequestByBranches` defaults to null → falls through to
+> `compareBranches` → `createPullRequest`.
 
 - [ ] **Step 9: Full suite + typecheck** — `npm run typecheck && npm test` → PASS.
 
