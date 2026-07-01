@@ -125,10 +125,20 @@ dispatch so a parent's own work clones a branch that already contains its childr
   parent issue and mark it **Done on merge — before the parent's own work runs**. A plain
   merge commit gives Linear nothing to link, so the parent's lifecycle stays correct.
 - **Top of the tree** (no feature-node parent) → an open `feature → base` **PR for human
-  review**, never auto-merged.
+  review**, never auto-merged. **Completion is detected by the PR's *merged state***
+  (`findPullRequestByBranches` in `src/github.ts`), **not** by git ancestry — a **squash** or
+  **rebase** merge creates new commits on base, so the branch's own commits are never
+  ancestors and an ancestry check would misread the merge as "still unmerged" and re-open an
+  identical PR every poll (the AII-188 bug). When the top-of-tree PR is found **merged** (any
+  method — squash, rebase, or merge-commit), the orchestrator **deletes the feature branch**
+  (`deleteBranch`) and idempotently marks the node Done (`markMerged`, wired via
+  `MergeUpDeps.finalizeMerged`). An **open** PR is left alone; only when no PR exists is one
+  opened (gated on the branch being ahead).
 
-The step is idempotent (a branch already merged — 0 commits ahead — is skipped) and fails
-soft per roll-up. It scans only feature nodes completed in a recent window to stay cheap.
+The step is idempotent (a branch already merged — 0 commits ahead — is skipped; and once the
+top-of-tree branch is deleted, `compareBranches` returns null so the node is skipped forever)
+and fails soft per roll-up. It scans only feature nodes completed in a recent window to stay
+cheap.
 
 > ⚠️ **Auto-roll-up needs the runner callback.** A feature node only completes when its
 > closing-work PR merges and Linear marks it Done; the roll-up keys off that completed
@@ -150,7 +160,15 @@ soft per roll-up. It scans only feature nodes completed in a recent window to st
    into its own feature branch → human merges → orchestrator marks node Done.
 5. The **merge-up** rolls each completed feature node's branch up into its parent's branch
    (direct merge). The top node's branch is offered as a `feature → base` PR.
-6. A human reviews and merges that final PR. The whole tree lands on the base branch.
+6. A human reviews and merges that final PR **by any merge method** (squash, rebase, or
+   merge-commit). The orchestrator detects the merge from the PR's merged state, deletes the
+   feature branch, and keeps the node Done — it does **not** re-open the PR. The whole tree
+   lands on the base branch.
+
+> **Operator note (pre-deploy window):** until an orchestrator carrying this fix is deployed,
+> merge grouped top-of-tree PRs with `--delete-branch` (or a real merge commit), never
+> squash-and-leave — an un-fixed orchestrator re-opens the PR and flips the parent to In
+> Progress (AII-188).
 
 ---
 
@@ -162,8 +180,8 @@ soft per roll-up. It scans only feature nodes completed in a recent window to st
 | Shared types (`featureBranchChain`, `FeatureNodeRollUp`) | `src/providers/types.ts` |
 | Branch names | `src/pipeline/branch-name.ts` (`buildFeatureBranchName`) |
 | Cascade branch creation + PR-base resolution | `src/feature-branch.ts` (`resolveBaseBranch`) |
-| Roll-up (direct merge / human PR) | `src/merge-up.ts` (`runMergeUps`) |
-| GitHub helpers (branch/compare/merge/PR) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`) |
+| Roll-up (direct merge / human PR); top-of-tree merged-state completion + branch delete + finalize | `src/merge-up.ts` (`runMergeUps`) |
+| GitHub helpers (branch/compare/merge/PR; branch delete; merged-PR lookup) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`, `deleteBranch`, `findPullRequestByBranches`) |
 | Plan-Complete transition | `src/runner-callback.ts` → `markPlanComplete` |
 | Poll-loop wiring (roll-up before dispatch; base resolved per issue) | `src/index.ts` |
 
