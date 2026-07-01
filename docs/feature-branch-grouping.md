@@ -127,8 +127,11 @@ dispatch so a parent's own work clones a branch that already contains its childr
 - **Top of the tree** (no feature-node parent) → an open `feature → base` **PR for human
   review**, never auto-merged.
 
-The step is idempotent (a branch already merged — 0 commits ahead — is skipped) and fails
-soft per roll-up. It scans only feature nodes completed in a recent window to stay cheap.
+The step is **idempotent** and **fails soft** per roll-up — one failure never aborts the others or the poll loop. It scans only feature nodes completed in a recent window to stay cheap.
+
+Idempotency is handled differently per path:
+- **Internal level:** `compareBranches` returning 0 (branch already merged into parent) or `null` (branch missing) causes an early return.
+- **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker. If the PR is still open, the step returns and awaits the human. Only when no PR exists is a new one opened (guarded by an ahead-check so a missing branch exits early). This replaces the old git-ancestry heuristic (`compareBranches` alone at the top-of-tree path), which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)).
 
 > ⚠️ **Auto-roll-up needs the runner callback.** A feature node only completes when its
 > closing-work PR merges and Linear marks it Done; the roll-up keys off that completed
@@ -150,7 +153,7 @@ soft per roll-up. It scans only feature nodes completed in a recent window to st
    into its own feature branch → human merges → orchestrator marks node Done.
 5. The **merge-up** rolls each completed feature node's branch up into its parent's branch
    (direct merge). The top node's branch is offered as a `feature → base` PR.
-6. A human reviews and merges that final PR. The whole tree lands on the base branch.
+6. A human reviews and merges that final PR **by any merge method** (merge-commit, squash, or rebase). On the next poll tick the orchestrator detects the merged PR state, deletes the feature branch, and calls `markMerged` to finalize the top node Done — the tree lands on the base branch and the PR is never re-opened.
 
 ---
 
@@ -163,7 +166,7 @@ soft per roll-up. It scans only feature nodes completed in a recent window to st
 | Branch names | `src/pipeline/branch-name.ts` (`buildFeatureBranchName`) |
 | Cascade branch creation + PR-base resolution | `src/feature-branch.ts` (`resolveBaseBranch`) |
 | Roll-up (direct merge / human PR) | `src/merge-up.ts` (`runMergeUps`) |
-| GitHub helpers (branch/compare/merge/PR) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`) |
+| GitHub helpers (branch/compare/merge/PR/merged-state) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`, `findPullRequestByBranches`, `deleteBranch`) — `findPullRequestByBranches` detects the top-of-tree PR's merged state (robust to any merge method); `deleteBranch` removes the feature branch after merge |
 | Plan-Complete transition | `src/runner-callback.ts` → `markPlanComplete` |
 | Poll-loop wiring (roll-up before dispatch; base resolved per issue) | `src/index.ts` |
 
@@ -185,6 +188,7 @@ and no `featureBranchChain`, so its issues always PR to the base branch.
   `SESSION_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`; otherwise a GitHub Actions
   run falls back to the `:latest` runner, which may be incompatible with the current
   workflow/entrypoint.
+- **Top-of-tree PR merge method:** any method (merge-commit, squash, rebase) works correctly — the orchestrator detects completion via the PR's merged state, not git ancestry. On orchestrator versions before AII-188 shipped, squash/rebase merges left the feature branch appearing "ahead" of base, causing the PR to be re-opened each poll tick. If running a pre-fix orchestrator, use merge-commit with **Delete branch** checked as a temporary workaround.
 - **Don't restart the orchestrator mid-run.** A restart drops in-flight job tracking,
   leaving dispatched issues stuck with `AI-Working` plus a dedup row. Recover by removing
   `AI-Working` in Linear and deleting the dedup entry (`DELETE /api/dedup/<issue-uuid>`).
