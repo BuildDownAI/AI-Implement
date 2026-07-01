@@ -46,6 +46,8 @@ export interface AIImplementSnapshot {
  * AI-Implement issues that have at least one AI-Implement child.
  */
 export interface FeatureNodeRollUp {
+  /** Provider-internal ID (Linear UUID) — passed to markMerged when the top-of-tree PR is detected as merged. */
+  issueId: string;
   /** The feature node's identifier → branch `ai-implement/feature/<identifier>`. */
   identifier: string;
   /** Capacity/scope bucket (team key) — used to resolve the repo mapping. */
