@@ -39,7 +39,13 @@ const deps = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn
 });
 
 const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
-  issueId: "issue-uuid-1", identifier: "AII-101", scopeKey: "AII", parentIdentifier: "AII-102", ...o,
+  issueId: "issue-uuid-1",
+  identifier: "AII-101",
+  scopeKey: "AII",
+  parentIdentifier: "AII-102",
+  branch: "ai-implement/feature/aii-101",
+  target: "ai-implement/feature/aii-102",
+  ...o,
 });
 
 beforeEach(() => {
@@ -91,7 +97,7 @@ describe("runMergeUps — multi-level feature trees", () => {
     await runMergeUps(
       [
         rollUp({ issueId: "uuid-101", identifier: "AII-101", parentIdentifier: "AII-102" }),
-        rollUp({ issueId: "uuid-102", identifier: "AII-102", parentIdentifier: null }),
+        rollUp({ issueId: "uuid-102", identifier: "AII-102", parentIdentifier: null, branch: "ai-implement/feature/aii-102", target: null }),
       ],
       deps(() => mapping(), finalizeMerged),
     );
@@ -109,7 +115,7 @@ describe("runMergeUps — multi-level feature trees", () => {
     await runMergeUps(
       [
         rollUp({ issueId: "uuid-101", identifier: "AII-101", parentIdentifier: "AII-102" }),
-        rollUp({ issueId: "uuid-102", identifier: "AII-102", parentIdentifier: null }),
+        rollUp({ issueId: "uuid-102", identifier: "AII-102", parentIdentifier: null, branch: "ai-implement/feature/aii-102", target: null }),
       ],
       deps(() => mapping(), finalizeMerged),
     );
@@ -147,7 +153,7 @@ describe("runMergeUps — multi-level feature trees", () => {
     vi.mocked(compareBranches).mockResolvedValue(0);
     const finalizeMerged = vi.fn(async () => {});
     await runMergeUps(
-      [rollUp({ identifier: "AII-102", parentIdentifier: null })],
+      [rollUp({ identifier: "AII-102", parentIdentifier: null, branch: "ai-implement/feature/aii-102", target: null })],
       deps(() => mapping(), finalizeMerged),
     );
 

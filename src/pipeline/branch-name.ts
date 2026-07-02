@@ -67,6 +67,20 @@ export function buildFeatureBranchName(parentIdentifier: string | undefined): st
   return `ai-implement/feature/${slugify(parentIdentifier, "parent")}`;
 }
 
+const MAX_MULTI_ISSUE_KEYS = 3;
+
+/**
+ * Shared branch for a multi-issue grouping container. Named from sorted, capped child
+ * identifiers so the name is order-independent and stable as long as the child set
+ * doesn't change. Grouping truth lives in the Linear hierarchy; nothing parses this name back.
+ */
+export function buildMultiIssueBranchName(childIdentifiers: string[]): string {
+  const slugs = childIdentifiers.map((id) => slugify(id, "issue")).sort();
+  const shown = slugs.slice(0, MAX_MULTI_ISSUE_KEYS).join("-");
+  const extra = slugs.length - MAX_MULTI_ISSUE_KEYS;
+  return `ai-implement/multi-issue/${shown}${extra > 0 ? `-plus${extra}` : ""}`;
+}
+
 export function branchMatchesIssueIdentifier(branchRef: string | undefined, issueIdentifier: string | undefined): boolean {
   if (!branchRef || !issueIdentifier) return false;
 
