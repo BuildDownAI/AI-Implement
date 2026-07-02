@@ -341,6 +341,7 @@ export class LinearProvider implements TicketingProvider {
     const data = await this.linearMutation<{
       issues: {
         nodes: Array<{
+          id: string;
           identifier: string;
           team: { key: string };
           children: { nodes: Array<{ labels: { nodes: Array<{ name: string }> } }> };
@@ -358,6 +359,7 @@ export class LinearProvider implements TicketingProvider {
           }
         ) {
           nodes {
+            id
             identifier
             team { key }
             children(first: 50) { nodes { labels { nodes { name } } } }
@@ -377,6 +379,7 @@ export class LinearProvider implements TicketingProvider {
       const parentIsFeatureNode =
         !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
       rollUps.push({
+        issueId: node.id,
         identifier: node.identifier,
         scopeKey: node.team.key,
         parentIdentifier: parentIsFeatureNode ? node.parent!.identifier : null,

@@ -255,22 +255,19 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     // children's merged work. Best-effort — never blocks the poll.
     if (providers.length > 0) {
       try {
-        const rollUps = (
-          await Promise.all(
-            providers.map((p) =>
-              p.fetchFeatureNodeRollUps().catch((err) => {
-                console.error("[merge-up] Provider fetchFeatureNodeRollUps failed:", err);
-                return [] as FeatureNodeRollUp[];
-              }),
-            ),
-          )
-        ).flat();
-        if (rollUps.length > 0) {
-          await runMergeUps(rollUps, {
-            githubAppId: config.githubAppId,
-            githubAppPrivateKey: config.githubAppPrivateKey,
-            resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
+        for (const provider of providers) {
+          const rollUps = await provider.fetchFeatureNodeRollUps().catch((err) => {
+            console.error("[merge-up] Provider fetchFeatureNodeRollUps failed:", err);
+            return [] as FeatureNodeRollUp[];
           });
+          if (rollUps.length > 0) {
+            await runMergeUps(rollUps, {
+              githubAppId: config.githubAppId,
+              githubAppPrivateKey: config.githubAppPrivateKey,
+              resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
+              finalizeMerged: (id) => provider.markMerged(id),
+            });
+          }
         }
       } catch (err) {
         console.error("[merge-up] roll-up step failed:", err);

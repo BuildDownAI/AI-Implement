@@ -422,6 +422,63 @@ export async function findOpenPullRequest(
 }
 
 /**
+ * Finds any PR (open, closed, or merged) for the given head→base pair.
+ * Prefers a merged PR when multiple results exist (e.g. after a re-open / force-push).
+ * Returns null on empty list or non-OK response (soft failure).
+ */
+export async function findPullRequestByBranches(
+  token: string,
+  owner: string,
+  repo: string,
+  head: string,
+  base: string,
+): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean } | null> {
+  const url =
+    `https://api.github.com/repos/${owner}/${repo}/pulls` +
+    `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&state=all&per_page=10`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) return null;
+  const prs = (await res.json()) as Array<{
+    number: number;
+    html_url: string;
+    state: string;
+    merged_at: string | null;
+  }>;
+  if (prs.length === 0) return null;
+  const mergedPr = prs.find((p) => p.merged_at !== null);
+  const pr = mergedPr ?? prs[0];
+  return {
+    number: pr.number,
+    url: pr.html_url,
+    state: pr.state === "open" ? "open" : "closed",
+    merged: pr.merged_at !== null,
+  };
+}
+
+/**
+ * Deletes a branch ref. Treats 404 as success (idempotent — branch may have been
+ * manually deleted or removed by GitHub's "delete on merge" setting).
+ */
+export async function deleteBranch(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<boolean> {
+  const enc = branch.split("/").map(encodeURIComponent).join("/");
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${enc}`;
+  const res = await fetch(url, { method: "DELETE", headers: ghHeaders(token) });
+  if (res.status === 204 || res.status === 404) return true;
+  const body = await res.text().catch(() => "");
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/git/refs/heads/${enc}`,
+    bodyText: body,
+    message: `deleteBranch(${branch}) failed: HTTP ${res.status}: ${body}`,
+  });
+}
+
+/**
  * Opens a PR head→base. Returns the created PR, or an existing open one if GitHub
  * reports a duplicate (422). Throws on other failures.
  */
