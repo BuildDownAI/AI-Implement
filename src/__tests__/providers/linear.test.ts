@@ -154,7 +154,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   afterEach(() => { vi.restoreAllMocks(); });
 
   type Ancestor = { identifier: string; labels?: string[]; parent?: Ancestor | null };
-  type Child = { labels?: string[]; stateType?: string };
+  type Child = { labels?: string[]; stateType?: string; identifier?: string };
 
   function labelNodes(names: string[] | undefined) {
     return { nodes: (names ?? []).map((name) => ({ name })) };
@@ -192,7 +192,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       inverseRelations: { nodes: overrides.inverseRelations ?? [] },
       children: {
         nodes: (overrides.children ?? []).map((c, i) => ({
-          identifier: `${overrides.identifier ?? "ENG-1"}-c${i}`,
+          identifier: c.identifier ?? `${overrides.identifier ?? "ENG-1"}-c${i}`,
           state: { type: c.stateType ?? "unstarted" },
           labels: labelNodes(c.labels),
         })),
@@ -252,8 +252,19 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   });
 
   describe("feature-branch grouping", () => {
-    it("a leaf under a labeled parent targets the parent's feature-branch chain", async () => {
+    it("a leaf under a grouping parent (≥2 AI children) gets the multi-issue branch name in its chain", async () => {
       mockSinglePage([
+        // Grouping container in allNodes with ≥2 AI children
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          children: [
+            { labels: ["AI-Implement"], identifier: "OOL-96" },
+            { labels: ["AI-Implement"], identifier: "OOL-97" },
+          ],
+        }),
+        // Leaf whose parent is OOL-78
         makeIssue({
           id: "leaf",
           identifier: "OOL-96",
@@ -262,8 +273,36 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
         }),
       ]);
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      // Parent (OOL-78) is never dispatched — grouping container
+      expect(snap.needsPlanning.some((i) => i.id === "parent")).toBe(false);
+      expect(snap.readyForImplementation.some((i) => i.id === "parent")).toBe(false);
+      // Leaf gets the multi-issue branch name (sorted: ool-96, ool-97)
       const leaf = snap.readyForImplementation.find((i) => i.id === "leaf")!;
-      expect(leaf.featureBranchChain).toEqual(["OOL-78"]);
+      expect(leaf.featureBranchChain).toEqual(["ai-implement/multi-issue/ool-96-ool-97"]);
+    });
+
+    it("a leaf under a single-AI-child parent gets no chain (PRs to base)", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          children: [{ labels: ["AI-Implement"], identifier: "OOL-96" }],
+        }),
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-96",
+          labels: ["AI-Implement", "Plan-Complete"],
+          parent: { identifier: "OOL-78", labels: ["AI-Implement"] },
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      // Parent with 1 AI child is skipped
+      expect(snap.needsPlanning.some((i) => i.id === "parent")).toBe(false);
+      expect(snap.readyForImplementation.some((i) => i.id === "parent")).toBe(false);
+      // Leaf has no chain (PRs to base; no grouping parent)
+      const leaf = snap.readyForImplementation.find((i) => i.id === "leaf")!;
+      expect(leaf.featureBranchChain).toBeUndefined();
     });
 
     it("a leaf under an UNlabeled parent gets no chain (PRs to base)", async () => {
@@ -280,8 +319,30 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       expect(leaf.featureBranchChain).toBeUndefined();
     });
 
-    it("cascades the chain through labeled grandparents", async () => {
+    it("cascades the chain through labeled grouping grandparents (both must be in allNodes with ≥2 AI children)", async () => {
+      // Grandparent OOL-78 has AI children OOL-96 and OOL-97 → branch ool-96-ool-97
+      // Parent OOL-96 has AI children OOL-99 and OOL-100 → branch ool-100-ool-99 (sorted)
+      // Leaf OOL-99 under OOL-96 (under OOL-78) → chain is base-most first
       mockSinglePage([
+        makeIssue({
+          id: "grandparent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          children: [
+            { labels: ["AI-Implement"], identifier: "OOL-96" },
+            { labels: ["AI-Implement"], identifier: "OOL-97" },
+          ],
+        }),
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-96",
+          labels: ["AI-Implement"],
+          parent: { identifier: "OOL-78", labels: ["AI-Implement"] },
+          children: [
+            { labels: ["AI-Implement"], identifier: "OOL-99" },
+            { labels: ["AI-Implement"], identifier: "OOL-100" },
+          ],
+        }),
         makeIssue({
           id: "leaf",
           identifier: "OOL-99",
@@ -295,11 +356,14 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       ]);
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       const leaf = snap.needsPlanning.find((i) => i.id === "leaf")!;
-      // base-most first
-      expect(leaf.featureBranchChain).toEqual(["OOL-78", "OOL-96"]);
+      // Grandparent branch (base-most first), then parent branch
+      expect(leaf.featureBranchChain).toEqual([
+        "ai-implement/multi-issue/ool-96-ool-97",
+        "ai-implement/multi-issue/ool-100-ool-99",
+      ]);
     });
 
-    it("skips a feature-node parent while any AI-Implement child is in flight", async () => {
+    it("skips a grouping parent (≥2 AI children) regardless of child state", async () => {
       mockSinglePage([
         makeIssue({
           id: "parent",
@@ -307,7 +371,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           labels: ["AI-Implement"],
           children: [
             { labels: ["AI-Implement"], stateType: "completed" },
-            { labels: ["AI-Implement"], stateType: "started" }, // still in flight
+            { labels: ["AI-Implement"], stateType: "started" },
           ],
         }),
       ]);
@@ -316,7 +380,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       expect(snap.readyForImplementation).toEqual([]);
     });
 
-    it("dispatches a feature-node parent once all AI-Implement children are terminal, onto its own branch", async () => {
+    it("skips a grouping parent even when all AI children are terminal (never dispatches)", async () => {
       mockSinglePage([
         makeIssue({
           id: "parent",
@@ -325,13 +389,27 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           children: [
             { labels: ["AI-Implement"], stateType: "completed" },
             { labels: ["AI-Implement"], stateType: "canceled" },
-            { labels: ["Improvement"], stateType: "started" }, // non-AI child does not gate
+            { labels: ["Improvement"], stateType: "started" }, // non-AI child never gates
           ],
         }),
       ]);
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
-      const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
-      expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
+    });
+
+    it("skips a parent with exactly 1 AI-Implement child", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          children: [{ labels: ["AI-Implement"], stateType: "completed" }],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
     });
 
     it("skips a labeled parent whose children are not yet AI-Implement (race guard)", async () => {
@@ -346,6 +424,21 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       expect(snap.needsPlanning).toEqual([]);
       expect(snap.readyForImplementation).toEqual([]);
+    });
+
+    it("a leaf whose labeled ancestor is not in allNodes (e.g. already terminal) gets no chain", async () => {
+      // OOL-78 is not in allNodes → groupingBranchFor("OOL-78") = null → no chain
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-96",
+          labels: ["AI-Implement", "Plan-Complete"],
+          parent: { identifier: "OOL-78", labels: ["AI-Implement"] },
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const leaf = snap.readyForImplementation.find((i) => i.id === "leaf")!;
+      expect(leaf.featureBranchChain).toBeUndefined();
     });
   });
 
@@ -411,33 +504,113 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
       json: async () => ({ data: { issues: { nodes } } }),
     } as Response);
   }
-  const labels = (...names: string[]) => ({ nodes: names.map((name) => ({ name })) });
-
-  it("returns feature nodes with parent target; non-feature parent → null (base)", async () => {
-    mockResponse([
-      { identifier: "OOL-107", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("AI-Implement") }] },
-        parent: { identifier: "OOL-106", labels: labels("AI-Implement") } },
-      { identifier: "OOL-106", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("AI-Implement") }] },
-        parent: null },
-    ]);
-    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([
-      { identifier: "OOL-107", scopeKey: "OOL", parentIdentifier: "OOL-106" },
-      { identifier: "OOL-106", scopeKey: "OOL", parentIdentifier: null },
-    ]);
+  const lbl = (...names: string[]) => ({ nodes: names.map((name) => ({ name })) });
+  const child = (identifier: string, type: string, ...labelNames: string[]) => ({
+    identifier, state: { type }, labels: lbl(...labelNames),
   });
 
-  it("excludes completed issues that are not feature nodes (no AI-Implement child)", async () => {
+  it("surfaces an active grouping parent when all AI-Implement children are terminal; computes branch and null target", async () => {
+    mockResponse([{
+      id: "parent-id",
+      identifier: "OOL-78",
+      team: { key: "OOL" },
+      children: { nodes: [
+        child("OOL-96", "completed", "AI-Implement"),
+        child("OOL-97", "canceled", "AI-Implement"),
+        child("OOL-extra", "started"), // non-AI child, ignored
+      ]},
+      parent: null,
+    }]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toHaveLength(1);
+    expect(rollUps[0]).toMatchObject({
+      issueId: "parent-id",
+      identifier: "OOL-78",
+      scopeKey: "OOL",
+      parentIdentifier: null,
+      branch: "ai-implement/multi-issue/ool-96-ool-97",
+      target: null,
+    });
+  });
+
+  it("does not surface a grouping parent when some AI children are still in-flight", async () => {
+    mockResponse([{
+      id: "parent-id",
+      identifier: "OOL-78",
+      team: { key: "OOL" },
+      children: { nodes: [
+        child("OOL-96", "completed", "AI-Implement"),
+        child("OOL-97", "started", "AI-Implement"),
+      ]},
+      parent: null,
+    }]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([]);
+  });
+
+  it("does not surface issues with fewer than 2 AI-Implement children", async () => {
     mockResponse([
-      { identifier: "OOL-50", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("Improvement") }] }, parent: null },
-      { identifier: "OOL-51", team: { key: "OOL" },
+      { id: "id1", identifier: "OOL-50", team: { key: "OOL" },
+        children: { nodes: [child("OOL-51", "completed", "AI-Implement")] }, parent: null },
+      { id: "id2", identifier: "OOL-60", team: { key: "OOL" },
+        children: { nodes: [child("OOL-61", "completed", "Improvement")] }, parent: null },
+      { id: "id3", identifier: "OOL-70", team: { key: "OOL" },
         children: { nodes: [] }, parent: null },
     ]);
     const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([]);
+  });
+
+  it("computes target from parent's AI children when parent is also a grouping container", async () => {
+    mockResponse([{
+      id: "child-id",
+      identifier: "OOL-78",
+      team: { key: "OOL" },
+      children: { nodes: [
+        child("OOL-96", "completed", "AI-Implement"),
+        child("OOL-97", "canceled", "AI-Implement"),
+      ]},
+      parent: {
+        identifier: "OOL-50",
+        labels: lbl("AI-Implement"),
+        children: { nodes: [
+          { identifier: "OOL-78", labels: lbl("AI-Implement") },
+          { identifier: "OOL-79", labels: lbl("AI-Implement") },
+        ]},
+      },
+    }]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toHaveLength(1);
+    expect(rollUps[0]).toMatchObject({
+      issueId: "child-id",
+      identifier: "OOL-78",
+      parentIdentifier: "OOL-50",
+      branch: "ai-implement/multi-issue/ool-96-ool-97",
+      target: "ai-implement/multi-issue/ool-78-ool-79",
+    });
+  });
+
+  it("sets target to null when parent is not a grouping container (has only 1 AI child)", async () => {
+    mockResponse([{
+      id: "child-id",
+      identifier: "OOL-78",
+      team: { key: "OOL" },
+      children: { nodes: [
+        child("OOL-96", "completed", "AI-Implement"),
+        child("OOL-97", "canceled", "AI-Implement"),
+      ]},
+      parent: {
+        identifier: "OOL-50",
+        labels: lbl("AI-Implement"),
+        children: { nodes: [
+          { identifier: "OOL-78", labels: lbl("AI-Implement") }, // only 1 AI child
+        ]},
+      },
+    }]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toHaveLength(1);
+    expect(rollUps[0].parentIdentifier).toBe("OOL-50");
+    expect(rollUps[0].target).toBeNull();
   });
 });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { branchMatchesIssueIdentifier, buildIssueBranchName, buildFeatureBranchName, normalizeBranchPrefix } from "../pipeline/branch-name.js";
+import { branchMatchesIssueIdentifier, buildIssueBranchName, buildFeatureBranchName, buildMultiIssueBranchName, normalizeBranchPrefix } from "../pipeline/branch-name.js";
 
 describe("buildIssueBranchName", () => {
   it("builds issue-scoped branch names from issue metadata", () => {
@@ -33,6 +33,46 @@ describe("buildFeatureBranchName", () => {
 
   it("falls back defensively for empty identifiers", () => {
     expect(buildFeatureBranchName(undefined)).toBe("ai-implement/feature/parent");
+  });
+});
+
+describe("buildMultiIssueBranchName", () => {
+  it("produces sorted, order-independent names", () => {
+    expect(buildMultiIssueBranchName(["AII-200", "AII-100"])).toBe(
+      buildMultiIssueBranchName(["AII-100", "AII-200"]),
+    );
+  });
+
+  it("always starts with ai-implement/multi-issue/", () => {
+    expect(buildMultiIssueBranchName(["AII-1", "AII-2"])).toMatch(/^ai-implement\/multi-issue\//);
+  });
+
+  it("does not append a suffix when exactly 3 keys", () => {
+    expect(buildMultiIssueBranchName(["AII-1", "AII-2", "AII-3"])).toBe(
+      "ai-implement/multi-issue/aii-1-aii-2-aii-3",
+    );
+  });
+
+  it("caps at 3 and appends -plus1 for 4 keys", () => {
+    expect(buildMultiIssueBranchName(["AII-4", "AII-1", "AII-2", "AII-3"])).toBe(
+      "ai-implement/multi-issue/aii-1-aii-2-aii-3-plus1",
+    );
+  });
+
+  it("appends -plus3 for 6 keys", () => {
+    expect(buildMultiIssueBranchName(["AII-6", "AII-5", "AII-4", "AII-1", "AII-2", "AII-3"])).toBe(
+      "ai-implement/multi-issue/aii-1-aii-2-aii-3-plus3",
+    );
+  });
+
+  it("handles a single identifier (degenerate case, no cap suffix)", () => {
+    expect(buildMultiIssueBranchName(["AII-100"])).toBe("ai-implement/multi-issue/aii-100");
+  });
+
+  it("slugifies mixed-case identifiers", () => {
+    expect(buildMultiIssueBranchName(["OOL-78", "OOL-96"])).toBe(
+      "ai-implement/multi-issue/ool-78-ool-96",
+    );
   });
 });
 

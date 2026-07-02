@@ -8,6 +8,7 @@ import type {
 } from "./types.js";
 import { MissingProviderConfigError } from "./types.js";
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
+import { buildMultiIssueBranchName } from "../pipeline/branch-name.js";
 
 interface GraphQLResponse<T> {
   data?: T;
@@ -252,6 +253,24 @@ export class LinearProvider implements TicketingProvider {
     const needsPlanning: AIImplementSnapshot["needsPlanning"] = [];
     const readyForImplementation: AIImplementSnapshot["readyForImplementation"] = [];
 
+    // Build a map from each non-terminal AI-Implement issue's identifier → its AI-Implement
+    // child identifiers. Used to compute grouping branch names for multi-issue containers.
+    const aiChildIdsByIdentifier = new Map<string, string[]>();
+    for (const issue of allNodes) {
+      const aiKids = (issue.children?.nodes ?? [])
+        .filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL));
+      if (aiKids.length > 0) {
+        aiChildIdsByIdentifier.set(issue.identifier, aiKids.map((c) => c.identifier));
+      }
+    }
+    // Returns the shared multi-issue branch name when an ancestor has ≥2 AI-Implement children;
+    // returns null for non-grouping ancestors (lone child, or ancestor not in the live set).
+    const groupingBranchFor = (identifier: string): string | null => {
+      const kids = aiChildIdsByIdentifier.get(identifier);
+      if (!kids || kids.length < 2) return null;
+      return buildMultiIssueBranchName(kids);
+    };
+
     for (const issue of allNodes) {
       const labelNames = new Set(issue.labels?.nodes?.map((l) => l.name) ?? []);
 
@@ -278,34 +297,35 @@ export class LinearProvider implements TicketingProvider {
       }
 
       // Feature-branch grouping (see src/feature-branch.ts). An AI-Implement issue is one of:
-      //   - leaf (no children)            → implement now; PR targets nearest feature-node
-      //                                      ancestor branch (or base).
-      //   - feature-node (>=1 AI child)   → its own work waits until ALL its AI-Implement
-      //                                      children reach a terminal state, then implements
-      //                                      onto its OWN feature branch. While children are in
-      //                                      flight the parent is skipped (its branch is cut
-      //                                      lazily when the first child dispatches).
-      //   - waiting parent (children but  → skipped (race guard: the parent was labeled before
-      //     none AI-Implement yet)          its children were, so let it sit).
+      //   - leaf (no children)       → implement now; PR targets any grouping-ancestor branch
+      //                                (ancestors with ≥2 AI children) in base-most order, or base.
+      //   - grouping container       → ≥2 AI-Implement children: never dispatched; its children
+      //     (≥2 AI children)           implement onto the shared multi-issue branch.
+      //   - single-AI-child parent   → exactly 1 AI child: not a group; parent never dispatches;
+      //                                lone child PRs straight to base.
+      //   - waiting parent (children → skipped (race guard: parent was labeled before its children).
+      //     but none AI-Implement)
       const children = issue.children?.nodes ?? [];
       const aiChildren = children.filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL));
-      const ancestorChain = labeledAncestorChain(issue.parent);
 
       let featureBranchChain: string[] | undefined;
       if (children.length === 0) {
-        // Leaf.
-        featureBranchChain = ancestorChain.length > 0 ? ancestorChain : undefined;
-      } else if (aiChildren.length > 0) {
-        const allAIChildrenTerminal = aiChildren.every(
-          (c) => c.state?.type === "completed" || c.state?.type === "canceled",
-        );
-        if (!allAIChildrenTerminal) {
-          console.log(`[linear] Skipping ${issue.identifier}: feature-node parent waiting on in-flight AI-Implement children`);
-          continue;
-        }
-        // All AI-Implement children done — implement the parent's closing work onto its own branch.
-        featureBranchChain = [...ancestorChain, issue.identifier];
+        // Leaf: walk labeled ancestors and include only grouping ancestors (≥2 AI children).
+        const ancestorIds = labeledAncestorChain(issue.parent);
+        const chain = ancestorIds
+          .map((id) => groupingBranchFor(id))
+          .filter((b): b is string => b !== null);
+        featureBranchChain = chain.length > 0 ? chain : undefined;
+      } else if (aiChildren.length >= 2) {
+        // Grouping container: pure grouping, never dispatched — children do the work.
+        console.log(`[linear] Skipping ${issue.identifier}: grouping container (${aiChildren.length} AI-Implement children)`);
+        continue;
+      } else if (aiChildren.length === 1) {
+        // Single AI child: not a group; parent is skipped, lone child PRs to base.
+        console.log(`[linear] Skipping ${issue.identifier}: parent with 1 AI-Implement child is not a grouping container`);
+        continue;
       } else {
+        // No AI children yet: race guard.
         console.log(`[linear] Skipping ${issue.identifier}: parent labeled but no child has AI-Implement set yet`);
         continue;
       }
@@ -332,11 +352,11 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {
-    // Recently-completed AI-Implement issues that are feature nodes (>=1 AI-Implement
-    // child) need their feature branch rolled up into the parent. Bound the scan to a
-    // recent window so the set stays small; the merge-up step skips already-merged
-    // branches cheaply via a branch comparison. A completed feature node implies its
-    // own closing work merged and all its children done.
+    // Scan recently-updated active AI-Implement grouping containers (≥2 AI-Implement children)
+    // whose AI children are all in a terminal state. These need their shared multi-issue branch
+    // rolled up into the parent (or opened as a top-of-tree PR for human review). The filter
+    // uses nin:["completed","canceled"] so we find still-active grouping parents before they are
+    // finalized — self-finalization happens here, not via a native GitHub integration.
     const since = new Date(Date.now() - ROLLUP_LOOKBACK_MS).toISOString();
     const data = await this.linearMutation<{
       issues: {
@@ -344,8 +364,16 @@ export class LinearProvider implements TicketingProvider {
           id: string;
           identifier: string;
           team: { key: string };
-          children: { nodes: Array<{ labels: { nodes: Array<{ name: string }> } }> };
-          parent: { identifier: string; labels: { nodes: Array<{ name: string }> } } | null;
+          children: { nodes: Array<{
+            identifier: string;
+            state: { type: string };
+            labels: { nodes: Array<{ name: string }> };
+          }> };
+          parent: {
+            identifier: string;
+            labels: { nodes: Array<{ name: string }> };
+            children: { nodes: Array<{ identifier: string; labels: { nodes: Array<{ name: string }> } }> };
+          } | null;
         }>;
       };
     }>(
@@ -354,7 +382,7 @@ export class LinearProvider implements TicketingProvider {
           first: 100
           filter: {
             labels: { name: { eq: "AI-Implement" } }
-            state: { type: { eq: "completed" } }
+            state: { type: { nin: ["completed", "canceled"] } }
             updatedAt: { gt: $since }
           }
         ) {
@@ -362,8 +390,16 @@ export class LinearProvider implements TicketingProvider {
             id
             identifier
             team { key }
-            children(first: 50) { nodes { labels { nodes { name } } } }
-            parent { identifier labels { nodes { name } } }
+            children(first: 50) { nodes {
+              identifier
+              state { type }
+              labels { nodes { name } }
+            } }
+            parent {
+              identifier
+              labels { nodes { name } }
+              children(first: 50) { nodes { identifier labels { nodes { name } } } }
+            }
           }
         }
       }`,
@@ -372,17 +408,38 @@ export class LinearProvider implements TicketingProvider {
 
     const rollUps: FeatureNodeRollUp[] = [];
     for (const node of data.issues?.nodes ?? []) {
-      const isFeatureNode = (node.children?.nodes ?? []).some((c) =>
+      // Only surface grouping containers: ≥2 AI-Implement children, all terminal.
+      const aiChildren = (node.children?.nodes ?? []).filter((c) =>
         (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
       );
-      if (!isFeatureNode) continue;
+      if (aiChildren.length < 2) continue;
+      const allTerminal = aiChildren.every(
+        (c) => c.state?.type === "completed" || c.state?.type === "canceled",
+      );
+      if (!allTerminal) continue;
+
+      const childKeys = aiChildren.map((c) => c.identifier);
+      const branch = buildMultiIssueBranchName(childKeys);
+
       const parentIsFeatureNode =
         !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
+      let target: string | null = null;
+      if (parentIsFeatureNode && node.parent) {
+        const parentAiChildren = (node.parent.children?.nodes ?? []).filter((c) =>
+          (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
+        );
+        if (parentAiChildren.length >= 2) {
+          target = buildMultiIssueBranchName(parentAiChildren.map((c) => c.identifier));
+        }
+      }
+
       rollUps.push({
         issueId: node.id,
         identifier: node.identifier,
         scopeKey: node.team.key,
         parentIdentifier: parentIsFeatureNode ? node.parent!.identifier : null,
+        branch,
+        target,
       });
     }
     return rollUps;

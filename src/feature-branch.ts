@@ -1,7 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue } from "./providers/types.js";
 import { ensureBranchExists } from "./github.js";
-import { buildFeatureBranchName } from "./pipeline/branch-name.js";
 
 /**
  * Feature-branch grouping for parent/child issues.
@@ -20,9 +19,10 @@ import { buildFeatureBranchName } from "./pipeline/branch-name.js";
  * Resolves the branch a dispatched issue's PR should target, creating any feature
  * branches in `issue.featureBranchChain` that don't yet exist.
  *
- * The chain is base-most first: each identifier's branch `ai-implement/feature/<id>` is
- * cut from the previous entry's branch (or mapping.defaultBranch for the first), and the
- * PR targets the LAST entry's branch. An empty/absent chain returns mapping.defaultBranch.
+ * The chain is base-most first and carries resolved branch names (e.g.,
+ * "ai-implement/multi-issue/aii-100-aii-200"). Each branch is cut from the previous
+ * entry's branch (or mapping.defaultBranch for the first), and the PR targets the LAST
+ * entry. An empty/absent chain returns mapping.defaultBranch.
  *
  * `ensureBranchExists` is idempotent (422-tolerant), so an existing ancestor branch is
  * reused and only the missing tip of the chain is cut.
@@ -43,8 +43,7 @@ export async function resolveBaseBranch(opts: {
   try {
     let cutFrom = mapping.defaultBranch;
     let target = mapping.defaultBranch;
-    for (const identifier of chain) {
-      const branch = buildFeatureBranchName(identifier);
+    for (const branch of chain) {
       await ensureBranchExists(ghToken, mapping.owner, mapping.repo, branch, cutFrom);
       cutFrom = branch;
       target = branch;
