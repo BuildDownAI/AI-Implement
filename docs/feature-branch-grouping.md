@@ -13,28 +13,30 @@ This is the operator/developer reference. The decision history lives in
 
 A Linear issue tree maps onto a tree of git branches:
 
-- A **parent issue** that carries the `AI-Implement` label *and* has at least one
-  `AI-Implement` child becomes a **feature node**. It owns a long-running feature branch
-  `ai-implement/feature/<issue-key>`.
-- Its **labelled children** are worked on and open PRs **into that feature branch**, not
-  into the repo's base branch.
+- A **parent issue** that carries the `AI-Implement` label *and* has **two or more**
+  `AI-Implement` children becomes a **grouping node**. It owns a shared branch named from
+  its children: `ai-implement/multi-issue/<sorted child slugs>`. The grouping node carries
+  **no implementation work of its own** and is never dispatched.
+- A parent with **exactly one** `AI-Implement` child is **not** a grouping node — that lone
+  child PRs directly to the repo base branch (or the nearest grouping ancestor) as if the
+  parent didn't exist.
+- The **labelled children** open PRs **into the shared grouping branch**, not into the
+  repo's base branch.
 - Unlabelled children are ignored until they too get the `AI-Implement` label — so you can
   roll a tree out incrementally.
-- The tree is **recursive**: a child that is itself a feature node gets its own branch cut
-  from its parent's branch, and so on.
-- When a feature node's children are all done, the node's **own work** runs (a parent
-  can carry work that isn't done in any child — e.g. a final cleanup), committed onto its
-  own feature branch.
-- Completed feature branches **roll up** into their parent's branch automatically; the
-  single top-of-tree `feature → base` merge is left as a human-reviewed PR.
+- The tree is **recursive**: a child that is itself a grouping node gets its own shared
+  branch cut from its parent's branch, and so on.
+- When **all** AI-Implement children reach a terminal state (completed or cancelled), the
+  grouping branch **rolls up** automatically. Internal levels roll up via a direct merge;
+  the single top-of-tree roll-up is offered as a human-reviewed `multi-issue → base` PR.
 
 ```
-testing                                  (repo base branch)
-└─ ai-implement/feature/PROJ-100         parent PROJ-100 (feature node)
-   ├─ ai-implement/feature/PROJ-101      child PROJ-101 (also a feature node)
-   │   ├─ PR: PROJ-103 (leaf) ─────────► feature/PROJ-101
-   │   └─ PR: PROJ-104 (leaf) ─────────► feature/PROJ-101
-   └─ PR: PROJ-102 (leaf) ─────────────► feature/PROJ-100
+testing                                           (repo base branch)
+└─ ai-implement/multi-issue/aii-100-aii-101       grouping node AII-99
+   ├─ ai-implement/multi-issue/aii-103-aii-104    grouping node AII-100
+   │   ├─ PR: AII-103 (leaf) ──────────────────► multi-issue/aii-103-aii-104
+   │   └─ PR: AII-104 (leaf) ──────────────────► multi-issue/aii-103-aii-104
+   └─ PR: AII-101 (leaf) ──────────────────────► multi-issue/aii-100-aii-101
 ```
 
 ---
@@ -67,10 +69,18 @@ classifies each one (`src/providers/linear.ts`, `fetchAIImplementSnapshot`):
 | `AI-Working` or `AI-Planning` present | in-progress | counted for capacity, skipped |
 | `Ready for Review` present | in review | skipped |
 | blocked by an open "blocks" relation | blocked | skipped |
-| **no children** | **leaf** | dispatched; PR targets the nearest feature-node ancestor branch (or base) |
-| **≥1 `AI-Implement` child, not all terminal** | **feature node (waiting)** | skipped — its branch is cut lazily when the first child dispatches |
-| **≥1 `AI-Implement` child, all terminal** | **feature node (ready)** | dispatched; its own closing work lands on its own feature branch |
+| **no children** | **leaf** | dispatched; PR targets the nearest grouping-node ancestor branch (or base) |
+| **exactly 1 `AI-Implement` child** | **single-child parent** | skipped — not a grouping node; the lone child PRs to base as a leaf |
+| **≥2 `AI-Implement` children, not all terminal** | **grouping node (waiting)** | skipped — its branch is cut lazily when the first child dispatches |
+| **≥2 `AI-Implement` children, all terminal** | **grouping node (roll-up ready)** | roll-up fires; grouping node is NOT dispatched |
 | **has children but none `AI-Implement` yet** | **waiting parent** | skipped — race guard (see below) |
+
+### The ≥2 gate
+
+Two or more AI-Implement children are required to form a grouping node. A parent with
+exactly one AI-Implement child is treated the same as a non-parent: the orchestrator skips
+it and the lone child dispatches as a leaf toward the base branch. Only at ≥2 children does
+the parent become a passive grouping container.
 
 ### The race guard
 
@@ -80,24 +90,24 @@ a child gets labelled. This is what lets you label a whole tree at once (or top-
 without the parent being worked prematurely. Log line:
 `Skipping <key>: parent labeled but no child has AI-Implement set yet`.
 
-### Parent closing work is deferred
-
-A feature node is **not** implemented while any of its `AI-Implement` children are still
-in flight (`Skipping <key>: feature-node parent waiting on in-flight AI-Implement
-children`). Only once **all** its labelled children reach a terminal state does its own
-work dispatch — onto its own feature branch. "Terminal" means completed *or* cancelled, so
-a cancelled child doesn't block the parent forever.
-
 ---
 
-## 4. Feature branches: naming and the cascade
+## 4. Branch naming and the cascade
 
-- Branch name: `ai-implement/feature/<issue-key-slug>` (`buildFeatureBranchName` in
-  `src/pipeline/branch-name.ts`).
-- The provider attaches an ordered `featureBranchChain` (base-most first) to each
-  dispatchable issue (`TicketIssue.featureBranchChain` in `src/providers/types.ts`). For a
-  leaf it ends at the nearest feature-node ancestor; for a ready feature node it ends at
-  the node itself.
+- Branch name: `ai-implement/multi-issue/<sorted child slugs>` (`buildMultiIssueBranchName`
+  in `src/pipeline/branch-name.ts`). Each child identifier is slugified (lowercased;
+  non-alphanumeric runs replaced by hyphens), the slugs are sorted, and the first three are
+  joined with hyphens. When there are more than three children, a `-plus{N}` suffix records
+  the count of omitted children. Examples:
+  - 2 children AII-101 and AII-102 → `ai-implement/multi-issue/aii-101-aii-102`
+  - 5 children AII-101 through AII-105 → `ai-implement/multi-issue/aii-101-aii-102-aii-103-plus2`
+- The parent's own key is **excluded** from the branch name by design. The name is a stable
+  label; the grouping truth lives in the Linear hierarchy. Nothing parses the name back into
+  a set of issues.
+- The provider attaches an ordered `featureBranchChain` (base-most first) carrying **branch
+  name strings** to each dispatchable issue (`TicketIssue.featureBranchChain` in
+  `src/providers/types.ts`). Only grouping ancestors with ≥2 AI children appear in the
+  chain; single-AI-child ancestors are dropped so the lone child reaches the base.
 - At dispatch time, `resolveBaseBranch` (`src/feature-branch.ts`) walks the chain and
   **creates each branch that doesn't exist, cut from the previous one** (or from the repo
   base for the first), returning the branch the PR should target. Branch creation is
@@ -114,31 +124,33 @@ grouping**.
 
 ## 5. Roll-up (the merge-up)
 
-When a feature-node issue completes, its branch is merged into its parent's branch
-(`src/merge-up.ts`, fed by `LinearProvider.fetchFeatureNodeRollUps`, run each poll **before**
-dispatch so a parent's own work clones a branch that already contains its children's work):
+When **all** of a grouping node's AI-Implement children reach a terminal state (completed
+or cancelled), `fetchFeatureNodeRollUps` surfaces the node and the roll-up fires
+(`src/merge-up.ts`, run each poll **before** dispatch). The grouping node itself is **never
+dispatched** — it has no implementation work and does not need a runner callback to advance.
 
-- **Internal level** (the parent is itself a feature node) → a **direct git merge**
+- **Internal level** (the parent is itself a grouping node) → a **direct git merge**
   (`POST /merges`, `mergeBranch` in `src/github.ts`), **not** a pull request, with a commit
-  message that carries no issue identifier. *Why no PR:* a roll-up PR's base branch name and
-  title encode the parent's key, so Linear's GitHub integration would auto-link the PR to the
-  parent issue and mark it **Done on merge — before the parent's own work runs**. A plain
-  merge commit gives Linear nothing to link, so the parent's lifecycle stays correct.
-- **Top of the tree** (no feature-node parent) → an open `feature → base` **PR for human
-  review**, never auto-merged.
+  message that carries no issue identifier. *Why no PR:* a roll-up PR's base branch name
+  and title would encode the parent's key, giving Linear's GitHub integration a signal to
+  mark the parent Done before the tree is finalized. A plain merge commit gives Linear
+  nothing to link.
+- **Top of the tree** (no grouping-node parent) → an open `multi-issue → base` **PR for
+  human review**, never auto-merged.
 
-The step is **idempotent** and **fails soft** per roll-up — one failure never aborts the others or the poll loop. It scans only feature nodes completed in a recent window to stay cheap.
+The step is **idempotent** and **fails soft** per roll-up — one failure never aborts the
+others or the poll loop.
 
 Idempotency is handled differently per path:
-- **Internal level:** `compareBranches` returning 0 (branch already merged into parent) or `null` (branch missing) causes an early return.
-- **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker. If the PR is still open, the step returns and awaits the human. Only when no PR exists is a new one opened (guarded by an ahead-check so a missing branch exits early). This replaces the old git-ancestry heuristic (`compareBranches` alone at the top-of-tree path), which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)).
-
-> ⚠️ **Auto-roll-up needs the runner callback.** A feature node only completes when its
-> closing-work PR merges and Linear marks it Done; the roll-up keys off that completed
-> state. Planning's `Plan-Complete` transition is delivered by the runner callback
-> (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`, which must be **publicly reachable**).
-> With the callback disabled, planning stalls at `AI-Planning` and the cascade can't advance
-> on its own.
+- **Internal level:** `compareBranches` returning 0 (branch already merged into parent) or
+  `null` (branch missing) causes an early return.
+- **Top of the tree:** `findPullRequestByBranches` is checked first. If the
+  `multi-issue → base` PR is **merged** — by any method (merge-commit, squash, or rebase)
+  — the orchestrator deletes the grouping branch (`deleteBranch`) and calls `markMerged` to
+  finalize the grouping node in the tracker. **This path self-finalizes without requiring
+  native Linear/GitHub integration** — the PR merged-state check is the only signal needed.
+  If the PR is still open, the step returns and awaits the human. Only when no PR exists is
+  a new one opened (guarded by an ahead-check so a missing branch exits early).
 
 ---
 
@@ -146,14 +158,15 @@ Idempotency is handled differently per path:
 
 1. Label the tree `AI-Implement` (whole tree at once is fine — the gates sequence it).
 2. Leaves with no blockers dispatch: **plan → (auto-approve) → implement → PR** into their
-   parent's feature branch. The cascade branches are created on the first leaf dispatch.
-3. A human merges each leaf PR → the orchestrator marks the leaf **Done** (via poll detector + webhook) → any blocked sibling
-   unblocks and runs.
-4. When a feature node's children are all Done, its **own closing work** dispatches → PR
-   into its own feature branch → human merges → orchestrator marks node Done.
-5. The **merge-up** rolls each completed feature node's branch up into its parent's branch
-   (direct merge). The top node's branch is offered as a `feature → base` PR.
-6. A human reviews and merges that final PR **by any merge method** (merge-commit, squash, or rebase). On the next poll tick the orchestrator detects the merged PR state, deletes the feature branch, and calls `markMerged` to finalize the top node Done — the tree lands on the base branch and the PR is never re-opened.
+   parent's grouping branch. The cascade branches are created on the first leaf dispatch.
+3. A human merges each leaf PR → the orchestrator marks the leaf **Done** (via poll
+   detector + webhook) → any blocked sibling unblocks and runs.
+4. When all of a grouping node's AI-Implement children are Done (or cancelled), the
+   **roll-up** fires automatically: the shared grouping branch merges into its parent's
+   branch (internal levels) or is offered as a `multi-issue → base` PR (top of tree).
+5. A human reviews and merges that final PR **by any merge method** (merge-commit, squash,
+   or rebase). On the next poll tick the orchestrator detects the merged PR state, deletes
+   the grouping branch, and calls `markMerged` to finalize the top grouping node Done.
 
 ---
 
@@ -162,11 +175,11 @@ Idempotency is handled differently per path:
 | Concern | File |
 |---------|------|
 | Label query, classification, roll-up discovery | `src/providers/linear.ts` (`fetchAIImplementSnapshot`, `fetchFeatureNodeRollUps`) |
-| Shared types (`featureBranchChain`, `FeatureNodeRollUp`) | `src/providers/types.ts` |
-| Branch names | `src/pipeline/branch-name.ts` (`buildFeatureBranchName`) |
+| Shared types (`featureBranchChain` carries branch name strings; `FeatureNodeRollUp`) | `src/providers/types.ts` |
+| Branch names | `src/pipeline/branch-name.ts` (`buildMultiIssueBranchName`); `fetchFeatureNodeRollUps` surfaces grouping nodes on children-all-terminal |
 | Cascade branch creation + PR-base resolution | `src/feature-branch.ts` (`resolveBaseBranch`) |
 | Roll-up (direct merge / human PR) | `src/merge-up.ts` (`runMergeUps`) |
-| GitHub helpers (branch/compare/merge/PR/merged-state) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`, `findPullRequestByBranches`, `deleteBranch`) — `findPullRequestByBranches` detects the top-of-tree PR's merged state (robust to any merge method); `deleteBranch` removes the feature branch after merge |
+| GitHub helpers (branch/compare/merge/PR/merged-state) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`, `findPullRequestByBranches`, `deleteBranch`) — `findPullRequestByBranches` detects the top-of-tree PR's merged state (robust to any merge method); `deleteBranch` removes the grouping branch after merge |
 | Plan-Complete transition | `src/runner-callback.ts` → `markPlanComplete` |
 | Poll-loop wiring (roll-up before dispatch; base resolved per issue) | `src/index.ts` |
 
@@ -188,7 +201,20 @@ and no `featureBranchChain`, so its issues always PR to the base branch.
   `SESSION_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`; otherwise a GitHub Actions
   run falls back to the `:latest` runner, which may be incompatible with the current
   workflow/entrypoint.
-- **Top-of-tree PR merge method:** any method (merge-commit, squash, rebase) works correctly — the orchestrator detects completion via the PR's merged state, not git ancestry. On orchestrator versions before AII-188 shipped, squash/rebase merges left the feature branch appearing "ahead" of base, causing the PR to be re-opened each poll tick. If running a pre-fix orchestrator, use merge-commit with **Delete branch** checked as a temporary workaround.
+- **Top-of-tree PR merge method:** any method (merge-commit, squash, rebase) works
+  correctly — the orchestrator detects completion via the PR's merged state, not git
+  ancestry.
+- **Child-set mutation hazard:** the grouping branch name is derived from the child set at
+  the time the branch is first created. If a child is added to or removed from a grouping
+  node while the branch is in flight, `buildMultiIssueBranchName` will compute a different
+  name for the current child set, and the orchestrator will create a second branch —
+  orphaning the first. **Drain all in-flight `ai-implement/multi-issue/*` groups before
+  mutating their child sets.**
+- **Migration from old `ai-implement/feature/*` branches:** teams upgrading from the
+  pre-AII-152 model (where grouping branches used `ai-implement/feature/<parent-key>`)
+  should drain any in-flight `ai-implement/feature/*` groups before deploying. After
+  deploy, new groups use the `ai-implement/multi-issue/…` form; the old form will no longer
+  be created.
 - **Don't restart the orchestrator mid-run.** A restart drops in-flight job tracking,
   leaving dispatched issues stuck with `AI-Working` plus a dedup row. Recover by removing
   `AI-Working` in Linear and deleting the dedup entry (`DELETE /api/dedup/<issue-uuid>`).
