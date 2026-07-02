@@ -421,14 +421,20 @@ export class LinearProvider implements TicketingProvider {
       const childKeys = aiChildren.map((c) => c.identifier);
       const branch = buildMultiIssueBranchName(childKeys);
 
+      // Only treat the parent as an internal roll-up target when it is a REAL grouping
+      // container (labeled AND >=2 AI-Implement children). Otherwise this node is the top of
+      // the tree: parentIdentifier AND target must both be null so merge-up.ts opens a
+      // human-reviewed feature→base PR rather than direct-merging into the default branch.
       const parentIsFeatureNode =
         !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
       let target: string | null = null;
+      let parentIdentifier: string | null = null;
       if (parentIsFeatureNode && node.parent) {
         const parentAiChildren = (node.parent.children?.nodes ?? []).filter((c) =>
           (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
         );
         if (parentAiChildren.length >= 2) {
+          parentIdentifier = node.parent.identifier;
           target = buildMultiIssueBranchName(parentAiChildren.map((c) => c.identifier));
         }
       }
@@ -437,7 +443,7 @@ export class LinearProvider implements TicketingProvider {
         issueId: node.id,
         identifier: node.identifier,
         scopeKey: node.team.key,
-        parentIdentifier: parentIsFeatureNode ? node.parent!.identifier : null,
+        parentIdentifier,
         branch,
         target,
       });

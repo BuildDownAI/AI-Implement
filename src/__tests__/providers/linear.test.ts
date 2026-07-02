@@ -590,7 +590,11 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     });
   });
 
-  it("sets target to null when parent is not a grouping container (has only 1 AI child)", async () => {
+  it("treats a container under a labeled single-AI-child parent as top-of-tree (parentIdentifier AND target both null)", async () => {
+    // The parent carries the AI-Implement label but is NOT a real grouping container (only 1 AI
+    // child), so this node is the top of the tree. parentIdentifier must be null alongside target
+    // — otherwise merge-up.ts routes it into the internal direct-merge path and silently merges
+    // into the default branch with no human-reviewed PR.
     mockResponse([{
       id: "child-id",
       identifier: "OOL-78",
@@ -609,7 +613,7 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     }]);
     const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
     expect(rollUps).toHaveLength(1);
-    expect(rollUps[0].parentIdentifier).toBe("OOL-50");
+    expect(rollUps[0].parentIdentifier).toBeNull();
     expect(rollUps[0].target).toBeNull();
   });
 });
