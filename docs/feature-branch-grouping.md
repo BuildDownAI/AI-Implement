@@ -45,9 +45,9 @@ grouping branch self-finalizes.
 
 ```
 testing                                  (repo base branch)
-└─ ai-implement/multi-issue/aii-5-aii-10 shared grouping branch
-   ├─ PR: AII-5 (leaf) ─────────────────► multi-issue/aii-5-aii-10
-   └─ PR: AII-10 (leaf) ────────────────► multi-issue/aii-5-aii-10
+└─ ai-implement/multi-issue/aii-10-aii-5 shared grouping branch
+   ├─ PR: AII-5 (leaf) ─────────────────► multi-issue/aii-10-aii-5
+   └─ PR: AII-10 (leaf) ────────────────► multi-issue/aii-10-aii-5
 ```
 
 **Degenerate case:** `Multi-Issue` label on a parent with fewer than 2 `AI-Implement`
