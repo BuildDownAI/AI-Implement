@@ -153,15 +153,22 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  type Ancestor = { identifier: string; labels?: string[]; parent?: Ancestor | null };
-  type Child = { labels?: string[]; stateType?: string };
+  type Ancestor = { identifier: string; labels?: string[]; aiChildIdentifiers?: string[]; parent?: Ancestor | null };
+  type Child = { identifier?: string; labels?: string[]; stateType?: string };
 
   function labelNodes(names: string[] | undefined) {
     return { nodes: (names ?? []).map((name) => ({ name })) };
   }
   function ancestorNode(a: Ancestor | null | undefined): unknown {
     if (!a) return null;
-    return { identifier: a.identifier, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
+    return {
+      identifier: a.identifier,
+      labels: labelNodes(a.labels),
+      children: {
+        nodes: (a.aiChildIdentifiers ?? []).map((id) => ({ identifier: id, labels: labelNodes(["AI-Implement"]) })),
+      },
+      parent: ancestorNode(a.parent),
+    };
   }
 
   function makeIssue(overrides: {
@@ -177,9 +184,10 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
     parent?: Ancestor | null;
     children?: Child[];
   } = {}) {
+    const issueIdentifier = overrides.identifier ?? "ENG-1";
     return {
       id: overrides.id ?? "uuid-1",
-      identifier: overrides.identifier ?? "ENG-1",
+      identifier: issueIdentifier,
       title: overrides.title ?? "Title",
       description: overrides.description ?? null,
       team: { id: "team-id", key: overrides.teamKey ?? "ENG" },
@@ -192,7 +200,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       inverseRelations: { nodes: overrides.inverseRelations ?? [] },
       children: {
         nodes: (overrides.children ?? []).map((c, i) => ({
-          identifier: `${overrides.identifier ?? "ENG-1"}-c${i}`,
+          identifier: c.identifier ?? `${issueIdentifier}-c${i}`,
           state: { type: c.stateType ?? "unstarted" },
           labels: labelNodes(c.labels),
         })),
@@ -258,12 +266,12 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           id: "leaf",
           identifier: "OOL-96",
           labels: ["AI-Implement", "Plan-Complete"],
-          parent: { identifier: "OOL-78", labels: ["AI-Implement"] },
+          parent: { identifier: "OOL-78", labels: ["AI-Implement"], aiChildIdentifiers: ["OOL-96"] },
         }),
       ]);
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       const leaf = snap.readyForImplementation.find((i) => i.id === "leaf")!;
-      expect(leaf.featureBranchChain).toEqual(["OOL-78"]);
+      expect(leaf.featureBranchChain).toEqual(["ai-implement/feature/ool-78"]);
     });
 
     it("a leaf under an UNlabeled parent gets no chain (PRs to base)", async () => {
@@ -289,14 +297,15 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           parent: {
             identifier: "OOL-96",
             labels: ["AI-Implement"],
-            parent: { identifier: "OOL-78", labels: ["AI-Implement"] },
+            aiChildIdentifiers: ["OOL-99"],
+            parent: { identifier: "OOL-78", labels: ["AI-Implement"], aiChildIdentifiers: ["OOL-96"] },
           },
         }),
       ]);
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       const leaf = snap.needsPlanning.find((i) => i.id === "leaf")!;
-      // base-most first
-      expect(leaf.featureBranchChain).toEqual(["OOL-78", "OOL-96"]);
+      // base-most first; each entry is a branch name
+      expect(leaf.featureBranchChain).toEqual(["ai-implement/feature/ool-78", "ai-implement/feature/ool-96"]);
     });
 
     it("skips a feature-node parent while any AI-Implement child is in flight", async () => {
@@ -323,15 +332,15 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           identifier: "OOL-78",
           labels: ["AI-Implement"],
           children: [
-            { labels: ["AI-Implement"], stateType: "completed" },
-            { labels: ["AI-Implement"], stateType: "canceled" },
-            { labels: ["Improvement"], stateType: "started" }, // non-AI child does not gate
+            { identifier: "OOL-78-c0", labels: ["AI-Implement"], stateType: "completed" },
+            { identifier: "OOL-78-c1", labels: ["AI-Implement"], stateType: "canceled" },
+            { identifier: "OOL-78-c2", labels: ["Improvement"], stateType: "started" }, // non-AI child does not gate
           ],
         }),
       ]);
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
-      expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+      expect(parent.featureBranchChain).toEqual(["ai-implement/feature/ool-78"]);
     });
 
     it("skips a labeled parent whose children are not yet AI-Implement (race guard)", async () => {
@@ -346,6 +355,111 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       expect(snap.needsPlanning).toEqual([]);
       expect(snap.readyForImplementation).toEqual([]);
+    });
+
+    describe("Multi-Issue grouping", () => {
+      it("Multi-Issue parent with >=2 terminal AI children is never dispatched", async () => {
+        mockSinglePage([
+          makeIssue({
+            id: "mi-parent",
+            identifier: "AII-10",
+            labels: ["AI-Implement", "Multi-Issue"],
+            children: [
+              { identifier: "AII-11", labels: ["AI-Implement"], stateType: "completed" },
+              { identifier: "AII-12", labels: ["AI-Implement"], stateType: "completed" },
+            ],
+          }),
+        ]);
+        const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+        expect(snap.needsPlanning).toEqual([]);
+        expect(snap.readyForImplementation).toEqual([]);
+      });
+
+      it("Multi-Issue parent with children in flight is skipped", async () => {
+        mockSinglePage([
+          makeIssue({
+            id: "mi-parent",
+            identifier: "AII-10",
+            labels: ["AI-Implement", "Multi-Issue"],
+            children: [
+              { identifier: "AII-11", labels: ["AI-Implement"], stateType: "started" },
+              { identifier: "AII-12", labels: ["AI-Implement"], stateType: "completed" },
+            ],
+          }),
+        ]);
+        const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+        expect(snap.needsPlanning).toEqual([]);
+        expect(snap.readyForImplementation).toEqual([]);
+      });
+
+      it("Multi-Issue parent with <2 AI children is skipped (degenerate)", async () => {
+        mockSinglePage([
+          makeIssue({
+            id: "mi-parent",
+            identifier: "AII-10",
+            labels: ["AI-Implement", "Multi-Issue"],
+            children: [
+              { identifier: "AII-11", labels: ["AI-Implement"], stateType: "completed" },
+            ],
+          }),
+        ]);
+        const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+        expect(snap.needsPlanning).toEqual([]);
+        expect(snap.readyForImplementation).toEqual([]);
+      });
+
+      it("leaf under a Multi-Issue parent gets multi-issue branch in chain", async () => {
+        mockSinglePage([
+          makeIssue({
+            id: "leaf",
+            identifier: "AII-11",
+            labels: ["AI-Implement"],
+            parent: {
+              identifier: "AII-10",
+              labels: ["AI-Implement", "Multi-Issue"],
+              aiChildIdentifiers: ["AII-11", "AII-12"],
+            },
+          }),
+        ]);
+        const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+        const leaf = snap.needsPlanning.find((i) => i.id === "leaf")!;
+        expect(leaf.featureBranchChain).toEqual(["ai-implement/multi-issue/aii-11-aii-12"]);
+      });
+
+      it("leaf under degenerate Multi-Issue parent (<2 AI children) gets no chain", async () => {
+        mockSinglePage([
+          makeIssue({
+            id: "leaf",
+            identifier: "AII-11",
+            labels: ["AI-Implement"],
+            parent: {
+              identifier: "AII-10",
+              labels: ["AI-Implement", "Multi-Issue"],
+              aiChildIdentifiers: ["AII-11"], // only 1 AI child — degenerate
+            },
+          }),
+        ]);
+        const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+        const leaf = snap.needsPlanning.find((i) => i.id === "leaf")!;
+        expect(leaf.featureBranchChain).toBeUndefined();
+      });
+
+      it("feature-node parent without Multi-Issue label still dispatches normally (regression guard)", async () => {
+        mockSinglePage([
+          makeIssue({
+            id: "fn-parent",
+            identifier: "OOL-78",
+            labels: ["AI-Implement"],
+            children: [
+              { identifier: "OOL-78-c0", labels: ["AI-Implement"], stateType: "completed" },
+              { identifier: "OOL-78-c1", labels: ["AI-Implement"], stateType: "canceled" },
+            ],
+          }),
+        ]);
+        const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+        const parent = snap.needsPlanning.find((i) => i.id === "fn-parent")!;
+        expect(parent.featureBranchChain).toEqual(["ai-implement/feature/ool-78"]);
+      });
     });
   });
 
@@ -412,29 +526,80 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     } as Response);
   }
   const labels = (...names: string[]) => ({ nodes: names.map((name) => ({ name })) });
+  const stateOf = (type: string) => ({ type });
 
-  it("returns feature nodes with parent target; non-feature parent → null (base)", async () => {
+  it("feature-node: returns branch/target; non-feature parent → target null", async () => {
     mockResponse([
-      { identifier: "OOL-107", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("AI-Implement") }] },
-        parent: { identifier: "OOL-106", labels: labels("AI-Implement") } },
-      { identifier: "OOL-106", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("AI-Implement") }] },
+      { id: "id-107", identifier: "OOL-107", state: stateOf("completed"), team: { key: "OOL" },
+        labels: labels("AI-Implement"),
+        children: { nodes: [{ identifier: "OOL-107-c", state: stateOf("completed"), labels: labels("AI-Implement") }] },
+        parent: { identifier: "OOL-106", labels: labels("AI-Implement"),
+          children: { nodes: [{ identifier: "OOL-107", labels: labels("AI-Implement") }] } } },
+      { id: "id-106", identifier: "OOL-106", state: stateOf("completed"), team: { key: "OOL" },
+        labels: labels("AI-Implement"),
+        children: { nodes: [{ identifier: "OOL-107", state: stateOf("completed"), labels: labels("AI-Implement") }] },
         parent: null },
     ]);
     const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([
-      { identifier: "OOL-107", scopeKey: "OOL", parentIdentifier: "OOL-106" },
-      { identifier: "OOL-106", scopeKey: "OOL", parentIdentifier: null },
+      { issueId: "id-107", identifier: "OOL-107", scopeKey: "OOL", parentIdentifier: "OOL-106",
+        branch: "ai-implement/feature/ool-107", target: "ai-implement/feature/ool-106" },
+      { issueId: "id-106", identifier: "OOL-106", scopeKey: "OOL", parentIdentifier: null,
+        branch: "ai-implement/feature/ool-106", target: null },
     ]);
   });
 
   it("excludes completed issues that are not feature nodes (no AI-Implement child)", async () => {
     mockResponse([
-      { identifier: "OOL-50", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("Improvement") }] }, parent: null },
-      { identifier: "OOL-51", team: { key: "OOL" },
+      { id: "id-50", identifier: "OOL-50", state: stateOf("completed"), team: { key: "OOL" },
+        labels: labels("AI-Implement"),
+        children: { nodes: [{ identifier: "OOL-50-c", state: stateOf("completed"), labels: labels("Improvement") }] },
+        parent: null },
+      { id: "id-51", identifier: "OOL-51", state: stateOf("completed"), team: { key: "OOL" },
+        labels: labels("AI-Implement"),
         children: { nodes: [] }, parent: null },
+    ]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([]);
+  });
+
+  it("feature-node with non-completed state is excluded", async () => {
+    mockResponse([
+      { id: "id-99", identifier: "OOL-99", state: stateOf("started"), team: { key: "OOL" },
+        labels: labels("AI-Implement"),
+        children: { nodes: [{ identifier: "OOL-99-c", state: stateOf("completed"), labels: labels("AI-Implement") }] },
+        parent: null },
+    ]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([]);
+  });
+
+  it("Multi-Issue: surfaces when all AI children terminal, with multi-issue branch and null target", async () => {
+    mockResponse([
+      { id: "id-mi", identifier: "AII-10", state: stateOf("started"), team: { key: "AII" },
+        labels: labels("AI-Implement", "Multi-Issue"),
+        children: { nodes: [
+          { identifier: "AII-11", state: stateOf("completed"), labels: labels("AI-Implement") },
+          { identifier: "AII-12", state: stateOf("completed"), labels: labels("AI-Implement") },
+        ] },
+        parent: null },
+    ]);
+    const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([
+      { issueId: "id-mi", identifier: "AII-10", scopeKey: "AII", parentIdentifier: null,
+        branch: "ai-implement/multi-issue/aii-11-aii-12", target: null },
+    ]);
+  });
+
+  it("Multi-Issue: excluded when a child is still in flight", async () => {
+    mockResponse([
+      { id: "id-mi", identifier: "AII-10", state: stateOf("started"), team: { key: "AII" },
+        labels: labels("AI-Implement", "Multi-Issue"),
+        children: { nodes: [
+          { identifier: "AII-11", state: stateOf("started"), labels: labels("AI-Implement") },
+          { identifier: "AII-12", state: stateOf("completed"), labels: labels("AI-Implement") },
+        ] },
+        parent: null },
     ]);
     const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([]);
