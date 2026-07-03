@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { branchMatchesIssueIdentifier, buildIssueBranchName, buildFeatureBranchName, normalizeBranchPrefix } from "../pipeline/branch-name.js";
+import { branchMatchesIssueIdentifier, buildIssueBranchName, buildFeatureBranchName, buildMultiIssueBranchName, normalizeBranchPrefix } from "../pipeline/branch-name.js";
 
 describe("buildIssueBranchName", () => {
   it("builds issue-scoped branch names from issue metadata", () => {
@@ -33,6 +33,34 @@ describe("buildFeatureBranchName", () => {
 
   it("falls back defensively for empty identifiers", () => {
     expect(buildFeatureBranchName(undefined)).toBe("ai-implement/feature/parent");
+  });
+});
+
+describe("buildMultiIssueBranchName", () => {
+  it("sorts child identifiers and joins with dashes", () => {
+    expect(buildMultiIssueBranchName(["AII-10", "AII-5"])).toBe("ai-implement/multi-issue/aii-10-aii-5");
+  });
+
+  it("is order-independent — same result regardless of input order", () => {
+    const a = buildMultiIssueBranchName(["AII-10", "AII-5"]);
+    const b = buildMultiIssueBranchName(["AII-5", "AII-10"]);
+    expect(a).toBe(b);
+  });
+
+  it("sorts three identifiers ascending", () => {
+    expect(buildMultiIssueBranchName(["Z-3", "A-1", "M-2"])).toBe("ai-implement/multi-issue/a-1-m-2-z-3");
+  });
+
+  it("caps at 3 slugs and appends -plusN suffix for extras (lexicographic sort)", () => {
+    // aii-1, aii-10, aii-2, aii-3, aii-5 in lexicographic order
+    const result = buildMultiIssueBranchName(["AII-5", "AII-10", "AII-1", "AII-2", "AII-3"]);
+    expect(result).toBe("ai-implement/multi-issue/aii-1-aii-10-aii-2-plus2");
+  });
+
+  it("produces no suffix for exactly 3 children", () => {
+    // aii-1, aii-10, aii-5 in lexicographic order
+    const result = buildMultiIssueBranchName(["AII-5", "AII-10", "AII-1"]);
+    expect(result).toBe("ai-implement/multi-issue/aii-1-aii-10-aii-5");
   });
 });
 

@@ -22,14 +22,13 @@ export interface TicketIssue {
   /**
    * Feature-branch grouping chain, set by the Linear provider for dispatchable issues.
    *
-   * An ordered list of issue identifiers (base-most first). Each names a feature branch
-   * `ai-implement/feature/<id>` that must exist before this issue dispatches; each branch
-   * is cut from the previous entry's branch (or mapping.defaultBranch for the first). This
-   * issue's PR targets the LAST entry's branch. Absent/empty → PR targets mapping.defaultBranch.
+   * An ordered list of branch names (base-most first). Each branch must exist before this
+   * issue dispatches; each is cut from the previous entry's branch (or mapping.defaultBranch
+   * for the first). This issue's PR targets the LAST entry. Absent/empty → PR targets
+   * mapping.defaultBranch.
    *
-   * For a leaf the chain ends at its nearest feature-node ancestor; for a feature-node parent
-   * whose AI-Implement children are all complete, the chain ends at the parent itself (its
-   * closing work lands on its own feature branch). See src/feature-branch.ts.
+   * Branch names are pre-computed by the provider (feature/<key> or multi-issue/<slugs>)
+   * so consumers never need to derive them. See src/feature-branch.ts.
    */
   featureBranchChain?: string[];
 }
@@ -41,24 +40,25 @@ export interface AIImplementSnapshot {
 }
 
 /**
- * A completed feature-node issue whose feature branch should be rolled up into its
- * parent (see src/merge-up.ts). Produced by the provider from recently-completed
- * AI-Implement issues that have at least one AI-Implement child.
+ * A feature-node or multi-issue-grouping issue whose branch should be rolled up
+ * (see src/merge-up.ts). Produced by the provider.
  */
 export interface FeatureNodeRollUp {
   /** Provider-internal ID (Linear UUID) — passed to markMerged when the top-of-tree PR is detected as merged. */
   issueId: string;
-  /** The feature node's identifier → branch `ai-implement/feature/<identifier>`. */
+  /** The issue's human-readable identifier (for logging). */
   identifier: string;
   /** Capacity/scope bucket (team key) — used to resolve the repo mapping. */
   scopeKey: string;
   /**
-   * Parent identifier when the parent is itself a feature node (the parent has the
-   * AI-Implement label) → roll into `ai-implement/feature/<parent>` and auto-merge.
-   * null when there is no feature-node parent → roll into the mapping's base branch
-   * via a human-reviewed PR (never auto-merged).
+   * Parent identifier when the parent is itself a grouping node → auto-merge.
+   * null when there is no grouping parent → open human-reviewed PR into the base branch.
    */
   parentIdentifier: string | null;
+  /** The branch to roll up (e.g. `ai-implement/feature/<key>` or `ai-implement/multi-issue/<slugs>`). */
+  branch: string;
+  /** The target branch to merge/PR into, or null → mapping.defaultBranch. */
+  target: string | null;
 }
 
 export type IssueLifecycleState = "active" | "completed" | "cancelled";

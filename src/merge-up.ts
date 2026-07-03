@@ -1,7 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { FeatureNodeRollUp } from "./providers/types.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { buildFeatureBranchName } from "./pipeline/branch-name.js";
 import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBranches, mergeBranch } from "./github.js";
 
 /**
@@ -49,10 +48,8 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
   const { owner, repo } = mapping;
   const ghToken = await getInstallationToken(deps.githubAppId, deps.githubAppPrivateKey, owner);
 
-  const branch = buildFeatureBranchName(rollUp.identifier);
-  const target = rollUp.parentIdentifier
-    ? buildFeatureBranchName(rollUp.parentIdentifier)
-    : mapping.defaultBranch;
+  const branch = rollUp.branch;
+  const target = rollUp.target ?? mapping.defaultBranch;
 
   if (rollUp.parentIdentifier !== null) {
     // Internal roll-up → direct merge, no PR (avoids Linear linking the roll-up to the
