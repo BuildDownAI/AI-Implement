@@ -49,4 +49,19 @@ describe("overview page", () => {
     expect(overviewScript).toContain("status === 'review_failed'");
     expect(overviewScript).toContain("review failed");
   });
+
+  it("includes stuck_giveup in the attention KPI filter", () => {
+    expect(overviewScript).toContain("stuck_giveup");
+    expect(overviewScript).toContain("e.conclusion === 'stuck_giveup'");
+  });
+
+  it("includes timed_out in statusBadge map for display consistency", () => {
+    expect(overviewScript).toContain("timed_out: 'warn'");
+  });
+
+  it("includes stuck_giveup in renderRecentFailures filter", () => {
+    const failuresIdx = overviewScript.indexOf("renderRecentFailures");
+    const afterFn = overviewScript.slice(failuresIdx);
+    expect(afterFn).toContain("stuck_giveup");
+  });
 });
