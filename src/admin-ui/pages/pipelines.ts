@@ -63,7 +63,10 @@ export const pipelinesScript = `
       function makeBadge(cls, text) {
         return '<span class="badge tight ' + cls + '">' + window.esc(text) + '</span>';
       }
-      function statusBadge(status) {
+      function jobBadge(status, conclusion) {
+        if (status === 'timed_out' && conclusion === 'stuck_giveup') {
+          return makeBadge('fail', 'Needs human');
+        }
         const label = status === 'review_failed' ? 'review failed' : (status || 'dispatched');
         return makeBadge(statusClass[status] || 'neutral', label);
       }
@@ -124,7 +127,7 @@ export const pipelinesScript = `
           const imageCell = impl.sessionImage
             ? '<td class="mono" title="' + window.esc(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
-          const combinedStatus = statusBadge(plan.status) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status);
+          const combinedStatus = jobBadge(plan.status, plan.conclusion) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + jobBadge(impl.status, impl.conclusion);
           const prLink = impl.prUrl ? '<a href="' + window.esc(impl.prUrl) + '" target="_blank">View</a>' : '—';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
@@ -158,7 +161,7 @@ export const pipelinesScript = `
             + '<td class="mono">' + window.esc(entry.repo || '—') + '</td>'
             + '<td>' + runnerCell + '</td>'
             + imageCell
-            + '<td>' + statusBadge(entry.status) + '</td>'
+            + '<td>' + jobBadge(entry.status, entry.conclusion) + '</td>'
             + '<td>' + (entry.prUrl ? '<a href="' + window.esc(entry.prUrl) + '" target="_blank">View</a>' : '—') + '</td>';
         }
         tbody.appendChild(tr);

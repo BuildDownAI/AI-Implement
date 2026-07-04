@@ -182,7 +182,7 @@ export const overviewScript = `
   }
 
   function statusBadge(status) {
-    const map = { running: 'running', review_failed: 'warn', failed: 'fail', completed: 'success' };
+    const map = { running: 'running', review_failed: 'warn', timed_out: 'warn', failed: 'fail', completed: 'success' };
     const kind = map[status] || 'neutral';
     const label = status === 'review_failed' ? 'review failed' : status;
     return '<span class="badge ' + kind + '">' + window.esc(label) + '</span>';
@@ -211,7 +211,7 @@ export const overviewScript = `
   function renderKpis(log, mappings, running) {
     const now = Date.now();
     const failed24h = log.filter(function (e) {
-      return (e.status === 'failed' || e.status === 'review_failed') && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && e.conclusion === 'stuck_giveup')) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     });
 
     const mappingEntries = Object.entries(mappings);
@@ -321,7 +321,7 @@ export const overviewScript = `
     if (!tbody || !empty) return;
     const now = Date.now();
     const failures = log.filter(function (e) {
-      return (e.status === 'failed' || e.status === 'review_failed') && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && e.conclusion === 'stuck_giveup')) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     }).sort(function (a, b) {
       return new Date(b.dispatchedAt).getTime() - new Date(a.dispatchedAt).getTime();
     }).slice(0, 8);
