@@ -16,29 +16,41 @@ export interface StuckWatchdogConfig {
 }
 
 /**
- * Remediates a stuck GHA job with bounded retry logic (3-attempt budget).
+ * Remediates a stuck job with bounded retry logic (3-attempt budget).
  *
- * Attempts 1-3: cancel run, mark timed_out/stuck_requeued, reset ticket for
- * re-dispatch (clears AI-Working label + dedup entry).
+ * Attempts 1-3: stop the runner, mark timed_out/stuck_requeued, reset ticket
+ * for re-dispatch (clears AI-Working label + dedup entry).
  *
- * Attempt 4+: cancel run, mark timed_out/stuck_giveup, clear AI-Working label
- * only (dedup left intact so the poller won't re-pick it), fire loud
+ * Attempt 4+: stop the runner, mark timed_out/stuck_giveup, clear AI-Working
+ * label only (dedup left intact so the poller won't re-pick it), fire loud
  * notifyStuckGiveUp alert, and post a Linear comment.
  *
- * Cancel happens before dedup is cleared to prevent a race where the next poll
- * cycle re-dispatches before the zombie GHA run is stopped.
+ * Stop happens before dedup is cleared to prevent a race where the next poll
+ * cycle re-dispatches before the zombie runner is stopped.
+ *
+ * @param stopRunner - Optional caller-supplied cleanup callback. For GHA jobs,
+ *   omit this and the helper cancels the workflow run itself. For Fly/local
+ *   jobs, supply a callback that destroys the machine/container and invalidates
+ *   the nonce.
  */
 export async function remediateStuckJob(
   config: StuckWatchdogConfig,
   provider: TicketingProvider | null,
   job: Job,
   lastRunStatus: string,
+  stopRunner?: () => Promise<void>,
 ): Promise<void> {
   if (!job.issueId) return;
 
-  // Cancel the GHA run before resetting dedup — prevents a re-dispatch racing
-  // with a still-live run.
-  if (job.runId && job.repo) {
+  // Stop the runner before resetting dedup — prevents a re-dispatch racing
+  // with a still-live runner.
+  if (stopRunner) {
+    try {
+      await stopRunner();
+    } catch (err) {
+      console.error(`[monitor] stopRunner failed for ${job.issueIdentifier}:`, err);
+    }
+  } else if (job.runId && job.repo) {
     const [owner, repo] = job.repo.split("/");
     if (owner && repo) {
       try {

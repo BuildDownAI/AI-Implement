@@ -1435,19 +1435,7 @@ async function monitorFlyMachineJob(
       await postSessionLogs(config, provider, job, "machine_timeout");
     }
 
-    try {
-      await destroyMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
-      console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
-    } catch (err) {
-      // Machine may already be gone — that's fine
-      if (!(err instanceof Error && err.message.includes("404"))) {
-        console.error(`[monitor] Failed to destroy timed-out machine ${job.machineId}:`, err);
-      }
-    }
-    updateJobStatus(job.id, "timed_out", "machine_timeout");
-    invalidateNonce(job.id);
     const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
-    console.warn(`[monitor] Fly machine job ${job.id} (${job.issueIdentifier}) timed out after ${elapsedMin}m`);
 
     // Post timeout status comment to Linear (best-effort, skip shadow jobs)
     if (job.runnerMode !== "shadow" && job.issueId) {
@@ -1460,7 +1448,27 @@ async function monitorFlyMachineJob(
       });
     }
 
-    await resetTicket(provider, job);
+    const watchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+
+    const stopRunner = async () => {
+      try {
+        await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
+      } catch (err) {
+        // Machine may already be gone — that's fine
+        if (!(err instanceof Error && err.message.includes("404"))) {
+          console.error(`[monitor] Failed to destroy timed-out machine ${job.machineId}:`, err);
+        }
+      }
+      invalidateNonce(job.id);
+    };
+
+    await remediateStuckJob(watchdogConfig, provider, job, "machine_timeout", stopRunner);
     return;
   }
 
@@ -1573,17 +1581,8 @@ async function monitorLocalDockerJob(
 
   if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
     await postLocalContainerLogs(provider, job, "container_timeout");
-    try {
-      await removeLocalContainer(job.machineId);
-      console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
-    } catch (err) {
-      console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
-    }
 
-    updateJobStatus(job.id, "timed_out", "container_timeout");
-    invalidateNonce(job.id);
     const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
-    console.warn(`[monitor] Local Docker job ${job.id} (${job.issueIdentifier}) timed out after ${elapsedMin}m`);
 
     if (job.issueId) {
       postStatusComment(provider, job.issueId, {
@@ -1594,7 +1593,24 @@ async function monitorLocalDockerJob(
       });
     }
 
-    await resetTicket(provider, job);
+    const watchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+
+    const stopRunner = async () => {
+      try {
+        await removeLocalContainer(job.machineId!);
+        console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
+      } catch (err) {
+        console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
+      }
+      invalidateNonce(job.id);
+    };
+
+    await remediateStuckJob(watchdogConfig, provider, job, "container_timeout", stopRunner);
     return;
   }
 
