@@ -27,6 +27,7 @@ interface TokenResponse {
 let clientId: string | null = null;
 let clientSecret: string | null = null;
 let cached: CachedToken | null = null;
+let inflightMint: Promise<CachedToken> | null = null;
 
 /** Seeds the app credential once at startup (from LINEAR_CLIENT_ID / LINEAR_CLIENT_SECRET). */
 export function configureLinearAuth(id: string, secret: string): void {
@@ -69,7 +70,18 @@ export async function getLinearToken(): Promise<string> {
   if (cached && Date.now() < cached.expiresAt) {
     return cached.token;
   }
-  cached = await mintToken();
+
+  // De-dup concurrent mints:
+  // the first caller past a stale/absent cache starts the mint and parks its promise here.
+  // any caller that races in while it's outstanding awaits the *same* promise instead of firing its own request.
+  // Cleared in .finally so the next expiry mints afresh and a failed mint never leaves a rejected promise wedged here.
+  if (!inflightMint) {
+    inflightMint = mintToken().finally(() => {
+      inflightMint = null;
+    });
+  }
+
+  cached = await inflightMint;
   return cached.token;
 }
 

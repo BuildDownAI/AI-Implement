@@ -75,6 +75,21 @@ describe("getLinearToken", () => {
     expect(fetch).toHaveBeenCalledTimes(1); // minted once, reused on the second call
   });
 
+  it("de-dups concurrent mints into a single request", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { access_token: "token_a", expires_in: THIRTY_DAYS_S } },
+      { ok: true, json: { access_token: "token_b", expires_in: THIRTY_DAYS_S } },
+    ]));
+
+    // Two callers race past an empty cache in the same tick. The in-flight guard should
+    // collapse them onto one mint, so both see token_a and the second queued response
+    // (token_b) is never consumed — without the guard, each would fire its own fetch.
+    const [t1, t2] = await Promise.all([getLinearToken(), getLinearToken()]);
+    expect(t1).toBe("token_a");
+    expect(t2).toBe("token_a");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("re-mints after the cache is cleared", async () => {
     vi.mocked(fetch).mockImplementation(mockFetch([
       { ok: true, json: { access_token: "token_a", expires_in: THIRTY_DAYS_S } },
