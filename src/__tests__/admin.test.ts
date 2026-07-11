@@ -112,7 +112,6 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
     flySessionsToken: null,
     flySessionsApp: null,
     flySessionsRegion: null,
-    linearApiKey: "test-linear-key",
     githubAppId: "test-app-id",
     githubAppPrivateKey: "test-private-key",
   };
@@ -187,7 +186,6 @@ describe("admin auth", () => {
       flySessionsToken: null,
       flySessionsApp: null,
       flySessionsRegion: null,
-      linearApiKey: "test",
       githubAppId: "test",
       githubAppPrivateKey: "test",
     }, makeFakeRegistry(provider));
@@ -848,7 +846,6 @@ describe("admin secrets", () => {
       flySessionsToken: "fly-token",
       flySessionsApp: "ai-implement-sessions",
       flySessionsRegion: null,
-      linearApiKey: "test-linear-key",
       githubAppId: "test-app-id",
       githubAppPrivateKey: "test-private-key",
     };
@@ -1112,7 +1109,6 @@ describe("admin global secrets", () => {
       flySessionsToken: "fly-token",
       flySessionsApp: "ai-implement-sessions",
       flySessionsRegion: null,
-      linearApiKey: "test-linear-key",
       githubAppId: "test-app-id",
       githubAppPrivateKey: "test-private-key",
     };

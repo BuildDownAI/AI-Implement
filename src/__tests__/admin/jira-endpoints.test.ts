@@ -119,7 +119,6 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
     flySessionsToken: null,
     flySessionsApp: null,
     flySessionsRegion: null,
-    linearApiKey: "test-linear-key",
     githubAppId: "test-app-id",
     githubAppPrivateKey: "test-private-key",
   };
