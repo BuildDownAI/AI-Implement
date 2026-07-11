@@ -428,7 +428,6 @@ describe("buildSessionMachineConfig", () => {
     githubAppPrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
     sessionToken: "tok_abc",
     machineNonce: "nonce_def",
-    linearApiKey: "lin_api_test",
     anthropicApiKey: "sk-ant-test",
   };
 
@@ -445,7 +444,6 @@ describe("buildSessionMachineConfig", () => {
     expect(env.GITHUB_DEFAULT_BRANCH).toBe("main");
     expect(env.GITHUB_APP_ID).toBe("12345");
     expect(env.SESSION_MODE).toBe("autonomous");
-    expect(env.LINEAR_API_KEY).toBe("lin_api_test");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
   });
 

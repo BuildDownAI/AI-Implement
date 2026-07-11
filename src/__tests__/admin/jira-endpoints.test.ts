@@ -70,7 +70,8 @@ const fetchMock = vi.fn();
 const origToken = process.env.JIRA_TOKEN;
 const origCloud = process.env.JIRA_CLOUD_ID;
 const origSite = process.env.JIRA_SITE_URL;
-const origLinear = process.env.LINEAR_API_KEY;
+const origClientId = process.env.LINEAR_CLIENT_ID;
+const origClientSecret = process.env.LINEAR_CLIENT_SECRET;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -106,8 +107,10 @@ afterEach(() => {
   else process.env.JIRA_CLOUD_ID = origCloud;
   if (origSite === undefined) delete process.env.JIRA_SITE_URL;
   else process.env.JIRA_SITE_URL = origSite;
-  if (origLinear === undefined) delete process.env.LINEAR_API_KEY;
-  else process.env.LINEAR_API_KEY = origLinear;
+  if (origClientId === undefined) delete process.env.LINEAR_CLIENT_ID;
+  else process.env.LINEAR_CLIENT_ID = origClientId;
+  if (origClientSecret === undefined) delete process.env.LINEAR_CLIENT_SECRET;
+  else process.env.LINEAR_CLIENT_SECRET = origClientSecret;
 });
 
 function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminRequest>[2] {
@@ -305,7 +308,8 @@ describe("/api/jira/field-options", () => {
 
 describe("/api/admin/config-status", () => {
   beforeEach(() => {
-    delete process.env.LINEAR_API_KEY;
+    delete process.env.LINEAR_CLIENT_ID;
+    delete process.env.LINEAR_CLIENT_SECRET;
     delete process.env.JIRA_TOKEN;
     delete process.env.JIRA_CLOUD_ID;
     delete process.env.JIRA_SITE_URL;
@@ -314,8 +318,9 @@ describe("/api/admin/config-status", () => {
     delete process.env.GAP_FILL_TRIGGER_SECRET;
   });
 
-  it("returns linear: true / jira: false when only LINEAR_API_KEY set", async () => {
-    process.env.LINEAR_API_KEY = "lk";
+  it("returns linear: true / jira: false when only Linear client creds set", async () => {
+    process.env.LINEAR_CLIENT_ID = "cid";
+    process.env.LINEAR_CLIENT_SECRET = "csec";
     const token = await login("secret");
     const res = await request("/api/admin/config-status", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(200);
@@ -339,7 +344,8 @@ describe("/api/admin/config-status", () => {
   });
 
   it("returns everything ON when all env vars set", async () => {
-    process.env.LINEAR_API_KEY = "lk";
+    process.env.LINEAR_CLIENT_ID = "cid";
+    process.env.LINEAR_CLIENT_SECRET = "csec";
     process.env.JIRA_TOKEN = "t";
     process.env.JIRA_CLOUD_ID = "c";
     process.env.JIRA_SITE_URL = "https://x.atlassian.net";

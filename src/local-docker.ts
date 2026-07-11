@@ -10,7 +10,6 @@ const SECRET_ENV_KEYS = new Set([
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
   "GITHUB_APP_PRIVATE_KEY",
-  "LINEAR_API_KEY",
   "RUN_TOKEN",
   "SESSION_TOKEN",
 ]);
@@ -24,7 +23,6 @@ export interface LocalRunnerInput {
   owner: string;
   repo: string;
   defaultBranch: string;
-  linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
   githubAppId: string;
@@ -67,7 +65,6 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
     RUNNER_PHASE: input.phase ?? "implementation",
   };
 
-  if (input.linearApiKey) env.LINEAR_API_KEY = input.linearApiKey;
   if (input.claudeOAuthToken) env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   if (input.anthropicApiKey) env.ANTHROPIC_API_KEY = input.anthropicApiKey;
   if (input.orchestratorUrl) env.ORCHESTRATOR_URL = input.orchestratorUrl;

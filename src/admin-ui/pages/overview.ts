@@ -396,7 +396,7 @@ export const overviewScript = `
     const container = document.getElementById('overview-env-status');
     if (!container) return;
     const pills = [
-      { label: 'Linear', on: !!status.linear, hint: 'LINEAR_API_KEY' },
+      { label: 'Linear', on: !!status.linear, hint: 'LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET' },
       { label: 'Jira', on: !!status.jira, hint: 'JIRA_TOKEN + JIRA_CLOUD_ID + JIRA_SITE_URL' },
       { label: 'Runner callback', on: !!status.runnerCallback, hint: 'RUNNER_CALLBACK_BASE_URL + RUNNER_TOKEN_SECRET' },
       { label: 'Gap-fill trigger', on: !!status.gapFillTrigger, hint: 'GAP_FILL_TRIGGER_SECRET' },

@@ -1,6 +1,7 @@
+import { withLinearToken } from "./linear-app-auth.js";
+
 export interface PlanningFetchParams {
   issueId: string;
-  linearApiKey: string;
   maxPages?: number;
   capBytes?: number;
   fetchImpl?: typeof fetch;
@@ -27,11 +28,13 @@ export async function fetchPlanningContext(params: PlanningFetchParams): Promise
   try {
     for (let p = 0; p < maxPages; p++) {
       const query = `query($id:String!,$after:String){issue(id:$id){comments(first:100,after:$after,orderBy:createdAt){nodes{body createdAt}pageInfo{hasNextPage endCursor}}}}`;
-      const resp = await fetchImpl("https://api.linear.app/graphql", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": params.linearApiKey },
-        body: JSON.stringify({ query, variables: { id: params.issueId, after } }),
-      });
+      const resp = await withLinearToken((token) =>
+        fetchImpl("https://api.linear.app/graphql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+          body: JSON.stringify({ query, variables: { id: params.issueId, after } }),
+        }),
+      );
       if (!resp.ok) throw new Error(`Linear HTTP ${resp.status}`);
       const data: any = await resp.json();
       const nodes = data?.data?.issue?.comments?.nodes ?? [];

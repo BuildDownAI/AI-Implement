@@ -82,7 +82,7 @@ docs/
 ## Running locally
 
 ```bash
-cp .env.example .env   # fill in LINEAR_API_KEY, GITHUB_PAT
+cp .env.example .env   # fill in LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET, GITHUB_PAT
 npm install
 npm run dev            # runs src/index.ts via tsx
 npm run dev:local      # rebuilds local session image, then runs local Docker jobs
@@ -115,7 +115,8 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `LINEAR_API_KEY` | Yes | Linear personal API key |
+| `LINEAR_CLIENT_ID` | Yes | Linear OAuth app client ID (client-credentials grant) |
+| `LINEAR_CLIENT_SECRET` | Yes | Linear OAuth app client secret |
 | `GITHUB_APP_ID` | Yes | GitHub App numeric ID |
 | `GITHUB_APP_PRIVATE_KEY` | Yes | GitHub App RSA private key (PEM, `\n`-escaped) |
 | `NOTIFY_TYPE` | No | `slack` (default) or `teams` |
@@ -350,7 +351,7 @@ cp clients/example-client.toml clients/<slug>.toml
 # Edit the file, then:
 fly apps create <app_name> --org <org>
 fly volumes create dedup_data --size 1 --region iad --app <app_name>
-fly secrets set LINEAR_API_KEY=... GITHUB_APP_ID=... GITHUB_APP_PRIVATE_KEY=... --app <app_name>
+fly secrets set LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... GITHUB_APP_ID=... GITHUB_APP_PRIVATE_KEY=... --app <app_name>
 ```
 
 Then commit `clients/<slug>.toml` and push — the workflow deploys all clients automatically using the single `FLY_API_TOKEN` org secret.

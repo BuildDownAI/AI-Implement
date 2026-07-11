@@ -17,6 +17,7 @@ import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken } from "./github-app-auth.js";
+import { configureLinearAuth } from "./linear-app-auth.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
@@ -53,7 +54,6 @@ import { detectMergedPrs } from "./poll-merged-prs.js";
 // ---------- Configuration ----------
 
 interface AppConfig {
-  linearApiKey: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
   notifyWebhookUrl: string | null;
@@ -122,13 +122,15 @@ function loadConfig(): AppConfig {
     console.warn("[main] /trigger/gap-fill endpoint disabled (GAP_FILL_TRIGGER_SECRET not set)");
   }
 
-  const linearApiKey = process.env.LINEAR_API_KEY || null;
-  if (!linearApiKey) {
-    console.warn("[main] LINEAR_API_KEY not set — Linear mappings will be skipped (the ProviderRegistry tolerates missing per-provider env vars)");
+  const linearClientId = process.env.LINEAR_CLIENT_ID || null;
+  const linearClientSecret = process.env.LINEAR_CLIENT_SECRET || null;
+  if (!linearClientId || !linearClientSecret) {
+    console.warn("[main] LINEAR_CLIENT_ID/LINEAR_CLIENT_SECRET not set — Linear mappings will be skipped (the ProviderRegistry tolerates missing per-provider config)");
+  } else {
+    configureLinearAuth(linearClientId, linearClientSecret);
   }
 
   return {
-    linearApiKey,
     githubAppId: required("GITHUB_APP_ID"),
     githubAppPrivateKey: required("GITHUB_APP_PRIVATE_KEY"),
     notifyWebhookUrl,
@@ -540,7 +542,6 @@ async function dispatchPlanning(
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) for all execution paths.
   const planningContextInputs = await buildPlanningContextInputs({
     issue,
-    linearApiKey: config.linearApiKey,
     ticketingProviderId: provider.id,
   });
 
@@ -612,7 +613,6 @@ async function dispatchPlanning(
             owner: mapping.owner,
             repo: mapping.repo,
             defaultBranch: mapping.defaultBranch,
-            // No linearApiKey: planning runner does not post to Linear directly
             anthropicApiKey: config.anthropicApiKey ?? undefined,
             claudeOAuthToken: config.claudeOAuthToken ?? undefined,
             githubAppId: config.githubAppId,
@@ -665,7 +665,6 @@ async function dispatchPlanning(
             owner: mapping.owner,
             repo: mapping.repo,
             defaultBranch: mapping.defaultBranch,
-            // No linearApiKey: planning runner does not post to Linear directly
             anthropicApiKey: config.anthropicApiKey ?? undefined,
             claudeOAuthToken: config.claudeOAuthToken ?? undefined,
             githubAppId: config.githubAppId,
@@ -980,7 +979,6 @@ async function dispatchFlyMachine(
         owner: mapping.owner,
         repo: mapping.repo,
         defaultBranch: baseBranch,
-        linearApiKey: config.linearApiKey ?? undefined,
         anthropicApiKey: config.anthropicApiKey ?? undefined,
         claudeOAuthToken: config.claudeOAuthToken ?? undefined,
         githubAppId: config.githubAppId,
@@ -1064,7 +1062,6 @@ async function dispatchLocalDocker(
         owner: mapping.owner,
         repo: mapping.repo,
         defaultBranch: baseBranch,
-        linearApiKey: config.linearApiKey ?? undefined,
         anthropicApiKey: config.anthropicApiKey ?? undefined,
         claudeOAuthToken: config.claudeOAuthToken ?? undefined,
         githubAppId: config.githubAppId,
@@ -2210,7 +2207,6 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         flySessionsToken: config.flySessionsToken,
         flySessionsApp: config.flySessionsApp,
         flySessionsRegion: config.flySessionsRegion,
-        linearApiKey: config.linearApiKey,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
       }, registry)) return;

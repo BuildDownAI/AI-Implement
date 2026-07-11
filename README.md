@@ -53,7 +53,7 @@ You'll need a Linear workspace, a GitHub App you control, a Fly.io account, and 
 git clone https://github.com/BuildDownAI/AI-Implement.git
 cd AI-Implement
 asdf install                 # installs the Node version pinned in .tool-versions
-cp .env.example .env       # fill in LINEAR_API_KEY + GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY
+cp .env.example .env       # fill in LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET + GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY
 npm install
 npm run dev                # starts polling + HTTP server on :8080
 ```

@@ -7,7 +7,7 @@
 # Then:
 #   1. Create the Fly app:  fly apps create <app_name> --org <org>
 #   2. Add the volume:      fly volumes create dedup_data --size 1 --region <region> --app <app_name>
-#   3. Set secrets:         fly secrets set LINEAR_API_KEY=... GITHUB_APP_ID=... ... --app <app_name>
+#   3. Set secrets:         fly secrets set LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... GITHUB_APP_ID=... ... --app <app_name>
 #   4. Add a GitHub secret: FLY_API_TOKEN_<SLUG_UPPERCASE>=<fly-deploy-token>
 #   5. Commit and push — the deploy-clients.yml workflow will pick it up automatically.
 #
