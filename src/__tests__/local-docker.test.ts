@@ -16,8 +16,7 @@ const baseInput: LocalRunnerInput = {
   owner: "BuildDownAI",
   repo: "AI-Implement",
   defaultBranch: "main",
-  githubAppId: "12345",
-  githubAppPrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+  githubToken: "ghs_test_token",
   sessionToken: "session-token",
   machineNonce: "nonce-123",
   anthropicApiKey: "sk-ant-test",
@@ -33,7 +32,10 @@ describe("buildLocalRunnerEnv", () => {
     expect(env.ISSUE_IDENTIFIER).toBe("ENG-42");
     expect(env.GITHUB_OWNER).toBe("BuildDownAI");
     expect(env.GITHUB_REPO).toBe("AI-Implement");
-    expect(env.GITHUB_APP_ID).toBe("12345");
+    expect(env.GITHUB_TOKEN).toBe("ghs_test_token");
+    // The App private key must never reach a runner — only the short-lived install token.
+    expect(env.GITHUB_APP_ID).toBeUndefined();
+    expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
     expect(env.ORCHESTRATOR_URL).toBe("http://host.docker.internal:8080");
     expect(env.SESSION_MODE).toBe("autonomous");
@@ -88,7 +90,7 @@ describe("buildDockerRunArgs", () => {
     expect(args).toContain("-e");
     expect(args).toContain("AI_IMPLEMENT_MODE=local");
     expect(args).toContain("ISSUE_IDENTIFIER=ENG-42");
-    expect(args).not.toContain("GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----");
+    expect(args).not.toContain("GITHUB_TOKEN=ghs_test_token"); // token is a secret → env-file, not a public -e arg
     expect(args).not.toContain("SESSION_TOKEN=session-token");
     expect(args).not.toContain("LINEAR_API_KEY=lin_api_test");
     expect(args).not.toContain("ANTHROPIC_API_KEY=sk-ant-test");
@@ -101,21 +103,24 @@ describe("splitLocalRunnerEnv", () => {
     const { publicEnv, secretEnv } = splitLocalRunnerEnv(buildLocalRunnerEnv(baseInput));
 
     expect(publicEnv.ISSUE_IDENTIFIER).toBe("ENG-42");
-    expect(publicEnv.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
+    expect(publicEnv.GITHUB_TOKEN).toBeUndefined();
     expect(publicEnv.SESSION_TOKEN).toBeUndefined();
-    expect(secretEnv.GITHUB_APP_PRIVATE_KEY).toContain("BEGIN RSA PRIVATE KEY");
+    expect(secretEnv.GITHUB_TOKEN).toBe("ghs_test_token"); // GITHUB_TOKEN routes into secretEnv via SECRET_ENV_KEYS
     expect(secretEnv.SESSION_TOKEN).toBe("session-token");
+    // The App private key is gone entirely — present in neither map.
+    expect(publicEnv.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
+    expect(secretEnv.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
   });
 });
 
 describe("buildDockerEnvFileContent", () => {
   it("escapes literal newlines for env-file compatibility", () => {
     const content = buildDockerEnvFileContent({
-      GITHUB_APP_PRIVATE_KEY: "-----BEGIN-----\nkey\n-----END-----",
+      MULTILINE_SECRET: "-----BEGIN-----\nkey\n-----END-----",
       SESSION_TOKEN: "session-token",
     });
 
-    expect(content).toContain("GITHUB_APP_PRIVATE_KEY=-----BEGIN-----\\nkey\\n-----END-----");
+    expect(content).toContain("MULTILINE_SECRET=-----BEGIN-----\\nkey\\n-----END-----");
     expect(content).toContain("SESSION_TOKEN=session-token");
   });
 });

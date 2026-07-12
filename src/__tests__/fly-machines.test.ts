@@ -424,8 +424,7 @@ describe("buildSessionMachineConfig", () => {
     owner: "test-org",
     repo: "test-repo",
     defaultBranch: "main",
-    githubAppId: "12345",
-    githubAppPrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+    githubToken: "ghs_test_token",
     sessionToken: "tok_abc",
     machineNonce: "nonce_def",
     anthropicApiKey: "sk-ant-test",
@@ -442,7 +441,10 @@ describe("buildSessionMachineConfig", () => {
     expect(env.GITHUB_OWNER).toBe("test-org");
     expect(env.GITHUB_REPO).toBe("test-repo");
     expect(env.GITHUB_DEFAULT_BRANCH).toBe("main");
-    expect(env.GITHUB_APP_ID).toBe("12345");
+    expect(env.GITHUB_TOKEN).toBe("ghs_test_token");
+    // The App private key must never reach a runner — only the short-lived install token.
+    expect(env.GITHUB_APP_ID).toBeUndefined();
+    expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
     expect(env.SESSION_MODE).toBe("autonomous");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
   });
