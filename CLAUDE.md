@@ -162,7 +162,7 @@ Page conventions: each `<name>.ts` exports two strings. The HTML uses `data-page
 
 When adding a new page: create the page module, append both strings to the lists in `src/admin-ui/index.ts`, and add the route to `sidebar.ts`. When adding a new design token: extend `tokens.ts` and the `tokens.test.ts` spot-check. When adding a new icon: drop the SVG inner markup into `iconRegistry`.
 
-The 14 not-yet-implemented routes (`overview`, `issues`, `pulls`, `blockers`, `pipelines`, `models`, `channels`, `policies`, `runners`, `secrets`, `mcp`, `webhooks`, `customizations`, `updates`) are stubbed in `src/admin-ui/pages/stubs.ts` with `RoadmapNote`-style placeholders pointing to the plan that ships them.
+Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still stubbed in `src/admin-ui/pages/stubs.ts` with "Coming soon" placeholders (badged "Not implemented yet" or "Partially implemented") that explain what exists today and link to the related built pages.
 
 ## Notification adapter
 
