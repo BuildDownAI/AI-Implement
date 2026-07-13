@@ -330,8 +330,9 @@ The default runner image itself must also be public on GHCR — Fly pulls anonym
 
 Runner image channels:
 
-- `ghcr.io/builddownai/ai-implement-runner:latest` is published from `main` and is the stable default for production orchestrators and synced target-repo workflows.
-- `ghcr.io/builddownai/ai-implement-runner:next` is published from `testing` and is intended for staging/testing orchestrators. Set `SESSION_IMAGE=ghcr.io/builddownai/ai-implement-runner:next` in that orchestrator environment to keep it paired with the testing runner.
+- `.github/workflows/build-runner.yml` publishes the runner image to `ghcr.io/<owner>/ai-implement-runner` (the lowercased owner of the repo it runs in), so a fork's builds land in its own namespace automatically — a namespace the `github-actions` allowlist already trusts. The built-in fallback in the code and synced workflows stays `ghcr.io/builddownai/ai-implement-runner` regardless; a fork that wants its own image used must pin it via `AI_IMPLEMENT_RUNNER_IMAGE` or `.ai-implement/image.yml` rather than editing the fallback.
+- The `:latest` channel is published from `main` and is the stable default for production orchestrators and synced target-repo workflows.
+- The `:next` channel is published from `testing` and is intended for staging/testing orchestrators. Set the orchestrator's runner-image env var to your namespace's `:next` tag (e.g. `AI_IMPLEMENT_RUNNER_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`) to keep that environment paired with the testing runner.
 - Commit SHA tags are pushed first, then the build digest is smoke-tested before any mutable channel is promoted. Use the immutable digest for the strongest rollback pin; the SHA tag is a convenient lookup tag for the same build.
 - Channel-scoped date/debug tags are promoted only after the digest image passes smoke testing. They use `base-<channel>-vYYYYMMDD-<12-char-sha>` (for example, `base-next-v20260526-abc123def456`) so `latest` and `next` builds do not collide and same-day builds do not overwrite each other.
 - Cancelled or failed runs can leave SHA-only images with no channel pointer. That is intentional fail-closed behavior; clean old SHA-only images through GHCR retention/cleanup rather than relying on mutable channel tags for retention.
