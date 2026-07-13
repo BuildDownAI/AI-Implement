@@ -394,6 +394,68 @@ describe("pushStep", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("blocks the push when a sensitive file is staged", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, "src/app.ts\n.env\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not block a staged deletion of a sensitive file", async () => {
+    // git itself omits deletions when --diff-filter=d is passed; simulate that:
+    // the deleted .env only shows up if the filter flag is missing.
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " D .env\n M src/app.ts\n");
+      if (gitArgs[0] === "diff") {
+        return gitArgs.includes("--diff-filter=d")
+          ? spawnResult(0, "src/app.ts\n")
+          : spawnResult(0, "src/app.ts\n.env\n");
+      }
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\nD\t.env\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/9");
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["diff", "--cached", "--name-only", "--diff-filter=d"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+  });
+
+  it("throws when listing staged files fails instead of skipping the sensitive-file guard", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "diff") return spawnResult(128, "", "fatal: bad revision");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/git diff --cached failed/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("refuses to push over the base branch", async () => {
     await expect(
       pushStep.run(
