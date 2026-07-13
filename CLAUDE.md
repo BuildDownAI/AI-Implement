@@ -197,6 +197,14 @@ Each project's mapping carries an optional **Branch Prefix** (blank = none, the 
 
 The prefix only affects the **initial orchestrator-driven run** — `/ai-implement` comment-triggered gap-fill runs commit to the existing PR branch and are unaffected. Like the run-caps, the prefix reaches the runner as the `branch_prefix` dispatch input (GitHub Actions) or `AI_IMPLEMENT_BRANCH_PREFIX` env var (Fly/local), and is only sent when set — so a project that sets a prefix must have **re-synced `claude-implement.yml`** to its target repo first, otherwise GitHub rejects the dispatch with "unexpected inputs".
 
+### Jira: AI-Implement Profiles field (multi-select)
+
+When using the Jira provider, the orchestrator reads a multi-select custom field to populate `TicketIssue.profiles` on each dispatched issue. The field is discovered by name at runtime — **it must be named exactly `AI-Implement Profiles`** in your Jira instance for auto-discovery to work. If the field is absent the orchestrator logs a warning and continues without populating profiles (it does not fail).
+
+If the field exists under a different name, or if multiple fields share the same name, set `profilesFieldOverride` to the explicit `customfield_NNNNN` ID — via the **Profiles Field** dropdown in the `/admin` Projects edit dialog or the add-project wizard's Jira step, or directly on the mapping's `ticketingConfig` through the API. When all three overrides (`statusFieldOverride`, `repoFieldOverride`, `profilesFieldOverride`) are set, the orchestrator skips the `listFields` call entirely.
+
+At implementation-dispatch time the orchestrator forwards the issue's profiles, comma-joined, as the `profiles` workflow_dispatch input (GitHub Actions) or `AI_IMPLEMENT_PROFILES` env var (Fly/local). Like the run-caps and branch prefix, it is only sent when non-empty — so an issue with profiles set dispatches to a target repo only after that repo has **re-synced `claude-implement.yml`**, otherwise GitHub rejects the dispatch with "unexpected inputs". The runner parses the env var (comma-split, trimmed, empties dropped) into `ctx.data.profiles`; **no built-in pipeline step consumes it** — it is deliberately the contract surface for image-baked `custom/` steps (loaded via `AI_IMPLEMENT_CUSTOM_ROOT` / `resolveModuleImport`), which branch their setup on the selected profiles. Profiles are per-issue, so unlike the mapping-scoped `skills_repo` there is no repo-variable mirror: `/ai-implement` comment-triggered gap-fill runs and orchestrator review-feedback re-dispatches run without profiles (the initial profile-aware run already produced the PR they amend).
+
 ### Runner log verbosity
 
 `AI_IMPLEMENT_LOG_LEVEL` controls how much the runner logs during an implement pass:

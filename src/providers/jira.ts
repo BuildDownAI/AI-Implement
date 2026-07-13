@@ -96,6 +96,18 @@ function isTerminalStatus(fields: Record<string, unknown>): boolean {
   return ((fields.status as { statusCategory?: { key?: string } } | null)?.statusCategory?.key) === "done";
 }
 
+function parseMultiSelectValues(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return (raw as Array<unknown>)
+    .map((item) => {
+      if (item && typeof item === "object" && typeof (item as { value?: unknown }).value === "string") {
+        return (item as { value: string }).value.trim();
+      }
+      return "";
+    })
+    .filter((v) => v.length > 0);
+}
+
 /** Shape of a single entry in an issue's `issuelinks` field. A `Blocks` link with
  *  an `inwardIssue` means "this issue is blocked by inwardIssue". */
 interface JiraIssueLink {
@@ -167,6 +179,7 @@ export class JiraProvider implements TicketingProvider {
     return getCachedFieldIds(this.cacheScope, this.client, {
       statusOverride: m.ticketingConfig.statusFieldOverride ?? null,
       repoOverride: m.ticketingConfig.repoFieldOverride ?? null,
+      profilesOverride: m.ticketingConfig.profilesFieldOverride ?? null,
     });
   }
 
@@ -197,6 +210,7 @@ export class JiraProvider implements TicketingProvider {
         fieldIds.statusFieldId,
         fieldIds.repoFieldId,
         ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
+        ...(fieldIds.profilesFieldId ? [fieldIds.profilesFieldId] : []),
       ];
 
       // Reference the status field by its resolved customfield id, not a hardcoded
@@ -265,6 +279,9 @@ export class JiraProvider implements TicketingProvider {
           ? adfToPlainText(description)
           : null;
     const statusOption = raw.fields[fieldIds.statusFieldId] as { value?: string } | null;
+    const profiles = fieldIds.profilesFieldId
+      ? parseMultiSelectValues(raw.fields[fieldIds.profilesFieldId])
+      : [];
     return {
       id: raw.id,
       identifier: raw.key,
@@ -272,6 +289,7 @@ export class JiraProvider implements TicketingProvider {
       description: descText,
       scopeKey,
       nativeStatus: statusOption?.value ?? "",
+      ...(profiles.length > 0 ? { profiles } : {}),
     };
   }
   /**

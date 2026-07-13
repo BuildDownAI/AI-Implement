@@ -63,6 +63,13 @@ export const stepperHtml = `
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.</div>
           </div>
           <div class="field">
+            <label class="field-label">Profiles Field</label>
+            <select class="input" id="np-jira-profiles-field">
+              <option value="">(auto-discover by name "AI-Implement Profiles")</option>
+            </select>
+            <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.</div>
+          </div>
+          <div class="field">
             <label class="field-label">Repo Field Value</label>
             <select class="input" id="np-jira-repo-value" onchange="updateStepperNextButton()">
               <option value="">Select a Repo Field first</option>
@@ -298,6 +305,7 @@ export const stepperScript = `
     jiraRepoFieldValue: '',
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
+    jiraProfilesFieldOverride: '',
     teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '',
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
@@ -315,6 +323,7 @@ export const stepperScript = `
     data.jiraRepoFieldValue = '';
     data.jiraStatusFieldOverride = '';
     data.jiraRepoFieldOverride = '';
+    data.jiraProfilesFieldOverride = '';
     data.teamKey = '';
     data.owner = '';
     data.repo = '';
@@ -386,6 +395,8 @@ export const stepperScript = `
     if (statusFldEl) statusFldEl.value = '';
     const repoFldEl = document.getElementById('np-jira-repo-field');
     if (repoFldEl) repoFldEl.value = '';
+    const profilesFldEl = document.getElementById('np-jira-profiles-field');
+    if (profilesFldEl) profilesFldEl.value = '';
     const jqlStatus = document.getElementById('np-jira-jql-status');
     if (jqlStatus) { jqlStatus.textContent = ''; jqlStatus.style.color = ''; }
     const linearCfg = document.getElementById('np-linear-config');
@@ -584,8 +595,10 @@ export const stepperScript = `
         else if (txt) data.jiraRepoFieldValue = txt.value.trim();
         const sf = document.getElementById('np-jira-status-field');
         const rf = document.getElementById('np-jira-repo-field');
+        const pf = document.getElementById('np-jira-profiles-field');
         if (sf) data.jiraStatusFieldOverride = sf.value.trim();
         if (rf) data.jiraRepoFieldOverride = rf.value.trim();
+        if (pf) data.jiraProfilesFieldOverride = pf.value.trim();
       } else {
         const tkEl = document.getElementById('np-teamKey');
         if (tkEl) data.teamKey = tkEl.value.trim();
@@ -700,6 +713,7 @@ export const stepperScript = `
       cfgText = 'JQL: ' + (window.esc(jqlPreview) || '&mdash;') + ' &middot; repo=' + (window.esc(data.jiraRepoFieldValue) || '&mdash;');
       if (data.jiraStatusFieldOverride) cfgText += ' &middot; statusField=' + window.esc(data.jiraStatusFieldOverride);
       if (data.jiraRepoFieldOverride) cfgText += ' &middot; repoField=' + window.esc(data.jiraRepoFieldOverride);
+      if (data.jiraProfilesFieldOverride) cfgText += ' &middot; profilesField=' + window.esc(data.jiraProfilesFieldOverride);
     } else {
       cfgText = 'team=' + (window.esc(data.teamKey) || '&mdash;');
     }
@@ -806,8 +820,9 @@ export const stepperScript = `
   async function stepperLoadJiraFields() {
     const statusSel = document.getElementById('np-jira-status-field');
     const repoSel = document.getElementById('np-jira-repo-field');
+    const profilesSel = document.getElementById('np-jira-profiles-field');
     if (jiraFieldsLoaded) return;
-    if (!statusSel && !repoSel) return;
+    if (!statusSel && !repoSel && !profilesSel) return;
     try {
       const res = await window.api('/api/jira/fields');
       if (!res.ok) return;
@@ -817,12 +832,16 @@ export const stepperScript = `
       });
       const prevStatus = statusSel ? (statusSel.value || statusSel.dataset.pendingValue || '') : '';
       const prevRepo = repoSel ? (repoSel.value || repoSel.dataset.pendingValue || '') : '';
+      const prevProfiles = profilesSel ? (profilesSel.value || profilesSel.dataset.pendingValue || '') : '';
       const statusPlaceholder = statusSel && statusSel.options[0] ? statusSel.options[0] : null;
       const repoPlaceholder = repoSel && repoSel.options[0] ? repoSel.options[0] : null;
+      const profilesPlaceholder = profilesSel && profilesSel.options[0] ? profilesSel.options[0] : null;
       if (statusSel) statusSel.innerHTML = '';
       if (repoSel) repoSel.innerHTML = '';
+      if (profilesSel) profilesSel.innerHTML = '';
       if (statusSel && statusPlaceholder) statusSel.appendChild(statusPlaceholder);
       if (repoSel && repoPlaceholder) repoSel.appendChild(repoPlaceholder);
+      if (profilesSel && profilesPlaceholder) profilesSel.appendChild(profilesPlaceholder);
       for (const f of fields) {
         const labelText = f.name + ' (' + f.id + ')';
         if (statusSel) {
@@ -837,9 +856,16 @@ export const stepperScript = `
           o2.textContent = labelText;
           repoSel.appendChild(o2);
         }
+        if (profilesSel) {
+          const o3 = document.createElement('option');
+          o3.value = f.id;
+          o3.textContent = labelText;
+          profilesSel.appendChild(o3);
+        }
       }
       if (statusSel && prevStatus) statusSel.value = prevStatus;
       if (repoSel && prevRepo) repoSel.value = prevRepo;
+      if (profilesSel && prevProfiles) profilesSel.value = prevProfiles;
       jiraFieldsLoaded = true;
     } catch (err) {
       console.error('stepperLoadJiraFields failed:', err);
@@ -1033,6 +1059,7 @@ export const stepperScript = `
             repoFieldValue: data.jiraRepoFieldValue,
             statusFieldOverride: data.jiraStatusFieldOverride || null,
             repoFieldOverride: data.jiraRepoFieldOverride || null,
+            profilesFieldOverride: data.jiraProfilesFieldOverride || null,
           }
         : { kind: 'linear' },
     };

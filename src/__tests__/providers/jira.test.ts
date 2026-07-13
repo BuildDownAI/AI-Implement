@@ -3,6 +3,7 @@ import { JiraProvider, createJiraProviderFromConfig } from "../../providers/jira
 import { JiraClient } from "../../providers/jira-client.js";
 import { MissingProviderConfigError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
+import { validateTicketingConfig } from "../../providers/ticketing-config.js";
 import type { RepoMapping } from "../../config.js";
 
 const stubClient = () => new JiraClient({ token: "t", cloudId: "c" });
@@ -126,6 +127,7 @@ const jiraMapping = (
     repoFieldValue: string;
     statusFieldOverride: string | null;
     repoFieldOverride: string | null;
+    profilesFieldOverride: string | null;
   }> = {},
 ): RepoMapping => ({
   ...baseMapping,
@@ -136,6 +138,7 @@ const jiraMapping = (
     repoFieldValue: overrides.repoFieldValue ?? "acme/x",
     statusFieldOverride: overrides.statusFieldOverride,
     repoFieldOverride: overrides.repoFieldOverride,
+    profilesFieldOverride: overrides.profilesFieldOverride,
   },
 });
 
@@ -393,6 +396,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
         "acme/x": jiraMapping({
           statusFieldOverride: "status",
           repoFieldOverride: "customfield_10101",
+          profilesFieldOverride: "customfield_10200",
         }),
       }),
     });
@@ -725,6 +729,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
           repoFieldValue: "acme/x",
           statusFieldOverride: "customfield_10100",
           repoFieldOverride: "customfield_10101",
+          profilesFieldOverride: "customfield_10200",
         }),
       }),
     });
@@ -978,7 +983,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
     new JiraProvider({
       client, cacheScope: "c", siteUrl: "https://x",
       getMappings: () => ({
-        m1: jiraMapping({ repoFieldValue: "acme/x", statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101" }),
+        m1: jiraMapping({ repoFieldValue: "acme/x", statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101", profilesFieldOverride: "customfield_10200" }),
       }),
     });
 
@@ -1091,5 +1096,185 @@ describe("JiraProvider.findByKey", () => {
       cacheScope: "c-fbk2", siteUrl: "https://x", getMappings: () => ({}),
     });
     expect(await p.findByKey("MISS-1")).toBeNull();
+  });
+});
+
+describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    clearFieldCache();
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const FIELDS_WITH_PROFILES = {
+    ok: true,
+    json: async () => [
+      { id: "customfield_10100", name: "AI-Implement Status", custom: true, schema: {} },
+      { id: "customfield_10101", name: "AI-Implement Repo", custom: true, schema: {} },
+      { id: "customfield_10200", name: "AI-Implement Profiles", custom: true, schema: {} },
+    ],
+  } as Response;
+
+  const searchOk = (issues: unknown[]): Response =>
+    ({ ok: true, json: async () => ({ issues }) }) as Response;
+
+  const profilesIssue = (profiles: unknown) => ({
+    id: "10001", key: "P-1",
+    fields: {
+      summary: "P-1",
+      description: null,
+      customfield_10100: { value: "Ready" },
+      customfield_10101: { value: "acme/x" },
+      customfield_10200: profiles,
+    },
+  });
+
+  it("maps multi-select profile values to issue.profiles", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_WITH_PROFILES)
+      .mockResolvedValueOnce(searchOk([profilesIssue([{ value: "backend" }, { value: "webapp" }])]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-prof-multi" }),
+      cacheScope: "c-prof-multi", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].profiles).toEqual(["backend", "webapp"]);
+  });
+
+  it("leaves profiles absent when the multi-select is empty", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_WITH_PROFILES)
+      .mockResolvedValueOnce(searchOk([profilesIssue([])]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-prof-empty" }),
+      cacheScope: "c-prof-empty", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].profiles).toBeUndefined();
+  });
+
+  it("leaves profiles absent when the field value is null", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_WITH_PROFILES)
+      .mockResolvedValueOnce(searchOk([profilesIssue(null)]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-prof-null" }),
+      cacheScope: "c-prof-null", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].profiles).toBeUndefined();
+  });
+
+  it("leaves profiles absent when the profiles field is not present in Jira (profilesFieldId null)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([{
+        id: "10001", key: "P-1",
+        fields: {
+          summary: "P-1",
+          description: null,
+          customfield_10100: { value: "Ready" },
+          customfield_10101: { value: "acme/x" },
+        },
+      }]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-prof-no-field" }),
+      cacheScope: "c-prof-no-field", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].profiles).toBeUndefined();
+    warnSpy.mockRestore();
+  });
+
+  it("uses profilesFieldOverride to resolve profiles without calling listFields for all three overrides", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(searchOk([{
+        id: "10001", key: "P-1",
+        fields: {
+          summary: "P-1",
+          description: null,
+          customfield_10100: { value: "Ready" },
+          customfield_10101: { value: "acme/x" },
+          customfield_10200: [{ value: "mobile" }],
+        },
+      }]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const mappingWithOverrides: RepoMapping = {
+      ...jiraMapping({
+        statusFieldOverride: "customfield_10100",
+        repoFieldOverride: "customfield_10101",
+      }),
+      ticketingConfig: {
+        kind: "jira",
+        jql: "project = TEST",
+        repoFieldValue: "acme/x",
+        statusFieldOverride: "customfield_10100",
+        repoFieldOverride: "customfield_10101",
+        profilesFieldOverride: "customfield_10200",
+      },
+    };
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-prof-override" }),
+      cacheScope: "c-prof-override", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": mappingWithOverrides }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    // 3 fetches total: bucket search + children query + capacity search (no listFields call)
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(3);
+    expect(snap.needsPlanning[0].profiles).toEqual(["mobile"]);
+  });
+});
+
+describe("validateTicketingConfig — profilesFieldOverride passthrough", () => {
+  it("passes through profilesFieldOverride as a string when provided", () => {
+    const result = validateTicketingConfig("jira", {
+      kind: "jira",
+      jql: "project = TEST",
+      repoFieldValue: "acme/x",
+      profilesFieldOverride: "customfield_10200",
+    });
+    if (result.kind !== "jira") throw new Error("expected jira");
+    expect(result.profilesFieldOverride).toBe("customfield_10200");
+  });
+
+  it("normalizes absent profilesFieldOverride to null", () => {
+    const result = validateTicketingConfig("jira", {
+      kind: "jira",
+      jql: "project = TEST",
+      repoFieldValue: "acme/x",
+    });
+    if (result.kind !== "jira") throw new Error("expected jira");
+    expect(result.profilesFieldOverride).toBeNull();
+  });
+
+  it("normalizes non-string profilesFieldOverride to null", () => {
+    const result = validateTicketingConfig("jira", {
+      kind: "jira",
+      jql: "project = TEST",
+      repoFieldValue: "acme/x",
+      profilesFieldOverride: 42,
+    });
+    if (result.kind !== "jira") throw new Error("expected jira");
+    expect(result.profilesFieldOverride).toBeNull();
   });
 });

@@ -2,19 +2,22 @@ import type { JiraClient } from "./jira-client.js";
 
 export const STATUS_FIELD_NAME = "AI-Implement Status";
 export const REPO_FIELD_NAME = "AI-Implement Repo";
+export const PROFILES_FIELD_NAME = "AI-Implement Profiles";
 
 export interface ResolvedFieldIds {
   statusFieldId: string;
   repoFieldId: string;
   /** Classic-project "Epic Link" custom field, when the instance has one. Best-effort:
    *  absent on next-gen/team-managed projects (which use the native parent field) and
-   *  when both status/repo overrides short-circuit the listFields call. */
+   *  when all three overrides short-circuit the listFields call. */
   epicLinkFieldId?: string;
+  profilesFieldId: string | null;
 }
 
 interface OverrideOptions {
   statusOverride: string | null;
   repoOverride: string | null;
+  profilesOverride: string | null;
 }
 
 interface ListFieldsClient {
@@ -25,10 +28,11 @@ export async function resolveCustomFieldIds(
   client: ListFieldsClient,
   overrides: OverrideOptions,
 ): Promise<ResolvedFieldIds> {
-  if (overrides.statusOverride && overrides.repoOverride) {
+  if (overrides.statusOverride && overrides.repoOverride && overrides.profilesOverride) {
     return {
       statusFieldId: overrides.statusOverride,
       repoFieldId: overrides.repoOverride,
+      profilesFieldId: overrides.profilesOverride,
     };
   }
 
@@ -48,10 +52,25 @@ export async function resolveCustomFieldIds(
     return matches[0].id;
   };
 
+  let profilesFieldId: string | null = overrides.profilesOverride;
+  if (profilesFieldId === null) {
+    const profileMatches = fields.filter((f) => f.name === PROFILES_FIELD_NAME);
+    if (profileMatches.length === 0) {
+      console.warn(`[jira] Custom field "${PROFILES_FIELD_NAME}" not found — profiles will not be populated`);
+    } else if (profileMatches.length > 1) {
+      console.warn(
+        `[jira] Multiple custom fields named "${PROFILES_FIELD_NAME}" — set an explicit profilesFieldOverride to disambiguate`,
+      );
+    } else {
+      profilesFieldId = profileMatches[0].id;
+    }
+  }
+
   return {
     statusFieldId: overrides.statusOverride ?? lookup(STATUS_FIELD_NAME),
     repoFieldId: overrides.repoOverride ?? lookup(REPO_FIELD_NAME),
     ...(epicLink ? { epicLinkFieldId: epicLink.id } : {}),
+    profilesFieldId,
   };
 }
 
@@ -63,7 +82,7 @@ export async function getCachedFieldIds(
   overrides: OverrideOptions,
 ): Promise<ResolvedFieldIds> {
   // Override values must participate in the key — changing them on a live mapping otherwise serves stale IDs.
-  const fullKey = `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}`;
+  const fullKey = `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}`;
   const existing = cache.get(fullKey);
   if (existing) return existing;
   const ids = await resolveCustomFieldIds(client, overrides);

@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, getPullRequestState } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState } from "./github.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
@@ -472,6 +472,7 @@ async function dispatchGitHubActions(
     ...capDispatchFields(mapping),
     ...branchPrefixDispatchFields(mapping),
     ...skillsRepoDispatchFields(mapping),
+    ...profilesDispatchFields(issue),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
     run_progress_token: runProgressToken,
@@ -1003,7 +1004,7 @@ async function dispatchFlyMachine(
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -1078,7 +1079,7 @@ async function dispatchLocalDocker(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -1941,6 +1942,10 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         ...providerDispatchFields(mapping),
         ...capDispatchFields(mapping),
         ...skillsRepoDispatchFields(mapping),
+        // No profilesDispatchFields here: profiles are per-issue (read off the fresh
+        // TicketIssue at poll time), and review-fix queue entries only persist the
+        // issue id — re-fetching the ticket just for profiles isn't worth it for a
+        // gap-fill pass on a PR the profile-aware initial run already produced.
         runner_callback_url: runnerCallbackUrl,
         run_token: runToken,
         run_progress_token: runProgressToken,

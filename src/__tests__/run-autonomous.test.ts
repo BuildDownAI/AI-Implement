@@ -878,6 +878,50 @@ describe("runAutonomous", () => {
 
     expect(capturedSkillsRepo).toBeUndefined();
   });
+
+  it("parses AI_IMPLEMENT_PROFILES into context data profiles: splits on comma, trims, drops empties", async () => {
+    vi.stubEnv("AI_IMPLEMENT_PROFILES", "backend , ,webapp");
+
+    let capturedProfiles: string[] | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedProfiles = ctx.data.profiles;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-profiles", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedProfiles).toEqual(["backend", "webapp"]);
+  });
+
+  it("sets profiles to an empty array when AI_IMPLEMENT_PROFILES is absent", async () => {
+    let capturedProfiles: string[] | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedProfiles = ctx.data.profiles;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-profiles", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedProfiles).toEqual([]);
+  });
 });
 
 describe("resolveLogLevel", () => {
