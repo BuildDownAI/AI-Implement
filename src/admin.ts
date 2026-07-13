@@ -44,7 +44,7 @@ import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./wor
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 
 const SKILLS_REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
-// NOTE: skillsRepo is *syntax*-validated only — it is NOT sanitised. Any code that
+// NOTE: skillsRepo is syntax- and host-validated only — it is NOT sanitised. Any code that
 // later feeds this value to a subprocess (e.g. the `git clone` in the runner) MUST
 // pass it as a separate argv element, never interpolated into a shell string, to
 // avoid command injection.
@@ -54,13 +54,23 @@ function normalizeSkillsRepo(raw: unknown): string | null {
   const v = raw.trim();
   if (v === "") return null;
   if (SKILLS_REPO_SHORTHAND.test(v)) return `https://github.com/${v}`;
-  // Only https:// remotes (and the owner/repo shorthand handled above) are usable on
-  // the runner: clone auth is the orchestrator-minted token embedded in the URL. An
-  // SSH (git@…) URL would need keys the runner doesn't have, so the install step just
-  // warns and installs nothing — a silent no-op. Reject it here rather than storing a
-  // value that looks accepted but does nothing at dispatch.
-  const ok = /^https:\/\/[^\s]+$/.test(v); // any https:// git URL, host-agnostic, with or without a trailing .git
-  if (!ok) throw new Error("skillsRepo must be 'owner/repo' shorthand or an https:// URL (SSH git@ URLs are not supported — the runner clones via an https token)");
+  // Only https://github.com remotes (and the owner/repo shorthand handled above, which
+  // implies github.com) are usable on the runner: clone auth is the orchestrator-minted
+  // GitHub App installation token embedded in the URL, and that credential must never
+  // be sent to any other host. An SSH (git@…) URL would need keys the runner doesn't
+  // have, so the install step just warns and installs nothing — a silent no-op. Reject
+  // both here rather than storing a value that looks accepted but does nothing (or
+  // worse) at dispatch. Exact host match, case-insensitive; www.github.com excluded —
+  // git remotes live on the apex host.
+  let host: string | null = null;
+  if (/^https:\/\/[^\s]+$/.test(v)) {
+    try {
+      host = new URL(v).hostname.toLowerCase();
+    } catch {
+      host = null;
+    }
+  }
+  if (host !== "github.com") throw new Error("skillsRepo must be 'owner/repo' shorthand or an https://github.com/... URL (the runner clones with a GitHub token, so other hosts and SSH git@ URLs are not supported)");
   return v;
 }
 
