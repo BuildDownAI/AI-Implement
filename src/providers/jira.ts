@@ -42,6 +42,49 @@ function jqlFieldRef(fieldId: string): string {
   return match ? `cf[${match[1]}]` : fieldId;
 }
 
+/**
+ * Read the repo-field value regardless of how the custom field is typed in
+ * Jira. Single-select option fields serialize as { value: string }; plain
+ * text (short-text) fields serialize as a bare string. Both are legitimate
+ * ways to hold the repo identifier, so support either rather than assuming
+ * an option field (which silently reads "" for text fields and drops the
+ * issue as a mismatch).
+ */
+function readRepoFieldValue(raw: unknown): string {
+  if (typeof raw === "string") return raw.trim();
+  if (raw && typeof raw === "object" && typeof (raw as { value?: unknown }).value === "string") {
+    return (raw as { value: string }).value;
+  }
+  return "";
+}
+
+/** Shape of a single entry in an issue's `issuelinks` field. A `Blocks` link with
+ *  an `inwardIssue` means "this issue is blocked by inwardIssue". */
+interface JiraIssueLink {
+  type?: { name?: string };
+  inwardIssue?: { key?: string; fields?: { status?: { statusCategory?: { key?: string } } } };
+  outwardIssue?: { key?: string; fields?: { status?: { statusCategory?: { key?: string } } } };
+}
+
+/**
+ * True when the issue has an open "Blocks" link pointing inward (it is blocked by an
+ * issue whose status category is not terminal). Mirrors the Linear provider's
+ * inverse-relation "blocks" skip. A blocker in the `done` category never blocks.
+ *
+ * NOTE: the link type is matched on the default name "Blocks". A Jira instance that
+ * renames this link type will fail open here (the issue dispatches as if unblocked).
+ * Making the name per-mapping configurable is the follow-up if that becomes a need.
+ */
+function isBlockedByIncomplete(issuelinks: unknown): boolean {
+  if (!Array.isArray(issuelinks)) return false;
+  return (issuelinks as JiraIssueLink[]).some(
+    (l) =>
+      l.type?.name === "Blocks" &&
+      l.inwardIssue != null &&
+      l.inwardIssue.fields?.status?.statusCategory?.key !== "done",
+  );
+}
+
 export interface JiraProviderConstructor {
   client: JiraClient;
   /** Per-instance cache scope label; typically the cloud ID. */
@@ -117,7 +160,7 @@ export class JiraProvider implements TicketingProvider {
     if (jiraEntries.length === 1) return jiraEntries[0][0];
     const repoFieldId = (await this.fields(jiraEntries[0][0])).repoFieldId;
     const issue = await this.client.getIssue(issueId, [repoFieldId]);
-    const repoValue = (issue.fields[repoFieldId] as { value?: string } | null)?.value ?? "";
+    const repoValue = readRepoFieldValue(issue.fields[repoFieldId]);
     const match = jiraEntries.find(
       ([, m]) => m.ticketingConfig.kind === "jira" && m.ticketingConfig.repoFieldValue === repoValue,
     );
@@ -144,6 +187,7 @@ export class JiraProvider implements TicketingProvider {
       const fieldsToFetch = [
         "summary",
         "description",
+        "issuelinks",
         fieldIds.statusFieldId,
         fieldIds.repoFieldId,
       ];
@@ -159,14 +203,17 @@ export class JiraProvider implements TicketingProvider {
       const bucketIssues = await this.client.searchJql(bucketJql, fieldsToFetch);
 
       for (const raw of bucketIssues) {
-        const repoOption = raw.fields[fieldIds.repoFieldId] as { value?: string } | null;
-        const actualRepo = repoOption?.value ?? "";
+        const actualRepo = readRepoFieldValue(raw.fields[fieldIds.repoFieldId]);
         if (actualRepo !== cfg.repoFieldValue) {
           const mismatchKey = `${scopeKey}::${raw.key}`;
           if (!this.notifiedMismatches.has(mismatchKey)) {
             this.notifiedMismatches.add(mismatchKey);
             this.onRepoFieldMismatch(scopeKey, raw.key, actualRepo);
           }
+          continue;
+        }
+        if (isBlockedByIncomplete(raw.fields.issuelinks)) {
+          console.log(`[jira] Skipping ${raw.key}: blocked by an incomplete issue`);
           continue;
         }
         const statusOption = raw.fields[fieldIds.statusFieldId] as { value?: string } | null;
