@@ -12,7 +12,7 @@ describe("resolveModule", () => {
       builtinRoot: "/app",
       existsSyncImpl: (p) => p.includes("custom"),
     });
-    expect(result).toContain("custom/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toContain("custom/pipelines/autonomous.yml");
   });
 
   it("returns builtin path when no custom override exists", () => {
@@ -21,7 +21,7 @@ describe("resolveModule", () => {
       builtinRoot: "/app",
       existsSyncImpl: () => false,
     });
-    expect(result).toBe("/app/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toBe("/app/pipelines/autonomous.yml");
   });
 
   it("falls back to bakedRoot custom/ when workspace has no override", () => {
@@ -29,9 +29,9 @@ describe("resolveModule", () => {
       customRoot: "/workspace",
       bakedRoot: "/baked",
       builtinRoot: "/app",
-      existsSyncImpl: (p) => p.startsWith("/baked/"),
+      existsSyncImpl: (p) => p.replace(/\\/g, "/").startsWith("/baked/"),
     });
-    expect(result).toBe("/baked/custom/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toBe("/baked/custom/pipelines/autonomous.yml");
   });
 
   it("prefers workspace custom/ over bakedRoot custom/ when both exist", () => {
@@ -41,7 +41,7 @@ describe("resolveModule", () => {
       builtinRoot: "/app",
       existsSyncImpl: () => true,
     });
-    expect(result).toBe("/workspace/custom/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toBe("/workspace/custom/pipelines/autonomous.yml");
   });
 
   it("returns builtin path when neither workspace nor bakedRoot has an override", () => {
@@ -51,7 +51,7 @@ describe("resolveModule", () => {
       builtinRoot: "/app",
       existsSyncImpl: () => false,
     });
-    expect(result).toBe("/app/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toBe("/app/pipelines/autonomous.yml");
   });
 
   it("reads the baked root from AI_IMPLEMENT_CUSTOM_ROOT when the option is not passed", () => {
@@ -59,9 +59,9 @@ describe("resolveModule", () => {
     const result = resolveModule("pipelines/autonomous.yml", {
       customRoot: "/workspace",
       builtinRoot: "/app",
-      existsSyncImpl: (p) => p.startsWith("/image/"),
+      existsSyncImpl: (p) => p.replace(/\\/g, "/").startsWith("/image/"),
     });
-    expect(result).toBe("/image/custom/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toBe("/image/custom/pipelines/autonomous.yml");
   });
 
   it("checks only the workspace custom path when no baked root is configured", () => {
@@ -71,12 +71,12 @@ describe("resolveModule", () => {
       customRoot: "/workspace",
       builtinRoot: "/app",
       existsSyncImpl: (p) => {
-        checkedPaths.push(p);
+        checkedPaths.push(p.replace(/\\/g, "/"));
         return false;
       },
     });
     expect(checkedPaths).toEqual(["/workspace/custom/pipelines/autonomous.yml"]);
-    expect(result).toBe("/app/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toBe("/app/pipelines/autonomous.yml");
   });
 
   it("does not check the baked root twice when it equals customRoot", () => {
@@ -86,7 +86,7 @@ describe("resolveModule", () => {
       bakedRoot: "/workspace",
       builtinRoot: "/app",
       existsSyncImpl: (p) => {
-        checkedPaths.push(p);
+        checkedPaths.push(p.replace(/\\/g, "/"));
         return false;
       },
     });
@@ -172,7 +172,7 @@ describe("resolveModuleImport", () => {
         return false;
       },
     });
-    expect(capturedPaths.some((p) => p.includes("/my/workspace/custom/steps/push"))).toBe(true);
+    expect(capturedPaths.some((p) => p.replace(/\\/g, "/").includes("/my/workspace/custom/steps/push"))).toBe(true);
   });
 
   it("rethrows non-MODULE_NOT_FOUND import errors", async () => {
@@ -204,7 +204,7 @@ describe("resolveModuleImport", () => {
     const result = await resolveModuleImport("steps/implement", {
       customRoot: "/workspace",
       bakedRoot: "/baked",
-      existsSyncImpl: (p) => p === "/baked/custom/steps/implement.ts",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/") === "/baked/custom/steps/implement.ts",
       importFn: async () => ({ default: bakedModule }),
     });
     expect(result).toBe(bakedModule);
@@ -229,7 +229,7 @@ describe("resolveModuleImport", () => {
     const bakedModule = { run: async () => ({}) };
     const result = await resolveModuleImport("steps/implement", {
       customRoot: "/workspace",
-      existsSyncImpl: (p) => p === "/image/custom/steps/implement.ts",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/") === "/image/custom/steps/implement.ts",
       importFn: async () => ({ default: bakedModule }),
     });
     expect(result).toBe(bakedModule);
@@ -241,7 +241,7 @@ describe("resolveModuleImport", () => {
     const result = await resolveModuleImport("steps/push", {
       customRoot: "/workspace",
       existsSyncImpl: (p) => {
-        checkedPaths.push(p);
+        checkedPaths.push(p.replace(/\\/g, "/"));
         return false;
       },
     });

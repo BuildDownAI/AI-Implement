@@ -38,7 +38,11 @@ describe("getDiff generated-file exclusion", () => {
   });
 
   afterEach(() => {
-    rmSync(repo, { recursive: true, force: true });
+    try {
+      rmSync(repo, { recursive: true, force: true });
+    } catch {
+      // On Windows, git marks object files read-only; ignore cleanup failures
+    }
   });
 
   it("includes hand-written source changes", () => {
@@ -108,7 +112,11 @@ describe("getDiff untracked-file inclusion", () => {
   });
 
   afterEach(() => {
-    rmSync(repo, { recursive: true, force: true });
+    try {
+      rmSync(repo, { recursive: true, force: true });
+    } catch {
+      // On Windows, git marks object files read-only; ignore cleanup failures
+    }
   });
 
   it("includes newly created untracked files as additions", () => {

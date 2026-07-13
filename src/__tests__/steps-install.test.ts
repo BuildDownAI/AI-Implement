@@ -40,7 +40,7 @@ function makeContext(): DefaultPipelineContext {
 
 function mockRootPackageJson(extraMatches?: (p: string) => boolean) {
   vi.mocked(fs.existsSync).mockImplementation((p) => {
-    const rawPath = String(p);
+    const rawPath = String(p).replace(/\\/g, "/");
     return rawPath.endsWith("package.json") || extraMatches?.(rawPath) === true;
   });
 }
@@ -312,7 +312,7 @@ describe("installStep", () => {
 
   it("preserves configured packageManager when skipping without package.json", async () => {
     vi.mocked(fs.existsSync).mockImplementation((p) =>
-      String(p).includes(".ai-implement/config.yml"),
+      String(p).replace(/\\/g, "/").includes(".ai-implement/config.yml"),
     );
     vi.mocked(fs.readFileSync).mockReturnValue("packageManager: pnpm\n");
 

@@ -116,7 +116,7 @@ describe("loadPipelineDefinition", () => {
       },
     });
 
-    expect(resolvedPath).toContain("custom/pipelines/autonomous.yml");
+    expect(resolvedPath.replace(/\\/g, "/")).toContain("custom/pipelines/autonomous.yml");
   });
 
   it("uses a baked-root custom/pipelines/autonomous.yml when the workspace has none", () => {
@@ -124,14 +124,14 @@ describe("loadPipelineDefinition", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       customRoot: "/workspace",
       bakedRoot: "/baked",
-      existsSyncImpl: (p) => p.startsWith("/baked/"),
+      existsSyncImpl: (p) => p.replace(/\\/g, "/").startsWith("/baked/"),
       readFileSyncImpl: (path, _enc) => {
         resolvedPath = path;
         return CUSTOM_PIPELINE_YAML;
       },
     });
 
-    expect(resolvedPath).toBe("/baked/custom/pipelines/autonomous.yml");
+    expect(resolvedPath.replace(/\\/g, "/")).toBe("/baked/custom/pipelines/autonomous.yml");
     expect(pipeline.id).toBe("custom-loop");
     expect(pipeline.steps.map((s) => s.id)).toEqual([
       "clone",
@@ -154,7 +154,7 @@ describe("loadPipelineDefinition", () => {
       },
     });
 
-    expect(resolvedPath).toBe("/app/pipelines/autonomous.yml");
+    expect(resolvedPath.replace(/\\/g, "/")).toBe("/app/pipelines/autonomous.yml");
   });
 
   it("skips install-skills when skillsRepo is unset, runs it when set", () => {
