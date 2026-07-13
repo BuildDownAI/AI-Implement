@@ -626,6 +626,7 @@ describe("admin mappings", () => {
       repoFieldValue: "org/jira-app",
       statusFieldOverride: null,
       repoFieldOverride: null,
+      profilesFieldOverride: null,
     });
   });
 

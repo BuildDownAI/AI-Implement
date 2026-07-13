@@ -32,6 +32,9 @@ export interface TicketIssue {
    * closing work lands on its own feature branch). See src/feature-branch.ts.
    */
   featureBranchChain?: string[];
+  /** AI-Implement Profiles selections from the Jira multi-select field. Jira-only; absent for
+   *  Linear issues and for Jira issues without the field or with an empty selection. */
+  profiles?: string[];
 }
 
 export interface AIImplementSnapshot {
