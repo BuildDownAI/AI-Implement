@@ -282,7 +282,10 @@ Resolution is handled by two functions in `src/pipeline/resolve-module.ts`:
 | `resolveModule(path)` | YAML and template files | Absolute filesystem path |
 | `resolveModuleImport<T>(path)` | TypeScript/JavaScript modules | `default` export, or `null` if no override |
 
-Both check `custom/<path>` (relative to `process.cwd()`) first, then fall back to the built-in package root. There is no per-type discovery logic — the same two functions cover all extension points.
+Both functions search two custom roots in order, then fall back to the built-in package root. There is no per-type discovery logic — the same two functions cover all extension points.
+
+1. **Workspace root** — `custom/<path>` relative to `process.cwd()`. This is how orchestrator-side loading picks up a fork's `custom/` (the orchestrator runs with cwd = app root).
+2. **Baked root** — `<AI_IMPLEMENT_CUSTOM_ROOT>/custom/<path>`, where the `AI_IMPLEMENT_CUSTOM_ROOT` env var names a directory that *contains* a `custom/` subdirectory. This is how the session runner picks up overrides: its cwd is `/workspace` (the target-repo clone dir, empty at process start), so the workspace root never matches there. `Dockerfile.session` copies the repo's `custom/` to `/app/custom/` and sets `AI_IMPLEMENT_CUSTOM_ROOT=/app`, so a client fork that builds its own runner image gets its `custom/pipelines/` and `custom/steps/` honored inside the runner — including the import-time load of `pipelines/autonomous.yml` and the eager step resolution in `createDefaultRunner()`, both of which happen before the clone step runs. With the env var unset (local dev, tests) resolution behaves exactly as before.
 
 ### Extension points
 

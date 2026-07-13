@@ -7,7 +7,12 @@ Resolution is implemented by two functions in `src/pipeline/resolve-module.ts`:
 - `resolveModule(path)` — synchronous, returns a file-system path. Used for YAML, template files, and runtime step discovery by the runner.
 - `resolveModuleImport<T>(path, options?)` — async, dynamically imports the module and returns its `default` export. Used for TypeScript/JavaScript step and provider overrides loaded at runner construction. Returns `null` when no custom override is present so the caller can fall back to the built-in.
 
-Both functions check `custom/<path>` (relative to `process.cwd()`) before the built-in. This is the **single utility** — there is no per-module-type discovery logic.
+Both functions check two roots for `custom/<path>` before the built-in. This is the **single utility** — there is no per-module-type discovery logic.
+
+1. `custom/<path>` relative to `process.cwd()` — matches orchestrator-side loading (cwd = app root).
+2. `<AI_IMPLEMENT_CUSTOM_ROOT>/custom/<path>` — the env var names a directory that *contains* a `custom/` subdirectory. `Dockerfile.session` copies this directory to `/app/custom/` and sets `AI_IMPLEMENT_CUSTOM_ROOT=/app`, which is what makes overrides work **inside the session runner**: the runner's cwd is `/workspace` (the target-repo clone dir, empty when the pipeline definition and step registry load), so root 1 never matches there.
+
+So: to get your fork's `custom/` honored by the runner, build and publish your own runner image (see "Runner image resolution" in `CLAUDE.md`) — the image build bakes `custom/` in. `custom/steps/*.ts` files baked into the image are loaded by plain `node` (no tsx), which type-strips them on Node 24; keep them to erasable TypeScript syntax and `import type` for anything under `src/` (runtime imports of `src/` won't resolve in the image — only compiled `dist/` ships).
 
 ## What's wired up today
 

@@ -101,6 +101,15 @@ RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY pipelines/ ./pipelines/
 
+# Bake custom/ overrides into the image. The runner's cwd is /workspace (the
+# target-repo clone dir, empty at process start), so cwd-relative custom/
+# resolution never fires runner-side; AI_IMPLEMENT_CUSTOM_ROOT points
+# resolve-module.ts at a secondary root that CONTAINS custom/. Upstream ships
+# only placeholders here — client forks that build their own runner image get
+# their custom/pipelines + custom/steps honored by the runner via this bake.
+COPY custom/ ./custom/
+ENV AI_IMPLEMENT_CUSTOM_ROOT=/app
+
 # Tool manifest for the agent
 RUN mkdir -p /etc/ai-implement
 COPY session/tools.md /etc/ai-implement/tools.md

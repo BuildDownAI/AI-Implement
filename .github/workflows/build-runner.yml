@@ -17,6 +17,7 @@ on:
       - "session/**"
       - "src/**"
       - "pipelines/**"
+      - "custom/**"
       - ".github/workflows/build-runner.yml"
   workflow_dispatch:
     inputs:
