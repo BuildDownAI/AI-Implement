@@ -13,11 +13,15 @@ export interface StuckGiveUpNotification {
   lastRunStatus: string; // "queued" | "in_progress" | "run_not_found"
 }
 
+// The run phases that produce a user-facing notification
+export type NotificationPhase = "planning" | "implementation";
+
 export interface Notification {
   issueIdentifier: string;
   issueTitle: string;
   issueUrl: string;
   repoFullName: string;
+  phase: NotificationPhase;
 }
 
 export interface CompletionNotification {
@@ -31,6 +35,13 @@ export interface CompletionNotification {
   runUrl: string | null;
   durationMs?: number | null;
 }
+
+// Human label for a run phase, reused across notification kinds (dispatch, completion, …).
+// Keyed on NotificationPhase, so widening that union is a compile error here until the new phase gets a label — no silent fallthrough.
+const PHASE_LABELS: Record<NotificationPhase, string> = {
+  planning: "AI Planning",
+  implementation: "AI Implementation",
+};
 
 export async function notifyStuckGiveUp(
   type: string,
@@ -96,7 +107,7 @@ async function notifySlack(webhookUrl: string, n: Notification): Promise<void> {
           type: "section",
           text: {
             type: "mrkdwn",
-            text: `*AI Implementation Dispatched*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\``,
+            text: `*${PHASE_LABELS[n.phase]} Dispatched*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\``,
           },
         },
       ],
@@ -122,7 +133,7 @@ async function notifyTeams(webhookUrl: string, n: Notification): Promise<void> {
           body: [
             {
               type: "TextBlock",
-              text: "AI Implementation Dispatched",
+              text: `${PHASE_LABELS[n.phase]} Dispatched`,
               weight: "Bolder",
               size: "Medium",
             },

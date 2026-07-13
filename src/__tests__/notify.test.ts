@@ -1,11 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { notify, notifyCompletion } from "../notify.js";
+import type { Notification } from "../notify.js";
 
-const notification = {
+const notification: Notification = {
   issueIdentifier: "TEST-5",
   issueTitle: "Fix the thing",
   issueUrl: "https://linear.app/issue/TEST-5",
   repoFullName: "org/repo",
+  phase: "implementation",
 };
 
 describe("notify (dispatch)", () => {
@@ -70,6 +72,32 @@ describe("notify (dispatch)", () => {
     it("throws on non-ok response", async () => {
       vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "Server Error" } as Response);
       await expect(notify("teams", "https://webhook.example.com/teams", notification)).rejects.toThrow("500");
+    });
+  });
+
+  // AII-168: planning and implementation dispatch separately; each must be labelled
+  // so one issue's two dispatches don't read as a duplicate run.
+  describe("phase label", () => {
+    // Returns the dispatch title for a given provider + phase: the slack mrkdwn line
+    // (title embedded in a larger string) or the teams TextBlock text (the title alone).
+    async function dispatchTitle(type: "slack" | "teams", phase: Notification["phase"]): Promise<string> {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      await notify(type, "https://webhook.example.com/hook", { ...notification, phase });
+      const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+      return type === "slack" ? body.blocks[0].text.text : body.attachments[0].content.body[0].text;
+    }
+
+    it("slack labels a planning dispatch", async () => {
+      expect(await dispatchTitle("slack", "planning")).toContain("AI Planning Dispatched");
+    });
+    it("slack labels an implementation dispatch", async () => {
+      expect(await dispatchTitle("slack", "implementation")).toContain("AI Implementation Dispatched");
+    });
+    it("teams labels a planning dispatch", async () => {
+      expect(await dispatchTitle("teams", "planning")).toBe("AI Planning Dispatched");
+    });
+    it("teams labels an implementation dispatch", async () => {
+      expect(await dispatchTitle("teams", "implementation")).toBe("AI Implementation Dispatched");
     });
   });
 });
