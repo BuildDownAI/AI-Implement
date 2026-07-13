@@ -702,6 +702,7 @@ async function dispatchPlanning(
             issueTitle: issue.title,
             issueUrl: provider.issueUrl(issue),
             repoFullName: `${mapping.owner}/${mapping.repo}`,
+            phase: "planning",
           }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
         }
         // Intentionally do NOT call markDispatched() — dedup table stays clear
@@ -785,6 +786,7 @@ async function dispatchPlanning(
       issueTitle: issue.title,
       issueUrl: provider.issueUrl(issue),
       repoFullName: `${mapping.owner}/${mapping.repo}`,
+      phase: "planning",
     }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
   }
 
@@ -1116,6 +1118,7 @@ async function postDispatch(
       issueTitle: issue.title,
       issueUrl: provider.issueUrl(issue),
       repoFullName: `${mapping.owner}/${mapping.repo}`,
+      phase: "implementation",
     }).catch((err) => console.error(`[poll] Notification failed:`, err));
   }
 
