@@ -422,8 +422,16 @@ export async function findOpenPullRequest(
 }
 
 /**
- * Finds any PR (open, closed, or merged) for the given head→base pair.
- * Prefers a merged PR when multiple results exist (e.g. after a re-open / force-push).
+ * Finds the most relevant PR (open, closed, or merged) for the given head→base pair.
+ * Selection is intent-ordered rather than list-ordered: a merged PR wins (terminal state),
+ * else an open PR, else the most recently updated closed PR. This matters when several
+ * PRs have existed for the same branch pair over time — GitHub's default list order is
+ * `created` desc, so a newer closed PR would otherwise shadow an older PR that was later
+ * reopened (reopened PRs keep their created date). The query sorts by `updated` desc so
+ * the per_page=10 window holds the most recently *active* PRs (a window cut by created
+ * date could drop that reopened-but-old PR entirely — something client-side sorting
+ * cannot recover); the explicit selection below then makes the choice deterministic
+ * without trusting response ordering.
  * Returns null on empty list or non-OK response (soft failure).
  */
 export async function findPullRequestByBranches(
@@ -435,7 +443,8 @@ export async function findPullRequestByBranches(
 ): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean } | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/pulls` +
-    `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&state=all&per_page=10`;
+    `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}` +
+    `&state=all&sort=updated&direction=desc&per_page=10`;
   const res = await fetch(url, { headers: ghHeaders(token) });
   if (!res.ok) return null;
   const prs = (await res.json()) as Array<{
@@ -443,10 +452,13 @@ export async function findPullRequestByBranches(
     html_url: string;
     state: string;
     merged_at: string | null;
+    updated_at: string;
   }>;
   if (prs.length === 0) return null;
-  const mergedPr = prs.find((p) => p.merged_at !== null);
-  const pr = mergedPr ?? prs[0];
+  const pr =
+    prs.find((p) => p.merged_at !== null) ??
+    prs.find((p) => p.state === "open") ??
+    prs.reduce((best, p) => (p.updated_at > best.updated_at ? p : best));
   return {
     number: pr.number,
     url: pr.html_url,

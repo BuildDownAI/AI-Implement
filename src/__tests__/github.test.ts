@@ -442,6 +442,56 @@ describe("findPullRequestByBranches", () => {
     expect(result).toMatchObject({ number: 8, merged: true });
   });
 
+  it("prefers an open PR over a newer closed-unmerged one (reopened PRs keep their created date)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { number: 12, html_url: "https://gh/pr/12", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
+        { number: 7, html_url: "https://gh/pr/7", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z" },
+      ],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
+      number: 7, url: "https://gh/pr/7", state: "open", merged: false,
+    });
+  });
+
+  it("prefers a merged PR over an open one", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { number: 12, html_url: "https://gh/pr/12", state: "open", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
+        { number: 7, html_url: "https://gh/pr/7", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z" },
+      ],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
+      number: 7, url: "https://gh/pr/7", state: "closed", merged: true,
+    });
+  });
+
+  it("picks the most recently updated PR when all are closed-unmerged, regardless of list order", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { number: 4, html_url: "https://gh/pr/4", state: "closed", merged_at: null, updated_at: "2026-06-20T10:00:00Z" },
+        { number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, updated_at: "2026-07-05T10:00:00Z" },
+        { number: 3, html_url: "https://gh/pr/3", state: "closed", merged_at: null, updated_at: "2026-06-28T10:00:00Z" },
+      ],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
+      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+    });
+  });
+
+  it("requests the list sorted by updated desc so the per_page window holds recently active PRs", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => [] }));
+    vi.stubGlobal("fetch", fetchMock);
+    await findPullRequestByBranches("tok", "owner", "repo", "h", "b");
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("state=all&sort=updated&direction=desc&per_page=10"),
+      expect.anything(),
+    );
+  });
+
   it("returns null on non-OK response", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toBeNull();
