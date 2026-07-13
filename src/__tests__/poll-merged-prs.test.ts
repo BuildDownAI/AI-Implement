@@ -81,6 +81,22 @@ describe("detectMergedPrs", () => {
     });
     expect(recon.hasReconciliationForPr("o/r", 5)).toBe(false);
   });
+  it("does not create a duplicate row when a webhook enqueues during the poller's await gap", async () => {
+    seedCompletedJob(5);
+    // Simulate a merged-PR webhook delivery landing while the poller is parked
+    // on the GitHub API call — i.e. after the poller's hasReconciliationForPr
+    // check but before its enqueueReconciliation.
+    const getPullRequestState = vi.fn(async () => {
+      recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "webhook-sha" });
+      return { merged: true, state: "closed" as const };
+    });
+    await mod.detectMergedPrs({
+      getPullRequestState,
+      tokenForOwner: async () => "tok",
+      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+    });
+    expect(recon.getPendingReconciliations()).toHaveLength(1);
+  });
   it("skips rows whose PR already has a queue row", async () => {
     seedCompletedJob(5);
     recon.enqueueReconciliation({ issueId: "i1", issueIdentifier: "ENG-1", prNumber: 5, repo: "o/r", mergeCommitSha: "" });
