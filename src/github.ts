@@ -33,6 +33,8 @@ interface DispatchInputs {
   branch_prefix?: string;
   /** Optional skills repo (owner/repo or git URL) forwarded to the runner. Only forwarded when set. */
   skills_repo?: string;
+  /** Comma-joined AI-Implement Profiles from the issue (Jira multi-select). Only forwarded when non-empty. */
+  profiles?: string;
   /** Public base URL the runner should POST results back to. Empty when callback disabled. */
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
@@ -146,6 +148,31 @@ export function skillsRepoDispatchFields(
  */
 export function skillsRepoRunnerEnv(mapping: RepoMapping): Record<string, string> {
   return mapping.skillsRepo ? { AI_IMPLEMENT_SKILLS_REPO: mapping.skillsRepo } : {};
+}
+
+/**
+ * Profiles dispatch input for an issue. Unlike the mapping-scoped fields above,
+ * profiles are per-ISSUE (the Jira "AI-Implement Profiles" multi-select on the
+ * ticket). Only included when the issue carries at least one profile, so default
+ * repos keep dispatching to workflow templates that haven't been re-synced with
+ * the new input.
+ */
+export function profilesDispatchFields(
+  issue: { profiles?: string[] },
+): Pick<DispatchInputs, "profiles"> {
+  return issue.profiles && issue.profiles.length > 0
+    ? { profiles: issue.profiles.join(",") }
+    : {};
+}
+
+/**
+ * Profiles env var for the runner process (Fly/local execution modes), where
+ * the value arrives via container env rather than a workflow input.
+ */
+export function profilesRunnerEnv(issue: { profiles?: string[] }): Record<string, string> {
+  return issue.profiles && issue.profiles.length > 0
+    ? { AI_IMPLEMENT_PROFILES: issue.profiles.join(",") }
+    : {};
 }
 
 export async function dispatchWorkflow(

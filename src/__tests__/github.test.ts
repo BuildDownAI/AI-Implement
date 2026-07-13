@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -360,6 +360,34 @@ describe("skillsRepoRunnerEnv", () => {
   it("includes AI_IMPLEMENT_SKILLS_REPO when set", () => {
     expect(skillsRepoRunnerEnv(makeMapping({ skillsRepo: "org/skills" }))).toEqual({
       AI_IMPLEMENT_SKILLS_REPO: "org/skills",
+    });
+  });
+});
+
+describe("profilesDispatchFields", () => {
+  it("returns empty object when the issue has no profiles", () => {
+    expect(profilesDispatchFields({})).toEqual({});
+    expect(profilesDispatchFields({ profiles: undefined })).toEqual({});
+    expect(profilesDispatchFields({ profiles: [] })).toEqual({});
+  });
+
+  it("comma-joins profiles when present", () => {
+    expect(profilesDispatchFields({ profiles: ["backend"] })).toEqual({ profiles: "backend" });
+    expect(profilesDispatchFields({ profiles: ["backend", "webapp"] })).toEqual({
+      profiles: "backend,webapp",
+    });
+  });
+});
+
+describe("profilesRunnerEnv", () => {
+  it("returns empty object when the issue has no profiles", () => {
+    expect(profilesRunnerEnv({})).toEqual({});
+    expect(profilesRunnerEnv({ profiles: [] })).toEqual({});
+  });
+
+  it("includes AI_IMPLEMENT_PROFILES when profiles are present", () => {
+    expect(profilesRunnerEnv({ profiles: ["backend", "webapp"] })).toEqual({
+      AI_IMPLEMENT_PROFILES: "backend,webapp",
     });
   });
 });

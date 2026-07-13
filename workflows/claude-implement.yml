@@ -90,6 +90,11 @@ on:
         required: false
         type: string
         default: ""
+      profiles:
+        description: "Comma-separated AI-Implement profile names from the issue; consumed by custom pipeline steps (empty = none)"
+        required: false
+        type: string
+        default: ""
       runner_callback_url:
         description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
         required: false
@@ -267,6 +272,7 @@ jobs:
           AI_IMPLEMENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
           AI_IMPLEMENT_BRANCH_PREFIX: ${{ inputs.branch_prefix }}
           AI_IMPLEMENT_SKILLS_REPO: ${{ inputs.skills_repo }}
+          AI_IMPLEMENT_PROFILES: ${{ inputs.profiles }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
