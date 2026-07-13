@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -172,6 +172,49 @@ describe("installSkillsStep", () => {
     // Shorthand was converted to HTTPS — clone was attempted (and failed), not silently skipped
     expect(warnings.every((w) => !w.includes("non-https"))).toBe(true);
     expect(warnings.some((w) => w.includes("clone failed") || w.includes("install failed"))).toBe(true);
+  });
+
+  it("embeds the token only for github.com clones; cross-host https URLs get no credentials", async () => {
+    // Shim `git` with a script that records its argv, so we can assert exactly what
+    // remote URL the step hands to `git clone` for each host.
+    const shimDir = mkdtempSync(join(tmpdir(), "git-shim-"));
+    const argsFile = join(shimDir, "git-args.txt");
+    writeFileSync(
+      join(shimDir, "git"),
+      `#!/bin/sh\nprintf '%s\\n' "$@" > "${argsFile}"\nexit 1\n`,
+      { mode: 0o755 },
+    );
+    const origPath = process.env.PATH;
+    process.env.PATH = `${shimDir}:${origPath}`;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const cloneArgsFor = async (skillsRepoUrl: string): Promise<string> => {
+      await installSkillsStep.run(
+        ctx(),
+        { skillsRepoUrl, githubToken: "sekret-token", homeDir },
+        new NoopStepReporter(),
+      );
+      return readFileSync(argsFile, "utf8");
+    };
+    try {
+      // Cross-host: the remote is passed through verbatim — no token, no basic auth.
+      const crossHost = await cloneArgsFor("https://evil.example.com/acme/skills.git");
+      expect(crossHost).toContain("https://evil.example.com/acme/skills.git");
+      expect(crossHost).not.toContain("sekret-token");
+      expect(crossHost).not.toContain("x-access-token");
+
+      // github.com (any case): the token is embedded as basic auth.
+      const github = await cloneArgsFor("https://GitHub.com/acme/skills.git");
+      expect(github).toContain("https://x-access-token:sekret-token@GitHub.com/acme/skills.git");
+
+      // www.github.com is deliberately not credentialed — apex host only.
+      const www = await cloneArgsFor("https://www.github.com/acme/skills.git");
+      expect(www).toContain("https://www.github.com/acme/skills.git");
+      expect(www).not.toContain("sekret-token");
+    } finally {
+      process.env.PATH = origPath;
+      warnSpy.mockRestore();
+      rmSync(shimDir, { recursive: true, force: true });
+    }
   });
 
   it("does not install dirs where SKILL.md is arbitrarily nested (not under a recognized root)", async () => {

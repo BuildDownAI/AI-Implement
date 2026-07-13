@@ -736,13 +736,40 @@ describe("admin mappings", () => {
     expect(JSON.parse(res.body).error).toContain("skillsRepo");
   });
 
-  it("persists a non-github HTTPS skillsRepo URL (host-agnostic)", async () => {
+  it("rejects a non-github HTTPS skillsRepo URL (the runner's token must never leave github.com)", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "SR5", owner: "org", repo: "app", skillsRepo: "https://gitlab.com/acme/skills",
     }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+  });
+
+  it("rejects a lookalike-host skillsRepo URL (github.com prefix on another domain)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR6", owner: "org", repo: "app", skillsRepo: "https://github.com.evil.example/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+  });
+
+  it("rejects a www.github.com skillsRepo URL (git remotes live on the apex host)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR7", owner: "org", repo: "app", skillsRepo: "https://www.github.com/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+  });
+
+  it("accepts a github.com skillsRepo URL regardless of host case", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR8", owner: "org", repo: "app", skillsRepo: "https://GitHub.com/acme/skills.git",
+    }, token);
     expect(create.statusCode).toBe(202);
-    expect(JSON.parse(create.body).skillsRepo).toBe("https://gitlab.com/acme/skills");
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://GitHub.com/acme/skills.git");
   });
 
   it("clears skillsRepo when an existing mapping is updated to null", async () => {

@@ -43,7 +43,7 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
     try {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-implement-skills-"));
 
-      // Local paths (used in tests) pass through unchanged; remote URLs get the token embedded.
+      // Local paths (used in tests) pass through unchanged; github.com remotes get the token embedded.
       const isLocalPath = skillsRepoUrl.startsWith("/") || skillsRepoUrl.startsWith("file://");
       // Only https:// remotes are cloneable on the runner — auth is the orchestrator-minted
       // token embedded in the URL. SSH (git@…) or http:// would need keys the runner lacks, so
@@ -54,9 +54,25 @@ export const installSkillsStep: StepModule<InstallSkillsInputs, InstallSkillsOut
         );
         return { skillsInstalled: 0, skillsRepoRef: null };
       }
-      const remote = isLocalPath
-        ? skillsRepoUrl
-        : skillsRepoUrl.replace("https://", `https://x-access-token:${githubToken}@`);
+      // The GitHub App installation token is only valid for github.com — embedding it
+      // in the clone URL for any other host would hand an org-scoped credential to a
+      // third party as HTTP basic auth. Exact host match only ("github.com",
+      // case-insensitive; "www.github.com" is deliberately excluded — GitHub serves
+      // git remotes on the apex host, and a redirect must never carry credentials).
+      // Cross-host https remotes are cloned WITHOUT credentials: public repos still
+      // work, private ones fail fast under GIT_TERMINAL_PROMPT=0 instead of leaking.
+      let isGitHubHost = false;
+      if (!isLocalPath) {
+        try {
+          isGitHubHost = new URL(skillsRepoUrl).hostname.toLowerCase() === "github.com";
+        } catch {
+          // unparseable URL — treat as non-GitHub; the clone below fails on its own
+        }
+      }
+      const remote =
+        isLocalPath || !isGitHubHost
+          ? skillsRepoUrl
+          : skillsRepoUrl.replace("https://", `https://x-access-token:${githubToken}@`);
 
       const cloneResult = spawnSync(
         "git",

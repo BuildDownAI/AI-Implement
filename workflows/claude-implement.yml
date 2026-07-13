@@ -86,7 +86,7 @@ on:
         type: string
         default: ""
       skills_repo:
-        description: "Optional skills repo (owner/repo or git URL) cloned + installed into ~/.claude/skills (empty = none)"
+        description: "Optional skills repo (owner/repo or https://github.com URL; token auth is github.com-only) cloned + installed into ~/.claude/skills (empty = none)"
         required: false
         type: string
         default: ""
