@@ -119,6 +119,30 @@ describe("loadPipelineDefinition", () => {
     expect(resolvedPath).toContain("custom/pipelines/autonomous.yml");
   });
 
+  it("uses a baked-root custom/pipelines/autonomous.yml when the workspace has none", () => {
+    let resolvedPath = "";
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      customRoot: "/workspace",
+      bakedRoot: "/baked",
+      existsSyncImpl: (p) => p.startsWith("/baked/"),
+      readFileSyncImpl: (path, _enc) => {
+        resolvedPath = path;
+        return CUSTOM_PIPELINE_YAML;
+      },
+    });
+
+    expect(resolvedPath).toBe("/baked/custom/pipelines/autonomous.yml");
+    expect(pipeline.id).toBe("custom-loop");
+    expect(pipeline.steps.map((s) => s.id)).toEqual([
+      "clone",
+      "install",
+      "feedback-loop",
+      "preflight",
+      "push",
+      "notify",
+    ]);
+  });
+
   it("resolves to the builtin path when no custom override exists", () => {
     let resolvedPath = "";
     loadPipelineDefinition("pipelines/autonomous.yml", {
