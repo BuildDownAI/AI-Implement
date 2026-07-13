@@ -256,8 +256,15 @@ export function handleAdminRequest(
       return true;
     }
 
-    if (url === "/api/log" && method === "GET") {
-      json(res, 200, listLog());
+    if ((url === "/api/log" || url.startsWith("/api/log?")) && method === "GET") {
+      const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+      const p = new URLSearchParams(qs);
+      const sinceRaw = p.get("since");
+      const untilRaw = p.get("until");
+      // Invalid (non-numeric) values are ignored rather than rejected.
+      const since = sinceRaw && Number.isFinite(Number(sinceRaw)) ? Number(sinceRaw) : undefined;
+      const until = untilRaw && Number.isFinite(Number(untilRaw)) ? Number(untilRaw) : undefined;
+      json(res, 200, listLog({ since, until }));
       return true;
     }
 

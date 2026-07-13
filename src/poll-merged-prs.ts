@@ -33,7 +33,7 @@ export function prNumberFromUrl(url: string): number | null {
  * re-checked next tick.
  */
 export async function detectMergedPrs(deps: DetectDeps): Promise<void> {
-  for (const job of listLog(500)) {
+  for (const job of listLog({ limit: 500 })) {
     if (!job.repo || !job.prUrl) continue;
     if (!CANDIDATE_STATUSES.has(job.status)) continue;
     const prNumber = prNumberFromUrl(job.prUrl);

@@ -75,6 +75,67 @@ npm run dev:local          # rebuilds the runner image, then starts RUNNER_MODE=
 
 Docker must be running. Local mode still opens real GitHub PRs; it just avoids deploying the orchestrator or publishing a runner image while you test changes.
 
+### Getting an admin token
+
+Once the service is running, open `http://localhost:8080/admin` in your browser, log in with `ADMIN_ACCESS_CODE`, then run this in the browser console:
+
+```js
+localStorage.getItem('admin_token')
+```
+
+Copy the returned token for use in API calls below.
+
+### Testing the admin API with curl
+
+**Linux / macOS**
+
+```bash
+TOKEN="<paste token here>"
+
+# All jobs (up to 100)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/log
+
+# Jobs from the last hour
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/api/log?since=$(($(date +%s%3N) - 3600000))"
+
+# Jobs in a fixed time range (Unix ms)
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/api/log?since=1750000000000&until=1750999999999"
+```
+
+**Windows (PowerShell)**
+
+```powershell
+$TOKEN = "<paste token here>"
+
+# All jobs (up to 100)
+Invoke-WebRequest -Uri "http://localhost:8080/api/log" `
+  -Headers @{ Authorization = "Bearer $TOKEN" } | Select-Object -ExpandProperty Content
+
+# Jobs from the last hour
+$since = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 3600000
+Invoke-WebRequest -Uri "http://localhost:8080/api/log?since=$since" `
+  -Headers @{ Authorization = "Bearer $TOKEN" } | Select-Object -ExpandProperty Content
+
+# Jobs in a fixed time range (Unix ms)
+Invoke-WebRequest -Uri "http://localhost:8080/api/log?since=1750000000000&until=1750999999999" `
+  -Headers @{ Authorization = "Bearer $TOKEN" } | Select-Object -ExpandProperty Content
+```
+
+> **Note:** PowerShell's `curl` is an alias for `Invoke-WebRequest` — the `-H` flag syntax used by real curl doesn't work. Use `Invoke-WebRequest` as above, or install real curl via `winget install curl.curl` and call it as `curl.exe`.
+
+### Seeding test data locally
+
+To pre-populate the DB with jobs spread across different time windows (useful for testing time filters):
+
+```powershell
+New-Item -ItemType Directory -Force data
+.\scripts\seed-test-jobs.ps1
+```
+
+Requires `sqlite3` on PATH (`winget install SQLite.SQLite`). Run after the service has started at least once so the DB schema is initialized.
+
 AI-Implement uses `better-sqlite3`, which ships a native Node addon. Always run
 `npm install`, `npm ci`, and `npm rebuild` with the Node major pinned in
 `.tool-versions` / `.nvmrc`; otherwise `node_modules` can be compiled for one
