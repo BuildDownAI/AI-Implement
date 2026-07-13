@@ -6,6 +6,10 @@ export const REPO_FIELD_NAME = "AI-Implement Repo";
 export interface ResolvedFieldIds {
   statusFieldId: string;
   repoFieldId: string;
+  /** Classic-project "Epic Link" custom field, when the instance has one. Best-effort:
+   *  absent on next-gen/team-managed projects (which use the native parent field) and
+   *  when both status/repo overrides short-circuit the listFields call. */
+  epicLinkFieldId?: string;
 }
 
 interface OverrideOptions {
@@ -29,6 +33,10 @@ export async function resolveCustomFieldIds(
   }
 
   const fields = await client.listFields();
+  // Best-effort by design: first match wins on a duplicate "Epic Link" name (unlike
+  // status/repo below, which hard-fail on ambiguity) — epicLinkFieldId is advisory
+  // and a wrong pick degrades to native-parent-only attribution, not a failure.
+  const epicLink = fields.find((f) => f.name === "Epic Link");
   const lookup = (name: string): string => {
     const matches = fields.filter((f) => f.name === name);
     if (matches.length === 0) {
@@ -43,6 +51,7 @@ export async function resolveCustomFieldIds(
   return {
     statusFieldId: overrides.statusOverride ?? lookup(STATUS_FIELD_NAME),
     repoFieldId: overrides.repoOverride ?? lookup(REPO_FIELD_NAME),
+    ...(epicLink ? { epicLinkFieldId: epicLink.id } : {}),
   };
 }
 
