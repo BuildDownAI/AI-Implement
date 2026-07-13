@@ -598,7 +598,7 @@ async function handleDestroySession(
         const mapping = job.teamKey ? getMappings()[job.teamKey] : undefined;
         if (mapping) {
           const provider = await registry.forMapping(mapping);
-          await provider.clearWorkingState(job.issueId);
+          await provider.clearWorkingState(job.issueId, job.teamKey!);
           deleteDispatched(job.issueId);
         } else {
           console.warn(

@@ -265,7 +265,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
               githubAppId: config.githubAppId,
               githubAppPrivateKey: config.githubAppPrivateKey,
               resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
-              finalizeMerged: (id) => provider.markMerged(id),
+              finalizeMerged: (id, scopeKey) => provider.markMerged(id, scopeKey),
             });
           }
         }
@@ -1655,9 +1655,16 @@ async function monitorLocalDockerJob(
 /** Mark a Linear issue as Ready for Review after a successful job. */
 async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: string): Promise<void> {
   if (!job.issueId) return;
+  // teamKey is the authoritative scope (set to issue.scopeKey at job creation).
+  // It's always present here, but guard rather than pass "" — an empty scope
+  // makes Jira's fields("") throw and leaves the ticket stuck.
+  if (!job.teamKey) {
+    console.error(`[monitor] Cannot mark ${job.issueIdentifier} as Ready for Review: job has no teamKey`);
+    return;
+  }
   try {
-    await provider.markPrReady(job.issueId, prUrl);
-    if (job.issueId) resetStuckAttempts(job.issueId);
+    await provider.markPrReady(job.issueId, job.teamKey, prUrl);
+    resetStuckAttempts(job.issueId);
     console.log(`[monitor] Marked ${job.issueIdentifier} as Ready for Review (PR: ${prUrl})`);
   } catch (err) {
     console.error(`[monitor] Failed to mark ${job.issueIdentifier} as Ready for Review:`, err);
@@ -1667,8 +1674,13 @@ async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: 
 /** Remove AI-Working label and reset issue state after a failed/timed-out job. */
 async function resetTicket(provider: TicketingProvider, job: Job): Promise<void> {
   if (!job.issueId) return;
+  // See markReadyForReview: guard the scope rather than passing "" downstream.
+  if (!job.teamKey) {
+    console.error(`[monitor] Cannot reset ticket ${job.issueIdentifier}: job has no teamKey`);
+    return;
+  }
   try {
-    await provider.clearWorkingState(job.issueId);
+    await provider.clearWorkingState(job.issueId, job.teamKey);
 
     // Clear the dedup entry so the issue can be re-dispatched
     deleteDispatched(job.issueId);
@@ -1844,8 +1856,10 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
 async function processReconciliations(_config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const teamRepoMap = getMappings();
   await runReconciliations({
-    mappingForRepo: (repo) =>
-      Object.values(teamRepoMap).find((m) => `${m.owner}/${m.repo}` === repo),
+    mappingForRepo: (repo) => {
+      const entry = Object.entries(teamRepoMap).find(([, m]) => `${m.owner}/${m.repo}` === repo);
+      return entry ? { scopeKey: entry[0], mapping: entry[1] } : undefined;
+    },
     resolveProvider: (mapping) => registry.forMapping(mapping),
   });
 }

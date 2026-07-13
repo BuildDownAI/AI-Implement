@@ -121,6 +121,7 @@ describe("dispatch → callback round-trip", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markImplementationFailed")?.args).toEqual([
       "uuid-2",
+      "ENG",
       "tests timed out",
     ]);
   });

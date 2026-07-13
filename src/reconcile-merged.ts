@@ -8,7 +8,9 @@ import {
 } from "./reconciliation.js";
 
 export interface ReconcileDeps {
-  mappingForRepo: (repo: string) => RepoMapping | undefined;
+  /** Resolve a repo to its mapping AND the scope/team key it is registered under —
+   *  markMerged needs the authoritative scopeKey (Jira picks its mapping by it). */
+  mappingForRepo: (repo: string) => { scopeKey: string; mapping: RepoMapping } | undefined;
   resolveProvider: (mapping: RepoMapping) => Promise<TicketingProvider>;
 }
 
@@ -25,14 +27,14 @@ export async function runReconciliations(deps: ReconcileDeps): Promise<void> {
   console.log(`[reconcile] Processing ${pending.length} pending reconciliation(s)`);
   for (const job of pending) {
     try {
-      const mapping = deps.mappingForRepo(job.repo);
-      if (!mapping) {
+      const resolved = deps.mappingForRepo(job.repo);
+      if (!resolved) {
         console.warn(`[reconcile] No mapping for repo ${job.repo}, skipping #${job.id}`);
         updateReconciliationStatus(job.id, "skipped");
         continue;
       }
-      const provider = await deps.resolveProvider(mapping);
-      await provider.markMerged(job.issueId);
+      const provider = await deps.resolveProvider(resolved.mapping);
+      await provider.markMerged(job.issueId, resolved.scopeKey);
       updateReconciliationStatus(job.id, "dispatched");
       console.log(`[reconcile] Marked ${job.issueIdentifier ?? job.issueId} Done (PR #${job.prNumber} in ${job.repo})`);
     } catch (err) {
