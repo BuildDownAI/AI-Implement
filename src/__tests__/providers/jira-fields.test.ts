@@ -204,26 +204,6 @@ describe("resolveCustomFieldIds — epicLinkFieldId", () => {
   });
 });
 
-describe("resolveCustomFieldIds — epicLinkFieldId", () => {
-  it("resolves Epic Link field id when present (best-effort)", async () => {
-    const client = { listFields: async () => ([
-      { id: "customfield_10100", name: "AI-Implement Status", custom: true },
-      { id: "customfield_10101", name: "AI-Implement Repo", custom: true },
-      { id: "customfield_10014", name: "Epic Link", custom: true },
-    ]) };
-    const ids = await resolveCustomFieldIds(client as any, { statusOverride: null, repoOverride: null });
-    expect(ids.epicLinkFieldId).toBe("customfield_10014");
-  });
-  it("leaves epicLinkFieldId undefined when no Epic Link field exists", async () => {
-    const client = { listFields: async () => ([
-      { id: "customfield_10100", name: "AI-Implement Status", custom: true },
-      { id: "customfield_10101", name: "AI-Implement Repo", custom: true },
-    ]) };
-    const ids = await resolveCustomFieldIds(client as any, { statusOverride: null, repoOverride: null });
-    expect(ids.epicLinkFieldId).toBeUndefined();
-  });
-});
-
 describe("STATUS_VALUES", () => {
   it("contains every state in the locked machine", () => {
     expect(Object.values(STATUS_VALUES)).toEqual([
