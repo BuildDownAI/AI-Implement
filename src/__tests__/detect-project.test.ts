@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+
+const isWindows = process.platform === "win32";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -48,12 +50,16 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(tmpDir, { recursive: true, force: true });
+  try {
+    rmSync(tmpDir, { recursive: true, force: true });
+  } catch {
+    // On Windows, bash-created files may be locked briefly after the process exits
+  }
 });
 
 // ── 1. Auto-detection: package.json with 'dev' script ─────────────────────────
 
-describe("auto-detection: package.json with dev script", () => {
+describe.skipIf(isWindows)("auto-detection: package.json with dev script", () => {
   beforeEach(() => {
     writeFileSync(
       join(tmpDir, "package.json"),
@@ -91,7 +97,7 @@ describe("auto-detection: package.json with dev script", () => {
 
 // ── 2. Auto-detection: package.json with 'start' but no 'dev' script ──────────
 
-describe("auto-detection: package.json with start script only", () => {
+describe.skipIf(isWindows)("auto-detection: package.json with start script only", () => {
   beforeEach(() => {
     writeFileSync(
       join(tmpDir, "package.json"),
@@ -112,7 +118,7 @@ describe("auto-detection: package.json with start script only", () => {
 
 // ── 3. .ai-implement.toml: custom values ──────────────────────────────────────
 
-describe(".ai-implement.toml custom values", () => {
+describe.skipIf(isWindows)(".ai-implement.toml custom values", () => {
   beforeEach(() => {
     writeFileSync(
       join(tmpDir, ".ai-implement.toml"),
@@ -212,7 +218,7 @@ describe(".ai-implement.toml custom values", () => {
 
 // ── 4. .ai-implement.toml: required secrets present ──────────────────────────
 
-describe(".ai-implement.toml required secrets — all present", () => {
+describe.skipIf(isWindows)(".ai-implement.toml required secrets — all present", () => {
   beforeEach(() => {
     writeFileSync(
       join(tmpDir, ".ai-implement.toml"),
@@ -254,7 +260,7 @@ describe(".ai-implement.toml required secrets — all present", () => {
 
 // ── 5. .ai-implement.toml: missing required secret → exit 1 ──────────────────
 
-describe(".ai-implement.toml required secrets — missing", () => {
+describe.skipIf(isWindows)(".ai-implement.toml required secrets — missing", () => {
   beforeEach(() => {
     writeFileSync(
       join(tmpDir, ".ai-implement.toml"),
@@ -276,7 +282,7 @@ describe(".ai-implement.toml required secrets — missing", () => {
 
 // ── 6. .ai-implement.toml: optional secrets section ──────────────────────────
 
-describe(".ai-implement.toml optional secrets", () => {
+describe.skipIf(isWindows)(".ai-implement.toml optional secrets", () => {
   it("does not fail when optional secrets are absent", () => {
     writeFileSync(
       join(tmpDir, ".ai-implement.toml"),
@@ -308,7 +314,7 @@ describe(".ai-implement.toml optional secrets", () => {
 
 // ── 7. External env var takes precedence over TOML ───────────────────────────
 
-describe("external CLAUDE_MODEL env var precedence", () => {
+describe.skipIf(isWindows)("external CLAUDE_MODEL env var precedence", () => {
   beforeEach(() => {
     writeFileSync(
       join(tmpDir, ".ai-implement.toml"),
@@ -324,7 +330,7 @@ describe("external CLAUDE_MODEL env var precedence", () => {
   });
 });
 
-describe("external CLAUDE_MAX_TURNS env var precedence", () => {
+describe.skipIf(isWindows)("external CLAUDE_MAX_TURNS env var precedence", () => {
   beforeEach(() => {
     writeFileSync(join(tmpDir, ".ai-implement.toml"), "claude_max_turns = 50");
   });
@@ -339,7 +345,7 @@ describe("external CLAUDE_MAX_TURNS env var precedence", () => {
 
 // ── 8. Unknown project: no sentinel files ─────────────────────────────────────
 
-describe("auto-detection: django project", () => {
+describe.skipIf(isWindows)("auto-detection: django project", () => {
   beforeEach(() => {
     writeFileSync(join(tmpDir, "requirements.txt"), "django==5.0.0\n");
     writeFileSync(join(tmpDir, "manage.py"), "#!/usr/bin/env python\n");
@@ -354,7 +360,7 @@ describe("auto-detection: django project", () => {
   });
 });
 
-describe("auto-detection: rails project", () => {
+describe.skipIf(isWindows)("auto-detection: rails project", () => {
   beforeEach(() => {
     writeFileSync(join(tmpDir, "Gemfile"), 'source "https://rubygems.org"\n');
     writeFileSync(join(tmpDir, "config.ru"), "run Rails.application\n");
@@ -369,7 +375,7 @@ describe("auto-detection: rails project", () => {
   });
 });
 
-describe("auto-detection: go project", () => {
+describe.skipIf(isWindows)("auto-detection: go project", () => {
   beforeEach(() => {
     writeFileSync(join(tmpDir, "go.mod"), "module example.com/app\n");
   });
@@ -383,7 +389,7 @@ describe("auto-detection: go project", () => {
   });
 });
 
-describe("auto-detection: docker compose project", () => {
+describe.skipIf(isWindows)("auto-detection: docker compose project", () => {
   beforeEach(() => {
     writeFileSync(
       join(tmpDir, "docker-compose.yml"),
@@ -413,7 +419,7 @@ describe("auto-detection: docker compose project", () => {
   });
 });
 
-describe("unknown project type", () => {
+describe.skipIf(isWindows)("unknown project type", () => {
   it("exits 0 with empty SETUP_CMD and DEV_CMD", () => {
     const { status, stdout } = runDetect(tmpDir);
     expect(status).toBe(0);

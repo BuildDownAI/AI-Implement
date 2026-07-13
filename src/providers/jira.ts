@@ -315,6 +315,16 @@ export class JiraProvider implements TicketingProvider {
       readStatusValue(fields, fieldIds.statusFieldId) !== "" &&
       readRepoFieldValue(fields[fieldIds.repoFieldId]) === repoFieldValue;
 
+    // A child is finished when its native status reached the Done category (a human
+    // moved it) OR its AI-Implement Status is "Merged" — the orchestrator's
+    // done-on-merge path (markMerged) only sets the custom field and never
+    // transitions native status, the same asymmetry the completed-node roll-up
+    // query in fetchFeatureNodeRollUps handles with its OR. Without this, a child
+    // merged through the normal flow would gate its feature-node parent forever.
+    const childTerminal = (fields: Record<string, unknown>): boolean =>
+      isTerminalStatus(fields) ||
+      readStatusValue(fields, fieldIds.statusFieldId) === STATUS_VALUES.MERGED;
+
     const childFields = [
       fieldIds.statusFieldId,
       fieldIds.repoFieldId,
@@ -341,7 +351,7 @@ export class JiraProvider implements TicketingProvider {
         const parentKey = effectiveParentKey(ch.fields, fieldIds);
         if (!parentKey) continue;
         const list = childrenByParent.get(parentKey) ?? [];
-        list.push({ designated: designated(ch.fields), terminal: isTerminalStatus(ch.fields) });
+        list.push({ designated: designated(ch.fields), terminal: childTerminal(ch.fields) });
         childrenByParent.set(parentKey, list);
       }
     } catch (err) {

@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+
+const isWindows = process.platform === "win32";
 import { spawnSync } from "node:child_process";
 
 function runBash(script: string) {
@@ -8,7 +10,7 @@ function runBash(script: string) {
   });
 }
 
-describe("session/lib.sh", () => {
+describe.skipIf(isWindows)("session/lib.sh", () => {
   it("passes shellcheck cleanly", () => {
     const result = spawnSync("shellcheck", ["session/lib.sh"], {
       encoding: "utf-8",

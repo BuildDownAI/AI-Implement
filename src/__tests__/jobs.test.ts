@@ -218,8 +218,65 @@ describe("jobs table", () => {
       log.appendLog({ issueId: `issue-${i}` });
     }
 
-    const all = log.listLog(600);
+    const all = log.listLog({ limit: 600 });
     expect(all.length).toBeLessThanOrEqual(500);
+  });
+});
+
+describe("listLog time filtering", () => {
+  /** Appends a job and pins its dispatched_at to the given timestamp. */
+  function seedJobAt(issueId: string, dispatchedAt: number): number {
+    const jobId = log.appendLog({ issueId });
+    dedup.getDb()
+      .prepare("UPDATE dispatch_log SET dispatched_at = ? WHERE id = ?")
+      .run(dispatchedAt, jobId);
+    return jobId;
+  }
+
+  it("since returns only jobs dispatched at or after the bound (inclusive)", () => {
+    seedJobAt("old", 1_000);
+    seedJobAt("boundary", 2_000);
+    seedJobAt("new", 3_000);
+
+    const jobs = log.listLog({ since: 2_000 });
+    expect(jobs.map((j) => j.issueId)).toEqual(["new", "boundary"]);
+  });
+
+  it("until returns only jobs dispatched at or before the bound (inclusive)", () => {
+    seedJobAt("old", 1_000);
+    seedJobAt("boundary", 2_000);
+    seedJobAt("new", 3_000);
+
+    const jobs = log.listLog({ until: 2_000 });
+    expect(jobs.map((j) => j.issueId)).toEqual(["boundary", "old"]);
+  });
+
+  it("since + until returns the inclusive window, newest first", () => {
+    seedJobAt("too-old", 1_000);
+    seedJobAt("in-window-1", 2_000);
+    seedJobAt("in-window-2", 2_500);
+    seedJobAt("too-new", 3_000);
+
+    const jobs = log.listLog({ since: 2_000, until: 2_500 });
+    expect(jobs.map((j) => j.issueId)).toEqual(["in-window-2", "in-window-1"]);
+  });
+
+  it("limit option applies together with a time filter", () => {
+    seedJobAt("a", 1_000);
+    seedJobAt("b", 2_000);
+    seedJobAt("c", 3_000);
+
+    const jobs = log.listLog({ since: 1_000, limit: 2 });
+    expect(jobs.map((j) => j.issueId)).toEqual(["c", "b"]);
+  });
+
+  it("defaults to 100 rows without a filter but the full retained window with one", () => {
+    for (let i = 0; i < 150; i++) {
+      log.appendLog({ issueId: `issue-${i}` });
+    }
+
+    expect(log.listLog()).toHaveLength(100);
+    expect(log.listLog({ since: 0 })).toHaveLength(150);
   });
 });
 

@@ -273,13 +273,21 @@ export function getUnnotifiedTerminalJobs(): Job[] {
   );
 }
 
-export function listLog(limit = 100): Job[] {
+export function listLog(opts: { since?: number; until?: number; limit?: number } = {}): Job[] {
+  const { since, until } = opts;
+  // When a time filter is present, default to the full retained window so a
+  // range query isn't silently truncated to the newest 100 rows.
+  const limit = opts.limit ?? (since !== undefined || until !== undefined ? MAX_LOG_ENTRIES : 100);
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  if (since !== undefined) { conditions.push("dispatched_at >= ?"); params.push(since); }
+  if (until !== undefined) { conditions.push("dispatched_at <= ?"); params.push(until); }
+  const where = conditions.length ? " WHERE " + conditions.join(" AND ") : "";
+  params.push(limit);
   return mapRows(
     getDb()
-      .prepare(
-        "SELECT * FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?",
-      )
-      .all(limit) as RawRow[],
+      .prepare("SELECT * FROM dispatch_log" + where + " ORDER BY dispatched_at DESC LIMIT ?")
+      .all(...params) as RawRow[],
   );
 }
 
@@ -365,7 +373,7 @@ export interface PullSummary {
 }
 
 export function getPulls(): PullSummary[] {
-  const rows = listLog(500).filter((j) => j.prUrl);
+  const rows = listLog({ limit: 500 }).filter((j) => j.prUrl);
   const byUrl = new Map<string, PullSummary>();
   for (const j of rows) {
     const ts = j.dispatchedAt;

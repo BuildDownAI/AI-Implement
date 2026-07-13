@@ -803,6 +803,25 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     expect(parent.featureBranchChain).toEqual(["OOL-78"]);
   });
 
+  it("treats a child merged via markMerged (custom status Merged, native status not done) as terminal", async () => {
+    // markMerged only sets the AI-Implement Status custom field — native status
+    // stays untouched. The gating check must accept that as terminal or the
+    // feature-node parent would stay blocked forever after a normal merge.
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      {
+        when: /parent in/,
+        issues: [
+          issue("OOL-78-c0", "Merged", "acme/x", { parentKey: "OOL-78", statusCategory: "indeterminate" }),
+        ],
+      },
+      { when: /key in/, issues: [] }, // OOL-78 has no parent
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
+    expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+  });
+
   it("skips a parent whose children are not yet designated (race guard)", async () => {
     const client = fakeClient([
       { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
@@ -1043,6 +1062,7 @@ describe("JiraProvider.childrenJql (Epic Link fallback)", () => {
     expect(jql.endsWith(")")).toBe(true);
   });
 });
+
 
 describe("JiraProvider.findByKey", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });

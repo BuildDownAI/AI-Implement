@@ -1555,6 +1555,55 @@ describe("admin log", () => {
     const data = JSON.parse(res.body);
     expect(data[0].phase).toBe("planning");
   });
+
+  /** Appends a job and pins its dispatched_at to the given timestamp. */
+  function seedJobAt(issueId: string, dispatchedAt: number): void {
+    const jobId = log.appendLog({ issueId, issueIdentifier: issueId, repo: "org/repo" });
+    dedup.getDb()
+      .prepare("UPDATE dispatch_log SET dispatched_at = ? WHERE id = ?")
+      .run(dispatchedAt, jobId);
+  }
+
+  it("GET /api/log?since= filters out jobs dispatched before the bound", async () => {
+    seedJobAt("LNR-OLD", 1_000);
+    seedJobAt("LNR-NEW", 3_000);
+    const token = await login("secret");
+    const res = await request("/api/log?since=2000", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data.map((j: { issueId: string }) => j.issueId)).toEqual(["LNR-NEW"]);
+  });
+
+  it("GET /api/log?until= filters out jobs dispatched after the bound", async () => {
+    seedJobAt("LNR-OLD", 1_000);
+    seedJobAt("LNR-NEW", 3_000);
+    const token = await login("secret");
+    const res = await request("/api/log?until=2000", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data.map((j: { issueId: string }) => j.issueId)).toEqual(["LNR-OLD"]);
+  });
+
+  it("GET /api/log?since=&until= returns only the inclusive window", async () => {
+    seedJobAt("LNR-A", 1_000);
+    seedJobAt("LNR-B", 2_000);
+    seedJobAt("LNR-C", 3_000);
+    const token = await login("secret");
+    const res = await request("/api/log?since=2000&until=2000", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data.map((j: { issueId: string }) => j.issueId)).toEqual(["LNR-B"]);
+  });
+
+  it("GET /api/log ignores non-numeric since/until instead of erroring", async () => {
+    seedJobAt("LNR-A", 1_000);
+    seedJobAt("LNR-B", 3_000);
+    const token = await login("secret");
+    const res = await request("/api/log?since=banana&until=", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data).toHaveLength(2);
+  });
 });
 
 describe("classifyTemplate", () => {
