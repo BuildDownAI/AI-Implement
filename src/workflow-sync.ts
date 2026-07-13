@@ -314,9 +314,19 @@ async function ensureSyncBranch(params: {
   syncBranch: string;
 }): Promise<void> {
   const { gh, repo, baseBranch, syncBranch } = params;
-  const base = await gh.request<{ object: { sha: string } }>(
+  const base = await gh.maybeRequest<{ object: { sha: string } }>(
     `/repos/${repo}/git/ref/heads/${encodeRefPath(baseBranch)}`,
   );
+  if (!base) {
+    // Deliberately a plain Error, not a GitHubApiError: classifySyncError passes an
+    // unknown error's raw message through verbatim, so this descriptive text is exactly
+    // what the admin UI shows instead of an opaque "GitHub 404 /repos/.../git/ref/..." dump.
+    throw new Error(
+      `Base branch "${baseBranch}" does not exist in ${repo}. ` +
+        `The repository may be empty (no commits yet) or the configured branch name is wrong. ` +
+        `Push an initial commit or correct the branch name in the project settings.`,
+    );
+  }
   const syncRef = await gh.maybeRequest<{ object: { sha: string } }>(
     `/repos/${repo}/git/ref/heads/${encodeRefPath(syncBranch)}`,
   );

@@ -397,6 +397,47 @@ describe("syncWorkflowTemplates", () => {
     })).rejects.toThrow("Missing workflow template: workflows/claude-plan.yml");
   });
 
+  it("throws a descriptive error when the base branch does not exist", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    // The fake repo only has "main"; a mapping pointing at "develop" hits a 404 on the ref lookup.
+    const fake = makeGithubFetch();
+
+    await expect(syncWorkflowTemplates({
+      mapping: { ...mapping, defaultBranch: "develop" },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    })).rejects.toThrow(
+      'Base branch "develop" does not exist in acme/app. ' +
+        "The repository may be empty (no commits yet) or the configured branch name is wrong. " +
+        "Push an initial commit or correct the branch name in the project settings.",
+    );
+  });
+
+  it("surfaces the missing-base-branch message verbatim through classifySyncError (the sync-status path)", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch();
+
+    // Mirrors runWorkflowSync in workflow-sync-queue.ts, which stores
+    // classifySyncError(err) on the failed job; the admin UI renders its .message.
+    const err = await syncWorkflowTemplates({
+      mapping: { ...mapping, defaultBranch: "develop" },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    }).then(() => null, (e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const classified = classifySyncError(err);
+    expect(classified.category).toBe("unknown");
+    expect(classified.message).toBe((err as Error).message);
+    expect(classified.message).toContain('Base branch "develop" does not exist in acme/app');
+  });
+
   it("prefixes the sync branch when the mapping sets a branchPrefix", async () => {
     const templatesRoot = makeTemplatesRoot();
     const fake = makeGithubFetch();
