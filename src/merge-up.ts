@@ -89,6 +89,14 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
     return;
   }
   if (pr?.state === "open") return; // awaiting human merge
+  // A human may have closed the PR without merging (a deliberate veto). Respect that
+  // decision — do not re-open on every poll cycle while the branch stays ahead.
+  if (pr && pr.state === "closed" && !pr.merged) {
+    console.log(
+      `[merge-up] Skipping feature→base PR for ${rollUp.identifier}: PR #${pr.number} was closed without merging`,
+    );
+    return;
+  }
 
   // No PR yet — open one if the branch has commits not yet in the base.
   const ahead = await compareBranches(ghToken, owner, repo, target, branch);
