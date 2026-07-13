@@ -13,3 +13,7 @@ clients/*.toml
 .conductor/
 .wrangler/
 .worktrees/
+
+/.idea/**
+
+/data/dedup.**
