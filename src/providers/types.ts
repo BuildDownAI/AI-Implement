@@ -72,7 +72,7 @@ export interface TicketingProvider {
   fetchAIImplementSnapshot(): Promise<AIImplementSnapshot>;
   fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>>;
   /** Recently-completed feature-node issues whose branch should roll up into its
-   *  parent (feature-branch grouping merge-up). Linear-only; others return []. */
+   *  parent (feature-branch grouping merge-up). */
   fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]>;
 
   // Lifecycle verbs.

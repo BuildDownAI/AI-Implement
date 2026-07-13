@@ -339,6 +339,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
         issue("10001", "P-1", "Ready", "acme/x"),
         issue("10002", "P-2", "Plan Approved", "acme/x", "desc"),
       ]))
+      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
       .mockResolvedValueOnce(searchOk([]));
 
     const p = new JiraProvider({
@@ -432,6 +433,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
         issue("30001", "P-20", "Ready", "acme/x"),
         issue("30002", "P-21", "Ready", "acme/wrong"),
       ]))
+      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
       .mockResolvedValueOnce(searchOk([]));
 
     const onRepoFieldMismatch = vi.fn();
@@ -462,6 +464,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
       .mockResolvedValueOnce(searchOk([textIssue("50001", "P-40", "Ready", "acme/x")]))
+      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
       .mockResolvedValueOnce(searchOk([]));
 
     const onRepoFieldMismatch = vi.fn();
@@ -543,6 +546,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
         withLinks(issue("50001", "P-40", "Ready", "acme/x"), [blockedByLink("indeterminate")]),
         issue("50002", "P-41", "Ready", "acme/x"),
       ]))
+      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
       .mockResolvedValueOnce(searchOk([]));
 
     const p = new JiraProvider({
@@ -561,6 +565,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
       .mockResolvedValueOnce(searchOk([
         withLinks(issue("50003", "P-42", "Ready", "acme/x"), [blockedByLink("done")]),
       ]))
+      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
       .mockResolvedValueOnce(searchOk([]));
 
     const p = new JiraProvider({
@@ -579,6 +584,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
       .mockResolvedValueOnce(searchOk([
         withLinks(issue("50004", "P-43", "Ready", "acme/x"), [blocksOtherLink()]),
       ]))
+      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
       .mockResolvedValueOnce(searchOk([]));
 
     const p = new JiraProvider({
@@ -595,6 +601,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
       .mockResolvedValueOnce(searchOk([issue("50005", "P-44", "Ready", "acme/x")]))
+      .mockResolvedValueOnce(searchOk([])) // parent in (...) children query
       .mockResolvedValueOnce(searchOk([]));
 
     const p = new JiraProvider({
@@ -665,6 +672,373 @@ describe("JiraProvider.fetchLifecycleStates", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 });
+
+// --- Feature-branch grouping (mirrors linear.test.ts) ---
+import { JiraProvider as JiraProviderFB } from "../../providers/jira.js";
+
+describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
+  // Build a JiraIssue with the overridden status (10100) + repo (10101) custom fields.
+  const issue = (
+    key: string,
+    status: string,
+    repo: string,
+    extra: { parentKey?: string | null; statusCategory?: string } = {},
+  ) => ({
+    id: `id-${key}`,
+    key,
+    fields: {
+      summary: key,
+      description: null,
+      issuelinks: [],
+      parent: extra.parentKey ? { key: extra.parentKey } : null,
+      status: { statusCategory: { key: extra.statusCategory ?? "indeterminate" } },
+      customfield_10100: status ? { value: status } : null,
+      customfield_10101: { value: repo },
+    },
+  });
+
+  // Fake JiraClient: matches each searchJql call by a substring of its JQL.
+  const fakeClient = (routes: Array<{ when: RegExp; issues: unknown[] }>) =>
+    ({
+      async searchJql(jql: string, fields: string[]) {
+        const issues = (routes.find((x) => x.when.test(jql))?.issues ?? []) as Array<{
+          id: string;
+          key: string;
+          fields: Record<string, unknown>;
+        }>;
+        // Simulate Jira REST field projection: a query that does not request
+        // "parent" gets no parent in its results.
+        if (fields && !fields.includes("parent")) {
+          return issues.map((i) => ({ ...i, fields: { ...i.fields, parent: undefined } }));
+        }
+        return issues;
+      },
+    }) as unknown as import("../../providers/jira-client.js").JiraClient;
+
+  const makeProvider = (client: import("../../providers/jira-client.js").JiraClient) =>
+    new JiraProviderFB({
+      client,
+      cacheScope: "c",
+      siteUrl: "https://x",
+      getMappings: () => ({
+        m1: jiraMapping({
+          repoFieldValue: "acme/x",
+          statusFieldOverride: "customfield_10100",
+          repoFieldOverride: "customfield_10101",
+        }),
+      }),
+    });
+
+  it("a leaf under a designated parent targets the parent's feature-branch chain", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })] },
+      { when: /parent in/, issues: [] }, // OOL-96 has no children → leaf
+      { when: /key in/, issues: [issue("OOL-78", "Implementing", "acme/x", { parentKey: null })] }, // ancestor is designated
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-96")!;
+    expect(leaf.featureBranchChain).toEqual(["OOL-78"]);
+    expect(leaf.parentRef).toEqual({ identifier: "OOL-78" });
+  });
+
+  it("a leaf under an UNdesignated parent gets no chain (PRs to base)", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-50", "Ready", "acme/x", { parentKey: "OOL-40" })] },
+      { when: /parent in/, issues: [] },
+      { when: /key in/, issues: [issue("OOL-40", "", "acme/x")] }, // status unset → not designated
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const leaf = snap.needsPlanning.find((i) => i.identifier === "OOL-50")!;
+    expect(leaf.featureBranchChain).toBeUndefined();
+  });
+
+  it("cascades the chain through designated grandparents (base-most first)", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-99", "Ready", "acme/x", { parentKey: "OOL-96" })] },
+      { when: /parent in/, issues: [] },
+      // ancestor walk: level 1 returns OOL-96 (parent OOL-78); level 2 returns OOL-78 (no parent)
+      { when: /key in \("OOL-96"\)/, issues: [issue("OOL-96", "Ready", "acme/x", { parentKey: "OOL-78" })] },
+      { when: /key in \("OOL-78"\)/, issues: [issue("OOL-78", "Ready", "acme/x", { parentKey: null })] },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const leaf = snap.needsPlanning.find((i) => i.identifier === "OOL-99")!;
+    expect(leaf.featureBranchChain).toEqual(["OOL-78", "OOL-96"]);
+  });
+
+  it("skips a feature-node parent while any designated child is in flight", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      {
+        when: /parent in/,
+        issues: [
+          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
+          issue("OOL-78-c1", "Implementing", "acme/x", { parentKey: "OOL-78", statusCategory: "indeterminate" }),
+        ],
+      },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    expect(snap.needsPlanning).toEqual([]);
+    expect(snap.readyForImplementation).toEqual([]);
+  });
+
+  it("dispatches a feature-node parent once all designated children are terminal, onto its own branch", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      {
+        when: /parent in/,
+        issues: [
+          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
+          issue("OOL-78-c1", "", "acme/x", { parentKey: "OOL-78", statusCategory: "indeterminate" }), // undesignated → no gate
+        ],
+      },
+      { when: /key in/, issues: [] }, // OOL-78 has no parent
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
+    expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+  });
+
+  it("skips a parent whose children are not yet designated (race guard)", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      { when: /parent in/, issues: [issue("OOL-78-c0", "", "acme/x", { parentKey: "OOL-78" })] },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    expect(snap.needsPlanning).toEqual([]);
+    expect(snap.readyForImplementation).toEqual([]);
+  });
+
+  it("fails closed when the children (gating) query errors: candidates are deferred, not dispatched", async () => {
+    const client = {
+      async searchJql(jql: string) {
+        if (/parent in/.test(jql)) throw new Error("Jira unavailable");
+        if (/in \(Ready/.test(jql)) return [issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })];
+        return [];
+      },
+    } as unknown as import("../../providers/jira-client.js").JiraClient;
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    // Can't tell a leaf from a feature-node parent once gating failed → defer everything.
+    expect(snap.needsPlanning).toEqual([]);
+    expect(snap.readyForImplementation).toEqual([]);
+  });
+
+  it("fails open when only the ancestor walk errors: candidate dispatches as a leaf targeting base", async () => {
+    const client = {
+      async searchJql(jql: string) {
+        if (/key in/.test(jql)) throw new Error("Jira unavailable");
+        if (/parent in/.test(jql)) return []; // OOL-96 has no children → leaf
+        if (/in \(Ready/.test(jql)) return [issue("OOL-96", "Plan Approved", "acme/x", { parentKey: "OOL-78" })];
+        return [];
+      },
+    } as unknown as import("../../providers/jira-client.js").JiraClient;
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-96")!;
+    expect(leaf).toBeDefined();
+    expect(leaf.featureBranchChain).toBeUndefined();
+  });
+});
+
+describe("JiraProvider.fetchAIImplementSnapshot — Epic Link hierarchy (classic projects)", () => {
+  beforeEach(() => { clearFieldCache(); });
+  afterEach(() => { clearFieldCache(); });
+
+  const FIELDS = [
+    { id: "customfield_10100", name: "AI-Implement Status", custom: true },
+    { id: "customfield_10101", name: "AI-Implement Repo", custom: true },
+    { id: "customfield_10014", name: "Epic Link", custom: true },
+  ];
+
+  // Issue with an optional native `parent` and an optional classic Epic Link (cf 10014).
+  const issue = (
+    key: string,
+    status: string,
+    repo: string,
+    extra: { parentKey?: string | null; epicLink?: string | null; statusCategory?: string } = {},
+  ) => ({
+    id: `id-${key}`,
+    key,
+    fields: {
+      summary: key,
+      description: null,
+      issuelinks: [],
+      parent: extra.parentKey ? { key: extra.parentKey } : null,
+      status: { statusCategory: { key: extra.statusCategory ?? "indeterminate" } },
+      customfield_10100: status ? { value: status } : null,
+      customfield_10101: { value: repo },
+      customfield_10014: extra.epicLink ?? null,
+    },
+  });
+
+  const client = (routes: Array<{ when: RegExp; issues: unknown[] }>) =>
+    ({
+      async listFields() { return FIELDS; },
+      async searchJql(jql: string, fields: string[]) {
+        const issues = (routes.find((x) => x.when.test(jql))?.issues ?? []) as Array<{
+          id: string;
+          key: string;
+          fields: Record<string, unknown>;
+        }>;
+        if (fields && !fields.includes("parent")) {
+          return issues.map((i) => ({ ...i, fields: { ...i.fields, parent: undefined } }));
+        }
+        return issues;
+      },
+    }) as unknown as import("../../providers/jira-client.js").JiraClient;
+
+  // No status/repo overrides → fields() calls listFields and resolves the Epic Link field id.
+  const provider = (c: import("../../providers/jira-client.js").JiraClient) =>
+    new JiraProviderFB({
+      client: c,
+      cacheScope: "epic-scope",
+      siteUrl: "https://x",
+      getMappings: () => ({ m1: jiraMapping({ repoFieldValue: "acme/x" }) }),
+    });
+
+  it("attributes an Epic-Link child to its epic and blocks the epic while that child is in flight", async () => {
+    const c = client([
+      { when: /in \(Ready/, issues: [issue("OOL-EP", "Ready", "acme/x")] }, // epic, no native parent
+      {
+        when: /parent in/, // childrenJql ORs the Epic Link clause; the in-flight child is linked via Epic Link only
+        issues: [issue("OOL-S", "Implementing", "acme/x", { epicLink: "OOL-EP", statusCategory: "indeterminate" })],
+      },
+    ]);
+    const snap = await provider(c).fetchAIImplementSnapshot();
+    // Pre-fix this epic looked like a leaf (epic-link child dropped) and dispatched prematurely.
+    expect(snap.needsPlanning).toEqual([]);
+    expect(snap.readyForImplementation).toEqual([]);
+  });
+
+  it("an Epic-Link leaf targets its epic's feature branch", async () => {
+    const c = client([
+      { when: /in \(Ready/, issues: [issue("OOL-S", "Plan Approved", "acme/x", { epicLink: "OOL-EP" })] },
+      { when: /parent in/, issues: [] }, // story has no children → leaf
+      { when: /key in/, issues: [issue("OOL-EP", "Implementing", "acme/x")] }, // epic is designated
+    ]);
+    const snap = await provider(c).fetchAIImplementSnapshot();
+    const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-S")!;
+    expect(leaf.featureBranchChain).toEqual(["OOL-EP"]);
+    expect(leaf.parentRef).toEqual({ identifier: "OOL-EP" });
+  });
+
+  it("rolls up an Epic-Link feature node (child attributed via Epic Link)", async () => {
+    const c = client([
+      { when: /statusCategory = Done/, issues: [issue("OOL-EP", "PR Ready", "acme/x", { statusCategory: "done" })] },
+      { when: /parent in/, issues: [issue("OOL-S", "PR Ready", "acme/x", { epicLink: "OOL-EP", statusCategory: "done" })] },
+    ]);
+    const rollUps = await provider(c).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([{ issueId: "id-OOL-EP", identifier: "OOL-EP", scopeKey: "m1", parentIdentifier: null }]);
+  });
+});
+
+describe("JiraProvider.fetchFeatureNodeRollUps", () => {
+  const issue = (key: string, status: string, repo: string, parentKey: string | null = null) => ({
+    id: `id-${key}`, key,
+    fields: {
+      parent: parentKey ? { key: parentKey } : null,
+      customfield_10100: status ? { value: status } : null,
+      customfield_10101: { value: repo },
+    },
+  });
+  const fakeClient = (routes: Array<{ when: RegExp; issues: unknown[] }>) =>
+    ({
+      async searchJql(jql: string, fields: string[]) {
+        const issues = (routes.find((x) => x.when.test(jql))?.issues ?? []) as Array<{
+          id: string;
+          key: string;
+          fields: Record<string, unknown>;
+        }>;
+        // Simulate Jira REST field projection: a query that does not request
+        // "parent" gets no parent in its results.
+        if (fields && !fields.includes("parent")) {
+          return issues.map((i) => ({ ...i, fields: { ...i.fields, parent: undefined } }));
+        }
+        return issues;
+      },
+    }) as unknown as import("../../providers/jira-client.js").JiraClient;
+  const makeProvider = (client: import("../../providers/jira-client.js").JiraClient) =>
+    new JiraProvider({
+      client, cacheScope: "c", siteUrl: "https://x",
+      getMappings: () => ({
+        m1: jiraMapping({ repoFieldValue: "acme/x", statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101" }),
+      }),
+    });
+
+  it("rolls a completed feature node into its designated parent (auto-merge → parentIdentifier set)", async () => {
+    const client = fakeClient([
+      { when: /statusCategory = Done/, issues: [issue("OOL-90", "PR Ready", "acme/x", "OOL-78")] }, // completed node w/ parent
+      { when: /parent in/, issues: [issue("OOL-90-c", "PR Ready", "acme/x", "OOL-90")] },           // it has a designated child → feature node
+      { when: /key in/, issues: [issue("OOL-78", "Ready", "acme/x", null)] },                       // parent is designated
+    ]);
+    const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", parentIdentifier: "OOL-78" }]);
+  });
+
+  it("top-of-tree feature node → parentIdentifier null (human feature→base PR)", async () => {
+    const client = fakeClient([
+      { when: /statusCategory = Done/, issues: [issue("OOL-78", "PR Ready", "acme/x", null)] },
+      { when: /parent in/, issues: [issue("OOL-78-c", "PR Ready", "acme/x", "OOL-78")] },
+    ]);
+    const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([{ issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1", parentIdentifier: null }]);
+  });
+
+  it("excludes completed issues that are not feature nodes (no designated children)", async () => {
+    const client = fakeClient([
+      { when: /statusCategory = Done/, issues: [issue("OOL-1", "PR Ready", "acme/x", null)] },
+      { when: /parent in/, issues: [] }, // no children → not a feature node
+    ]);
+    expect(await makeProvider(client).fetchFeatureNodeRollUps()).toEqual([]);
+  });
+
+  it("excludes a completed issue whose own AI-Implement Status is unset (not a designated node)", async () => {
+    const client = fakeClient([
+      { when: /statusCategory = Done/, issues: [issue("OOL-5", "", "acme/x", null)] },
+      { when: /parent in/, issues: [issue("OOL-5-c", "PR Ready", "acme/x", "OOL-5")] },
+    ]);
+    expect(await makeProvider(client).fetchFeatureNodeRollUps()).toEqual([]);
+  });
+
+  it("sets parentIdentifier null when the parent exists but is not itself designated", async () => {
+    const client = fakeClient([
+      { when: /statusCategory = Done/, issues: [issue("OOL-90", "PR Ready", "acme/x", "OOL-70")] },
+      { when: /parent in/, issues: [issue("OOL-90-c", "PR Ready", "acme/x", "OOL-90")] },
+      { when: /key in/, issues: [issue("OOL-70", "", "acme/x", null)] },
+    ]);
+    const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", parentIdentifier: null }]);
+  });
+});
+
+describe("JiraProvider.childrenJql (Epic Link fallback)", () => {
+  const provider = () =>
+    new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c" }),
+      cacheScope: "c",
+      siteUrl: "https://x",
+      getMappings: () => ({}),
+    }) as unknown as { childrenJql(keys: string[], ids: Record<string, string | undefined>): string };
+
+  it("returns a plain parent-in query when no Epic Link field is resolved", () => {
+    const jql = provider().childrenJql(["A-1", "A-2"], {
+      statusFieldId: "customfield_10100",
+      repoFieldId: "customfield_10101",
+    });
+    expect(jql).toBe('parent in ("A-1","A-2")');
+  });
+
+  it("ORs the Epic Link clause (cf[N]) when epicLinkFieldId is resolved", () => {
+    const jql = provider().childrenJql(["A-1", "A-2"], {
+      statusFieldId: "customfield_10100",
+      repoFieldId: "customfield_10101",
+      epicLinkFieldId: "customfield_10014",
+    });
+    expect(jql).toContain('parent in ("A-1","A-2")');
+    expect(jql).toContain('cf[10014] in ("A-1","A-2")');
+    expect(jql.startsWith("(")).toBe(true);
+    expect(jql.endsWith(")")).toBe(true);
+  });
+});
+
 
 describe("JiraProvider.findByKey", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
