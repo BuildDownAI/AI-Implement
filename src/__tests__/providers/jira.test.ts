@@ -189,7 +189,7 @@ describe("JiraProvider lifecycle status setters", () => {
       .mockResolvedValueOnce(FIELDS_RESPONSE)
       .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({ cacheScope: "c2", mappings: { "acme/x": jiraMapping() } });
-    await p.markPlanComplete("10001");
+    await p.markPlanComplete("10001", "acme/x");
     expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Plan Approved");
   });
 
@@ -199,7 +199,7 @@ describe("JiraProvider lifecycle status setters", () => {
       .mockResolvedValueOnce(okEmpty()) // setField PUT
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response); // comment POST
     const p = makeProvider({ cacheScope: "c3", mappings: { "acme/x": jiraMapping() } });
-    await p.markPlanningFailed("10001", "boom");
+    await p.markPlanningFailed("10001", "acme/x", "boom");
 
     const calls = vi.mocked(fetch).mock.calls;
     expectStatusBody(calls[1], "Planning Failed");
@@ -224,7 +224,7 @@ describe("JiraProvider lifecycle status setters", () => {
       .mockResolvedValueOnce(okEmpty())
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response);
     const p = makeProvider({ cacheScope: "c5", mappings: { "acme/x": jiraMapping() } });
-    await p.markPrReady("10001", "https://github.com/acme/x/pull/42");
+    await p.markPrReady("10001", "acme/x", "https://github.com/acme/x/pull/42");
 
     const calls = vi.mocked(fetch).mock.calls;
     expectStatusBody(calls[1], "PR Ready");
@@ -240,7 +240,7 @@ describe("JiraProvider lifecycle status setters", () => {
       .mockResolvedValueOnce(okEmpty())
       .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "c1" }) } as Response);
     const p = makeProvider({ cacheScope: "c6", mappings: { "acme/x": jiraMapping() } });
-    await p.markImplementationFailed("10001", "kaboom");
+    await p.markImplementationFailed("10001", "acme/x", "kaboom");
 
     const calls = vi.mocked(fetch).mock.calls;
     expectStatusBody(calls[1], "Implementation Failed");
@@ -253,31 +253,26 @@ describe("JiraProvider lifecycle status setters", () => {
       .mockResolvedValueOnce(FIELDS_RESPONSE)
       .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({ cacheScope: "c7", mappings: { "acme/x": jiraMapping() } });
-    await p.clearWorkingState("10001");
+    await p.clearWorkingState("10001", "acme/x");
     expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Plan Approved");
   });
 
-  it("markMerged sets status to Merged (single-mapping shortcut)", async () => {
+  it("markMerged sets status to Merged using the supplied scopeKey", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(FIELDS_RESPONSE)
       .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({ cacheScope: "c-merged", mappings: { "acme/x": jiraMapping() } });
-    await p.markMerged("10001");
+    await p.markMerged("10001", "acme/x");
     // The last fetch must be a PUT to the issue's field with value "Merged"
     expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Merged");
   });
 
-  it("multi-mapping markPlanComplete looks up scopeKey from the issue's repo field", async () => {
+  it("multi-mapping markPlanComplete uses the supplied scopeKey directly (no repo-field read-back)", async () => {
+    // Only the field-resolution fetch and the setField PUT should happen — the
+    // provider must NOT fetch the issue to re-derive its scope. Supplying a
+    // getIssue mock would go unused; omitting it proves no read-back occurs.
     vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields (first .fields() call)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          id: "10001",
-          key: "PROJ-1",
-          fields: { customfield_10101: { value: "acme/y" } },
-        }),
-      } as Response) // getIssue
+      .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields (resolve field ids for "acme/y")
       .mockResolvedValueOnce(okEmpty()); // setField
     const p = makeProvider({
       cacheScope: "c8",
@@ -286,59 +281,32 @@ describe("JiraProvider lifecycle status setters", () => {
         "acme/y": jiraMapping({ repoFieldValue: "acme/y" }),
       },
     });
-    await p.markPlanComplete("10001");
-    const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
-    // The PUT URL should include /issue/10001
+    await p.markPlanComplete("10001", "acme/y");
+    const calls = vi.mocked(fetch).mock.calls;
+    // Exactly two fetches: field resolution + setField. No getIssue read-back.
+    expect(calls.length).toBe(2);
+    const lastCall = calls.at(-1)!;
     expect(String(lastCall[0])).toMatch(/\/issue\/10001/);
     expectStatusBody(lastCall, "Plan Approved");
   });
 
-  it("multi-mapping scopeKey lookup handles a plain-text (bare-string) repo field", async () => {
+  it("multi-mapping markPlanComplete succeeds even when the issue's repo field would read back empty", async () => {
+    // Regression: previously the provider re-derived scope by reading the
+    // issue's repo field back from Jira; an empty/unreadable field threw
+    // "No Jira mapping matched repoFieldValue=". With the scopeKey carried
+    // through end-to-end, the read-back is gone and the call just succeeds.
     vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          id: "10001",
-          key: "PROJ-1",
-          fields: { customfield_10101: "acme/y" }, // text field: bare string
-        }),
-      } as Response) // getIssue
-      .mockResolvedValueOnce(okEmpty()); // setField
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(okEmpty());
     const p = makeProvider({
-      cacheScope: "c8-text",
+      cacheScope: "c-empty-field",
       mappings: {
         "acme/x": jiraMapping({ repoFieldValue: "acme/x" }),
         "acme/y": jiraMapping({ repoFieldValue: "acme/y" }),
       },
     });
-    await p.markPlanComplete("10001");
-    const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
-    expect(String(lastCall[0])).toMatch(/\/issue\/10001/);
-    expectStatusBody(lastCall, "Plan Approved");
-  });
-
-  it("scopeKeyForIssue throws when no mapping matches the issue's repo field", async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(FIELDS_RESPONSE) // listFields
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          id: "10001",
-          key: "PROJ-1",
-          fields: { customfield_10101: { value: "acme/unknown" } },
-        }),
-      } as Response); // getIssue
-    const p = makeProvider({
-      cacheScope: "c-no-match",
-      mappings: {
-        "acme/x": jiraMapping({ repoFieldValue: "acme/x" }),
-        "acme/y": jiraMapping({ repoFieldValue: "acme/y" }),
-      },
-    });
-    await expect(p.markPlanComplete("10001")).rejects.toThrow(
-      /No Jira mapping matched/,
-    );
+    await p.markPlanComplete("10001", "acme/x");
+    expectStatusBody(vi.mocked(fetch).mock.calls.at(-1)!, "Plan Approved");
   });
 });
 

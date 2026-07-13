@@ -215,6 +215,7 @@ describe("handleRunnerResult — planning", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPlanningFailed")?.args).toEqual([
       "i",
+      "ENG",
       "boom",
     ]);
   });
@@ -246,6 +247,7 @@ describe("handleRunnerResult — implementation", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPrReady")?.args).toEqual([
       "i",
+      "ENG",
       "https://github.com/o/r/pull/1",
     ]);
   });
@@ -308,7 +310,7 @@ describe("handleRunnerResult — implementation", () => {
     const calls = fake.recordedCalls();
     expect(
       calls.find((c) => c.method === "markImplementationFailed")?.args,
-    ).toEqual(["i", "tests fail"]);
+    ).toEqual(["i", "ENG", "tests fail"]);
   });
 });
 
@@ -766,8 +768,9 @@ describe("handleRunnerResult — SENSITIVE_FILES_BLOCKED failure code", () => {
     expect(res.status).toBe(200);
     const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
     expect(call).toBeDefined();
-    const [issueId, comment] = call!.args as [string, string];
+    const [issueId, scopeKey, comment] = call!.args as [string, string, string];
     expect(issueId).toBe("i");
+    expect(scopeKey).toBe("ENG");
     expect(comment).toContain("🔒");
     expect(comment).toContain("Blocked by security guardrail");
     expect(comment).toContain(".env");
@@ -794,7 +797,7 @@ describe("handleRunnerResult — SENSITIVE_FILES_BLOCKED failure code", () => {
       resolveProvider: makeResolve(fake),
     });
     const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
-    const [, comment] = call!.args as [string, string];
+    const [, , comment] = call!.args as [string, string, string];
     expect(comment).toBe("compilation error");
     expect(comment).not.toContain("🔒");
   });

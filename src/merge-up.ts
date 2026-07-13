@@ -28,8 +28,10 @@ export interface MergeUpDeps {
   githubAppPrivateKey: string;
   /** Resolve the repo mapping for a scope/team key, or null when unmapped/paused. */
   resolveMapping: (scopeKey: string) => RepoMapping | null;
-  /** Move the provider issue to a completed state after its top-of-tree PR merges. Idempotent. */
-  finalizeMerged: (issueId: string) => Promise<void>;
+  /** Move the provider issue to a completed state after its top-of-tree PR merges. Idempotent.
+   *  scopeKey is the roll-up's authoritative capacity-bucket key (Jira needs it to pick the
+   *  right mapping; Linear ignores it). */
+  finalizeMerged: (issueId: string, scopeKey: string) => Promise<void>;
 }
 
 export async function runMergeUps(rollUps: FeatureNodeRollUp[], deps: MergeUpDeps): Promise<void> {
@@ -82,7 +84,7 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
   const pr = await findPullRequestByBranches(ghToken, owner, repo, branch, target);
   if (pr?.merged) {
     await deleteBranch(ghToken, owner, repo, branch);
-    await deps.finalizeMerged(rollUp.issueId);
+    await deps.finalizeMerged(rollUp.issueId, rollUp.scopeKey);
     console.log(`[merge-up] ${branch} merged; deleted branch + finalized ${rollUp.identifier}`);
     return;
   }

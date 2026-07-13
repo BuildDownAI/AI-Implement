@@ -29,7 +29,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         const a = sampleIssue({ id: "a", identifier: "TEST-A" });
         const b = sampleIssue({ id: "b", identifier: "TEST-B" });
         const provider = await factory({ initialIssues: [a, b] });
-        await provider.markPlanComplete("b");
+        await provider.markPlanComplete("b", "TEAM");
         const snap = await provider.fetchAIImplementSnapshot();
         expect(snap.needsPlanning.map((i) => i.id)).toEqual(["a"]);
         expect(snap.readyForImplementation.map((i) => i.id)).toEqual(["b"]);
@@ -93,7 +93,7 @@ export function runProviderContract(label: string, factory: ContractProviderFact
         const a = sampleIssue({ id: "a" });
         const provider = await factory({ initialIssues: [a] });
         await provider.markImplementing("a", "TEAM");
-        await provider.clearWorkingState("a");
+        await provider.clearWorkingState("a", "TEAM");
         const snap = await provider.fetchAIImplementSnapshot();
         expect(snap.inProgressCountsByScope.TEAM ?? 0).toBe(0);
       });

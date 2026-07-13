@@ -130,46 +130,6 @@ export class JiraProvider implements TicketingProvider {
     await this.client.setField(issueId, ids.statusFieldId, { value });
   }
 
-  /**
-   * For verbs that don't carry scopeKey explicitly (markPlanComplete,
-   * markPlanningFailed, markPrReady, markImplementationFailed,
-   * clearWorkingState), look up the right scopeKey from the issue's
-   * repo field. Single-Jira-mapping deployments short-circuit; multi-mapping
-   * matches against the issue's repo field value.
-   *
-   * Note: When multiple Jira mappings exist, this uses the FIRST mapping's
-   * field overrides (statusFieldOverride/repoFieldOverride) to resolve the
-   * repo field ID for ALL mappings. This works because the field cache is
-   * keyed on (cacheScope, statusOverride, repoOverride) and two mappings on
-   * the same Jira cloud almost always share overrides. If two Jira mappings
-   * deliberately set different repoFieldOverride values, the lookup will use
-   * the first mapping's resolved field ID and could misidentify the scope.
-   *
-   * This is acceptable for Phase 2 (single Jira instance, single repo-field
-   * setup); revisit if/when we support divergent field-override setups across
-   * mappings on the same Jira instance.
-   */
-  private async scopeKeyForIssue(issueId: string): Promise<string> {
-    const mappings = this.getMappings();
-    const jiraEntries = Object.entries(mappings).filter(
-      ([, m]) => m.ticketingConfig.kind === "jira",
-    );
-    if (jiraEntries.length === 0) {
-      throw new Error("No Jira mapping configured");
-    }
-    if (jiraEntries.length === 1) return jiraEntries[0][0];
-    const repoFieldId = (await this.fields(jiraEntries[0][0])).repoFieldId;
-    const issue = await this.client.getIssue(issueId, [repoFieldId]);
-    const repoValue = readRepoFieldValue(issue.fields[repoFieldId]);
-    const match = jiraEntries.find(
-      ([, m]) => m.ticketingConfig.kind === "jira" && m.ticketingConfig.repoFieldValue === repoValue,
-    );
-    if (!match) {
-      throw new Error(`No Jira mapping matched repoFieldValue=${repoValue} for issue ${issueId}`);
-    }
-    return match[0];
-  }
-
   async fetchAIImplementSnapshot(): Promise<AIImplementSnapshot> {
     const mappings = this.getMappings();
     const jiraEntries = Object.entries(mappings).filter(
@@ -287,34 +247,28 @@ export class JiraProvider implements TicketingProvider {
   async markPlanningStarted(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.PLANNING);
   }
-  async markPlanComplete(issueId: string): Promise<void> {
-    const scopeKey = await this.scopeKeyForIssue(issueId);
+  async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
   }
-  async markPlanningFailed(issueId: string, reason: string): Promise<void> {
-    const scopeKey = await this.scopeKeyForIssue(issueId);
+  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.PLANNING_FAILED);
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
   }
   async markImplementing(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTING);
   }
-  async markPrReady(issueId: string, prUrl: string): Promise<void> {
-    const scopeKey = await this.scopeKeyForIssue(issueId);
+  async markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.PR_READY);
     await this.postComment(issueId, `🚀 PR ready for review: ${prUrl}`);
   }
-  async markImplementationFailed(issueId: string, reason: string): Promise<void> {
-    const scopeKey = await this.scopeKeyForIssue(issueId);
+  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.IMPLEMENTATION_FAILED);
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
   }
-  async clearWorkingState(issueId: string): Promise<void> {
-    const scopeKey = await this.scopeKeyForIssue(issueId);
+  async clearWorkingState(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.APPROVED);
   }
-  async markMerged(issueId: string): Promise<void> {
-    const scopeKey = await this.scopeKeyForIssue(issueId);
+  async markMerged(issueId: string, scopeKey: string): Promise<void> {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.MERGED);
   }
   async postComment(issueId: string, body: string): Promise<void> {

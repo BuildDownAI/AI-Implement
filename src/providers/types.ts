@@ -75,17 +75,24 @@ export interface TicketingProvider {
    *  parent (feature-branch grouping merge-up). Linear-only; others return []. */
   fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]>;
 
-  // Lifecycle verbs
+  // Lifecycle verbs.
+  //
+  // scopeKey is the authoritative capacity-bucket key the orchestrator chose
+  // when it discovered the issue (Linear → team key, Jira → mapping ID). It is
+  // carried end-to-end — minted into the run token at dispatch and read back at
+  // the callback — so every verb receives it rather than re-deriving it. Linear
+  // ignores it (it resolves the team from the issue itself); Jira needs it to
+  // pick the right mapping without a fragile repo-field read-back.
   markPlanningStarted(issueId: string, scopeKey: string): Promise<void>;
-  markPlanComplete(issueId: string): Promise<void>;
-  markPlanningFailed(issueId: string, reason: string): Promise<void>;
+  markPlanComplete(issueId: string, scopeKey: string): Promise<void>;
+  markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<void>;
   markImplementing(issueId: string, scopeKey: string): Promise<void>;
-  markPrReady(issueId: string, prUrl: string): Promise<void>;
-  markImplementationFailed(issueId: string, reason: string): Promise<void>;
-  clearWorkingState(issueId: string): Promise<void>;
+  markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<void>;
+  markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<void>;
+  clearWorkingState(issueId: string, scopeKey: string): Promise<void>;
   /** Move the issue to a completed state after its PR merged. Idempotent:
    *  no-op when the issue is already completed/cancelled. */
-  markMerged(issueId: string): Promise<void>;
+  markMerged(issueId: string, scopeKey: string): Promise<void>;
 
   // Communication
   postComment(issueId: string, body: string): Promise<void>;

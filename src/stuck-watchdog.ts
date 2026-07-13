@@ -71,7 +71,7 @@ export async function remediateStuckJob(
 
     if (provider) {
       try {
-        await provider.clearWorkingState(job.issueId);
+        await provider.clearWorkingState(job.issueId, job.teamKey ?? "");
         deleteDispatched(job.issueId);
         console.log(`[monitor] Reset ticket ${job.issueIdentifier} for requeue`);
       } catch (err) {
@@ -87,7 +87,7 @@ export async function remediateStuckJob(
 
     if (provider) {
       try {
-        await provider.clearWorkingState(job.issueId);
+        await provider.clearWorkingState(job.issueId, job.teamKey ?? "");
       } catch (err) {
         console.error(`[monitor] Failed to clear working state for ${job.issueIdentifier}:`, err);
       }
