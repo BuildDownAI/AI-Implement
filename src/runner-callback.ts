@@ -181,6 +181,7 @@ export async function handleRunnerResult(
       try {
         await provider.markPlanningFailed(
           claims.issueId,
+          mappingTeamKey,
           input.body.failureReason ?? "unspecified",
         );
       } catch (err) {
@@ -190,6 +191,7 @@ export async function handleRunnerResult(
       try {
         await provider.markImplementationFailed(
           claims.issueId,
+          mappingTeamKey,
           formatFailureComment(input.body.failureCode, input.body.failureReason),
         );
       } catch (err) {
@@ -199,13 +201,13 @@ export async function handleRunnerResult(
     // gap-analysis failure: no status transition (PR already terminal)
   } else if (input.body.phase === "planning") {
     try {
-      await provider.markPlanComplete(claims.issueId);
+      await provider.markPlanComplete(claims.issueId, mappingTeamKey);
     } catch (err) {
       warn("markPlanComplete", err);
     }
   } else if (input.body.phase === "implementation") {
     try {
-      await provider.markPrReady(claims.issueId, input.body.prUrl!);
+      await provider.markPrReady(claims.issueId, mappingTeamKey, input.body.prUrl!);
     } catch (err) {
       warn("markPrReady", err);
     }

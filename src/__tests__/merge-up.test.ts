@@ -115,7 +115,7 @@ describe("runMergeUps", () => {
     );
 
     expect(vi.mocked(deleteBranch)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
-    expect(finalizeMerged).toHaveBeenCalledWith("uuid-parent");
+    expect(finalizeMerged).toHaveBeenCalledWith("uuid-parent", "OOL");
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(compareBranches)).not.toHaveBeenCalled();
   });
@@ -141,7 +141,7 @@ describe("runMergeUps", () => {
       [rollUp({ issueId: "uuid-p", identifier: "OOL-106", parentIdentifier: null })],
       deps(() => mapping(), finalizeMerged),
     );
-    expect(finalizeMerged).toHaveBeenCalledWith("uuid-p");
+    expect(finalizeMerged).toHaveBeenCalledWith("uuid-p", "OOL");
   });
 
   it("warns (does not crash) when the internal merge conflicts", async () => {
