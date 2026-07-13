@@ -56,10 +56,17 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       "git config user.email",
     );
     runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
-    const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only"], {
+    // --diff-filter=d excludes staged deletions: removing an accidentally-committed
+    // secret (e.g. deleting a .env) is exactly what the guard wants to allow.
+    const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only", "--diff-filter=d"], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    if (stagedResult.status !== 0) {
+      // Fail closed: an empty list on git failure would silently skip the guard.
+      const stderr = (stagedResult.stderr?.toString() ?? "").replaceAll(githubToken, "***");
+      throw new Error(`git diff --cached failed (exit ${stagedResult.status ?? "null"}): ${stderr}`);
+    }
     const stagedFiles = stagedResult.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
     const sensitiveHits = findSensitiveFiles(stagedFiles);
     if (sensitiveHits.length > 0) {
