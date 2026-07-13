@@ -34,6 +34,11 @@ export interface CompletionNotification {
   prUrl: string | null;
   runUrl: string | null;
   durationMs?: number | null;
+  phase: NotificationPhase;
+  summary?: string;
+  detail?: string;
+  remediation?: string;
+  docsUrl?: string;
 }
 
 // Human label for a run phase, reused across notification kinds (dispatch, completion, …).
@@ -194,18 +199,19 @@ function completionEmoji(status: string): string {
   }
 }
 
-function completionLabel(status: string): string {
+function completionLabel(status: string, phase: NotificationPhase): string {
+  const phaseLabel = PHASE_LABELS[phase]; // "AI Planning" | "AI Implementation"
   switch (status) {
     case "completed":
-      return "AI Implementation Completed";
+      return `${phaseLabel} Completed`;
     case "review_failed":
-      return "AI Implementation Needs Review";
+      return `${phaseLabel} Needs Review`;
     case "failed":
-      return "AI Implementation Failed";
+      return `${phaseLabel} Failed`;
     case "timed_out":
-      return "AI Implementation Timed Out";
+      return `${phaseLabel} Timed Out`;
     default:
-      return "AI Implementation Finished";
+      return `${phaseLabel} Finished`;
   }
 }
 
@@ -229,7 +235,7 @@ async function notifyCompletionSlack(
   n: CompletionNotification,
 ): Promise<void> {
   const emoji = completionEmoji(n.status);
-  const label = completionLabel(n.status);
+  const label = completionLabel(n.status, n.phase);
 
   let text = `${emoji} *${label}*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\``;
   if (n.prUrl) {
@@ -241,6 +247,10 @@ async function notifyCompletionSlack(
   if (n.durationMs != null) {
     text += `\nDuration: ${formatDuration(n.durationMs)}`;
   }
+  if (n.summary) text += `\n\n${n.summary}`;
+  if (n.detail) text += `\n${n.detail}`;
+  if (n.remediation) text += `\n*Next step:* ${n.remediation}`;
+  if (n.docsUrl) text += `\n<${n.docsUrl}|Troubleshooting guide>`;
 
   const res = await fetch(webhookUrl, {
     method: "POST",
@@ -411,7 +421,7 @@ async function notifyCompletionTeams(
   n: CompletionNotification,
 ): Promise<void> {
   const icon = completionTeamsIcon(n.status);
-  const label = completionLabel(n.status);
+  const label = completionLabel(n.status, n.phase);
 
   const facts = [
     {
@@ -433,6 +443,12 @@ async function notifyCompletionTeams(
     facts.push({ title: "Duration", value: formatDuration(n.durationMs) });
   }
 
+  const classification: string[] = [];
+  if (n.summary) classification.push(n.summary);
+  if (n.detail) classification.push(n.detail);
+  if (n.remediation) classification.push(`**Next step:** ${n.remediation}`);
+  if (n.docsUrl) classification.push(`[Troubleshooting guide](${n.docsUrl})`);
+
   const card = {
     type: "message",
     attachments: [
@@ -453,6 +469,13 @@ async function notifyCompletionTeams(
               type: "FactSet",
               facts,
             },
+            ...(classification.length
+              ? [{
+                  type: "TextBlock",
+                  text: classification.join("\n\n"),
+                  wrap: true 
+                }]
+              : []),
           ],
         },
       },

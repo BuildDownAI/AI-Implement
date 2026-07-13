@@ -718,8 +718,8 @@ describe("formatFailureComment", () => {
     expect(formatFailureComment(undefined, "tests fail")).toBe("tests fail");
   });
 
-  it("returns 'unspecified' when both are undefined", () => {
-    expect(formatFailureComment(undefined, undefined)).toBe("unspecified");
+  it("returns a default summary when both are undefined", () => {
+    expect(formatFailureComment(undefined, undefined)).toBe("Unspecified failure.");
   });
 
   it("formats SENSITIVE_FILES_BLOCKED with a structured comment", () => {
@@ -728,6 +728,7 @@ describe("formatFailureComment", () => {
     expect(msg).toContain("Blocked by security guardrail");
     expect(msg).toContain(".env");
     expect(msg).toContain(".gitignore");
+    expect(msg).toContain("troubleshooting"); // remediation now links the docs
   });
 
   it("formats SENSITIVE_FILES_BLOCKED even when failureReason is undefined", () => {
