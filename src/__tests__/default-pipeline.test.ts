@@ -17,7 +17,7 @@ describe("createDefaultRunner", () => {
 
     const runner = await createDefaultRunner({
       customRoot: "/workspace",
-      existsSyncImpl: (p) => p.endsWith("/custom/steps/clone.ts"),
+      existsSyncImpl: (p) => p.replace(/\\/g, "/").endsWith("/custom/steps/clone.ts"),
       importFn: async () => ({ default: customClone }),
     });
 
@@ -41,7 +41,7 @@ describe("createDefaultRunner", () => {
     const runner = await createDefaultRunner({
       customRoot: "/workspace",
       bakedRoot: "/app",
-      existsSyncImpl: (p) => p === "/app/custom/steps/clone.ts",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/") === "/app/custom/steps/clone.ts",
       importFn: async () => ({ default: bakedClone }),
     });
 

@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+const isWindows = process.platform === "win32";
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -61,11 +63,15 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(homeDir, { recursive: true, force: true });
-  if (repoDir) {
-    rmSync(repoDir, { recursive: true, force: true });
-    repoDir = undefined;
+  try {
+    rmSync(homeDir, { recursive: true, force: true });
+    if (repoDir) {
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+  } catch {
+    // On Windows, git marks object files read-only; ignore cleanup failures
   }
+  repoDir = undefined;
 });
 
 describe("installSkillsStep", () => {
@@ -174,7 +180,9 @@ describe("installSkillsStep", () => {
     expect(warnings.some((w) => w.includes("clone failed") || w.includes("install failed"))).toBe(true);
   });
 
-  it("embeds the token only for github.com clones; cross-host https URLs get no credentials", async () => {
+  // Skipped on Windows: the git shim is a #!/bin/sh script found via a
+  // colon-separated PATH — both POSIX-only mechanisms.
+  it.skipIf(isWindows)("embeds the token only for github.com clones; cross-host https URLs get no credentials", async () => {
     // Shim `git` with a script that records its argv, so we can assert exactly what
     // remote URL the step hands to `git clone` for each host.
     const shimDir = mkdtempSync(join(tmpdir(), "git-shim-"));

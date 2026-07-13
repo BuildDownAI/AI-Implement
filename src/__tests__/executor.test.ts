@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+const isWindows = process.platform === "win32";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -90,7 +92,7 @@ exit ${code}
   chmodSync(path, 0o755);
 }
 
-describe("ClaudeCliExecutor", () => {
+describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   it("returns the result event's text as stdout (compat) plus telemetry", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     installFakeClaude(SUCCESS_LINES, 0);
