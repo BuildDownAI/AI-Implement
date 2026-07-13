@@ -97,8 +97,8 @@ describe("runMergeUps — multi-level feature trees", () => {
     );
 
     expect(finalizeMerged).toHaveBeenCalledTimes(1);
-    expect(finalizeMerged).toHaveBeenCalledWith("uuid-102");
-    expect(finalizeMerged).not.toHaveBeenCalledWith("uuid-101");
+    expect(finalizeMerged).toHaveBeenCalledWith("uuid-102", "AII");
+    expect(finalizeMerged).not.toHaveBeenCalledWith("uuid-101", "AII");
   });
 
   it("two-level tree in one pass: exactly one internal mergeBranch and one top-of-tree createPullRequest", async () => {

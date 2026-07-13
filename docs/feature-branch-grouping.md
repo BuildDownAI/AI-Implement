@@ -161,7 +161,8 @@ Idempotency is handled differently per path:
 
 | Concern | File |
 |---------|------|
-| Label query, classification, roll-up discovery | `src/providers/linear.ts` (`fetchAIImplementSnapshot`, `fetchFeatureNodeRollUps`) |
+| Label query, classification, roll-up discovery (Linear) | `src/providers/linear.ts` (`fetchAIImplementSnapshot`, `fetchFeatureNodeRollUps`) |
+| Jira classification, chain enrichment, roll-up discovery | `src/providers/jira.ts` (`enrichFeatureBranches`, `fetchFeatureNodeRollUps`), pure helpers in `src/providers/jira-hierarchy.ts`, Epic Link field discovery in `src/providers/jira-fields.ts` |
 | Shared types (`featureBranchChain`, `FeatureNodeRollUp`) | `src/providers/types.ts` |
 | Branch names | `src/pipeline/branch-name.ts` (`buildFeatureBranchName`) |
 | Cascade branch creation + PR-base resolution | `src/feature-branch.ts` (`resolveBaseBranch`) |
@@ -170,8 +171,20 @@ Idempotency is handled differently per path:
 | Plan-Complete transition | `src/runner-callback.ts` → `markPlanComplete` |
 | Poll-loop wiring (roll-up before dispatch; base resolved per issue) | `src/index.ts` |
 
-Feature-branch grouping is **Linear-only**. The Jira provider returns an empty roll-up list
-and no `featureBranchChain`, so its issues always PR to the base branch.
+Feature-branch grouping is supported on **both providers**:
+
+- **Linear**: a parent issue is a feature node when it carries the `AI-Implement` label and
+  has labelled children; completion is the issue reaching a completed workflow state.
+- **Jira**: hierarchy comes from the native `parent` field, falling back to the classic
+  **Epic Link** custom field when the instance has one (so Epic → Story trees group too).
+  An issue is "designated" when its AI-Implement Status field is set and its AI-Implement
+  Repo field matches the mapping. Roll-up discovery treats a node as completed when its
+  native status category is Done **or** its AI-Implement Status field is `Merged` — the
+  orchestrator's done-on-merge path only sets the custom field, never the native status,
+  so without the OR the cascade would stall waiting for a manual status move. The gating
+  children query fails **closed** (candidates are deferred for the poll rather than
+  dispatched prematurely); the branch-targeting ancestor walk fails **open** (chains
+  default to the base branch).
 
 ---
 

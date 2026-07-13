@@ -570,7 +570,7 @@ describe("LinearProvider.markPlanComplete", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.markPlanComplete("issue-1");
+    await p.markPlanComplete("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(7);
     const removeBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
@@ -673,7 +673,7 @@ describe("LinearProvider.markPrReady", () => {
     mockJsonOnce({ commentCreate: { success: true } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.markPrReady("issue-1", "https://github.com/o/r/pull/7");
+    await p.markPrReady("issue-1", "team-a", "https://github.com/o/r/pull/7");
 
     expect(fetch).toHaveBeenCalledTimes(4);
     const swapBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
@@ -697,7 +697,7 @@ describe("LinearProvider.clearWorkingState", () => {
     mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.clearWorkingState("issue-1");
+    await p.clearWorkingState("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(3);
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
@@ -712,7 +712,7 @@ describe("LinearProvider.clearWorkingState", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.clearWorkingState("issue-1");
+    await p.clearWorkingState("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(3);
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
@@ -725,7 +725,7 @@ describe("LinearProvider.clearWorkingState", () => {
     mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.clearWorkingState("issue-1");
+    await p.clearWorkingState("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(2);
   });
@@ -736,7 +736,7 @@ describe("LinearProvider.clearWorkingState", () => {
     mockJsonOnce({ issue: { labels: { nodes: [] } } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.clearWorkingState("issue-1");
+    await p.clearWorkingState("issue-1", "team-a");
 
     // Two labels-fetch queries run; no update mutation when there's nothing to remove
     expect(fetch).toHaveBeenCalledTimes(2);
@@ -762,7 +762,7 @@ describe("LinearProvider.markPlanningFailed", () => {
     } as Response);
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.markPlanningFailed("issue-1", "GraphQL exploded");
+    await p.markPlanningFailed("issue-1", "team-a", "GraphQL exploded");
 
     const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
     const body = JSON.parse(lastCall[1]?.body as string);
@@ -789,7 +789,7 @@ describe("LinearProvider.markImplementationFailed", () => {
     } as Response);
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.markImplementationFailed("issue-1", "tests timed out");
+    await p.markImplementationFailed("issue-1", "team-a", "tests timed out");
 
     const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
     const body = JSON.parse(lastCall[1]?.body as string);
@@ -812,7 +812,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({ linearApiKey: "k", linearWorkspaceUrl: "https://linear.app/acme" });
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(4);
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
@@ -823,7 +823,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issue: { state: { type: "completed" }, team: { key: "ENG" }, labels: { nodes: [] } } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(1);
   });
@@ -832,7 +832,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issue: { state: { type: "canceled" }, team: { key: "ENG" }, labels: { nodes: [] } } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(1);
   });
@@ -848,7 +848,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
     expect(updateBody.variables.stateId).toBe("s-shipped");
@@ -861,7 +861,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({ linearApiKey: "k" });
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
     expect(updateBody.variables.labelIds).toEqual(["L2", "L3"]);

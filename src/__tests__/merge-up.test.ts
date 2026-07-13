@@ -115,7 +115,7 @@ describe("runMergeUps", () => {
     );
 
     expect(vi.mocked(deleteBranch)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", "ai-implement/feature/ool-106");
-    expect(finalizeMerged).toHaveBeenCalledWith("uuid-parent");
+    expect(finalizeMerged).toHaveBeenCalledWith("uuid-parent", "OOL");
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(compareBranches)).not.toHaveBeenCalled();
   });
@@ -141,7 +141,19 @@ describe("runMergeUps", () => {
       [rollUp({ issueId: "uuid-p", identifier: "OOL-106", parentIdentifier: null })],
       deps(() => mapping(), finalizeMerged),
     );
-    expect(finalizeMerged).toHaveBeenCalledWith("uuid-p");
+    expect(finalizeMerged).toHaveBeenCalledWith("uuid-p", "OOL");
+  });
+
+  it("does not re-open the top-level PR after a human closed it without merging (veto)", async () => {
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 55, url: "https://gh/pr/55", state: "closed", merged: false,
+    });
+    const finalizeMerged = vi.fn();
+    await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping(), finalizeMerged));
+    expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+    expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
+    expect(finalizeMerged).not.toHaveBeenCalled();
   });
 
   it("warns (does not crash) when the internal merge conflicts", async () => {
