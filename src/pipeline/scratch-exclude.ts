@@ -11,6 +11,28 @@ import path from "node:path";
 export const SCRATCH_PATHS = ["ai-output/"] as const;
 
 /**
+ * Append gitignore-style patterns to `.git/info/exclude` if not already present.
+ * Idempotent: patterns already in the file are never duplicated.
+ */
+export function appendExcludePaths(workspaceDir: string, paths: string[]): void {
+  const excludePath = path.join(workspaceDir, ".git", "info", "exclude");
+  fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+
+  let existing = "";
+  try {
+    existing = fs.readFileSync(excludePath, "utf-8");
+  } catch {
+    existing = "";
+  }
+  const present = new Set(existing.split("\n").map((line) => line.trim()));
+  const missing = paths.filter((p) => !present.has(p));
+  if (missing.length > 0) {
+    const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+    fs.appendFileSync(excludePath, `${separator}${missing.join("\n")}\n`);
+  }
+}
+
+/**
  * Make orchestrator scratch paths uncommittable in a freshly-prepared workspace.
  *
  * Two deterministic guards, applied once after the working tree exists so every
@@ -27,21 +49,7 @@ export const SCRATCH_PATHS = ["ai-output/"] as const;
  * workspace.
  */
 export function prepareScratchExclusion(workspaceDir: string): void {
-  const excludePath = path.join(workspaceDir, ".git", "info", "exclude");
-  fs.mkdirSync(path.dirname(excludePath), { recursive: true });
-
-  let existing = "";
-  try {
-    existing = fs.readFileSync(excludePath, "utf-8");
-  } catch {
-    existing = "";
-  }
-  const present = new Set(existing.split("\n").map((line) => line.trim()));
-  const missing = SCRATCH_PATHS.filter((p) => !present.has(p));
-  if (missing.length > 0) {
-    const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-    fs.appendFileSync(excludePath, `${separator}${missing.join("\n")}\n`);
-  }
+  appendExcludePaths(workspaceDir, [...SCRATCH_PATHS]);
 
   // Untrack scratch paths a prior run committed; `--ignore-unmatch` makes this a
   // no-op when nothing matches, so it's safe to run unconditionally. A non-zero
