@@ -16,11 +16,11 @@ export interface TicketIssue {
   nativeStatus: string;
   /**
    * Immediate parent identifier, when this issue has a parent. Logging/informational only.
-   * Populated by the Linear provider; undefined for other providers.
+   * Populated by the Linear and Jira providers; undefined for others.
    */
   parentRef?: { identifier: string };
   /**
-   * Feature-branch grouping chain, set by the Linear provider for dispatchable issues.
+   * Feature-branch grouping chain, set by the Linear and Jira providers for dispatchable issues.
    *
    * An ordered list of issue identifiers (base-most first). Each names a feature branch
    * `ai-implement/feature/<id>` that must exist before this issue dispatches; each branch

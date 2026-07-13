@@ -33,6 +33,9 @@ export async function resolveCustomFieldIds(
   }
 
   const fields = await client.listFields();
+  // Best-effort by design: first match wins on a duplicate "Epic Link" name (unlike
+  // status/repo below, which hard-fail on ambiguity) — epicLinkFieldId is advisory
+  // and a wrong pick degrades to native-parent-only attribution, not a failure.
   const epicLink = fields.find((f) => f.name === "Epic Link");
   const lookup = (name: string): string => {
     const matches = fields.filter((f) => f.name === name);
