@@ -42,7 +42,7 @@ import {
   removeLocalContainer,
   startLocalRunnerContainer,
 } from "./local-docker.js";
-import { resolveTerminalStatus } from "./monitor-status.js";
+import { resolveTerminalStatus, workflowFileForJob } from "./monitor-status.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
@@ -1331,9 +1331,7 @@ async function monitorGitHubActionsJob(
     );
     if (!mapping) return;
 
-    const workflowFile = job.executionMode === "planning"
-      ? mapping.planningWorkflowFile
-      : mapping.workflowFile;
+    const workflowFile = workflowFileForJob(job, mapping);
 
     const runId = await findWorkflowRunId(
       ghToken,

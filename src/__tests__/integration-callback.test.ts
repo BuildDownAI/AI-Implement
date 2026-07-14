@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
+import type * as LogModule from "../log.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
@@ -11,6 +12,7 @@ const SECRET = "integration-test-secret";
 
 let dbPath: string;
 let dedup: typeof DedupModule;
+let log: typeof LogModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 
@@ -22,9 +24,13 @@ beforeEach(async () => {
   );
   process.env.DEDUP_DB_PATH = dbPath;
   dedup = await import("../dedup.js");
+  log = await import("../log.js");
   runnerTokens = await import("../runner-tokens.js");
   runnerCallback = await import("../runner-callback.js");
   dedup.getDb();
+  // The callback handler now reads dispatch_log (planning job finalization);
+  // production always creates it at startup via initLogTable().
+  log.initLogTable();
 });
 
 afterEach(() => {
