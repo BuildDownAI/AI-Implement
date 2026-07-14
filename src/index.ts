@@ -20,7 +20,8 @@ import { getInstallationToken } from "./github-app-auth.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
-import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata } from "./fly-machines.js";
+import { classifyCompletion, renderClassification } from "./completion-classification.js";
+import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
@@ -41,7 +42,7 @@ import {
   removeLocalContainer,
   startLocalRunnerContainer,
 } from "./local-docker.js";
-import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
+import { resolveTerminalStatus } from "./monitor-status.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
@@ -1285,8 +1286,8 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
     }
   }
 
-  // Send notifications for newly terminal jobs
-  await sendCompletionNotifications(config, registry);
+  // Send notifications + post comments for newly terminal jobs
+  await reportJobCompletion(config, registry);
 }
 
 async function monitorGitHubActionsJob(
@@ -1470,6 +1471,7 @@ async function monitorFlyMachineJob(
 
   let machineDone = false;
   let machineConclusion = "unknown";
+  let machineExitCode: number | null = null;
 
   try {
     const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
@@ -1486,6 +1488,7 @@ async function monitorFlyMachineJob(
     if (machine.state === "stopped" || machine.state === "destroyed") {
       machineDone = true;
       machineConclusion = machine.state;
+      machineExitCode = readMachineExitCode(machine);
     }
   } catch (err) {
     // 404 means machine was already destroyed (auto_destroy)
@@ -1505,9 +1508,7 @@ async function monitorFlyMachineJob(
     // Use PR existence to distinguish success from failure:
     // if a PR was created, the session completed its job; otherwise it failed
     const reviewNeedsAttention = !!prUrl && postPushReviewNeedsAttention(job.id);
-    const jobStatus: JobStatus = prUrl
-      ? (reviewNeedsAttention ? "review_failed" : "completed")
-      : "failed";
+    const jobStatus: JobStatus = resolveTerminalStatus(machineExitCode, prUrl, reviewNeedsAttention, job.phase);
 
     // Stamp pr_number on the machine before it's destroyed so reaper/audit
     // tools can read it. Only possible when machine is still accessible.
@@ -1617,7 +1618,7 @@ async function monitorLocalDockerJob(
     ? await findPrForIssue(config, job.repo, job.issueIdentifier)
     : null;
   const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
-  const jobStatus = resolveLocalDockerTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention);
+  const jobStatus = resolveTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention, job.phase);
 
   if (jobStatus === "failed") {
     await postLocalContainerLogs(provider, job, state.exitCode === 0 ? "pr_not_found" : "container_failed");
@@ -1694,9 +1695,7 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
 
 // ---------- Completion notifications ----------
 
-async function sendCompletionNotifications(config: AppConfig, registry: ProviderRegistry): Promise<void> {
-  if (!config.notifyWebhookUrl) return;
-
+async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const terminalJobs = getUnnotifiedTerminalJobs();
   const mappings = getMappings();
   for (const job of terminalJobs) {
@@ -1728,10 +1727,11 @@ async function sendCompletionNotifications(config: AppConfig, registry: Provider
       // the mapping is gone (orphaned job).
       const identifier = job.issueIdentifier || job.issueId;
       let issueUrl = `https://linear.app/issue/${identifier}`;
+      let provider: TicketingProvider | null = null;
       const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
       if (mapping) {
         try {
-          const provider = await registry.forMapping(mapping);
+          provider = await registry.forMapping(mapping);
           issueUrl = provider.issueUrl({
             id: job.issueId,
             identifier,
@@ -1745,22 +1745,44 @@ async function sendCompletionNotifications(config: AppConfig, registry: Provider
         }
       }
 
-      await notifyCompletion(config.notifyType, config.notifyWebhookUrl, {
-        issueIdentifier: identifier,
-        issueTitle: job.issueTitle || "Unknown",
-        issueUrl,
-        repoFullName,
-        status: job.status as "completed" | "review_failed" | "failed" | "timed_out",
-        conclusion: job.conclusion,
-        prUrl: job.prUrl,
-        runUrl,
-        durationMs,
-      });
+      // Tracker comment — ALWAYS, independent of the Slack/Teams webhook (failures only)
+      // classifyCompletion returns null on a clean success, so successes stay quiet everywhere
+      const classification = classifyCompletion(job);
+      if (classification && provider) {
+        try {
+          await provider.postComment(job.issueId, renderClassification(classification));
+        } catch (err) {
+          console.warn(`[monitor] Failed to post classification comment for job ${job.id}:`, err);
+        }
+      }
+
+      if (config.notifyWebhookUrl) {
+        try {
+          await notifyCompletion(config.notifyType, config.notifyWebhookUrl, {
+            issueIdentifier: identifier,
+            issueTitle: job.issueTitle || "Unknown",
+            issueUrl,
+            repoFullName,
+            status: job.status as "completed" | "review_failed" | "failed" | "timed_out",
+            conclusion: job.conclusion,
+            prUrl: job.prUrl,
+            runUrl,
+            durationMs,
+            phase: job.phase === "planning" ? "planning" : "implementation", // job.phase is a wider string (planning|implementation|gap-analysis) — narrow, don't cast
+            summary: classification?.summary,
+            detail: classification?.detail,
+            remediation: classification?.remediation,
+            docsUrl: classification?.docsUrl,
+          });
+          console.log(`[monitor] Sent ${job.status} notification for ${job.issueIdentifier} (job #${job.id}, dispatch #${job.dispatchNumber})`);
+        } catch (err) {
+          console.error(`[monitor] Failed to send notification for job ${job.id}:`, err);
+        }
+      }
 
       markJobNotified(job.id);
-      console.log(`[monitor] Sent ${job.status} notification for ${job.issueIdentifier} (job #${job.id}, dispatch #${job.dispatchNumber})`);
     } catch (err) {
-      console.error(`[monitor] Failed to send notification for job ${job.id}:`, err);
+      console.error(`[monitor] Failed to process completed job #${job.id}:`, err);
     }
   }
 }

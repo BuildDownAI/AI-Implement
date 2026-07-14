@@ -5,6 +5,7 @@ import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { upsertStepRecord } from "./step-log.js";
 import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
+import { renderClassification, TROUBLESHOOTING_URL, type Classification } from "./completion-classification.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
 
@@ -51,17 +52,21 @@ function bad(status: number, error: string): HandleRunnerResultOutput {
 }
 
 /**
- * Formats the failure reason for the ticket comment. When the runner reports a
- * known `failureCode`, uses a structured description so the ticket reader has
- * actionable context. Falls back to the raw `failureReason` string for all
- * other failures.
+ * Renders a failure using the helper function that's shared with Slack/Teams notifications.
+ * When the runner reports a known `failureCode`, makes use of the helper's structured description so the ticket reader has actionable context.
+ * Passes along the raw `failureReason` string for all other failures.
  */
 export function formatFailureComment(failureCode: string | undefined, failureReason: string | undefined): string {
-  if (failureCode === "SENSITIVE_FILES_BLOCKED") {
-    const detail = failureReason ?? "sensitive files detected in staged changes";
-    return `🔒 Blocked by security guardrail\n\n${detail}\n\nRemove these files from the implementation or ensure they are excluded via .gitignore before re-running.`;
-  }
-  return failureReason ?? "unspecified";
+  const c: Classification =
+    failureCode === "SENSITIVE_FILES_BLOCKED"
+      ? {
+          summary: "🔒 Blocked by security guardrail.",
+          detail: failureReason ?? "Sensitive files detected in staged changes.",
+          remediation: "Remove or .gitignore the flagged files, then re-run.",
+          docsUrl: TROUBLESHOOTING_URL,
+        }
+      : { summary: failureReason ?? "Unspecified failure." };
+  return renderClassification(c);
 }
 
 function parseBearerToken(authorization: string | undefined): string | null {

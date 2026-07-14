@@ -114,6 +114,7 @@ describe("notifyCompletion", () => {
     conclusion: "success" as const,
     prUrl: "https://github.com/org/repo/pull/42",
     runUrl: "https://github.com/org/repo/actions/runs/123",
+    phase: "implementation" as const,
   };
 
   describe("slack", () => {
@@ -178,6 +179,30 @@ describe("notifyCompletion", () => {
       expect(text).toContain("pull/42");
     });
 
+    it("labels the phase — planning vs implementation", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase, status: "completed", phase: "planning",
+      });
+      const text = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).blocks[0].text.text;
+      expect(text).toContain("AI Planning Completed");
+    });
+
+    it("renders the classification (summary, remediation, docs link) on failure", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      await notifyCompletion("slack", "https://webhook.example.com/slack", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        detail: "The runner exited with code 1.",
+        remediation: "Check the run logs, then re-dispatch once fixed.",
+        docsUrl: "https://docs.builddown.ai/reference/troubleshooting",
+      });
+      const text = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).blocks[0].text.text;
+      expect(text).toContain("Implementation failed.");
+      expect(text).toContain("*Next step:* Check the run logs");
+      expect(text).toContain("<https://docs.builddown.ai/reference/troubleshooting|Troubleshooting guide>");
+    });
+
 
     it("throws on non-ok response", async () => {
       vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "err" } as Response);
@@ -216,6 +241,30 @@ describe("notifyCompletion", () => {
       const body = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
       const facts = body.attachments[0].content.body[1].facts;
       expect(facts.some((f: { title: string }) => f.title === "PR")).toBe(false);
+    });
+
+    it("labels the phase in the card title", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      await notifyCompletion("teams", "https://webhook.example.com/teams", {
+        ...completionBase, status: "completed", phase: "planning",
+      });
+      const card = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).attachments[0].content;
+      expect(card.body[0].text).toContain("AI Planning Completed");
+    });
+
+    it("adds a classification TextBlock with the docs link on failure", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200 } as Response);
+      await notifyCompletion("teams", "https://webhook.example.com/teams", {
+        ...completionBase, status: "failed", conclusion: "exit_1", prUrl: null,
+        summary: "Implementation failed.",
+        remediation: "Check the run logs, then re-dispatch once fixed.",
+        docsUrl: "https://docs.builddown.ai/reference/troubleshooting",
+      });
+      const card = JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).attachments[0].content;
+      const textBlocks = card.body.filter((b: { type: string }) => b.type === "TextBlock");
+      const classification = textBlocks[textBlocks.length - 1].text;
+      expect(classification).toContain("Implementation failed.");
+      expect(classification).toContain("[Troubleshooting guide](https://docs.builddown.ai/reference/troubleshooting)");
     });
 
     it("throws on non-ok response", async () => {
