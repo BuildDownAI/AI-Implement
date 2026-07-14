@@ -14,6 +14,14 @@
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
+#
+# Private runner images: the plan job pulls the runner image as its container.
+# When that image is private on GHCR the pull is authenticated with GITHUB_TOKEN via
+# the container `credentials:` block (hence `packages: read` in the permissions block).
+# The token can only read private packages owned by THIS repo's org, so a private
+# runner image must live in the same org; a different-org private image needs a PAT
+# swapped into `credentials.password`. Fly/local pull anonymously, so private runner
+# images are only usable in this GitHub Actions execution mode.
 
 name: Claude AI Planning
 
@@ -80,6 +88,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: read
 
 jobs:
   validate-runner-image:
@@ -157,6 +166,13 @@ jobs:
     timeout-minutes: 30
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}
+      # Authenticate the image pull so a private GHCR runner image owned by this
+      # repo's org can be pulled (packages: read scopes GITHUB_TOKEN for this).
+      # Harmless for the public default image. Cross-org private images need a PAT
+      # swapped in for the password — see the header comment.
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Generate GitHub App token
         id: app-token

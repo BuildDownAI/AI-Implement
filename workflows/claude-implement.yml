@@ -18,6 +18,18 @@
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
 #   AI_IMPLEMENT_RUNNER_LABEL                    - runs-on label for the implement job (default ubuntu-latest); set to a larger-runner label to speed up CPU-bound test suites.
+#
+# Private runner images:
+#   The implement job runs the runner image as its container. When that image is
+#   private on GHCR, the pull is authenticated with the job's GITHUB_TOKEN via the
+#   container `credentials:` block below, which is why this workflow requests
+#   `packages: read`. The token can only read private packages owned by THIS repo's
+#   org/account, so a private runner image must live in the same org (e.g. a repo
+#   that pins its own image via .ai-implement/image.yml — the allowlist auto-trusts
+#   the owner's ghcr.io/<owner>/ namespace, so no extra prefix variable is needed).
+#   A private image in a different org needs a PAT swapped into `credentials.password`.
+#   Because Fly Machines and local Docker pull the runner image anonymously, a private
+#   runner image is only usable in this GitHub Actions execution mode.
 
 name: Claude AI Implementation
 
@@ -121,6 +133,7 @@ permissions:
   pull-requests: write
   issues: write
   id-token: write
+  packages: read
 
 jobs:
   validate-runner-image:
@@ -214,6 +227,13 @@ jobs:
     timeout-minutes: ${{ inputs.job_timeout_minutes && fromJSON(inputs.job_timeout_minutes) || 90 }}
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}
+      # Authenticate the image pull so a private GHCR runner image owned by this
+      # repo's org can be pulled (packages: read scopes GITHUB_TOKEN for this).
+      # Harmless for the public default image. Cross-org private images need a PAT
+      # swapped in for the password — see the header comment.
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Generate GitHub App token
         id: app-token
