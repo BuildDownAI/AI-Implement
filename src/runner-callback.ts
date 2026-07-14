@@ -1,4 +1,4 @@
-import { getJobByDispatchId, updateJobPrUrl } from "./log.js";
+import { getJobByDispatchId, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
@@ -209,6 +209,14 @@ export async function handleRunnerResult(
       await provider.markPlanComplete(claims.issueId, mappingTeamKey);
     } catch (err) {
       warn("markPlanComplete", err);
+    }
+    // Finalize the job row immediately: the issue stays excluded from dispatch
+    // while its planning job is in flight, so waiting for the GHA monitor to
+    // notice the run finished delays the planning→implementation handoff — and
+    // if run tracking failed entirely, blocks it until the stuck watchdog fires.
+    const job = getJobByDispatchId(claims.dispatchId);
+    if (job) {
+      updateJobStatus(job.id, "completed", "planning_callback");
     }
   } else if (input.body.phase === "implementation") {
     try {
