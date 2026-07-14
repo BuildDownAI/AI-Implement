@@ -191,6 +191,38 @@ describe("handleRunnerResult — planning", () => {
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
 
+  it("finalizes the dispatch-log job as completed on planning success", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobById(jobId);
+    expect(job?.status).toBe("completed");
+    expect(job?.completedAt).not.toBeNull();
+  });
+
   it("calls markPlanningFailed on failure", async () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
