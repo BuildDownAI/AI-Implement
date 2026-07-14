@@ -208,9 +208,12 @@ export function updateJobStatus(
   prUrl?: string | null,
 ): void {
   const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out";
+  // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
+  // caller has none — the GHA monitor often can't resolve a PR for dispatch runs and
+  // must not wipe the link on completion.
   getDb()
     .prepare(
-      "UPDATE dispatch_log SET status = ?, conclusion = ?, pr_url = ?, completed_at = ? WHERE id = ?",
+      "UPDATE dispatch_log SET status = ?, conclusion = ?, pr_url = COALESCE(?, pr_url), completed_at = ? WHERE id = ?",
     )
     .run(
       status,
@@ -219,6 +222,23 @@ export function updateJobStatus(
       isTerminal ? Date.now() : null,
       jobId,
     );
+}
+
+/**
+ * Finalizes planning jobs left in 'unknown' (the boot-time reset for GHA jobs whose
+ * run was never attached — e.g. the orchestrator restarted mid-run). Called when the
+ * same issue's IMPLEMENTATION phase dispatches: implementation only follows plan
+ * approval, so any still-'unknown' planning row demonstrably finished. Jobs the
+ * monitor still tracks ('dispatched'/'running') are left alone — the monitor will
+ * record their real outcome. Returns the number of rows finalized.
+ */
+export function completeOrphanedPlanningJobs(issueId: string): number {
+  const result = getDb()
+    .prepare(
+      "UPDATE dispatch_log SET status = 'completed', conclusion = COALESCE(conclusion, 'inferred_from_plan_approval'), completed_at = COALESCE(completed_at, ?) WHERE issue_id = ? AND phase = 'planning' AND status = 'unknown'",
+    )
+    .run(Date.now(), issueId);
+  return result.changes;
 }
 
 export function markJobNotified(jobId: number): void {
