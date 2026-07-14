@@ -13,7 +13,7 @@
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
-#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
 
 name: Claude AI Planning
 
@@ -72,7 +72,7 @@ on:
         type: string
         default: ""
       runner_image:
-        description: "Override the default runner image (must match ghcr.io/builddownai/* or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
+        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
         default: ""
@@ -96,6 +96,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [ -z "$owner" ]; then
+            echo "::error::GITHUB_REPOSITORY_OWNER is empty; cannot derive the owner image prefix." >&2
+            exit 1
+          fi
+
           runner_image="${REQUESTED_RUNNER_IMAGE:-}"
           if [ -z "$runner_image" ]; then
             runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
@@ -111,7 +117,7 @@ jobs:
               ;;
           esac
 
-          allowed_prefixes="ghcr.io/builddownai/"
+          allowed_prefixes="ghcr.io/builddownai/,ghcr.io/${owner}/"
           if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
             allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
           fi
@@ -121,12 +127,12 @@ jobs:
           for raw_prefix in "${prefixes[@]}"; do
             prefix="$(echo "$raw_prefix" | xargs)"
             [ -z "$prefix" ] && continue
-            case "$runner_image" in
-              "$prefix"*)
-                allowed=true
-                break
-                ;;
-            esac
+            # Literal prefix match — quote "$prefix" so glob metacharacters in an
+            # operator-supplied AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES can't widen it.
+            if [[ "$runner_image" == "$prefix"* ]]; then
+              allowed=true
+              break
+            fi
           done
 
           if [ "$allowed" != "true" ]; then
