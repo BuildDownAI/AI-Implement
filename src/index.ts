@@ -14,7 +14,7 @@ import { notify, notifyCompletion } from "./notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { handleTokenRequest } from "./token-vending.js";
@@ -306,6 +306,17 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           await dispatchPlanning(config, issueProvider, issue, mapping);
         } else {
           const prior = countPriorDispatches(issue.id);
+
+          // Implementation only dispatches after plan approval, so any planning row
+          // still stuck in 'unknown' (orphaned by an orchestrator restart before its
+          // run was attached) demonstrably finished — finalize it so the pipelines
+          // UI doesn't show 'unknown' forever.
+          const finalizedPlans = completeOrphanedPlanningJobs(issue.id);
+          if (finalizedPlans > 0) {
+            console.log(
+              `[poll] Finalized ${finalizedPlans} orphaned planning job(s) for ${issue.identifier} (implementation dispatching)`,
+            );
+          }
 
           if (prior.count > 0) {
             const ago = prior.lastDispatchedAt
@@ -1381,6 +1392,14 @@ async function monitorGitHubActionsJob(
         prUrl = await findPrForRun(ghToken, owner, repo, job.runId);
       } catch {
         // Non-critical
+      }
+      // workflow_dispatch runs report the ref they were dispatched on (the default
+      // branch) as head_branch, so findPrForRun misses the PR the runner created
+      // during the run. Fall back to matching an open PR by the issue's branch
+      // naming. Planning runs never open PRs — skip them so an implementation PR
+      // from an earlier dispatch is not misattributed to a planning row.
+      if (!prUrl && job.phase !== "planning") {
+        prUrl = await findPrForIssue(config, job.repo, job.issueIdentifier);
       }
     }
 

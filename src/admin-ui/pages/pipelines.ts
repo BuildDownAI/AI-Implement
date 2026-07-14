@@ -198,7 +198,12 @@ export const pipelinesScript = `
           const imageCell = impl.sessionImage
             ? '<td class="mono" title="' + window.esc(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
-          const combinedStatus = statusBadge(plan.status) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status);
+          // A grouped row exists only when an implement dispatch followed this plan,
+          // which requires plan approval — so a plan row stranded in a non-terminal
+          // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
+          const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
+            ? 'completed' : plan.status;
+          const combinedStatus = statusBadge(planStatus) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status);
           const prLink = impl.prUrl ? '<a href="' + window.esc(impl.prUrl) + '" target="_blank">View</a>' : '—';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
