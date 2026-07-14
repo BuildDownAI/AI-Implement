@@ -410,6 +410,25 @@ describe("deleteBranch", () => {
     expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
   });
 
+  it('returns true on 422 "Reference does not exist" (the git-refs API reports a missing ref as 422, not 404)', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      status: 422,
+      ok: false,
+      text: async () =>
+        '{"message":"Reference does not exist","documentation_url":"https://docs.github.com/rest/git/refs#delete-a-reference","status":"422"}',
+    } as unknown as Response);
+    expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
+  });
+
+  it("throws on a 422 that is not a missing ref (e.g. protected branch)", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      status: 422,
+      ok: false,
+      text: async () => '{"message":"Refusing to delete the default branch"}',
+    } as unknown as Response);
+    await expect(deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).rejects.toThrow();
+  });
+
   it("throws on other non-success statuses", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({
       status: 403,

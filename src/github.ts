@@ -495,8 +495,11 @@ export async function findPullRequestByBranches(
 }
 
 /**
- * Deletes a branch ref. Treats 404 as success (idempotent — branch may have been
- * manually deleted or removed by GitHub's "delete on merge" setting).
+ * Deletes a branch ref. Treats an already-missing ref as success (idempotent —
+ * branch may have been manually deleted or removed by GitHub's "delete on merge"
+ * setting). The git-refs DELETE endpoint reports a missing ref as
+ * 422 "Reference does not exist" (404 only covers a missing repo), so both are
+ * accepted; other 422s (e.g. refusing to delete a protected branch) still throw.
  */
 export async function deleteBranch(
   token: string,
@@ -509,6 +512,7 @@ export async function deleteBranch(
   const res = await fetch(url, { method: "DELETE", headers: ghHeaders(token) });
   if (res.status === 204 || res.status === 404) return true;
   const body = await res.text().catch(() => "");
+  if (res.status === 422 && body.includes("Reference does not exist")) return true;
   throw new GitHubApiError({
     status: res.status,
     path: `/repos/${owner}/${repo}/git/refs/heads/${enc}`,
