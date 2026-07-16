@@ -75,11 +75,6 @@ export function buildGroupingBranchName(
   return `ai-implement/${mode}/${slugify(parentIdentifier, "parent")}`;
 }
 
-/** Feature-node branch. Retained so existing call sites keep compiling; a downstream issue
- *  migrates them to buildGroupingBranchName and deletes this. */
-export function buildFeatureBranchName(parentIdentifier: string | undefined): string {
-  return buildGroupingBranchName(parentIdentifier, "feature");
-}
 
 export function branchMatchesIssueIdentifier(branchRef: string | undefined, issueIdentifier: string | undefined): boolean {
   if (!branchRef || !issueIdentifier) return false;

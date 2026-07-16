@@ -1,5 +1,6 @@
 import type {
   AIImplementSnapshot,
+  FeatureBranchChainEntry,
   FeatureNodeRollUp,
   IssueLifecycleState,
   ProviderConfig,
@@ -307,8 +308,8 @@ export class JiraProvider implements TicketingProvider {
     candidates: import("./jira-client.js").JiraIssue[],
     repoFieldValue: string,
     fieldIds: ResolvedFieldIds,
-  ): Promise<Map<string, { skip: boolean; chain?: string[] }>> {
-    const out = new Map<string, { skip: boolean; chain?: string[] }>();
+  ): Promise<Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[] }>> {
+    const out = new Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[] }>();
     if (candidates.length === 0) return out;
 
     const designated = (fields: Record<string, unknown>): boolean =>
@@ -405,7 +406,11 @@ export class JiraProvider implements TicketingProvider {
         (k) => ancestorParent.get(k) ?? null,
         (k) => ancestorDesignated.get(k) ?? false,
       );
-      const chain = cls.kind === "feature-node-ready" ? [...ancestors, cand.key] : ancestors;
+      const entries: FeatureBranchChainEntry[] = ancestors.map((identifier) => ({ identifier, mode: "feature" }));
+      const chain =
+        cls.kind === "feature-node-ready"
+          ? [...entries, { identifier: cand.key, mode: "feature" as const }]
+          : entries;
       out.set(cand.key, { skip: false, chain });
     }
     return out;
@@ -445,12 +450,15 @@ export class JiraProvider implements TicketingProvider {
         this.childrenJql(completed.map((c) => c.key), fieldIds),
         [fieldIds.statusFieldId, fieldIds.repoFieldId, "parent", ...epicLinkFields],
       );
-      const designatedChildParents = new Set<string>();
+      const designatedChildrenByParent = new Map<string, string[]>();
       for (const ch of children) {
         const pk = effectiveParentKey(ch.fields, fieldIds);
-        if (pk && designated(ch.fields)) designatedChildParents.add(pk);
+        if (!pk || !designated(ch.fields)) continue;
+        const list = designatedChildrenByParent.get(pk) ?? [];
+        list.push(ch.key);
+        designatedChildrenByParent.set(pk, list);
       }
-      const featureNodes = completed.filter((c) => designatedChildParents.has(c.key));
+      const featureNodes = completed.filter((c) => designatedChildrenByParent.has(c.key));
       if (featureNodes.length === 0) continue;
 
       // Is each feature node's parent itself designated (→ auto-merge) or not (→ human PR)?
@@ -468,11 +476,14 @@ export class JiraProvider implements TicketingProvider {
 
       for (const node of featureNodes) {
         const parentKey = effectiveParentKey(node.fields, fieldIds);
+        const hasGroupingParent = !!parentKey && designatedParents.has(parentKey);
         rollUps.push({
           issueId: node.id,
           identifier: node.key,
           scopeKey,
-          parentIdentifier: parentKey && designatedParents.has(parentKey) ? parentKey : null,
+          mode: "feature",
+          parent: hasGroupingParent ? { identifier: parentKey!, mode: "feature" } : null,
+          childIdentifiers: designatedChildrenByParent.get(node.key) ?? [],
         });
       }
     }
