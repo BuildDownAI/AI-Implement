@@ -40,7 +40,12 @@ permissions:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    # Native arm64 runner (the orchestrator runs on Graviton/t4g). Building
+    # linux/arm64 here avoids QEMU emulation entirely — the emulated
+    # better-sqlite3 native compile was the bulk of the build time. If arm64
+    # hosted runners aren't available on this plan, swap back to ubuntu-latest
+    # (the build still works under QEMU, just slowly).
+    runs-on: ubuntu-24.04-arm
     environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
@@ -68,9 +73,7 @@ jobs:
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "Image: $IMAGE"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
+      # No QEMU: the runner is already arm64, so the build is native.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -82,6 +85,10 @@ jobs:
           push: true
           tags: ${{ steps.image.outputs.image }}
           provenance: false
+          # Reuse unchanged layers (incl. the better-sqlite3 native build)
+          # across deploys via the GitHub Actions cache backend.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Point current-image at the new build
         run: |
