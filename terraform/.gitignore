@@ -1,0 +1,14 @@
+# Terraform working dirs (tf.sh sets TF_DATA_DIR=.terraform-<env>)
+.terraform/
+.terraform-*/
+
+# State and plan artifacts (state lives in S3; never commit local copies)
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Local secret material staged for fill-secrets.sh
+.env
+private-key.pem

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+# Install and start the SSM agent before anything else so we can debug from
+# the AWS console even if a later step fails. AL2023 minimal AMIs don't ship
+# the agent preinstalled; the package is in the AL2023 repos.
+dnf install -y amazon-ssm-agent
+systemctl enable --now amazon-ssm-agent
+
+# Install Docker and the rest of the bootstrap deps
+dnf update -y
+dnf install -y docker awscli-2 jq
+
+systemctl enable --now docker
+
+# Mount the persistent data volume at /data
+DATA_MOUNT=/data
+mkdir -p "$DATA_MOUNT"
+
+# Pick the data EBS volume by excluding the root disk. On Nitro instances the
+# data volume shows up as /dev/nvmeXnY (X != 0 typically) regardless of the
+# logical device_name configured in Terraform. Find root via findmnt → PKNAME,
+# then pick the first NVMe disk that isn't root.
+ROOT_PARTITION=$(findmnt -no SOURCE /)
+ROOT_DISK_NAME=$(lsblk -no PKNAME "$ROOT_PARTITION" | head -n1 | tr -d ' ')
+if [ -n "$ROOT_DISK_NAME" ]; then
+  ROOT_DISK="/dev/$ROOT_DISK_NAME"
+else
+  ROOT_DISK="$ROOT_PARTITION"
+fi
+
+DATA_DEVICE=""
+for _ in $(seq 1 60); do
+  while read -r name type _; do
+    [ "$type" = "disk" ] || continue
+    # Only consider NVMe-backed EBS volumes; AL2023 ships zram0 as a "disk"
+    # type for compressed-RAM swap, which we must not pick.
+    case "$name" in nvme*) ;; *) continue ;; esac
+    candidate="/dev/$name"
+    [ "$candidate" = "$ROOT_DISK" ] && continue
+    [ -b "$candidate" ] || continue
+    DATA_DEVICE="$candidate"
+    break
+  done < <(lsblk -ndo NAME,TYPE,MOUNTPOINT)
+  [ -n "$DATA_DEVICE" ] && break
+  sleep 2
+done
+
+if [ -z "$DATA_DEVICE" ]; then
+  echo "No unmounted data disk found; aborting bootstrap" >&2
+  exit 1
+fi
+
+if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
+  mkfs.ext4 -L data "$DATA_DEVICE"
+fi
+
+if ! grep -q "LABEL=data" /etc/fstab; then
+  echo "LABEL=data $DATA_MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
+mount -a
+
+# The orchestrator container runs as UID/GID 1000 (the 'node' user in the
+# official node image). The mount root is owned 0:0 by default, so SQLite
+# can't create /data/dedup.sqlite. Make the mount writable for the container.
+chown 1000:1000 "$DATA_MOUNT"
+
+# Drop wrapper and systemd unit. The image to run is read from SSM
+# (/<project>-deploy/current-image) by the wrapper on each start, so a
+# freshly-bootstrapped instance picks up the most recently deployed SHA
+# without any local state.
+cat > /usr/local/bin/run-orchestrator.sh <<'WRAPPER'
+${run_script}
+WRAPPER
+chmod 0755 /usr/local/bin/run-orchestrator.sh
+
+cat > /etc/systemd/system/orchestrator.service <<'UNIT'
+${systemd_unit}
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now orchestrator.service || true
+
+# Bounce the SSM agent again now that everything else has settled. `dnf update`
+# earlier in bootstrap can upgrade amazon-ssm-agent in-flight and leave the
+# upgraded service unable to re-register; an explicit restart after the rest of
+# bootstrap completes fixes registration reliably.
+systemctl restart amazon-ssm-agent
