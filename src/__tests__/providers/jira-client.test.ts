@@ -167,3 +167,34 @@ describe("JiraClient", () => {
     await expect(client.listFields()).rejects.toThrow(/204 No Content/);
   });
 });
+
+describe("JiraClient Basic auth (email + API token)", () => {
+  const basicConfig = {
+    token: "api-tok",
+    email: "svc@example.com",
+    siteUrl: "https://acme.atlassian.net",
+  };
+  const expectedBasic = `Basic ${Buffer.from("svc@example.com:api-tok").toString("base64")}`;
+
+  it("uses Basic auth header when email is set", async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ issues: [] }) });
+    const client = new JiraClient(basicConfig);
+    await client.searchJql("project = X", []);
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe(expectedBasic);
+  });
+
+  it("routes calls to the site URL (not api.atlassian.com) in Basic mode", async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ issues: [] }) });
+    const client = new JiraClient({ ...basicConfig, siteUrl: "https://acme.atlassian.net/" });
+    await client.searchJql("project = X", []);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://acme.atlassian.net/rest/api/3/search/jql");
+  });
+
+  it("throws if email is set without a siteUrl", () => {
+    expect(() => new JiraClient({ token: "t", email: "svc@example.com" })).toThrow(/siteUrl/);
+  });
+
+  it("throws if neither email nor cloudId is provided", () => {
+    expect(() => new JiraClient({ token: "t" })).toThrow(/cloudId/);
+  });
+});

@@ -1,8 +1,18 @@
 export interface JiraClientConfig {
-  /** Bearer token for the Jira service account (or OAuth access token). */
+  /** API token (used with Basic auth) or OAuth 2.0 access token (Bearer). */
   token: string;
-  /** Cloud ID used to route API calls through api.atlassian.com. */
-  cloudId: string;
+  /**
+   * Service-account email. When set, the client authenticates with Basic auth
+   * (email:token) against `siteUrl` — the durable API-token path for Jira
+   * Cloud (tokens from id.atlassian.com don't expire). When unset, it falls
+   * back to Bearer auth through the OAuth gateway (api.atlassian.com), which
+   * requires `cloudId`.
+   */
+  email?: string;
+  /** Site base URL (https://<site>.atlassian.net). Required for Basic auth. */
+  siteUrl?: string;
+  /** Cloud ID for the OAuth gateway path (Bearer). Required when email is unset. */
+  cloudId?: string;
 }
 
 export interface JiraIssue {
@@ -43,9 +53,24 @@ export class JiraClient {
   private readonly authHeader: string;
 
   constructor(config: JiraClientConfig) {
-    const cloudId = config.cloudId.replace(/\/$/, "");
-    this.apiBase = `https://api.atlassian.com/ex/jira/${cloudId}`;
-    this.authHeader = `Bearer ${config.token}`;
+    if (config.email) {
+      // Basic auth (email:api-token) against the site domain. Long-lived; no
+      // token refresh needed. Same REST v3 paths as the OAuth gateway.
+      if (!config.siteUrl) {
+        throw new Error("JiraClient: siteUrl is required for Basic auth (email set)");
+      }
+      this.apiBase = config.siteUrl.replace(/\/+$/, "");
+      const basic = Buffer.from(`${config.email}:${config.token}`).toString("base64");
+      this.authHeader = `Basic ${basic}`;
+    } else {
+      // OAuth 2.0 gateway path (Bearer). Access tokens are short-lived.
+      if (!config.cloudId) {
+        throw new Error("JiraClient: cloudId is required for Bearer auth (email unset)");
+      }
+      const cloudId = config.cloudId.replace(/\/$/, "");
+      this.apiBase = `https://api.atlassian.com/ex/jira/${cloudId}`;
+      this.authHeader = `Bearer ${config.token}`;
+    }
   }
 
   private async rawRequest(method: string, path: string, body?: unknown): Promise<Response> {
