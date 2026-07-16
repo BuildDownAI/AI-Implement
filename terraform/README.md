@@ -91,7 +91,7 @@ graph TB
             end
 
             subgraph PrivNets["Existing Private Subnet (AZ-a)"]
-                EC2["EC2 Orchestrator  t4g.nano\nAL2023 arm64 · port 8080\n(Docker + awslogs driver)"]
+                EC2["EC2 Orchestrator  t4g.small\nAL2023 arm64 · port 8080\n(Docker + awslogs driver)"]
                 EBS[("EBS Data Volume\ngp3 · encrypted · /data\nprevent_destroy")]
             end
 
