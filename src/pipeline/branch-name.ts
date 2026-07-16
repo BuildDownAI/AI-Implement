@@ -57,14 +57,28 @@ export function buildIssueBranchName(
   return cleaned ? `${cleaned}/${base}` : base;
 }
 
+/** Which kind of grouping a parent issue's shared branch represents. The value IS the
+ *  branch path segment: "feature" groups sub-parts of one feature; "multi-issue" groups
+ *  otherwise-unrelated issues that should land as one reviewable unit. */
+export type FeatureBranchMode = "feature" | "multi-issue";
+
 /**
- * Shared feature branch for a parent issue's children. Derived from the parent
- * identifier only (stable across child dispatches; no title drift), so no registry
- * is needed to recover the name. Collision-free because Linear identifiers are
- * unique and slug-safe within a workspace.
+ * Shared grouping branch for a parent issue's children. Derived from the parent identifier
+ * only — stable across child dispatches, across title edits, and across changes to the child
+ * set — so no registry is needed to recover the name. Collision-free because tracker
+ * identifiers are unique and slug-safe within a workspace.
  */
+export function buildGroupingBranchName(
+  parentIdentifier: string | undefined,
+  mode: FeatureBranchMode,
+): string {
+  return `ai-implement/${mode}/${slugify(parentIdentifier, "parent")}`;
+}
+
+/** Feature-node branch. Retained so existing call sites keep compiling; a downstream issue
+ *  migrates them to buildGroupingBranchName and deletes this. */
 export function buildFeatureBranchName(parentIdentifier: string | undefined): string {
-  return `ai-implement/feature/${slugify(parentIdentifier, "parent")}`;
+  return buildGroupingBranchName(parentIdentifier, "feature");
 }
 
 export function branchMatchesIssueIdentifier(branchRef: string | undefined, issueIdentifier: string | undefined): boolean {
