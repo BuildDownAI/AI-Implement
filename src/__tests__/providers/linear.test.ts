@@ -153,15 +153,17 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  type Ancestor = { identifier: string; labels?: string[]; parent?: Ancestor | null };
+  type Ancestor = { identifier: string; description?: string | null; labels?: string[]; parent?: Ancestor | null };
   type Child = { labels?: string[]; stateType?: string };
+
+  const MULTI_YML = ["```yaml", "# ai-implement.yml", "feature_branch:", '  mode: "multi-issue"', "```"].join("\n");
 
   function labelNodes(names: string[] | undefined) {
     return { nodes: (names ?? []).map((name) => ({ name })) };
   }
   function ancestorNode(a: Ancestor | null | undefined): unknown {
     if (!a) return null;
-    return { identifier: a.identifier, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
+    return { identifier: a.identifier, description: a.description ?? null, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
   }
 
   function makeIssue(overrides: {
@@ -347,6 +349,90 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       expect(snap.needsPlanning).toEqual([]);
       expect(snap.readyForImplementation).toEqual([]);
     });
+
+    it("targets a multi-issue parent's branch when the parent's ai-implement.yml selects it", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-87",
+          labels: ["AI-Implement"],
+          parent: { identifier: "OOL-78", description: MULTI_YML, labels: ["AI-Implement"] },
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning[0].featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "multi-issue" }]);
+    });
+
+    it("leaves feature-node behaviour unchanged when there is no ai-implement.yml", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-87",
+          labels: ["AI-Implement"],
+          parent: { identifier: "OOL-78", description: null, labels: ["AI-Implement"] },
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning[0].featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
+    });
+
+    it("resolves each ancestor's mode independently when modes are mixed", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-87",
+          labels: ["AI-Implement"],
+          parent: {
+            identifier: "OOL-78",
+            description: MULTI_YML,
+            labels: ["AI-Implement"],
+            parent: { identifier: "OOL-70", description: null, labels: ["AI-Implement"] },
+          },
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning[0].featureBranchChain).toEqual([
+        { identifier: "OOL-70", mode: "feature" },
+        { identifier: "OOL-78", mode: "multi-issue" },
+      ]);
+    });
+
+    it("puts a multi-issue parent's own closing work on its multi-issue branch", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          description: MULTI_YML,
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+            { labels: ["AI-Implement"], stateType: "canceled" },
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
+      expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "multi-issue" }]);
+    });
+
+    it("strips the config block from the description handed to the runner", async () => {
+      const descWithConfig = `Group of unrelated work.\n\n${MULTI_YML}`;
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          description: descWithConfig,
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
+      expect(parent.description).toBe("Group of unrelated work.");
+      expect(parent.description).not.toContain("feature_branch");
+    });
   });
 
   it("counts AI-Working / AI-Planning issues by scope and excludes them from buckets", async () => {
@@ -412,6 +498,7 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     } as Response);
   }
   const labels = (...names: string[]) => ({ nodes: names.map((name) => ({ name })) });
+  const MULTI_YML = ["```yaml", "# ai-implement.yml", "feature_branch:", '  mode: "multi-issue"', "```"].join("\n");
 
   it("returns feature nodes with parent target; non-feature parent → null (base)", async () => {
     mockResponse([
@@ -438,6 +525,23 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     ]);
     const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([]);
+  });
+
+  it("carries each node's and its parent's mode onto the roll-up", async () => {
+    mockResponse([
+      {
+        id: "ool-78-id",
+        identifier: "OOL-78",
+        description: MULTI_YML,
+        team: { key: "OOL" },
+        children: { nodes: [{ identifier: "OOL-87", labels: labels("AI-Implement") }] },
+        parent: { identifier: "OOL-70", description: null, labels: labels("AI-Implement") },
+      },
+    ]);
+    const [rollUp] = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
+    expect(rollUp.mode).toBe("multi-issue");
+    expect(rollUp.parent).toEqual({ identifier: "OOL-70", mode: "feature" });
+    expect(rollUp.childIdentifiers).toEqual(["OOL-87"]);
   });
 });
 
