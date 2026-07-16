@@ -20,9 +20,12 @@ variable "project" {
 }
 
 variable "instance_type" {
+  # t4g.nano (512 MB) OOM-kills `dnf` during user-data bootstrap (and is too
+  # small to run Docker + the Node orchestrator anyway). t4g.small (2 GB) is the
+  # practical floor; bump to t4g.medium (4 GB) for more headroom.
   description = "EC2 instance type for the orchestrator"
   type        = string
-  default     = "t4g.nano"
+  default     = "t4g.small"
 }
 
 variable "data_volume_size_gb" {
