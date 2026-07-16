@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION=${region}
+PROJECT=${project}
+LOG_GROUP=${log_group}
+
+# SSM is the source of truth for the currently-deployed image. The deploy
+# workflow updates this parameter on every successful build; on each
+# (re)start we re-read it. ECR stays IMMUTABLE — only the SSM pointer moves.
+IMAGE=$(aws ssm get-parameter \
+  --name "/$PROJECT-deploy/current-image" \
+  --region "$REGION" \
+  --query 'Parameter.Value' \
+  --output text)
+
+# Authenticate to ECR
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "$(echo "$IMAGE" | cut -d/ -f1)"
+
+# Fetch SSM parameters under /$PROJECT/ as -e KEY=VALUE args.
+# Use null-byte-delimited JSON output so multi-line SecureString values
+# (e.g. GitHub App PEM keys) survive intact.
+ENV_ARGS=()
+while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+  key="$${name##*/}"
+  ENV_ARGS+=(-e "$${key}=$${value}")
+done < <(aws ssm get-parameters-by-path \
+    --path "/$PROJECT" \
+    --with-decryption \
+    --recursive \
+    --region "$REGION" \
+    --output json \
+  | jq -j '.Parameters[] | "\(.Name)\u0000\(.Value)\u0000"')
+
+docker pull "$IMAGE"
+docker rm -f orchestrator 2>/dev/null || true
+
+exec docker run --rm \
+  --name orchestrator \
+  -p 8080:8080 \
+  -v /data:/data \
+  --log-driver=awslogs \
+  --log-opt awslogs-region="$REGION" \
+  --log-opt awslogs-group="$LOG_GROUP" \
+  --log-opt awslogs-create-group=false \
+  "$${ENV_ARGS[@]}" \
+  "$IMAGE"

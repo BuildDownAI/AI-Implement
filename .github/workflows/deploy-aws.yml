@@ -1,0 +1,127 @@
+name: Deploy to AWS
+
+# Builds the orchestrator image, pushes it to ECR, moves the SSM "current-image"
+# pointer, and restarts the EC2 service via SSM — mirroring the manual steps in
+# terraform/README.md.
+#
+# Auth is GitHub OIDC (no static AWS keys): the job targets a GitHub Environment
+# (dev/prod) whose AWS_DEPLOY_ROLE_ARN variable holds the deploy-role ARN. The
+# IAM trust policy (terraform/iam.tf) restricts assumption to
+# repo:<owner>/<repo>:environment:<env>, so the job MUST run in an Environment
+# for the OIDC sub claim to match.
+#
+# Branch mapping: push to `testing` -> dev, push to `main` -> prod. A manual
+# workflow_dispatch lets you choose. NOTE: prod is not yet configured (see the
+# TODO placeholders in terraform/locals.tf and terraform/envs/prod.backend.hcl);
+# a prod deploy will not succeed until that stack is applied.
+
+on:
+  push:
+    branches: [testing, main]
+    paths-ignore:
+      - "terraform/**"
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+concurrency:
+  group: deploy-aws-${{ github.event_name == 'workflow_dispatch' && inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      # Matches var.project in terraform (ECR repo is "<project>-orchestrator",
+      # instances are tagged Project=<project>).
+      PROJECT: ai-implement
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        id: creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image reference
+        id: image
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${PROJECT}-orchestrator:${GITHUB_SHA}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Image: $IMAGE"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+          provenance: false
+
+      - name: Point current-image at the new build
+        run: |
+          aws ssm put-parameter --overwrite \
+            --region "$AWS_REGION" \
+            --name "/${PROJECT}-deploy/current-image" \
+            --type String \
+            --value "${{ steps.image.outputs.image }}"
+
+      - name: Find orchestrator instance
+        id: instance
+        run: |
+          ID=$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Project,Values=${PROJECT}" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text)
+          if [ -z "$ID" ]; then
+            echo "No running instance tagged Project=${PROJECT}; current-image staged, next restart will pick it up." >&2
+            exit 1
+          fi
+          echo "instance_id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Instance: $ID"
+
+      - name: Restart the orchestrator service
+        id: restart
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "${{ steps.instance.outputs.instance_id }}" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["sudo systemctl restart orchestrator.service"]' \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for restart to complete
+        run: |
+          aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --command-id "${{ steps.restart.outputs.command_id }}" \
+            --instance-id "${{ steps.instance.outputs.instance_id }}"
+          echo "Restart command completed."
