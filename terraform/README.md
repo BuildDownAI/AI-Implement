@@ -227,7 +227,7 @@ After the first apply succeeds:
    *PowerShell:*
    ```powershell
    foreach ($name in @("GITHUB_APP_ID","GITHUB_WEBHOOK_SECRET",
-                        "JIRA_TOKEN","JIRA_CLOUD_ID","JIRA_SITE_URL",
+                        "JIRA_EMAIL","JIRA_TOKEN","JIRA_CLOUD_ID","JIRA_SITE_URL",
                         "ADMIN_ACCESS_CODE","RUNNER_TOKEN_SECRET",
                         "GAP_FILL_TRIGGER_SECRET","NOTIFY_TYPE","NOTIFY_WEBHOOK_URL")) {
      $v = [System.Environment]::GetEnvironmentVariable($name, 'Process')
@@ -241,7 +241,7 @@ After the first apply succeeds:
    *bash:*
    ```bash
    for name in GITHUB_APP_ID GITHUB_WEBHOOK_SECRET \
-               JIRA_TOKEN JIRA_CLOUD_ID JIRA_SITE_URL \
+               JIRA_EMAIL JIRA_TOKEN JIRA_CLOUD_ID JIRA_SITE_URL \
                ADMIN_ACCESS_CODE RUNNER_TOKEN_SECRET \
                GAP_FILL_TRIGGER_SECRET NOTIFY_TYPE NOTIFY_WEBHOOK_URL; do
      read -rsp "$name: " v && echo

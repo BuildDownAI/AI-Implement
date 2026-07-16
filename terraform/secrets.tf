@@ -10,6 +10,9 @@ locals {
     "GITHUB_APP_ID",
     "GITHUB_APP_PRIVATE_KEY",
     "GITHUB_WEBHOOK_SECRET",
+    # Jira Basic auth (recommended): JIRA_EMAIL + JIRA_TOKEN (API token) +
+    # JIRA_SITE_URL. JIRA_CLOUD_ID is only needed for the OAuth Bearer path.
+    "JIRA_EMAIL",
     "JIRA_TOKEN",
     "JIRA_CLOUD_ID",
     "JIRA_SITE_URL",
