@@ -80,9 +80,13 @@ let _adminJiraClient: JiraClient | null = null;
 function getAdminJiraClient(): JiraClient | null {
   if (_adminJiraClient) return _adminJiraClient;
   const token = process.env.JIRA_TOKEN;
+  if (!token) return null;
+  const email = process.env.JIRA_EMAIL;
+  const siteUrl = process.env.JIRA_SITE_URL;
   const cloudId = process.env.JIRA_CLOUD_ID;
-  if (!token || !cloudId) return null;
-  _adminJiraClient = new JiraClient({ token, cloudId });
+  // Basic auth needs a site URL; OAuth needs a cloud id.
+  if (email ? !siteUrl : !cloudId) return null;
+  _adminJiraClient = new JiraClient({ token, email, siteUrl, cloudId });
   return _adminJiraClient;
 }
 
@@ -395,7 +399,11 @@ export function handleAdminRequest(
     if (url === "/api/admin/config-status" && method === "GET") {
       json(res, 200, {
         linear: !!process.env.LINEAR_API_KEY,
-        jira: !!(process.env.JIRA_TOKEN && process.env.JIRA_CLOUD_ID && process.env.JIRA_SITE_URL),
+        jira: !!(
+          process.env.JIRA_TOKEN &&
+          process.env.JIRA_SITE_URL &&
+          (process.env.JIRA_EMAIL || process.env.JIRA_CLOUD_ID)
+        ),
         jiraSiteUrl: process.env.JIRA_SITE_URL ?? null,
         runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),
         gapFillTrigger: !!process.env.GAP_FILL_TRIGGER_SECRET,

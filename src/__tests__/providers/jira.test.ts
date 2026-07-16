@@ -69,6 +69,19 @@ describe("createJiraProviderFromConfig", () => {
     );
     expect(p.id).toBe("jira");
   });
+
+  it("constructs in Basic-auth mode with email + token + siteUrl (no cloudId)", () => {
+    const p = createJiraProviderFromConfig(
+      { jiraToken: "api-tok", jiraEmail: "svc@example.com", jiraSiteUrl: "https://acme.atlassian.net" },
+      noMappings,
+    );
+    expect(p.id).toBe("jira");
+  });
+
+  it("throws when jiraEmail is set but jiraSiteUrl is missing", () => {
+    expect(() => createJiraProviderFromConfig({ jiraToken: "t", jiraEmail: "svc@example.com" }, noMappings))
+      .toThrow(MissingProviderConfigError);
+  });
 });
 
 describe("JiraProvider.postComment", () => {
