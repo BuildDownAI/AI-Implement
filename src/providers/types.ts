@@ -133,6 +133,8 @@ export interface ProviderConfig {
   jiraToken?: string;
   jiraCloudId?: string;
   jiraSiteUrl?: string;
+  /** Service-account email; when set, Jira uses Basic auth (email:token). */
+  jiraEmail?: string;
 }
 
 /** Factory shape for provider modules (used by resolveProvider). */

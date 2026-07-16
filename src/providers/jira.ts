@@ -600,13 +600,25 @@ export function createJiraProviderFromConfig(
   config: ProviderConfig,
   getMappings: () => Record<string, RepoMapping>,
 ): JiraProvider {
-  if (!config.jiraToken || !config.jiraCloudId || !config.jiraSiteUrl) {
-    throw new MissingProviderConfigError("jira", "jiraToken/jiraCloudId/jiraSiteUrl");
+  if (!config.jiraToken || !config.jiraSiteUrl) {
+    throw new MissingProviderConfigError("jira", "jiraToken/jiraSiteUrl");
   }
-  const client = new JiraClient({ token: config.jiraToken, cloudId: config.jiraCloudId });
+  // Auth mode: Basic (email + API token) when jiraEmail is set — the durable
+  // Jira Cloud path; otherwise OAuth Bearer via the gateway, which needs cloudId.
+  if (!config.jiraEmail && !config.jiraCloudId) {
+    throw new MissingProviderConfigError("jira", "jiraEmail (API-token auth) or jiraCloudId (OAuth)");
+  }
+  const client = new JiraClient({
+    token: config.jiraToken,
+    email: config.jiraEmail,
+    siteUrl: config.jiraSiteUrl,
+    cloudId: config.jiraCloudId,
+  });
   return new JiraProvider({
     client,
-    cacheScope: config.jiraCloudId,
+    // Field-id cache scope: unique per deployment. Site URL in Basic mode,
+    // cloud id in OAuth mode (one of the two is guaranteed present above).
+    cacheScope: config.jiraEmail ? config.jiraSiteUrl : config.jiraCloudId!,
     siteUrl: config.jiraSiteUrl,
     getMappings,
     onRepoFieldMismatch: (mappingId, issueKey, actualRepo) => {
