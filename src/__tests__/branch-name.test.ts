@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { branchMatchesIssueIdentifier, buildIssueBranchName, buildFeatureBranchName, normalizeBranchPrefix } from "../pipeline/branch-name.js";
+import { branchMatchesIssueIdentifier, buildIssueBranchName, buildFeatureBranchName, buildGroupingBranchName, normalizeBranchPrefix } from "../pipeline/branch-name.js";
 
 describe("buildIssueBranchName", () => {
   it("builds issue-scoped branch names from issue metadata", () => {
@@ -33,6 +33,24 @@ describe("buildFeatureBranchName", () => {
 
   it("falls back defensively for empty identifiers", () => {
     expect(buildFeatureBranchName(undefined)).toBe("ai-implement/feature/parent");
+  });
+});
+
+describe("buildGroupingBranchName", () => {
+  it("uses the mode as the branch path segment", () => {
+    expect(buildGroupingBranchName("AII-219", "feature")).toBe("ai-implement/feature/aii-219");
+    expect(buildGroupingBranchName("AII-219", "multi-issue")).toBe("ai-implement/multi-issue/aii-219");
+  });
+
+  it("slugifies the identifier and falls back for undefined", () => {
+    expect(buildGroupingBranchName("OOL/78", "multi-issue")).toBe("ai-implement/multi-issue/ool-78");
+    expect(buildGroupingBranchName(undefined, "multi-issue")).toBe("ai-implement/multi-issue/parent");
+  });
+
+  it("keeps buildFeatureBranchName byte-identical to the feature mode", () => {
+    for (const id of ["OOL-78", "AII-219", undefined]) {
+      expect(buildFeatureBranchName(id)).toBe(buildGroupingBranchName(id, "feature"));
+    }
   });
 });
 
