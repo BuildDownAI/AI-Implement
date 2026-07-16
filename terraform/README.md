@@ -134,33 +134,20 @@ graph TB
 
 ## First-time bootstrap
 
-**1. Create the state bucket** (once per account — skip if it already exists):
+**1. State bucket — handled automatically by `tf.sh`.**
 
-*PowerShell:*
-```powershell
-$ACCOUNT_ID = aws sts get-caller-identity --query Account --output text --profile <your-profile>
-aws s3api create-bucket --bucket "tfstates-$ACCOUNT_ID" --region us-east-1 --profile <your-profile>
-aws s3api put-bucket-versioning --bucket "tfstates-$ACCOUNT_ID" `
-  --versioning-configuration Status=Enabled --profile <your-profile>
-aws s3api put-bucket-encryption --bucket "tfstates-$ACCOUNT_ID" `
-  --server-side-encryption-configuration '{\"Rules\":[{\"ApplyServerSideEncryptionByDefault\":{\"SSEAlgorithm\":\"AES256\"}}]}' `
-  --profile <your-profile>
-```
+`init` (below) bootstraps the S3 state bucket named in `envs/<env>.backend.hcl`
+if it doesn't already exist, creating it with versioning, AES256 default
+encryption, and a public-access block. It's idempotent — an existing bucket is
+left untouched — and account-scoped, so it only ever touches a bucket you own.
+Set `TF_SKIP_BOOTSTRAP=1` to skip the check (e.g. if the bucket is managed
+elsewhere).
 
-*bash:*
-```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile <your-profile>)
-aws s3api create-bucket --bucket "tfstates-$ACCOUNT_ID" --region us-east-1 --profile <your-profile>
-aws s3api put-bucket-versioning --bucket "tfstates-$ACCOUNT_ID" \
-  --versioning-configuration Status=Enabled --profile <your-profile>
-aws s3api put-bucket-encryption --bucket "tfstates-$ACCOUNT_ID" \
-  --server-side-encryption-configuration \
-  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' \
-  --profile <your-profile>
-```
-
-If this is a brand-new environment, record the bucket name in
-`envs/<env>.backend.hcl`.
+For a brand-new environment, just set the bucket name in
+`envs/<env>.backend.hcl` first; `tf.sh` creates it on init. (To pre-create it by
+hand instead — for example in a locked-down account where the CLI user can't
+create buckets — use `aws s3api create-bucket` + `put-bucket-versioning` +
+`put-bucket-encryption` and then run init with `TF_SKIP_BOOTSTRAP=1`.)
 
 **2. Init:**
 
