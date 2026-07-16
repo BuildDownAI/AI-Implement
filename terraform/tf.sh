@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
 # Environment-aware terraform wrapper. The environment is the only parameter
-# besides the AWS profile — it selects both the state location
+# besides the AWS profile - it selects both the state location
 # (envs/<env>.backend.hcl) and the per-env values (locals.tf env_config).
 #
 # On init (explicit or the auto-init before the first plan/apply of an env),
 # it bootstraps the S3 state bucket named in envs/<env>.backend.hcl if it does
-# not already exist — creating it with versioning, AES256 default encryption,
+# not already exist - creating it with versioning, AES256 default encryption,
 # and a public-access block. This is idempotent: if the bucket is already
 # present it is left untouched. Set TF_SKIP_BOOTSTRAP=1 to skip the check.
 #
@@ -67,7 +67,7 @@ ensure_state_bucket() {
     exit 1
   fi
   # S3 bucket names are lowercase; an unfilled placeholder (e.g.
-  # tfstates-PROD-ACCOUNT-ID) contains illegal characters — fail clearly.
+  # tfstates-PROD-ACCOUNT-ID) contains illegal characters - fail clearly.
   if [[ "$bucket" =~ [^a-z0-9.-] ]]; then
     echo "State bucket '$bucket' in $BACKEND_FILE looks like an unfilled placeholder." >&2
     echo "Set a real, lowercase bucket name for '$ENV' before init." >&2
@@ -80,7 +80,7 @@ ensure_state_bucket() {
     || { echo "Failed to list S3 buckets (check AWS_PROFILE='$AWS_PROFILE')." >&2; exit 1; }
   [[ "$existing" == "$bucket" ]] && return 0
 
-  echo "[$ENV] state bucket '$bucket' not found; creating in $region…" >&2
+  echo "[$ENV] state bucket '$bucket' not found; creating in $region..." >&2
   if [[ "$region" == "us-east-1" ]]; then
     aws s3api create-bucket --bucket "$bucket" --region "$region" \
       --profile "$AWS_PROFILE" >/dev/null

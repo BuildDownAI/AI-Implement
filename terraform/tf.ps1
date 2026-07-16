@@ -4,7 +4,7 @@
   Environment-aware terraform wrapper.
 
 .DESCRIPTION
-  The environment is the only parameter besides the AWS profile — it selects
+  The environment is the only parameter besides the AWS profile - it selects
   both the state location (envs/<env>.backend.hcl) and the per-env values
   (locals.tf env_config).
 
@@ -76,7 +76,7 @@ function Initialize-StateBucket {
   }
   if ($existing -eq $bucket) { return }
 
-  Write-Host "[$Env] state bucket '$bucket' not found; creating in $region…" -ForegroundColor DarkGray
+  Write-Host "[$Env] state bucket '$bucket' not found; creating in $region..." -ForegroundColor DarkGray
   if ($region -eq 'us-east-1') {
     aws s3api create-bucket --bucket $bucket --region $region --profile $env:AWS_PROFILE | Out-Null
   } else {
