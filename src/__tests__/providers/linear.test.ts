@@ -263,7 +263,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       ]);
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       const leaf = snap.readyForImplementation.find((i) => i.id === "leaf")!;
-      expect(leaf.featureBranchChain).toEqual(["OOL-78"]);
+      expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
     });
 
     it("a leaf under an UNlabeled parent gets no chain (PRs to base)", async () => {
@@ -296,7 +296,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       const leaf = snap.needsPlanning.find((i) => i.id === "leaf")!;
       // base-most first
-      expect(leaf.featureBranchChain).toEqual(["OOL-78", "OOL-96"]);
+      expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]);
     });
 
     it("skips a feature-node parent while any AI-Implement child is in flight", async () => {
@@ -331,7 +331,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       ]);
       const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
       const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
-      expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+      expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
     });
 
     it("skips a labeled parent whose children are not yet AI-Implement (race guard)", async () => {
@@ -416,16 +416,16 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
   it("returns feature nodes with parent target; non-feature parent → null (base)", async () => {
     mockResponse([
       { identifier: "OOL-107", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("AI-Implement") }] },
+        children: { nodes: [{ identifier: "OOL-child1", labels: labels("AI-Implement") }] },
         parent: { identifier: "OOL-106", labels: labels("AI-Implement") } },
       { identifier: "OOL-106", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("AI-Implement") }] },
+        children: { nodes: [{ identifier: "OOL-child2", labels: labels("AI-Implement") }] },
         parent: null },
     ]);
     const rollUps = await new LinearProvider({ linearApiKey: "k" }).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([
-      { identifier: "OOL-107", scopeKey: "OOL", parentIdentifier: "OOL-106" },
-      { identifier: "OOL-106", scopeKey: "OOL", parentIdentifier: null },
+      { identifier: "OOL-107", scopeKey: "OOL", mode: "feature", parent: { identifier: "OOL-106", mode: "feature" }, childIdentifiers: ["OOL-child1"] },
+      { identifier: "OOL-106", scopeKey: "OOL", mode: "feature", parent: null, childIdentifiers: ["OOL-child2"] },
     ]);
   });
 

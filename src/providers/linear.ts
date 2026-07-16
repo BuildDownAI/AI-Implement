@@ -1,5 +1,6 @@
 import type {
   AIImplementSnapshot,
+  FeatureBranchChainEntry,
   FeatureNodeRollUp,
   IssueLifecycleState,
   TicketIssue,
@@ -35,13 +36,13 @@ type AncestorNode = {
  * branches this issue's PR should cascade through. The walk stops at the first unlabeled
  * ancestor (its child cuts from the base branch, not a feature branch).
  */
-function labeledAncestorChain(parent: AncestorNode): string[] {
-  const collected: string[] = [];
+function labeledAncestorChain(parent: AncestorNode): FeatureBranchChainEntry[] {
+  const collected: FeatureBranchChainEntry[] = [];
   let node = parent;
   while (node) {
     const hasLabel = (node.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
     if (!hasLabel) break;
-    collected.push(node.identifier);
+    collected.push({ identifier: node.identifier, mode: "feature" });
     node = node.parent ?? null;
   }
   return collected.reverse();
@@ -291,7 +292,7 @@ export class LinearProvider implements TicketingProvider {
       const aiChildren = children.filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL));
       const ancestorChain = labeledAncestorChain(issue.parent);
 
-      let featureBranchChain: string[] | undefined;
+      let featureBranchChain: FeatureBranchChainEntry[] | undefined;
       if (children.length === 0) {
         // Leaf.
         featureBranchChain = ancestorChain.length > 0 ? ancestorChain : undefined;
@@ -304,7 +305,7 @@ export class LinearProvider implements TicketingProvider {
           continue;
         }
         // All AI-Implement children done — implement the parent's closing work onto its own branch.
-        featureBranchChain = [...ancestorChain, issue.identifier];
+        featureBranchChain = [...ancestorChain, { identifier: issue.identifier, mode: "feature" }];
       } else {
         console.log(`[linear] Skipping ${issue.identifier}: parent labeled but no child has AI-Implement set yet`);
         continue;
@@ -344,7 +345,7 @@ export class LinearProvider implements TicketingProvider {
           id: string;
           identifier: string;
           team: { key: string };
-          children: { nodes: Array<{ labels: { nodes: Array<{ name: string }> } }> };
+          children: { nodes: Array<{ identifier: string; labels: { nodes: Array<{ name: string }> } }> };
           parent: { identifier: string; labels: { nodes: Array<{ name: string }> } } | null;
         }>;
       };
@@ -362,7 +363,7 @@ export class LinearProvider implements TicketingProvider {
             id
             identifier
             team { key }
-            children(first: 50) { nodes { labels { nodes { name } } } }
+            children(first: 50) { nodes { identifier labels { nodes { name } } } }
             parent { identifier labels { nodes { name } } }
           }
         }
@@ -372,17 +373,19 @@ export class LinearProvider implements TicketingProvider {
 
     const rollUps: FeatureNodeRollUp[] = [];
     for (const node of data.issues?.nodes ?? []) {
-      const isFeatureNode = (node.children?.nodes ?? []).some((c) =>
+      const aiChildren = (node.children?.nodes ?? []).filter((c) =>
         (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
       );
-      if (!isFeatureNode) continue;
+      if (aiChildren.length === 0) continue;
       const parentIsFeatureNode =
         !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
       rollUps.push({
         issueId: node.id,
         identifier: node.identifier,
         scopeKey: node.team.key,
-        parentIdentifier: parentIsFeatureNode ? node.parent!.identifier : null,
+        mode: "feature",
+        parent: parentIsFeatureNode ? { identifier: node.parent!.identifier, mode: "feature" } : null,
+        childIdentifiers: aiChildren.map((c) => c.identifier),
       });
     }
     return rollUps;

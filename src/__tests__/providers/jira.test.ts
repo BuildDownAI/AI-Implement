@@ -742,7 +742,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     ]);
     const snap = await makeProvider(client).fetchAIImplementSnapshot();
     const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-96")!;
-    expect(leaf.featureBranchChain).toEqual(["OOL-78"]);
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
     expect(leaf.parentRef).toEqual({ identifier: "OOL-78" });
   });
 
@@ -767,7 +767,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     ]);
     const snap = await makeProvider(client).fetchAIImplementSnapshot();
     const leaf = snap.needsPlanning.find((i) => i.identifier === "OOL-99")!;
-    expect(leaf.featureBranchChain).toEqual(["OOL-78", "OOL-96"]);
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]);
   });
 
   it("skips a feature-node parent while any designated child is in flight", async () => {
@@ -800,7 +800,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     ]);
     const snap = await makeProvider(client).fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
-    expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+    expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
   });
 
   it("treats a child merged via markMerged (custom status Merged, native status not done) as terminal", async () => {
@@ -819,7 +819,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     ]);
     const snap = await makeProvider(client).fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
-    expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+    expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
   });
 
   it("skips a parent whose children are not yet designated (race guard)", async () => {
@@ -940,7 +940,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — Epic Link hierarchy (classic
     ]);
     const snap = await provider(c).fetchAIImplementSnapshot();
     const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-S")!;
-    expect(leaf.featureBranchChain).toEqual(["OOL-EP"]);
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-EP", mode: "feature" }]);
     expect(leaf.parentRef).toEqual({ identifier: "OOL-EP" });
   });
 
@@ -950,7 +950,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — Epic Link hierarchy (classic
       { when: /parent in/, issues: [issue("OOL-S", "PR Ready", "acme/x", { epicLink: "OOL-EP", statusCategory: "done" })] },
     ]);
     const rollUps = await provider(c).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-EP", identifier: "OOL-EP", scopeKey: "m1", parentIdentifier: null }]);
+    expect(rollUps).toEqual([{ issueId: "id-OOL-EP", identifier: "OOL-EP", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-S"] }]);
   });
 });
 
@@ -994,7 +994,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
       { when: /key in/, issues: [issue("OOL-78", "Ready", "acme/x", null)] },                       // parent is designated
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", parentIdentifier: "OOL-78" }]);
+    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: { identifier: "OOL-78", mode: "feature" }, childIdentifiers: ["OOL-90-c"] }]);
   });
 
   it("top-of-tree feature node → parentIdentifier null (human feature→base PR)", async () => {
@@ -1003,7 +1003,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
       { when: /parent in/, issues: [issue("OOL-78-c", "PR Ready", "acme/x", "OOL-78")] },
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1", parentIdentifier: null }]);
+    expect(rollUps).toEqual([{ issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-78-c"] }]);
   });
 
   it("excludes completed issues that are not feature nodes (no designated children)", async () => {
@@ -1029,7 +1029,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
       { when: /key in/, issues: [issue("OOL-70", "", "acme/x", null)] },
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", parentIdentifier: null }]);
+    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-90-c"] }]);
   });
 });
 

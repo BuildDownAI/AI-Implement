@@ -1,7 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import type { FeatureNodeRollUp } from "./providers/types.js";
 import { getInstallationToken } from "./github-app-auth.js";
-import { buildFeatureBranchName } from "./pipeline/branch-name.js";
+import { buildGroupingBranchName } from "./pipeline/branch-name.js";
 import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBranches, mergeBranch } from "./github.js";
 
 /**
@@ -10,13 +10,13 @@ import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBran
  * When a feature-node issue completes, its feature branch should be merged into its
  * parent's branch:
  *
- *   - parent is a feature node → **direct git merge** `feature/<child>` into
- *     `feature/<parent>` (no PR). A PR's base-branch name and title encode the parent's
- *     identifier, so Linear's GitHub integration would auto-link the roll-up to the
+ *   - parent is a grouping node → **direct git merge** `ai-implement/<mode>/<child>` into
+ *     `ai-implement/<mode>/<parent>` (no PR). A PR's base-branch name and title encode the
+ *     parent's identifier, so Linear's GitHub integration would auto-link the roll-up to the
  *     parent issue and falsely mark it Done on merge — before its own closing work runs.
  *     A plain merge commit with no identifiers avoids that.
- *   - no feature-node parent (top of the tree) → open a `feature/<top>` → base PR and
- *     leave it for a human to review and merge (never auto-merged).
+ *   - no grouping parent (top of the tree) → open a `ai-implement/<mode>/<top>` → base PR
+ *     and leave it for a human to review and merge (never auto-merged).
  *
  * Idempotent: a branch already merged into its target (0 commits ahead) is skipped, so
  * re-running each poll cycle is cheap and safe. Fails soft per roll-up — one failure
@@ -51,12 +51,12 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
   const { owner, repo } = mapping;
   const ghToken = await getInstallationToken(deps.githubAppId, deps.githubAppPrivateKey, owner);
 
-  const branch = buildFeatureBranchName(rollUp.identifier);
-  const target = rollUp.parentIdentifier
-    ? buildFeatureBranchName(rollUp.parentIdentifier)
+  const branch = buildGroupingBranchName(rollUp.identifier, rollUp.mode);
+  const target = rollUp.parent
+    ? buildGroupingBranchName(rollUp.parent.identifier, rollUp.parent.mode)
     : mapping.defaultBranch;
 
-  if (rollUp.parentIdentifier !== null) {
+  if (rollUp.parent !== null) {
     // Internal roll-up → direct merge, no PR (avoids Linear linking the roll-up to the
     // parent issue). Commit message is intentionally free of issue identifiers / magic words.
     const ahead = await compareBranches(ghToken, owner, repo, target, branch);
@@ -101,13 +101,17 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
   // No PR yet — open one if the branch has commits not yet in the base.
   const ahead = await compareBranches(ghToken, owner, repo, target, branch);
   if (ahead === null || ahead === 0) return; // branch missing or fully merged by ancestry
+  const grouped = rollUp.childIdentifiers.length
+    ? `\n\nGrouped issues:\n${rollUp.childIdentifiers.map((id) => `- ${id}`).join("\n")}`
+    : "";
   const newPr = await createPullRequest(ghToken, owner, repo, {
     head: branch,
     base: target,
     title: "[ai-implement] Feature branch ready for review",
     body:
-      "Automated feature-branch grouping: this feature branch's work is complete and ready " +
-      "to merge into the base branch. Opened for human review.",
+      "Automated feature-branch grouping: this branch's work is complete and ready " +
+      "to merge into the base branch. Opened for human review." +
+      grouped,
   });
   console.log(`[merge-up] Opened feature→base PR ${newPr.url} for ${rollUp.identifier} (awaiting human merge)`);
 }
