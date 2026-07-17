@@ -1,5 +1,6 @@
 # AI-Implement — Codebase Guide
 
+
 ## What this is
 
 A Node.js service that polls Linear for issues labeled "AI-Implement" and dispatches GitHub Actions workflows that run Claude Code to implement them. It also provides an admin UI and manages workflow templates synced to target repos.
