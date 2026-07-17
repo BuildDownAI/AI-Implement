@@ -253,7 +253,7 @@ function buildPullRequestBody(
     "",
     `Fixes ${issueIdentifier}`,
     "",
-    "Generated with AI-Implement",
+    `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
   ].join("\n");
 }
 

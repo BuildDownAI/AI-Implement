@@ -241,6 +241,69 @@ describe("pushStep", () => {
     expect(body.body).not.toContain("## AI review");
   });
 
+  it("footer includes harness, model, and provider with explicit values", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext({ model: "claude-opus-4-5", provider: "bedrock" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("Generated with AI-Implement · harness: Claude Code · model: claude-opus-4-5 · provider: bedrock");
+  });
+
+  it("footer degrades to model: unknown when model is absent", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("Generated with AI-Implement");
+    expect(body.body).toContain("model: unknown");
+  });
+
+  it("footer defaults to provider: anthropic when provider is absent", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext({ model: "claude-sonnet-4-6" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("provider: anthropic");
+  });
+
+  it("footer includes Bedrock ARN-style model ID verbatim", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    const bedrockModel = "anthropic.claude-opus-4-5-20260101-v1:0";
+    await pushStep.run(makeContext({ model: bedrockModel, provider: "bedrock" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain(`model: ${bedrockModel}`);
+    expect(body.body).toContain("provider: bedrock");
+  });
+
   it("checks out implementation branch and commits working tree changes before pushing", async () => {
     mockGitSuccess("abc123");
     vi.mocked(fetch).mockResolvedValueOnce({
