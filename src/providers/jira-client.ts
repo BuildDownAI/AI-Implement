@@ -74,15 +74,29 @@ export class JiraClient {
   }
 
   private async rawRequest(method: string, path: string, body?: unknown): Promise<Response> {
-    const res = await fetch(`${this.apiBase}${path}`, {
-      method,
-      headers: {
-        Authorization: this.authHeader,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    const url = `${this.apiBase}${path}`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: this.authHeader,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+    } catch (err) {
+      // Node/undici throws a generic "fetch failed" TypeError for anything below
+      // the HTTP layer (DNS, TLS, connection refused, timeout) — the actual reason
+      // lives in `err.cause`, which is otherwise silently dropped by callers that
+      // only read `err.message`. Fold it into the message and log server-side so
+      // it survives round-tripping through the admin API as a JSON error string.
+      const cause = err instanceof Error && err.cause instanceof Error ? err.cause.message : undefined;
+      const detail = cause ?? (err instanceof Error ? err.message : String(err));
+      console.error(`[jira-client] ${method} ${url} network error: ${detail}`);
+      throw new Error(`Jira ${method} ${path} failed before receiving a response: ${detail}`);
+    }
     if (!res.ok) {
       const text = await res.text();
       throw new JiraApiError(
