@@ -1,3 +1,11 @@
+import type { FeatureBranchMode } from "../pipeline/branch-name.js";
+
+/** One rung of a feature-branch grouping chain → branch `ai-implement/<mode>/<identifier>`. */
+export interface FeatureBranchChainEntry {
+  identifier: string;
+  mode: FeatureBranchMode;
+}
+
 /** A ticket issue, normalized across providers. */
 export interface TicketIssue {
   /** Provider-internal ID (Linear UUID, Jira issue ID). */
@@ -22,16 +30,19 @@ export interface TicketIssue {
   /**
    * Feature-branch grouping chain, set by the Linear and Jira providers for dispatchable issues.
    *
-   * An ordered list of issue identifiers (base-most first). Each names a feature branch
-   * `ai-implement/feature/<id>` that must exist before this issue dispatches; each branch
-   * is cut from the previous entry's branch (or mapping.defaultBranch for the first). This
-   * issue's PR targets the LAST entry's branch. Absent/empty → PR targets mapping.defaultBranch.
+   * Ordered base-most first. Each entry names a grouping branch `ai-implement/<mode>/<identifier>`
+   * that must exist before this issue dispatches; each branch is cut from the previous entry's
+   * branch (or mapping.defaultBranch for the first). This issue's PR targets the LAST entry's
+   * branch. Absent/empty → PR targets mapping.defaultBranch.
    *
-   * For a leaf the chain ends at its nearest feature-node ancestor; for a feature-node parent
-   * whose AI-Implement children are all complete, the chain ends at the parent itself (its
-   * closing work lands on its own feature branch). See src/feature-branch.ts.
+   * Entries carry `mode` because a branch name is NOT derivable from an identifier alone —
+   * an ancestor's mode comes from its own ai-implement.yml, which only the provider can read.
+   *
+   * For a leaf the chain ends at its nearest grouping ancestor; for a grouping parent whose
+   * AI-Implement children are all terminal, the chain ends at the parent itself (its closing
+   * work lands on its own branch). See src/feature-branch.ts.
    */
-  featureBranchChain?: string[];
+  featureBranchChain?: FeatureBranchChainEntry[];
   /** AI-Implement Profiles selections from the Jira multi-select field. Jira-only; absent for
    *  Linear issues and for Jira issues without the field or with an empty selection. */
   profiles?: string[];
@@ -44,24 +55,26 @@ export interface AIImplementSnapshot {
 }
 
 /**
- * A completed feature-node issue whose feature branch should be rolled up into its
- * parent (see src/merge-up.ts). Produced by the provider from recently-completed
- * AI-Implement issues that have at least one AI-Implement child.
+ * A grouping issue whose branch should be rolled up (see src/merge-up.ts). Produced by the
+ * provider from recently-completed AI-Implement issues that have at least one AI-Implement child.
  */
 export interface FeatureNodeRollUp {
   /** Provider-internal ID (Linear UUID) — passed to markMerged when the top-of-tree PR is detected as merged. */
   issueId: string;
-  /** The feature node's identifier → branch `ai-implement/feature/<identifier>`. */
+  /** The grouping node's identifier. */
   identifier: string;
   /** Capacity/scope bucket (team key) — used to resolve the repo mapping. */
   scopeKey: string;
+  /** This node's grouping mode → its branch is `ai-implement/<mode>/<identifier>`. */
+  mode: FeatureBranchMode;
   /**
-   * Parent identifier when the parent is itself a feature node (the parent has the
-   * AI-Implement label) → roll into `ai-implement/feature/<parent>` and auto-merge.
-   * null when there is no feature-node parent → roll into the mapping's base branch
-   * via a human-reviewed PR (never auto-merged).
+   * The grouping parent, when this node has one → roll into the parent's branch via a direct
+   * auto-merge. null when there is no grouping parent (top of the tree) → roll into the
+   * mapping's base branch via a human-reviewed PR (never auto-merged).
    */
-  parentIdentifier: string | null;
+  parent: { identifier: string; mode: FeatureBranchMode } | null;
+  /** Identifiers of the grouped AI-Implement children — enumerated in the top-of-tree PR body. */
+  childIdentifiers: string[];
 }
 
 export type IssueLifecycleState = "active" | "completed" | "cancelled";
