@@ -211,6 +211,7 @@ export class JiraProvider implements TicketingProvider {
     const needsPlanning: TicketIssue[] = [];
     const readyForImplementation: TicketIssue[] = [];
     const inProgressCountsByScope: Record<string, number> = {};
+    const parentsToFinalize: AIImplementSnapshot["parentsToFinalize"] = [];
 
     for (const [scopeKey, m] of jiraEntries) {
       if (m.ticketingConfig.kind !== "jira") continue;
@@ -262,6 +263,10 @@ export class JiraProvider implements TicketingProvider {
       for (const raw of candidates) {
         const info = chains.get(raw.key);
         if (info?.skip) continue; // feature-node-blocked or waiting-parent
+        if (info?.finalize) {
+          parentsToFinalize.push({ issueId: raw.id, identifier: raw.key, scopeKey });
+          continue;
+        }
         const statusValue = readStatusValue(raw.fields, fieldIds.statusFieldId);
         const ticket = this.toTicketIssue(raw, scopeKey, fieldIds);
         const parentKey = effectiveParentKey(raw.fields, fieldIds);
@@ -277,7 +282,7 @@ export class JiraProvider implements TicketingProvider {
       inProgressCountsByScope[scopeKey] = capacityIssues.length;
     }
 
-    return { needsPlanning, readyForImplementation, inProgressCountsByScope };
+    return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize };
   }
 
   private toTicketIssue(
@@ -315,8 +320,8 @@ export class JiraProvider implements TicketingProvider {
     candidates: import("./jira-client.js").JiraIssue[],
     repoFieldValue: string,
     fieldIds: ResolvedFieldIds,
-  ): Promise<Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[] }>> {
-    const out = new Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[] }>();
+  ): Promise<Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[]; finalize?: boolean }>> {
+    const out = new Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[]; finalize?: boolean }>();
     if (candidates.length === 0) return out;
 
     const designated = (fields: Record<string, unknown>): boolean =>
@@ -419,10 +424,19 @@ export class JiraProvider implements TicketingProvider {
         identifier,
         mode: ancestorMode.get(identifier) ?? "feature",
       }));
-      const mode = parseIssueConfig(descriptionText(cand.fields), cand.key).config.featureBranch.mode;
-      const chain =
-        cls.kind === "feature-node-ready" ? [...entries, { identifier: cand.key, mode }] : entries;
-      out.set(cand.key, { skip: false, chain });
+      const parsedCand = parseIssueConfig(descriptionText(cand.fields), cand.key);
+      const mode = parsedCand.config.featureBranch.mode;
+      if (cls.kind === "feature-node-ready") {
+        const isBlankSpec = !parsedCand.description || parsedCand.description.trim() === "";
+        if (isBlankSpec) {
+          console.log(`[jira] Finalizing empty grouping parent ${cand.key} (no own work)`);
+          out.set(cand.key, { skip: false, finalize: true });
+          continue;
+        }
+        out.set(cand.key, { skip: false, chain: [...entries, { identifier: cand.key, mode }] });
+      } else {
+        out.set(cand.key, { skip: false, chain: entries });
+      }
     }
     return out;
   }
