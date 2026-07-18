@@ -102,7 +102,7 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
   const ahead = await compareBranches(ghToken, owner, repo, target, branch);
   if (ahead === null || ahead === 0) return; // branch missing or fully merged by ancestry
   const grouped = rollUp.childIdentifiers.length
-    ? `\n\nGrouped issues:\n${rollUp.childIdentifiers.map((id) => `- ${id}`).join("\n")}`
+    ? `\n\nGrouped issues: ${rollUp.childIdentifiers.join(", ")}`
     : "";
   const newPr = await createPullRequest(ghToken, owner, repo, {
     head: branch,
