@@ -52,6 +52,9 @@ export interface AIImplementSnapshot {
   needsPlanning: TicketIssue[];
   readyForImplementation: TicketIssue[];
   inProgressCountsByScope: Record<string, number>;
+  /** Grouping parents with all-terminal children but a blank stripped description — finalize via
+   *  markMerged instead of dispatching an implement pass with an empty spec. */
+  parentsToFinalize: Array<{ issueId: string; identifier: string; scopeKey: string }>;
 }
 
 /**

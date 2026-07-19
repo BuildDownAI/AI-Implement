@@ -431,7 +431,7 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
   if (providers.length === 0) {
-    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {} };
+    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
   }
   const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
   return {
@@ -443,6 +443,7 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
       }
       return acc;
     }, {}),
+    parentsToFinalize: snapshots.flatMap((s) => s.parentsToFinalize),
   };
 }
 

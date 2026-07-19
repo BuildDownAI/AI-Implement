@@ -324,6 +324,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
+          description: "Closing work spec.",
           children: [
             { labels: ["AI-Implement"], stateType: "completed" },
             { labels: ["AI-Implement"], stateType: "canceled" },
@@ -403,7 +404,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           id: "parent",
           identifier: "OOL-78",
           labels: ["AI-Implement"],
-          description: MULTI_YML,
+          description: `Closing work spec.\n\n${MULTI_YML}`,
           children: [
             { labels: ["AI-Implement"], stateType: "completed" },
             { labels: ["AI-Implement"], stateType: "canceled" },
@@ -432,6 +433,66 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
       expect(parent.description).toBe("Group of unrelated work.");
       expect(parent.description).not.toContain("feature_branch");
+    });
+
+    it("finalizes an empty-spec grouping parent (null description) instead of dispatching", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          description: null,
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+            { labels: ["AI-Implement"], stateType: "canceled" },
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
+      expect(snap.parentsToFinalize).toEqual([
+        { issueId: "parent", identifier: "OOL-78", scopeKey: "ENG" },
+      ]);
+    });
+
+    it("finalizes an empty-spec grouping parent (ai-implement.yml-only description) instead of dispatching", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          description: MULTI_YML,
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
+      expect(snap.parentsToFinalize).toEqual([
+        { issueId: "parent", identifier: "OOL-78", scopeKey: "ENG" },
+      ]);
+    });
+
+    it("dispatches a non-empty-spec grouping parent normally (no regression)", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          description: "## Do the work\n\nActual spec here.",
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+            { labels: ["AI-Implement"], stateType: "canceled" },
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({ linearApiKey: "k" }).fetchAIImplementSnapshot();
+      const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
+      expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
+      expect(snap.parentsToFinalize).toEqual([]);
     });
   });
 
