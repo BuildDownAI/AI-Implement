@@ -34,23 +34,15 @@ if [ "$AI_IMPLEMENT_MODE" = "gha" ]; then
   GITHUB_OWNER="${GITHUB_REPOSITORY%%/*}"
   GITHUB_REPO="${GITHUB_REPOSITORY#*/}"
 else
-  require_env GITHUB_APP_ID GITHUB_APP_PRIVATE_KEY GITHUB_OWNER GITHUB_REPO
+  require_env GITHUB_TOKEN GITHUB_OWNER GITHUB_REPO
 fi
 export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
 export GITHUB_OWNER GITHUB_REPO
 export PR_NUMBER="${PR_NUMBER:-}"
 
 # ── 3. Token acquisition ─────────────────────────────────────────────────────
-if [ "$AI_IMPLEMENT_MODE" = "gha" ]; then
-  log "Using GITHUB_TOKEN from GHA"
-  export GH_TOKEN="$GITHUB_TOKEN"
-else
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR/token-refresh.sh"
-  GITHUB_TOKEN=$(cat /tmp/github-token)
-  export GITHUB_TOKEN
-  export GH_TOKEN="$GITHUB_TOKEN"
-fi
+# Both GHA (workflow-minted) and fly/local (orchestrator-minted) receive GITHUB_TOKEN directly.
+export GH_TOKEN="$GITHUB_TOKEN"
 
 # ── 4. Git config + clone ────────────────────────────────────────────────────
 if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then

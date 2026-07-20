@@ -599,6 +599,8 @@ async function dispatchPlanning(
           DEPENDENCIES: planningContextInputs.dependencies,
         };
 
+        // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
+        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
         if (execPath === "fly-machines") {
           const minSecretsVersion = getFlySecretsMinVersion();
           let allSecretNames: string[] = [];
@@ -609,7 +611,6 @@ async function dispatchPlanning(
             console.warn(`[poll] Failed to fetch app secrets for ${issue.identifier}, proceeding without team secrets:`, err);
           }
 
-          const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
           const { image: resolvedImage, source: imageSource } = await resolveSessionImage({
             owner: mapping.owner,
             repo: mapping.repo,
@@ -628,8 +629,7 @@ async function dispatchPlanning(
             defaultBranch: mapping.defaultBranch,
             anthropicApiKey: config.anthropicApiKey ?? undefined,
             claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-            githubAppId: config.githubAppId,
-            githubAppPrivateKey: config.githubAppPrivateKey,
+            githubToken: ghToken,
             sessionToken,
             machineNonce,
             phase: "planning",
@@ -680,8 +680,7 @@ async function dispatchPlanning(
             defaultBranch: mapping.defaultBranch,
             anthropicApiKey: config.anthropicApiKey ?? undefined,
             claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-            githubAppId: config.githubAppId,
-            githubAppPrivateKey: config.githubAppPrivateKey,
+            githubToken: ghToken,
             sessionToken,
             machineNonce,
             phase: "planning",
@@ -996,8 +995,7 @@ async function dispatchFlyMachine(
         defaultBranch: baseBranch,
         anthropicApiKey: config.anthropicApiKey ?? undefined,
         claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
+        githubToken: ghToken,
         sessionToken,
         machineNonce,
         sessionMode: mapping.sessionMode,
@@ -1068,6 +1066,8 @@ async function dispatchLocalDocker(
         config.runnerCallbackBaseUrl ??
         `http://host.docker.internal:${config.healthPort}`;
 
+      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
       const container = await startLocalRunnerContainer({
         image: config.localRunnerImage,
         issueId: issue.id,
@@ -1079,8 +1079,7 @@ async function dispatchLocalDocker(
         defaultBranch: baseBranch,
         anthropicApiKey: config.anthropicApiKey ?? undefined,
         claudeOAuthToken: config.claudeOAuthToken ?? undefined,
-        githubAppId: config.githubAppId,
-        githubAppPrivateKey: config.githubAppPrivateKey,
+        githubToken: ghToken,
         sessionToken,
         machineNonce,
         sessionMode: mapping.sessionMode,
