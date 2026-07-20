@@ -158,7 +158,6 @@ export interface AdminConfig {
   flySessionsToken: string | null;
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
-  linearApiKey: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
 }
@@ -394,7 +393,7 @@ export function handleAdminRequest(
 
     if (url === "/api/admin/config-status" && method === "GET") {
       json(res, 200, {
-        linear: !!process.env.LINEAR_API_KEY,
+        linear: !!(process.env.LINEAR_CLIENT_ID && process.env.LINEAR_CLIENT_SECRET),
         jira: !!(process.env.JIRA_TOKEN && process.env.JIRA_CLOUD_ID && process.env.JIRA_SITE_URL),
         jiraSiteUrl: process.env.JIRA_SITE_URL ?? null,
         runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),

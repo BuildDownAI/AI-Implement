@@ -20,7 +20,6 @@ const baseInput: LocalRunnerInput = {
   githubAppPrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
   sessionToken: "session-token",
   machineNonce: "nonce-123",
-  linearApiKey: "lin_api_test",
   anthropicApiKey: "sk-ant-test",
   orchestratorUrl: "http://host.docker.internal:8080",
 };
@@ -35,7 +34,6 @@ describe("buildLocalRunnerEnv", () => {
     expect(env.GITHUB_OWNER).toBe("BuildDownAI");
     expect(env.GITHUB_REPO).toBe("AI-Implement");
     expect(env.GITHUB_APP_ID).toBe("12345");
-    expect(env.LINEAR_API_KEY).toBe("lin_api_test");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
     expect(env.ORCHESTRATOR_URL).toBe("http://host.docker.internal:8080");
     expect(env.SESSION_MODE).toBe("autonomous");

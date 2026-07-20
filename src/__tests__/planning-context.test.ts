@@ -1,6 +1,12 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { buildPlanningContextInputs } from "../planning-context.js";
+import { configureLinearAuth, __setLinearTokenForTest } from "../linear-app-auth.js";
 import type { TicketIssue } from "../providers/types.js";
+
+beforeEach(() => {
+  configureLinearAuth("client-id", "client-secret");
+  __setLinearTokenForTest("test-token");
+});
 
 const ISSUE: TicketIssue = {
   id: "issue-123",
@@ -16,7 +22,6 @@ describe("buildPlanningContextInputs", () => {
     const fetchImpl = vi.fn();
     const result = await buildPlanningContextInputs({
       issue: ISSUE,
-      linearApiKey: "lin-key",
       ticketingProviderId: "jira",
       fetchImpl,
     });
@@ -60,7 +65,6 @@ describe("buildPlanningContextInputs", () => {
 
     const result = await buildPlanningContextInputs({
       issue: ISSUE,
-      linearApiKey: "lin-key",
       ticketingProviderId: "linear",
       fetchImpl,
     });
@@ -77,7 +81,6 @@ describe("buildPlanningContextInputs", () => {
     const fetchImpl = vi.fn().mockRejectedValue(new Error("network down"));
     const result = await buildPlanningContextInputs({
       issue: ISSUE,
-      linearApiKey: "lin-key",
       ticketingProviderId: "linear",
       fetchImpl,
     });

@@ -369,7 +369,6 @@ export interface SessionMachineInput {
   owner: string;
   repo: string;
   defaultBranch: string;
-  linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
   githubAppId: string;
@@ -410,9 +409,6 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     RUNNER_PHASE: input.phase ?? "implementation",
   };
 
-  if (input.linearApiKey) {
-    env.LINEAR_API_KEY = input.linearApiKey;
-  }
   if (input.claudeOAuthToken) {
     env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   }

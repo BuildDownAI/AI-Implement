@@ -128,7 +128,6 @@ export interface TicketingProvider {
 
 /** Configuration handed to provider factories. */
 export interface ProviderConfig {
-  linearApiKey?: string;
   linearWorkspaceUrl?: string;
   jiraToken?: string;
   jiraCloudId?: string;

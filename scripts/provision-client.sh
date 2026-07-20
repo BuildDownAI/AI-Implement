@@ -193,7 +193,8 @@ read_private_key() {
   echo "  Set GITHUB_APP_PRIVATE_KEY from $PEM_PATH"
 }
 
-read_secret "LINEAR_API_KEY"             "LINEAR_API_KEY (lin_api_...)" "true"
+read_secret "LINEAR_CLIENT_ID"           "LINEAR_CLIENT_ID (Linear OAuth app client ID)" "true"
+read_secret "LINEAR_CLIENT_SECRET"       "LINEAR_CLIENT_SECRET (Linear OAuth app client secret)" "true"
 read_secret "GITHUB_APP_ID"              "GITHUB_APP_ID (numeric)" "true"
 read_private_key
 read_secret "CLAUDE_CODE_OAUTH_TOKEN"    "CLAUDE_CODE_OAUTH_TOKEN (preferred auth for Claude Code, optional)"

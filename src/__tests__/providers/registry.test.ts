@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ProviderRegistry } from "../../providers/registry.js";
+import { configureLinearAuth } from "../../linear-app-auth.js";
 import type { RepoMapping } from "../../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -32,9 +33,14 @@ const jiraMapping = makeMapping({
   ticketingConfig: { kind: "jira", jql: "project = TEST", repoFieldValue: "acme/test" },
 });
 
+// Linear provider construction now requires the app credential to be configured.
+beforeEach(() => {
+  configureLinearAuth("client-id", "client-secret");
+});
+
 describe("ProviderRegistry", () => {
   it("returns a Linear provider for a Linear mapping", async () => {
-    const reg = new ProviderRegistry({ linearApiKey: "k" }, () => ({}));
+    const reg = new ProviderRegistry({}, () => ({}));
     const p = await reg.forMapping(linearMapping);
     expect(p.id).toBe("linear");
   });
@@ -49,7 +55,7 @@ describe("ProviderRegistry", () => {
   });
 
   it("returns the same Linear provider instance across calls", async () => {
-    const reg = new ProviderRegistry({ linearApiKey: "k" }, () => ({}));
+    const reg = new ProviderRegistry({}, () => ({}));
     const p1 = await reg.forMapping(linearMapping);
     const p2 = await reg.forMapping(linearMapping);
     expect(p1).toBe(p2);
@@ -57,7 +63,7 @@ describe("ProviderRegistry", () => {
 
   it("forAllMappings returns one provider per unique id", async () => {
     const reg = new ProviderRegistry(
-      { linearApiKey: "k", jiraToken: "t", jiraCloudId: "c", jiraSiteUrl: "https://x" },
+      { jiraToken: "t", jiraCloudId: "c", jiraSiteUrl: "https://x" },
       () => ({}),
     );
     const providers = await reg.forAllMappings([linearMapping, linearMapping, jiraMapping]);
@@ -67,7 +73,7 @@ describe("ProviderRegistry", () => {
   it("forAllMappings skips providers whose construction fails", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     // No Jira env, so Jira construction will throw MissingProviderConfigError.
-    const reg = new ProviderRegistry({ linearApiKey: "k" }, () => ({}));
+    const reg = new ProviderRegistry({}, () => ({}));
     const providers = await reg.forAllMappings([linearMapping, jiraMapping]);
     expect(providers).toHaveLength(1);
     expect(providers[0].id).toBe("linear");
@@ -76,7 +82,7 @@ describe("ProviderRegistry", () => {
   });
 
   it("invalidate() drops cached instances", async () => {
-    const reg = new ProviderRegistry({ linearApiKey: "k" }, () => ({}));
+    const reg = new ProviderRegistry({}, () => ({}));
     const p1 = await reg.forMapping(linearMapping);
     reg.invalidate();
     const p2 = await reg.forMapping(linearMapping);
