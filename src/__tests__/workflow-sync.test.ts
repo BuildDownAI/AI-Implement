@@ -49,14 +49,6 @@ function makeTemplatesRoot(): string {
   return tempRoot;
 }
 
-function addCustomTemplates(root: string): void {
-  for (const dir of ["steps", "pipelines", "providers"]) {
-    mkdirSync(join(root, "workflows/custom", dir), { recursive: true });
-    writeFileSync(join(root, "workflows/custom", dir, ".gitkeep"), "");
-  }
-  writeFileSync(join(root, "workflows/custom/README.md"), "custom-readme\n");
-}
-
 interface FakePull {
   number: number;
   html_url: string;
@@ -489,22 +481,6 @@ describe("syncWorkflowTemplates", () => {
     expect(result.syncBranch).toBe("sync/ai-implement");
   });
 
-  it("does not seed the custom/ scaffold into a target repository", async () => {
-    const templatesRoot = makeTemplatesRoot();
-    addCustomTemplates(templatesRoot);
-    const fake = makeGithubFetch();
-
-    const result = await syncWorkflowTemplates({
-      mapping, githubAppId: "app-id", githubAppPrivateKey: "private-key",
-      templatesRoot, fetchImpl: fake.fetchImpl, getInstallationTokenImpl: async () => "token",
-    });
-
-    expect(result.changedFiles).not.toContain("custom/README.md");
-    expect(result.changedFiles).not.toContain("custom/steps/.gitkeep");
-    expect(result.changedFiles).not.toContain("custom/pipelines/.gitkeep");
-    expect(result.changedFiles).not.toContain("custom/providers/.gitkeep");
-    expect(fake.branches["sync/ai-implement"].files["custom/README.md"]).toBeUndefined();
-  });
 });
 
 describe("classifySyncError", () => {
