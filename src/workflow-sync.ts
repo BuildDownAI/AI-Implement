@@ -42,30 +42,6 @@ const SEED_ONCE_FILES = [
     message: "Add PLANNING.md planning template (customise for this repo)",
     description: "Claude planning prompt template; customise this for your repo",
   },
-  {
-    local: "workflows/custom/README.md",
-    remote: "custom/README.md",
-    message: "Add custom/README.md (repo-local override guide)",
-    description: "Guide for repo-local step/pipeline overrides under custom/",
-  },
-  {
-    local: "workflows/custom/steps/.gitkeep",
-    remote: "custom/steps/.gitkeep",
-    message: "Seed custom/steps/ directory",
-    description: "custom/steps/ placeholder (override or add pipeline steps)",
-  },
-  {
-    local: "workflows/custom/pipelines/.gitkeep",
-    remote: "custom/pipelines/.gitkeep",
-    message: "Seed custom/pipelines/ directory",
-    description: "custom/pipelines/ placeholder (override pipeline definitions)",
-  },
-  {
-    local: "workflows/custom/providers/.gitkeep",
-    remote: "custom/providers/.gitkeep",
-    message: "Seed custom/providers/ directory",
-    description: "custom/providers/ placeholder (reserved for provider overrides)",
-  },
 ] as const;
 
 export interface WorkflowSyncOptions {

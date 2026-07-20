@@ -489,7 +489,7 @@ describe("syncWorkflowTemplates", () => {
     expect(result.syncBranch).toBe("sync/ai-implement");
   });
 
-  it("seeds the custom/ scaffold (README + .gitkeep placeholders) on a fresh repo", async () => {
+  it("does not seed the custom/ scaffold into a target repository", async () => {
     const templatesRoot = makeTemplatesRoot();
     addCustomTemplates(templatesRoot);
     const fake = makeGithubFetch();
@@ -499,25 +499,11 @@ describe("syncWorkflowTemplates", () => {
       templatesRoot, fetchImpl: fake.fetchImpl, getInstallationTokenImpl: async () => "token",
     });
 
-    expect(result.changedFiles).toContain("custom/README.md");
-    expect(result.changedFiles).toContain("custom/steps/.gitkeep");
-    expect(result.changedFiles).toContain("custom/pipelines/.gitkeep");
-    expect(result.changedFiles).toContain("custom/providers/.gitkeep");
-    expect(fake.branches["sync/ai-implement"].files["custom/README.md"]).toBe("custom-readme\n");
-  });
-
-  it("does not overwrite custom/README.md when it already exists on base", async () => {
-    const templatesRoot = makeTemplatesRoot();
-    addCustomTemplates(templatesRoot);
-    const fake = makeGithubFetch({ mainFiles: { "custom/README.md": "repo-owned\n" } });
-
-    const result = await syncWorkflowTemplates({
-      mapping, githubAppId: "app-id", githubAppPrivateKey: "private-key",
-      templatesRoot, fetchImpl: fake.fetchImpl, getInstallationTokenImpl: async () => "token",
-    });
-
     expect(result.changedFiles).not.toContain("custom/README.md");
-    expect(fake.branches["sync/ai-implement"].files["custom/README.md"]).toBe("repo-owned\n");
+    expect(result.changedFiles).not.toContain("custom/steps/.gitkeep");
+    expect(result.changedFiles).not.toContain("custom/pipelines/.gitkeep");
+    expect(result.changedFiles).not.toContain("custom/providers/.gitkeep");
+    expect(fake.branches["sync/ai-implement"].files["custom/README.md"]).toBeUndefined();
   });
 });
 
