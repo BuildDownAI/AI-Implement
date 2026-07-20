@@ -223,7 +223,7 @@ Set it as a repository or organization **variable** (Settings → Secrets and va
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
 
-The Projects page **Sync workflows** action always syncs `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml` into the target repo. It seeds `WORKFLOW.md`, `PLANNING.md`, and the `custom/` scaffold (`custom/README.md` plus `.gitkeep` placeholders for `custom/steps/`, `custom/pipelines/`, `custom/providers/`) once, and never overwrites them (each repo owns its prompt templates and customizations after initial setup). `.github/workflows/sync-workflow.yml` remains as a manual fallback, but normal distribution should happen from the orchestrator.
+The Projects page **Sync workflows** action always syncs `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml` into the target repo. It seeds `WORKFLOW.md` and `PLANNING.md` once and never overwrites them. The `custom/` directory is an AI-Implement fork-local extension point; workflow sync never creates or modifies it in a target repository. `.github/workflows/sync-workflow.yml` remains as a manual fallback, but normal distribution should happen from the orchestrator.
 
 ### Model IDs are passed through verbatim
 
@@ -306,7 +306,8 @@ Both functions search two custom roots in order, then fall back to the built-in 
 
 ### Rules
 
-- The orchestrator **never** overwrites any file under `custom/` except `custom/README.md`.
+- `custom/` belongs to an AI-Implement fork, not a target repository: workflow sync never creates or overwrites it in target repos.
+- Upstream changes preserve fork-owned files under `custom/`; only `custom/README.md` may be maintained upstream.
 - A CI check (`protect-custom.yml`) rejects upstream PRs that touch other `custom/` files.
 - When implementing client-specific behaviour, **always place new files in `custom/`** rather than modifying built-in modules — this keeps the fork rebasing cleanly on upstream changes.
 - A `custom/` file that exists but has no `default` export produces a warning and falls back to the built-in rather than silently misbehaving.
