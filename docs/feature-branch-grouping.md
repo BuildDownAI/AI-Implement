@@ -14,8 +14,8 @@ This is the operator/developer reference. The decision history lives in
 A Linear issue tree maps onto a tree of git branches:
 
 - A **parent issue** that carries the `AI-Implement` label *and* has at least one
-  `AI-Implement` child becomes a **feature node**. It owns a long-running feature branch
-  `ai-implement/feature/<issue-key>`.
+  `AI-Implement` child becomes a **feature node**. It owns a long-running shared branch
+  `ai-implement/<mode>/<issue-key>` (mode defaults to `feature` — see §5).
 - Its **labelled children** are worked on and open PRs **into that feature branch**, not
   into the repo's base branch.
 - Unlabelled children are ignored until they too get the `AI-Implement` label — so you can
@@ -72,6 +72,9 @@ classifies each one (`src/providers/linear.ts`, `fetchAIImplementSnapshot`):
 | **≥1 `AI-Implement` child, all terminal** | **feature node (ready)** | dispatched; its own closing work lands on its own feature branch |
 | **has children but none `AI-Implement` yet** | **waiting parent** | skipped — race guard (see below) |
 
+This classification and the label lifecycle above apply identically to both `feature` and
+`multi-issue` mode — the grouping mode affects only the shared branch name (§4).
+
 ### The race guard
 
 If you label a parent **before** its children, the parent has children but none carry
@@ -92,8 +95,12 @@ a cancelled child doesn't block the parent forever.
 
 ## 4. Feature branches: naming and the cascade
 
-- Branch name: `ai-implement/feature/<issue-key-slug>` (`buildFeatureBranchName` in
-  `src/pipeline/branch-name.ts`).
+- Branch name: `ai-implement/<mode>/<issue-key-slug>` (`buildGroupingBranchName` in
+  `src/pipeline/branch-name.ts`), where `<mode>` is the grouping mode read from the
+  parent's `ai-implement.yml` block (see §5) — `"feature"` by default. The two modes
+  (`"feature"` and `"multi-issue"`) differ **only** in this path segment; everything else
+  about grouping — dispatch gating, base-branch resolution, roll-up, and lifecycle — is
+  identical for both.
 - The provider attaches an ordered `featureBranchChain` (base-most first) to each
   dispatchable issue (`TicketIssue.featureBranchChain` in `src/providers/types.ts`). For a
   leaf it ends at the nearest feature-node ancestor; for a ready feature node it ends at
@@ -112,7 +119,64 @@ grouping**.
 
 ---
 
-## 5. Roll-up (the merge-up)
+## 5. `ai-implement.yml` — per-issue grouping config
+
+A parent issue can embed a fenced code block in its description to configure the
+orchestrator. Today the only config key is `feature_branch.mode`, which selects the
+grouping branch path segment.
+
+This is a general-purpose issue-config channel; `feature_branch` is its first key. Future
+per-issue settings will extend this block without changing the discovery logic.
+
+### Schema
+
+```
+# ai-implement.yml (example)
+feature_branch:
+  mode: "multi-issue"   # "feature" (default) | "multi-issue"
+```
+
+`feature_branch.mode` selects the branch path segment for the parent's shared branch —
+`ai-implement/feature/<key>` or `ai-implement/multi-issue/<key>`. Any unrecognized value
+(or an absent block) silently defaults to `"feature"`.
+
+### Block selection
+
+The **first fenced code block** in the description whose **first non-blank line** is
+exactly `# ai-implement.yml` wins. The fence info string is **not** the selector —
+` ```yaml `, ` ```yml `, and bare ` ``` ` all work equally. The marker must be the first
+non-blank content line inside the block; the YAML comment syntax (`# ...`) ensures it is
+ignored by the YAML parser and survives Jira's ADF-to-plaintext pipeline verbatim.
+
+> **Examples in docs:** use `# ai-implement.yml (example)` as the marker line (extra text
+> after `yml` prevents the block from matching the selector pattern), as shown in the schema
+> example above.
+
+### Strip-from-description behaviour
+
+A matched block is **always stripped** from `TicketIssue.description` before the runner
+sees it, even when the block is broken YAML. Config is orchestrator metadata, not
+implementation spec — removing it prevents the agent from trying to create or manage the
+configuration file as part of the work. An unmatched block is never touched.
+
+### Fail-open ladder
+
+Every failure path silently resolves to `"feature"` mode so no dispatch is ever blocked by
+a config error:
+
+| Condition | Outcome |
+|-----------|---------|
+| No marked block found in description | `feature` mode (no warning) |
+| Marked block present, YAML invalid | `feature` mode + `[issue-config]` warning |
+| Marked block present, no `feature_branch` key | `feature` mode (no warning) |
+| `feature_branch` is not a mapping | `feature` mode + `[issue-config]` warning |
+| `feature_branch.mode` is an unrecognized string | `feature` mode + `[issue-config]` warning |
+| `feature_branch.mode: "feature"` | `feature` mode |
+| `feature_branch.mode: "multi-issue"` | `multi-issue` mode |
+
+---
+
+## 6. Roll-up (the merge-up)
 
 When a feature-node issue completes, its branch is merged into its parent's branch
 (`src/merge-up.ts`, fed by `LinearProvider.fetchFeatureNodeRollUps`, run each poll **before**
@@ -125,7 +189,9 @@ dispatch so a parent's own work clones a branch that already contains its childr
   parent issue and mark it **Done on merge — before the parent's own work runs**. A plain
   merge commit gives Linear nothing to link, so the parent's lifecycle stays correct.
 - **Top of the tree** (no feature-node parent) → an open `feature → base` **PR for human
-  review**, never auto-merged.
+  review**, never auto-merged. The PR body includes a `Grouped issues:` list enumerating the
+  child issue identifiers that were merged into the branch. This applies to both `feature`
+  and `multi-issue` mode.
 
 The step is **idempotent** and **fails soft** per roll-up — one failure never aborts the others or the poll loop. It scans only feature nodes completed in a recent window to stay cheap.
 
@@ -142,7 +208,7 @@ Idempotency is handled differently per path:
 
 ---
 
-## 6. End-to-end lifecycle of one tree
+## 7. End-to-end lifecycle of one tree
 
 1. Label the tree `AI-Implement` (whole tree at once is fine — the gates sequence it).
 2. Leaves with no blockers dispatch: **plan → (auto-approve) → implement → PR** into their
@@ -152,30 +218,45 @@ Idempotency is handled differently per path:
 4. When a feature node's children are all Done, its **own closing work** dispatches → PR
    into its own feature branch → human merges → orchestrator marks node Done.
 5. The **merge-up** rolls each completed feature node's branch up into its parent's branch
-   (direct merge). The top node's branch is offered as a `feature → base` PR.
+   (direct merge). The top node's branch is offered as a `feature → base` PR (with a
+   `Grouped issues:` list in the body).
 6. A human reviews and merges that final PR **by any merge method** (merge-commit, squash, or rebase). On the next poll tick the orchestrator detects the merged PR state, deletes the feature branch, and calls `markMerged` to finalize the top node Done — the tree lands on the base branch and the PR is never re-opened.
 
 ---
 
-## 7. Where each part lives
+## 8. Where each part lives
 
 | Concern | File |
 |---------|------|
-| Label query, classification, roll-up discovery | `src/providers/linear.ts` (`fetchAIImplementSnapshot`, `fetchFeatureNodeRollUps`) |
+| Label query, classification, roll-up discovery (Linear) | `src/providers/linear.ts` (`fetchAIImplementSnapshot`, `fetchFeatureNodeRollUps`) |
+| Jira classification, chain enrichment, roll-up discovery | `src/providers/jira.ts` (`enrichFeatureBranches`, `fetchFeatureNodeRollUps`), pure helpers in `src/providers/jira-hierarchy.ts`, Epic Link field discovery in `src/providers/jira-fields.ts` |
 | Shared types (`featureBranchChain`, `FeatureNodeRollUp`) | `src/providers/types.ts` |
-| Branch names | `src/pipeline/branch-name.ts` (`buildFeatureBranchName`) |
+| Per-issue config (`ai-implement.yml` mode selector) | `src/issue-config.ts` (`parseIssueConfig`) |
+| Branch names | `src/pipeline/branch-name.ts` (`buildGroupingBranchName`, `FeatureBranchMode`) |
 | Cascade branch creation + PR-base resolution | `src/feature-branch.ts` (`resolveBaseBranch`) |
 | Roll-up (direct merge / human PR) | `src/merge-up.ts` (`runMergeUps`) |
 | GitHub helpers (branch/compare/merge/PR/merged-state) | `src/github.ts` (`ensureBranchExists`, `compareBranches`, `mergeBranch`, `createPullRequest`, `findOpenPullRequest`, `findPullRequestByBranches`, `deleteBranch`) — `findPullRequestByBranches` detects the top-of-tree PR's merged state (robust to any merge method); `deleteBranch` removes the feature branch after merge |
 | Plan-Complete transition | `src/runner-callback.ts` → `markPlanComplete` |
 | Poll-loop wiring (roll-up before dispatch; base resolved per issue) | `src/index.ts` |
 
-Feature-branch grouping is **Linear-only**. The Jira provider returns an empty roll-up list
-and no `featureBranchChain`, so its issues always PR to the base branch.
+Feature-branch grouping is supported on **both providers**:
+
+- **Linear**: a parent issue is a feature node when it carries the `AI-Implement` label and
+  has labelled children; completion is the issue reaching a completed workflow state.
+- **Jira**: hierarchy comes from the native `parent` field, falling back to the classic
+  **Epic Link** custom field when the instance has one (so Epic → Story trees group too).
+  An issue is "designated" when its AI-Implement Status field is set and its AI-Implement
+  Repo field matches the mapping. Roll-up discovery treats a node as completed when its
+  native status category is Done **or** its AI-Implement Status field is `Merged` — the
+  orchestrator's done-on-merge path only sets the custom field, never the native status,
+  so without the OR the cascade would stall waiting for a manual status move. The gating
+  children query fails **closed** (candidates are deferred for the poll rather than
+  dispatched prematurely); the branch-targeting ancestor walk fails **open** (chains
+  default to the base branch).
 
 ---
 
-## 8. Operational notes
+## 9. Operational notes
 
 - **Re-sync workflows** to the target repo so `claude-implement.yml` accepts the
   `base_branch` input; otherwise GitHub 422s the grouped dispatch (the orchestrator only

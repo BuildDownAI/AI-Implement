@@ -22,6 +22,13 @@ describe("findSensitiveFiles – env files", () => {
     expect(findSensitiveFiles(["prod.env"])).toHaveLength(1);
     expect(findSensitiveFiles(["secrets.env"])).toHaveLength(1);
   });
+
+  it("allows intentionally-committed env templates", () => {
+    expect(findSensitiveFiles([".env.example"])).toHaveLength(0);
+    expect(findSensitiveFiles([".env.sample"])).toHaveLength(0);
+    expect(findSensitiveFiles([".env.template"])).toHaveLength(0);
+    expect(findSensitiveFiles([".env.production.example"])).toHaveLength(0);
+  });
 });
 
 describe("findSensitiveFiles – private keys and certificates", () => {
@@ -62,6 +69,20 @@ describe("findSensitiveFiles – cloud credentials", () => {
   it("blocks GCP service account key files", () => {
     expect(findSensitiveFiles(["serviceAccountKey.json"])).toHaveLength(1);
     expect(findSensitiveFiles(["my-service-account.json"])).toHaveLength(1);
+    expect(findSensitiveFiles(["my-service-account-key.json"])).toHaveLength(1);
+    expect(findSensitiveFiles(["svc-service_account-credentials.json"])).toHaveLength(1);
+  });
+
+  it("does not block source files that merely mention service accounts", () => {
+    expect(
+      findSensitiveFiles([
+        "serviceAccount.ts",
+        "service_account.py",
+        "ServiceAccountController.java",
+        "service-account.go",
+        "service-account.md",
+      ]),
+    ).toHaveLength(0);
   });
 
   it("blocks Terraform variable and state files", () => {

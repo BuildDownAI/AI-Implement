@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -364,6 +364,34 @@ describe("skillsRepoRunnerEnv", () => {
   });
 });
 
+describe("profilesDispatchFields", () => {
+  it("returns empty object when the issue has no profiles", () => {
+    expect(profilesDispatchFields({})).toEqual({});
+    expect(profilesDispatchFields({ profiles: undefined })).toEqual({});
+    expect(profilesDispatchFields({ profiles: [] })).toEqual({});
+  });
+
+  it("comma-joins profiles when present", () => {
+    expect(profilesDispatchFields({ profiles: ["backend"] })).toEqual({ profiles: "backend" });
+    expect(profilesDispatchFields({ profiles: ["backend", "webapp"] })).toEqual({
+      profiles: "backend,webapp",
+    });
+  });
+});
+
+describe("profilesRunnerEnv", () => {
+  it("returns empty object when the issue has no profiles", () => {
+    expect(profilesRunnerEnv({})).toEqual({});
+    expect(profilesRunnerEnv({ profiles: [] })).toEqual({});
+  });
+
+  it("includes AI_IMPLEMENT_PROFILES when profiles are present", () => {
+    expect(profilesRunnerEnv({ profiles: ["backend", "webapp"] })).toEqual({
+      AI_IMPLEMENT_PROFILES: "backend,webapp",
+    });
+  });
+});
+
 describe("deleteBranch", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
@@ -380,6 +408,25 @@ describe("deleteBranch", () => {
   it("returns true on 404 (idempotent — branch already deleted)", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({ status: 404, ok: false } as Response);
     expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
+  });
+
+  it('returns true on 422 "Reference does not exist" (the git-refs API reports a missing ref as 422, not 404)', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      status: 422,
+      ok: false,
+      text: async () =>
+        '{"message":"Reference does not exist","documentation_url":"https://docs.github.com/rest/git/refs#delete-a-reference","status":"422"}',
+    } as unknown as Response);
+    expect(await deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).toBe(true);
+  });
+
+  it("throws on a 422 that is not a missing ref (e.g. protected branch)", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      status: 422,
+      ok: false,
+      text: async () => '{"message":"Refusing to delete the default branch"}',
+    } as unknown as Response);
+    await expect(deleteBranch("tok", "owner", "repo", "ai-implement/feature/foo-1")).rejects.toThrow();
   });
 
   it("throws on other non-success statuses", async () => {
@@ -440,6 +487,56 @@ describe("findPullRequestByBranches", () => {
     })));
     const result = await findPullRequestByBranches("tok", "owner", "repo", "h", "b");
     expect(result).toMatchObject({ number: 8, merged: true });
+  });
+
+  it("prefers an open PR over a newer closed-unmerged one (reopened PRs keep their created date)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { number: 12, html_url: "https://gh/pr/12", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
+        { number: 7, html_url: "https://gh/pr/7", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z" },
+      ],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
+      number: 7, url: "https://gh/pr/7", state: "open", merged: false,
+    });
+  });
+
+  it("prefers a merged PR over an open one", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { number: 12, html_url: "https://gh/pr/12", state: "open", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
+        { number: 7, html_url: "https://gh/pr/7", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z" },
+      ],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
+      number: 7, url: "https://gh/pr/7", state: "closed", merged: true,
+    });
+  });
+
+  it("picks the most recently updated PR when all are closed-unmerged, regardless of list order", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => [
+        { number: 4, html_url: "https://gh/pr/4", state: "closed", merged_at: null, updated_at: "2026-06-20T10:00:00Z" },
+        { number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, updated_at: "2026-07-05T10:00:00Z" },
+        { number: 3, html_url: "https://gh/pr/3", state: "closed", merged_at: null, updated_at: "2026-06-28T10:00:00Z" },
+      ],
+    })));
+    expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
+      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+    });
+  });
+
+  it("requests the list sorted by updated desc so the per_page window holds recently active PRs", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => [] }));
+    vi.stubGlobal("fetch", fetchMock);
+    await findPullRequestByBranches("tok", "owner", "repo", "h", "b");
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("state=all&sort=updated&direction=desc&per_page=10"),
+      expect.anything(),
+    );
   });
 
   it("returns null on non-OK response", async () => {

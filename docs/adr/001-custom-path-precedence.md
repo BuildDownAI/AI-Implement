@@ -64,3 +64,13 @@ A YAML config file would map step/provider IDs to implementation modules. Reject
 
 ### Monorepo with packages
 Split the orchestrator into a core package and per-client packages in a monorepo. Rejected: significantly more infrastructure (Turborepo/Nx, changesets, per-client CI); overkill for the number of extension points currently needed.
+
+---
+
+## Amendment (2026-07-13): baked runner-image root
+
+The original cwd-relative resolution only worked orchestrator-side (cwd = app root). In the session runner, cwd is `/workspace` — the target-repo clone dir, empty when the pipeline definition and step registry load — so `custom/` was dead code runner-side.
+
+Resolution now searches a second root between the workspace and the built-in: `<AI_IMPLEMENT_CUSTOM_ROOT>/custom/<path>`, where the env var names a directory containing `custom/`. `Dockerfile.session` bakes the repo's `custom/` into the image at `/app/custom/` and sets `AI_IMPLEMENT_CUSTOM_ROOT=/app`, so forks that build their own runner image get their overrides honored inside the runner. Precedence: workspace `custom/` > baked `custom/` > built-in. With the env var unset, behavior is unchanged. Both `resolveModule` and `resolveModuleImport` accept an injectable `bakedRoot` option for tests.
+
+Per-target-repo overrides (a `custom/` inside the cloned repo at `/workspace`) remain out of scope: the pipeline definition and step registry load before the clone step runs, so post-clone semantics need a separate design.

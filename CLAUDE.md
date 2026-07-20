@@ -163,7 +163,7 @@ Page conventions: each `<name>.ts` exports two strings. The HTML uses `data-page
 
 When adding a new page: create the page module, append both strings to the lists in `src/admin-ui/index.ts`, and add the route to `sidebar.ts`. When adding a new design token: extend `tokens.ts` and the `tokens.test.ts` spot-check. When adding a new icon: drop the SVG inner markup into `iconRegistry`.
 
-The 14 not-yet-implemented routes (`overview`, `issues`, `pulls`, `blockers`, `pipelines`, `models`, `channels`, `policies`, `runners`, `secrets`, `mcp`, `webhooks`, `customizations`, `updates`) are stubbed in `src/admin-ui/pages/stubs.ts` with `RoadmapNote`-style placeholders pointing to the plan that ships them.
+Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still stubbed in `src/admin-ui/pages/stubs.ts` with "Coming soon" placeholders (badged "Not implemented yet" or "Partially implemented") that explain what exists today and link to the related built pages.
 
 ## Notification adapter
 
@@ -197,6 +197,14 @@ Each project's mapping carries three optional caps, editable in the `/admin` Pro
 Each project's mapping carries an optional **Branch Prefix** (blank = none, the default). When set, it is prepended as a path segment to the implementation branch name: with prefix `pr`, a branch that would be `ai-implement/PROJ-123-add-login` becomes `pr/ai-implement/PROJ-123-add-login`. Each `/`-separated segment of the prefix must start with a letter or digit and may otherwise contain only letters, digits, `.`, `_`, `-` (no `..` or `//`, ≤ 64 chars); the admin API rejects anything else.
 
 The prefix only affects the **initial orchestrator-driven run** — `/ai-implement` comment-triggered gap-fill runs commit to the existing PR branch and are unaffected. Like the run-caps, the prefix reaches the runner as the `branch_prefix` dispatch input (GitHub Actions) or `AI_IMPLEMENT_BRANCH_PREFIX` env var (Fly/local), and is only sent when set — so a project that sets a prefix must have **re-synced `claude-implement.yml`** to its target repo first, otherwise GitHub rejects the dispatch with "unexpected inputs".
+
+### Jira: AI-Implement Profiles field (multi-select)
+
+When using the Jira provider, the orchestrator reads a multi-select custom field to populate `TicketIssue.profiles` on each dispatched issue. The field is discovered by name at runtime — **it must be named exactly `AI-Implement Profiles`** in your Jira instance for auto-discovery to work. If the field is absent the orchestrator logs a warning and continues without populating profiles (it does not fail).
+
+If the field exists under a different name, or if multiple fields share the same name, set `profilesFieldOverride` to the explicit `customfield_NNNNN` ID — via the **Profiles Field** dropdown in the `/admin` Projects edit dialog or the add-project wizard's Jira step, or directly on the mapping's `ticketingConfig` through the API. When all three overrides (`statusFieldOverride`, `repoFieldOverride`, `profilesFieldOverride`) are set, the orchestrator skips the `listFields` call entirely.
+
+At implementation-dispatch time the orchestrator forwards the issue's profiles, comma-joined, as the `profiles` workflow_dispatch input (GitHub Actions) or `AI_IMPLEMENT_PROFILES` env var (Fly/local). Like the run-caps and branch prefix, it is only sent when non-empty — so an issue with profiles set dispatches to a target repo only after that repo has **re-synced `claude-implement.yml`**, otherwise GitHub rejects the dispatch with "unexpected inputs". Profile option names must not contain commas — the forwarding contract is a comma-joined list, so a literal comma in a name would split it into two profiles. The runner parses the env var (comma-split, trimmed, empties dropped) into `ctx.data.profiles`; **no built-in pipeline step consumes it** — it is deliberately the contract surface for image-baked `custom/` steps (loaded via `AI_IMPLEMENT_CUSTOM_ROOT` / `resolveModuleImport`), which branch their setup on the selected profiles. Profiles are per-issue, so unlike the mapping-scoped `skills_repo` there is no repo-variable mirror: `/ai-implement` comment-triggered gap-fill runs and orchestrator review-feedback re-dispatches run without profiles (the initial profile-aware run already produced the PR they amend).
 
 ### Runner log verbosity
 
@@ -253,11 +261,11 @@ The workflow runs `aws-actions/configure-aws-credentials` once before the contai
 
 ## Feature-branch grouping (parent/child issues)
 
-A Linear **parent issue** tagged `AI-Implement` that has `AI-Implement` children becomes a **feature node**: it owns a long-running branch `ai-implement/feature/<issue-key>`, its labelled children PR **into that branch** (not the repo base), and the tree cascades recursively. A parent's own work is deferred until its children finish, then runs onto its own branch; completed feature branches **roll up** into their parent automatically (internal levels via a direct merge, the top of the tree as a human-reviewed `feature → base` PR).
+A Linear **parent issue** tagged `AI-Implement` that has `AI-Implement` children becomes a **feature node**: it owns a long-running branch `ai-implement/feature/<issue-key>` (or `ai-implement/multi-issue/<issue-key>` — selectable via an `ai-implement.yml` block in the parent's description), its labelled children PR **into that branch** (not the repo base), and the tree cascades recursively. A parent's own work is deferred until its children finish, then runs onto its own branch; completed feature branches **roll up** into their parent automatically (internal levels via a direct merge, the top of the tree as a human-reviewed `feature → base` PR).
 
 Key labels: `AI-Implement` (trigger) → `AI-Planning` (planning in flight) → `Plan-Complete` (ready to implement) → `AI-Working` (implementing) → `Ready for Review` (PR open); the orchestrator moves the issue to Done when the PR merges (via poll detector and optional webhook; this complements any native Linear/Jira GitHub integration). A parent labelled before its children is left alone until a child is labelled (race guard).
 
-Parts: classification + roll-up discovery in `src/providers/linear.ts`; `TicketIssue.featureBranchChain` / `FeatureNodeRollUp` in `src/providers/types.ts`; cascade branch creation in `src/feature-branch.ts` (`resolveBaseBranch`); roll-up in `src/merge-up.ts`; GitHub helpers in `src/github.ts`; `Plan-Complete` via `src/runner-callback.ts`; wired into the poll loop in `src/index.ts`. Linear-only (Jira PRs to base). **Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
+Parts: classification + roll-up discovery in `src/providers/linear.ts`; `TicketIssue.featureBranchChain` / `FeatureNodeRollUp` in `src/providers/types.ts`; per-issue config (`ai-implement.yml` mode selector) in `src/issue-config.ts`; cascade branch creation in `src/feature-branch.ts` (`resolveBaseBranch`); roll-up in `src/merge-up.ts`; GitHub helpers in `src/github.ts`; `Plan-Complete` via `src/runner-callback.ts`; wired into the poll loop in `src/index.ts`. Jira support lives in `src/providers/jira.ts` + `src/providers/jira-hierarchy.ts` (native parent with classic Epic Link fallback; roll-up completion = native Done **or** AI-Implement Status `Merged`). **Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
 
 Operational requirements: re-sync `claude-implement.yml` to the target repo (for the `base_branch` input); a **publicly reachable** runner callback (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`) so planning auto-advances and the cascade self-drives; and pair the runner image with the orchestrator channel (testing → `SESSION_IMAGE=…:next`).
 
@@ -283,7 +291,10 @@ Resolution is handled by two functions in `src/pipeline/resolve-module.ts`:
 | `resolveModule(path)` | YAML and template files | Absolute filesystem path |
 | `resolveModuleImport<T>(path)` | TypeScript/JavaScript modules | `default` export, or `null` if no override |
 
-Both check `custom/<path>` (relative to `process.cwd()`) first, then fall back to the built-in package root. There is no per-type discovery logic — the same two functions cover all extension points.
+Both functions search two custom roots in order, then fall back to the built-in package root. There is no per-type discovery logic — the same two functions cover all extension points.
+
+1. **Workspace root** — `custom/<path>` relative to `process.cwd()`. This is how orchestrator-side loading picks up a fork's `custom/` (the orchestrator runs with cwd = app root).
+2. **Baked root** — `<AI_IMPLEMENT_CUSTOM_ROOT>/custom/<path>`, where the `AI_IMPLEMENT_CUSTOM_ROOT` env var names a directory that *contains* a `custom/` subdirectory. This is how the session runner picks up overrides: its cwd is `/workspace` (the target-repo clone dir, empty at process start), so the workspace root never matches there. `Dockerfile.session` copies the repo's `custom/` to `/app/custom/` and sets `AI_IMPLEMENT_CUSTOM_ROOT=/app`, so a client fork that builds its own runner image gets its `custom/pipelines/` and `custom/steps/` honored inside the runner — including the import-time load of `pipelines/autonomous.yml` and the eager step resolution in `createDefaultRunner()`, both of which happen before the clone step runs. With the env var unset (local dev, tests) resolution behaves exactly as before.
 
 ### Extension points
 
@@ -318,7 +329,7 @@ Both execution modes resolve the runner image with the same ladder, highest prio
 
 The `github-actions` allowlist auto-trusts `ghcr.io/builddownai/` and the repo owner's own `ghcr.io/<owner>/` namespace, so a fork using its own published image needs no extra config; `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is only for third-party registries. The `fly-machines` path validates image-reference format but has no allowlist.
 
-The image must be publicly pullable. The customer owns building and publishing it. If `.ai-implement/image.yml` is absent, malformed, or points at an unreachable reference, resolution falls through to the next ladder rung.
+The image should be publicly pullable for the broadest compatibility (a private image restricts you to the GitHub Actions execution mode — see "Private runner images" below). The customer owns building and publishing it. If `.ai-implement/image.yml` is absent, malformed, or points at an unreachable reference, resolution falls through to the next ladder rung.
 
 This resolution applies to **both** execution modes. On the Fly Machines path the orchestrator boots the session machine on the resolved image directly. On the GitHub Actions path the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-implement.yml` (which runs it as the job's `container.image`) — but only when the choice is explicit: a per-repo `.ai-implement/image.yml` override, or an explicitly-set `SESSION_IMAGE`. When neither is set the orchestrator sends no `runner_image`, so the workflow keeps its own resolution order (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in `:latest` default) and repos that pin via that variable are not overridden.
 
@@ -326,10 +337,19 @@ Planning runs (`claude-plan.yml`) now run on the same runner container and honor
 
 The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
 
+### Private runner images
+
+A private GHCR runner image is only usable in the **GitHub Actions execution mode**. The Fly Machines and local Docker backends pull the image anonymously (no credential mechanism), so a private image fails at machine-create time with `failed to get manifest ... unauthorized`. There is no workaround on those backends — choosing a private image is effectively choosing GHA mode.
+
+On the GitHub Actions path, `claude-implement.yml`, `comment-trigger.yml`, and `claude-plan.yml` authenticate the container pull with the job's `GITHUB_TOKEN`: each requests `packages: read` and passes the token through the container `credentials:` block. A bare `packages: read` is **not** enough on its own — GitHub Actions does not auto-authenticate a job-container image pull, so the `credentials:` block is what actually performs the authenticated pull.
+
+`GITHUB_TOKEN` can only read private packages owned by the **same org/account as the target repo**. So a private runner image must live in the target repo's own org — the realistic case is a customer pinning their own private image via `.ai-implement/image.yml` (the GHA allowlist auto-trusts the owner's `ghcr.io/<owner>/` namespace, so no extra prefix variable is needed) and linking that GHCR package to the repo. The default `ghcr.io/builddownai/ai-implement-runner` image stays public precisely because a cross-org `GITHUB_TOKEN` cannot pull it; making it private would break every customer repo. A private image hosted in a *different* org requires swapping a PAT (with `read:packages` on that org) into the workflow's `credentials.password` in place of `GITHUB_TOKEN`.
+
 Runner image channels:
 
-- `ghcr.io/builddownai/ai-implement-runner:latest` is published from `main` and is the stable default for production orchestrators and synced target-repo workflows.
-- `ghcr.io/builddownai/ai-implement-runner:next` is published from `testing` and is intended for staging/testing orchestrators. Set `SESSION_IMAGE=ghcr.io/builddownai/ai-implement-runner:next` in that orchestrator environment to keep it paired with the testing runner.
+- `.github/workflows/build-runner.yml` publishes the runner image to `ghcr.io/<owner>/ai-implement-runner` (the lowercased owner of the repo it runs in), so a fork's builds land in its own namespace automatically — a namespace the `github-actions` allowlist already trusts. The built-in fallback in the code and synced workflows stays `ghcr.io/builddownai/ai-implement-runner` regardless; a fork that wants its own image used must pin it via `AI_IMPLEMENT_RUNNER_IMAGE` or `.ai-implement/image.yml` rather than editing the fallback.
+- The `:latest` channel is published from `main` and is the stable default for production orchestrators and synced target-repo workflows.
+- The `:next` channel is published from `testing` and is intended for staging/testing orchestrators. Set the orchestrator's runner-image env var to your namespace's `:next` tag (e.g. `AI_IMPLEMENT_RUNNER_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`) to keep that environment paired with the testing runner.
 - Commit SHA tags are pushed first, then the build digest is smoke-tested before any mutable channel is promoted. Use the immutable digest for the strongest rollback pin; the SHA tag is a convenient lookup tag for the same build.
 - Channel-scoped date/debug tags are promoted only after the digest image passes smoke testing. They use `base-<channel>-vYYYYMMDD-<12-char-sha>` (for example, `base-next-v20260526-abc123def456`) so `latest` and `next` builds do not collide and same-day builds do not overwrite each other.
 - Cancelled or failed runs can leave SHA-only images with no channel pointer. That is intentional fail-closed behavior; clean old SHA-only images through GHCR retention/cleanup rather than relying on mutable channel tags for retention.

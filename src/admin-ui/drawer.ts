@@ -284,7 +284,7 @@ export const drawerScript = `
     const logsLink = document.getElementById('drawer-logs-link');
     const mapping = mappings && job.teamKey ? mappings[job.teamKey] : null;
     const repoParts = repoPartsForJob(job, mapping);
-    const hasWorkflowLogs = job.runId && (job.executionMode === 'github-actions' || job.executionMode === 'planning');
+    const hasWorkflowLogs = job.runId && job.executionMode === 'github-actions';
     if (hasWorkflowLogs && repoParts) {
       logsLink.href = 'https://github.com/' + repoParts.owner + '/' + repoParts.repo + '/actions/runs/' + job.runId;
       logsLink.textContent = 'View workflow logs ↗';

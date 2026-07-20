@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, getPullRequestState } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState } from "./github.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
@@ -14,14 +14,15 @@ import { notify, notifyCompletion } from "./notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
-import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata } from "./fly-machines.js";
+import { classifyCompletion, renderClassification } from "./completion-classification.js";
+import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
@@ -42,7 +43,7 @@ import {
   removeLocalContainer,
   startLocalRunnerContainer,
 } from "./local-docker.js";
-import { resolveLocalDockerTerminalStatus } from "./local-docker-monitor.js";
+import { resolveTerminalStatus, workflowFileForJob } from "./monitor-status.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
@@ -267,7 +268,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
               githubAppId: config.githubAppId,
               githubAppPrivateKey: config.githubAppPrivateKey,
               resolveMapping: (scopeKey) => teamRepoMap[scopeKey] ?? null,
-              finalizeMerged: (id) => provider.markMerged(id),
+              finalizeMerged: (id, scopeKey) => provider.markMerged(id, scopeKey),
             });
           }
         }
@@ -307,6 +308,17 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           await dispatchPlanning(config, issueProvider, issue, mapping);
         } else {
           const prior = countPriorDispatches(issue.id);
+
+          // Implementation only dispatches after plan approval, so any planning row
+          // still stuck in 'unknown' (orphaned by an orchestrator restart before its
+          // run was attached) demonstrably finished — finalize it so the pipelines
+          // UI doesn't show 'unknown' forever.
+          const finalizedPlans = completeOrphanedPlanningJobs(issue.id);
+          if (finalizedPlans > 0) {
+            console.log(
+              `[poll] Finalized ${finalizedPlans} orphaned planning job(s) for ${issue.identifier} (implementation dispatching)`,
+            );
+          }
 
           if (prior.count > 0) {
             const ago = prior.lastDispatchedAt
@@ -474,6 +486,7 @@ async function dispatchGitHubActions(
     ...capDispatchFields(mapping),
     ...branchPrefixDispatchFields(mapping),
     ...skillsRepoDispatchFields(mapping),
+    ...profilesDispatchFields(issue),
     runner_callback_url: runnerCallbackUrl,
     run_token: runToken,
     run_progress_token: runProgressToken,
@@ -700,6 +713,7 @@ async function dispatchPlanning(
             issueTitle: issue.title,
             issueUrl: provider.issueUrl(issue),
             repoFullName: `${mapping.owner}/${mapping.repo}`,
+            phase: "planning",
           }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
         }
         // Intentionally do NOT call markDispatched() — dedup table stays clear
@@ -783,6 +797,7 @@ async function dispatchPlanning(
       issueTitle: issue.title,
       issueUrl: provider.issueUrl(issue),
       repoFullName: `${mapping.owner}/${mapping.repo}`,
+      phase: "planning",
     }).catch((err) => console.error(`[poll] Planning notification failed:`, err));
   }
 
@@ -997,7 +1012,7 @@ async function dispatchFlyMachine(
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -1072,7 +1087,7 @@ async function dispatchLocalDocker(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -1112,6 +1127,7 @@ async function postDispatch(
       issueTitle: issue.title,
       issueUrl: provider.issueUrl(issue),
       repoFullName: `${mapping.owner}/${mapping.repo}`,
+      phase: "implementation",
     }).catch((err) => console.error(`[poll] Notification failed:`, err));
   }
 
@@ -1277,8 +1293,8 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
     }
   }
 
-  // Send notifications for newly terminal jobs
-  await sendCompletionNotifications(config, registry);
+  // Send notifications + post comments for newly terminal jobs
+  await reportJobCompletion(config, registry);
 }
 
 async function monitorGitHubActionsJob(
@@ -1311,9 +1327,7 @@ async function monitorGitHubActionsJob(
     );
     if (!mapping) return;
 
-    const workflowFile = job.executionMode === "planning"
-      ? mapping.planningWorkflowFile
-      : mapping.workflowFile;
+    const workflowFile = workflowFileForJob(job, mapping);
 
     const runId = await findWorkflowRunId(
       ghToken,
@@ -1372,6 +1386,14 @@ async function monitorGitHubActionsJob(
         prUrl = await findPrForRun(ghToken, owner, repo, job.runId);
       } catch {
         // Non-critical
+      }
+      // workflow_dispatch runs report the ref they were dispatched on (the default
+      // branch) as head_branch, so findPrForRun misses the PR the runner created
+      // during the run. Fall back to matching an open PR by the issue's branch
+      // naming. Planning runs never open PRs — skip them so an implementation PR
+      // from an earlier dispatch is not misattributed to a planning row.
+      if (!prUrl && job.phase !== "planning") {
+        prUrl = await findPrForIssue(config, job.repo, job.issueIdentifier);
       }
     }
 
@@ -1462,6 +1484,7 @@ async function monitorFlyMachineJob(
 
   let machineDone = false;
   let machineConclusion = "unknown";
+  let machineExitCode: number | null = null;
 
   try {
     const machine = await getMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
@@ -1478,6 +1501,7 @@ async function monitorFlyMachineJob(
     if (machine.state === "stopped" || machine.state === "destroyed") {
       machineDone = true;
       machineConclusion = machine.state;
+      machineExitCode = readMachineExitCode(machine);
     }
   } catch (err) {
     // 404 means machine was already destroyed (auto_destroy)
@@ -1497,9 +1521,7 @@ async function monitorFlyMachineJob(
     // Use PR existence to distinguish success from failure:
     // if a PR was created, the session completed its job; otherwise it failed
     const reviewNeedsAttention = !!prUrl && postPushReviewNeedsAttention(job.id);
-    const jobStatus: JobStatus = prUrl
-      ? (reviewNeedsAttention ? "review_failed" : "completed")
-      : "failed";
+    const jobStatus: JobStatus = resolveTerminalStatus(machineExitCode, prUrl, reviewNeedsAttention, job.phase);
 
     // Stamp pr_number on the machine before it's destroyed so reaper/audit
     // tools can read it. Only possible when machine is still accessible.
@@ -1609,7 +1631,7 @@ async function monitorLocalDockerJob(
     ? await findPrForIssue(config, job.repo, job.issueIdentifier)
     : null;
   const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
-  const jobStatus = resolveLocalDockerTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention);
+  const jobStatus = resolveTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention, job.phase);
 
   if (jobStatus === "failed") {
     await postLocalContainerLogs(provider, job, state.exitCode === 0 ? "pr_not_found" : "container_failed");
@@ -1648,9 +1670,16 @@ async function monitorLocalDockerJob(
 /** Mark a Linear issue as Ready for Review after a successful job. */
 async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: string): Promise<void> {
   if (!job.issueId) return;
+  // teamKey is the authoritative scope (set to issue.scopeKey at job creation).
+  // It's always present here, but guard rather than pass "" — an empty scope
+  // makes Jira's fields("") throw and leaves the ticket stuck.
+  if (!job.teamKey) {
+    console.error(`[monitor] Cannot mark ${job.issueIdentifier} as Ready for Review: job has no teamKey`);
+    return;
+  }
   try {
-    await provider.markPrReady(job.issueId, prUrl);
-    if (job.issueId) resetStuckAttempts(job.issueId);
+    await provider.markPrReady(job.issueId, job.teamKey, prUrl);
+    resetStuckAttempts(job.issueId);
     console.log(`[monitor] Marked ${job.issueIdentifier} as Ready for Review (PR: ${prUrl})`);
   } catch (err) {
     console.error(`[monitor] Failed to mark ${job.issueIdentifier} as Ready for Review:`, err);
@@ -1660,8 +1689,13 @@ async function markReadyForReview(provider: TicketingProvider, job: Job, prUrl: 
 /** Remove AI-Working label and reset issue state after a failed/timed-out job. */
 async function resetTicket(provider: TicketingProvider, job: Job): Promise<void> {
   if (!job.issueId) return;
+  // See markReadyForReview: guard the scope rather than passing "" downstream.
+  if (!job.teamKey) {
+    console.error(`[monitor] Cannot reset ticket ${job.issueIdentifier}: job has no teamKey`);
+    return;
+  }
   try {
-    await provider.clearWorkingState(job.issueId);
+    await provider.clearWorkingState(job.issueId, job.teamKey);
 
     // Clear the dedup entry so the issue can be re-dispatched
     deleteDispatched(job.issueId);
@@ -1674,9 +1708,7 @@ async function resetTicket(provider: TicketingProvider, job: Job): Promise<void>
 
 // ---------- Completion notifications ----------
 
-async function sendCompletionNotifications(config: AppConfig, registry: ProviderRegistry): Promise<void> {
-  if (!config.notifyWebhookUrl) return;
-
+async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const terminalJobs = getUnnotifiedTerminalJobs();
   const mappings = getMappings();
   for (const job of terminalJobs) {
@@ -1708,10 +1740,11 @@ async function sendCompletionNotifications(config: AppConfig, registry: Provider
       // the mapping is gone (orphaned job).
       const identifier = job.issueIdentifier || job.issueId;
       let issueUrl = `https://linear.app/issue/${identifier}`;
+      let provider: TicketingProvider | null = null;
       const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
       if (mapping) {
         try {
-          const provider = await registry.forMapping(mapping);
+          provider = await registry.forMapping(mapping);
           issueUrl = provider.issueUrl({
             id: job.issueId,
             identifier,
@@ -1725,22 +1758,44 @@ async function sendCompletionNotifications(config: AppConfig, registry: Provider
         }
       }
 
-      await notifyCompletion(config.notifyType, config.notifyWebhookUrl, {
-        issueIdentifier: identifier,
-        issueTitle: job.issueTitle || "Unknown",
-        issueUrl,
-        repoFullName,
-        status: job.status as "completed" | "review_failed" | "failed" | "timed_out",
-        conclusion: job.conclusion,
-        prUrl: job.prUrl,
-        runUrl,
-        durationMs,
-      });
+      // Tracker comment — ALWAYS, independent of the Slack/Teams webhook (failures only)
+      // classifyCompletion returns null on a clean success, so successes stay quiet everywhere
+      const classification = classifyCompletion(job);
+      if (classification && provider) {
+        try {
+          await provider.postComment(job.issueId, renderClassification(classification));
+        } catch (err) {
+          console.warn(`[monitor] Failed to post classification comment for job ${job.id}:`, err);
+        }
+      }
+
+      if (config.notifyWebhookUrl) {
+        try {
+          await notifyCompletion(config.notifyType, config.notifyWebhookUrl, {
+            issueIdentifier: identifier,
+            issueTitle: job.issueTitle || "Unknown",
+            issueUrl,
+            repoFullName,
+            status: job.status as "completed" | "review_failed" | "failed" | "timed_out",
+            conclusion: job.conclusion,
+            prUrl: job.prUrl,
+            runUrl,
+            durationMs,
+            phase: job.phase === "planning" ? "planning" : "implementation", // job.phase is a wider string (planning|implementation|gap-analysis) — narrow, don't cast
+            summary: classification?.summary,
+            detail: classification?.detail,
+            remediation: classification?.remediation,
+            docsUrl: classification?.docsUrl,
+          });
+          console.log(`[monitor] Sent ${job.status} notification for ${job.issueIdentifier} (job #${job.id}, dispatch #${job.dispatchNumber})`);
+        } catch (err) {
+          console.error(`[monitor] Failed to send notification for job ${job.id}:`, err);
+        }
+      }
 
       markJobNotified(job.id);
-      console.log(`[monitor] Sent ${job.status} notification for ${job.issueIdentifier} (job #${job.id}, dispatch #${job.dispatchNumber})`);
     } catch (err) {
-      console.error(`[monitor] Failed to send notification for job ${job.id}:`, err);
+      console.error(`[monitor] Failed to process completed job #${job.id}:`, err);
     }
   }
 }
@@ -1837,8 +1892,10 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
 async function processReconciliations(_config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const teamRepoMap = getMappings();
   await runReconciliations({
-    mappingForRepo: (repo) =>
-      Object.values(teamRepoMap).find((m) => `${m.owner}/${m.repo}` === repo),
+    mappingForRepo: (repo) => {
+      const entry = Object.entries(teamRepoMap).find(([, m]) => `${m.owner}/${m.repo}` === repo);
+      return entry ? { scopeKey: entry[0], mapping: entry[1] } : undefined;
+    },
     resolveProvider: (mapping) => registry.forMapping(mapping),
   });
 }
@@ -1920,6 +1977,10 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         ...providerDispatchFields(mapping),
         ...capDispatchFields(mapping),
         ...skillsRepoDispatchFields(mapping),
+        // No profilesDispatchFields here: profiles are per-issue (read off the fresh
+        // TicketIssue at poll time), and review-fix queue entries only persist the
+        // issue id — re-fetching the ticket just for profiles isn't worth it for a
+        // gap-fill pass on a PR the profile-aware initial run already produced.
         runner_callback_url: runnerCallbackUrl,
         run_token: runToken,
         run_progress_token: runProgressToken,

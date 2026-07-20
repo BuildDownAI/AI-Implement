@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+
+const isWindows = process.platform === "win32";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +9,11 @@ import { runHookScript } from "../pipeline/steps/hooks.js";
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "hook-")); });
 afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // On Windows, bash-created files may be locked briefly after the process exits
+  }
   // Clean up env the hook scripts export, so a failing assertion mid-test can't
   // leak a var into other tests sharing this Vitest worker's process.env.
   for (const k of ["FOO_TEST_VAR", "SIMPLE_TEST_VAR", "MULTI_TEST_VAR"]) {
@@ -15,7 +21,7 @@ afterEach(() => {
   }
 });
 
-describe("runHookScript", () => {
+describe.skipIf(isWindows)("runHookScript", () => {
   it("runs the script and merges GITHUB_ENV exports into process.env", () => {
     writeFileSync(join(dir, "setup.sh"), 'echo "FOO_TEST_VAR=bar123" >> "$GITHUB_ENV"\n');
     const result = runHookScript("setup", "setup.sh", dir);

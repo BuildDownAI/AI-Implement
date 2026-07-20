@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { resolveModule, resolveModuleImport } from "../pipeline/resolve-module.js";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("resolveModule", () => {
   it("returns custom path when custom override exists", () => {
@@ -8,7 +12,7 @@ describe("resolveModule", () => {
       builtinRoot: "/app",
       existsSyncImpl: (p) => p.includes("custom"),
     });
-    expect(result).toContain("custom/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toContain("custom/pipelines/autonomous.yml");
   });
 
   it("returns builtin path when no custom override exists", () => {
@@ -17,7 +21,76 @@ describe("resolveModule", () => {
       builtinRoot: "/app",
       existsSyncImpl: () => false,
     });
-    expect(result).toBe("/app/pipelines/autonomous.yml");
+    expect(result.replace(/\\/g, "/")).toBe("/app/pipelines/autonomous.yml");
+  });
+
+  it("falls back to bakedRoot custom/ when workspace has no override", () => {
+    const result = resolveModule("pipelines/autonomous.yml", {
+      customRoot: "/workspace",
+      bakedRoot: "/baked",
+      builtinRoot: "/app",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/").startsWith("/baked/"),
+    });
+    expect(result.replace(/\\/g, "/")).toBe("/baked/custom/pipelines/autonomous.yml");
+  });
+
+  it("prefers workspace custom/ over bakedRoot custom/ when both exist", () => {
+    const result = resolveModule("pipelines/autonomous.yml", {
+      customRoot: "/workspace",
+      bakedRoot: "/baked",
+      builtinRoot: "/app",
+      existsSyncImpl: () => true,
+    });
+    expect(result.replace(/\\/g, "/")).toBe("/workspace/custom/pipelines/autonomous.yml");
+  });
+
+  it("returns builtin path when neither workspace nor bakedRoot has an override", () => {
+    const result = resolveModule("pipelines/autonomous.yml", {
+      customRoot: "/workspace",
+      bakedRoot: "/baked",
+      builtinRoot: "/app",
+      existsSyncImpl: () => false,
+    });
+    expect(result.replace(/\\/g, "/")).toBe("/app/pipelines/autonomous.yml");
+  });
+
+  it("reads the baked root from AI_IMPLEMENT_CUSTOM_ROOT when the option is not passed", () => {
+    vi.stubEnv("AI_IMPLEMENT_CUSTOM_ROOT", "/image");
+    const result = resolveModule("pipelines/autonomous.yml", {
+      customRoot: "/workspace",
+      builtinRoot: "/app",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/").startsWith("/image/"),
+    });
+    expect(result.replace(/\\/g, "/")).toBe("/image/custom/pipelines/autonomous.yml");
+  });
+
+  it("checks only the workspace custom path when no baked root is configured", () => {
+    vi.stubEnv("AI_IMPLEMENT_CUSTOM_ROOT", "");
+    const checkedPaths: string[] = [];
+    const result = resolveModule("pipelines/autonomous.yml", {
+      customRoot: "/workspace",
+      builtinRoot: "/app",
+      existsSyncImpl: (p) => {
+        checkedPaths.push(p.replace(/\\/g, "/"));
+        return false;
+      },
+    });
+    expect(checkedPaths).toEqual(["/workspace/custom/pipelines/autonomous.yml"]);
+    expect(result.replace(/\\/g, "/")).toBe("/app/pipelines/autonomous.yml");
+  });
+
+  it("does not check the baked root twice when it equals customRoot", () => {
+    const checkedPaths: string[] = [];
+    resolveModule("pipelines/autonomous.yml", {
+      customRoot: "/workspace",
+      bakedRoot: "/workspace",
+      builtinRoot: "/app",
+      existsSyncImpl: (p) => {
+        checkedPaths.push(p.replace(/\\/g, "/"));
+        return false;
+      },
+    });
+    expect(checkedPaths).toEqual(["/workspace/custom/pipelines/autonomous.yml"]);
   });
 });
 
@@ -99,7 +172,7 @@ describe("resolveModuleImport", () => {
         return false;
       },
     });
-    expect(capturedPaths.some((p) => p.includes("/my/workspace/custom/steps/push"))).toBe(true);
+    expect(capturedPaths.some((p) => p.replace(/\\/g, "/").includes("/my/workspace/custom/steps/push"))).toBe(true);
   });
 
   it("rethrows non-MODULE_NOT_FOUND import errors", async () => {
@@ -124,5 +197,77 @@ describe("resolveModuleImport", () => {
       importFn: async () => ({ default: fakeProvider }),
     });
     expect(result).toBe(fakeProvider);
+  });
+
+  it("falls back to bakedRoot custom/ when workspace has no override", async () => {
+    const bakedModule = { run: async () => ({}) };
+    const result = await resolveModuleImport("steps/implement", {
+      customRoot: "/workspace",
+      bakedRoot: "/baked",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/") === "/baked/custom/steps/implement.ts",
+      importFn: async () => ({ default: bakedModule }),
+    });
+    expect(result).toBe(bakedModule);
+  });
+
+  it("prefers a workspace override over a bakedRoot override", async () => {
+    const workspaceModule = { run: async () => ({ source: "workspace" }) };
+    const bakedModule = { run: async () => ({ source: "baked" }) };
+    const result = await resolveModuleImport("steps/implement", {
+      customRoot: "/workspace",
+      bakedRoot: "/baked",
+      existsSyncImpl: (p) => p.endsWith("implement.ts"),
+      importFn: async (url) => ({
+        default: url.includes("/workspace/") ? workspaceModule : bakedModule,
+      }),
+    });
+    expect(result).toBe(workspaceModule);
+  });
+
+  it("reads the baked root from AI_IMPLEMENT_CUSTOM_ROOT when the option is not passed", async () => {
+    vi.stubEnv("AI_IMPLEMENT_CUSTOM_ROOT", "/image");
+    const bakedModule = { run: async () => ({}) };
+    const result = await resolveModuleImport("steps/implement", {
+      customRoot: "/workspace",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/") === "/image/custom/steps/implement.ts",
+      importFn: async () => ({ default: bakedModule }),
+    });
+    expect(result).toBe(bakedModule);
+  });
+
+  it("checks only workspace custom paths when no baked root is configured", async () => {
+    vi.stubEnv("AI_IMPLEMENT_CUSTOM_ROOT", "");
+    const checkedPaths: string[] = [];
+    const result = await resolveModuleImport("steps/push", {
+      customRoot: "/workspace",
+      existsSyncImpl: (p) => {
+        checkedPaths.push(p.replace(/\\/g, "/"));
+        return false;
+      },
+    });
+    expect(checkedPaths).toEqual([
+      "/workspace/custom/steps/push.ts",
+      "/workspace/custom/steps/push.js",
+      "/workspace/custom/steps/push.mjs",
+    ]);
+    expect(result).toBeNull();
+  });
+
+  it("falls through to the baked root when the workspace override has no default export", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const bakedModule = { run: async () => ({}) };
+      const result = await resolveModuleImport("steps/implement", {
+        customRoot: "/workspace",
+        bakedRoot: "/baked",
+        existsSyncImpl: (p) => p.endsWith("implement.ts"),
+        importFn: async (url) =>
+          url.includes("/workspace/") ? { namedExport: {} } : { default: bakedModule },
+      });
+      expect(result).toBe(bakedModule);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("has no default export"));
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

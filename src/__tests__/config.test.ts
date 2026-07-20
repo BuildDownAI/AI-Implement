@@ -371,6 +371,7 @@ describe("config", () => {
         repoFieldValue: "acme/x",
         statusFieldOverride: "customfield_10001",
         repoFieldOverride: "customfield_10002",
+        profilesFieldOverride: null,
       });
     });
 

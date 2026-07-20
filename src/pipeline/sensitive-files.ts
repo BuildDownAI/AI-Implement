@@ -24,7 +24,11 @@ const SENSITIVE_PATTERNS: SensitivePattern[] = [
   { description: ".env file",
     match: (_, b) => b === ".env" },
   { description: ".env.* variant",
-    match: (_, b) => b.startsWith(".env.") },
+    // .env.example / .env.sample / .env.template (and e.g. .env.production.example)
+    // are intentionally-committed templates with no real values — allow them.
+    match: (_, b) =>
+      b.startsWith(".env.") &&
+      ![".example", ".sample", ".template"].some((t) => b.endsWith(t)) },
   { description: "*.env file",
     match: (_, b) => b !== ".env" && b.endsWith(".env") },
   { description: "Rails master.key",
@@ -57,8 +61,11 @@ const SENSITIVE_PATTERNS: SensitivePattern[] = [
   // ── Cloud provider credentials ───────────────────────────────────────────
   { description: "AWS credentials file",
     match: (f) => f.includes("/.aws/credentials") || f === ".aws/credentials" },
-  { description: "GCP service account key (*-service-account*.json or serviceAccountKey.json)",
-    match: (_, b) => b === "serviceAccountKey.json" || /service.?account/i.test(b) },
+  { description: "GCP service account key (*service-account*.json or serviceAccountKey.json)",
+    // Anchored to .json so ordinary source files that mention service accounts
+    // (serviceAccount.ts, service_account.py, ServiceAccountController.java, …)
+    // are not blocked — GCP keys are always JSON documents.
+    match: (_, b) => b === "serviceAccountKey.json" || /service.?account.*\.json$/i.test(b) },
   { description: "Terraform variable file (*.tfvars)",
     match: (_, b) => b.endsWith(".tfvars") },
   { description: "Terraform state file (*.tfstate)",

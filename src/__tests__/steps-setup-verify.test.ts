@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+
+const isWindows = process.platform === "win32";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,9 +20,9 @@ function ctx() {
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "sv-")); });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* Windows EPERM on bash-created files */ } });
 
-describe("setupStep", () => {
+describe.skipIf(isWindows)("setupStep", () => {
   it("runs the setup script and returns ran:true", async () => {
     writeFileSync(join(dir, "s.sh"), "echo hi\n");
     const out = await setupStep.run(ctx(), { workspaceDir: dir, scriptPath: "s.sh" }, new NoopStepReporter());
@@ -34,7 +36,7 @@ describe("setupStep", () => {
   });
 });
 
-describe("verifyStep", () => {
+describe.skipIf(isWindows)("verifyStep", () => {
   it("throws when the verify script fails", async () => {
     writeFileSync(join(dir, "v.sh"), "exit 2\n");
     await expect(
