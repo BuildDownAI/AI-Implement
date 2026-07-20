@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { resolveBaseBranch } from "../feature-branch.js";
 import type { RepoMapping } from "../config.js";
-import type { TicketIssue } from "../providers/types.js";
+import type { FeatureBranchChainEntry, TicketIssue } from "../providers/types.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   return {
@@ -27,7 +27,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   };
 }
 
-function makeIssue(featureBranchChain?: string[]): TicketIssue {
+function makeIssue(featureBranchChain?: FeatureBranchChainEntry[]): TicketIssue {
   return {
     id: "child-uuid",
     identifier: "OOL-87",
@@ -49,7 +49,7 @@ describe("resolveBaseBranch", () => {
       .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ object: { sha: "base-sha" } }) } as Response) // base head
       .mockResolvedValueOnce({ ok: true, status: 201 } as Response);                                // create ref
 
-    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(["OOL-78"]), mapping: makeMapping() });
+    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]), mapping: makeMapping() });
 
     expect(base).toBe("ai-implement/feature/ool-78");
     const createBody = JSON.parse((vi.mocked(fetch).mock.calls[2][1] as RequestInit).body as string);
@@ -69,7 +69,7 @@ describe("resolveBaseBranch", () => {
 
     const base = await resolveBaseBranch({
       ghToken: "t",
-      issue: makeIssue(["OOL-78", "OOL-96"]),
+      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]),
       mapping: makeMapping(),
     });
 
@@ -92,7 +92,7 @@ describe("resolveBaseBranch", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response);
 
-    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue(["OOL-78"]), mapping: makeMapping() });
+    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]), mapping: makeMapping() });
 
     expect(base).toBe("testing");
     expect(warn).toHaveBeenCalled();

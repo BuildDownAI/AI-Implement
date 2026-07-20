@@ -191,6 +191,38 @@ describe("handleRunnerResult — planning", () => {
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
 
+  it("finalizes the dispatch-log job as completed on planning success", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobById(jobId);
+    expect(job?.status).toBe("completed");
+    expect(job?.completedAt).not.toBeNull();
+  });
+
   it("calls markPlanningFailed on failure", async () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -215,6 +247,7 @@ describe("handleRunnerResult — planning", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPlanningFailed")?.args).toEqual([
       "i",
+      "ENG",
       "boom",
     ]);
   });
@@ -246,6 +279,7 @@ describe("handleRunnerResult — implementation", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPrReady")?.args).toEqual([
       "i",
+      "ENG",
       "https://github.com/o/r/pull/1",
     ]);
   });
@@ -308,7 +342,7 @@ describe("handleRunnerResult — implementation", () => {
     const calls = fake.recordedCalls();
     expect(
       calls.find((c) => c.method === "markImplementationFailed")?.args,
-    ).toEqual(["i", "tests fail"]);
+    ).toEqual(["i", "ENG", "tests fail"]);
   });
 });
 
@@ -718,8 +752,8 @@ describe("formatFailureComment", () => {
     expect(formatFailureComment(undefined, "tests fail")).toBe("tests fail");
   });
 
-  it("returns 'unspecified' when both are undefined", () => {
-    expect(formatFailureComment(undefined, undefined)).toBe("unspecified");
+  it("returns a default summary when both are undefined", () => {
+    expect(formatFailureComment(undefined, undefined)).toBe("Unspecified failure.");
   });
 
   it("formats SENSITIVE_FILES_BLOCKED with a structured comment", () => {
@@ -728,6 +762,7 @@ describe("formatFailureComment", () => {
     expect(msg).toContain("Blocked by security guardrail");
     expect(msg).toContain(".env");
     expect(msg).toContain(".gitignore");
+    expect(msg).toContain("troubleshooting"); // remediation now links the docs
   });
 
   it("formats SENSITIVE_FILES_BLOCKED even when failureReason is undefined", () => {
@@ -766,8 +801,9 @@ describe("handleRunnerResult — SENSITIVE_FILES_BLOCKED failure code", () => {
     expect(res.status).toBe(200);
     const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
     expect(call).toBeDefined();
-    const [issueId, comment] = call!.args as [string, string];
+    const [issueId, scopeKey, comment] = call!.args as [string, string, string];
     expect(issueId).toBe("i");
+    expect(scopeKey).toBe("ENG");
     expect(comment).toContain("🔒");
     expect(comment).toContain("Blocked by security guardrail");
     expect(comment).toContain(".env");
@@ -794,7 +830,7 @@ describe("handleRunnerResult — SENSITIVE_FILES_BLOCKED failure code", () => {
       resolveProvider: makeResolve(fake),
     });
     const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
-    const [, comment] = call!.args as [string, string];
+    const [, , comment] = call!.args as [string, string, string];
     expect(comment).toBe("compilation error");
     expect(comment).not.toContain("🔒");
   });

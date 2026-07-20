@@ -58,6 +58,10 @@ export interface PipelineContextData {
   branchPrefix?: string;
   /** Autonomous runner: URL of the skills repo to clone and install into ~/.claude/skills/. */
   skillsRepo?: string;
+  /** Autonomous runner: per-issue AI-Implement profile names (from AI_IMPLEMENT_PROFILES).
+   *  Always set by run-autonomous ([] when the env var is absent). No built-in step reads
+   *  it — it is the contract surface for image-baked custom/ steps. */
+  profiles?: string[];
   /** Autonomous runner: WORKFLOW.md hook script paths (relative to repo root). */
   hooks?: { setup?: string; verify?: string; teardown?: string };
 }

@@ -8,6 +8,13 @@ const BUILTIN_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..", ".
 export interface ResolveModuleOptions {
   /** Root directory to look for custom/ overrides. Defaults to process.cwd(). */
   customRoot?: string;
+  /**
+   * Secondary root for custom/ overrides baked into the runner image — a
+   * directory that CONTAINS a custom/ subdirectory (same shape as customRoot).
+   * Defaults to the AI_IMPLEMENT_CUSTOM_ROOT env var. Checked after customRoot,
+   * before the built-in.
+   */
+  bakedRoot?: string;
   /** Root directory for built-in files. Defaults to the package root. */
   builtinRoot?: string;
   /** Injectable fs.existsSync for testing. */
@@ -15,27 +22,53 @@ export interface ResolveModuleOptions {
 }
 
 /**
+ * Roots to search for custom/ overrides, in precedence order:
+ *   1. customRoot (defaults to process.cwd()) — the workspace always wins.
+ *   2. bakedRoot (defaults to env AI_IMPLEMENT_CUSTOM_ROOT) — overrides baked
+ *      into the runner image at build time. In Dockerfile.session this is /app,
+ *      i.e. the image's custom/ lives at /app/custom/. Skipped when unset or
+ *      identical to customRoot.
+ */
+function customSearchRoots(options?: { customRoot?: string; bakedRoot?: string }): string[] {
+  const customRoot = options?.customRoot ?? process.cwd();
+  const bakedRoot = options?.bakedRoot ?? process.env.AI_IMPLEMENT_CUSTOM_ROOT;
+  const roots = [customRoot];
+  if (bakedRoot && bakedRoot !== customRoot) roots.push(bakedRoot);
+  return roots;
+}
+
+/**
  * Resolves a module path by checking custom/<path> before falling back to the
  * built-in package root. Enables per-workspace overrides without patching the
- * runner image.
+ * runner image, and image-baked overrides (AI_IMPLEMENT_CUSTOM_ROOT) for forks
+ * that build their own runner image.
  *
  * resolveModule('pipelines/autonomous.yml')
- *   → custom/pipelines/autonomous.yml   (if present in customRoot)
- *   → <package-root>/pipelines/autonomous.yml  (fallback)
+ *   → <customRoot>/custom/pipelines/autonomous.yml   (if present; customRoot defaults to cwd)
+ *   → <bakedRoot>/custom/pipelines/autonomous.yml    (if present; bakedRoot defaults to env AI_IMPLEMENT_CUSTOM_ROOT)
+ *   → <package-root>/pipelines/autonomous.yml        (fallback)
  */
 export function resolveModule(modulePath: string, options?: ResolveModuleOptions): string {
   const existsSyncFn = options?.existsSyncImpl ?? existsSync;
-  const customRoot = options?.customRoot ?? process.cwd();
   const builtinRoot = options?.builtinRoot ?? BUILTIN_ROOT;
 
-  const customPath = join(customRoot, "custom", modulePath);
-  if (existsSyncFn(customPath)) return customPath;
+  for (const root of customSearchRoots(options)) {
+    const customPath = join(root, "custom", modulePath);
+    if (existsSyncFn(customPath)) return customPath;
+  }
   return join(builtinRoot, modulePath);
 }
 
 export interface ImportModuleOptions {
   /** Root directory to look for custom/ overrides. Defaults to process.cwd(). */
   customRoot?: string;
+  /**
+   * Secondary root for custom/ overrides baked into the runner image — a
+   * directory that CONTAINS a custom/ subdirectory (same shape as customRoot).
+   * Defaults to the AI_IMPLEMENT_CUSTOM_ROOT env var. Checked after customRoot,
+   * before the built-in.
+   */
+  bakedRoot?: string;
   /** Injectable fs.existsSync for testing. */
   existsSyncImpl?: (path: string) => boolean;
   /** Injectable import function for testing. Receives a file:// URL string. */
@@ -78,6 +111,7 @@ async function tryImportDefault<T>(
  *
  * resolveModuleImport("steps/implement")
  *   → imports custom/steps/implement.ts (or .js) and returns its default export
+ *     (workspace customRoot first, then the baked AI_IMPLEMENT_CUSTOM_ROOT)
  *   → null if no custom override exists (caller uses built-in)
  */
 export async function resolveModuleImport<T>(
@@ -85,19 +119,20 @@ export async function resolveModuleImport<T>(
   options?: ImportModuleOptions,
 ): Promise<T | null> {
   const existsSyncFn = options?.existsSyncImpl ?? existsSync;
-  const customRoot = options?.customRoot ?? process.cwd();
 
-  for (const ext of [".ts", ".js", ".mjs"]) {
-    const customPath = join(customRoot, "custom", `${modulePath}${ext}`);
-    if (!existsSyncFn(customPath)) continue;
-    const mod = await tryImportDefault<T>(customPath, options?.importFn);
-    if (mod !== null) return mod;
-    // File existed but produced no default export. A named-only export is
-    // almost certainly a mistake — warn loudly rather than silently using the
-    // built-in.
-    console.warn(
-      `resolveModuleImport: ${customPath} exists but has no default export; ignoring`,
-    );
+  for (const root of customSearchRoots(options)) {
+    for (const ext of [".ts", ".js", ".mjs"]) {
+      const customPath = join(root, "custom", `${modulePath}${ext}`);
+      if (!existsSyncFn(customPath)) continue;
+      const mod = await tryImportDefault<T>(customPath, options?.importFn);
+      if (mod !== null) return mod;
+      // File existed but produced no default export. A named-only export is
+      // almost certainly a mistake — warn loudly rather than silently using the
+      // built-in (or the next root).
+      console.warn(
+        `resolveModuleImport: ${customPath} exists but has no default export; ignoring`,
+      );
+    }
   }
   return null;
 }

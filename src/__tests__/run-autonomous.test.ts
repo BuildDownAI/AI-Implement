@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+const isWindows = process.platform === "win32";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -72,7 +74,11 @@ describe("runAutonomous", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
-    rmSync(workspaceDir, { recursive: true, force: true });
+    try {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    } catch {
+      // On Windows, bash-created files may be locked briefly after the process exits
+    }
   });
 
   it("returns exitCode 0 on successful pipeline run", async () => {
@@ -772,9 +778,9 @@ describe("runAutonomous", () => {
     ).rejects.toThrow("Missing required env var: ISSUE_ID");
   });
 
-  it("runs the teardown hook even when the pipeline fails", async () => {
+  it.skipIf(isWindows)("runs the teardown hook even when the pipeline fails", async () => {
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
-    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\n');
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'printf "" > teardown-ran.marker\n');
     const { pipeline, runner } = makeSingleStepPipeline("bad-step", {
       run: vi.fn().mockRejectedValue(new Error("step exploded")),
     });
@@ -791,9 +797,9 @@ describe("runAutonomous", () => {
     expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
   });
 
-  it("runs the teardown hook on a successful run", async () => {
+  it.skipIf(isWindows)("runs the teardown hook on a successful run", async () => {
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
-    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\n');
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'printf "" > teardown-ran.marker\n');
     const { pipeline, runner } = makeSingleStepPipeline("ok-step", { run: vi.fn().mockResolvedValue({}) });
 
     const result = await runAutonomous({
@@ -808,11 +814,11 @@ describe("runAutonomous", () => {
     expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
   });
 
-  it("a failing teardown does not mask the run outcome or throw", async () => {
+  it.skipIf(isWindows)("a failing teardown does not mask the run outcome or throw", async () => {
     writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
     // Teardown runs (marker) but exits non-zero — its failure must not change the
     // pipeline's exitCode 1 nor surface as an unhandled rejection.
-    writeFileSync(join(workspaceDir, "teardown.sh"), 'touch "teardown-ran.marker"\nexit 1\n');
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'printf "" > teardown-ran.marker\nexit 1\n');
     const { pipeline, runner } = makeSingleStepPipeline("bad-step", {
       run: vi.fn().mockRejectedValue(new Error("step exploded")),
     });
@@ -871,6 +877,50 @@ describe("runAutonomous", () => {
     });
 
     expect(capturedSkillsRepo).toBeUndefined();
+  });
+
+  it("parses AI_IMPLEMENT_PROFILES into context data profiles: splits on comma, trims, drops empties", async () => {
+    vi.stubEnv("AI_IMPLEMENT_PROFILES", "backend , ,webapp");
+
+    let capturedProfiles: string[] | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedProfiles = ctx.data.profiles;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-profiles", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedProfiles).toEqual(["backend", "webapp"]);
+  });
+
+  it("sets profiles to an empty array when AI_IMPLEMENT_PROFILES is absent", async () => {
+    let capturedProfiles: string[] | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedProfiles = ctx.data.profiles;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-profiles", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedProfiles).toEqual([]);
   });
 });
 

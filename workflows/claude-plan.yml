@@ -13,7 +13,15 @@
 #
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
-#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Comma-separated image prefixes allowed in addition to ghcr.io/builddownai/.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
+#
+# Private runner images: the plan job pulls the runner image as its container.
+# When that image is private on GHCR the pull is authenticated with GITHUB_TOKEN via
+# the container `credentials:` block (hence `packages: read` in the permissions block).
+# The token can only read private packages owned by THIS repo's org, so a private
+# runner image must live in the same org; a different-org private image needs a PAT
+# swapped into `credentials.password`. Fly/local pull anonymously, so private runner
+# images are only usable in this GitHub Actions execution mode.
 
 name: Claude AI Planning
 
@@ -72,7 +80,7 @@ on:
         type: string
         default: ""
       runner_image:
-        description: "Override the default runner image (must match ghcr.io/builddownai/* or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
+        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
         default: ""
@@ -80,6 +88,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: read
 
 jobs:
   validate-runner-image:
@@ -96,6 +105,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [ -z "$owner" ]; then
+            echo "::error::GITHUB_REPOSITORY_OWNER is empty; cannot derive the owner image prefix." >&2
+            exit 1
+          fi
+
           runner_image="${REQUESTED_RUNNER_IMAGE:-}"
           if [ -z "$runner_image" ]; then
             runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
@@ -111,7 +126,7 @@ jobs:
               ;;
           esac
 
-          allowed_prefixes="ghcr.io/builddownai/"
+          allowed_prefixes="ghcr.io/builddownai/,ghcr.io/${owner}/"
           if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
             allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
           fi
@@ -121,12 +136,12 @@ jobs:
           for raw_prefix in "${prefixes[@]}"; do
             prefix="$(echo "$raw_prefix" | xargs)"
             [ -z "$prefix" ] && continue
-            case "$runner_image" in
-              "$prefix"*)
-                allowed=true
-                break
-                ;;
-            esac
+            # Literal prefix match — quote "$prefix" so glob metacharacters in an
+            # operator-supplied AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES can't widen it.
+            if [[ "$runner_image" == "$prefix"* ]]; then
+              allowed=true
+              break
+            fi
           done
 
           if [ "$allowed" != "true" ]; then
@@ -151,6 +166,13 @@ jobs:
     timeout-minutes: 30
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}
+      # Authenticate the image pull so a private GHCR runner image owned by this
+      # repo's org can be pulled (packages: read scopes GITHUB_TOKEN for this).
+      # Harmless for the public default image. Cross-org private images need a PAT
+      # swapped in for the password — see the header comment.
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Generate GitHub App token
         id: app-token

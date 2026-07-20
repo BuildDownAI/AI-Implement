@@ -105,6 +105,15 @@ export const projectsHtml = `
             </div>
           </div>
           <div class="md-field">
+            <label>Profiles Field</label>
+            <select id="md-jira-profiles-field">
+              <option value="">(auto-discover by name "AI-Implement Profiles")</option>
+            </select>
+            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
+              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.
+            </div>
+          </div>
+          <div class="md-field">
             <label>Repo Field Value</label>
             <select id="md-jira-repo-value">
               <option value="">Select a Repo Field first</option>
@@ -294,12 +303,16 @@ export const projectsScript = `
     document.getElementById('md-jira-jql').value = (tp === 'jira' && tc.kind === 'jira' && tc.jql) ? tc.jql : '';
     const pendingStatus = (tp === 'jira' && tc.statusFieldOverride) ? tc.statusFieldOverride : '';
     const pendingRepoFld = (tp === 'jira' && tc.repoFieldOverride) ? tc.repoFieldOverride : '';
+    const pendingProfilesFld = (tp === 'jira' && tc.profilesFieldOverride) ? tc.profilesFieldOverride : '';
     const statusFldEl = document.getElementById('md-jira-status-field');
     const repoFldEl = document.getElementById('md-jira-repo-field');
+    const profilesFldEl = document.getElementById('md-jira-profiles-field');
     statusFldEl.dataset.pendingValue = pendingStatus;
     repoFldEl.dataset.pendingValue = pendingRepoFld;
+    profilesFldEl.dataset.pendingValue = pendingProfilesFld;
     statusFldEl.value = pendingStatus;
     repoFldEl.value = pendingRepoFld;
+    profilesFldEl.value = pendingProfilesFld;
     // Repo field value: stash for after the dropdown loads
     const pendingRepoVal = (tp === 'jira' && tc.kind === 'jira' && tc.repoFieldValue) ? tc.repoFieldValue : '';
     const sel = document.getElementById('md-jira-repo-value');
@@ -360,6 +373,7 @@ export const projectsScript = `
   async function loadJiraFields() {
     const statusSel = document.getElementById('md-jira-status-field');
     const repoSel = document.getElementById('md-jira-repo-field');
+    const profilesSel = document.getElementById('md-jira-profiles-field');
     if (jiraFieldsLoaded) return;
     try {
       const res = await window.api('/api/jira/fields');
@@ -370,12 +384,16 @@ export const projectsScript = `
       });
       const prevStatus = statusSel ? (statusSel.value || statusSel.dataset.pendingValue || '') : '';
       const prevRepo = repoSel ? (repoSel.value || repoSel.dataset.pendingValue || '') : '';
+      const prevProfiles = profilesSel ? (profilesSel.value || profilesSel.dataset.pendingValue || '') : '';
       const statusPlaceholder = statusSel && statusSel.options[0] ? statusSel.options[0] : null;
       const repoPlaceholder = repoSel && repoSel.options[0] ? repoSel.options[0] : null;
+      const profilesPlaceholder = profilesSel && profilesSel.options[0] ? profilesSel.options[0] : null;
       if (statusSel) statusSel.innerHTML = '';
       if (repoSel) repoSel.innerHTML = '';
+      if (profilesSel) profilesSel.innerHTML = '';
       if (statusSel && statusPlaceholder) statusSel.appendChild(statusPlaceholder);
       if (repoSel && repoPlaceholder) repoSel.appendChild(repoPlaceholder);
+      if (profilesSel && profilesPlaceholder) profilesSel.appendChild(profilesPlaceholder);
       for (const f of fields) {
         const labelText = f.name + ' (' + f.id + ')';
         if (statusSel) {
@@ -390,10 +408,17 @@ export const projectsScript = `
           o2.textContent = labelText;
           repoSel.appendChild(o2);
         }
+        if (profilesSel) {
+          const o3 = document.createElement('option');
+          o3.value = f.id;
+          o3.textContent = labelText;
+          profilesSel.appendChild(o3);
+        }
       }
       // Restore previously set values (e.g. from openMappingDialog before fields loaded)
       if (statusSel && prevStatus) statusSel.value = prevStatus;
       if (repoSel && prevRepo) repoSel.value = prevRepo;
+      if (profilesSel && prevProfiles) profilesSel.value = prevProfiles;
       jiraFieldsLoaded = true;
     } catch (err) {
       console.error('loadJiraFields failed:', err);
@@ -600,12 +625,14 @@ export const projectsScript = `
       const repoFieldValue = sel.classList.contains('hidden') ? txt.value.trim() : sel.value.trim();
       const statusFieldOverride = document.getElementById('md-jira-status-field').value.trim() || null;
       const repoFieldOverride = document.getElementById('md-jira-repo-field').value.trim() || null;
+      const profilesFieldOverride = document.getElementById('md-jira-profiles-field').value.trim() || null;
       body.ticketingConfig = {
         kind: 'jira',
         jql: jql,
         repoFieldValue: repoFieldValue,
         statusFieldOverride: statusFieldOverride,
         repoFieldOverride: repoFieldOverride,
+        profilesFieldOverride: profilesFieldOverride,
       };
     }
 

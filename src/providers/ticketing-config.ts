@@ -14,6 +14,8 @@ export interface JiraMappingConfig {
   statusFieldOverride?: string | null;
   /** Optional explicit customfield_NNNNN override for the repo field. */
   repoFieldOverride?: string | null;
+  /** Optional explicit customfield_NNNNN override for the profiles field. */
+  profilesFieldOverride?: string | null;
 }
 
 export type TicketingMappingConfig = LinearMappingConfig | JiraMappingConfig;
@@ -50,6 +52,7 @@ export function validateTicketingConfig(provider: ProviderId, value: unknown): T
       repoFieldValue: obj.repoFieldValue,
       statusFieldOverride: typeof obj.statusFieldOverride === "string" ? obj.statusFieldOverride : null,
       repoFieldOverride: typeof obj.repoFieldOverride === "string" ? obj.repoFieldOverride : null,
+      profilesFieldOverride: typeof obj.profilesFieldOverride === "string" ? obj.profilesFieldOverride : null,
     };
   }
   throw new Error(`Unknown provider for ticketingConfig: ${provider}`);

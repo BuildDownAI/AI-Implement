@@ -33,6 +33,8 @@ interface DispatchInputs {
   branch_prefix?: string;
   /** Optional skills repo (owner/repo or git URL) forwarded to the runner. Only forwarded when set. */
   skills_repo?: string;
+  /** Comma-joined AI-Implement Profiles from the issue (Jira multi-select). Only forwarded when non-empty. */
+  profiles?: string;
   /** Public base URL the runner should POST results back to. Empty when callback disabled. */
   runner_callback_url?: string;
   /** Signed run token authorizing the runner's callback POST. Empty when callback disabled. */
@@ -146,6 +148,31 @@ export function skillsRepoDispatchFields(
  */
 export function skillsRepoRunnerEnv(mapping: RepoMapping): Record<string, string> {
   return mapping.skillsRepo ? { AI_IMPLEMENT_SKILLS_REPO: mapping.skillsRepo } : {};
+}
+
+/**
+ * Profiles dispatch input for an issue. Unlike the mapping-scoped fields above,
+ * profiles are per-ISSUE (the Jira "AI-Implement Profiles" multi-select on the
+ * ticket). Only included when the issue carries at least one profile, so default
+ * repos keep dispatching to workflow templates that haven't been re-synced with
+ * the new input.
+ */
+export function profilesDispatchFields(
+  issue: { profiles?: string[] },
+): Pick<DispatchInputs, "profiles"> {
+  return issue.profiles && issue.profiles.length > 0
+    ? { profiles: issue.profiles.join(",") }
+    : {};
+}
+
+/**
+ * Profiles env var for the runner process (Fly/local execution modes), where
+ * the value arrives via container env rather than a workflow input.
+ */
+export function profilesRunnerEnv(issue: { profiles?: string[] }): Record<string, string> {
+  return issue.profiles && issue.profiles.length > 0
+    ? { AI_IMPLEMENT_PROFILES: issue.profiles.join(",") }
+    : {};
 }
 
 export async function dispatchWorkflow(
@@ -422,8 +449,16 @@ export async function findOpenPullRequest(
 }
 
 /**
- * Finds any PR (open, closed, or merged) for the given head→base pair.
- * Prefers a merged PR when multiple results exist (e.g. after a re-open / force-push).
+ * Finds the most relevant PR (open, closed, or merged) for the given head→base pair.
+ * Selection is intent-ordered rather than list-ordered: a merged PR wins (terminal state),
+ * else an open PR, else the most recently updated closed PR. This matters when several
+ * PRs have existed for the same branch pair over time — GitHub's default list order is
+ * `created` desc, so a newer closed PR would otherwise shadow an older PR that was later
+ * reopened (reopened PRs keep their created date). The query sorts by `updated` desc so
+ * the per_page=10 window holds the most recently *active* PRs (a window cut by created
+ * date could drop that reopened-but-old PR entirely — something client-side sorting
+ * cannot recover); the explicit selection below then makes the choice deterministic
+ * without trusting response ordering.
  * Returns null on empty list or non-OK response (soft failure).
  */
 export async function findPullRequestByBranches(
@@ -435,7 +470,8 @@ export async function findPullRequestByBranches(
 ): Promise<{ number: number; url: string; state: "open" | "closed"; merged: boolean } | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/pulls` +
-    `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&state=all&per_page=10`;
+    `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}` +
+    `&state=all&sort=updated&direction=desc&per_page=10`;
   const res = await fetch(url, { headers: ghHeaders(token) });
   if (!res.ok) return null;
   const prs = (await res.json()) as Array<{
@@ -443,10 +479,13 @@ export async function findPullRequestByBranches(
     html_url: string;
     state: string;
     merged_at: string | null;
+    updated_at: string;
   }>;
   if (prs.length === 0) return null;
-  const mergedPr = prs.find((p) => p.merged_at !== null);
-  const pr = mergedPr ?? prs[0];
+  const pr =
+    prs.find((p) => p.merged_at !== null) ??
+    prs.find((p) => p.state === "open") ??
+    prs.reduce((best, p) => (p.updated_at > best.updated_at ? p : best));
   return {
     number: pr.number,
     url: pr.html_url,
@@ -456,8 +495,11 @@ export async function findPullRequestByBranches(
 }
 
 /**
- * Deletes a branch ref. Treats 404 as success (idempotent — branch may have been
- * manually deleted or removed by GitHub's "delete on merge" setting).
+ * Deletes a branch ref. Treats an already-missing ref as success (idempotent —
+ * branch may have been manually deleted or removed by GitHub's "delete on merge"
+ * setting). The git-refs DELETE endpoint reports a missing ref as
+ * 422 "Reference does not exist" (404 only covers a missing repo), so both are
+ * accepted; other 422s (e.g. refusing to delete a protected branch) still throw.
  */
 export async function deleteBranch(
   token: string,
@@ -470,6 +512,7 @@ export async function deleteBranch(
   const res = await fetch(url, { method: "DELETE", headers: ghHeaders(token) });
   if (res.status === 204 || res.status === 404) return true;
   const body = await res.text().catch(() => "");
+  if (res.status === 422 && body.includes("Reference does not exist")) return true;
   throw new GitHubApiError({
     status: res.status,
     path: `/repos/${owner}/${repo}/git/refs/heads/${enc}`,

@@ -167,15 +167,17 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  type Ancestor = { identifier: string; labels?: string[]; parent?: Ancestor | null };
+  type Ancestor = { identifier: string; description?: string | null; labels?: string[]; parent?: Ancestor | null };
   type Child = { labels?: string[]; stateType?: string };
+
+  const MULTI_YML = ["```yaml", "# ai-implement.yml", "feature_branch:", '  mode: "multi-issue"', "```"].join("\n");
 
   function labelNodes(names: string[] | undefined) {
     return { nodes: (names ?? []).map((name) => ({ name })) };
   }
   function ancestorNode(a: Ancestor | null | undefined): unknown {
     if (!a) return null;
-    return { identifier: a.identifier, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
+    return { identifier: a.identifier, description: a.description ?? null, labels: labelNodes(a.labels), parent: ancestorNode(a.parent) };
   }
 
   function makeIssue(overrides: {
@@ -277,7 +279,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       ]);
       const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       const leaf = snap.readyForImplementation.find((i) => i.id === "leaf")!;
-      expect(leaf.featureBranchChain).toEqual(["OOL-78"]);
+      expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
     });
 
     it("a leaf under an UNlabeled parent gets no chain (PRs to base)", async () => {
@@ -310,7 +312,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       const leaf = snap.needsPlanning.find((i) => i.id === "leaf")!;
       // base-most first
-      expect(leaf.featureBranchChain).toEqual(["OOL-78", "OOL-96"]);
+      expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]);
     });
 
     it("skips a feature-node parent while any AI-Implement child is in flight", async () => {
@@ -345,7 +347,7 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       ]);
       const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
-      expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+      expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
     });
 
     it("skips a labeled parent whose children are not yet AI-Implement (race guard)", async () => {
@@ -360,6 +362,90 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
       const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       expect(snap.needsPlanning).toEqual([]);
       expect(snap.readyForImplementation).toEqual([]);
+    });
+
+    it("targets a multi-issue parent's branch when the parent's ai-implement.yml selects it", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-87",
+          labels: ["AI-Implement"],
+          parent: { identifier: "OOL-78", description: MULTI_YML, labels: ["AI-Implement"] },
+        }),
+      ]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning[0].featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "multi-issue" }]);
+    });
+
+    it("leaves feature-node behaviour unchanged when there is no ai-implement.yml", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-87",
+          labels: ["AI-Implement"],
+          parent: { identifier: "OOL-78", description: null, labels: ["AI-Implement"] },
+        }),
+      ]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning[0].featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
+    });
+
+    it("resolves each ancestor's mode independently when modes are mixed", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "leaf",
+          identifier: "OOL-87",
+          labels: ["AI-Implement"],
+          parent: {
+            identifier: "OOL-78",
+            description: MULTI_YML,
+            labels: ["AI-Implement"],
+            parent: { identifier: "OOL-70", description: null, labels: ["AI-Implement"] },
+          },
+        }),
+      ]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning[0].featureBranchChain).toEqual([
+        { identifier: "OOL-70", mode: "feature" },
+        { identifier: "OOL-78", mode: "multi-issue" },
+      ]);
+    });
+
+    it("puts a multi-issue parent's own closing work on its multi-issue branch", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          description: MULTI_YML,
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+            { labels: ["AI-Implement"], stateType: "canceled" },
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
+      expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "multi-issue" }]);
+    });
+
+    it("strips the config block from the description handed to the runner", async () => {
+      const descWithConfig = `Group of unrelated work.\n\n${MULTI_YML}`;
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          description: descWithConfig,
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
+      expect(parent.description).toBe("Group of unrelated work.");
+      expect(parent.description).not.toContain("feature_branch");
     });
   });
 
@@ -426,20 +512,21 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     } as Response);
   }
   const labels = (...names: string[]) => ({ nodes: names.map((name) => ({ name })) });
+  const MULTI_YML = ["```yaml", "# ai-implement.yml", "feature_branch:", '  mode: "multi-issue"', "```"].join("\n");
 
   it("returns feature nodes with parent target; non-feature parent → null (base)", async () => {
     mockResponse([
       { identifier: "OOL-107", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("AI-Implement") }] },
+        children: { nodes: [{ identifier: "OOL-child1", labels: labels("AI-Implement") }] },
         parent: { identifier: "OOL-106", labels: labels("AI-Implement") } },
       { identifier: "OOL-106", team: { key: "OOL" },
-        children: { nodes: [{ labels: labels("AI-Implement") }] },
+        children: { nodes: [{ identifier: "OOL-child2", labels: labels("AI-Implement") }] },
         parent: null },
     ]);
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([
-      { identifier: "OOL-107", scopeKey: "OOL", parentIdentifier: "OOL-106" },
-      { identifier: "OOL-106", scopeKey: "OOL", parentIdentifier: null },
+      { identifier: "OOL-107", scopeKey: "OOL", mode: "feature", parent: { identifier: "OOL-106", mode: "feature" }, childIdentifiers: ["OOL-child1"] },
+      { identifier: "OOL-106", scopeKey: "OOL", mode: "feature", parent: null, childIdentifiers: ["OOL-child2"] },
     ]);
   });
 
@@ -452,6 +539,23 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     ]);
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([]);
+  });
+
+  it("carries each node's and its parent's mode onto the roll-up", async () => {
+    mockResponse([
+      {
+        id: "ool-78-id",
+        identifier: "OOL-78",
+        description: MULTI_YML,
+        team: { key: "OOL" },
+        children: { nodes: [{ identifier: "OOL-87", labels: labels("AI-Implement") }] },
+        parent: { identifier: "OOL-70", description: null, labels: labels("AI-Implement") },
+      },
+    ]);
+    const [rollUp] = await new LinearProvider({}).fetchFeatureNodeRollUps();
+    expect(rollUp.mode).toBe("multi-issue");
+    expect(rollUp.parent).toEqual({ identifier: "OOL-70", mode: "feature" });
+    expect(rollUp.childIdentifiers).toEqual(["OOL-87"]);
   });
 });
 
@@ -584,7 +688,7 @@ describe("LinearProvider.markPlanComplete", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({});
-    await p.markPlanComplete("issue-1");
+    await p.markPlanComplete("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(7);
     const removeBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
@@ -687,7 +791,7 @@ describe("LinearProvider.markPrReady", () => {
     mockJsonOnce({ commentCreate: { success: true } });
 
     const p = new LinearProvider({});
-    await p.markPrReady("issue-1", "https://github.com/o/r/pull/7");
+    await p.markPrReady("issue-1", "team-a", "https://github.com/o/r/pull/7");
 
     expect(fetch).toHaveBeenCalledTimes(4);
     const swapBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
@@ -711,7 +815,7 @@ describe("LinearProvider.clearWorkingState", () => {
     mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1");
+    await p.clearWorkingState("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(3);
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[1][1]?.body as string);
@@ -726,7 +830,7 @@ describe("LinearProvider.clearWorkingState", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1");
+    await p.clearWorkingState("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(3);
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[2][1]?.body as string);
@@ -739,7 +843,7 @@ describe("LinearProvider.clearWorkingState", () => {
     mockJsonOnce({ issue: { labels: { nodes: [{ id: "lo", name: "Other" }] } } });
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1");
+    await p.clearWorkingState("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(2);
   });
@@ -750,7 +854,7 @@ describe("LinearProvider.clearWorkingState", () => {
     mockJsonOnce({ issue: { labels: { nodes: [] } } });
 
     const p = new LinearProvider({});
-    await p.clearWorkingState("issue-1");
+    await p.clearWorkingState("issue-1", "team-a");
 
     // Two labels-fetch queries run; no update mutation when there's nothing to remove
     expect(fetch).toHaveBeenCalledTimes(2);
@@ -776,7 +880,7 @@ describe("LinearProvider.markPlanningFailed", () => {
     } as Response);
 
     const p = new LinearProvider({});
-    await p.markPlanningFailed("issue-1", "GraphQL exploded");
+    await p.markPlanningFailed("issue-1", "team-a", "GraphQL exploded");
 
     const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
     const body = JSON.parse(lastCall[1]?.body as string);
@@ -803,7 +907,7 @@ describe("LinearProvider.markImplementationFailed", () => {
     } as Response);
 
     const p = new LinearProvider({});
-    await p.markImplementationFailed("issue-1", "tests timed out");
+    await p.markImplementationFailed("issue-1", "team-a", "tests timed out");
 
     const lastCall = vi.mocked(fetch).mock.calls.at(-1)!;
     const body = JSON.parse(lastCall[1]?.body as string);
@@ -826,7 +930,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({ linearWorkspaceUrl: "https://linear.app/acme" });
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(4);
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
@@ -837,7 +941,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issue: { state: { type: "completed" }, team: { key: "ENG" }, labels: { nodes: [] } } });
 
     const p = new LinearProvider({});
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(1);
   });
@@ -846,7 +950,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issue: { state: { type: "canceled" }, team: { key: "ENG" }, labels: { nodes: [] } } });
 
     const p = new LinearProvider({});
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     expect(fetch).toHaveBeenCalledTimes(1);
   });
@@ -862,7 +966,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({});
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
     expect(updateBody.variables.stateId).toBe("s-shipped");
@@ -875,7 +979,7 @@ describe("LinearProvider.markMerged", () => {
     mockJsonOnce({ issueUpdate: { success: true } });
 
     const p = new LinearProvider({});
-    await p.markMerged("issue-1");
+    await p.markMerged("issue-1", "team-a");
 
     const updateBody = JSON.parse(vi.mocked(fetch).mock.calls[3][1]?.body as string);
     expect(updateBody.variables.labelIds).toEqual(["L2", "L3"]);

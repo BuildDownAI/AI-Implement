@@ -39,7 +39,8 @@ const deps = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn
 });
 
 const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
-  issueId: "issue-uuid-1", identifier: "AII-101", scopeKey: "AII", parentIdentifier: "AII-102", ...o,
+  issueId: "issue-uuid-1", identifier: "AII-101", scopeKey: "AII", mode: "feature",
+  parent: { identifier: "AII-102", mode: "feature" }, childIdentifiers: [], ...o,
 });
 
 beforeEach(() => {
@@ -90,15 +91,15 @@ describe("runMergeUps — multi-level feature trees", () => {
     const finalizeMerged = vi.fn(async () => {});
     await runMergeUps(
       [
-        rollUp({ issueId: "uuid-101", identifier: "AII-101", parentIdentifier: "AII-102" }),
-        rollUp({ issueId: "uuid-102", identifier: "AII-102", parentIdentifier: null }),
+        rollUp({ issueId: "uuid-101", identifier: "AII-101", parent: { identifier: "AII-102", mode: "feature" } }),
+        rollUp({ issueId: "uuid-102", identifier: "AII-102", parent: null }),
       ],
       deps(() => mapping(), finalizeMerged),
     );
 
     expect(finalizeMerged).toHaveBeenCalledTimes(1);
-    expect(finalizeMerged).toHaveBeenCalledWith("uuid-102");
-    expect(finalizeMerged).not.toHaveBeenCalledWith("uuid-101");
+    expect(finalizeMerged).toHaveBeenCalledWith("uuid-102", "AII");
+    expect(finalizeMerged).not.toHaveBeenCalledWith("uuid-101", "AII");
   });
 
   it("two-level tree in one pass: exactly one internal mergeBranch and one top-of-tree createPullRequest", async () => {
@@ -108,8 +109,8 @@ describe("runMergeUps — multi-level feature trees", () => {
     const finalizeMerged = vi.fn(async () => {});
     await runMergeUps(
       [
-        rollUp({ issueId: "uuid-101", identifier: "AII-101", parentIdentifier: "AII-102" }),
-        rollUp({ issueId: "uuid-102", identifier: "AII-102", parentIdentifier: null }),
+        rollUp({ issueId: "uuid-101", identifier: "AII-101", parent: { identifier: "AII-102", mode: "feature" } }),
+        rollUp({ issueId: "uuid-102", identifier: "AII-102", parent: null }),
       ],
       deps(() => mapping(), finalizeMerged),
     );
@@ -147,7 +148,7 @@ describe("runMergeUps — multi-level feature trees", () => {
     vi.mocked(compareBranches).mockResolvedValue(0);
     const finalizeMerged = vi.fn(async () => {});
     await runMergeUps(
-      [rollUp({ identifier: "AII-102", parentIdentifier: null })],
+      [rollUp({ identifier: "AII-102", parent: null })],
       deps(() => mapping(), finalizeMerged),
     );
 

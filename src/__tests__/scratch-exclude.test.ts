@@ -29,7 +29,11 @@ describe("prepareScratchExclusion", () => {
     dir = initRepo();
   });
   afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // On Windows, git marks object files read-only; ignore cleanup failures
+    }
   });
 
   it("keeps untracked ai-output/ out of the staged set after git add -A", () => {

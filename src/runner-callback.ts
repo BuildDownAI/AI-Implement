@@ -1,10 +1,11 @@
-import { getJobByDispatchId, updateJobPrUrl } from "./log.js";
+import { getJobByDispatchId, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { upsertStepRecord } from "./step-log.js";
 import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
+import { renderClassification, TROUBLESHOOTING_URL, type Classification } from "./completion-classification.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
 
@@ -51,17 +52,21 @@ function bad(status: number, error: string): HandleRunnerResultOutput {
 }
 
 /**
- * Formats the failure reason for the ticket comment. When the runner reports a
- * known `failureCode`, uses a structured description so the ticket reader has
- * actionable context. Falls back to the raw `failureReason` string for all
- * other failures.
+ * Renders a failure using the helper function that's shared with Slack/Teams notifications.
+ * When the runner reports a known `failureCode`, makes use of the helper's structured description so the ticket reader has actionable context.
+ * Passes along the raw `failureReason` string for all other failures.
  */
 export function formatFailureComment(failureCode: string | undefined, failureReason: string | undefined): string {
-  if (failureCode === "SENSITIVE_FILES_BLOCKED") {
-    const detail = failureReason ?? "sensitive files detected in staged changes";
-    return `🔒 Blocked by security guardrail\n\n${detail}\n\nRemove these files from the implementation or ensure they are excluded via .gitignore before re-running.`;
-  }
-  return failureReason ?? "unspecified";
+  const c: Classification =
+    failureCode === "SENSITIVE_FILES_BLOCKED"
+      ? {
+          summary: "🔒 Blocked by security guardrail.",
+          detail: failureReason ?? "Sensitive files detected in staged changes.",
+          remediation: "Remove or .gitignore the flagged files, then re-run.",
+          docsUrl: TROUBLESHOOTING_URL,
+        }
+      : { summary: failureReason ?? "Unspecified failure." };
+  return renderClassification(c);
 }
 
 function parseBearerToken(authorization: string | undefined): string | null {
@@ -181,6 +186,7 @@ export async function handleRunnerResult(
       try {
         await provider.markPlanningFailed(
           claims.issueId,
+          mappingTeamKey,
           input.body.failureReason ?? "unspecified",
         );
       } catch (err) {
@@ -190,6 +196,7 @@ export async function handleRunnerResult(
       try {
         await provider.markImplementationFailed(
           claims.issueId,
+          mappingTeamKey,
           formatFailureComment(input.body.failureCode, input.body.failureReason),
         );
       } catch (err) {
@@ -199,13 +206,21 @@ export async function handleRunnerResult(
     // gap-analysis failure: no status transition (PR already terminal)
   } else if (input.body.phase === "planning") {
     try {
-      await provider.markPlanComplete(claims.issueId);
+      await provider.markPlanComplete(claims.issueId, mappingTeamKey);
     } catch (err) {
       warn("markPlanComplete", err);
     }
+    // Finalize the job row immediately: the issue stays excluded from dispatch
+    // while its planning job is in flight, so waiting for the GHA monitor to
+    // notice the run finished delays the planning→implementation handoff — and
+    // if run tracking failed entirely, blocks it until the stuck watchdog fires.
+    const job = getJobByDispatchId(claims.dispatchId);
+    if (job) {
+      updateJobStatus(job.id, "completed", "planning_callback");
+    }
   } else if (input.body.phase === "implementation") {
     try {
-      await provider.markPrReady(claims.issueId, input.body.prUrl!);
+      await provider.markPrReady(claims.issueId, mappingTeamKey, input.body.prUrl!);
     } catch (err) {
       warn("markPrReady", err);
     }

@@ -117,7 +117,7 @@ const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
  *    `ai-implement/{issueIdentifier}-...`.
  */
 function findMatchingDispatch(repo: string, branch?: string, prUrl?: string, prNumber?: number) {
-  const jobs = listLog(500);
+  const jobs = listLog({ limit: 500 });
 
   for (const job of jobs) {
     if (job.repo !== repo) continue;

@@ -62,16 +62,21 @@ function parsePrivateKey(pem: string): crypto.KeyObject {
   return crypto.createPrivateKey(normalized);
 }
 
+// exp is minted this many seconds below GitHub's 600s cap (and iat backdated the same)
+// so a host clock running ahead of GitHub still validates. Larger drift needs a clock resync (NTP).
+const CLOCK_SKEW_TOLERANCE_S = 300;
+
 /**
  * Creates a signed JWT for authenticating as a GitHub App.
- * Valid for 10 minutes (GitHub's max is 10 min).
+ * Minted below GitHub's 10-min exp cap by CLOCK_SKEW_TOLERANCE_S so a host clock running ahead of GitHub still passes validation.
+ * Exported for unit tests that assert the iat/exp skew bounds.
  */
-function createAppJwt(appId: string, privateKey: string): string {
+export function createAppJwt(appId: string, privateKey: string): string {
   const now = Math.floor(Date.now() / 1000);
   const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
   const payload = Buffer.from(JSON.stringify({
-    iat: now - 60, // 60s clock skew buffer
-    exp: now + 600,
+    iat: now - CLOCK_SKEW_TOLERANCE_S, // 300s clock skew buffer (for hosts ahead of GitHub's time)
+    exp: now + 600 - CLOCK_SKEW_TOLERANCE_S,
     iss: appId,
   })).toString("base64url");
 

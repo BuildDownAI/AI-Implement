@@ -120,8 +120,9 @@ const SYNC_ERROR_MESSAGES: Record<Exclude<SyncErrorCategory, "unknown">, string>
 
 export function classifySyncError(err: unknown): ClassifiedSyncError {
   if (err instanceof GitHubApiError) {
-    // 401 first: a bad/expired App JWT (often host clock skew — the JWT currently has no forward-skew margin) 401s regardless of which endpoint was hit.
-    // Never let a 401 fall through to the 404 "not installed" check below.
+    // 401 first: a bad/expired App JWT is rejected at GitHub's auth layer regardless of endpoint,
+    // so catch every 401 here before the 404 "not installed" check.
+    // Host clock skew is the usual cause — the JWT tolerates ±300s of drift (AII-199), so a 401 implies drift beyond that or bad credentials.
     if (err.status === 401) return classify("clock-skew-suspected", err.message);
     if (err.status === 403) return classify("permission-denied", err.message); // incl. missing `workflows` perm on .github/workflows PUT
     
@@ -313,9 +314,19 @@ async function ensureSyncBranch(params: {
   syncBranch: string;
 }): Promise<void> {
   const { gh, repo, baseBranch, syncBranch } = params;
-  const base = await gh.request<{ object: { sha: string } }>(
+  const base = await gh.maybeRequest<{ object: { sha: string } }>(
     `/repos/${repo}/git/ref/heads/${encodeRefPath(baseBranch)}`,
   );
+  if (!base) {
+    // Deliberately a plain Error, not a GitHubApiError: classifySyncError passes an
+    // unknown error's raw message through verbatim, so this descriptive text is exactly
+    // what the admin UI shows instead of an opaque "GitHub 404 /repos/.../git/ref/..." dump.
+    throw new Error(
+      `Base branch "${baseBranch}" does not exist in ${repo}. ` +
+        `The repository may be empty (no commits yet) or the configured branch name is wrong. ` +
+        `Push an initial commit or correct the branch name in the project settings.`,
+    );
+  }
   const syncRef = await gh.maybeRequest<{ object: { sha: string } }>(
     `/repos/${repo}/git/ref/heads/${encodeRefPath(syncBranch)}`,
   );

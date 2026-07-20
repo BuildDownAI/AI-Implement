@@ -209,6 +209,15 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     }
   })();
   const skillsRepo = process.env.AI_IMPLEMENT_SKILLS_REPO?.trim() || undefined;
+  // Per-issue AI-Implement profile names (from the Jira multi-select field, forwarded
+  // by the orchestrator as the `profiles` dispatch input / AI_IMPLEMENT_PROFILES env).
+  // No built-in step consumes ctx.data.profiles — this is deliberately the contract
+  // surface for image-baked custom/ steps (resolveModuleImport over
+  // AI_IMPLEMENT_CUSTOM_ROOT), which branch their setup on the selected profiles.
+  const profiles = (process.env.AI_IMPLEMENT_PROFILES ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
 
   const logLevel = resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL);
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
@@ -251,6 +260,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       maxIterations,
       branchPrefix,
       skillsRepo,
+      profiles,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,

@@ -98,7 +98,7 @@ describe("remediateStuckJob", () => {
       await remediateStuckJob(mockConfig, provider, job, "queued");
 
       expect(updateJobStatus).toHaveBeenCalledWith(job.id, "timed_out", "stuck_requeued");
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(provider.postComment).not.toHaveBeenCalled();
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
@@ -143,7 +143,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "queued");
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
       expect(deleteDispatched).not.toHaveBeenCalled();
     });
 
@@ -257,7 +257,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
     });
 
     it("calls clearWorkingState for a stuck planning job (hard-stop path)", async () => {
@@ -267,7 +267,7 @@ describe("remediateStuckJob", () => {
 
       await remediateStuckJob(mockConfig, provider, job, "in_progress");
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "ENG");
     });
   });
 
