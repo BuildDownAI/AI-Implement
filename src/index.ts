@@ -30,6 +30,7 @@ import { handleRunnerResult } from "./runner-callback.js";
 import type { RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
+import { runRunnerCallbackSelfCheck } from "./callback-self-check.js";
 import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 import {
   fetchLocalContainerLogs,
@@ -1729,6 +1730,18 @@ async function main(): Promise<void> {
   }
 
   const server = startServer(config, registry);
+
+  // Best-effort check that runners will be able to reach the callback URL.
+  // Advisory only — a broken callback path otherwise fails silently as
+  // endless planning re-dispatch. Skipped in local mode (host.docker.internal
+  // is not resolvable from the host). Delayed so a proxy/tunnel that routes to
+  // this instance has a moment to notice the server is up.
+  setTimeout(() => {
+    void runRunnerCallbackSelfCheck({
+      baseUrl: config.runnerCallbackBaseUrl,
+      runnerMode: initialRunnerMode,
+    });
+  }, 5_000).unref();
 
   // Reconcile machines from any previous run before starting the poll loop
   await startupReconciliation(config, registry);
