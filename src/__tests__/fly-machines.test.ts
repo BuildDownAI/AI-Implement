@@ -16,6 +16,7 @@ import {
   updateMachineMetadata,
 } from "../fly-machines.js";
 import type { SessionMachineInput } from "../fly-machines.js";
+import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
 
 const TOKEN = "fly-test-token";
 const APP = "ai-implement-sessions-test";
@@ -631,6 +632,122 @@ describe("buildSessionMachineConfig", () => {
   it("omits expected_ttl_seconds from metadata when not provided", () => {
     const result = buildSessionMachineConfig(baseInput);
     expect(result.config.metadata!.expected_ttl_seconds).toBeUndefined();
+  });
+
+  describe("AI_IMPLEMENT_RUN_CONFIG envelope", () => {
+    it("passes through AI_IMPLEMENT_RUN_CONFIG from extraEnv and is decodable", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
+        runnerPhase: "implementation",
+        maxTurns: 30,
+        maxIterations: 2,
+        branchPrefix: "pr",
+        skillsRepo: "org/skills",
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+      };
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+        extraEnv: {
+          AI_IMPLEMENT_MAX_TURNS: "30",
+          AI_IMPLEMENT_MAX_ITERATIONS: "2",
+          AI_IMPLEMENT_BRANCH_PREFIX: "pr",
+          AI_IMPLEMENT_SKILLS_REPO: "org/skills",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
+        },
+      });
+      const env = result.config.env!;
+
+      expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG);
+      expect(decoded.issue.id).toBe("uuid-123");
+      expect(decoded.issue.identifier).toBe("ENG-42");
+      expect(decoded.maxTurns).toBe(30);
+      expect(decoded.maxIterations).toBe(2);
+      expect(decoded.branchPrefix).toBe("pr");
+      expect(decoded.skillsRepo).toBe("org/skills");
+      expect(decoded.runnerCallbackUrl).toBe("https://orchestrator.example.com/callback");
+      expect(decoded.runnerPhase).toBe("implementation");
+    });
+
+    it("flat legacy vars remain alongside the envelope", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
+        runnerPhase: "implementation",
+        maxTurns: 30,
+        branchPrefix: "pr",
+        skillsRepo: "org/skills",
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+      };
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+        runToken: "run-tok",
+        extraEnv: {
+          AI_IMPLEMENT_MAX_TURNS: "30",
+          AI_IMPLEMENT_BRANCH_PREFIX: "pr",
+          AI_IMPLEMENT_SKILLS_REPO: "org/skills",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
+        },
+      });
+      const env = result.config.env!;
+
+      expect(env.ISSUE_ID).toBe("uuid-123");
+      expect(env.RUNNER_CALLBACK_URL).toBe("https://orchestrator.example.com/callback");
+      expect(env.AI_IMPLEMENT_MAX_TURNS).toBe("30");
+      expect(env.AI_IMPLEMENT_BRANCH_PREFIX).toBe("pr");
+      expect(env.AI_IMPLEMENT_SKILLS_REPO).toBe("org/skills");
+      expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
+    });
+
+    it("planning session envelope has runnerPhase=planning and no branchPrefix/skillsRepo", () => {
+      const planningConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
+        runnerPhase: "planning",
+        maxTurns: 20,
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+      };
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        phase: "planning",
+        extraEnv: {
+          PARENT: "ENG-40",
+          SIBLINGS: "",
+          DEPENDENCIES: "",
+          AI_IMPLEMENT_MAX_TURNS: "20",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningConfig),
+        },
+      });
+      const env = result.config.env!;
+
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG);
+      expect(decoded.runnerPhase).toBe("planning");
+      expect(decoded.branchPrefix).toBeUndefined();
+      expect(decoded.skillsRepo).toBeUndefined();
+      expect(env.PARENT).toBe("ENG-40");
+      expect(env.AI_IMPLEMENT_MAX_TURNS).toBe("20");
+    });
+
+    it("secrets are not present in the decoded envelope", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "uuid-123", identifier: "ENG-42", title: "T", description: "D" },
+        runnerPhase: "implementation",
+      };
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
+      });
+      const env = result.config.env!;
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as Record<string, unknown>;
+      expect(decoded.SESSION_TOKEN).toBeUndefined();
+      expect(decoded.GITHUB_TOKEN).toBeUndefined();
+      expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(decoded.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    });
   });
 
   it("smoke test: metadata has all required keys with correct types", () => {

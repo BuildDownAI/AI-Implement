@@ -47,6 +47,7 @@ import {
 } from "./local-docker.js";
 import { resolveTerminalStatus, workflowFileForJob } from "./monitor-status.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
@@ -648,6 +649,20 @@ async function dispatchPlanning(
           DEPENDENCIES: planningContextInputs.dependencies,
         };
 
+        const planningRunConfig: RunConfigV1 = {
+          v: 1,
+          issue: {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description || issue.title,
+          },
+          runnerPhase: "planning",
+          ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
+          ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+          ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+        };
+
         // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
         const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
         if (execPath === "fly-machines") {
@@ -696,7 +711,7 @@ async function dispatchPlanning(
             tenantId: config.tenantId ?? undefined,
             expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
             extraEnv: (() => {
-              const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv };
+              const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) };
               return Object.keys(merged).length > 0 ? merged : undefined;
             })(),
           });
@@ -738,7 +753,7 @@ async function dispatchPlanning(
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken: runToken || undefined,
             extraEnv: (() => {
-              const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv };
+              const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...planningEnv, AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningRunConfig) };
               return Object.keys(merged).length > 0 ? merged : undefined;
             })(),
           });
@@ -1068,6 +1083,23 @@ async function dispatchFlyMachine(
         defaultImage: config.sessionImage,
       });
 
+      const implRunConfig: RunConfigV1 = {
+        v: 1,
+        issue: {
+          id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          description: issue.description || issue.title,
+        },
+        runnerPhase: "implementation",
+        ...(baseBranch !== mapping.defaultBranch ? { baseBranch } : {}),
+        ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
+        ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
+        ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+        ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
+        ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+      };
+
       const machineConfig = buildSessionMachineConfig({
         image: resolvedImage,
         issueId: issue.id,
@@ -1096,7 +1128,7 @@ async function dispatchFlyMachine(
         tenantId: config.tenantId ?? undefined,
         expectedTtlSeconds: Math.round(SWEEP_MACHINE_MAX_AGE_MS / 1000),
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(implRunConfig) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
@@ -1152,6 +1184,23 @@ async function dispatchLocalDocker(
 
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
+      const localImplRunConfig: RunConfigV1 = {
+        v: 1,
+        issue: {
+          id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          description: issue.description || issue.title,
+        },
+        runnerPhase: "implementation",
+        ...(baseBranch !== mapping.defaultBranch ? { baseBranch } : {}),
+        ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
+        ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
+        ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+        ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
+        ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+      };
+
       const container = await startLocalRunnerContainer({
         image: config.localRunnerImage,
         issueId: issue.id,
@@ -1171,7 +1220,7 @@ async function dispatchLocalDocker(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken: runToken || undefined,
         extraEnv: (() => {
-          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue) };
+          const merged = { ...mapping.extraEnv, ...capRunnerEnv(mapping), ...branchPrefixRunnerEnv(mapping), ...skillsRepoRunnerEnv(mapping), ...profilesRunnerEnv(issue), AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(localImplRunConfig) };
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
