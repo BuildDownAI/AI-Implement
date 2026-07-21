@@ -18,14 +18,16 @@ const ALWAYS_SYNC_FILES = [
     message: "Sync claude-implement.yml from ai-implement",
   },
   {
-    local: "workflows/comment-trigger.yml",
-    remote: ".github/workflows/comment-trigger.yml",
-    message: "Sync comment-trigger.yml from ai-implement",
-  },
-  {
     local: "workflows/claude-plan.yml",
     remote: ".github/workflows/claude-plan.yml",
     message: "Sync claude-plan.yml from ai-implement",
+  },
+] as const;
+
+const REMOVE_FILES = [
+  {
+    remote: ".github/workflows/comment-trigger.yml",
+    message: "Remove comment-trigger.yml — /ai-implement is now handled by the orchestrator",
   },
 ] as const;
 
@@ -349,6 +351,9 @@ function syncPrBody(): string {
     "",
     "**Added once (never overwritten):**",
     ...SEED_ONCE_FILES.map((file) => `- \`${file.remote}\` — ${file.description}`),
+    "",
+    "**Removed:**",
+    ...REMOVE_FILES.map((file) => `- \`${file.remote}\``),
   ].join("\n");
 }
 
@@ -428,6 +433,17 @@ export async function syncWorkflowTemplates(
       message: file.message,
     });
     if (changed) changedFiles.push(file.remote);
+  }
+
+  for (const file of REMOVE_FILES) {
+    const remote = await getRemoteFile(gh, targetRepo, file.remote, syncBranch);
+    if (remote) {
+      await gh.request(`/repos/${targetRepo}/contents/${encodeRepoPath(file.remote)}`, {
+        method: "DELETE",
+        body: JSON.stringify({ message: file.message, sha: remote.sha, branch: syncBranch }),
+      });
+      changedFiles.push(file.remote);
+    }
   }
 
   const existingPr = await findSyncPr(gh, targetRepo, syncBranch);

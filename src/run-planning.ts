@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { postRunnerResult } from "./runner-result.js";
+import { decodeRunConfig } from "./run-config.js";
 
 export type PlanningExecutor = (
   prompt: string,
@@ -57,14 +58,27 @@ export interface RunPlanningOptions {
 
 export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number }> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
+
+  // Resolve planning context: prefer envelope cfg.planningContext, fall back to legacy env vars.
+  let envelopePlanningContext: { parent?: string; siblings?: string; dependencies?: string } | undefined;
+  const rawConfig = process.env.AI_IMPLEMENT_RUN_CONFIG;
+  if (rawConfig) {
+    try {
+      const cfg = decodeRunConfig(rawConfig);
+      if (cfg.planningContext) envelopePlanningContext = cfg.planningContext;
+    } catch {
+      // Malformed envelope: fall back to env vars without failing.
+    }
+  }
+
   const subs: Record<string, string> = {
     ISSUE_ID: requireEnv("ISSUE_ID"),
     ISSUE_IDENTIFIER: requireEnv("ISSUE_IDENTIFIER"),
     ISSUE_TITLE: requireEnv("ISSUE_TITLE"),
     ISSUE_DESCRIPTION: requireEnv("ISSUE_DESCRIPTION"),
-    PARENT: process.env.PARENT?.trim() || "None",
-    SIBLINGS: process.env.SIBLINGS?.trim() || "None",
-    DEPENDENCIES: process.env.DEPENDENCIES?.trim() || "None",
+    PARENT: envelopePlanningContext?.parent ?? process.env.PARENT?.trim() ?? "None",
+    SIBLINGS: envelopePlanningContext?.siblings ?? process.env.SIBLINGS?.trim() ?? "None",
+    DEPENDENCIES: envelopePlanningContext?.dependencies ?? process.env.DEPENDENCIES?.trim() ?? "None",
   };
   let model = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
   let prompt = buildDefaultPlanningPrompt(subs);

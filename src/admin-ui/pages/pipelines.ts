@@ -131,6 +131,7 @@ export const pipelinesScript = `
         completed: 'success',
         review_failed: 'warn',
         failed: 'fail',
+        'dispatch-failed': 'fail',
         timed_out: 'warn'
       };
 

@@ -184,6 +184,21 @@ export function getDb(): Database.Database {
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_review_fix_dispatches_pr ON review_fix_dispatches(repo, pr_number, created_at)`);
     db.exec(`
+      CREATE TABLE IF NOT EXISTS comment_gapfill_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        comment_id INTEGER NOT NULL UNIQUE,
+        commenter TEXT NOT NULL,
+        instruction TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL,
+        processed_at INTEGER
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_status ON comment_gapfill_queue(status, created_at)`);
+    db.exec(`
       CREATE TABLE IF NOT EXISTS workflow_sync_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         team_key TEXT NOT NULL UNIQUE,
