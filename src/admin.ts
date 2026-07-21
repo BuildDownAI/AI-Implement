@@ -10,6 +10,7 @@ import {
   DEFAULT_PLANNING_ENABLED,
   DEFAULT_PLANNING_WORKFLOW_FILE,
   DEFAULT_AUTO_APPROVE_PLANS,
+  DEFAULT_AUTO_MERGE,
   DEFAULT_PROVIDER,
   upsertMapping,
   updateMappingCap,
@@ -1009,6 +1010,7 @@ async function handleUpsertMapping(
       planningEnabled?: boolean;
       planningWorkflowFile?: string;
       autoApprovePlans?: boolean;
+      autoMerge?: boolean;
       extraEnv?: Record<string, string>;
       provider?: string;
       awsRegion?: string | null;
@@ -1072,6 +1074,7 @@ async function handleUpsertMapping(
     const planningEnabled = body.planningEnabled ?? DEFAULT_PLANNING_ENABLED;
     const planningWorkflowFile = body.planningWorkflowFile ?? DEFAULT_PLANNING_WORKFLOW_FILE;
     const autoApprovePlans = body.autoApprovePlans ?? DEFAULT_AUTO_APPROVE_PLANS;
+    const autoMerge = body.autoMerge ?? DEFAULT_AUTO_MERGE;
 
     if (planningEnabled && !planningWorkflowFile) {
       json(res, 400, { error: "planningWorkflowFile is required when planningEnabled is true" });
@@ -1171,6 +1174,7 @@ async function handleUpsertMapping(
       planningEnabled,
       planningWorkflowFile,
       autoApprovePlans,
+      autoMerge,
       extraEnv,
       provider,
       ticketingProvider: ticketing.ticketingProvider,
