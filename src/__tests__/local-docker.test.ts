@@ -6,6 +6,7 @@ import {
   splitLocalRunnerEnv,
 } from "../local-docker.js";
 import type { LocalRunnerInput } from "../local-docker.js";
+import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
 
 const baseInput: LocalRunnerInput = {
   image: "ai-implement-runner:local",
@@ -70,6 +71,129 @@ describe("buildLocalRunnerEnv", () => {
 
     expect(env.SESSION_MODE).toBe("hybrid");
     expect(env.CUSTOM_VAR).toBe("ok");
+  });
+
+  describe("AI_IMPLEMENT_RUN_CONFIG envelope", () => {
+    it("passes through AI_IMPLEMENT_RUN_CONFIG from extraEnv and is decodable", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "issue-uuid", identifier: "ENG-42", title: "Add local mode", description: "Run implementation jobs locally" },
+        runnerPhase: "implementation",
+        maxTurns: 40,
+        maxIterations: 3,
+        branchPrefix: "pr",
+        skillsRepo: "org/skills",
+        runnerCallbackUrl: "http://host.docker.internal:8080/callback",
+      };
+      const env = buildLocalRunnerEnv({
+        ...baseInput,
+        runnerCallbackUrl: "http://host.docker.internal:8080/callback",
+        extraEnv: {
+          AI_IMPLEMENT_MAX_TURNS: "40",
+          AI_IMPLEMENT_MAX_ITERATIONS: "3",
+          AI_IMPLEMENT_BRANCH_PREFIX: "pr",
+          AI_IMPLEMENT_SKILLS_REPO: "org/skills",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
+        },
+      });
+
+      expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG);
+      expect(decoded.issue.id).toBe("issue-uuid");
+      expect(decoded.issue.identifier).toBe("ENG-42");
+      expect(decoded.maxTurns).toBe(40);
+      expect(decoded.maxIterations).toBe(3);
+      expect(decoded.branchPrefix).toBe("pr");
+      expect(decoded.skillsRepo).toBe("org/skills");
+      expect(decoded.runnerCallbackUrl).toBe("http://host.docker.internal:8080/callback");
+      expect(decoded.runnerPhase).toBe("implementation");
+    });
+
+    it("flat legacy vars remain alongside the envelope", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "issue-uuid", identifier: "ENG-42", title: "Add local mode", description: "Run implementation jobs locally" },
+        runnerPhase: "implementation",
+        maxTurns: 40,
+        branchPrefix: "pr",
+        skillsRepo: "org/skills",
+      };
+      const env = buildLocalRunnerEnv({
+        ...baseInput,
+        extraEnv: {
+          AI_IMPLEMENT_MAX_TURNS: "40",
+          AI_IMPLEMENT_BRANCH_PREFIX: "pr",
+          AI_IMPLEMENT_SKILLS_REPO: "org/skills",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
+        },
+      });
+
+      expect(env.ISSUE_ID).toBe("issue-uuid");
+      expect(env.AI_IMPLEMENT_MAX_TURNS).toBe("40");
+      expect(env.AI_IMPLEMENT_BRANCH_PREFIX).toBe("pr");
+      expect(env.AI_IMPLEMENT_SKILLS_REPO).toBe("org/skills");
+      expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
+    });
+
+    it("planning session envelope has runnerPhase=planning", () => {
+      const planningConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "issue-uuid", identifier: "ENG-42", title: "Add local mode", description: "Run implementation jobs locally" },
+        runnerPhase: "planning",
+        maxTurns: 20,
+      };
+      const env = buildLocalRunnerEnv({
+        ...baseInput,
+        phase: "planning",
+        extraEnv: {
+          PARENT: "ENG-40",
+          SIBLINGS: "",
+          DEPENDENCIES: "",
+          AI_IMPLEMENT_MAX_TURNS: "20",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningConfig),
+        },
+      });
+
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG);
+      expect(decoded.runnerPhase).toBe("planning");
+      expect(decoded.branchPrefix).toBeUndefined();
+      expect(decoded.skillsRepo).toBeUndefined();
+      expect(env.PARENT).toBe("ENG-40");
+      expect(env.AI_IMPLEMENT_MAX_TURNS).toBe("20");
+    });
+
+    it("AI_IMPLEMENT_RUN_CONFIG is in the public env bucket (not secret)", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "issue-uuid", identifier: "ENG-42", title: "Add local mode", description: "Run implementation jobs locally" },
+        runnerPhase: "implementation",
+      };
+      const env = buildLocalRunnerEnv({
+        ...baseInput,
+        extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
+      });
+      const { publicEnv, secretEnv } = splitLocalRunnerEnv(env);
+
+      expect(publicEnv.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
+      expect(secretEnv.AI_IMPLEMENT_RUN_CONFIG).toBeUndefined();
+    });
+
+    it("secrets are not present in the decoded envelope", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "issue-uuid", identifier: "ENG-42", title: "T", description: "D" },
+        runnerPhase: "implementation",
+      };
+      const env = buildLocalRunnerEnv({
+        ...baseInput,
+        extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
+      });
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as Record<string, unknown>;
+      expect(decoded.SESSION_TOKEN).toBeUndefined();
+      expect(decoded.GITHUB_TOKEN).toBeUndefined();
+      expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(decoded.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    });
   });
 });
 
