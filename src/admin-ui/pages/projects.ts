@@ -140,6 +140,16 @@ export const projectsHtml = `
             <input id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
+          <div class="md-field">
+            <label>Additional sensitive patterns <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <textarea id="md-sensitive-add" rows="3" placeholder="one glob per line"></textarea>
+            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
+          </div>
+          <div class="md-field">
+            <label>Allowed exceptions <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <textarea id="md-sensitive-allow" rows="3" placeholder="one glob per line"></textarea>
+            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
+          </div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -294,6 +304,8 @@ export const projectsScript = `
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
     document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
     document.getElementById('md-skills-repo').value = m.skillsRepo || '';
+    document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
+    document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -612,6 +624,8 @@ export const projectsScript = `
       maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
       branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
       skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
+      sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
+      sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
