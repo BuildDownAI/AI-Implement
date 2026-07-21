@@ -75,17 +75,28 @@ function normalizeSkillsRepo(raw: unknown): string | null {
   return v;
 }
 
-function normalizeSensitiveGlobs(raw: string | string[] | undefined | null): string[] | null {
+function normalizeSensitiveGlobs(raw: unknown): string[] | null {
   if (raw == null) return null;
+  if (typeof raw !== "string" && !Array.isArray(raw)) {
+    throw new Error("must be a string or an array of strings");
+  }
   const items = Array.isArray(raw) ? raw : raw.split("\n");
-  const globs = items.map((g) => g.trim()).filter((g) => g.length > 0);
+  for (const item of items) {
+    if (typeof item !== "string") {
+      throw new Error("must be a string or an array of strings");
+    }
+  }
+  const globs = (items as string[]).map((g) => g.trim()).filter((g) => g.length > 0);
   if (globs.length === 0) return null;
   if (globs.length > 100) {
     throw new Error(`too many globs (${globs.length}); maximum is 100 per list`);
   }
   for (const glob of globs) {
-    if (glob === "**") {
-      throw new Error(`glob "**" is not allowed (would disable the guardrail entirely)`);
+    // Reject globs made up entirely of wildcards, path separators, and dots
+    // ("**", "**/*", "*", ".*", ...): they match everything and would disable
+    // the guardrail. Every glob must carry at least one literal path character.
+    if (glob.replace(/[*/.\s]/g, "").length === 0) {
+      throw new Error(`glob "${glob}" is not allowed (matches everything, which would disable the guardrail); each glob must contain a literal path character`);
     }
     if (glob.length > 256) {
       throw new Error(`glob too long (${glob.length} chars): "${glob.slice(0, 30)}..."; maximum is 256 characters`);

@@ -890,6 +890,45 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toContain("[z-a]");
   });
+
+  it("rejects an all-wildcard glob (**/*) in sensitiveAllowPatterns with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD5", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["**/*"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("**/*");
+  });
+
+  it("rejects a bare * glob (matches everything) with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD6", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["*"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-string sensitiveAddPatterns value with a clean 400 (no raw TypeError)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD7", owner: "org", repo: "app",
+      sensitiveAddPatterns: 123,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("string");
+  });
+
+  it("accepts wildcard-heavy globs that still contain a literal path component (202)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGOK", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["**/secrets.env", ".env.*"],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAllowPatterns).toEqual(["**/secrets.env", ".env.*"]);
+  });
 });
 
 describe("admin runner-mode", () => {
