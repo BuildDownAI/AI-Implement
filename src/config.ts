@@ -13,6 +13,7 @@ export const DEFAULT_MACHINE_MEMORY_MB = 4096;
 export const DEFAULT_PLANNING_ENABLED = true;
 export const DEFAULT_PLANNING_WORKFLOW_FILE = "claude-plan.yml";
 export const DEFAULT_AUTO_APPROVE_PLANS = true;
+export const DEFAULT_AUTO_MERGE = true;
 
 export type ExecutionMode = "github-actions" | "fly-machines";
 export type SessionMode = "autonomous" | "interactive" | "hybrid";
@@ -37,6 +38,10 @@ export interface RepoMapping {
   planningWorkflowFile: string;
   /** Whether to auto-approve plans and proceed to implementation automatically. Default true. */
   autoApprovePlans: boolean;
+  /** When true, the orchestrator auto-merges this project's child PRs into their
+   *  ai-implement/{feature,multi-issue}/* grouping branch once checks pass. Never
+   *  merges into defaultBranch (top-of-tree stays human-reviewed). Default false. */
+  autoMerge: boolean;
   /** Extra env vars injected into Fly machine env at dispatch time. */
   extraEnv: Record<string, string>;
   /** Claude provider used by the dispatched workflow. Default 'anthropic'. */
@@ -103,6 +108,9 @@ function ensureMappingsColumns(): void {
   if (!names.has("auto_approve_plans")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN auto_approve_plans INTEGER NOT NULL DEFAULT 1`);
   }
+  if (!names.has("auto_merge")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN auto_merge INTEGER NOT NULL DEFAULT 1`);
+  }
   if (!names.has("extra_env")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN extra_env TEXT`);
   }
@@ -155,6 +163,7 @@ export function initMappingsTable(): void {
       planning_enabled INTEGER NOT NULL DEFAULT 1,
       planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
       auto_approve_plans INTEGER NOT NULL DEFAULT 1,
+      auto_merge INTEGER NOT NULL DEFAULT 1,
       extra_env TEXT,
       provider TEXT NOT NULL DEFAULT '${DEFAULT_PROVIDER}',
       ticketing_provider TEXT NOT NULL DEFAULT '${DEFAULT_TICKETING_PROVIDER}',
@@ -174,10 +183,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -186,7 +195,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -202,6 +211,7 @@ export function getMappings(): Record<string, RepoMapping> {
       planning_enabled: number;
       planning_workflow_file: string;
       auto_approve_plans: number;
+      auto_merge: number;
       extra_env: string | null;
       provider: string | null;
       ticketing_provider: string | null;
@@ -240,6 +250,7 @@ export function getMappings(): Record<string, RepoMapping> {
       planningEnabled: Boolean(row.planning_enabled ?? DEFAULT_PLANNING_ENABLED),
       planningWorkflowFile: row.planning_workflow_file || DEFAULT_PLANNING_WORKFLOW_FILE,
       autoApprovePlans: Boolean(row.auto_approve_plans ?? DEFAULT_AUTO_APPROVE_PLANS),
+      autoMerge: Boolean(row.auto_merge ?? DEFAULT_AUTO_MERGE),
       extraEnv: (() => { try { return row.extra_env ? JSON.parse(row.extra_env) as Record<string, string> : {}; } catch { return {}; } })(),
       provider: (row.provider as ClaudeProvider) ?? DEFAULT_PROVIDER,
       ticketingProvider: (row.ticketing_provider as ProviderId) ?? DEFAULT_TICKETING_PROVIDER,
@@ -259,7 +270,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -275,6 +286,7 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.planningEnabled ? 1 : 0,
       mapping.planningWorkflowFile,
       mapping.autoApprovePlans ? 1 : 0,
+      mapping.autoMerge ? 1 : 0,
       Object.keys(mapping.extraEnv).length > 0 ? JSON.stringify(mapping.extraEnv) : null,
       mapping.provider,
       mapping.ticketingProvider,

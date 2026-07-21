@@ -175,6 +175,7 @@ export const projectsHtml = `
         <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
           <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-planning" type="checkbox" style="width:auto" onchange="onPlanningChange()"> Enabled</label>
           <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-approve" type="checkbox" style="width:auto" checked> Auto-approve</label>
+          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-merge" type="checkbox" style="width:auto" checked> Auto-merge child PRs</label>
           <div id="md-planning-wf-wrap" class="md-field hidden" style="flex:1;min-width:160px;margin-bottom:0">
             <label>Planning Workflow File</label><input id="md-planning-wf" value="claude-plan.yml">
           </div>
@@ -286,6 +287,7 @@ export const projectsScript = `
     document.getElementById('md-env').value = envToText(m.extraEnv);
     document.getElementById('md-planning').checked = !!m.planningEnabled;
     document.getElementById('md-auto-approve').checked = m.autoApprovePlans !== false;
+    document.getElementById('md-auto-merge').checked = m.autoMerge !== false;
     document.getElementById('md-planning-wf').value = m.planningWorkflowFile || 'claude-plan.yml';
     document.getElementById('md-provider').value = m.provider || 'anthropic';
     document.getElementById('md-aws-region').value = m.awsRegion || '';
@@ -603,6 +605,7 @@ export const projectsScript = `
       machineMemoryMb: parseInt(document.getElementById('md-mem').value, 10),
       planningEnabled: document.getElementById('md-planning').checked,
       autoApprovePlans: document.getElementById('md-auto-approve').checked,
+      autoMerge: document.getElementById('md-auto-merge').checked,
       planningWorkflowFile: document.getElementById('md-planning-wf').value.trim(),
       extraEnv: parseEnvText(document.getElementById('md-env').value),
       provider: document.getElementById('md-provider').value,

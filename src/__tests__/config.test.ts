@@ -24,6 +24,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     planningEnabled: false,
     planningWorkflowFile: "",
     autoApprovePlans: true,
+    autoMerge: false,
     extraEnv: {},
     provider: "anthropic",
     ticketingProvider: "linear",
@@ -193,6 +194,18 @@ describe("config", () => {
     config.initMappingsTable();
     config.upsertMapping("APR", mapping({ owner: "org", repo: "repo", autoApprovePlans: false }));
     expect(config.getMappings().APR.autoApprovePlans).toBe(false);
+  });
+
+  it("autoMerge round-trips true when upserted", () => {
+    config.initMappingsTable();
+    config.upsertMapping("AMT", mapping({ owner: "org", repo: "repo", autoMerge: true }));
+    expect(config.getMappings().AMT.autoMerge).toBe(true);
+  });
+
+  it("autoMerge round-trips false when upserted", () => {
+    config.initMappingsTable();
+    config.upsertMapping("AMF", mapping({ owner: "org", repo: "repo", autoMerge: false }));
+    expect(config.getMappings().AMF.autoMerge).toBe(false);
   });
 
   it("planningEnabled round-trips both values", () => {
