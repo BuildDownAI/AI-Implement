@@ -18,6 +18,8 @@ export interface RunConfigV1 {
   maxIterations?: number;
   commentInstruction?: string;
   sensitiveFiles?: { add?: string[]; allow?: string[] };
+  profiles?: string[];
+  planningContext?: { parent?: string; siblings?: string; dependencies?: string };
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -50,7 +52,8 @@ export function decodeRunConfig(encoded: string): RunConfigV1 {
 
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
-    runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles } = cfg;
+    runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
+    profiles, planningContext } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -62,5 +65,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (maxIterations !== undefined) out.maxIterations = maxIterations;
   if (commentInstruction !== undefined) out.commentInstruction = commentInstruction;
   if (sensitiveFiles !== undefined) out.sensitiveFiles = sensitiveFiles;
+  if (profiles !== undefined) out.profiles = profiles;
+  if (planningContext !== undefined) out.planningContext = planningContext;
   return out;
 }

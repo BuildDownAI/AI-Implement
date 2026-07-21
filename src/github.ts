@@ -193,6 +193,7 @@ export interface EnvelopeDispatchOpts {
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
   commentInstruction?: string;
+  planningContext?: { parent?: string; siblings?: string; dependencies?: string };
 }
 
 /**
@@ -204,7 +205,7 @@ export interface EnvelopeDispatchOpts {
  */
 export function buildEnvelopeDispatchInputs(
   mapping: RepoMapping,
-  issue: { id: string; identifier: string; title: string; description?: string | null },
+  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[] },
   opts: EnvelopeDispatchOpts,
 ): DispatchInputs {
   const runConfig: RunConfigV1 = {
@@ -227,6 +228,8 @@ export function buildEnvelopeDispatchInputs(
     ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
       ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
       : {}),
+    ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
+    ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
   };
 
   return {
