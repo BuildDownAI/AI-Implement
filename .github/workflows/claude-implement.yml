@@ -36,34 +36,17 @@ name: Claude AI Implementation
 on:
   workflow_dispatch:
     inputs:
-      issue_id:
-        description: "Ticketing-system issue ID"
+      run_config:
+        description: "base64 JSON RunConfig envelope — see docs/workflow-envelope.md"
         required: true
         type: string
-      issue_identifier:
-        description: "Ticketing-system issue identifier (e.g., ENG-123)"
-        required: true
-        type: string
-      issue_title:
-        description: "Ticketing-system issue title"
-        required: true
-        type: string
-      issue_description:
-        description: "Ticketing-system issue description"
-        required: true
-        type: string
-      pr_number:
-        description: "Existing PR number for gap-fill runs (leave empty for new implementation)"
+      runner_image:
+        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
         default: ""
-      base_branch:
-        description: "Branch the runner clones and the PR targets (feature-branch grouping). Empty = repo default."
-        required: false
-        type: string
-        default: ""
-      runner_phase:
-        description: "Runner callback phase: implementation or gap-analysis (empty keeps legacy PR_NUMBER inference)"
+      job_timeout_minutes:
+        description: "Per-project job timeout in minutes, must be a positive integer (empty = 90)"
         required: false
         type: string
         default: ""
@@ -77,41 +60,6 @@ on:
         required: false
         type: string
         default: ""
-      max_turns:
-        description: "Cap on Claude turns per implement pass (empty = runner default)"
-        required: false
-        type: string
-        default: ""
-      max_iterations:
-        description: "Cap on implement/review iterations (empty = provider default)"
-        required: false
-        type: string
-        default: ""
-      job_timeout_minutes:
-        description: "Per-project job timeout in minutes, must be a positive integer (empty = 90)"
-        required: false
-        type: string
-        default: ""
-      branch_prefix:
-        description: "Optional branch-name prefix prepended as a path segment (empty = no prefix)"
-        required: false
-        type: string
-        default: ""
-      skills_repo:
-        description: "Optional skills repo (owner/repo or https://github.com URL; token auth is github.com-only) cloned + installed into ~/.claude/skills (empty = none)"
-        required: false
-        type: string
-        default: ""
-      profiles:
-        description: "Comma-separated AI-Implement profile names from the issue; consumed by custom pipeline steps (empty = none)"
-        required: false
-        type: string
-        default: ""
-      runner_callback_url:
-        description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
-        required: false
-        type: string
-        default: ""
       run_token:
         description: "HMAC bearer token authorizing the result POST; empty skips callback"
         required: false
@@ -119,11 +67,6 @@ on:
         default: ""
       run_progress_token:
         description: "HMAC bearer token authorizing progress POSTs; empty skips progress callback"
-        required: false
-        type: string
-        default: ""
-      runner_image:
-        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
         default: ""
@@ -279,24 +222,10 @@ jobs:
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-          ISSUE_ID: ${{ inputs.issue_id }}
-          ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
-          ISSUE_TITLE: ${{ inputs.issue_title }}
-          ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          GITHUB_DEFAULT_BRANCH: ${{ inputs.base_branch || github.ref_name }}
-          RUNNER_PHASE: ${{ inputs.runner_phase }}
-          PROVIDER: ${{ inputs.provider }}
-          AWS_REGION: ${{ inputs.aws_region }}
-          AI_IMPLEMENT_MAX_TURNS: ${{ inputs.max_turns }}
-          AI_IMPLEMENT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
-          AI_IMPLEMENT_BRANCH_PREFIX: ${{ inputs.branch_prefix }}
-          AI_IMPLEMENT_SKILLS_REPO: ${{ inputs.skills_repo }}
-          AI_IMPLEMENT_PROFILES: ${{ inputs.profiles }}
+          AI_IMPLEMENT_RUN_CONFIG: ${{ inputs.run_config }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
         run: /opt/ai-implement/entrypoint.sh
