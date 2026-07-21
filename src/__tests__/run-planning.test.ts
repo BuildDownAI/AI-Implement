@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runPlanning } from "../run-planning.js";
+import { encodeRunConfig } from "../run-config.js";
 
 type RunnerResultPayload = {
   phase: "planning";
@@ -34,6 +35,7 @@ describe("runPlanning", () => {
     delete process.env.RUNNER_CALLBACK_URL;
     delete process.env.RUN_TOKEN;
     delete process.env.CLAUDE_MODEL;
+    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
   });
 
   it("renders PLANNING.md, runs the executor, collects comments, posts a planning callback", async () => {
@@ -102,6 +104,31 @@ describe("runPlanning", () => {
     expect(result.exitCode).toBe(0);
     expect(capturedPrompt).toContain("ENG-42");
     expect(capturedPrompt).toContain("Add widget");
+  });
+
+  it("resolves issue fields and planning context from the AI_IMPLEMENT_RUN_CONFIG envelope, ignoring legacy env", async () => {
+    delete process.env.ISSUE_ID;
+    delete process.env.ISSUE_IDENTIFIER;
+    delete process.env.ISSUE_TITLE;
+    delete process.env.ISSUE_DESCRIPTION;
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encodeRunConfig({
+      v: 1,
+      issue: { id: "e-1", identifier: "AII-9", title: "Envelope issue", description: "From envelope." },
+      planningContext: { parent: "AII-1", siblings: "AII-2", dependencies: "AII-3" },
+    });
+    let capturedPrompt = "";
+    const fakeExecutor = (prompt: string) => {
+      capturedPrompt = prompt;
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const result = await runPlanning({ workspaceDir: ws, executor: fakeExecutor });
+    expect(result.exitCode).toBe(0);
+    expect(capturedPrompt).toContain("AII-9");
+    expect(capturedPrompt).toContain("Envelope issue");
+    expect(capturedPrompt).toContain("From envelope.");
+    expect(capturedPrompt).toContain("**Parent:** AII-1");
+    expect(capturedPrompt).toContain("**Siblings:** AII-2");
+    expect(capturedPrompt).toContain("**Dependencies:** AII-3");
   });
 
   it("CLAUDE_MODEL env overrides PLANNING.md model", async () => {
