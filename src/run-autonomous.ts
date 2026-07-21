@@ -401,6 +401,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       phase: runnerPhase,
       outcome: "success",
       prUrl: typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined,
+      callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 0 };
@@ -412,6 +413,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       outcome: "failure",
       failureReason: err instanceof Error ? err.message : String(err),
       failureCode: err instanceof SensitiveFilesError ? err.code : undefined,
+      callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
