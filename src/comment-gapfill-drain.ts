@@ -168,6 +168,9 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
           ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
           ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+          ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
+            ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
+            : {}),
           ...(item.instruction ? { commentInstruction: item.instruction } : {}),
         };
 
@@ -315,6 +318,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       }
     } catch (err) {
       console.error(`[comment-gapfill] Error processing comment gap-fill #${item.id}:`, err);
+      markCommentGapfillProcessed(item.id, "failed");
     }
   }
 }
