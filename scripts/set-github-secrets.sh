@@ -11,7 +11,6 @@
 #   On each TARGET repo (e.g. acme/api):
 #     AI_IMPLEMENT_APP_ID         — claude-implement.yml authenticates as the App
 #     AI_IMPLEMENT_PRIVATE_KEY    — same
-#     LINEAR_API_KEY              — runner posts status back to Linear
 #     CLAUDE_CODE_OAUTH_TOKEN     — runner authenticates Claude Code (preferred)
 #       or ANTHROPIC_API_KEY      — fallback Claude auth if no OAuth token
 #
@@ -58,7 +57,7 @@ echo
 echo "Will set secrets on:"
 echo "  Orchestrator: $ORCH_REPO  (AI_IMPLEMENT_APP_ID, AI_IMPLEMENT_PRIVATE_KEY)"
 for repo in "${TARGET_REPOS[@]}"; do
-  echo "  Target:       $repo  (AI_IMPLEMENT_APP_ID, AI_IMPLEMENT_PRIVATE_KEY, LINEAR_API_KEY, CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)"
+  echo "  Target:       $repo  (AI_IMPLEMENT_APP_ID, AI_IMPLEMENT_PRIVATE_KEY, CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)"
 done
 echo
 
@@ -74,19 +73,12 @@ if [ ! -f "$PEM_PATH" ]; then
   exit 1
 fi
 
-read -rsp "LINEAR_API_KEY (lin_api_...): " LINEAR_KEY
-echo
 read -rsp "CLAUDE_CODE_OAUTH_TOKEN (preferred; leave blank to use ANTHROPIC_API_KEY): " OAUTH_TOKEN
 echo
 API_KEY=""
 if [ -z "$OAUTH_TOKEN" ]; then
   read -rsp "ANTHROPIC_API_KEY (fallback Claude auth): " API_KEY
   echo
-fi
-
-if [ -z "$LINEAR_KEY" ]; then
-  echo "Error: empty value for LINEAR_API_KEY." >&2
-  exit 1
 fi
 
 if [ -z "$OAUTH_TOKEN" ] && [ -z "$API_KEY" ]; then
@@ -115,10 +107,9 @@ set_secret_file "$ORCH_REPO" AI_IMPLEMENT_PRIVATE_KEY "$PEM_PATH"
 
 for target in "${TARGET_REPOS[@]}"; do
   echo
-  echo "=== Setting secrets on $target (runner auth + Linear + Claude) ==="
+  echo "=== Setting secrets on $target (runner auth + Claude) ==="
   set_secret      "$target" AI_IMPLEMENT_APP_ID      "$APP_ID"
   set_secret_file "$target" AI_IMPLEMENT_PRIVATE_KEY "$PEM_PATH"
-  set_secret      "$target" LINEAR_API_KEY           "$LINEAR_KEY"
   if [ -n "$OAUTH_TOKEN" ]; then
     set_secret    "$target" CLAUDE_CODE_OAUTH_TOKEN  "$OAUTH_TOKEN"
   else
@@ -126,7 +117,7 @@ for target in "${TARGET_REPOS[@]}"; do
   fi
 done
 
-unset LINEAR_KEY OAUTH_TOKEN API_KEY
+unset OAUTH_TOKEN API_KEY
 
 echo
 echo "Done. Verify with:"

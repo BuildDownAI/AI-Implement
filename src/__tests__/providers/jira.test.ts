@@ -755,7 +755,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     ]);
     const snap = await makeProvider(client).fetchAIImplementSnapshot();
     const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-96")!;
-    expect(leaf.featureBranchChain).toEqual(["OOL-78"]);
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
     expect(leaf.parentRef).toEqual({ identifier: "OOL-78" });
   });
 
@@ -780,7 +780,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     ]);
     const snap = await makeProvider(client).fetchAIImplementSnapshot();
     const leaf = snap.needsPlanning.find((i) => i.identifier === "OOL-99")!;
-    expect(leaf.featureBranchChain).toEqual(["OOL-78", "OOL-96"]);
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }, { identifier: "OOL-96", mode: "feature" }]);
   });
 
   it("skips a feature-node parent while any designated child is in flight", async () => {
@@ -800,8 +800,9 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
   });
 
   it("dispatches a feature-node parent once all designated children are terminal, onto its own branch", async () => {
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
     const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      { when: /in \(Ready/, issues: [parentWithSpec] },
       {
         when: /parent in/,
         issues: [
@@ -813,15 +814,16 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     ]);
     const snap = await makeProvider(client).fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
-    expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+    expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
   });
 
   it("treats a child merged via markMerged (custom status Merged, native status not done) as terminal", async () => {
     // markMerged only sets the AI-Implement Status custom field — native status
     // stays untouched. The gating check must accept that as terminal or the
     // feature-node parent would stay blocked forever after a normal merge.
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
     const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      { when: /in \(Ready/, issues: [parentWithSpec] },
       {
         when: /parent in/,
         issues: [
@@ -832,7 +834,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     ]);
     const snap = await makeProvider(client).fetchAIImplementSnapshot();
     const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
-    expect(parent.featureBranchChain).toEqual(["OOL-78"]);
+    expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
   });
 
   it("skips a parent whose children are not yet designated (race guard)", async () => {
@@ -872,6 +874,45 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-96")!;
     expect(leaf).toBeDefined();
     expect(leaf.featureBranchChain).toBeUndefined();
+  });
+
+  it("finalizes an empty-spec feature-node-ready parent instead of dispatching", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      {
+        when: /parent in/,
+        issues: [
+          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
+        ],
+      },
+      { when: /key in/, issues: [] }, // OOL-78 has no parent
+    ]);
+    // OOL-78's description is null (blank spec) in the default issue() helper
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    expect(snap.needsPlanning).toEqual([]);
+    expect(snap.readyForImplementation).toEqual([]);
+    expect(snap.parentsToFinalize).toEqual([
+      { issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1" },
+    ]);
+  });
+
+  it("dispatches a non-empty-spec feature-node-ready parent normally (no regression)", async () => {
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "## Do the work\n\nActual spec here." } };
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [parentWithSpec] },
+      {
+        when: /parent in/,
+        issues: [
+          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
+        ],
+      },
+      { when: /key in/, issues: [] },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
+    expect(parent).toBeDefined();
+    expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
+    expect(snap.parentsToFinalize).toEqual([]);
   });
 });
 
@@ -953,7 +994,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — Epic Link hierarchy (classic
     ]);
     const snap = await provider(c).fetchAIImplementSnapshot();
     const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-S")!;
-    expect(leaf.featureBranchChain).toEqual(["OOL-EP"]);
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "OOL-EP", mode: "feature" }]);
     expect(leaf.parentRef).toEqual({ identifier: "OOL-EP" });
   });
 
@@ -963,7 +1004,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — Epic Link hierarchy (classic
       { when: /parent in/, issues: [issue("OOL-S", "PR Ready", "acme/x", { epicLink: "OOL-EP", statusCategory: "done" })] },
     ]);
     const rollUps = await provider(c).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-EP", identifier: "OOL-EP", scopeKey: "m1", parentIdentifier: null }]);
+    expect(rollUps).toEqual([{ issueId: "id-OOL-EP", identifier: "OOL-EP", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-S"] }]);
   });
 });
 
@@ -1007,7 +1048,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
       { when: /key in/, issues: [issue("OOL-78", "Ready", "acme/x", null)] },                       // parent is designated
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", parentIdentifier: "OOL-78" }]);
+    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: { identifier: "OOL-78", mode: "feature" }, childIdentifiers: ["OOL-90-c"] }]);
   });
 
   it("top-of-tree feature node → parentIdentifier null (human feature→base PR)", async () => {
@@ -1016,7 +1057,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
       { when: /parent in/, issues: [issue("OOL-78-c", "PR Ready", "acme/x", "OOL-78")] },
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1", parentIdentifier: null }]);
+    expect(rollUps).toEqual([{ issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-78-c"] }]);
   });
 
   it("excludes completed issues that are not feature nodes (no designated children)", async () => {
@@ -1042,7 +1083,182 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
       { when: /key in/, issues: [issue("OOL-70", "", "acme/x", null)] },
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
-    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", parentIdentifier: null }]);
+    expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-90-c"] }]);
+  });
+});
+
+// --- Mode resolution from ai-implement.yml in issue descriptions ---
+
+describe("JiraProvider — grouping mode from ai-implement.yml", () => {
+  // ADF document with a codeBlock carrying the multi-issue config.
+  const ADF_MULTI = {
+    type: "doc",
+    version: 1,
+    content: [
+      { type: "paragraph", content: [{ type: "text", text: "Group of unrelated work." }] },
+      {
+        type: "codeBlock",
+        attrs: { language: "yaml" },
+        content: [{ type: "text", text: '# ai-implement.yml\nfeature_branch:\n  mode: "multi-issue"' }],
+      },
+    ],
+  };
+
+  const PLAIN_MULTI = '```\n# ai-implement.yml\nfeature_branch:\n  mode: "multi-issue"\n```';
+
+  const issue = (
+    key: string,
+    status: string,
+    repo: string,
+    extra: {
+      parentKey?: string | null;
+      statusCategory?: string;
+      description?: unknown;
+    } = {},
+  ) => ({
+    id: `id-${key}`,
+    key,
+    fields: {
+      summary: key,
+      description: extra.description ?? null,
+      issuelinks: [],
+      parent: extra.parentKey ? { key: extra.parentKey } : null,
+      status: { statusCategory: { key: extra.statusCategory ?? "indeterminate" } },
+      customfield_10100: status ? { value: status } : null,
+      customfield_10101: { value: repo },
+    },
+  });
+
+  const fakeClient = (routes: Array<{ when: RegExp; issues: unknown[] }>) =>
+    ({
+      async searchJql(jql: string, fields: string[]) {
+        const issues = (routes.find((x) => x.when.test(jql))?.issues ?? []) as Array<{
+          id: string;
+          key: string;
+          fields: Record<string, unknown>;
+        }>;
+        if (fields && !fields.includes("parent")) {
+          return issues.map((i) => ({ ...i, fields: { ...i.fields, parent: undefined } }));
+        }
+        return issues;
+      },
+    }) as unknown as import("../../providers/jira-client.js").JiraClient;
+
+  const makeProvider = (client: import("../../providers/jira-client.js").JiraClient) =>
+    new JiraProviderFB({
+      client,
+      cacheScope: "c-mode",
+      siteUrl: "https://x",
+      getMappings: () => ({
+        m1: jiraMapping({
+          repoFieldValue: "acme/x",
+          statusFieldOverride: "customfield_10100",
+          repoFieldOverride: "customfield_10101",
+          profilesFieldOverride: "customfield_10200",
+        }),
+      }),
+    });
+
+  it("reads multi-issue mode from an ADF code block", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })] },
+      { when: /parent in/, issues: [] },
+      { when: /key in/, issues: [issue("BAC-1", "Implementing", "acme/x", { description: ADF_MULTI })] },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const leaf = snap.needsPlanning.find((i) => i.identifier === "BAC-2")!;
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "BAC-1", mode: "multi-issue" }]);
+  });
+
+  it("reads multi-issue mode from a plain-string description", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })] },
+      { when: /parent in/, issues: [] },
+      { when: /key in/, issues: [issue("BAC-1", "Implementing", "acme/x", { description: PLAIN_MULTI })] },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const leaf = snap.needsPlanning.find((i) => i.identifier === "BAC-2")!;
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "BAC-1", mode: "multi-issue" }]);
+  });
+
+  it("leaves feature-node behaviour unchanged with no ai-implement.yml", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })] },
+      { when: /parent in/, issues: [] },
+      { when: /key in/, issues: [issue("BAC-1", "Implementing", "acme/x")] },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const leaf = snap.needsPlanning.find((i) => i.identifier === "BAC-2")!;
+    expect(leaf.featureBranchChain).toEqual([{ identifier: "BAC-1", mode: "feature" }]);
+  });
+
+  it("strips the config block from the description handed to the runner", async () => {
+    const client = fakeClient([
+      {
+        when: /in \(Ready/,
+        issues: [issue("BAC-1", "Ready", "acme/x", { description: ADF_MULTI })],
+      },
+      {
+        when: /parent in/,
+        issues: [issue("BAC-1-c", "Merged", "acme/x", { parentKey: "BAC-1", statusCategory: "indeterminate" })],
+      },
+      { when: /key in/, issues: [] },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const parent = snap.needsPlanning.find((i) => i.identifier === "BAC-1")!;
+    expect(parent.description).toBe("Group of unrelated work.");
+    expect(parent.description).not.toContain("feature_branch");
+  });
+
+  it("defaults ancestor modes to feature when the ancestor walk fails (fails open)", async () => {
+    const client = {
+      async searchJql(jql: string) {
+        if (/key in/.test(jql)) throw new Error("Jira unavailable");
+        if (/parent in/.test(jql)) return [];
+        if (/in \(Ready/.test(jql)) return [issue("BAC-2", "Ready", "acme/x", { parentKey: "BAC-1" })];
+        return [];
+      },
+    } as unknown as import("../../providers/jira-client.js").JiraClient;
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const leaf = snap.needsPlanning.find((i) => i.identifier === "BAC-2")!;
+    expect(leaf).toBeDefined();
+    expect(leaf.featureBranchChain).toBeUndefined();
+  });
+
+  it("carries modes onto roll-ups", async () => {
+    const rollupIssue = (
+      key: string,
+      status: string,
+      repo: string,
+      parentKey: string | null = null,
+      description: unknown = null,
+    ) => ({
+      id: `id-${key}`,
+      key,
+      fields: {
+        description,
+        parent: parentKey ? { key: parentKey } : null,
+        customfield_10100: status ? { value: status } : null,
+        customfield_10101: { value: repo },
+      },
+    });
+
+    const client = fakeClient([
+      {
+        when: /statusCategory = Done/,
+        issues: [rollupIssue("BAC-1", "PR Ready", "acme/x", null, ADF_MULTI)],
+      },
+      {
+        when: /parent in/,
+        issues: [rollupIssue("BAC-2", "PR Ready", "acme/x", "BAC-1")],
+      },
+    ]);
+    const provider = makeProvider(client);
+    const rollUps = await provider.fetchFeatureNodeRollUps();
+    expect(rollUps).toHaveLength(1);
+    expect(rollUps[0].mode).toBe("multi-issue");
+    expect(rollUps[0].parent).toBeNull();
+    expect(rollUps[0].childIdentifiers).toEqual(["BAC-2"]);
   });
 });
 

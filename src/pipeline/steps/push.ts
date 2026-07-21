@@ -17,6 +17,7 @@ interface PushInputs extends Record<string, unknown> {
   prTitle?: string;
   implementationSummary?: string;
   testsSummary?: string;
+  sensitiveFiles?: { add?: string[]; allow?: string[] };
 }
 
 interface PushOutputs extends Record<string, unknown> {
@@ -68,7 +69,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       throw new Error(`git diff --cached failed (exit ${stagedResult.status ?? "null"}): ${stderr}`);
     }
     const stagedFiles = stagedResult.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
-    const sensitiveHits = findSensitiveFiles(stagedFiles);
+    const sensitiveHits = findSensitiveFiles(stagedFiles, inputs.sensitiveFiles);
     if (sensitiveHits.length > 0) {
       throw new SensitiveFilesError(sensitiveHits);
     }
@@ -253,7 +254,7 @@ function buildPullRequestBody(
     "",
     `Fixes ${issueIdentifier}`,
     "",
-    "Generated with AI-Implement",
+    `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
   ].join("\n");
 }
 

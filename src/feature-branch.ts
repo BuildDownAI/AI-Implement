@@ -1,7 +1,7 @@
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue } from "./providers/types.js";
 import { ensureBranchExists } from "./github.js";
-import { buildFeatureBranchName } from "./pipeline/branch-name.js";
+import { buildGroupingBranchName } from "./pipeline/branch-name.js";
 
 /**
  * Feature-branch grouping for parent/child issues.
@@ -20,7 +20,7 @@ import { buildFeatureBranchName } from "./pipeline/branch-name.js";
  * Resolves the branch a dispatched issue's PR should target, creating any feature
  * branches in `issue.featureBranchChain` that don't yet exist.
  *
- * The chain is base-most first: each identifier's branch `ai-implement/feature/<id>` is
+ * The chain is base-most first: each entry's branch `ai-implement/<mode>/<identifier>` is
  * cut from the previous entry's branch (or mapping.defaultBranch for the first), and the
  * PR targets the LAST entry's branch. An empty/absent chain returns mapping.defaultBranch.
  *
@@ -43,8 +43,8 @@ export async function resolveBaseBranch(opts: {
   try {
     let cutFrom = mapping.defaultBranch;
     let target = mapping.defaultBranch;
-    for (const identifier of chain) {
-      const branch = buildFeatureBranchName(identifier);
+    for (const entry of chain) {
+      const branch = buildGroupingBranchName(entry.identifier, entry.mode);
       await ensureBranchExists(ghToken, mapping.owner, mapping.repo, branch, cutFrom);
       cutFrom = branch;
       target = branch;
@@ -53,7 +53,7 @@ export async function resolveBaseBranch(opts: {
   } catch (err) {
     console.warn(
       `[poll] Feature-branch resolution failed for ${issue.identifier} ` +
-        `(chain ${chain.join(" -> ")}); falling back to base branch "${mapping.defaultBranch}":`,
+        `(chain ${chain.map((e) => `${e.mode}:${e.identifier}`).join(" -> ")}); falling back to base branch "${mapping.defaultBranch}":`,
       err,
     );
     return mapping.defaultBranch;

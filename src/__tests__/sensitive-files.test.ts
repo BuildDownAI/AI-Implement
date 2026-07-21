@@ -207,6 +207,29 @@ describe("formatSensitiveFilesError", () => {
   });
 });
 
+// ── findSensitiveFiles – config add/allow globs ──────────────────────────────
+
+describe("findSensitiveFiles – config add/allow globs", () => {
+  it("blocks files matching client add-globs", () => {
+    const hits = findSensitiveFiles(["config/prod.secrets.toml"], { add: ["*.secrets.toml"] });
+    expect(hits).toHaveLength(1);
+    expect(hits[0].description).toContain("client-configured");
+  });
+  it("allow-globs exempt built-in matches", () => {
+    expect(findSensitiveFiles([".env", ".env.production"], { allow: [".env", ".env.*"] })).toHaveLength(0);
+  });
+  it("allow wins over add", () => {
+    expect(findSensitiveFiles(["a.tok"], { add: ["*.tok"], allow: ["a.tok"] })).toHaveLength(0);
+  });
+  it("allow matches against full path and basename", () => {
+    expect(findSensitiveFiles(["deploy/.env"], { allow: [".env"] })).toHaveLength(0);
+    expect(findSensitiveFiles(["deploy/.env"], { allow: ["deploy/.env"] })).toHaveLength(0);
+  });
+  it("no config → unchanged behavior", () => {
+    expect(findSensitiveFiles([".env"])).toHaveLength(1);
+  });
+});
+
 // ── SensitiveFilesError ───────────────────────────────────────────────────────
 
 describe("SensitiveFilesError", () => {

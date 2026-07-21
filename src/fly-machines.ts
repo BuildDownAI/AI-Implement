@@ -369,11 +369,9 @@ export interface SessionMachineInput {
   owner: string;
   repo: string;
   defaultBranch: string;
-  linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
-  githubAppId: string;
-  githubAppPrivateKey: string;
+  githubToken: string;
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
@@ -402,17 +400,13 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     GITHUB_OWNER: input.owner,
     GITHUB_REPO: input.repo,
     GITHUB_DEFAULT_BRANCH: input.defaultBranch,
-    GITHUB_APP_ID: input.githubAppId,
-    GITHUB_APP_PRIVATE_KEY: input.githubAppPrivateKey,
+    GITHUB_TOKEN: input.githubToken,
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
     SESSION_MODE: input.sessionMode ?? "autonomous",
     RUNNER_PHASE: input.phase ?? "implementation",
   };
 
-  if (input.linearApiKey) {
-    env.LINEAR_API_KEY = input.linearApiKey;
-  }
   if (input.claudeOAuthToken) {
     env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   }

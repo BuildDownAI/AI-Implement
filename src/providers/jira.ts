@@ -1,5 +1,6 @@
 import type {
   AIImplementSnapshot,
+  FeatureBranchChainEntry,
   FeatureNodeRollUp,
   IssueLifecycleState,
   ProviderConfig,
@@ -16,6 +17,8 @@ import {
 } from "./jira-fields.js";
 import type { RepoMapping } from "../config.js";
 import { classifyByChildren, ancestorChain, type ChildState } from "./jira-hierarchy.js";
+import { parseIssueConfig } from "../issue-config.js";
+import type { FeatureBranchMode } from "../pipeline/branch-name.js";
 
 function adfToPlainText(adf: unknown): string {
   const out: string[] = [];
@@ -27,8 +30,13 @@ function adfToPlainText(adf: unknown): string {
       return;
     }
     if (Array.isArray(n.content)) {
-      for (const child of n.content) walk(child);
       const t = n.type;
+      // ADF represents code blocks structurally, with no fence markers. Re-emit them so
+      // markdown-shaped consumers (parseIssueConfig) see the same text a Linear
+      // description would carry.
+      if (t === "codeBlock") out.push("\n```\n");
+      for (const child of n.content) walk(child);
+      if (t === "codeBlock") out.push("\n```\n");
       if (t === "paragraph" || t === "heading" || t === "listItem") {
         out.push("\n");
       }
@@ -36,6 +44,12 @@ function adfToPlainText(adf: unknown): string {
   }
   walk(adf);
   return out.join("").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/** Jira descriptions arrive as ADF on API v3 and as a plain string on some instances/configs. */
+function descriptionText(fields: Record<string, unknown>): string | null {
+  const d = fields.description;
+  return typeof d === "string" ? d : d ? adfToPlainText(d) : null;
 }
 
 function jqlFieldRef(fieldId: string): string {
@@ -197,6 +211,7 @@ export class JiraProvider implements TicketingProvider {
     const needsPlanning: TicketIssue[] = [];
     const readyForImplementation: TicketIssue[] = [];
     const inProgressCountsByScope: Record<string, number> = {};
+    const parentsToFinalize: AIImplementSnapshot["parentsToFinalize"] = [];
 
     for (const [scopeKey, m] of jiraEntries) {
       if (m.ticketingConfig.kind !== "jira") continue;
@@ -248,6 +263,10 @@ export class JiraProvider implements TicketingProvider {
       for (const raw of candidates) {
         const info = chains.get(raw.key);
         if (info?.skip) continue; // feature-node-blocked or waiting-parent
+        if (info?.finalize) {
+          parentsToFinalize.push({ issueId: raw.id, identifier: raw.key, scopeKey });
+          continue;
+        }
         const statusValue = readStatusValue(raw.fields, fieldIds.statusFieldId);
         const ticket = this.toTicketIssue(raw, scopeKey, fieldIds);
         const parentKey = effectiveParentKey(raw.fields, fieldIds);
@@ -263,7 +282,7 @@ export class JiraProvider implements TicketingProvider {
       inProgressCountsByScope[scopeKey] = capacityIssues.length;
     }
 
-    return { needsPlanning, readyForImplementation, inProgressCountsByScope };
+    return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize };
   }
 
   private toTicketIssue(
@@ -271,13 +290,7 @@ export class JiraProvider implements TicketingProvider {
     scopeKey: string,
     fieldIds: ResolvedFieldIds,
   ): TicketIssue {
-    const description = raw.fields.description;
-    const descText =
-      typeof description === "string"
-        ? description
-        : description
-          ? adfToPlainText(description)
-          : null;
+    const descText = parseIssueConfig(descriptionText(raw.fields), raw.key).description;
     const statusOption = raw.fields[fieldIds.statusFieldId] as { value?: string } | null;
     const profiles = fieldIds.profilesFieldId
       ? parseMultiSelectValues(raw.fields[fieldIds.profilesFieldId])
@@ -307,8 +320,8 @@ export class JiraProvider implements TicketingProvider {
     candidates: import("./jira-client.js").JiraIssue[],
     repoFieldValue: string,
     fieldIds: ResolvedFieldIds,
-  ): Promise<Map<string, { skip: boolean; chain?: string[] }>> {
-    const out = new Map<string, { skip: boolean; chain?: string[] }>();
+  ): Promise<Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[]; finalize?: boolean }>> {
+    const out = new Map<string, { skip: boolean; chain?: FeatureBranchChainEntry[]; finalize?: boolean }>();
     if (candidates.length === 0) return out;
 
     const designated = (fields: Record<string, unknown>): boolean =>
@@ -368,6 +381,7 @@ export class JiraProvider implements TicketingProvider {
     //    base branch (no chain) and candidates still dispatch.
     const ancestorParent = new Map<string, string | null>();
     const ancestorDesignated = new Map<string, boolean>();
+    const ancestorMode = new Map<string, FeatureBranchMode>();
     try {
       let level = Array.from(
         new Set(candidates.map((c) => effectiveParentKey(c.fields, fieldIds)).filter((k): k is string => !!k)),
@@ -377,13 +391,14 @@ export class JiraProvider implements TicketingProvider {
         if (toFetch.length === 0) break;
         const rows = await this.client.searchJql(
           `key in (${toFetch.map((k) => JSON.stringify(k)).join(",")})`,
-          ["parent", fieldIds.statusFieldId, fieldIds.repoFieldId, ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : [])],
+          ["parent", "description", fieldIds.statusFieldId, fieldIds.repoFieldId, ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : [])],
         );
         const next: string[] = [];
         for (const row of rows) {
           const p = effectiveParentKey(row.fields, fieldIds);
           ancestorParent.set(row.key, p);
           ancestorDesignated.set(row.key, designated(row.fields));
+          ancestorMode.set(row.key, parseIssueConfig(descriptionText(row.fields), row.key).config.featureBranch.mode);
           if (p && ancestorDesignated.get(row.key)) next.push(p);
         }
         level = Array.from(new Set(next));
@@ -397,7 +412,7 @@ export class JiraProvider implements TicketingProvider {
       const cls = classifyByChildren(childrenByParent.get(cand.key) ?? []);
       if (cls.kind === "waiting-parent" || cls.kind === "feature-node-blocked") {
         out.set(cand.key, { skip: true });
-        console.log(`[jira] Skipping ${cand.key}: feature-node parent not ready (${cls.kind})`);
+        console.log(`[jira] Skipping ${cand.key}: grouping parent not ready (${cls.kind})`);
         continue;
       }
       const ancestors = ancestorChain(
@@ -405,8 +420,23 @@ export class JiraProvider implements TicketingProvider {
         (k) => ancestorParent.get(k) ?? null,
         (k) => ancestorDesignated.get(k) ?? false,
       );
-      const chain = cls.kind === "feature-node-ready" ? [...ancestors, cand.key] : ancestors;
-      out.set(cand.key, { skip: false, chain });
+      const entries: FeatureBranchChainEntry[] = ancestors.map((identifier) => ({
+        identifier,
+        mode: ancestorMode.get(identifier) ?? "feature",
+      }));
+      const parsedCand = parseIssueConfig(descriptionText(cand.fields), cand.key);
+      const mode = parsedCand.config.featureBranch.mode;
+      if (cls.kind === "feature-node-ready") {
+        const isBlankSpec = !parsedCand.description || parsedCand.description.trim() === "";
+        if (isBlankSpec) {
+          console.log(`[jira] Finalizing empty grouping parent ${cand.key} (no own work)`);
+          out.set(cand.key, { skip: false, finalize: true });
+          continue;
+        }
+        out.set(cand.key, { skip: false, chain: [...entries, { identifier: cand.key, mode }] });
+      } else {
+        out.set(cand.key, { skip: false, chain: entries });
+      }
     }
     return out;
   }
@@ -434,7 +464,7 @@ export class JiraProvider implements TicketingProvider {
       const completed = (
         await this.client.searchJql(
           `(${cfg.jql}) AND (statusCategory = Done OR ${jqlFieldRef(fieldIds.statusFieldId)} = ${JSON.stringify(STATUS_VALUES.MERGED)}) AND updated >= -14d`,
-          ["parent", fieldIds.statusFieldId, fieldIds.repoFieldId, ...epicLinkFields],
+          ["parent", "description", fieldIds.statusFieldId, fieldIds.repoFieldId, ...epicLinkFields],
         )
       ).filter((raw) => designated(raw.fields));
       if (completed.length === 0) continue;
@@ -445,12 +475,15 @@ export class JiraProvider implements TicketingProvider {
         this.childrenJql(completed.map((c) => c.key), fieldIds),
         [fieldIds.statusFieldId, fieldIds.repoFieldId, "parent", ...epicLinkFields],
       );
-      const designatedChildParents = new Set<string>();
+      const designatedChildrenByParent = new Map<string, string[]>();
       for (const ch of children) {
         const pk = effectiveParentKey(ch.fields, fieldIds);
-        if (pk && designated(ch.fields)) designatedChildParents.add(pk);
+        if (!pk || !designated(ch.fields)) continue;
+        const list = designatedChildrenByParent.get(pk) ?? [];
+        list.push(ch.key);
+        designatedChildrenByParent.set(pk, list);
       }
-      const featureNodes = completed.filter((c) => designatedChildParents.has(c.key));
+      const featureNodes = completed.filter((c) => designatedChildrenByParent.has(c.key));
       if (featureNodes.length === 0) continue;
 
       // Is each feature node's parent itself designated (→ auto-merge) or not (→ human PR)?
@@ -458,21 +491,31 @@ export class JiraProvider implements TicketingProvider {
         new Set(featureNodes.map((c) => effectiveParentKey(c.fields, fieldIds)).filter((k): k is string => !!k)),
       );
       const designatedParents = new Set<string>();
+      const parentMode = new Map<string, FeatureBranchMode>();
       if (parentKeys.length > 0) {
         const parents = await this.client.searchJql(
           `key in (${parentKeys.map((k) => JSON.stringify(k)).join(",")})`,
-          [fieldIds.statusFieldId, fieldIds.repoFieldId],
+          [fieldIds.statusFieldId, fieldIds.repoFieldId, "description"],
         );
-        for (const p of parents) if (designated(p.fields)) designatedParents.add(p.key);
+        for (const p of parents) {
+          if (!designated(p.fields)) continue;
+          designatedParents.add(p.key);
+          parentMode.set(p.key, parseIssueConfig(descriptionText(p.fields), p.key).config.featureBranch.mode);
+        }
       }
 
       for (const node of featureNodes) {
         const parentKey = effectiveParentKey(node.fields, fieldIds);
+        const hasGroupingParent = !!parentKey && designatedParents.has(parentKey);
         rollUps.push({
           issueId: node.id,
           identifier: node.key,
           scopeKey,
-          parentIdentifier: parentKey && designatedParents.has(parentKey) ? parentKey : null,
+          mode: parseIssueConfig(descriptionText(node.fields), node.key).config.featureBranch.mode,
+          parent: hasGroupingParent
+            ? { identifier: parentKey!, mode: parentMode.get(parentKey!) ?? "feature" }
+            : null,
+          childIdentifiers: designatedChildrenByParent.get(node.key) ?? [],
         });
       }
     }

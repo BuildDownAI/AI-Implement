@@ -33,7 +33,8 @@ const deps = (resolve: (k: string) => RepoMapping | null, finalizeMerged = vi.fn
 });
 
 const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
-  issueId: "issue-uuid-1", identifier: "OOL-107", scopeKey: "OOL", parentIdentifier: "OOL-106", ...o,
+  issueId: "issue-uuid-1", identifier: "OOL-107", scopeKey: "OOL", mode: "feature",
+  parent: { identifier: "OOL-106", mode: "feature" }, childIdentifiers: [], ...o,
 });
 
 beforeEach(() => {
@@ -81,7 +82,7 @@ describe("runMergeUps", () => {
   it("opens a human PR (no direct merge) for the top-level feature→base roll-up", async () => {
     vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
     vi.mocked(compareBranches).mockResolvedValue(3);
-    await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping()));
+    await runMergeUps([rollUp({ identifier: "OOL-106", parent: null })], deps(() => mapping()));
 
     expect(vi.mocked(createPullRequest)).toHaveBeenCalledWith("tok", "jodwyer", "alpacaWheel", expect.objectContaining({
       head: "ai-implement/feature/ool-106",
@@ -93,12 +94,58 @@ describe("runMergeUps", () => {
     expect(`${arg.title} ${arg.body}`).not.toMatch(/OOL-\d+/i);
   });
 
+  it("lists the grouped issues in the top-of-tree PR body", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps(
+      [rollUp({ identifier: "OOL-106", parent: null, childIdentifiers: ["OOL-87", "OOL-88"] })],
+      deps(() => mapping()),
+    );
+    const arg = vi.mocked(createPullRequest).mock.calls[0][3];
+    expect(arg.body).toMatch(/^Grouped issues: OOL-87, OOL-88$/m);
+    expect(arg.body).not.toContain("- OOL-87");
+    expect(arg.body).not.toContain("- OOL-88");
+  });
+
+  it("does not emit a Grouped issues line when there are no children", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps(
+      [rollUp({ identifier: "OOL-106", parent: null, childIdentifiers: [] })],
+      deps(() => mapping()),
+    );
+    const arg = vi.mocked(createPullRequest).mock.calls[0][3];
+    expect(arg.body).not.toContain("Grouped issues");
+  });
+
+  it("lists grouped issues in multi-issue mode", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps(
+      [rollUp({ identifier: "PROJ-5", parent: null, mode: "multi-issue", childIdentifiers: ["PROJ-10", "PROJ-11", "PROJ-12"] })],
+      deps(() => mapping()),
+    );
+    const arg = vi.mocked(createPullRequest).mock.calls[0][3];
+    expect(arg.body).toMatch(/^Grouped issues: PROJ-10, PROJ-11, PROJ-12$/m);
+  });
+
+  it("lists a single grouped child without trailing comma", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps(
+      [rollUp({ identifier: "OOL-106", parent: null, childIdentifiers: ["SOLO-1"] })],
+      deps(() => mapping()),
+    );
+    const arg = vi.mocked(createPullRequest).mock.calls[0][3];
+    expect(arg.body).toMatch(/^Grouped issues: SOLO-1$/m);
+  });
+
   it("leaves an open top-level PR untouched (awaiting human merge)", async () => {
     vi.mocked(findPullRequestByBranches).mockResolvedValue({
       number: 42, url: "https://gh/pr/42", state: "open", merged: false,
     });
     const finalizeMerged = vi.fn();
-    await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping(), finalizeMerged));
+    await runMergeUps([rollUp({ identifier: "OOL-106", parent: null })], deps(() => mapping(), finalizeMerged));
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
     expect(finalizeMerged).not.toHaveBeenCalled();
@@ -110,7 +157,7 @@ describe("runMergeUps", () => {
     });
     const finalizeMerged = vi.fn(async () => {});
     await runMergeUps(
-      [rollUp({ issueId: "uuid-parent", identifier: "OOL-106", parentIdentifier: null })],
+      [rollUp({ issueId: "uuid-parent", identifier: "OOL-106", parent: null })],
       deps(() => mapping(), finalizeMerged),
     );
 
@@ -125,7 +172,7 @@ describe("runMergeUps", () => {
     vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
     vi.mocked(compareBranches).mockResolvedValue(null);
     const finalizeMerged = vi.fn();
-    await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping(), finalizeMerged));
+    await runMergeUps([rollUp({ identifier: "OOL-106", parent: null })], deps(() => mapping(), finalizeMerged));
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
     expect(finalizeMerged).not.toHaveBeenCalled();
@@ -138,7 +185,7 @@ describe("runMergeUps", () => {
     vi.mocked(deleteBranch).mockResolvedValue(true); // 404 treated as success → true
     const finalizeMerged = vi.fn(async () => {});
     await runMergeUps(
-      [rollUp({ issueId: "uuid-p", identifier: "OOL-106", parentIdentifier: null })],
+      [rollUp({ issueId: "uuid-p", identifier: "OOL-106", parent: null })],
       deps(() => mapping(), finalizeMerged),
     );
     expect(finalizeMerged).toHaveBeenCalledWith("uuid-p", "OOL");
@@ -150,7 +197,7 @@ describe("runMergeUps", () => {
       number: 55, url: "https://gh/pr/55", state: "closed", merged: false,
     });
     const finalizeMerged = vi.fn();
-    await runMergeUps([rollUp({ identifier: "OOL-106", parentIdentifier: null })], deps(() => mapping(), finalizeMerged));
+    await runMergeUps([rollUp({ identifier: "OOL-106", parent: null })], deps(() => mapping(), finalizeMerged));
     expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
     expect(vi.mocked(deleteBranch)).not.toHaveBeenCalled();
     expect(finalizeMerged).not.toHaveBeenCalled();

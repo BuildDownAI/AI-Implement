@@ -112,7 +112,6 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
     flySessionsToken: null,
     flySessionsApp: null,
     flySessionsRegion: null,
-    linearApiKey: "test-linear-key",
     githubAppId: "test-app-id",
     githubAppPrivateKey: "test-private-key",
   };
@@ -187,7 +186,6 @@ describe("admin auth", () => {
       flySessionsToken: null,
       flySessionsApp: null,
       flySessionsRegion: null,
-      linearApiKey: "test",
       githubAppId: "test",
       githubAppPrivateKey: "test",
     }, makeFakeRegistry(provider));
@@ -806,6 +804,131 @@ describe("admin mappings", () => {
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).SRUPD2.skillsRepo).toBeNull();
   });
+
+  it("accepts newline-separated sensitiveAddPatterns string and persists as array", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGAP1", owner: "org", repo: "app",
+      sensitiveAddPatterns: "*.secrets.toml\n.env.local",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAddPatterns).toEqual(["*.secrets.toml", ".env.local"]);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SGAP1.sensitiveAddPatterns).toEqual(["*.secrets.toml", ".env.local"]);
+  });
+
+  it("accepts sensitiveAllowPatterns as an array and persists it", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGAL1", owner: "org", repo: "app",
+      sensitiveAllowPatterns: [".env", ".env.*"],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAllowPatterns).toEqual([".env", ".env.*"]);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SGAL1.sensitiveAllowPatterns).toEqual([".env", ".env.*"]);
+  });
+
+  it("treats blank sensitiveAddPatterns as null", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGNULL", owner: "org", repo: "app",
+      sensitiveAddPatterns: "   \n  ",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAddPatterns).toBeNull();
+  });
+
+  it("treats absent sensitiveAddPatterns/sensitiveAllowPatterns as null (regression guard)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGNONE", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAddPatterns).toBeNull();
+    expect(JSON.parse(res.body).sensitiveAllowPatterns).toBeNull();
+  });
+
+  it("rejects bare ** in sensitiveAddPatterns with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD1", owner: "org", repo: "app",
+      sensitiveAddPatterns: ["secrets/", "**"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("**");
+  });
+
+  it("rejects a glob longer than 256 chars with 400", async () => {
+    const token = await login("secret");
+    const longGlob = "a".repeat(257);
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD2", owner: "org", repo: "app",
+      sensitiveAddPatterns: [longGlob],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain(longGlob.slice(0, 30));
+  });
+
+  it("rejects more than 100 globs in sensitiveAllowPatterns with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD3", owner: "org", repo: "app",
+      sensitiveAllowPatterns: Array.from({ length: 101 }, (_, i) => `pattern-${i}.txt`),
+    }, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a picomatch-invalid glob with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD4", owner: "org", repo: "app",
+      sensitiveAddPatterns: ["[z-a]"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("[z-a]");
+  });
+
+  it("rejects an all-wildcard glob (**/*) in sensitiveAllowPatterns with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD5", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["**/*"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("**/*");
+  });
+
+  it("rejects a bare * glob (matches everything) with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD6", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["*"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-string sensitiveAddPatterns value with a clean 400 (no raw TypeError)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD7", owner: "org", repo: "app",
+      sensitiveAddPatterns: 123,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("string");
+  });
+
+  it("accepts wildcard-heavy globs that still contain a literal path component (202)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGOK", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["**/secrets.env", ".env.*"],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAllowPatterns).toEqual(["**/secrets.env", ".env.*"]);
+  });
 });
 
 describe("admin runner-mode", () => {
@@ -876,7 +999,6 @@ describe("admin secrets", () => {
       flySessionsToken: "fly-token",
       flySessionsApp: "ai-implement-sessions",
       flySessionsRegion: null,
-      linearApiKey: "test-linear-key",
       githubAppId: "test-app-id",
       githubAppPrivateKey: "test-private-key",
     };
@@ -1140,7 +1262,6 @@ describe("admin global secrets", () => {
       flySessionsToken: "fly-token",
       flySessionsApp: "ai-implement-sessions",
       flySessionsRegion: null,
-      linearApiKey: "test-linear-key",
       githubAppId: "test-app-id",
       githubAppPrivateKey: "test-private-key",
     };

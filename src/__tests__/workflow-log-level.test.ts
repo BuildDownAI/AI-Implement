@@ -5,8 +5,6 @@ import { join } from "node:path";
 const FILES = [
   "workflows/claude-implement.yml",
   ".github/workflows/claude-implement.yml",
-  "workflows/comment-trigger.yml",
-  ".github/workflows/comment-trigger.yml",
 ];
 
 describe("workflows forward AI_IMPLEMENT_LOG_LEVEL", () => {

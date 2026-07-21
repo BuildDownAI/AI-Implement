@@ -29,8 +29,3 @@ require_one_of() {
   done
   fail "At least one of $* must be set"
 }
-
-# Base64url encode from stdin (no padding, URL-safe alphabet).
-base64url() {
-  openssl base64 -e -A | tr '+/' '-_' | tr -d '='
-}

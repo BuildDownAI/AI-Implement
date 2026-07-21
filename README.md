@@ -54,7 +54,7 @@ git clone https://github.com/BuildDownAI/AI-Implement.git
 cd AI-Implement
 asdf install                 # installs the Node version pinned in .tool-versions
 cp .env.example .env         # fill in GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY, plus
-                             # LINEAR_API_KEY (Linear) or JIRA_TOKEN + JIRA_CLOUD_ID + JIRA_SITE_URL (Jira)
+                             # LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET (Linear) or JIRA_TOKEN + JIRA_CLOUD_ID + JIRA_SITE_URL (Jira)
 npm install
 npm run dev                  # starts polling + HTTP server on :8080
 ```
