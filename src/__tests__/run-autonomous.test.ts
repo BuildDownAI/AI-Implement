@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { runAutonomous, resolveLogLevel } from "../run-autonomous.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { encodeRunConfig } from "../run-config.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
 
 const REQUIRED_ENV: Record<string, string> = {
@@ -588,6 +589,44 @@ describe("runAutonomous", () => {
       prUrl: "https://github.com/acme/app/pull/1",
     });
     expect(body.comments).toEqual([{ body: "first" }, { body: "second" }]);
+  });
+
+  it("posts the implementation callback using the AI_IMPLEMENT_RUN_CONFIG envelope's runnerCallbackUrl (GHA mode, RUNNER_CALLBACK_URL unset)", async () => {
+    // GHA workflows never set RUNNER_CALLBACK_URL directly — only RUN_TOKEN — and carry the
+    // callback URL inside the envelope. Regression test for the bug where postRunnerResult
+    // silently no-op'd because it only ever read the legacy env var. The envelope takes
+    // precedence over the flat ISSUE_ID/etc env vars stubbed by stubRequiredEnv() above.
+    vi.stubEnv(
+      "AI_IMPLEMENT_RUN_CONFIG",
+      encodeRunConfig({
+        v: 1,
+        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+        runnerCallbackUrl: "https://orchestrator.example",
+      }),
+    );
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) };
+    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(mockFetch).toHaveBeenCalledWith(
+      "https://orchestrator.example/runner/result",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ Authorization: "Bearer run-token" }),
+      }),
+    );
   });
 
   it("uses token-backed progress reporting when a progress token is present", async () => {

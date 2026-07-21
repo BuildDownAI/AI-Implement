@@ -131,6 +131,30 @@ describe("runPlanning", () => {
     expect(capturedPrompt).toContain("**Dependencies:** AII-3");
   });
 
+  it("posts the runner-callback result using the envelope's runnerCallbackUrl when RUNNER_CALLBACK_URL is unset (GHA envelope mode)", async () => {
+    delete process.env.RUNNER_CALLBACK_URL;
+    process.env.RUN_TOKEN = "tok";
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encodeRunConfig({
+      v: 1,
+      issue: { id: "e-1", identifier: "AII-9", title: "Envelope issue", description: "From envelope." },
+      runnerCallbackUrl: "https://orch.example/callback",
+    });
+    const posted: Array<{ url: string; body: unknown }> = [];
+    const fakeFetch = async (u: string, init: RequestInit = {}) => {
+      posted.push({ url: u, body: JSON.parse(String(init.body)) });
+      return { ok: true, text: async () => "" } as Response;
+    };
+    const result = await runPlanning({
+      workspaceDir: ws,
+      executor: () => ({ status: 0, stdout: "", stderr: "" }),
+      fetchImpl: fakeFetch,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(posted).toHaveLength(1);
+    expect(posted[0].url).toBe("https://orch.example/callback/runner/result");
+    expect(posted[0].body).toMatchObject({ phase: "planning", outcome: "success" });
+  });
+
   it("CLAUDE_MODEL env overrides PLANNING.md model", async () => {
     writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: claude-x\n---\nbody");
     process.env.CLAUDE_MODEL = "claude-override";
