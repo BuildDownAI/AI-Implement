@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment } from "./github.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -51,6 +51,7 @@ import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
+import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs } from "./poll-merged-prs.js";
@@ -408,6 +409,30 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Process pending late review feedback that arrived after the original run.
   await processReviewFixQueue(config);
+
+  // Drain orchestrator-mediated /ai-implement comment gap-fills.
+  await drainCommentGapfillQueue({
+    getMappings,
+    runnerMode: getRunnerMode().mode,
+    notifyType: config.notifyType,
+    notifyWebhookUrl: config.notifyWebhookUrl,
+    runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+    runnerTokenSecret: config.runnerTokenSecret,
+    getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+    resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
+    checkContract: (params) => resolveWorkflowContract(params),
+    dispatch: dispatchWorkflow,
+    postComment: postPrComment,
+    onDispatchFailure: surfaceDispatchFailure,
+    flySessionsToken: config.flySessionsToken,
+    flySessionsApp: config.flySessionsApp,
+    flySessionsRegion: config.flySessionsRegion,
+    flyOrchestratorApp: config.flyOrchestratorApp,
+    tenantId: config.tenantId,
+    anthropicApiKey: config.anthropicApiKey,
+    claudeOAuthToken: config.claudeOAuthToken,
+    sessionImage: config.sessionImage,
+  });
 
   // Crash-recovery safety net for workflow syncs. (NOT the primary trigger. the admin handlers fire runWorkflowSync immediately on save) 
   // this only re-runs jobs that lost their runner to a restart or a wedge.
