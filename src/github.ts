@@ -648,3 +648,33 @@ export async function mergeBranch(
     message: `mergeBranch(${head} -> ${base}) failed: HTTP ${res.status}: ${body}`,
   });
 }
+
+export async function addCommentReaction(
+  token: string,
+  owner: string,
+  repo: string,
+  commentId: number,
+  content: string,
+): Promise<void> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`,
+    {
+      method: "POST",
+      headers: { ...ghHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    },
+  );
+  // Adding a reaction that already exists returns 200 (idempotent); 201 = created.
+  // A 422 here is a real Validation Failed (not "already exists" — that's 200), so
+  // surface it rather than masking it as success. The caller invokes this as a
+  // best-effort ack (fire-and-forget with .catch), so a throw is logged, not fatal,
+  // and never loses the already-enqueued row.
+  if (res.status === 201 || res.status === 200) return;
+  const body = await res.text().catch(() => "");
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`,
+    bodyText: body,
+    message: `addCommentReaction(${commentId}, ${content}) failed: HTTP ${res.status}: ${body}`,
+  });
+}
