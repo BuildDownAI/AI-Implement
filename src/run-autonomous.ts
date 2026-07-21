@@ -145,6 +145,25 @@ function parseEnvInt(raw: string | undefined, name: string): number | undefined 
   return undefined;
 }
 
+// Envelope values are orchestrator-authored, but decodeRunConfig does not
+// type-check them — apply the same guards the legacy env path does so a bad
+// value can't slip through unvalidated in envelope mode.
+function positiveIntOrUndefined(value: number | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (Number.isInteger(value) && value > 0) return value;
+  console.warn(`[runner] Ignoring invalid ${name}=${JSON.stringify(value)} (must be a positive integer); using default`);
+  return undefined;
+}
+
+function safeBranchPrefix(raw: string | undefined): string | undefined {
+  try {
+    return normalizeBranchPrefix(raw) ?? undefined;
+  } catch (err) {
+    console.warn(`[runner] Ignoring invalid branch prefix: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
 function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRunnerInputs {
   const githubOwner = env.GITHUB_OWNER;
   if (!githubOwner) throw new Error("Missing required env var: GITHUB_OWNER");
@@ -163,9 +182,9 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     runnerPhase: resolveRunnerPhase(cfg.runnerPhase, prNumber),
     callbackUrl: cfg.runnerCallbackUrl ?? null,
     progressToken: env.RUN_PROGRESS_TOKEN?.trim() || null,
-    maxTurns: cfg.maxTurns,
-    maxIterations: cfg.maxIterations,
-    branchPrefix: cfg.branchPrefix,
+    maxTurns: positiveIntOrUndefined(cfg.maxTurns, "run_config.maxTurns"),
+    maxIterations: positiveIntOrUndefined(cfg.maxIterations, "run_config.maxIterations"),
+    branchPrefix: safeBranchPrefix(cfg.branchPrefix),
     skillsRepo: cfg.skillsRepo,
     profiles: (env.AI_IMPLEMENT_PROFILES ?? "").split(",").map((p) => p.trim()).filter(Boolean),
     githubOwner,

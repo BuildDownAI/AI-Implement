@@ -199,4 +199,57 @@ describe("resolveRunnerInputs", () => {
       expect(inputs.progressToken).toBe("token-y");
     });
   });
+
+  describe("(e) envelope caps/branchPrefix are validated like flat env", () => {
+    it("ignores a non-positive-integer maxTurns/maxIterations from the envelope and warns", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          maxTurns: 0,
+          maxIterations: -3,
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.maxTurns).toBeUndefined();
+      expect(inputs.maxIterations).toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/run_config\.maxTurns/));
+      warnSpy.mockRestore();
+    });
+
+    it("ignores an invalid branchPrefix from the envelope and warns", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          branchPrefix: "bad..prefix",
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.branchPrefix).toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/branch prefix/));
+      warnSpy.mockRestore();
+    });
+
+    it("accepts valid caps and branchPrefix from the envelope", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          maxTurns: 12,
+          maxIterations: 3,
+          branchPrefix: "pr",
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.maxTurns).toBe(12);
+      expect(inputs.maxIterations).toBe(3);
+      expect(inputs.branchPrefix).toBe("pr");
+    });
+  });
 });
