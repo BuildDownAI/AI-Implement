@@ -664,7 +664,12 @@ export async function addCommentReaction(
       body: JSON.stringify({ content }),
     },
   );
-  if (res.status === 201 || res.status === 200 || res.status === 422) return;
+  // Adding a reaction that already exists returns 200 (idempotent); 201 = created.
+  // A 422 here is a real Validation Failed (not "already exists" — that's 200), so
+  // surface it rather than masking it as success. The caller invokes this as a
+  // best-effort ack (fire-and-forget with .catch), so a throw is logged, not fatal,
+  // and never loses the already-enqueued row.
+  if (res.status === 201 || res.status === 200) return;
   const body = await res.text().catch(() => "");
   throw new GitHubApiError({
     status: res.status,
