@@ -592,3 +592,28 @@ export async function mergeBranch(
     message: `mergeBranch(${head} -> ${base}) failed: HTTP ${res.status}: ${body}`,
   });
 }
+
+export async function addCommentReaction(
+  token: string,
+  owner: string,
+  repo: string,
+  commentId: number,
+  content: string,
+): Promise<void> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`,
+    {
+      method: "POST",
+      headers: { ...ghHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    },
+  );
+  if (res.status === 201 || res.status === 200 || res.status === 422) return;
+  const body = await res.text().catch(() => "");
+  throw new GitHubApiError({
+    status: res.status,
+    path: `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`,
+    bodyText: body,
+    message: `addCommentReaction(${commentId}, ${content}) failed: HTTP ${res.status}: ${body}`,
+  });
+}
