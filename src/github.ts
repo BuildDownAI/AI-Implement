@@ -683,6 +683,83 @@ export async function mergeBranch(
   });
 }
 
+// ---------- Auto-merge (child PR -> grouping branch) helpers ----------
+
+export async function listOpenPullRequests(
+  token: string, owner: string, repo: string,
+): Promise<Array<{ number: number; url: string; base: string; head: string; headSha: string; draft: boolean }>> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=100`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) return [];
+  const prs = (await res.json()) as Array<{
+    number: number; html_url: string; draft?: boolean;
+    base: { ref: string }; head: { ref: string; sha: string };
+  }>;
+  return prs.map((p) => ({
+    number: p.number, url: p.html_url, base: p.base.ref,
+    head: p.head.ref, headSha: p.head.sha, draft: p.draft === true,
+  }));
+}
+
+export async function getCombinedChecksState(
+  token: string, owner: string, repo: string, sha: string,
+): Promise<"success" | "pending" | "failure"> {
+  const runsRes = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100`,
+    { headers: ghHeaders(token) });
+  const statusRes = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/status`,
+    { headers: ghHeaders(token) });
+  const FAIL = new Set(["failure", "timed_out", "cancelled", "action_required", "stale"]);
+  if (runsRes.ok) {
+    const data = (await runsRes.json()) as { check_runs?: Array<{ status: string; conclusion: string | null }> };
+    for (const c of data.check_runs ?? []) {
+      if (c.status !== "completed") return "pending";
+      if (c.conclusion && FAIL.has(c.conclusion)) return "failure";
+    }
+  }
+  if (statusRes.ok) {
+    const s = (await statusRes.json()) as { state?: string; total_count?: number };
+    if (s.state === "failure" || s.state === "error") return "failure";
+    if (s.state === "pending" && (s.total_count ?? 0) > 0) return "pending";
+  }
+  return "success";
+}
+
+export async function hasChangesRequestedReview(
+  token: string, owner: string, repo: string, prNumber: number,
+): Promise<boolean> {
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`,
+    { headers: ghHeaders(token) });
+  if (!res.ok) return false;
+  const reviews = (await res.json()) as Array<{ user: { id: number } | null; state: string }>;
+  const latest = new Map<number, string>();
+  for (const r of reviews) {
+    if (!r.user || r.state === "COMMENTED") continue;
+    latest.set(r.user.id, r.state);
+  }
+  return [...latest.values()].includes("CHANGES_REQUESTED");
+}
+
+export async function mergePullRequest(
+  token: string, owner: string, repo: string, prNumber: number, sha: string,
+  method: "merge" | "squash" | "rebase",
+): Promise<"merged" | "blocked" | "conflict"> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
+    method: "PUT", headers: ghHeaders(token),
+    body: JSON.stringify({ merge_method: method, sha }),
+  });
+  if (res.status === 200) return "merged";
+  if (res.status === 405) return "blocked";
+  if (res.status === 409) return "conflict";
+  const body = await res.text().catch(() => "");
+  throw new GitHubApiError({
+    status: res.status, path: `/repos/${owner}/${repo}/pulls/${prNumber}/merge`,
+    bodyText: body, message: `mergePullRequest(#${prNumber}) failed: HTTP ${res.status}: ${body}`,
+  });
+}
+
 export async function addCommentReaction(
   token: string,
   owner: string,

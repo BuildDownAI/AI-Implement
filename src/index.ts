@@ -12,7 +12,7 @@ import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
-import { notify, notifyCompletion } from "./notify.js";
+import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -50,6 +50,7 @@ import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
+import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
@@ -290,6 +291,23 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       } catch (err) {
         console.error("[merge-up] roll-up step failed:", err);
       }
+    }
+
+    // Auto-merge child PRs into their grouping branch once checks pass (opt-in per project;
+    // never merges into defaultBranch — the top-of-tree PR stays human-reviewed). Best-effort.
+    try {
+      const autoMergeMappings = Object.values(teamRepoMap).filter((m) => m.autoMerge);
+      if (autoMergeMappings.length > 0) {
+        await runAutoMerges(autoMergeMappings, {
+          githubAppId: config.githubAppId,
+          githubAppPrivateKey: config.githubAppPrivateKey,
+          notify: config.notifyWebhookUrl
+            ? (message) => notifyText(config.notifyWebhookUrl!, message)
+            : undefined,
+        });
+      }
+    } catch (err) {
+      console.error("[auto-merge] step failed:", err);
     }
 
     // Implementation issues have priority over planning issues for slot allocation.

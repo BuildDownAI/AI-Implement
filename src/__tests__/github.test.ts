@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -28,6 +28,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxJobMinutes: null,
     branchPrefix: null,
     skillsRepo: null,
+    autoMerge: false,
     ...overrides,
   };
 }
@@ -591,5 +592,58 @@ describe("findPullRequestByBranches", () => {
   it("returns null on non-OK response", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toBeNull();
+  });
+});
+
+describe("mergePullRequest", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('returns "merged" on HTTP 200', async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 200, ok: true })));
+    expect(await mergePullRequest("tok", "owner", "repo", 5, "sha5", "merge")).toBe("merged");
+  });
+
+  it('returns "blocked" on HTTP 405', async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 405, ok: false })));
+    expect(await mergePullRequest("tok", "owner", "repo", 5, "sha5", "merge")).toBe("blocked");
+  });
+
+  it('returns "conflict" on HTTP 409', async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 409, ok: false })));
+    expect(await mergePullRequest("tok", "owner", "repo", 5, "sha5", "merge")).toBe("conflict");
+  });
+});
+
+describe("getCombinedChecksState", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('returns "success" when there are zero check-runs and zero commit statuses', async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ check_runs: [], state: "success", total_count: 0 }),
+    })));
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("success");
+  });
+
+  it('returns "pending" when a check-run is in_progress', async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ check_runs: [{ status: "in_progress", conclusion: null }] }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("pending");
+  });
+
+  it('returns "failure" when a completed check-run has conclusion "failure"', async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ check_runs: [{ status: "completed", conclusion: "failure" }] }),
+      })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
+    );
+    expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("failure");
   });
 });

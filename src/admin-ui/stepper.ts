@@ -200,6 +200,10 @@ export const stepperHtml = `
             <input type="checkbox" id="np-autoApprove" checked style="width:auto">
             Auto-approve plans — skip the manual approval step and proceed to implementation automatically.
           </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer">
+            <input type="checkbox" id="np-autoMerge" style="width:auto">
+            Auto-merge child PRs — automatically merge child PRs into their grouping branch once checks pass.
+          </label>
         </div>
       </div>
 
@@ -327,7 +331,7 @@ export const stepperScript = `
     teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
-    planningEnabled: true, autoApprovePlans: true,
+    planningEnabled: true, autoApprovePlans: true, autoMerge: false,
     maxInProgressAiIssues: 3,
     secrets: [],
   };
@@ -357,6 +361,7 @@ export const stepperScript = `
     data.awsRegion = '';
     data.planningEnabled = true;
     data.autoApprovePlans = true;
+    data.autoMerge = false;
     data.maxInProgressAiIssues = 3;
     data.secrets = [];
 
@@ -378,6 +383,8 @@ export const stepperScript = `
     if (planningEl) planningEl.checked = true;
     const autoApproveEl = document.getElementById('np-autoApprove');
     if (autoApproveEl) autoApproveEl.checked = true;
+    const amEl = document.getElementById('np-autoMerge');
+    if (amEl) amEl.checked = false;
 
     // Reset runner cards
     for (const card of document.querySelectorAll('[data-runner]')) {
@@ -647,9 +654,11 @@ export const stepperScript = `
       const arEl = document.getElementById('np-awsRegion');
       const plEl = document.getElementById('np-planning');
       const aaEl = document.getElementById('np-autoApprove');
+      const amEl = document.getElementById('np-autoMerge');
       if (arEl) data.awsRegion = arEl.value.trim();
       if (plEl) data.planningEnabled = plEl.checked;
       if (aaEl) data.autoApprovePlans = aaEl.checked;
+      if (amEl) data.autoMerge = amEl.checked;
     } else if (n === 5) {
       const maxEl = document.getElementById('np-maxAi');
       if (maxEl) data.maxInProgressAiIssues = parseInt(maxEl.value, 10);
@@ -1072,6 +1081,7 @@ export const stepperScript = `
       machineMemoryMb: data.machineMemoryMb,
       planningEnabled: data.planningEnabled,
       autoApprovePlans: data.autoApprovePlans,
+      autoMerge: data.autoMerge ?? false,
       planningWorkflowFile: 'claude-plan.yml',
       extraEnv: {},
       provider: data.provider,
