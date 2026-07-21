@@ -519,6 +519,108 @@ describe("pushStep", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("(c1) allow-list suppresses a default sensitive-file hit", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\t.env\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
+      new NoopStepReporter(),
+    );
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/9");
+  });
+
+  it("(c2) allow-list does not suppress an unrelated sensitive-file hit", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M id_rsa\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, "id_rsa\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
+        new NoopStepReporter(),
+      ),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("(c3) no sensitiveFiles config → existing default behavior unchanged", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("add-pattern hit carries client-configured pattern description", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M config.secret\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, "config.secret\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, sensitiveFiles: { add: ["*.secret"] } },
+        new NoopStepReporter(),
+      ),
+    ).rejects.toThrow(/client-configured pattern \(\*\.secret\)/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("allow-list glob suppresses a matching variant (.env.local)", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env.local\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env.local\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\t.env.local\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sensitiveFiles: { allow: [".env.*"] } },
+      new NoopStepReporter(),
+    );
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/9");
+  });
+
   it("refuses to push over the base branch", async () => {
     await expect(
       pushStep.run(

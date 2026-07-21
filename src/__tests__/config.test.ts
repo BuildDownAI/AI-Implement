@@ -36,6 +36,8 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     maxJobMinutes: null,
     branchPrefix: null,
     skillsRepo: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
     ...overrides,
   };
 }
@@ -571,6 +573,53 @@ describe("config", () => {
     const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
     reopened.close();
     expect(info.map((c) => c.name)).toContain("skills_repo");
+  });
+
+  it("round-trips sensitiveAddPatterns and sensitiveAllowPatterns", () => {
+    config.initMappingsTable();
+    config.upsertMapping("SAP", mapping({
+      owner: "org", repo: "repo",
+      sensitiveAddPatterns: ["*.secrets.toml", "**/.env.local"],
+      sensitiveAllowPatterns: [".env", ".env.*"],
+    }));
+    config.upsertMapping("SAP_NULL", mapping({
+      owner: "org", repo: "repo",
+      sensitiveAddPatterns: null,
+      sensitiveAllowPatterns: null,
+    }));
+
+    const all = config.getMappings();
+    expect(all.SAP.sensitiveAddPatterns).toEqual(["*.secrets.toml", "**/.env.local"]);
+    expect(all.SAP.sensitiveAllowPatterns).toEqual([".env", ".env.*"]);
+    expect(all.SAP_NULL.sensitiveAddPatterns).toBeNull();
+    expect(all.SAP_NULL.sensitiveAllowPatterns).toBeNull();
+  });
+
+  it("migrates a pre-existing mappings table to include sensitive glob columns (default null)", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG2", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    const m = config.getMappings().LEG2;
+    expect(m.sensitiveAddPatterns).toBeNull();
+    expect(m.sensitiveAllowPatterns).toBeNull();
+
+    const reopened = new Database(dbPath);
+    const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
+    reopened.close();
+    expect(info.map((c) => c.name)).toContain("sensitive_add_patterns");
+    expect(info.map((c) => c.name)).toContain("sensitive_allow_patterns");
   });
 
   it("getMappings falls back to {} when extra_env contains invalid JSON", () => {

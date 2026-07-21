@@ -9,7 +9,8 @@ export type JobStatus =
   | "completed"
   | "review_failed"
   | "failed"
-  | "timed_out";
+  | "timed_out"
+  | "dispatch-failed";
 
 export interface Job {
   id: number;
@@ -34,6 +35,7 @@ export interface Job {
   runnerMode: string | null;
   sessionImage: string | null;
   phase: string;
+  contract: string | null;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -114,6 +116,12 @@ function ensureLogColumns(): void {
   if (!names.has("phase")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN phase TEXT NOT NULL DEFAULT 'implementation'");
   }
+  if (!names.has("contract")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN contract TEXT");
+  }
+  if (!names.has("trigger")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN trigger TEXT");
+  }
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -148,12 +156,18 @@ export function appendLog(entry: {
   runnerMode?: string;
   sessionImage?: string | null;
   phase?: string;
+  /** Override the default 'dispatched' status (e.g. 'dispatch-failed'). */
+  status?: JobStatus;
+  /** Dispatch contract mode recorded for observability. */
+  contract?: "legacy" | "envelope";
+  /** Trigger source: 'comment' for orchestrator-mediated /ai-implement runs, null = orchestrator-initiated. */
+  trigger?: string;
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId).count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -164,12 +178,15 @@ export function appendLog(entry: {
     entry.dispatchId ?? null,
     dispatchNumber,
     entry.issueState ?? null,
+    entry.status ?? "dispatched",
     entry.machineNonce ?? null,
     entry.executionMode ?? "github-actions",
     entry.machineId ?? null,
     entry.runnerMode ?? null,
     entry.sessionImage ?? null,
     entry.phase ?? "implementation",
+    entry.contract ?? null,
+    entry.trigger ?? null,
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows
@@ -207,7 +224,7 @@ export function updateJobStatus(
   conclusion?: string | null,
   prUrl?: string | null,
 ): void {
-  const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out";
+  const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out" || status === "dispatch-failed";
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
   // caller has none — the GHA monitor often can't resolve a PR for dispatch runs and
   // must not wipe the link on completion.
@@ -327,6 +344,22 @@ export function updateJobPrUrl(jobId: number, prUrl: string): void {
     .run(prUrl, jobId);
 }
 
+/**
+ * Returns the most recent dispatch log entry for a given PR.
+ * Used to recover issue metadata for orchestrator-mediated comment gap-fills.
+ */
+export function getLatestDispatchForPr(owner: string, repo: string, prNumber: number): Job | null {
+  const fullRepo = `${owner}/${repo}`;
+  const prUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}`;
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE repo = ? AND pr_url = ? ORDER BY dispatched_at DESC LIMIT 1",
+    )
+    .get(fullRepo, prUrl) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
 interface RawRow {
   id: number;
   issue_id: string;
@@ -350,6 +383,8 @@ interface RawRow {
   runner_mode: string | null;
   session_image: string | null;
   phase: string | null;
+  contract: string | null;
+  trigger: string | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -376,6 +411,7 @@ function mapRows(rows: RawRow[]): Job[] {
     runnerMode: row.runner_mode ?? null,
     sessionImage: (row.session_image as string | null) ?? null,
     phase: row.phase ?? "implementation",
+    contract: row.contract ?? null,
   }));
 }
 

@@ -40,7 +40,8 @@ export interface RepoMapping {
   autoApprovePlans: boolean;
   /** When true, the orchestrator auto-merges this project's child PRs into their
    *  ai-implement/{feature,multi-issue}/* grouping branch once checks pass. Never
-   *  merges into defaultBranch (top-of-tree stays human-reviewed). Default false. */
+   *  merges into defaultBranch (top-of-tree stays human-reviewed). Default true (ON);
+   *  untick per-project in the Edit dialog to disable. */
   autoMerge: boolean;
   /** Extra env vars injected into Fly machine env at dispatch time. */
   extraEnv: Record<string, string>;
@@ -64,6 +65,10 @@ export interface RepoMapping {
   branchPrefix: string | null;
   /** Optional skills repo (owner/repo shorthand or git URL) to clone for per-project skills. NULL means no skills repo. */
   skillsRepo: string | null;
+  /** Glob patterns to add to the sensitive-files list for this project. NULL means unset. */
+  sensitiveAddPatterns: string[] | null;
+  /** Glob patterns that are explicitly allowed (not sensitive) for this project. NULL means unset. */
+  sensitiveAllowPatterns: string[] | null;
 }
 
 // Seed mappings are only applied on first run (empty DB).
@@ -144,6 +149,12 @@ function ensureMappingsColumns(): void {
   if (!names.has("skills_repo")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN skills_repo TEXT`);
   }
+  if (!names.has("sensitive_add_patterns")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN sensitive_add_patterns TEXT`);
+  }
+  if (!names.has("sensitive_allow_patterns")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN sensitive_allow_patterns TEXT`);
+  }
 }
 
 export function initMappingsTable(): void {
@@ -174,7 +185,9 @@ export function initMappingsTable(): void {
       max_iterations INTEGER,
       max_job_minutes INTEGER,
       branch_prefix TEXT,
-      skills_repo TEXT
+      skills_repo TEXT,
+      sensitive_add_patterns TEXT,
+      sensitive_allow_patterns TEXT
     )
   `);
   ensureMappingsColumns();
@@ -183,10 +196,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -195,7 +208,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -223,6 +236,8 @@ export function getMappings(): Record<string, RepoMapping> {
       max_job_minutes: number | null;
       branch_prefix: string | null;
       skills_repo: string | null;
+      sensitive_add_patterns: string | null;
+      sensitive_allow_patterns: string | null;
     }>;
 
   const result: Record<string, RepoMapping> = {};
@@ -262,6 +277,8 @@ export function getMappings(): Record<string, RepoMapping> {
       maxJobMinutes: row.max_job_minutes,
       branchPrefix: row.branch_prefix,
       skillsRepo: row.skills_repo,
+      sensitiveAddPatterns: (() => { try { return row.sensitive_add_patterns ? JSON.parse(row.sensitive_add_patterns) as string[] : null; } catch { return null; } })(),
+      sensitiveAllowPatterns: (() => { try { return row.sensitive_allow_patterns ? JSON.parse(row.sensitive_allow_patterns) as string[] : null; } catch { return null; } })(),
     };
   }
   return result;
@@ -270,7 +287,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -298,6 +315,8 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.maxJobMinutes,
       mapping.branchPrefix,
       mapping.skillsRepo,
+      mapping.sensitiveAddPatterns ? JSON.stringify(mapping.sensitiveAddPatterns) : null,
+      mapping.sensitiveAllowPatterns ? JSON.stringify(mapping.sensitiveAllowPatterns) : null,
     );
 }
 

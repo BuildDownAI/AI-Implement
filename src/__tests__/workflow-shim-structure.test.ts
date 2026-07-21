@@ -6,16 +6,12 @@ const IMPLEMENT_WORKFLOWS = [
   "workflows/claude-implement.yml",
   ".github/workflows/claude-implement.yml",
 ];
-const COMMENT_TRIGGER_WORKFLOWS = [
-  "workflows/comment-trigger.yml",
-  ".github/workflows/comment-trigger.yml",
-];
 const PLANNING_WORKFLOWS = [
   "workflows/claude-plan.yml",
   ".github/workflows/claude-plan.yml",
 ];
-const FILES = [...IMPLEMENT_WORKFLOWS, ...COMMENT_TRIGGER_WORKFLOWS];
-const SYNCED_WORKFLOW_FILES = [...IMPLEMENT_WORKFLOWS, ...COMMENT_TRIGGER_WORKFLOWS, ...PLANNING_WORKFLOWS];
+const FILES = [...IMPLEMENT_WORKFLOWS];
+const SYNCED_WORKFLOW_FILES = [...IMPLEMENT_WORKFLOWS, ...PLANNING_WORKFLOWS];
 
 describe("GHA workflow shims", () => {
   it("ships workflow templates in the orchestrator image for admin-triggered syncs", () => {
@@ -85,12 +81,6 @@ describe("GHA workflow shims", () => {
     );
   });
 
-  it("keeps the canonical and synced comment trigger workflows byte-for-byte identical", () => {
-    expect(readFileSync(".github/workflows/comment-trigger.yml", "utf-8")).toBe(
-      readFileSync("workflows/comment-trigger.yml", "utf-8"),
-    );
-  });
-
   it("keeps the canonical and synced planning workflows byte-for-byte identical", () => {
     expect(readFileSync(".github/workflows/claude-plan.yml", "utf-8")).toBe(
       readFileSync("workflows/claude-plan.yml", "utf-8"),
@@ -151,12 +141,12 @@ describe("GHA workflow shims", () => {
   }
 
   for (const f of IMPLEMENT_WORKFLOWS) {
-    it(`${f} accepts a base_branch input that can override GITHUB_DEFAULT_BRANCH`, () => {
+    it(`${f} accepts run_config as the required envelope input and passes it through as AI_IMPLEMENT_RUN_CONFIG`, () => {
       const yaml = readFileSync(f, "utf-8");
       const doc = parse(yaml) as any;
-      expect(doc.on.workflow_dispatch.inputs.base_branch).toBeDefined();
-      expect(doc.on.workflow_dispatch.inputs.base_branch.default).toBe("");
-      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*inputs\.base_branch\s*\|\|\s*github\.ref_name\s*\}\}/);
+      expect(doc.on.workflow_dispatch.inputs.run_config).toBeDefined();
+      expect(doc.on.workflow_dispatch.inputs.run_config.required).toBe(true);
+      expect(yaml).toMatch(/AI_IMPLEMENT_RUN_CONFIG:\s*\$\{\{\s*inputs\.run_config\s*\}\}/);
     });
 
     it(`${f} validates the runner image before the container job starts`, () => {
@@ -184,11 +174,6 @@ describe("GHA workflow shims", () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
-    });
-
-    it(`${f} falls back to the dispatched ref when base_branch is omitted`, () => {
-      const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/GITHUB_DEFAULT_BRANCH:\s*\$\{\{\s*inputs\.base_branch\s*\|\|\s*github\.ref_name\s*\}\}/);
     });
 
     it(`${f} validates Bedrock config before configuring AWS credentials`, () => {
@@ -280,14 +265,12 @@ describe("GHA workflow shims", () => {
   });
 
   for (const f of PLANNING_WORKFLOWS) {
-    it(`${f} accepts related-issue context as dispatch inputs`, () => {
+    it(`${f} accepts run_config as the required envelope input and passes it through as AI_IMPLEMENT_RUN_CONFIG`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/parent:\n\s+description:\s*"Related parent issue summary/);
-      expect(yaml).toMatch(/siblings:\n\s+description:\s*"Related sibling issues summary/);
-      expect(yaml).toMatch(/dependencies:\n\s+description:\s*"Related dependency issues summary/);
-      expect(yaml).toMatch(/PARENT:\s*\$\{\{\s*inputs\.parent\s*\}\}/);
-      expect(yaml).toMatch(/SIBLINGS:\s*\$\{\{\s*inputs\.siblings\s*\}\}/);
-      expect(yaml).toMatch(/DEPENDENCIES:\s*\$\{\{\s*inputs\.dependencies\s*\}\}/);
+      const doc = parse(yaml) as any;
+      expect(doc.on.workflow_dispatch.inputs.run_config).toBeDefined();
+      expect(doc.on.workflow_dispatch.inputs.run_config.required).toBe(true);
+      expect(yaml).toMatch(/AI_IMPLEMENT_RUN_CONFIG:\s*\$\{\{\s*inputs\.run_config\s*\}\}/);
     });
 
     it(`${f} does not call Linear directly from the workflow`, () => {
@@ -295,7 +278,6 @@ describe("GHA workflow shims", () => {
       expect(yaml).not.toMatch(/api\.linear\.app\/graphql/);
       expect(yaml).not.toMatch(/LINEAR_API_KEY/);
       expect(yaml).not.toMatch(/Update Linear labels/);
-      expect(yaml).toMatch(/runner\/result/);
     });
 
     it(`${f} does not allow Claude to curl Linear directly`, () => {
@@ -326,10 +308,10 @@ describe("GHA workflow shims", () => {
       expect(yaml).not.toMatch(/anthropics\/claude-code-action/);
     });
 
-    it(`${f} wires runner_callback_url and run_token to the entrypoint env`, () => {
+    it(`${f} wires run tokens to the entrypoint env`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/RUNNER_CALLBACK_URL:\s*\$\{\{\s*inputs\.runner_callback_url\s*\}\}/);
       expect(yaml).toMatch(/RUN_TOKEN:\s*\$\{\{\s*inputs\.run_token\s*\}\}/);
+      expect(yaml).toMatch(/RUN_PROGRESS_TOKEN:\s*\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
     });
 
     it(`${f} wires bedrock configure-aws-credentials guarded by provider == 'bedrock'`, () => {
