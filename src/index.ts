@@ -661,6 +661,7 @@ async function dispatchPlanning(
           ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
           ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
           ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
+          planningContext: planningContextInputs,
         };
 
         // both fly-machines and local-docker require a GitHub token now, so it's extracted here for convenience/readability
@@ -839,6 +840,7 @@ async function dispatchPlanning(
         runToken,
         // No runProgressToken: planning dispatches don't mint progress tokens.
         runnerImage,
+        planningContext: planningContextInputs,
       })
     : {
         issue_id: issue.id,

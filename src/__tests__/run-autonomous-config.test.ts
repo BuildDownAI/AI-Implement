@@ -314,4 +314,56 @@ describe("resolveRunnerInputs", () => {
       expect(inputs.sensitiveFiles).toBeUndefined();
     });
   });
+
+  describe("(g) profiles preference", () => {
+    it("prefers envelope profiles over AI_IMPLEMENT_PROFILES env var", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          profiles: ["backend"],
+        }),
+        AI_IMPLEMENT_PROFILES: "other,ignored",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.profiles).toEqual(["backend"]);
+    });
+
+    it("falls back to AI_IMPLEMENT_PROFILES when envelope omits profiles", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        AI_IMPLEMENT_PROFILES: "backend,webapp",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.profiles).toEqual(["backend", "webapp"]);
+    });
+
+    it("returns empty array when envelope has empty profiles and no env var", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          profiles: [],
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.profiles).toEqual([]);
+    });
+
+    it("parses AI_IMPLEMENT_PROFILES in legacy-env mode", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        AI_IMPLEMENT_PROFILES: " backend , webapp , ",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.profiles).toEqual(["backend", "webapp"]);
+    });
+  });
 });
