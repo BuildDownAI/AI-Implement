@@ -457,24 +457,24 @@ describe("admin mappings", () => {
     expect(JSON.parse(list.body).AAPD.autoApprovePlans).toBe(true);
   });
 
-  it("defaults autoMerge to true when omitted", async () => {
+  it("defaults autoMerge to false when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "AMD", owner: "org", repo: "amd-repo" }, token);
-    expect(create.statusCode).toBe(202);
-    expect(JSON.parse(create.body).autoMerge).toBe(true);
-
-    const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).AMD.autoMerge).toBe(true);
-  });
-
-  it("persists autoMerge:false when explicitly disabled (per-project opt-out)", async () => {
-    const token = await login("secret");
-    const create = await request("/api/mappings", "POST", "secret", { teamKey: "AMOFF", owner: "org", repo: "amoff-repo", autoMerge: false }, token);
     expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).autoMerge).toBe(false);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
-    expect(JSON.parse(list.body).AMOFF.autoMerge).toBe(false);
+    expect(JSON.parse(list.body).AMD.autoMerge).toBe(false);
+  });
+
+  it("persists autoMerge:true when explicitly enabled (per-project opt-in)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", { teamKey: "AMON", owner: "org", repo: "amon-repo", autoMerge: true }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).autoMerge).toBe(true);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).AMON.autoMerge).toBe(true);
   });
 
   it("rejects planningEnabled:true with empty planningWorkflowFile", async () => {

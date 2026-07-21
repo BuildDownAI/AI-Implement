@@ -13,7 +13,7 @@ export const DEFAULT_MACHINE_MEMORY_MB = 4096;
 export const DEFAULT_PLANNING_ENABLED = true;
 export const DEFAULT_PLANNING_WORKFLOW_FILE = "claude-plan.yml";
 export const DEFAULT_AUTO_APPROVE_PLANS = true;
-export const DEFAULT_AUTO_MERGE = true;
+export const DEFAULT_AUTO_MERGE = false;
 
 export type ExecutionMode = "github-actions" | "fly-machines";
 export type SessionMode = "autonomous" | "interactive" | "hybrid";
@@ -40,8 +40,8 @@ export interface RepoMapping {
   autoApprovePlans: boolean;
   /** When true, the orchestrator auto-merges this project's child PRs into their
    *  ai-implement/{feature,multi-issue}/* grouping branch once checks pass. Never
-   *  merges into defaultBranch (top-of-tree stays human-reviewed). Default true (ON);
-   *  untick per-project in the Edit dialog to disable. */
+   *  merges into defaultBranch (top-of-tree stays human-reviewed). Default false;
+   *  tick per-project in the Edit dialog to enable. */
   autoMerge: boolean;
   /** Extra env vars injected into Fly machine env at dispatch time. */
   extraEnv: Record<string, string>;
@@ -114,7 +114,7 @@ function ensureMappingsColumns(): void {
     db.exec(`ALTER TABLE mappings ADD COLUMN auto_approve_plans INTEGER NOT NULL DEFAULT 1`);
   }
   if (!names.has("auto_merge")) {
-    db.exec(`ALTER TABLE mappings ADD COLUMN auto_merge INTEGER NOT NULL DEFAULT 1`);
+    db.exec(`ALTER TABLE mappings ADD COLUMN auto_merge INTEGER NOT NULL DEFAULT 0`);
   }
   if (!names.has("extra_env")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN extra_env TEXT`);
@@ -174,7 +174,7 @@ export function initMappingsTable(): void {
       planning_enabled INTEGER NOT NULL DEFAULT 1,
       planning_workflow_file TEXT NOT NULL DEFAULT 'claude-plan.yml',
       auto_approve_plans INTEGER NOT NULL DEFAULT 1,
-      auto_merge INTEGER NOT NULL DEFAULT 1,
+      auto_merge INTEGER NOT NULL DEFAULT 0,
       extra_env TEXT,
       provider TEXT NOT NULL DEFAULT '${DEFAULT_PROVIDER}',
       ticketing_provider TEXT NOT NULL DEFAULT '${DEFAULT_TICKETING_PROVIDER}',
