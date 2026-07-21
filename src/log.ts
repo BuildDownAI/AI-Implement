@@ -119,6 +119,9 @@ function ensureLogColumns(): void {
   if (!names.has("contract")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN contract TEXT");
   }
+  if (!names.has("trigger")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN trigger TEXT");
+  }
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -157,12 +160,14 @@ export function appendLog(entry: {
   status?: JobStatus;
   /** Dispatch contract mode recorded for observability. */
   contract?: "legacy" | "envelope";
+  /** Trigger source: 'comment' for orchestrator-mediated /ai-implement runs, null = orchestrator-initiated. */
+  trigger?: string;
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId).count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -181,6 +186,7 @@ export function appendLog(entry: {
     entry.sessionImage ?? null,
     entry.phase ?? "implementation",
     entry.contract ?? null,
+    entry.trigger ?? null,
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows
@@ -338,6 +344,22 @@ export function updateJobPrUrl(jobId: number, prUrl: string): void {
     .run(prUrl, jobId);
 }
 
+/**
+ * Returns the most recent dispatch log entry for a given PR.
+ * Used to recover issue metadata for orchestrator-mediated comment gap-fills.
+ */
+export function getLatestDispatchForPr(owner: string, repo: string, prNumber: number): Job | null {
+  const fullRepo = `${owner}/${repo}`;
+  const prUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}`;
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE repo = ? AND pr_url = ? ORDER BY dispatched_at DESC LIMIT 1",
+    )
+    .get(fullRepo, prUrl) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
 interface RawRow {
   id: number;
   issue_id: string;
@@ -362,6 +384,7 @@ interface RawRow {
   session_image: string | null;
   phase: string | null;
   contract: string | null;
+  trigger: string | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {

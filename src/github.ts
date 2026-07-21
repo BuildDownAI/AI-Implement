@@ -53,6 +53,8 @@ interface DispatchInputs {
    * otherwise omitted so the workflow keeps its own image resolution.
    */
   runner_image?: string;
+  /** Operator instruction forwarded from the /ai-implement PR comment. Legacy mode only; envelope mode carries this inside run_config. */
+  comment_instruction?: string;
 }
 
 interface DispatchResult {
@@ -189,6 +191,8 @@ export interface EnvelopeDispatchOpts {
   runProgressToken?: string;
   runnerImage?: string | null;
   prNumber?: string;
+  /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
+  commentInstruction?: string;
 }
 
 /**
@@ -219,6 +223,7 @@ export function buildEnvelopeDispatchInputs(
     ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
     ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
     ...(opts.prNumber ? { prNumber: opts.prNumber } : {}),
+    ...(opts.commentInstruction ? { commentInstruction: opts.commentInstruction } : {}),
     ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
       ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
       : {}),
@@ -256,6 +261,29 @@ export async function dispatchWorkflow(
 
   const body = await res.text();
   return { success: false, status: res.status, error: body };
+}
+
+/**
+ * Posts a comment on a pull request (or issue — GitHub's comment API is unified).
+ * Used to notify the commenter when the orchestrator cannot locate a dispatch record.
+ */
+export async function postPrComment(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  body: string,
+): Promise<void> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ body }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`postPrComment failed: HTTP ${res.status}: ${text}`);
+  }
 }
 
 /**
