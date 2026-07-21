@@ -13,6 +13,7 @@ import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
+import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
 
 export interface RunAutonomousOptions {
   workspaceDir?: string;
@@ -25,12 +26,6 @@ export interface RunAutonomousOptions {
 
 export interface RunAutonomousResult {
   exitCode: number;
-}
-
-function requireEnv(n: string): string {
-  const v = process.env[n];
-  if (!v) throw new Error(`Missing required env var: ${n}`);
-  return v;
 }
 
 function optionalEnv(n: string): string | null {
@@ -119,23 +114,182 @@ export function resolveLogLevel(raw: string | undefined): LogLevel {
   return raw === "stream" ? "stream" : "summary";
 }
 
+export interface ResolvedRunnerInputs {
+  issueId: string;
+  issueIdentifier: string;
+  issueTitle: string;
+  issueDescription: string;
+  prNumber: string;
+  commentInstruction: string | null;
+  runnerPhase: "implementation" | "gap-analysis";
+  callbackUrl: string | null;
+  progressToken: string | null;
+  maxTurns: number | undefined;
+  maxIterations: number | undefined;
+  branchPrefix: string | undefined;
+  skillsRepo: string | undefined;
+  profiles: string[];
+  githubOwner: string;
+  githubRepo: string;
+  githubToken: string;
+  provider: string;
+  claudeModel: string | undefined;
+  logLevel: LogLevel;
+}
+
+function parseEnvInt(raw: string | undefined, name: string): number | undefined {
+  if (!raw) return undefined;
+  const n = parseInt(raw, 10);
+  if (Number.isInteger(n) && n > 0) return n;
+  console.warn(`[runner] Ignoring invalid ${name}="${raw}" (must be a positive integer); using default`);
+  return undefined;
+}
+
+// Envelope values are orchestrator-authored, but decodeRunConfig does not
+// type-check them — apply the same guards the legacy env path does so a bad
+// value can't slip through unvalidated in envelope mode.
+function positiveIntOrUndefined(value: number | undefined, name: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (Number.isInteger(value) && value > 0) return value;
+  console.warn(`[runner] Ignoring invalid ${name}=${JSON.stringify(value)} (must be a positive integer); using default`);
+  return undefined;
+}
+
+function safeBranchPrefix(raw: string | undefined): string | undefined {
+  try {
+    return normalizeBranchPrefix(raw) ?? undefined;
+  } catch (err) {
+    console.warn(`[runner] Ignoring invalid branch prefix: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
+function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRunnerInputs {
+  const githubOwner = env.GITHUB_OWNER;
+  if (!githubOwner) throw new Error("Missing required env var: GITHUB_OWNER");
+  const githubRepo = env.GITHUB_REPO;
+  if (!githubRepo) throw new Error("Missing required env var: GITHUB_REPO");
+  const githubToken = env.GITHUB_TOKEN || env.GH_TOKEN || "";
+  if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
+  const prNumber = cfg.prNumber ?? "";
+  return {
+    issueId: cfg.issue.id,
+    issueIdentifier: cfg.issue.identifier,
+    issueTitle: cfg.issue.title,
+    issueDescription: cfg.issue.description,
+    prNumber,
+    commentInstruction: cfg.commentInstruction ?? null,
+    runnerPhase: resolveRunnerPhase(cfg.runnerPhase, prNumber),
+    callbackUrl: cfg.runnerCallbackUrl ?? null,
+    progressToken: env.RUN_PROGRESS_TOKEN?.trim() || null,
+    maxTurns: positiveIntOrUndefined(cfg.maxTurns, "run_config.maxTurns"),
+    maxIterations: positiveIntOrUndefined(cfg.maxIterations, "run_config.maxIterations"),
+    branchPrefix: safeBranchPrefix(cfg.branchPrefix),
+    skillsRepo: cfg.skillsRepo,
+    profiles: (env.AI_IMPLEMENT_PROFILES ?? "").split(",").map((p) => p.trim()).filter(Boolean),
+    githubOwner,
+    githubRepo,
+    githubToken,
+    provider: env.PROVIDER || "anthropic",
+    claudeModel: env.CLAUDE_MODEL?.trim() || undefined,
+    logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
+  };
+}
+
+export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInputs {
+  const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
+  if (rawConfig) {
+    const cfg = decodeRunConfig(rawConfig);
+    console.log(`[run-config] source=envelope v=${cfg.v}`);
+    return inputsFromConfig(cfg, env);
+  }
+  console.log("[run-config] source=legacy-env");
+  const req = (n: string): string => {
+    const v = env[n];
+    if (!v) throw new Error(`Missing required env var: ${n}`);
+    return v;
+  };
+  const opt = (n: string): string | null => {
+    const v = env[n]?.trim();
+    return v ? v : null;
+  };
+  const issueId = req("ISSUE_ID");
+  const issueIdentifier = req("ISSUE_IDENTIFIER");
+  const issueTitle = req("ISSUE_TITLE");
+  const issueDescription = req("ISSUE_DESCRIPTION");
+  const githubOwner = req("GITHUB_OWNER");
+  const githubRepo = req("GITHUB_REPO");
+  const githubToken = env.GITHUB_TOKEN || env.GH_TOKEN || "";
+  if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
+  const prNumber = env.PR_NUMBER ?? "";
+  const commentInstruction = opt("AI_IMPLEMENT_COMMENT_INSTRUCTION");
+  const runnerPhase = resolveRunnerPhase(env.RUNNER_PHASE, prNumber);
+  const callbackUrl = opt("RUNNER_CALLBACK_URL");
+  const progressToken = opt("RUN_PROGRESS_TOKEN");
+  const maxTurns = parseEnvInt(env.AI_IMPLEMENT_MAX_TURNS, "AI_IMPLEMENT_MAX_TURNS");
+  const maxIterations = parseEnvInt(env.AI_IMPLEMENT_MAX_ITERATIONS, "AI_IMPLEMENT_MAX_ITERATIONS");
+  const branchPrefix = (() => {
+    try {
+      return normalizeBranchPrefix(env.AI_IMPLEMENT_BRANCH_PREFIX) ?? undefined;
+    } catch (err) {
+      console.warn(`[runner] Ignoring invalid AI_IMPLEMENT_BRANCH_PREFIX: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  })();
+  const skillsRepo = env.AI_IMPLEMENT_SKILLS_REPO?.trim() || undefined;
+  const profiles = (env.AI_IMPLEMENT_PROFILES ?? "")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return {
+    issueId,
+    issueIdentifier,
+    issueTitle,
+    issueDescription,
+    prNumber,
+    commentInstruction,
+    runnerPhase,
+    callbackUrl,
+    progressToken,
+    maxTurns,
+    maxIterations,
+    branchPrefix,
+    skillsRepo,
+    profiles,
+    githubOwner,
+    githubRepo,
+    githubToken,
+    provider: env.PROVIDER || "anthropic",
+    claudeModel: env.CLAUDE_MODEL?.trim() || undefined,
+    logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
+  };
+}
+
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
-  const issueId = requireEnv("ISSUE_ID");
-  const issueIdentifier = requireEnv("ISSUE_IDENTIFIER");
-  const issueTitle = requireEnv("ISSUE_TITLE");
-  const issueDescription = requireEnv("ISSUE_DESCRIPTION");
-  const githubOwner = requireEnv("GITHUB_OWNER");
-  const githubRepo = requireEnv("GITHUB_REPO");
-  const githubToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
-  if (!githubToken) throw new Error("Missing required env var: GITHUB_TOKEN");
+  const {
+    issueId,
+    issueIdentifier,
+    issueTitle,
+    issueDescription,
+    githubOwner,
+    githubRepo,
+    githubToken,
+    prNumber,
+    commentInstruction,
+    runnerPhase,
+    callbackUrl,
+    progressToken,
+    maxTurns,
+    maxIterations,
+    branchPrefix,
+    skillsRepo,
+    profiles,
+    logLevel,
+    provider,
+    claudeModel,
+  } = resolveRunnerInputs(process.env);
   const branch = resolveBranch(workspaceDir);
-  const prNumber = process.env.PR_NUMBER ?? "";
-  const commentInstruction = optionalEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION");
-  const runnerPhase = resolveRunnerPhase(process.env.RUNNER_PHASE, prNumber);
-
-  const callbackUrl = optionalEnv("RUNNER_CALLBACK_URL");
-  const progressToken = optionalEnv("RUN_PROGRESS_TOKEN");
 
   // Planning context is fetched from the orchestrator's provider-agnostic
   // endpoint using the reusable progress token — the runner never calls the
@@ -183,43 +337,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   }
   implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
-  const model = process.env.CLAUDE_MODEL || workflowModel || "claude-sonnet-4-6";
-  const provider = process.env.PROVIDER || "anthropic";
-  const parseEnvInt = (raw: string | undefined, name: string): number | undefined => {
-    if (!raw) return undefined;
-    const n = parseInt(raw, 10);
-    if (Number.isInteger(n) && n > 0) return n;
-    // The orchestrator validates caps before dispatch, so this only happens on a
-    // manual GHA dispatch with a bad value. Warn so "my cap isn't taking effect"
-    // is diagnosable rather than a silent fallback to the default.
-    console.warn(`[runner] Ignoring invalid ${name}="${raw}" (must be a positive integer); using default`);
-    return undefined;
-  };
-  const maxTurns = parseEnvInt(process.env.AI_IMPLEMENT_MAX_TURNS, "AI_IMPLEMENT_MAX_TURNS");
-  const maxIterations = parseEnvInt(process.env.AI_IMPLEMENT_MAX_ITERATIONS, "AI_IMPLEMENT_MAX_ITERATIONS");
-  const branchPrefix = (() => {
-    try {
-      return normalizeBranchPrefix(process.env.AI_IMPLEMENT_BRANCH_PREFIX) ?? undefined;
-    } catch (err) {
-      // The orchestrator validates the prefix before dispatch, so this only
-      // happens on a manual dispatch with a bad value. Warn rather than fail the
-      // run, and fall back to the default (no prefix).
-      console.warn(`[runner] Ignoring invalid AI_IMPLEMENT_BRANCH_PREFIX: ${err instanceof Error ? err.message : String(err)}`);
-      return undefined;
-    }
-  })();
-  const skillsRepo = process.env.AI_IMPLEMENT_SKILLS_REPO?.trim() || undefined;
-  // Per-issue AI-Implement profile names (from the Jira multi-select field, forwarded
-  // by the orchestrator as the `profiles` dispatch input / AI_IMPLEMENT_PROFILES env).
-  // No built-in step consumes ctx.data.profiles — this is deliberately the contract
-  // surface for image-baked custom/ steps (resolveModuleImport over
-  // AI_IMPLEMENT_CUSTOM_ROOT), which branch their setup on the selected profiles.
-  const profiles = (process.env.AI_IMPLEMENT_PROFILES ?? "")
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-  const logLevel = resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL);
+  const model = claudeModel || workflowModel || "claude-sonnet-4-6";
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
