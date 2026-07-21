@@ -180,7 +180,7 @@ Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are
 
 ### Operational prerequisites (webhook-based /ai-implement)
 
-The orchestrator handles `/ai-implement` PR comments directly via `POST /api/github/webhook`. Three prerequisites must be met before comment-triggered gap-fill runs work for a repo:
+The orchestrator handles `/ai-implement` PR comments directly via `POST /api/github/webhook`. Four prerequisites must be met before comment-triggered gap-fill runs work for a repo:
 
 - **GitHub App subscribed to `issue_comment`** — add `issue_comment` to the App's webhook event subscriptions (GitHub App settings). Without this, comment events are never delivered.
 - **`GITHUB_WEBHOOK_SECRET` set** — the orchestrator verifies HMAC-SHA256 signatures on every delivery; set the same secret value in both the App webhook configuration and the orchestrator's environment. Deliveries with an invalid or missing signature are rejected 401.
