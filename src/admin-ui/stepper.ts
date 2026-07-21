@@ -191,7 +191,7 @@ export const stepperHtml = `
             Auto-approve plans — skip the manual approval step and proceed to implementation automatically.
           </label>
           <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer">
-            <input type="checkbox" id="np-autoMerge" style="width:auto">
+            <input type="checkbox" id="np-autoMerge" style="width:auto" checked>
             Auto-merge child PRs — automatically merge child PRs into their grouping branch once checks pass.
           </label>
         </div>
@@ -313,7 +313,7 @@ export const stepperScript = `
     teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '',
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
-    planningEnabled: true, autoApprovePlans: true, autoMerge: false,
+    planningEnabled: true, autoApprovePlans: true, autoMerge: true,
     maxInProgressAiIssues: 3,
     secrets: [],
   };
@@ -341,7 +341,7 @@ export const stepperScript = `
     data.awsRegion = '';
     data.planningEnabled = true;
     data.autoApprovePlans = true;
-    data.autoMerge = false;
+    data.autoMerge = true;
     data.maxInProgressAiIssues = 3;
     data.secrets = [];
 
@@ -1055,7 +1055,7 @@ export const stepperScript = `
       machineMemoryMb: data.machineMemoryMb,
       planningEnabled: data.planningEnabled,
       autoApprovePlans: data.autoApprovePlans,
-      autoMerge: data.autoMerge ?? false,
+      autoMerge: data.autoMerge ?? true,
       planningWorkflowFile: 'claude-plan.yml',
       extraEnv: {},
       provider: data.provider,
