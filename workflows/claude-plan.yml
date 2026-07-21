@@ -28,37 +28,20 @@ name: Claude AI Planning
 on:
   workflow_dispatch:
     inputs:
-      issue_id:
-        description: "Ticketing-system issue ID"
+      run_config:
+        description: "base64 JSON RunConfig envelope — see docs/workflow-envelope.md"
         required: true
         type: string
-      issue_identifier:
-        description: "Ticketing-system issue identifier (e.g., ENG-123)"
-        required: true
-        type: string
-      issue_title:
-        description: "Ticketing-system issue title"
-        required: true
-        type: string
-      issue_description:
-        description: "Ticketing-system issue description"
-        required: true
-        type: string
-      parent:
-        description: "Related parent issue summary for planning context"
+      runner_image:
+        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
         required: false
         type: string
-        default: "None"
-      siblings:
-        description: "Related sibling issues summary for planning context"
+        default: ""
+      job_timeout_minutes:
+        description: "Per-project job timeout in minutes, must be a positive integer (empty = 30)"
         required: false
         type: string
-        default: "None"
-      dependencies:
-        description: "Related dependency issues summary for planning context"
-        required: false
-        type: string
-        default: "None"
+        default: ""
       provider:
         description: "Claude provider: 'anthropic' (default) or 'bedrock'"
         required: false
@@ -69,18 +52,13 @@ on:
         required: false
         type: string
         default: ""
-      runner_callback_url:
-        description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
-        required: false
-        type: string
-        default: ""
       run_token:
         description: "HMAC bearer token authorizing the result POST; empty skips callback"
         required: false
         type: string
         default: ""
-      runner_image:
-        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
+      run_progress_token:
+        description: "HMAC bearer token authorizing progress POSTs; empty skips progress callback"
         required: false
         type: string
         default: ""
@@ -163,7 +141,7 @@ jobs:
   plan:
     needs: validate-runner-image
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: ${{ inputs.job_timeout_minutes && fromJSON(inputs.job_timeout_minutes) || 30 }}
     container:
       image: ${{ needs.validate-runner-image.outputs.runner_image }}
       # Authenticate the image pull so a private GHCR runner image owned by this
@@ -206,29 +184,23 @@ jobs:
           aws-region: ${{ inputs.aws_region }}
           role-session-duration: 14400
 
-      - name: Mask runner callback token
+      - name: Mask runner callback tokens
         run: |
           if [ -n "${{ inputs.run_token }}" ]; then
             echo "::add-mask::${{ inputs.run_token }}"
+          fi
+          if [ -n "${{ inputs.run_progress_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_progress_token }}"
           fi
 
       - name: Run planning
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-          GITHUB_DEFAULT_BRANCH: ${{ github.ref_name }}
           RUNNER_PHASE: planning
-          ISSUE_ID: ${{ inputs.issue_id }}
-          ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
-          ISSUE_TITLE: ${{ inputs.issue_title }}
-          ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
-          PARENT: ${{ inputs.parent }}
-          SIBLINGS: ${{ inputs.siblings }}
-          DEPENDENCIES: ${{ inputs.dependencies }}
-          PROVIDER: ${{ inputs.provider }}
-          AWS_REGION: ${{ inputs.aws_region }}
+          AI_IMPLEMENT_RUN_CONFIG: ${{ inputs.run_config }}
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUN_TOKEN: ${{ inputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
         run: /opt/ai-implement/entrypoint.sh
