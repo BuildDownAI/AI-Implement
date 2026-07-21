@@ -1,11 +1,15 @@
 import type { RepoMapping } from "./config.js";
 import { GitHubApiError } from "./github-errors.js";
+import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 
 interface DispatchInputs {
-  issue_id: string;
-  issue_identifier: string;
-  issue_title: string;
-  issue_description: string;
+  /** Legacy mode: per-field issue data. */
+  issue_id?: string;
+  issue_identifier?: string;
+  issue_title?: string;
+  issue_description?: string;
+  /** Envelope mode: base64-encoded RunConfigV1 carrying all issue data. */
+  run_config?: string;
   parent?: string;
   siblings?: string;
   dependencies?: string;
@@ -15,9 +19,10 @@ interface DispatchInputs {
    * Base branch the runner clones and the child PR targets. Only forwarded when it
    * differs from the workflow's declared default (feature-branch grouping); omitted
    * otherwise so target repos that haven't re-synced the workflow input don't 422.
+   * In envelope mode this rides inside run_config.baseBranch instead.
    */
   base_branch?: string;
-  /** Explicit callback phase reported by the runner. */
+  /** Explicit callback phase reported by the runner. In envelope mode rides inside run_config. */
   runner_phase?: "implementation" | "gap-analysis";
   /** Claude provider: 'anthropic' (default) or 'bedrock'. Only forwarded when set. */
   provider?: string;
@@ -173,6 +178,57 @@ export function profilesRunnerEnv(issue: { profiles?: string[] }): Record<string
   return issue.profiles && issue.profiles.length > 0
     ? { AI_IMPLEMENT_PROFILES: issue.profiles.join(",") }
     : {};
+}
+
+export interface EnvelopeDispatchOpts {
+  runnerPhase: "implementation" | "gap-analysis" | "planning";
+  baseBranch?: string;
+  runnerCallbackUrl?: string;
+  runToken?: string;
+  /** Include for implementation/gap-analysis; omit for planning (no progress token). */
+  runProgressToken?: string;
+  runnerImage?: string | null;
+  prNumber?: string;
+}
+
+/**
+ * Assembles the 7-input envelope dispatch payload for target repos that have
+ * re-synced to the envelope-style workflow contract. Issue fields, caps,
+ * branchPrefix, skillsRepo, and baseBranch ride inside run_config; only the
+ * pass-through inputs (tokens, provider, image, timeout) stay top-level so
+ * the GHA workflow can ::add-mask:: the tokens before unpacking the envelope.
+ */
+export function buildEnvelopeDispatchInputs(
+  mapping: RepoMapping,
+  issue: { id: string; identifier: string; title: string; description?: string | null },
+  opts: EnvelopeDispatchOpts,
+): DispatchInputs {
+  const runConfig: RunConfigV1 = {
+    v: 1,
+    issue: {
+      id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description || issue.title,
+    },
+    runnerPhase: opts.runnerPhase,
+    ...(opts.baseBranch ? { baseBranch: opts.baseBranch } : {}),
+    ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
+    ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
+    ...(opts.runnerCallbackUrl ? { runnerCallbackUrl: opts.runnerCallbackUrl } : {}),
+    ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
+    ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+    ...(opts.prNumber ? { prNumber: opts.prNumber } : {}),
+  };
+
+  return {
+    run_config: encodeRunConfig(runConfig),
+    run_token: opts.runToken ?? "",
+    ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
+    ...providerDispatchFields(mapping),
+    ...(mapping.maxJobMinutes != null ? { job_timeout_minutes: String(mapping.maxJobMinutes) } : {}),
+    ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
+  };
 }
 
 export async function dispatchWorkflow(

@@ -9,7 +9,8 @@ export type JobStatus =
   | "completed"
   | "review_failed"
   | "failed"
-  | "timed_out";
+  | "timed_out"
+  | "dispatch-failed";
 
 export interface Job {
   id: number;
@@ -34,6 +35,7 @@ export interface Job {
   runnerMode: string | null;
   sessionImage: string | null;
   phase: string;
+  contract: string | null;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -114,6 +116,9 @@ function ensureLogColumns(): void {
   if (!names.has("phase")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN phase TEXT NOT NULL DEFAULT 'implementation'");
   }
+  if (!names.has("contract")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN contract TEXT");
+  }
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -148,12 +153,16 @@ export function appendLog(entry: {
   runnerMode?: string;
   sessionImage?: string | null;
   phase?: string;
+  /** Override the default 'dispatched' status (e.g. 'dispatch-failed'). */
+  status?: JobStatus;
+  /** Dispatch contract mode recorded for observability. */
+  contract?: "legacy" | "envelope";
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId).count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -164,12 +173,14 @@ export function appendLog(entry: {
     entry.dispatchId ?? null,
     dispatchNumber,
     entry.issueState ?? null,
+    entry.status ?? "dispatched",
     entry.machineNonce ?? null,
     entry.executionMode ?? "github-actions",
     entry.machineId ?? null,
     entry.runnerMode ?? null,
     entry.sessionImage ?? null,
     entry.phase ?? "implementation",
+    entry.contract ?? null,
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows
@@ -207,7 +218,7 @@ export function updateJobStatus(
   conclusion?: string | null,
   prUrl?: string | null,
 ): void {
-  const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out";
+  const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out" || status === "dispatch-failed";
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
   // caller has none — the GHA monitor often can't resolve a PR for dispatch runs and
   // must not wipe the link on completion.
@@ -350,6 +361,7 @@ interface RawRow {
   runner_mode: string | null;
   session_image: string | null;
   phase: string | null;
+  contract: string | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -376,6 +388,7 @@ function mapRows(rows: RawRow[]): Job[] {
     runnerMode: row.runner_mode ?? null,
     sessionImage: (row.session_image as string | null) ?? null,
     phase: row.phase ?? "implementation",
+    contract: row.contract ?? null,
   }));
 }
 

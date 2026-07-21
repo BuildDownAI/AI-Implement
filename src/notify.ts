@@ -14,7 +14,7 @@ export interface StuckGiveUpNotification {
 }
 
 // The run phases that produce a user-facing notification
-export type NotificationPhase = "planning" | "implementation";
+export type NotificationPhase = "planning" | "implementation" | "dispatch-failed";
 
 export interface Notification {
   issueIdentifier: string;
@@ -22,6 +22,10 @@ export interface Notification {
   issueUrl: string;
   repoFullName: string;
   phase: NotificationPhase;
+  /** Only set for dispatch-failed: the workflow file that was being dispatched. */
+  workflowFile?: string;
+  /** Only set for dispatch-failed: human-readable hint (e.g. "re-sync required?"). */
+  hint?: string;
 }
 
 export interface CompletionNotification {
@@ -46,6 +50,7 @@ export interface CompletionNotification {
 const PHASE_LABELS: Record<NotificationPhase, string> = {
   planning: "AI Planning",
   implementation: "AI Implementation",
+  "dispatch-failed": "Dispatch Failed",
 };
 
 export async function notifyStuckGiveUp(
@@ -103,6 +108,14 @@ export async function notifyCompletion(
 // ---------- Dispatch notifications ----------
 
 async function notifySlack(webhookUrl: string, n: Notification): Promise<void> {
+  let text: string;
+  if (n.phase === "dispatch-failed") {
+    text = `*${PHASE_LABELS[n.phase]}* — \`${n.workflowFile ?? ""}\`\nRepo: \`${n.repoFullName}\``;
+    if (n.hint) text += `\n⚠️ Hint: ${n.hint}`;
+  } else {
+    text = `*${PHASE_LABELS[n.phase]} Dispatched*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\``;
+  }
+
   const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -110,10 +123,7 @@ async function notifySlack(webhookUrl: string, n: Notification): Promise<void> {
       blocks: [
         {
           type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `*${PHASE_LABELS[n.phase]} Dispatched*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\``,
-          },
+          text: { type: "mrkdwn", text },
         },
       ],
     }),
@@ -126,6 +136,35 @@ async function notifySlack(webhookUrl: string, n: Notification): Promise<void> {
 }
 
 async function notifyTeams(webhookUrl: string, n: Notification): Promise<void> {
+  let bodyBlocks: unknown[];
+  if (n.phase === "dispatch-failed") {
+    const facts: Array<{ title: string; value: string }> = [
+      { title: "Workflow", value: n.workflowFile ?? "" },
+      { title: "Target Repo", value: n.repoFullName },
+    ];
+    if (n.hint) facts.push({ title: "Hint", value: n.hint });
+    bodyBlocks = [
+      { type: "TextBlock", text: PHASE_LABELS[n.phase], weight: "Bolder", size: "Medium" },
+      { type: "FactSet", facts },
+    ];
+  } else {
+    bodyBlocks = [
+      {
+        type: "TextBlock",
+        text: `${PHASE_LABELS[n.phase]} Dispatched`,
+        weight: "Bolder",
+        size: "Medium",
+      },
+      {
+        type: "FactSet",
+        facts: [
+          { title: "Issue", value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})` },
+          { title: "Target Repo", value: n.repoFullName },
+        ],
+      },
+    ];
+  }
+
   const card = {
     type: "message",
     attachments: [
@@ -135,27 +174,7 @@ async function notifyTeams(webhookUrl: string, n: Notification): Promise<void> {
           $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
           type: "AdaptiveCard",
           version: "1.4",
-          body: [
-            {
-              type: "TextBlock",
-              text: `${PHASE_LABELS[n.phase]} Dispatched`,
-              weight: "Bolder",
-              size: "Medium",
-            },
-            {
-              type: "FactSet",
-              facts: [
-                {
-                  title: "Issue",
-                  value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})`,
-                },
-                {
-                  title: "Target Repo",
-                  value: n.repoFullName,
-                },
-              ],
-            },
-          ],
+          body: bodyBlocks,
         },
       },
     ],
