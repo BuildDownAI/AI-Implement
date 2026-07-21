@@ -159,6 +159,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
           baseBranch: ctx.getOutputs("clone").branch,
           prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
+          sensitiveFiles: ctx.data.sensitiveFiles,
         }),
         skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
       };

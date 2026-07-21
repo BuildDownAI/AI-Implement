@@ -252,4 +252,66 @@ describe("resolveRunnerInputs", () => {
       expect(inputs.branchPrefix).toBe("pr");
     });
   });
+
+  describe("(f) sensitiveFiles threading", () => {
+    it("(a) allow-list in envelope maps to sensitiveFiles.allow", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          sensitiveFiles: { allow: [".env", ".env.*"] },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.sensitiveFiles).toEqual({ allow: [".env", ".env.*"] });
+    });
+
+    it("(a) add-patterns in envelope maps to sensitiveFiles.add", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          sensitiveFiles: { add: ["*.secret"] },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.sensitiveFiles).toEqual({ add: ["*.secret"] });
+    });
+
+    it("(a) both lists in envelope map to sensitiveFiles", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+          sensitiveFiles: { add: ["*.secret"], allow: [".env"] },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.sensitiveFiles).toEqual({ add: ["*.secret"], allow: [".env"] });
+    });
+
+    it("(b) absent sensitiveFiles in envelope → undefined", () => {
+      const env = {
+        AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig({
+          v: 1,
+          issue: { id: "e", identifier: "AII-9", title: "t", description: "d" },
+        }),
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.sensitiveFiles).toBeUndefined();
+    });
+
+    it("(b) legacy-env mode always returns sensitiveFiles as undefined", () => {
+      const env = {
+        ISSUE_ID: "i", ISSUE_IDENTIFIER: "AII-1", ISSUE_TITLE: "t", ISSUE_DESCRIPTION: "d",
+        ...BASE_ENV,
+      };
+      const inputs = resolveRunnerInputs(env as NodeJS.ProcessEnv);
+      expect(inputs.sensitiveFiles).toBeUndefined();
+    });
+  });
 });
