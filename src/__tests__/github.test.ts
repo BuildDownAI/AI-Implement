@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches } from "../github.js";
+import { decodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -389,6 +390,54 @@ describe("profilesRunnerEnv", () => {
     expect(profilesRunnerEnv({ profiles: ["backend", "webapp"] })).toEqual({
       AI_IMPLEMENT_PROFILES: "backend,webapp",
     });
+  });
+});
+
+describe("buildEnvelopeDispatchInputs", () => {
+  const baseIssue = { id: "uuid-1", identifier: "AII-1", title: "T", description: "D" };
+
+  it("carries profiles in run_config when non-empty", () => {
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: ["backend", "webapp"] }, { runnerPhase: "implementation" });
+    const cfg = decodeRunConfig(inputs.run_config as string);
+    expect(cfg.profiles).toEqual(["backend", "webapp"]);
+  });
+
+  it("omits profiles from run_config when absent or empty", () => {
+    const noProfiles = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "implementation" });
+    expect(decodeRunConfig(noProfiles.run_config as string).profiles).toBeUndefined();
+
+    const emptyProfiles = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: [] }, { runnerPhase: "implementation" });
+    expect(decodeRunConfig(emptyProfiles.run_config as string).profiles).toBeUndefined();
+  });
+
+  it("carries planningContext in run_config when provided", () => {
+    const ctx = { parent: "- AII-0: parent", siblings: "None", dependencies: "None" };
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, {
+      runnerPhase: "planning",
+      planningContext: ctx,
+    });
+    const cfg = decodeRunConfig(inputs.run_config as string);
+    expect(cfg.planningContext).toEqual(ctx);
+  });
+
+  it("omits planningContext from run_config when not provided", () => {
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning" });
+    expect(decodeRunConfig(inputs.run_config as string).planningContext).toBeUndefined();
+  });
+
+  it("implementation dispatch carries profiles but no planningContext", () => {
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: ["backend"] }, { runnerPhase: "implementation" });
+    const cfg = decodeRunConfig(inputs.run_config as string);
+    expect(cfg.profiles).toEqual(["backend"]);
+    expect(cfg.planningContext).toBeUndefined();
+  });
+
+  it("planning dispatch with context but no profiles", () => {
+    const ctx = { parent: "- AII-0: parent", siblings: "None", dependencies: "None" };
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning", planningContext: ctx });
+    const cfg = decodeRunConfig(inputs.run_config as string);
+    expect(cfg.profiles).toBeUndefined();
+    expect(cfg.planningContext).toEqual(ctx);
   });
 });
 

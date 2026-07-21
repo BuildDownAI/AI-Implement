@@ -14,6 +14,8 @@ const full: RunConfigV1 = {
   maxIterations: 3,
   commentInstruction: "do the thing",
   sensitiveFiles: { add: ["*.secrets.toml"], allow: [".env", ".env.*"] },
+  profiles: ["backend", "webapp"],
+  planningContext: { parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" },
 };
 
 describe("run-config envelope", () => {
@@ -43,5 +45,57 @@ describe("run-config envelope", () => {
     const decoded = decodeRunConfig(encodeRunConfig(big));
     expect(decoded.issue.description.length).toBeLessThanOrEqual(40_000 + 100);
     expect(decoded.issue.description).toContain("[truncated by ai-implement");
+  });
+
+  it("round-trips profiles", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-2", title: "t", description: "" },
+      profiles: ["backend", "webapp"],
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).profiles).toEqual(["backend", "webapp"]);
+  });
+
+  it("round-trips planningContext", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-2", title: "t", description: "" },
+      planningContext: { parent: "- AII-1: parent", siblings: "None", dependencies: "None" },
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).planningContext).toEqual({
+      parent: "- AII-1: parent",
+      siblings: "None",
+      dependencies: "None",
+    });
+  });
+
+  it("pickKnownKeys preserves profiles and planningContext", () => {
+    const withExtra = {
+      ...full,
+      futureField: "ignored",
+    };
+    const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.profiles).toEqual(["backend", "webapp"]);
+    expect(decoded.planningContext).toEqual({ parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" });
+    expect((decoded as Record<string, unknown>).futureField).toBeUndefined();
+  });
+
+  it("handles empty profiles array and absent planningContext", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-2", title: "t", description: "" },
+      profiles: [],
+    };
+    const decoded = decodeRunConfig(encodeRunConfig(cfg));
+    expect(decoded.profiles).toEqual([]);
+    expect(decoded.planningContext).toBeUndefined();
+  });
+
+  it("absent profiles and planningContext decode as undefined", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-2", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.profiles).toBeUndefined();
+    expect(decoded.planningContext).toBeUndefined();
   });
 });

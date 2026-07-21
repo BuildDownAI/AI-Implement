@@ -188,7 +188,9 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     branchPrefix: safeBranchPrefix(cfg.branchPrefix),
     skillsRepo: cfg.skillsRepo,
     sensitiveFiles: cfg.sensitiveFiles,
-    profiles: (env.AI_IMPLEMENT_PROFILES ?? "").split(",").map((p) => p.trim()).filter(Boolean),
+    profiles: cfg.profiles
+      ? cfg.profiles
+      : (env.AI_IMPLEMENT_PROFILES ?? "").split(",").map((p) => p.trim()).filter(Boolean),
     githubOwner,
     githubRepo,
     githubToken,
