@@ -1,4 +1,5 @@
 import path from "node:path";
+import picomatch from "picomatch";
 
 /**
  * File patterns that must never be committed by the pipeline.
@@ -92,6 +93,11 @@ const SENSITIVE_PATTERNS: SensitivePattern[] = [
     match: (_, b) => b === ".htpasswd" || b.endsWith(".htpasswd") },
 ];
 
+export interface SensitiveFilesConfig {
+  add?: string[];
+  allow?: string[];
+}
+
 export interface SensitiveFileMatch {
   file: string;
   description: string;
@@ -118,14 +124,33 @@ export class SensitiveFilesError extends Error {
  * `stagedFiles` is a list of repo-relative paths (output of
  * `git diff --cached --name-only`).
  */
-export function findSensitiveFiles(stagedFiles: string[]): SensitiveFileMatch[] {
+export function findSensitiveFiles(stagedFiles: string[], config?: SensitiveFilesConfig): SensitiveFileMatch[] {
+  const allowMatchers = (config?.allow ?? []).map((glob) => picomatch(glob, { dot: true }));
+  const addGlobs = (config?.add ?? []).map((glob) => ({ glob, matcher: picomatch(glob, { dot: true }) }));
+
   const hits: SensitiveFileMatch[] = [];
   for (const file of stagedFiles) {
     const basename = path.basename(file);
+
+    if (allowMatchers.some((m) => m(file) || m(basename))) {
+      continue;
+    }
+
+    let matched = false;
     for (const pattern of SENSITIVE_PATTERNS) {
       if (pattern.match(file, basename)) {
         hits.push({ file, description: pattern.description });
+        matched = true;
         break; // one match per file is enough
+      }
+    }
+
+    if (!matched) {
+      for (const { glob, matcher } of addGlobs) {
+        if (matcher(file) || matcher(basename)) {
+          hits.push({ file, description: `client-configured pattern (${glob})` });
+          break;
+        }
       }
     }
   }
