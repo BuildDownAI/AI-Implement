@@ -42,6 +42,7 @@ import { validateTicketingConfig, type TicketingMappingConfig } from "./provider
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
+import picomatch from "picomatch";
 
 const SKILLS_REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 // NOTE: skillsRepo is syntax- and host-validated only — it is NOT sanitised. Any code that
@@ -72,6 +73,30 @@ function normalizeSkillsRepo(raw: unknown): string | null {
   }
   if (host !== "github.com") throw new Error("skillsRepo must be 'owner/repo' shorthand or an https://github.com/... URL (the runner clones with a GitHub token, so other hosts and SSH git@ URLs are not supported)");
   return v;
+}
+
+function normalizeSensitiveGlobs(raw: string | string[] | undefined | null): string[] | null {
+  if (raw == null) return null;
+  const items = Array.isArray(raw) ? raw : raw.split("\n");
+  const globs = items.map((g) => g.trim()).filter((g) => g.length > 0);
+  if (globs.length === 0) return null;
+  if (globs.length > 100) {
+    throw new Error(`too many globs (${globs.length}); maximum is 100 per list`);
+  }
+  for (const glob of globs) {
+    if (glob === "**") {
+      throw new Error(`glob "**" is not allowed (would disable the guardrail entirely)`);
+    }
+    if (glob.length > 256) {
+      throw new Error(`glob too long (${glob.length} chars): "${glob.slice(0, 30)}..."; maximum is 256 characters`);
+    }
+    try {
+      picomatch.makeRe(glob, { dot: true, debug: true });
+    } catch (err) {
+      throw new Error(`invalid glob "${glob}": ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return globs;
 }
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -1020,6 +1045,8 @@ async function handleUpsertMapping(
       maxJobMinutes?: number | null;
       branchPrefix?: string | null;
       skillsRepo?: string | null;
+      sensitiveAddPatterns?: string | string[] | null;
+      sensitiveAllowPatterns?: string | string[] | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1158,6 +1185,22 @@ async function handleUpsertMapping(
       return;
     }
 
+    let sensitiveAddPatterns: string[] | null;
+    try {
+      sensitiveAddPatterns = normalizeSensitiveGlobs(body.sensitiveAddPatterns);
+    } catch (err) {
+      json(res, 400, { error: `sensitiveAddPatterns invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    let sensitiveAllowPatterns: string[] | null;
+    try {
+      sensitiveAllowPatterns = normalizeSensitiveGlobs(body.sensitiveAllowPatterns);
+    } catch (err) {
+      json(res, 400, { error: `sensitiveAllowPatterns invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -1186,6 +1229,8 @@ async function handleUpsertMapping(
       maxJobMinutes,
       branchPrefix,
       skillsRepo,
+      sensitiveAddPatterns,
+      sensitiveAllowPatterns,
     };
 
     upsertMapping(body.teamKey, mapping);

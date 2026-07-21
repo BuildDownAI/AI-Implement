@@ -24,12 +24,14 @@
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",
+    "picomatch": "^2.3.1",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/jsdom": "^28.0.1",
     "@types/node": "^24.12.4",
+    "@types/picomatch": "^3.0.0",
     "jsdom": "^29.1.0",
     "tsx": "^4.0.0",
     "typescript": "^5.7.0",
