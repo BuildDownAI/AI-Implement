@@ -5,7 +5,9 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs } from "./github.js";
+import { resolveWorkflowContract } from "./workflow-probe.js";
+import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
@@ -483,29 +485,64 @@ async function dispatchGitHubActions(
 
   const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
-  const result = await dispatchWorkflow(ghToken, mapping, {
-    issue_id: issue.id,
-    issue_identifier: issue.identifier,
-    issue_title: issue.title,
-    issue_description: issue.description || issue.title,
-    runner_phase: "implementation",
-    ...providerDispatchFields(mapping),
-    // Only forward base_branch when grouping moved it off the repo default: GitHub
-    // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
-    // re-synced the workflow keep working for the common (non-grouped) path.
-    ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
-    ...capDispatchFields(mapping),
-    ...branchPrefixDispatchFields(mapping),
-    ...skillsRepoDispatchFields(mapping),
-    ...profilesDispatchFields(issue),
-    runner_callback_url: runnerCallbackUrl,
-    run_token: runToken,
-    run_progress_token: runProgressToken,
-    ...(runnerImage ? { runner_image: runnerImage } : {}),
+  const contract = await resolveWorkflowContract({
+    owner: mapping.owner,
+    repo: mapping.repo,
+    workflowFile: mapping.workflowFile,
+    token: ghToken,
   });
 
+  const dispatchInputs = contract === "envelope"
+    ? buildEnvelopeDispatchInputs(mapping, issue, {
+        runnerPhase: "implementation",
+        baseBranch: baseBranch !== mapping.defaultBranch ? baseBranch : undefined,
+        runnerCallbackUrl: runnerCallbackUrl || undefined,
+        runToken,
+        runProgressToken,
+        runnerImage,
+      })
+    : {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        issue_title: issue.title,
+        issue_description: issue.description || issue.title,
+        runner_phase: "implementation" as const,
+        ...providerDispatchFields(mapping),
+        // Only forward base_branch when grouping moved it off the repo default: GitHub
+        // rejects unknown workflow_dispatch inputs (422), so target repos that haven't
+        // re-synced the workflow keep working for the common (non-grouped) path.
+        ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
+        ...capDispatchFields(mapping),
+        ...branchPrefixDispatchFields(mapping),
+        ...skillsRepoDispatchFields(mapping),
+        ...profilesDispatchFields(issue),
+        runner_callback_url: runnerCallbackUrl,
+        run_token: runToken,
+        run_progress_token: runProgressToken,
+        ...(runnerImage ? { runner_image: runnerImage } : {}),
+      };
+
+  const result = await dispatchWorkflow(ghToken, mapping, dispatchInputs);
+
   if (!result.success) {
-    console.error(`[poll] Failed to dispatch ${issue.identifier}: ${result.status} ${result.error}`);
+    await surfaceDispatchFailure(
+      result,
+      config.notifyType,
+      config.notifyWebhookUrl,
+      {
+        site: "poll",
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        issueTitle: issue.title,
+        teamKey: issue.scopeKey,
+        repo: `${mapping.owner}/${mapping.repo}`,
+        workflowFile: mapping.workflowFile,
+        contract,
+        issueUrl: provider.issueUrl(issue),
+        issueState: issue.nativeStatus,
+        phase: "implementation",
+      },
+    );
     return;
   }
 
@@ -522,6 +559,7 @@ async function dispatchGitHubActions(
     executionMode: "github-actions",
     runnerMode,
     sessionImage: runnerImage ?? null,
+    contract,
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -772,20 +810,54 @@ async function dispatchPlanning(
   // claude-plan.yml are not rejected with a 422 "unexpected inputs".
   const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
-  const result = await dispatchWorkflow(ghToken, planningMapping, {
-    issue_id: issue.id,
-    issue_identifier: issue.identifier,
-    issue_title: issue.title,
-    issue_description: issue.description || issue.title,
-    ...planningContextInputs,
-    ...providerDispatchFields(planningMapping),
-    runner_callback_url: runnerCallbackUrl,
-    run_token: runToken,
-    ...(runnerImage ? { runner_image: runnerImage } : {}),
+  const planningContract = await resolveWorkflowContract({
+    owner: mapping.owner,
+    repo: mapping.repo,
+    workflowFile: mapping.planningWorkflowFile,
+    token: ghToken,
   });
 
+  const planningDispatchInputs = planningContract === "envelope"
+    ? buildEnvelopeDispatchInputs(planningMapping, issue, {
+        runnerPhase: "planning",
+        runnerCallbackUrl: runnerCallbackUrl || undefined,
+        runToken,
+        // No runProgressToken: planning dispatches don't mint progress tokens.
+        runnerImage,
+      })
+    : {
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        issue_title: issue.title,
+        issue_description: issue.description || issue.title,
+        ...planningContextInputs,
+        ...providerDispatchFields(planningMapping),
+        runner_callback_url: runnerCallbackUrl,
+        run_token: runToken,
+        ...(runnerImage ? { runner_image: runnerImage } : {}),
+      };
+
+  const result = await dispatchWorkflow(ghToken, planningMapping, planningDispatchInputs);
+
   if (!result.success) {
-    console.error(`[poll] Failed to dispatch planning for ${issue.identifier}: ${result.status} ${result.error}`);
+    await surfaceDispatchFailure(
+      result,
+      config.notifyType,
+      config.notifyWebhookUrl,
+      {
+        site: "poll",
+        issueId: issue.id,
+        issueIdentifier: issue.identifier,
+        issueTitle: issue.title,
+        teamKey: issue.scopeKey,
+        repo: `${mapping.owner}/${mapping.repo}`,
+        workflowFile: mapping.planningWorkflowFile,
+        contract: planningContract,
+        issueUrl: provider.issueUrl(issue),
+        issueState: issue.nativeStatus,
+        phase: "planning",
+      },
+    );
     return;
   }
 
@@ -800,6 +872,7 @@ async function dispatchPlanning(
     executionMode: "github-actions",
     phase: "planning",
     sessionImage: runnerImage ?? null,
+    contract: planningContract,
   });
 
   if (config.notifyWebhookUrl) {
@@ -1978,28 +2051,69 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
-      const result = await dispatchWorkflow(ghToken, mapping, {
-        issue_id: fix.issueId,
-        issue_identifier: fix.issueIdentifier ?? fix.issueId,
-        issue_title: `Review feedback fix for PR #${fix.prNumber}`,
-        issue_description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
-        pr_number: String(fix.prNumber),
-        runner_phase: "gap-analysis",
-        ...providerDispatchFields(mapping),
-        ...capDispatchFields(mapping),
-        ...skillsRepoDispatchFields(mapping),
-        // No profilesDispatchFields here: profiles are per-issue (read off the fresh
-        // TicketIssue at poll time), and review-fix queue entries only persist the
-        // issue id — re-fetching the ticket just for profiles isn't worth it for a
-        // gap-fill pass on a PR the profile-aware initial run already produced.
-        runner_callback_url: runnerCallbackUrl,
-        run_token: runToken,
-        run_progress_token: runProgressToken,
-        ...(runnerImage ? { runner_image: runnerImage } : {}),
+
+      const reviewFixContract = await resolveWorkflowContract({
+        owner: mapping.owner,
+        repo: mapping.repo,
+        workflowFile: mapping.workflowFile,
+        token: ghToken,
       });
 
+      const fixIssue = {
+        id: fix.issueId,
+        identifier: fix.issueIdentifier ?? fix.issueId,
+        title: `Review feedback fix for PR #${fix.prNumber}`,
+        description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
+      };
+
+      const reviewFixInputs = reviewFixContract === "envelope"
+        ? buildEnvelopeDispatchInputs(mapping, fixIssue, {
+            runnerPhase: "gap-analysis",
+            prNumber: String(fix.prNumber),
+            runnerCallbackUrl: runnerCallbackUrl || undefined,
+            runToken,
+            runProgressToken,
+            runnerImage,
+          })
+        : {
+            issue_id: fix.issueId,
+            issue_identifier: fix.issueIdentifier ?? fix.issueId,
+            issue_title: `Review feedback fix for PR #${fix.prNumber}`,
+            issue_description: `Address late review feedback on PR #${fix.prNumber}. Queue reason: ${fix.reason}.`,
+            pr_number: String(fix.prNumber),
+            runner_phase: "gap-analysis" as const,
+            ...providerDispatchFields(mapping),
+            ...capDispatchFields(mapping),
+            ...skillsRepoDispatchFields(mapping),
+            // No profilesDispatchFields here: profiles are per-issue (read off the fresh
+            // TicketIssue at poll time), and review-fix queue entries only persist the
+            // issue id — re-fetching the ticket just for profiles isn't worth it for a
+            // gap-fill pass on a PR the profile-aware initial run already produced.
+            runner_callback_url: runnerCallbackUrl,
+            run_token: runToken,
+            run_progress_token: runProgressToken,
+            ...(runnerImage ? { runner_image: runnerImage } : {}),
+          };
+
+      const result = await dispatchWorkflow(ghToken, mapping, reviewFixInputs);
+
       if (!result.success) {
-        console.error(`[review-fix] Failed to dispatch review fix #${fix.id}: ${result.status} ${result.error}`);
+        await surfaceDispatchFailure(
+          result,
+          config.notifyType,
+          config.notifyWebhookUrl,
+          {
+            site: "review-fix",
+            issueId: fix.issueId,
+            issueIdentifier: fix.issueIdentifier ?? undefined,
+            issueTitle: `Review feedback fix for PR #${fix.prNumber}`,
+            teamKey: scopeKey,
+            repo: fix.repo,
+            workflowFile: mapping.workflowFile,
+            contract: reviewFixContract,
+            phase: "gap-analysis",
+          },
+        );
         updateReviewFixStatus(fix.id, "failed");
         continue;
       }
@@ -2015,6 +2129,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         dispatchNumber: prior.count + 1,
         executionMode: "github-actions",
         runnerMode: "default",
+        contract: reviewFixContract,
       });
       updateJobPrUrl(jobId, `https://github.com/${fix.repo}/pull/${fix.prNumber}`);
       if (dispatchId) {

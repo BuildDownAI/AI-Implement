@@ -182,9 +182,9 @@ export const overviewScript = `
   }
 
   function statusBadge(status) {
-    const map = { running: 'running', review_failed: 'warn', failed: 'fail', completed: 'success' };
+    const map = { running: 'running', review_failed: 'warn', failed: 'fail', 'dispatch-failed': 'fail', completed: 'success' };
     const kind = map[status] || 'neutral';
-    const label = status === 'review_failed' ? 'review failed' : status;
+    const label = status === 'review_failed' ? 'review failed' : status === 'dispatch-failed' ? 'dispatch failed' : status;
     return '<span class="badge ' + kind + '">' + window.esc(label) + '</span>';
   }
 
