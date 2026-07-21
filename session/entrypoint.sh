@@ -27,7 +27,15 @@ case "$PROVIDER" in
   *) fail "Unsupported provider: $PROVIDER" ;;
 esac
 export PROVIDER
-require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
+# AI_IMPLEMENT_RUN_CONFIG (the envelope) carries the issue fields when set; the
+# TS runner decodes them itself. Only the legacy per-field contract needs them
+# validated and exported here.
+if [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then
+  log "Issue fields will be resolved from the AI_IMPLEMENT_RUN_CONFIG envelope"
+else
+  require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
+  export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
+fi
 
 if [ "$AI_IMPLEMENT_MODE" = "gha" ]; then
   require_env GITHUB_TOKEN GITHUB_REPOSITORY
@@ -36,7 +44,6 @@ if [ "$AI_IMPLEMENT_MODE" = "gha" ]; then
 else
   require_env GITHUB_TOKEN GITHUB_OWNER GITHUB_REPO
 fi
-export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
 export GITHUB_OWNER GITHUB_REPO
 export PR_NUMBER="${PR_NUMBER:-}"
 

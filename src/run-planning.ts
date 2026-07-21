@@ -59,12 +59,14 @@ export interface RunPlanningOptions {
 export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number }> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
 
-  // Resolve planning context: prefer envelope cfg.planningContext, fall back to legacy env vars.
+  // Resolve issue fields + planning context: prefer the envelope, fall back to legacy env vars.
+  let envelopeIssue: { id: string; identifier: string; title: string; description: string } | undefined;
   let envelopePlanningContext: { parent?: string; siblings?: string; dependencies?: string } | undefined;
   const rawConfig = process.env.AI_IMPLEMENT_RUN_CONFIG;
   if (rawConfig) {
     try {
       const cfg = decodeRunConfig(rawConfig);
+      envelopeIssue = cfg.issue;
       if (cfg.planningContext) envelopePlanningContext = cfg.planningContext;
     } catch {
       // Malformed envelope: fall back to env vars without failing.
@@ -72,10 +74,10 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
   }
 
   const subs: Record<string, string> = {
-    ISSUE_ID: requireEnv("ISSUE_ID"),
-    ISSUE_IDENTIFIER: requireEnv("ISSUE_IDENTIFIER"),
-    ISSUE_TITLE: requireEnv("ISSUE_TITLE"),
-    ISSUE_DESCRIPTION: requireEnv("ISSUE_DESCRIPTION"),
+    ISSUE_ID: envelopeIssue?.id ?? requireEnv("ISSUE_ID"),
+    ISSUE_IDENTIFIER: envelopeIssue?.identifier ?? requireEnv("ISSUE_IDENTIFIER"),
+    ISSUE_TITLE: envelopeIssue?.title ?? requireEnv("ISSUE_TITLE"),
+    ISSUE_DESCRIPTION: envelopeIssue?.description ?? requireEnv("ISSUE_DESCRIPTION"),
     PARENT: envelopePlanningContext?.parent ?? process.env.PARENT?.trim() ?? "None",
     SIBLINGS: envelopePlanningContext?.siblings ?? process.env.SIBLINGS?.trim() ?? "None",
     DEPENDENCIES: envelopePlanningContext?.dependencies ?? process.env.DEPENDENCIES?.trim() ?? "None",
