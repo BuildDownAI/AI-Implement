@@ -226,6 +226,17 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       ? []
       : await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
 
+    // Finalize empty grouping parents (all children terminal, blank spec) — markMerged so the
+    // existing roll-up path opens the top-of-tree PR without dispatching a junk implement pass.
+    for (let i = 0; i < providers.length; i++) {
+      for (const entry of snapshots[i].parentsToFinalize) {
+        console.log(`[${providers[i].id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
+        await providers[i].markMerged(entry.issueId, entry.scopeKey).catch((err) => {
+          console.error(`[${providers[i].id}] Failed to finalize empty grouping parent ${entry.identifier}:`, err);
+        });
+      }
+    }
+
     const needsPlanning = snapshots.flatMap((s) => s.needsPlanning);
     const readyForImplementation = snapshots.flatMap((s) => s.readyForImplementation);
     const inProgressCountsByScope = snapshots.reduce<Record<string, number>>((acc, s) => {

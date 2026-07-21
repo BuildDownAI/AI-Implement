@@ -787,8 +787,9 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
   });
 
   it("dispatches a feature-node parent once all designated children are terminal, onto its own branch", async () => {
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
     const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      { when: /in \(Ready/, issues: [parentWithSpec] },
       {
         when: /parent in/,
         issues: [
@@ -807,8 +808,9 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     // markMerged only sets the AI-Implement Status custom field — native status
     // stays untouched. The gating check must accept that as terminal or the
     // feature-node parent would stay blocked forever after a normal merge.
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
     const client = fakeClient([
-      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      { when: /in \(Ready/, issues: [parentWithSpec] },
       {
         when: /parent in/,
         issues: [
@@ -859,6 +861,45 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     const leaf = snap.readyForImplementation.find((i) => i.identifier === "OOL-96")!;
     expect(leaf).toBeDefined();
     expect(leaf.featureBranchChain).toBeUndefined();
+  });
+
+  it("finalizes an empty-spec feature-node-ready parent instead of dispatching", async () => {
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("OOL-78", "Ready", "acme/x")] },
+      {
+        when: /parent in/,
+        issues: [
+          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
+        ],
+      },
+      { when: /key in/, issues: [] }, // OOL-78 has no parent
+    ]);
+    // OOL-78's description is null (blank spec) in the default issue() helper
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    expect(snap.needsPlanning).toEqual([]);
+    expect(snap.readyForImplementation).toEqual([]);
+    expect(snap.parentsToFinalize).toEqual([
+      { issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1" },
+    ]);
+  });
+
+  it("dispatches a non-empty-spec feature-node-ready parent normally (no regression)", async () => {
+    const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "## Do the work\n\nActual spec here." } };
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [parentWithSpec] },
+      {
+        when: /parent in/,
+        issues: [
+          issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
+        ],
+      },
+      { when: /key in/, issues: [] },
+    ]);
+    const snap = await makeProvider(client).fetchAIImplementSnapshot();
+    const parent = snap.needsPlanning.find((i) => i.identifier === "OOL-78")!;
+    expect(parent).toBeDefined();
+    expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
+    expect(snap.parentsToFinalize).toEqual([]);
   });
 });
 
