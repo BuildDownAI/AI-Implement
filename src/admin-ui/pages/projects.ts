@@ -304,8 +304,8 @@ export const projectsScript = `
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
     document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
     document.getElementById('md-skills-repo').value = m.skillsRepo || '';
-    document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\n');
-    document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\n');
+    document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
+    document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';

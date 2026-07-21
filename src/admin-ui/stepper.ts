@@ -747,8 +747,8 @@ export const stepperScript = `
     set('repo', window.esc(data.owner) + '/' + window.esc(data.repo));
     set('defaultBranch', window.esc(data.defaultBranch) || '&mdash;');
     set('skillsRepo', data.skillsRepo ? window.esc(data.skillsRepo) : '&mdash;');
-    set('sensitiveAddPatterns', data.sensitiveAddPatterns ? (data.sensitiveAddPatterns.split('\n').filter(function(l){return l.trim();}).length + ' pattern(s)') : '&mdash;');
-    set('sensitiveAllowPatterns', data.sensitiveAllowPatterns ? (data.sensitiveAllowPatterns.split('\n').filter(function(l){return l.trim();}).length + ' exception(s)') : '&mdash;');
+    set('sensitiveAddPatterns', data.sensitiveAddPatterns ? (data.sensitiveAddPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' pattern(s)') : '&mdash;');
+    set('sensitiveAllowPatterns', data.sensitiveAllowPatterns ? (data.sensitiveAllowPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' exception(s)') : '&mdash;');
 
     let runnerText = window.esc(data.executionMode);
     if (data.executionMode === 'fly-machines') {
