@@ -219,6 +219,9 @@ export function buildEnvelopeDispatchInputs(
     ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
     ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
     ...(opts.prNumber ? { prNumber: opts.prNumber } : {}),
+    ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
+      ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
+      : {}),
   };
 
   return {

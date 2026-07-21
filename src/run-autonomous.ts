@@ -128,6 +128,7 @@ export interface ResolvedRunnerInputs {
   maxIterations: number | undefined;
   branchPrefix: string | undefined;
   skillsRepo: string | undefined;
+  sensitiveFiles: { add?: string[]; allow?: string[] } | undefined;
   profiles: string[];
   githubOwner: string;
   githubRepo: string;
@@ -186,6 +187,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     maxIterations: positiveIntOrUndefined(cfg.maxIterations, "run_config.maxIterations"),
     branchPrefix: safeBranchPrefix(cfg.branchPrefix),
     skillsRepo: cfg.skillsRepo,
+    sensitiveFiles: cfg.sensitiveFiles,
     profiles: (env.AI_IMPLEMENT_PROFILES ?? "").split(",").map((p) => p.trim()).filter(Boolean),
     githubOwner,
     githubRepo,
@@ -255,6 +257,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     maxIterations,
     branchPrefix,
     skillsRepo,
+    sensitiveFiles: undefined,
     profiles,
     githubOwner,
     githubRepo,
@@ -284,6 +287,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     maxIterations,
     branchPrefix,
     skillsRepo,
+    sensitiveFiles,
     profiles,
     logLevel,
     provider,
@@ -378,6 +382,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       maxIterations,
       branchPrefix,
       skillsRepo,
+      sensitiveFiles,
       profiles,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
