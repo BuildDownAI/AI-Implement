@@ -43,6 +43,7 @@ export function providerConfigFromEnv(): ProviderConfig {
     jiraToken: process.env.JIRA_TOKEN,
     jiraCloudId: process.env.JIRA_CLOUD_ID,
     jiraSiteUrl: process.env.JIRA_SITE_URL,
+    jiraEmail: process.env.JIRA_EMAIL,
   };
 }
 
