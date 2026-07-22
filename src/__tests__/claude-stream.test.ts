@@ -73,6 +73,8 @@ describe("extractTelemetry", () => {
       costUsd: 0.83,
       tokensIn: 182000,
       tokensOut: 4100,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
       toolTrace: ["Bash pnpm check"],
     });
   });
@@ -89,6 +91,8 @@ describe("extractTelemetry", () => {
       costUsd: null,
       tokensIn: null,
       tokensOut: null,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
       toolTrace: [],
     });
   });
@@ -96,6 +100,29 @@ describe("extractTelemetry", () => {
     const t = extractTelemetry([{ type: "result", subtype: "success", num_turns: 3, usage: { input_tokens: 10, output_tokens: 2 } }]);
     expect(t.costUsd).toBeNull();
     expect(t.outcome).toBe("success");
+  });
+  it("counts cache-creation and cache-read tokens as input", () => {
+    const t = extractTelemetry([{
+      type: "result",
+      subtype: "success",
+      num_turns: 104,
+      usage: {
+        input_tokens: 90,
+        cache_creation_input_tokens: 400000,
+        cache_read_input_tokens: 12000000,
+        output_tokens: 89900,
+      },
+    }]);
+    expect(t.tokensIn).toBe(90 + 400000 + 12000000);
+    expect(t.cacheReadTokens).toBe(12000000);
+    expect(t.cacheCreationTokens).toBe(400000);
+    expect(t.tokensOut).toBe(89900);
+  });
+  it("leaves cache fields null when usage has no cache counters", () => {
+    const t = extractTelemetry([{ type: "result", subtype: "success", usage: { input_tokens: 10, output_tokens: 2 } }]);
+    expect(t.tokensIn).toBe(10);
+    expect(t.cacheReadTokens).toBeNull();
+    expect(t.cacheCreationTokens).toBeNull();
   });
 });
 
@@ -162,6 +189,20 @@ describe("summaryLine", () => {
   it("shows max_turns outcome at summary level", () => {
     expect(summaryLine({ outcome: "max_turns", numTurns: 50, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null }))
       .toBe("[claude] result=max_turns turns=50");
+  });
+  it("formats million-scale input and shows the cached share", () => {
+    expect(
+      summaryLine({
+        outcome: "success",
+        numTurns: 104,
+        durationMs: 1544000,
+        costUsd: 5.08,
+        tokensIn: 12400090,
+        tokensOut: 89900,
+        cacheReadTokens: 12000000,
+        cacheCreationTokens: 400000,
+      }),
+    ).toBe("[claude] result=success turns=104 duration=25m44s cost=$5.08 tokens=12.4M/89.9k (in/out, 97% cache reads)");
   });
 });
 

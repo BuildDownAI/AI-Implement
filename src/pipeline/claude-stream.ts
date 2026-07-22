@@ -60,17 +60,32 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
       costUsd: null,
       tokensIn: null,
       tokensOut: null,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
       toolTrace: extractToolTrace(events),
     };
   }
-  const usage = (result.usage ?? {}) as { input_tokens?: number; output_tokens?: number };
+  const usage = (result.usage ?? {}) as {
+    input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+    output_tokens?: number;
+  };
+  // usage.input_tokens counts only the uncached slice; on long agentic runs
+  // nearly all input arrives via the cache counters, so report the full sum.
+  const uncachedIn = num(usage.input_tokens);
+  const cacheCreation = num(usage.cache_creation_input_tokens);
+  const cacheRead = num(usage.cache_read_input_tokens);
+  const inParts = [uncachedIn, cacheCreation, cacheRead].filter((v): v is number => v != null);
   return {
     outcome: mapOutcome(result.subtype),
     numTurns: num(result.num_turns),
     durationMs: num(result.duration_ms),
     costUsd: num(result.total_cost_usd),
-    tokensIn: num(usage.input_tokens),
+    tokensIn: inParts.length > 0 ? inParts.reduce((a, b) => a + b, 0) : null,
     tokensOut: num(usage.output_tokens),
+    cacheReadTokens: cacheRead,
+    cacheCreationTokens: cacheCreation,
     toolTrace: extractToolTrace(events),
   };
 }
@@ -176,6 +191,7 @@ function humanizeMs(ms: number): string {
 
 function kfmt(n: number | null): string {
   if (n == null) return "?";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
@@ -186,7 +202,11 @@ export function summaryLine(t: RunTelemetry): string {
   // Omit cost when absent or zero (Bedrock typically reports no cost).
   if (t.costUsd != null && t.costUsd > 0) parts.push(`cost=$${t.costUsd.toFixed(2)}`);
   if (t.tokensIn != null || t.tokensOut != null) {
-    parts.push(`tokens=${kfmt(t.tokensIn)}/${kfmt(t.tokensOut)} (in/out)`);
+    const cacheRead = t.cacheReadTokens ?? null;
+    const cacheShare = t.tokensIn != null && t.tokensIn > 0 && cacheRead != null && cacheRead > 0
+      ? `, ${Math.round((cacheRead / t.tokensIn) * 100)}% cache reads`
+      : "";
+    parts.push(`tokens=${kfmt(t.tokensIn)}/${kfmt(t.tokensOut)} (in/out${cacheShare})`);
   }
   return parts.join(" ");
 }
