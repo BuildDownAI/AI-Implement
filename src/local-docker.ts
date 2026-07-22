@@ -9,8 +9,7 @@ const execFile = promisify(nodeExecFile);
 const SECRET_ENV_KEYS = new Set([
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
-  "GITHUB_APP_PRIVATE_KEY",
-  "LINEAR_API_KEY",
+  "GITHUB_TOKEN",
   "RUN_TOKEN",
   "SESSION_TOKEN",
 ]);
@@ -24,11 +23,9 @@ export interface LocalRunnerInput {
   owner: string;
   repo: string;
   defaultBranch: string;
-  linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
-  githubAppId: string;
-  githubAppPrivateKey: string;
+  githubToken: string;
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
@@ -59,15 +56,13 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
     GITHUB_OWNER: input.owner,
     GITHUB_REPO: input.repo,
     GITHUB_DEFAULT_BRANCH: input.defaultBranch,
-    GITHUB_APP_ID: input.githubAppId,
-    GITHUB_APP_PRIVATE_KEY: input.githubAppPrivateKey,
+    GITHUB_TOKEN: input.githubToken,
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
     SESSION_MODE: input.sessionMode ?? "autonomous",
     RUNNER_PHASE: input.phase ?? "implementation",
   };
 
-  if (input.linearApiKey) env.LINEAR_API_KEY = input.linearApiKey;
   if (input.claudeOAuthToken) env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   if (input.anthropicApiKey) env.ANTHROPIC_API_KEY = input.anthropicApiKey;
   if (input.orchestratorUrl) env.ORCHESTRATOR_URL = input.orchestratorUrl;

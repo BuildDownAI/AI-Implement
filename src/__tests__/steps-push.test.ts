@@ -241,6 +241,69 @@ describe("pushStep", () => {
     expect(body.body).not.toContain("## AI review");
   });
 
+  it("footer includes harness, model, and provider with explicit values", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext({ model: "claude-opus-4-5", provider: "bedrock" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("Generated with AI-Implement · harness: Claude Code · model: claude-opus-4-5 · provider: bedrock");
+  });
+
+  it("footer degrades to model: unknown when model is absent", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("Generated with AI-Implement");
+    expect(body.body).toContain("model: unknown");
+  });
+
+  it("footer defaults to provider: anthropic when provider is absent", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext({ model: "claude-sonnet-4-6" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("provider: anthropic");
+  });
+
+  it("footer includes Bedrock ARN-style model ID verbatim", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    const bedrockModel = "anthropic.claude-opus-4-5-20260101-v1:0";
+    await pushStep.run(makeContext({ model: bedrockModel, provider: "bedrock" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain(`model: ${bedrockModel}`);
+    expect(body.body).toContain("provider: bedrock");
+  });
+
   it("checks out implementation branch and commits working tree changes before pushing", async () => {
     mockGitSuccess("abc123");
     vi.mocked(fetch).mockResolvedValueOnce({
@@ -454,6 +517,108 @@ describe("pushStep", () => {
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/git diff --cached failed/);
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("(c1) allow-list suppresses a default sensitive-file hit", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\t.env\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
+      new NoopStepReporter(),
+    );
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/9");
+  });
+
+  it("(c2) allow-list does not suppress an unrelated sensitive-file hit", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M id_rsa\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, "id_rsa\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
+        new NoopStepReporter(),
+      ),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("(c3) no sensitiveFiles config → existing default behavior unchanged", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("add-pattern hit carries client-configured pattern description", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M config.secret\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, "config.secret\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, sensitiveFiles: { add: ["*.secret"] } },
+        new NoopStepReporter(),
+      ),
+    ).rejects.toThrow(/client-configured pattern \(\*\.secret\)/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("allow-list glob suppresses a matching variant (.env.local)", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env.local\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env.local\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\t.env.local\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sensitiveFiles: { allow: [".env.*"] } },
+      new NoopStepReporter(),
+    );
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/9");
   });
 
   it("refuses to push over the base branch", async () => {

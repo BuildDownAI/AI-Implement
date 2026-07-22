@@ -140,6 +140,16 @@ export const projectsHtml = `
             <input id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
+          <div class="md-field">
+            <label>Additional sensitive patterns <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <textarea id="md-sensitive-add" rows="3" placeholder="one glob per line"></textarea>
+            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
+          </div>
+          <div class="md-field">
+            <label>Allowed exceptions <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <textarea id="md-sensitive-allow" rows="3" placeholder="one glob per line"></textarea>
+            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
+          </div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -175,6 +185,7 @@ export const projectsHtml = `
         <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
           <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-planning" type="checkbox" style="width:auto" onchange="onPlanningChange()"> Enabled</label>
           <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-approve" type="checkbox" style="width:auto" checked> Auto-approve</label>
+          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-merge" type="checkbox" style="width:auto"> Auto-merge child PRs</label>
           <div id="md-planning-wf-wrap" class="md-field hidden" style="flex:1;min-width:160px;margin-bottom:0">
             <label>Planning Workflow File</label><input id="md-planning-wf" value="claude-plan.yml">
           </div>
@@ -286,6 +297,7 @@ export const projectsScript = `
     document.getElementById('md-env').value = envToText(m.extraEnv);
     document.getElementById('md-planning').checked = !!m.planningEnabled;
     document.getElementById('md-auto-approve').checked = m.autoApprovePlans !== false;
+    document.getElementById('md-auto-merge').checked = m.autoMerge === true;
     document.getElementById('md-planning-wf').value = m.planningWorkflowFile || 'claude-plan.yml';
     document.getElementById('md-provider').value = m.provider || 'anthropic';
     document.getElementById('md-aws-region').value = m.awsRegion || '';
@@ -294,6 +306,8 @@ export const projectsScript = `
     document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
     document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
     document.getElementById('md-skills-repo').value = m.skillsRepo || '';
+    document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
+    document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -603,6 +617,7 @@ export const projectsScript = `
       machineMemoryMb: parseInt(document.getElementById('md-mem').value, 10),
       planningEnabled: document.getElementById('md-planning').checked,
       autoApprovePlans: document.getElementById('md-auto-approve').checked,
+      autoMerge: document.getElementById('md-auto-merge').checked,
       planningWorkflowFile: document.getElementById('md-planning-wf').value.trim(),
       extraEnv: parseEnvText(document.getElementById('md-env').value),
       provider: document.getElementById('md-provider').value,
@@ -612,6 +627,8 @@ export const projectsScript = `
       maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
       branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
       skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
+      sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
+      sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;

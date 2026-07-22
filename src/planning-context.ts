@@ -1,4 +1,5 @@
 import type { TicketIssue } from "./providers/types.js";
+import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 
 export interface PlanningContextInputs {
   parent: string;
@@ -8,7 +9,6 @@ export interface PlanningContextInputs {
 
 interface PlanningContextParams {
   issue: TicketIssue;
-  linearApiKey: string | null;
   ticketingProviderId: string;
   fetchImpl?: typeof fetch;
 }
@@ -24,7 +24,7 @@ function toContextValue(lines: string[]): string {
 }
 
 export async function buildPlanningContextInputs(params: PlanningContextParams): Promise<PlanningContextInputs> {
-  if (params.ticketingProviderId !== "linear" || !params.linearApiKey) {
+  if (params.ticketingProviderId !== "linear" || !isLinearAuthConfigured()) {
     return NONE_CONTEXT;
   }
 
@@ -51,17 +51,19 @@ export async function buildPlanningContextInputs(params: PlanningContextParams):
   `;
 
   try {
-    const response = await fetchImpl("https://api.linear.app/graphql", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: params.linearApiKey,
-      },
-      body: JSON.stringify({
-        query,
-        variables: { id: params.issue.id },
+    const response = await withLinearToken((token) =>
+      fetchImpl("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          query,
+          variables: { id: params.issue.id },
+        }),
       }),
-    });
+    );
 
     if (!response.ok) {
       throw new Error(`Linear HTTP ${response.status}`);

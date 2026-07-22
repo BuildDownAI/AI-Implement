@@ -27,30 +27,29 @@ case "$PROVIDER" in
   *) fail "Unsupported provider: $PROVIDER" ;;
 esac
 export PROVIDER
-require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
+# AI_IMPLEMENT_RUN_CONFIG (the envelope) carries the issue fields when set; the
+# TS runner decodes them itself. Only the legacy per-field contract needs them
+# validated and exported here.
+if [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then
+  log "Issue fields will be resolved from the AI_IMPLEMENT_RUN_CONFIG envelope"
+else
+  require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
+  export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
+fi
 
 if [ "$AI_IMPLEMENT_MODE" = "gha" ]; then
   require_env GITHUB_TOKEN GITHUB_REPOSITORY
   GITHUB_OWNER="${GITHUB_REPOSITORY%%/*}"
   GITHUB_REPO="${GITHUB_REPOSITORY#*/}"
 else
-  require_env GITHUB_APP_ID GITHUB_APP_PRIVATE_KEY GITHUB_OWNER GITHUB_REPO
+  require_env GITHUB_TOKEN GITHUB_OWNER GITHUB_REPO
 fi
-export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION
 export GITHUB_OWNER GITHUB_REPO
 export PR_NUMBER="${PR_NUMBER:-}"
 
 # ── 3. Token acquisition ─────────────────────────────────────────────────────
-if [ "$AI_IMPLEMENT_MODE" = "gha" ]; then
-  log "Using GITHUB_TOKEN from GHA"
-  export GH_TOKEN="$GITHUB_TOKEN"
-else
-  # shellcheck disable=SC1091
-  source "$SCRIPT_DIR/token-refresh.sh"
-  GITHUB_TOKEN=$(cat /tmp/github-token)
-  export GITHUB_TOKEN
-  export GH_TOKEN="$GITHUB_TOKEN"
-fi
+# Both GHA (workflow-minted) and fly/local (orchestrator-minted) receive GITHUB_TOKEN directly.
+export GH_TOKEN="$GITHUB_TOKEN"
 
 # ── 4. Git config + clone ────────────────────────────────────────────────────
 if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then

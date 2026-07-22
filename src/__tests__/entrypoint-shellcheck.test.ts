@@ -57,4 +57,11 @@ describe("session/entrypoint.sh", () => {
     expect(content).toContain("su -p coder");
     expect(content).not.toContain("su -m -p coder");
   });
+
+  it("skips the legacy ISSUE_ID require/export when AI_IMPLEMENT_RUN_CONFIG is set", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    expect(content).toMatch(/if \[ -n "\$\{AI_IMPLEMENT_RUN_CONFIG:-\}" \]; then/);
+    expect(content).toContain('require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION');
+    expect(content).toContain("export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION");
+  });
 });

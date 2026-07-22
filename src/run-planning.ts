@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { postRunnerResult } from "./runner-result.js";
+import { decodeRunConfig } from "./run-config.js";
 
 export type PlanningExecutor = (
   prompt: string,
@@ -57,14 +58,35 @@ export interface RunPlanningOptions {
 
 export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number }> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
+
+  // Resolve issue fields + planning context + callback URL: prefer the envelope,
+  // fall back to legacy env vars. The callback URL matters most here — GHA never
+  // sets RUNNER_CALLBACK_URL as a plain env var, so without this the orchestrator
+  // never learns the run finished and the issue gets stuck mid-planning.
+  let envelopeIssue: { id: string; identifier: string; title: string; description: string } | undefined;
+  let envelopePlanningContext: { parent?: string; siblings?: string; dependencies?: string } | undefined;
+  let envelopeCallbackUrl: string | undefined;
+  const rawConfig = process.env.AI_IMPLEMENT_RUN_CONFIG;
+  if (rawConfig) {
+    try {
+      const cfg = decodeRunConfig(rawConfig);
+      envelopeIssue = cfg.issue;
+      if (cfg.planningContext) envelopePlanningContext = cfg.planningContext;
+      envelopeCallbackUrl = cfg.runnerCallbackUrl;
+    } catch {
+      // Malformed envelope: fall back to env vars without failing.
+    }
+  }
+  const callbackUrl = envelopeCallbackUrl ?? process.env.RUNNER_CALLBACK_URL?.trim() ?? null;
+
   const subs: Record<string, string> = {
-    ISSUE_ID: requireEnv("ISSUE_ID"),
-    ISSUE_IDENTIFIER: requireEnv("ISSUE_IDENTIFIER"),
-    ISSUE_TITLE: requireEnv("ISSUE_TITLE"),
-    ISSUE_DESCRIPTION: requireEnv("ISSUE_DESCRIPTION"),
-    PARENT: process.env.PARENT?.trim() || "None",
-    SIBLINGS: process.env.SIBLINGS?.trim() || "None",
-    DEPENDENCIES: process.env.DEPENDENCIES?.trim() || "None",
+    ISSUE_ID: envelopeIssue?.id ?? requireEnv("ISSUE_ID"),
+    ISSUE_IDENTIFIER: envelopeIssue?.identifier ?? requireEnv("ISSUE_IDENTIFIER"),
+    ISSUE_TITLE: envelopeIssue?.title ?? requireEnv("ISSUE_TITLE"),
+    ISSUE_DESCRIPTION: envelopeIssue?.description ?? requireEnv("ISSUE_DESCRIPTION"),
+    PARENT: envelopePlanningContext?.parent ?? process.env.PARENT?.trim() ?? "None",
+    SIBLINGS: envelopePlanningContext?.siblings ?? process.env.SIBLINGS?.trim() ?? "None",
+    DEPENDENCIES: envelopePlanningContext?.dependencies ?? process.env.DEPENDENCIES?.trim() ?? "None",
   };
   let model = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
   let prompt = buildDefaultPlanningPrompt(subs);
@@ -95,6 +117,7 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
       workspaceDir,
       outcome: "failure",
       failureReason: (result.stderr || "planning run failed").slice(-4000),
+      callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 1 };
@@ -103,6 +126,7 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
     phase: "planning",
     workspaceDir,
     outcome: "success",
+    callbackUrl,
     fetchImpl: opts.fetchImpl,
   });
   return { exitCode: 0 };

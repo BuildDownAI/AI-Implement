@@ -42,19 +42,10 @@ function makeTemplatesRoot(): string {
   tempRoot = mkdtempSync(join(tmpdir(), "workflow-sync-"));
   mkdirSync(join(tempRoot, "workflows"), { recursive: true });
   writeFileSync(join(tempRoot, "workflows/claude-implement.yml"), "implement-yml\n");
-  writeFileSync(join(tempRoot, "workflows/comment-trigger.yml"), "comment-yml\n");
   writeFileSync(join(tempRoot, "workflows/claude-plan.yml"), "plan-yml\n");
   writeFileSync(join(tempRoot, "workflows/WORKFLOW.md"), "workflow-md\n");
   writeFileSync(join(tempRoot, "workflows/PLANNING.md"), "planning-md\n");
   return tempRoot;
-}
-
-function addCustomTemplates(root: string): void {
-  for (const dir of ["steps", "pipelines", "providers"]) {
-    mkdirSync(join(root, "workflows/custom", dir), { recursive: true });
-    writeFileSync(join(root, "workflows/custom", dir, ".gitkeep"), "");
-  }
-  writeFileSync(join(root, "workflows/custom/README.md"), "custom-readme\n");
 }
 
 interface FakePull {
@@ -159,6 +150,13 @@ function makeGithubFetch(opts?: {
       branches[branch].aheadBy = 1;
       return response(200, { content: { path: remotePath } });
     }
+    if (contentsMatch && method === "DELETE") {
+      const remotePath = decodeURIComponent(contentsMatch[1]);
+      const branch = body.branch;
+      delete branches[branch].files[remotePath];
+      branches[branch].aheadBy = 1;
+      return response(200, { commit: { sha: "del-sha" } });
+    }
 
     if (path === "/repos/acme/app/pulls" && method === "GET") {
       return response(200, pulls);
@@ -205,7 +203,6 @@ describe("syncWorkflowTemplates", () => {
     expect(result.prUrl).toBe("https://github.com/acme/app/pull/123");
     expect(result.changedFiles).toEqual([
       ".github/workflows/claude-implement.yml",
-      ".github/workflows/comment-trigger.yml",
       ".github/workflows/claude-plan.yml",
       "WORKFLOW.md",
       "PLANNING.md",
@@ -237,7 +234,6 @@ describe("syncWorkflowTemplates", () => {
 
     expect(result.changedFiles).toEqual([
       ".github/workflows/claude-implement.yml",
-      ".github/workflows/comment-trigger.yml",
       ".github/workflows/claude-plan.yml",
     ]);
     expect(fake.branches["sync/ai-implement"].files["WORKFLOW.md"]).toBe("custom workflow\n");
@@ -248,7 +244,6 @@ describe("syncWorkflowTemplates", () => {
     const templatesRoot = makeTemplatesRoot();
     const syncedFiles = {
       ".github/workflows/claude-implement.yml": "implement-yml\n",
-      ".github/workflows/comment-trigger.yml": "comment-yml\n",
       ".github/workflows/claude-plan.yml": "plan-yml\n",
       "WORKFLOW.md": "workflow-md\n",
       "PLANNING.md": "planning-md\n",
@@ -306,7 +301,6 @@ describe("syncWorkflowTemplates", () => {
     const templatesRoot = makeTemplatesRoot();
     const syncedFiles = {
       ".github/workflows/claude-implement.yml": "implement-yml\n",
-      ".github/workflows/comment-trigger.yml": "comment-yml\n",
       ".github/workflows/claude-plan.yml": "plan-yml\n",
       "WORKFLOW.md": "workflow-md\n",
       "PLANNING.md": "planning-md\n",
@@ -489,36 +483,78 @@ describe("syncWorkflowTemplates", () => {
     expect(result.syncBranch).toBe("sync/ai-implement");
   });
 
-  it("seeds the custom/ scaffold (README + .gitkeep placeholders) on a fresh repo", async () => {
+  it("REMOVE_FILES: removes comment-trigger.yml when present on sync branch", async () => {
     const templatesRoot = makeTemplatesRoot();
-    addCustomTemplates(templatesRoot);
-    const fake = makeGithubFetch();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      ".github/workflows/comment-trigger.yml": "old-comment-trigger\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
 
     const result = await syncWorkflowTemplates({
-      mapping, githubAppId: "app-id", githubAppPrivateKey: "private-key",
-      templatesRoot, fetchImpl: fake.fetchImpl, getInstallationTokenImpl: async () => "token",
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
     });
 
-    expect(result.changedFiles).toContain("custom/README.md");
-    expect(result.changedFiles).toContain("custom/steps/.gitkeep");
-    expect(result.changedFiles).toContain("custom/pipelines/.gitkeep");
-    expect(result.changedFiles).toContain("custom/providers/.gitkeep");
-    expect(fake.branches["sync/ai-implement"].files["custom/README.md"]).toBe("custom-readme\n");
+    expect(result.changedFiles).toContain(".github/workflows/comment-trigger.yml");
+    expect(fake.branches["sync/ai-implement"].files[".github/workflows/comment-trigger.yml"]).toBeUndefined();
+    expect(fake.calls.some((call) => call.method === "DELETE" && call.path.includes("comment-trigger.yml"))).toBe(true);
   });
 
-  it("does not overwrite custom/README.md when it already exists on base", async () => {
+  it("REMOVE_FILES: no-ops when comment-trigger.yml is absent from sync branch", async () => {
     const templatesRoot = makeTemplatesRoot();
-    addCustomTemplates(templatesRoot);
-    const fake = makeGithubFetch({ mainFiles: { "custom/README.md": "repo-owned\n" } });
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
 
     const result = await syncWorkflowTemplates({
-      mapping, githubAppId: "app-id", githubAppPrivateKey: "private-key",
-      templatesRoot, fetchImpl: fake.fetchImpl, getInstallationTokenImpl: async () => "token",
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
     });
 
-    expect(result.changedFiles).not.toContain("custom/README.md");
-    expect(fake.branches["sync/ai-implement"].files["custom/README.md"]).toBe("repo-owned\n");
+    expect(result.changedFiles).not.toContain(".github/workflows/comment-trigger.yml");
+    expect(fake.calls.every((call) => call.method !== "DELETE")).toBe(true);
   });
+
+  it("REMOVE_FILES: removed file is the sole entry in changedFiles, triggering PR creation", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      ".github/workflows/comment-trigger.yml": "old-comment-trigger\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.status).toBe("pr-opened");
+    expect(result.changedFiles).toEqual([".github/workflows/comment-trigger.yml"]);
+  });
+
 });
 
 describe("classifySyncError", () => {

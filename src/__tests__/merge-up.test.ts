@@ -24,6 +24,8 @@ function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     sessionMode: "autonomous", machineCpus: 2, machineMemoryMb: 4096, planningEnabled: false,
     planningWorkflowFile: "", autoApprovePlans: true, extraEnv: {}, provider: "anthropic",
     ticketingProvider: "linear", ticketingConfig: { kind: "linear" }, awsRegion: null, paused: false,
+    autoMerge: false, maxTurns: null, maxIterations: null, maxJobMinutes: null,
+    branchPrefix: null, skillsRepo: null,
     ...overrides,
   };
 }
@@ -102,9 +104,42 @@ describe("runMergeUps", () => {
       deps(() => mapping()),
     );
     const arg = vi.mocked(createPullRequest).mock.calls[0][3];
-    expect(arg.body).toContain("Grouped issues:");
-    expect(arg.body).toContain("- OOL-87");
-    expect(arg.body).toContain("- OOL-88");
+    expect(arg.body).toMatch(/^Grouped issues: OOL-87, OOL-88$/m);
+    expect(arg.body).not.toContain("- OOL-87");
+    expect(arg.body).not.toContain("- OOL-88");
+  });
+
+  it("does not emit a Grouped issues line when there are no children", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps(
+      [rollUp({ identifier: "OOL-106", parent: null, childIdentifiers: [] })],
+      deps(() => mapping()),
+    );
+    const arg = vi.mocked(createPullRequest).mock.calls[0][3];
+    expect(arg.body).not.toContain("Grouped issues");
+  });
+
+  it("lists grouped issues in multi-issue mode", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps(
+      [rollUp({ identifier: "PROJ-5", parent: null, mode: "multi-issue", childIdentifiers: ["PROJ-10", "PROJ-11", "PROJ-12"] })],
+      deps(() => mapping()),
+    );
+    const arg = vi.mocked(createPullRequest).mock.calls[0][3];
+    expect(arg.body).toMatch(/^Grouped issues: PROJ-10, PROJ-11, PROJ-12$/m);
+  });
+
+  it("lists a single grouped child without trailing comma", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    await runMergeUps(
+      [rollUp({ identifier: "OOL-106", parent: null, childIdentifiers: ["SOLO-1"] })],
+      deps(() => mapping()),
+    );
+    const arg = vi.mocked(createPullRequest).mock.calls[0][3];
+    expect(arg.body).toMatch(/^Grouped issues: SOLO-1$/m);
   });
 
   it("leaves an open top-level PR untouched (awaiting human merge)", async () => {

@@ -6,6 +6,11 @@ import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { enqueueReviewFix } from "./review-fix-queue.js";
 import { AI_IMPLEMENT_NATIVE_REVIEW_MARKER, extractClaudeSummaryFindings } from "./pipeline/review-ledger.js";
 import { upsertReviewFinding } from "./review-ledger-store.js";
+import { getMappings } from "./config.js";
+import { getInstallationToken } from "./github-app-auth.js";
+import { resolveWorkflowContract } from "./workflow-probe.js";
+import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
+import { addCommentReaction } from "./github.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -86,6 +91,7 @@ interface ReviewCommentPayload {
 interface IssueCommentPayload {
   action?: string;
   comment?: {
+    id?: number;
     body?: string;
     html_url?: string;
     user?: { login?: string };
@@ -145,6 +151,8 @@ export async function handleGitHubWebhook(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   webhookSecret: string,
+  appId?: string,
+  privateKey?: string,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -177,7 +185,7 @@ export async function handleGitHubWebhook(
   }
 
   if (event === "issue_comment") {
-    handleIssueCommentWebhook(payload as IssueCommentPayload, res);
+    await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey);
     return;
   }
 
@@ -378,7 +386,48 @@ function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.Ser
   res.end(JSON.stringify({ acknowledged: true, reason: "awaiting_gap_analysis_result" }));
 }
 
-function handleIssueCommentWebhook(payload: IssueCommentPayload, res: http.ServerResponse): void {
+const AI_IMPLEMENT_COMMENT_RE = /^\/ai-implement(?:\s+([\s\S]*))?$/;
+
+async function checkCollaboratorWritePermission(
+  token: string,
+  owner: string,
+  repo: string,
+  username: string,
+): Promise<boolean> {
+  if (!username) return false;
+  let res: Response;
+  try {
+    res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}/permission`,
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "linear-dispatch-worker",
+          Authorization: `Bearer ${token}`,
+        },
+      },
+    );
+  } catch {
+    return false;
+  }
+  if (res.status !== 200) return false;
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    return false;
+  }
+  const perm = (data as { permission?: string }).permission;
+  return perm === "write" || perm === "maintain" || perm === "admin";
+}
+
+async function handleIssueCommentWebhook(
+  payload: IssueCommentPayload,
+  res: http.ServerResponse,
+  appId?: string,
+  privateKey?: string,
+): Promise<void> {
   if (payload.action !== "created") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
@@ -387,6 +436,85 @@ function handleIssueCommentWebhook(payload: IssueCommentPayload, res: http.Serve
   if (!payload.issue?.pull_request) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  // /ai-implement trigger — handled before trusted-author check
+  const rawBody = payload.comment?.body?.trim() ?? "";
+  const aiImplMatch = AI_IMPLEMENT_COMMENT_RE.exec(rawBody);
+  if (aiImplMatch !== null) {
+    const instruction = (aiImplMatch[1] ?? "").trim();
+    const repoFullName = payload.repository?.full_name ?? "";
+    const slashIdx = repoFullName.indexOf("/");
+    const owner = slashIdx >= 0 ? repoFullName.slice(0, slashIdx) : "";
+    const repo = slashIdx >= 0 ? repoFullName.slice(slashIdx + 1) : "";
+
+    if (!owner || !repo) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "no_mapping" }));
+      return;
+    }
+
+    const mapping = Object.values(getMappings()).find((m) => m.owner === owner && m.repo === repo) ?? null;
+    if (!mapping) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "no_mapping" }));
+      return;
+    }
+
+    if (!appId || !privateKey) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "no_app_credentials" }));
+      return;
+    }
+
+    let token: string;
+    try {
+      token = await getInstallationToken(appId, privateKey, owner);
+    } catch (err) {
+      console.error(`[webhook] /ai-implement: failed to get installation token for ${owner}:`, err);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "token_error" }));
+      return;
+    }
+
+    const contract = await resolveWorkflowContract({
+      owner,
+      repo,
+      workflowFile: mapping.workflowFile,
+      token,
+    }).catch(() => "legacy" as const);
+
+    if (contract !== "envelope") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "legacy_repo" }));
+      return;
+    }
+
+    const commenter = payload.comment?.user?.login ?? "";
+    const hasWriteAccess = await checkCollaboratorWritePermission(token, owner, repo, commenter);
+    if (!hasWriteAccess) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "insufficient_permission" }));
+      return;
+    }
+
+    const commentId = payload.comment?.id;
+    const prNumber = payload.issue?.number;
+    if (!commentId || !prNumber) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "missing_issue_comment_fields" }));
+      return;
+    }
+
+    enqueueCommentGapfill({ owner, repo, prNumber, commentId, commenter, instruction });
+
+    addCommentReaction(token, owner, repo, commentId, "eyes").catch((err) => {
+      console.warn(`[webhook] /ai-implement: failed to add 👀 reaction to comment ${commentId}:`, err);
+    });
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ queued: true }));
     return;
   }
 

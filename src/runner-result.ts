@@ -46,9 +46,15 @@ export async function postRunnerResult(params: {
   failureReason?: string;
   /** Machine-readable code set when a known guardrail trips (e.g. "SENSITIVE_FILES_BLOCKED"). */
   failureCode?: string;
+  /**
+   * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
+   * Falls back to the legacy RUNNER_CALLBACK_URL env var (never set in GHA envelope mode,
+   * where the URL travels inside AI_IMPLEMENT_RUN_CONFIG instead).
+   */
+  callbackUrl?: string | null;
   fetchImpl?: typeof fetch;
 }): Promise<void> {
-  const callbackUrl = process.env.RUNNER_CALLBACK_URL;
+  const callbackUrl = params.callbackUrl ?? process.env.RUNNER_CALLBACK_URL;
   const runToken = process.env.RUN_TOKEN;
   if (!callbackUrl || !runToken) return;
   if (params.phase === "implementation" && params.outcome === "success" && !params.prUrl) {

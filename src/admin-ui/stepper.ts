@@ -115,6 +115,16 @@ export const stepperHtml = `
             <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Additional sensitive patterns <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
+            <textarea class="input mono" id="np-sensitive-add" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
+            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
+          </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Allowed exceptions <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
+            <textarea class="input mono" id="np-sensitive-allow" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
+            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
+          </div>
         </div>
       </div>
 
@@ -190,6 +200,10 @@ export const stepperHtml = `
             <input type="checkbox" id="np-autoApprove" checked style="width:auto">
             Auto-approve plans — skip the manual approval step and proceed to implementation automatically.
           </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer">
+            <input type="checkbox" id="np-autoMerge" style="width:auto">
+            Auto-merge child PRs — automatically merge child PRs into their grouping branch once checks pass.
+          </label>
         </div>
       </div>
 
@@ -253,6 +267,14 @@ export const stepperHtml = `
             <div data-review="skillsRepo" class="mono"></div>
           </div>
           <div class="np-review-row">
+            <div class="np-review-label">Sensitive add patterns</div>
+            <div data-review="sensitiveAddPatterns"></div>
+          </div>
+          <div class="np-review-row">
+            <div class="np-review-label">Allowed exceptions</div>
+            <div data-review="sensitiveAllowPatterns"></div>
+          </div>
+          <div class="np-review-row">
             <div class="np-review-label">Runner</div>
             <div data-review="runner"></div>
           </div>
@@ -306,10 +328,10 @@ export const stepperScript = `
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
     jiraProfilesFieldOverride: '',
-    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '',
+    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
-    planningEnabled: true, autoApprovePlans: true,
+    planningEnabled: true, autoApprovePlans: true, autoMerge: false,
     maxInProgressAiIssues: 3,
     secrets: [],
   };
@@ -329,6 +351,8 @@ export const stepperScript = `
     data.repo = '';
     data.defaultBranch = '';
     data.skillsRepo = '';
+    data.sensitiveAddPatterns = '';
+    data.sensitiveAllowPatterns = '';
     data.executionMode = 'github-actions';
     data.machineCpus = 2;
     data.machineMemoryMb = 4096;
@@ -337,11 +361,12 @@ export const stepperScript = `
     data.awsRegion = '';
     data.planningEnabled = true;
     data.autoApprovePlans = true;
+    data.autoMerge = false;
     data.maxInProgressAiIssues = 3;
     data.secrets = [];
 
     // Clear inputs
-    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-skills-repo', 'np-awsRegion'];
+    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-skills-repo', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion'];
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
@@ -358,6 +383,8 @@ export const stepperScript = `
     if (planningEl) planningEl.checked = true;
     const autoApproveEl = document.getElementById('np-autoApprove');
     if (autoApproveEl) autoApproveEl.checked = true;
+    const amEl = document.getElementById('np-autoMerge');
+    if (amEl) amEl.checked = false;
 
     // Reset runner cards
     for (const card of document.querySelectorAll('[data-runner]')) {
@@ -608,10 +635,14 @@ export const stepperScript = `
       const reEl = document.getElementById('np-repo');
       const brEl = document.getElementById('np-defaultBranch');
       const srEl = document.getElementById('np-skills-repo');
+      const saEl = document.getElementById('np-sensitive-add');
+      const salEl = document.getElementById('np-sensitive-allow');
       if (owEl) data.owner = owEl.value.trim();
       if (reEl) data.repo = reEl.value.trim();
       if (brEl) data.defaultBranch = brEl.value.trim();
       if (srEl) data.skillsRepo = srEl.value.trim();
+      if (saEl) data.sensitiveAddPatterns = saEl.value.trim();
+      if (salEl) data.sensitiveAllowPatterns = salEl.value.trim();
     } else if (n === 3) {
       const smEl = document.getElementById('np-sessionMode');
       const cpEl = document.getElementById('np-cpus');
@@ -623,9 +654,11 @@ export const stepperScript = `
       const arEl = document.getElementById('np-awsRegion');
       const plEl = document.getElementById('np-planning');
       const aaEl = document.getElementById('np-autoApprove');
+      const amEl = document.getElementById('np-autoMerge');
       if (arEl) data.awsRegion = arEl.value.trim();
       if (plEl) data.planningEnabled = plEl.checked;
       if (aaEl) data.autoApprovePlans = aaEl.checked;
+      if (amEl) data.autoMerge = amEl.checked;
     } else if (n === 5) {
       const maxEl = document.getElementById('np-maxAi');
       if (maxEl) data.maxInProgressAiIssues = parseInt(maxEl.value, 10);
@@ -723,6 +756,8 @@ export const stepperScript = `
     set('repo', window.esc(data.owner) + '/' + window.esc(data.repo));
     set('defaultBranch', window.esc(data.defaultBranch) || '&mdash;');
     set('skillsRepo', data.skillsRepo ? window.esc(data.skillsRepo) : '&mdash;');
+    set('sensitiveAddPatterns', data.sensitiveAddPatterns ? (data.sensitiveAddPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' pattern(s)') : '&mdash;');
+    set('sensitiveAllowPatterns', data.sensitiveAllowPatterns ? (data.sensitiveAllowPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' exception(s)') : '&mdash;');
 
     let runnerText = window.esc(data.executionMode);
     if (data.executionMode === 'fly-machines') {
@@ -1046,11 +1081,14 @@ export const stepperScript = `
       machineMemoryMb: data.machineMemoryMb,
       planningEnabled: data.planningEnabled,
       autoApprovePlans: data.autoApprovePlans,
+      autoMerge: data.autoMerge ?? false,
       planningWorkflowFile: 'claude-plan.yml',
       extraEnv: {},
       provider: data.provider,
       awsRegion: data.provider === 'bedrock' ? (data.awsRegion || null) : null,
       skillsRepo: data.skillsRepo || null,
+      sensitiveAddPatterns: data.sensitiveAddPatterns || null,
+      sensitiveAllowPatterns: data.sensitiveAllowPatterns || null,
       ticketingProvider: data.ticketingProvider,
       ticketingConfig: data.ticketingProvider === 'jira'
         ? {

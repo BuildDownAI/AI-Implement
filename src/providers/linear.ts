@@ -9,6 +9,7 @@ import type {
 } from "./types.js";
 import { MissingProviderConfigError } from "./types.js";
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
+import { isLinearAuthConfigured, withLinearToken } from "../linear-app-auth.js";
 import { parseIssueConfig } from "../issue-config.js";
 
 interface GraphQLResponse<T> {
@@ -58,7 +59,6 @@ function labeledAncestorChain(parent: AncestorNode): FeatureBranchChainEntry[] {
 export class LinearProvider implements TicketingProvider {
   readonly id = "linear";
   private static readonly MOVABLE_STATE_TYPES = new Set(["triage", "backlog", "unstarted"]);
-  private readonly apiKey: string;
   private readonly workspaceUrl: string;
 
   // Caches keyed by team key (the scopeKey passed through the interface).
@@ -71,10 +71,9 @@ export class LinearProvider implements TicketingProvider {
   private completedStateByTeamKey = new Map<string, string>();
 
   constructor(config: ProviderConfig) {
-    if (!config.linearApiKey) {
-      throw new MissingProviderConfigError("linear", "linearApiKey");
+    if (!isLinearAuthConfigured()) {
+      throw new MissingProviderConfigError("linear", "linearClientId/linearClientSecret");
     }
-    this.apiKey = config.linearApiKey;
     this.workspaceUrl = config.linearWorkspaceUrl ?? "https://linear.app";
   }
 
@@ -112,21 +111,23 @@ export class LinearProvider implements TicketingProvider {
   }
 
   async fetchPlanningContext(issueId: string): Promise<string> {
-    return fetchLinearPlanningContext({ issueId, linearApiKey: this.apiKey });
+    return fetchLinearPlanningContext({ issueId });
   }
 
   private async linearMutation<T>(
     query: string,
     variables: Record<string, unknown>,
   ): Promise<T> {
-    const res = await fetch("https://api.linear.app/graphql", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: this.apiKey,
-      },
-      body: JSON.stringify({ query, variables }),
-    });
+    const res = await withLinearToken((token) =>
+      fetch("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ query, variables }),
+      }),
+    );
 
     if (!res.ok) {
       const body = await res.text();
@@ -267,6 +268,7 @@ export class LinearProvider implements TicketingProvider {
     const inProgressCountsByScope: Record<string, number> = {};
     const needsPlanning: AIImplementSnapshot["needsPlanning"] = [];
     const readyForImplementation: AIImplementSnapshot["readyForImplementation"] = [];
+    const parentsToFinalize: AIImplementSnapshot["parentsToFinalize"] = [];
 
     for (const issue of allNodes) {
       const labelNames = new Set(issue.labels?.nodes?.map((l) => l.name) ?? []);
@@ -323,7 +325,13 @@ export class LinearProvider implements TicketingProvider {
           console.log(`[linear] Skipping ${issue.identifier}: ${mode} grouping parent waiting on in-flight AI-Implement children`);
           continue;
         }
-        // All AI-Implement children done — implement the parent's closing work onto its own branch.
+        // All AI-Implement children done. If the spec is empty, finalize instead of dispatching.
+        const isBlankSpec = !parsed.description || parsed.description.trim() === "";
+        if (isBlankSpec) {
+          console.log(`[linear] Finalizing empty grouping parent ${issue.identifier} (no own work)`);
+          parentsToFinalize.push({ issueId: issue.id, identifier: issue.identifier, scopeKey: issue.team.key });
+          continue;
+        }
         featureBranchChain = [...ancestorChain, { identifier: issue.identifier, mode }];
       } else {
         console.log(`[linear] Skipping ${issue.identifier}: parent labeled but no child has AI-Implement set yet`);
@@ -348,7 +356,7 @@ export class LinearProvider implements TicketingProvider {
       }
     }
 
-    return { needsPlanning, readyForImplementation, inProgressCountsByScope };
+    return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize };
   }
 
   async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {

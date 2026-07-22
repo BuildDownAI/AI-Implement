@@ -10,6 +10,7 @@ import {
   DEFAULT_PLANNING_ENABLED,
   DEFAULT_PLANNING_WORKFLOW_FILE,
   DEFAULT_AUTO_APPROVE_PLANS,
+  DEFAULT_AUTO_MERGE,
   DEFAULT_PROVIDER,
   upsertMapping,
   updateMappingCap,
@@ -42,6 +43,7 @@ import { validateTicketingConfig, type TicketingMappingConfig } from "./provider
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
+import picomatch from "picomatch";
 
 const SKILLS_REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 // NOTE: skillsRepo is syntax- and host-validated only — it is NOT sanitised. Any code that
@@ -72,6 +74,41 @@ function normalizeSkillsRepo(raw: unknown): string | null {
   }
   if (host !== "github.com") throw new Error("skillsRepo must be 'owner/repo' shorthand or an https://github.com/... URL (the runner clones with a GitHub token, so other hosts and SSH git@ URLs are not supported)");
   return v;
+}
+
+function normalizeSensitiveGlobs(raw: unknown): string[] | null {
+  if (raw == null) return null;
+  if (typeof raw !== "string" && !Array.isArray(raw)) {
+    throw new Error("must be a string or an array of strings");
+  }
+  const items = Array.isArray(raw) ? raw : raw.split("\n");
+  for (const item of items) {
+    if (typeof item !== "string") {
+      throw new Error("must be a string or an array of strings");
+    }
+  }
+  const globs = (items as string[]).map((g) => g.trim()).filter((g) => g.length > 0);
+  if (globs.length === 0) return null;
+  if (globs.length > 100) {
+    throw new Error(`too many globs (${globs.length}); maximum is 100 per list`);
+  }
+  for (const glob of globs) {
+    // Reject globs made up entirely of wildcards, path separators, and dots
+    // ("**", "**/*", "*", ".*", ...): they match everything and would disable
+    // the guardrail. Every glob must carry at least one literal path character.
+    if (glob.replace(/[*/.\s]/g, "").length === 0) {
+      throw new Error(`glob "${glob}" is not allowed (matches everything, which would disable the guardrail); each glob must contain a literal path character`);
+    }
+    if (glob.length > 256) {
+      throw new Error(`glob too long (${glob.length} chars): "${glob.slice(0, 30)}..."; maximum is 256 characters`);
+    }
+    try {
+      picomatch.makeRe(glob, { dot: true, debug: true });
+    } catch (err) {
+      throw new Error(`invalid glob "${glob}": ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return globs;
 }
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -162,7 +199,6 @@ export interface AdminConfig {
   flySessionsToken: string | null;
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
-  linearApiKey: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
 }
@@ -398,7 +434,7 @@ export function handleAdminRequest(
 
     if (url === "/api/admin/config-status" && method === "GET") {
       json(res, 200, {
-        linear: !!process.env.LINEAR_API_KEY,
+        linear: !!(process.env.LINEAR_CLIENT_ID && process.env.LINEAR_CLIENT_SECRET),
         jira: !!(
           process.env.JIRA_TOKEN &&
           process.env.JIRA_SITE_URL &&
@@ -439,7 +475,7 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
   if (providers.length === 0) {
-    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {} };
+    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
   }
   const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
   return {
@@ -451,6 +487,7 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
       }
       return acc;
     }, {}),
+    parentsToFinalize: snapshots.flatMap((s) => s.parentsToFinalize),
   };
 }
 
@@ -1017,6 +1054,7 @@ async function handleUpsertMapping(
       planningEnabled?: boolean;
       planningWorkflowFile?: string;
       autoApprovePlans?: boolean;
+      autoMerge?: boolean;
       extraEnv?: Record<string, string>;
       provider?: string;
       awsRegion?: string | null;
@@ -1028,6 +1066,8 @@ async function handleUpsertMapping(
       maxJobMinutes?: number | null;
       branchPrefix?: string | null;
       skillsRepo?: string | null;
+      sensitiveAddPatterns?: string | string[] | null;
+      sensitiveAllowPatterns?: string | string[] | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1080,6 +1120,7 @@ async function handleUpsertMapping(
     const planningEnabled = body.planningEnabled ?? DEFAULT_PLANNING_ENABLED;
     const planningWorkflowFile = body.planningWorkflowFile ?? DEFAULT_PLANNING_WORKFLOW_FILE;
     const autoApprovePlans = body.autoApprovePlans ?? DEFAULT_AUTO_APPROVE_PLANS;
+    const autoMerge = body.autoMerge ?? DEFAULT_AUTO_MERGE;
 
     if (planningEnabled && !planningWorkflowFile) {
       json(res, 400, { error: "planningWorkflowFile is required when planningEnabled is true" });
@@ -1166,6 +1207,22 @@ async function handleUpsertMapping(
       return;
     }
 
+    let sensitiveAddPatterns: string[] | null;
+    try {
+      sensitiveAddPatterns = normalizeSensitiveGlobs(body.sensitiveAddPatterns);
+    } catch (err) {
+      json(res, 400, { error: `sensitiveAddPatterns invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    let sensitiveAllowPatterns: string[] | null;
+    try {
+      sensitiveAllowPatterns = normalizeSensitiveGlobs(body.sensitiveAllowPatterns);
+    } catch (err) {
+      json(res, 400, { error: `sensitiveAllowPatterns invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -1179,6 +1236,7 @@ async function handleUpsertMapping(
       planningEnabled,
       planningWorkflowFile,
       autoApprovePlans,
+      autoMerge,
       extraEnv,
       provider,
       ticketingProvider: ticketing.ticketingProvider,
@@ -1194,6 +1252,8 @@ async function handleUpsertMapping(
       maxJobMinutes,
       branchPrefix,
       skillsRepo,
+      sensitiveAddPatterns,
+      sensitiveAllowPatterns,
     };
 
     upsertMapping(body.teamKey, mapping);
