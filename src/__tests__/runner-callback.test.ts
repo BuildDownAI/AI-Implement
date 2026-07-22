@@ -836,6 +836,71 @@ describe("handleRunnerResult — SENSITIVE_FILES_BLOCKED failure code", () => {
   });
 });
 
+describe("unapproved-run failure codes", () => {
+  it("formatFailureComment renders REVIEW_UNAPPROVED with the draft PR link", () => {
+    const comment = formatFailureComment(
+      "REVIEW_UNAPPROVED",
+      "Automated review did not approve (iterations_exhausted after 3 iteration(s)). Missing tests.",
+      "https://github.com/o/r/pull/9",
+    );
+    expect(comment).toContain("without review approval");
+    expect(comment).toContain("https://github.com/o/r/pull/9");
+    expect(comment).toContain("Missing tests.");
+    expect(comment).toContain("**Next step:**");
+  });
+
+  it("formatFailureComment renders MAX_TURNS_EXHAUSTED distinctly", () => {
+    const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap", undefined);
+    expect(comment).toContain("turn cap");
+    expect(comment).toContain("No PR could be opened");
+  });
+
+  it("unknown failureCode still falls through to the generic summary", () => {
+    expect(formatFailureComment("SOMETHING_NEW", "boom", undefined)).toContain("boom");
+  });
+
+  it("records the draft PR url on the job for an implementation failure", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "nope",
+        prUrl: "https://github.com/o/r/pull/9",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.prUrl).toBe("https://github.com/o/r/pull/9");
+    const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
+    expect(call).toBeDefined();
+    const [, , comment] = call!.args as [string, string, string];
+    expect(comment).toContain("https://github.com/o/r/pull/9");
+  });
+});
+
 describe("handleRunnerResult — token replay", () => {
   it("returns 409 on already_consumed token", async () => {
     const { token } = runnerTokens.mintRunToken({

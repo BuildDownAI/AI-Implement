@@ -149,19 +149,43 @@ function applyWiring(step: YamlStep): StepDefinition {
       };
 
     case "push":
+      // Push always runs after the feedback loop on an initial run: unapproved work ships
+      // as a draft PR (with the reviewer feedback in the body) instead of being silently
+      // discarded. Gap-fill runs are different: Claude commits and pushes to the *existing*
+      // PR branch itself (the pipeline never owns git there — see run-autonomous.ts's
+      // gap-fill prompt). If the feedback loop doesn't approve a gap-fill, the tree Claude
+      // left behind is already clean/unchanged, so running push here would just throw
+      // "Nothing to commit" and turn a handled outcome into a generic red failure. Skip push
+      // in that one case; run-autonomous.ts's outcome derivation already produces a proper
+      // failure callback (code, no prUrl, autopsy) when push never ran.
       return {
         ...step,
-        inputs: (ctx: PipelineContext) => ({
-          workspaceDir: ctx.getOutputs("clone").workspaceDir,
-          repoOwner: ctx.getOutputs("clone").repoOwner,
-          repoRepo: ctx.getOutputs("clone").repoRepo,
-          githubToken: ctx.getOutputs("clone").githubToken,
-          branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
-          baseBranch: ctx.getOutputs("clone").branch,
-          prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
-          sensitiveFiles: ctx.data.sensitiveFiles,
-        }),
-        skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
+        skip: (ctx: PipelineContext) =>
+          Boolean(ctx.data.prNumber) && ctx.getOutputs("feedback-loop").approved !== true,
+        inputs: (ctx: PipelineContext) => {
+          const fb = ctx.getOutputs("feedback-loop");
+          const approved = fb.approved === true;
+          return {
+            workspaceDir: ctx.getOutputs("clone").workspaceDir,
+            repoOwner: ctx.getOutputs("clone").repoOwner,
+            repoRepo: ctx.getOutputs("clone").repoRepo,
+            githubToken: ctx.getOutputs("clone").githubToken,
+            branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
+            baseBranch: ctx.getOutputs("clone").branch,
+            prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
+            sensitiveFiles: ctx.data.sensitiveFiles,
+            draft: !approved,
+            reviewSummary: approved
+              ? undefined
+              : {
+                  terminationReason: typeof fb.terminationReason === "string" ? fb.terminationReason : "unknown",
+                  iterations: typeof fb.iterations === "number" ? fb.iterations : 0,
+                  finalFeedback: typeof fb.finalFeedback === "string" ? fb.finalFeedback : "",
+                  passes: Array.isArray(fb.passes) ? fb.passes : [],
+                  ...(typeof fb.postMortem === "string" ? { postMortem: fb.postMortem } : {}),
+                },
+          };
+        },
       };
 
     case "verify":
@@ -186,6 +210,9 @@ function applyWiring(step: YamlStep): StepDefinition {
           reviewProviders: ctx.getOutputs("install").reviewProviders,
         }),
         skip: (ctx: PipelineContext) => {
+          // Never run further review/force-push cycles against an unapproved
+          // draft — the review budget is already exhausted.
+          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
           const pushOutputs = ctx.getOutputs("push");
           return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
         },

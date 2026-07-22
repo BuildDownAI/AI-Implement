@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
 
 export interface WorkUnit {
@@ -23,6 +23,7 @@ interface ImplementOutputs extends Record<string, unknown> {
   tokensUsed: number;
   exitCode: number;
   subagentCount: number;
+  telemetry?: RunTelemetry;
 }
 
 const PARALLEL_IMPL_INSTRUCTIONS = `
@@ -70,7 +71,10 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       maxTurns,
     });
 
-    if (result.exitCode !== 0) {
+    // A max_turns termination is a completed-but-capped pass, not an invocation
+    // failure: the feedback loop needs the partial work + telemetry to run its
+    // post-mortem and open a draft PR, so don't discard it by throwing.
+    if (result.exitCode !== 0 && result.telemetry?.outcome !== "max_turns") {
       throw new Error(`LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
     }
 
@@ -82,6 +86,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       // is triggered, subagents run inside the single Claude session and are not reported
       // separately. This always returns 0 until the CLI exposes subagent metrics.
       subagentCount: 0,
+      telemetry: result.telemetry,
     };
   },
 };

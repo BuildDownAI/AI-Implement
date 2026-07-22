@@ -681,3 +681,133 @@ describe("pushStep", () => {
     }
   });
 });
+
+const REVIEW_SUMMARY = {
+  terminationReason: "iterations_exhausted",
+  iterations: 3,
+  finalFeedback: "Missing tests for the retry path.",
+  passes: [
+    { iteration: 1, implementTurns: 98, implementOutcome: "success", costUsd: 3.21, reviewApproved: false },
+  ],
+  postMortem: "## Post-mortem\nScope too broad.",
+};
+
+describe("pushStep draft PRs", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("creates a draft PR with an unapproved section in the body", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(true);
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+    expect(body.draft).toBe(true);
+    expect(body.body).toContain("Automated review did not approve");
+    expect(body.body).toContain("Missing tests for the retry path.");
+    expect(body.body).toContain("iterations_exhausted");
+    expect(body.body).toContain("Post-mortem");
+    // The test-plan line must not contradict the unapproved section above it: no
+    // testsSummary/preflight summary was supplied, so the fallback must say
+    // verification was skipped (unchecked box), not that it ran (checked box).
+    expect(body.body).toContain("- [ ] Automated verification was skipped — the review loop did not approve this change.");
+    expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  });
+
+  it("falls back to a titled normal PR when the draft flag is rejected (422, no existing PR)", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      // draft create → 422
+      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "draft not supported" } as Response)
+      // list open PRs → none
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [], text: async () => "" } as Response)
+      // retry without draft → created
+      .mockResolvedValueOnce({
+        ok: true, status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/10", number: 10 }),
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, prTitle: "ENG-42: Test", draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(false);
+    expect(outputs.prNumber).toBe(10);
+    const [, retryInit] = vi.mocked(fetch).mock.calls[2];
+    const retryBody = JSON.parse(String(retryInit?.body));
+    expect(retryBody.draft).toBeUndefined();
+    expect(retryBody.title).toBe("[NEEDS REVIEW — unapproved] ENG-42: Test");
+  });
+
+  it("still resolves an already-open PR on 422 when drafting", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "exists" } as Response)
+      .mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: true }],
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prNumber).toBe(8);
+    expect(outputs.draft).toBe(true);
+  });
+
+  it("reports draft=false when the 422-resolved existing PR is not a draft", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "exists" } as Response)
+      .mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: false }],
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(false);
+  });
+
+  it("non-draft pushes send no draft flag and no unapproved section", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.draft).toBe(false);
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+    expect(body.draft).toBeUndefined();
+    expect(body.body).not.toContain("Automated review did not approve");
+  });
+});

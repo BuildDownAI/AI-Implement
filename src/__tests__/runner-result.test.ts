@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { fetchPlanningContextFromOrchestrator } from "../runner-result.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "../runner-result.js";
 
 describe("fetchPlanningContextFromOrchestrator", () => {
   it("GETs /runner/planning-context with the progress token and returns the context", async () => {
@@ -42,5 +42,32 @@ describe("fetchPlanningContextFromOrchestrator", () => {
       fetchImpl,
     });
     expect(ctx).toBe("");
+  });
+});
+
+describe("postRunnerResult", () => {
+  beforeEach(() => {
+    vi.stubEnv("RUN_TOKEN", "run-token");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  // Task 4: the runner now always reports an outcome — the caller (run-autonomous.ts)
+  // is solely responsible for deciding success vs. coded failure. postRunnerResult
+  // itself must never silently skip the callback on this shape of input anymore.
+  it("sends the callback even when an implementation success has no prUrl", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 });

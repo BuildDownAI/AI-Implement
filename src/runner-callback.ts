@@ -56,16 +56,41 @@ function bad(status: number, error: string): HandleRunnerResultOutput {
  * When the runner reports a known `failureCode`, makes use of the helper's structured description so the ticket reader has actionable context.
  * Passes along the raw `failureReason` string for all other failures.
  */
-export function formatFailureComment(failureCode: string | undefined, failureReason: string | undefined): string {
-  const c: Classification =
-    failureCode === "SENSITIVE_FILES_BLOCKED"
-      ? {
-          summary: "🔒 Blocked by security guardrail.",
-          detail: failureReason ?? "Sensitive files detected in staged changes.",
-          remediation: "Remove or .gitignore the flagged files, then re-run.",
-          docsUrl: TROUBLESHOOTING_URL,
-        }
-      : { summary: failureReason ?? "Unspecified failure." };
+export function formatFailureComment(
+  failureCode: string | undefined,
+  failureReason: string | undefined,
+  prUrl?: string,
+): string {
+  let c: Classification;
+  if (failureCode === "SENSITIVE_FILES_BLOCKED") {
+    c = {
+      summary: "🔒 Blocked by security guardrail.",
+      detail: failureReason ?? "Sensitive files detected in staged changes.",
+      remediation: "Remove or .gitignore the flagged files, then re-run.",
+      docsUrl: TROUBLESHOOTING_URL,
+    };
+  } else if (failureCode === "REVIEW_UNAPPROVED" || failureCode === "MAX_TURNS_EXHAUSTED") {
+    const cause =
+      failureCode === "MAX_TURNS_EXHAUSTED"
+        ? "the implementation hit its turn cap before completing"
+        : "the automated reviewer did not approve within the allotted iterations";
+    c = {
+      summary: `🟡 Implementation finished without review approval — ${cause}.`,
+      detail: [
+        prUrl
+          ? `The work so far is preserved in a draft PR: ${prUrl}`
+          : "No PR could be opened (no code changes were produced).",
+        failureReason ?? "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      remediation:
+        "Review the draft PR and the run autopsy comment. Likely causes: over-broad issue scope, missing prerequisites, or thin context — split the ticket or add context, then re-dispatch.",
+      docsUrl: TROUBLESHOOTING_URL,
+    };
+  } else {
+    c = { summary: failureReason ?? "Unspecified failure." };
+  }
   return renderClassification(c);
 }
 
@@ -197,10 +222,16 @@ export async function handleRunnerResult(
         await provider.markImplementationFailed(
           claims.issueId,
           mappingTeamKey,
-          formatFailureComment(input.body.failureCode, input.body.failureReason),
+          formatFailureComment(input.body.failureCode, input.body.failureReason, input.body.prUrl),
         );
       } catch (err) {
         warn("markImplementationFailed", err);
+      }
+      // A coded unapproved failure still carries a draft PR — link it on the
+      // job row so the admin UI and merge-detection can see it.
+      if (typeof input.body.prUrl === "string" && input.body.prUrl) {
+        const job = getJobByDispatchId(claims.dispatchId);
+        if (job) updateJobPrUrl(job.id, input.body.prUrl);
       }
     }
     // gap-analysis failure: no status transition (PR already terminal)

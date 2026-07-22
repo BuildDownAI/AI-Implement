@@ -35,7 +35,7 @@ interface ReviewJson {
  */
 const MAX_REVIEW_DIFF_CHARS = 200_000;
 
-function capDiff(diff: string): string {
+export function capDiff(diff: string): string {
   if (diff.length <= MAX_REVIEW_DIFF_CHARS) return diff;
   const cut = diff.lastIndexOf("\n", MAX_REVIEW_DIFF_CHARS);
   // `> 0` (not `!== -1`) on purpose: fall back to the hard cap both when no

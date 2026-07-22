@@ -14,6 +14,15 @@ import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { writeRunAutopsy } from "./run-autopsy.js";
+
+type RunAutopsyPasses = Array<{
+  iteration: number;
+  implementTurns: number | null;
+  implementOutcome: string;
+  costUsd: number | null;
+  reviewApproved: boolean | null;
+}>;
 
 export interface RunAutonomousOptions {
   workspaceDir?: string;
@@ -391,22 +400,72 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     llmExecutor,
   );
 
+  let disposition: string | undefined;
+
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
     const runner = opts.runner ?? (await createDefaultRunner());
     await runWithTiming(timing, () => runner.run(pipeline, context, reporter));
+    const fbOutputs = context.getOutputs("feedback-loop");
     const pushOutputs = context.getOutputs("push");
+    const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
+    const approved = fbOutputs.approved === true;
+
+    if (approved && prUrl) {
+      disposition = `PR ${prUrl} (approved after ${typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?"} iteration(s))`;
+      await postRunnerResult({
+        workspaceDir,
+        phase: runnerPhase,
+        outcome: "success",
+        prUrl,
+        callbackUrl,
+        fetchImpl: opts.fetchImpl,
+      });
+      return { exitCode: 0 };
+    }
+
+    // The pipeline completed mechanically but the review loop never approved
+    // (or push produced no PR). This is NOT a success: report a coded failure
+    // so the ticket is updated and notifications fire, leave a run autopsy for
+    // the ticket, and flag the GHA run — but keep the job green (warning only).
+    const terminationReason =
+      typeof fbOutputs.terminationReason === "string" ? fbOutputs.terminationReason : "unknown";
+    const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : 0;
+    const finalFeedback = typeof fbOutputs.finalFeedback === "string" ? fbOutputs.finalFeedback : "";
+    const failureCode = terminationReason === "max_turns" ? "MAX_TURNS_EXHAUSTED" : "REVIEW_UNAPPROVED";
+    const failureReason =
+      `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
+      finalFeedback.slice(0, 500);
+
+    disposition = `${prUrl ? `draft PR ${prUrl}` : "no PR"} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
+
+    writeRunAutopsy(workspaceDir, {
+      issueIdentifier,
+      terminationReason,
+      iterations,
+      finalFeedback,
+      passes: Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [],
+      postMortem: typeof fbOutputs.postMortem === "string" ? fbOutputs.postMortem : undefined,
+      prUrl,
+    });
+    console.warn(
+      `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
+        (prUrl ? `draft PR opened: ${prUrl}` : "no PR opened"),
+    );
     await postRunnerResult({
       workspaceDir,
       phase: runnerPhase,
-      outcome: "success",
-      prUrl: typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined,
+      outcome: "failure",
+      failureCode,
+      failureReason,
+      prUrl,
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
     return { exitCode: 0 };
   } catch (err) {
     console.error(`Pipeline failed: ${err}`);
+    disposition = `failed: ${err instanceof Error ? err.message : String(err)}`;
     await postRunnerResult({
       workspaceDir,
       phase: runnerPhase,
@@ -420,7 +479,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   } finally {
     try {
       if (timing.records().length > 0) {
-        console.error(formatSummary(timing, issueIdentifier));
+        console.error(formatSummary(timing, issueIdentifier, disposition));
       }
     } catch (summaryErr) {
       console.error(`timing summary failed: ${summaryErr}`);

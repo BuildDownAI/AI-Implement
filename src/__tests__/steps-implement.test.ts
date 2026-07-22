@@ -149,4 +149,48 @@ describe("implementStep", () => {
       expect.objectContaining({ maxTurns: 5 }),
     );
   });
+
+  it("includes executor telemetry in outputs", async () => {
+    const telemetry = {
+      outcome: "success" as const,
+      numTurns: 12,
+      durationMs: 1000,
+      costUsd: 0.5,
+      tokensIn: 100,
+      tokensOut: 50,
+      toolTrace: ["Bash npm test"],
+    };
+    const executor = makeExecutor({ stdout: "done", exitCode: 0, tokensUsed: 150, telemetry });
+    const ctx = makeContext(executor);
+
+    const outputs = await implementStep.run(
+      ctx,
+      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.telemetry).toEqual(telemetry);
+  });
+
+  it("does not throw on non-zero exit when the outcome is max_turns", async () => {
+    const telemetry = {
+      outcome: "max_turns" as const,
+      numTurns: 50,
+      durationMs: 1000,
+      costUsd: null,
+      tokensIn: null,
+      tokensOut: null,
+      toolTrace: [],
+    };
+    const executor = makeExecutor({ stdout: "", exitCode: 1, tokensUsed: 0, telemetry });
+    const ctx = makeContext(executor);
+
+    const outputs = await implementStep.run(
+      ctx,
+      { workspaceDir: "/tmp/test", prompt: "Do it" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.telemetry?.outcome).toBe("max_turns");
+  });
 });

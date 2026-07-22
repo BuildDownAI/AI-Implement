@@ -53,7 +53,15 @@ function mapOutcome(subtype: unknown): RunTelemetry["outcome"] {
 export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
   const result = lastResult(events);
   if (!result) {
-    return { outcome: "unknown", numTurns: null, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null };
+    return {
+      outcome: "unknown",
+      numTurns: null,
+      durationMs: null,
+      costUsd: null,
+      tokensIn: null,
+      tokensOut: null,
+      toolTrace: extractToolTrace(events),
+    };
   }
   const usage = (result.usage ?? {}) as { input_tokens?: number; output_tokens?: number };
   return {
@@ -63,6 +71,7 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
     costUsd: num(result.total_cost_usd),
     tokensIn: num(usage.input_tokens),
     tokensOut: num(usage.output_tokens),
+    toolTrace: extractToolTrace(events),
   };
 }
 
@@ -93,6 +102,32 @@ function summarizeToolInput(input: unknown): string {
     return truncate(String(candidate), TOOL_INPUT_MAX);
   }
   return truncate(String(input), TOOL_INPUT_MAX);
+}
+
+const TOOL_TRACE_MAX = 200;
+
+/**
+ * Compact trace of every tool call in the session ("ToolName input-summary").
+ * Retained at BOTH log levels so a max_turns post-mortem can see where the
+ * turns went even when the run wasn't logged in stream mode. Capped to bound
+ * memory; a final marker entry records how many calls were dropped.
+ */
+export function extractToolTrace(events: StreamEvent[], max = TOOL_TRACE_MAX): string[] {
+  const trace: string[] = [];
+  let dropped = 0;
+  for (const e of events) {
+    if (e.type !== "assistant") continue;
+    const msg = e.message as { content?: Array<Record<string, unknown>> } | undefined;
+    for (const block of msg?.content ?? []) {
+      if (block.type !== "tool_use") continue;
+      const name = typeof block.name === "string" ? block.name : "tool";
+      const entry = `${name} ${summarizeToolInput(block.input)}`.trimEnd();
+      if (trace.length < max) trace.push(entry);
+      else dropped++;
+    }
+  }
+  if (dropped > 0) trace.push(`… ${dropped} more tool calls truncated`);
+  return trace;
 }
 
 export function formatEvent(event: StreamEvent): string | null {

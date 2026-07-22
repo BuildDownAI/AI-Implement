@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { TimingCollector, formatDuration, formatSummary, runWithTiming, span, TimingStepReporter } from "../pipeline/timing.js";
+import { NoopStepReporter } from "../pipeline/reporter.js";
 import type { Step, StepReporter } from "../pipeline/types.js";
 
 function step(partial: Partial<Step> & { id: string; status: Step["status"] }): Step {
@@ -123,7 +124,7 @@ describe("TimingStepReporter", () => {
     ]);
   });
 
-  it("forwards skipped/cancelled to inner without recording a duration", async () => {
+  it("records a zero-duration skipped step, but forwards cancelled without recording", async () => {
     const seen: Step[] = [];
     const inner: StepReporter = { report: async (s) => void seen.push(s) };
     const c = new TimingCollector("summary");
@@ -131,7 +132,9 @@ describe("TimingStepReporter", () => {
     await r.report(step({ id: "preflight", status: "skipped" }));
     await r.report(step({ id: "await-ci", status: "cancelled" }));
     expect(seen).toHaveLength(2);
-    expect(c.records()).toHaveLength(0);
+    expect(c.records()).toEqual([
+      { label: "preflight", parentId: null, ms: 0, kind: "step", skipped: true },
+    ]);
   });
 });
 
@@ -183,5 +186,37 @@ describe("span", () => {
       spy.mockRestore();
     }
     expect(errors.some((e) => e.includes("git-push") && e.includes("[timing]"))).toBe(true);
+  });
+});
+
+describe("skipped steps and disposition", () => {
+  it("records skipped steps and lists them in the summary", async () => {
+    const collector = new TimingCollector("summary");
+    const reporter = new TimingStepReporter(new NoopStepReporter(), collector);
+    await reporter.report({
+      id: "preflight", type: "preflight", status: "skipped",
+      started_at: new Date().toISOString(), ended_at: new Date().toISOString(),
+      parent_step_id: null, inputs: {}, outputs: {}, logs_url: null,
+    });
+    const out = formatSummary(collector, "ENG-1");
+    expect(out).toContain("preflight");
+    expect(out).toContain("skipped");
+  });
+
+  it("appends the disposition line when provided", () => {
+    const collector = new TimingCollector("summary");
+    collector.record({ label: "push", parentId: null, ms: 1000, kind: "step" });
+    const out = formatSummary(collector, "ENG-1", "draft PR #9 — review unapproved after 3/3 iterations (iterations_exhausted)");
+    expect(out).toContain("outcome: draft PR #9 — review unapproved after 3/3 iterations (iterations_exhausted)");
+  });
+
+  it("skipped steps are never flagged dominant", async () => {
+    const collector = new TimingCollector("summary");
+    collector.record({ label: "clone", parentId: null, ms: 50, kind: "step" });
+    collector.record({ label: "verify", parentId: null, ms: 0, kind: "step", skipped: true });
+    const out = formatSummary(collector, "ENG-1");
+    expect(out).toContain("clone");
+    expect(out.split("\n").find((l) => l.includes("verify"))).toContain("skipped");
+    expect(out.split("\n").find((l) => l.includes("verify"))).not.toContain("dominant");
   });
 });

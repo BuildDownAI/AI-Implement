@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -42,6 +42,22 @@ function makeSingleStepPipeline(stepId: string, mod: StepModule): {
     steps: [{ id: stepId, type: "custom", moduleId: stepId }],
   };
   const runner = new PipelineRunner().register(stepId, mod);
+  return { pipeline, runner };
+}
+
+// Outcome derivation (Task 4) reads context.getOutputs("feedback-loop") and
+// context.getOutputs("push"), so tests that need to land on the "success"
+// path must register both steps rather than a single "push" stand-in.
+function makeStepsPipeline(entries: Array<[string, StepModule]>): {
+  pipeline: PipelineDefinition;
+  runner: PipelineRunner;
+} {
+  const pipeline: PipelineDefinition = {
+    id: "test",
+    steps: entries.map(([stepId]) => ({ id: stepId, type: "custom", moduleId: stepId })),
+  };
+  let runner = new PipelineRunner();
+  for (const [stepId, mod] of entries) runner = runner.register(stepId, mod);
   return { pipeline, runner };
 }
 
@@ -481,7 +497,12 @@ describe("runAutonomous", () => {
         }),
       })
       .register("install", { run: vi.fn().mockResolvedValue({}) })
-      .register("feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) });
+      .register("feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) })
+      // Push no longer skips on an unapproved feedback-loop result — it opens a
+      // draft PR instead — so the default pipeline needs a push module here too.
+      .register("push", {
+        run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: true }),
+      });
 
     const result = await runAutonomous({
       workspaceDir,
@@ -557,8 +578,10 @@ describe("runAutonomous", () => {
     writeFileSync(join(workspaceDir, "ai-output", "comments", "01-first.md"), "first");
 
     const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) };
-    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/1" }) }],
+    ]);
 
     const result = await runAutonomous({
       workspaceDir,
@@ -707,8 +730,10 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUN_TOKEN", "run-token");
 
     const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
-    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/42" }) }],
+    ]);
 
     const result = await runAutonomous({
       workspaceDir,
@@ -737,8 +762,10 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUN_TOKEN", "run-token");
 
     const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
-    const mod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/99" }) };
-    const { pipeline, runner } = makeSingleStepPipeline("push", mod);
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/acme/app/pull/99" }) }],
+    ]);
 
     const result = await runAutonomous({
       workspaceDir,
@@ -760,11 +787,15 @@ describe("runAutonomous", () => {
     });
   });
 
-  it("skips success callback when push produces no PR URL", async () => {
+  it("reports a coded failure (not success) when push produces no PR URL", async () => {
+    // The old behavior silently skipped the callback here. Task 4 makes this
+    // an honest coded failure instead: the callback is always sent, carrying
+    // failureCode REVIEW_UNAPPROVED (no feedback-loop step ran, so approved
+    // defaults to false) — the job still exits 0 (warning only).
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
 
-    const mockFetch = vi.fn();
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
     const mod: StepModule = { run: vi.fn().mockResolvedValue({}) };
     const { pipeline, runner } = makeSingleStepPipeline("push", mod);
 
@@ -778,7 +809,234 @@ describe("runAutonomous", () => {
     });
 
     expect(result.exitCode).toBe(0);
-    expect(mockFetch).not.toHaveBeenCalled();
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+      failureCode: string;
+      prUrl?: string;
+    };
+    expect(body).toMatchObject({
+      phase: "implementation",
+      outcome: "failure",
+      failureCode: "REVIEW_UNAPPROVED",
+    });
+    expect(body.prUrl).toBeUndefined();
+  });
+
+  it("reports failure with REVIEW_UNAPPROVED and the draft PR url when the loop never approved", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 3,
+            finalFeedback: "nope",
+            terminationReason: "iterations_exhausted",
+            passes: [],
+          }),
+        },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/9",
+            prNumber: 9,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0); // job stays green — warning only
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      failureCode: string;
+      failureReason: string;
+      prUrl: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
+    expect(body.failureReason).toContain("iterations_exhausted");
+    expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
+  });
+
+  it("gap-fill run (prNumber set, unapproved) skips push — outcome derivation still reports a coded failure with no prUrl", async () => {
+    // Mirrors pipeline-loader.ts's push skip condition for gap-fill runs: Claude owns git on
+    // the existing PR branch there, so an unapproved gap-fill must not run push against an
+    // already-clean tree (it would throw "Nothing to commit"). This verifies the skip and the
+    // existing outcome-derivation fallback compose correctly — no change to run-autonomous.ts.
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const pushRun = vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/1", prNumber: 1, branchPushed: true });
+    const pipeline: PipelineDefinition = {
+      id: "test",
+      steps: [
+        { id: "feedback-loop", type: "custom", moduleId: "feedback-loop" },
+        {
+          id: "push",
+          type: "custom",
+          moduleId: "push",
+          skip: (ctx) => Boolean(ctx.data.prNumber) && ctx.getOutputs("feedback-loop").approved !== true,
+        },
+      ],
+    };
+    const runner = new PipelineRunner()
+      .register("feedback-loop", {
+        run: vi.fn().mockResolvedValue({
+          approved: false,
+          iterations: 2,
+          finalFeedback: "still missing tests",
+          terminationReason: "iterations_exhausted",
+          passes: [],
+        }),
+      })
+      .register("push", { run: pushRun });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(pushRun).not.toHaveBeenCalled(); // push was skipped, not run against a clean tree
+    expect(result.exitCode).toBe(0); // job stays green — warning only
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      failureCode: string;
+      prUrl?: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
+    expect(body.prUrl).toBeUndefined();
+  });
+
+  it("uses MAX_TURNS_EXHAUSTED when terminationReason is max_turns", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "ran out of turns",
+            terminationReason: "max_turns",
+            passes: [],
+          }),
+        },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/10",
+            prNumber: 10,
+            branchPushed: true,
+            draft: true,
+          }),
+        },
+      ],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { failureCode: string };
+    expect(body.failureCode).toBe("MAX_TURNS_EXHAUSTED");
+  });
+
+  it("writes the autopsy comment file on unapproved runs", async () => {
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 2,
+            finalFeedback: "nope",
+            terminationReason: "iterations_exhausted",
+            passes: [],
+          }),
+        },
+      ],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, draft: true }) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(result.exitCode).toBe(0);
+    const autopsyPath = join(workspaceDir, "ai-output", "comments", "90-run-autopsy.md");
+    expect(existsSync(autopsyPath)).toBe(true);
+    expect(readFileSync(autopsyPath, "utf-8")).toContain("nope");
+  });
+
+  it("still reports plain success with prUrl when approved", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved" }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/11", prNumber: 11, branchPushed: true, draft: false }) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      prUrl: string;
+      failureCode?: string;
+    };
+    expect(body.outcome).toBe("success");
+    expect(body.prUrl).toBe("https://github.com/o/r/pull/11");
+    expect(body.failureCode).toBeUndefined();
   });
 
   it("continues callback with empty comments when comment collection fails", async () => {
