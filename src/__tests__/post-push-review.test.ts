@@ -40,7 +40,7 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("**Merge readiness:** Ready to merge."))).toBe(true);
   });
 
-  it("submits a native APPROVE review when merge-ready", async () => {
+  it("submits a native COMMENT review when merge-ready", async () => {
     const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const reviewCalls: string[][] = [];
     const ghSpawn = vi.fn((args: string[]) => {
@@ -59,7 +59,7 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(reviewCalls[0]).toContain("event=APPROVE");
+    expect(reviewCalls[0]).toContain("event=COMMENT");
     const bodyArg = reviewCalls[0].find((arg) => arg.startsWith("body="));
     expect(bodyArg).toContain("<!-- ai-implement native-review -->");
     expect(bodyArg).toContain("AI-Implement post-push review approved this PR.");
@@ -118,14 +118,14 @@ describe("postPushReviewStep", () => {
 
     expect(warnings).toContain("stderr=gh: Unprocessable Entity (HTTP 422)");
     expect(warnings).toContain("stdout={\"message\":\"Can not approve your own pull request\"}");
-    expect(warnings).toContain("event=APPROVE");
+    expect(warnings).toContain("event=COMMENT");
     expect(warnings).toContain("bodyChars=");
     expect(warnings).toContain("author=ai-implement[bot]");
     expect(warnings).toContain("head=ai-implement/aii-200-x@abc1234");
     expect(warnings).toContain("base=main@def9876");
   });
 
-  it("submits a native REQUEST_CHANGES review when blockers remain", async () => {
+  it("submits a native COMMENT review when blockers remain", async () => {
     const reviewerJson = JSON.stringify({
       approved: false,
       blocking_issues: [{ title: "Fix validation", problem: "Null owners pass.", required_fix: "Reject null owners." }],
@@ -150,7 +150,7 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(reviewCalls[0]).toContain("event=REQUEST_CHANGES");
+    expect(reviewCalls[0]).toContain("event=COMMENT");
     expect(reviewCalls[0].find((arg) => arg.startsWith("body="))).toContain("Fix validation");
   });
 
@@ -1538,7 +1538,7 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(false);
-    expect(reviewCalls.some((call) => call.includes("event=APPROVE"))).toBe(false);
+    expect(reviewCalls.some((call) => call.some((arg) => arg.includes("approved this PR")))).toBe(false);
     expect(ghComments.some((c) => c.includes("did not complete") && c.includes("Manual review required"))).toBe(true);
   });
 
