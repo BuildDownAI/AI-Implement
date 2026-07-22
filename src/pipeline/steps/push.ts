@@ -67,7 +67,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     const hasWTChanges = hasWorkingTreeChanges(workspaceDir, githubToken);
     // Only check commits-ahead when working tree is clean: if there ARE working-tree changes
     // we always take the standard add→commit path regardless of prior commits.
-    const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseBranch);
+    const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseBranch, githubToken);
 
     if (!hasWTChanges && !agentCommitted) {
       if (inputs.groupingParent) {
@@ -111,15 +111,20 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       commitSha = resolveCommitSha(workspaceDir);
     } else {
       // Case A: agent committed its own changes — working tree is clean but commits exist
-      // ahead of base. Run the sensitive-file guard against the committed diff so the
-      // security check is not bypassed when the agent uses git commit directly.
-      // --diff-filter=d: same rationale as the staged path (allow intentional deletions).
-      const committedFiles = getCommittedDiffFiles(workspaceDir, baseBranch, githubToken);
-      const sensitiveHits = findSensitiveFiles(committedFiles, inputs.sensitiveFiles);
-      if (sensitiveHits.length > 0) {
-        throw new SensitiveFilesError(sensitiveHits);
-      }
+      // ahead of base. The sensitive-file guard runs against the full committed diff below.
       commitSha = resolveCommitSha(workspaceDir);
+    }
+
+    // Authoritative sensitive-file guard: scan the FULL committed diff (baseBranch..HEAD) —
+    // the complete set of files that will land in the PR — before push. This closes the
+    // mixed commit+working-tree gap where the standard path's --cached scan (newly-staged
+    // files only) would miss files the agent committed itself earlier in the run (present in
+    // HEAD but not the index). --diff-filter=d allows intentional deletions (e.g. removing a
+    // committed secret); getCommittedDiffFiles fails closed on git error.
+    const committedDiffFiles = getCommittedDiffFiles(workspaceDir, baseBranch, githubToken);
+    const committedSensitiveHits = findSensitiveFiles(committedDiffFiles, inputs.sensitiveFiles);
+    if (committedSensitiveHits.length > 0) {
+      throw new SensitiveFilesError(committedSensitiveHits);
     }
 
     const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken, agentCommitted ? baseBranch : undefined);
@@ -356,12 +361,18 @@ function stringValue(value: unknown): string | null {
  * Used to detect Case A: the agent committed its own changes, leaving a clean
  * working tree but commits ahead of the base branch.
  */
-function hasCommitsAheadOfBase(workspaceDir: string, baseBranch: string): boolean {
+function hasCommitsAheadOfBase(workspaceDir: string, baseBranch: string, githubToken: string): boolean {
   const result = spawnSync("git", ["rev-list", "--count", `${baseBranch}..HEAD`], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  if (result.status !== 0) return false;
+  if (result.status !== 0) {
+    // Fail closed: returning false here ("no commits ahead") would let a grouping-parent
+    // run take the Case-B no-op path and finalize the issue, silently discarding the agent's
+    // committed work. Every other guard in this file throws on git failure — match that.
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
+    throw new Error(`git rev-list ${baseBranch}..HEAD failed (exit ${result.status ?? "null"}): ${stderr}`);
+  }
   const n = parseInt(result.stdout.toString().trim(), 10);
   return !isNaN(n) && n > 0;
 }

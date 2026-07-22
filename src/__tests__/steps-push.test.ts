@@ -994,3 +994,51 @@ describe("pushStep — Case B (grouping parent no-op)", () => {
     expect(outputs.branchPushed).toBe(true);
   });
 });
+
+// ---- Review hardening: fail-closed git checks + mixed-state sensitive scan ----
+
+describe("pushStep — hardening (review findings)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("fails CLOSED when git rev-list errors on a grouping-parent run (never silently no-ops)", async () => {
+    // Regression: hasCommitsAheadOfBase used to return false on git error, which would make a
+    // grouping-parent run take the Case-B no-op → markMerged → silently discard committed work.
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, ""); // clean working tree
+      if (gitArgs[0] === "rev-list") return spawnResult(128, "", "fatal: bad revision 'main..HEAD'");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), { ...BASE_INPUTS, groupingParent: true }, new NoopStepReporter()),
+    ).rejects.toThrow(/git rev-list .*failed/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("catches a committed secret in a MIXED commit+working-tree state (unified committed-diff scan)", async () => {
+    // The agent committed a secret earlier in the run AND left other uncommitted edits. The
+    // dirty path's --cached scan only sees newly-staged files (no secret); the unified
+    // baseBranch..HEAD scan must still catch the already-committed .env.
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n"); // dirty working tree
+      if (gitArgs[0] === "diff" && gitArgs.includes("--cached")) {
+        return spawnResult(0, "src/app.ts\n"); // staged files — no secret here
+      }
+      if (gitArgs[0] === "diff" && gitArgs.includes("main..HEAD")) {
+        return spawnResult(0, "src/app.ts\n.env\n"); // full committed diff — secret committed earlier
+      }
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
