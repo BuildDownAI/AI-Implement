@@ -500,7 +500,10 @@ describe("loadPipelineDefinition", () => {
       expect(push.skip?.(ctx)).toBe(true);
     });
 
-    it("does not skip push when prNumber is set (gap-fill) and feedback-loop approved", () => {
+    it("skips push when prNumber is set (gap-fill) even when feedback-loop approved", () => {
+      // Gap-fill runs never own git: Claude commits and pushes to the existing PR
+      // branch itself, so the tree is clean by the time push would run — running it
+      // would throw "Nothing to commit" and turn an approved gap-fill into a failure.
       const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
         existsSyncImpl: () => false,
         readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
@@ -509,7 +512,7 @@ describe("loadPipelineDefinition", () => {
       const push = pipeline.steps.find((s) => s.id === "push")!;
       const ctx = makeContext({ prNumber: "42" });
       ctx.setOutputs("feedback-loop", { approved: true });
-      expect(push.skip?.(ctx)).toBe(false);
+      expect(push.skip?.(ctx)).toBe(true);
     });
 
     it("does not skip push on an initial run (no prNumber) even when feedback-loop was not approved", () => {

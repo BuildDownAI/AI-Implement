@@ -421,6 +421,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // Case B: grouping-parent run where the agent produced genuinely no changes. Push returned
     // a no-op (branchPushed=false, prUrl=null). Report success without a prUrl so the
     // orchestrator finalizes the issue and merge-up.ts opens the feature→base roll-up PR.
+    // (Gap-fill runs never set groupingParent, so this cannot collide with the skip-push
+    // gap-fill path below.)
     if (context.data.groupingParent && pushOutputs.branchPushed === false && !prUrl) {
       disposition = "no-op (grouping parent: no own work; finalized for roll-up)";
       await postRunnerResult({
@@ -434,8 +436,14 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       return { exitCode: 0 };
     }
 
-    if (approved && prUrl) {
-      disposition = `PR ${prUrl} (approved after ${typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?"} iteration(s))`;
+    // A gap-fill run (prNumber set) never produces push outputs: the pipeline skips
+    // push because Claude commits and pushes to the existing PR branch itself. An
+    // approved gap-fill without a prUrl is therefore a success, not REVIEW_UNAPPROVED.
+    if (approved && (prUrl || prNumber)) {
+      const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?";
+      disposition = prUrl
+        ? `PR ${prUrl} (approved after ${iterations} iteration(s))`
+        : `gap-fill on PR #${prNumber} (approved after ${iterations} iteration(s))`;
       await postRunnerResult({
         workspaceDir,
         phase: runnerPhase,
