@@ -481,7 +481,12 @@ describe("runAutonomous", () => {
         }),
       })
       .register("install", { run: vi.fn().mockResolvedValue({}) })
-      .register("feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) });
+      .register("feedback-loop", { run: vi.fn().mockResolvedValue({ approved: false }) })
+      // Push no longer skips on an unapproved feedback-loop result — it opens a
+      // draft PR instead — so the default pipeline needs a push module here too.
+      .register("push", {
+        run: vi.fn().mockResolvedValue({ prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: true }),
+      });
 
     const result = await runAutonomous({
       workspaceDir,

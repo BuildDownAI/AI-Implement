@@ -149,19 +149,35 @@ function applyWiring(step: YamlStep): StepDefinition {
       };
 
     case "push":
+      // Push always runs after the feedback loop: unapproved work ships as a
+      // draft PR (with the reviewer feedback in the body) instead of being
+      // silently discarded. "Nothing to commit" remains a loud failure.
       return {
         ...step,
-        inputs: (ctx: PipelineContext) => ({
-          workspaceDir: ctx.getOutputs("clone").workspaceDir,
-          repoOwner: ctx.getOutputs("clone").repoOwner,
-          repoRepo: ctx.getOutputs("clone").repoRepo,
-          githubToken: ctx.getOutputs("clone").githubToken,
-          branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
-          baseBranch: ctx.getOutputs("clone").branch,
-          prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
-          sensitiveFiles: ctx.data.sensitiveFiles,
-        }),
-        skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
+        inputs: (ctx: PipelineContext) => {
+          const fb = ctx.getOutputs("feedback-loop");
+          const approved = fb.approved === true;
+          return {
+            workspaceDir: ctx.getOutputs("clone").workspaceDir,
+            repoOwner: ctx.getOutputs("clone").repoOwner,
+            repoRepo: ctx.getOutputs("clone").repoRepo,
+            githubToken: ctx.getOutputs("clone").githubToken,
+            branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
+            baseBranch: ctx.getOutputs("clone").branch,
+            prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
+            sensitiveFiles: ctx.data.sensitiveFiles,
+            draft: !approved,
+            reviewSummary: approved
+              ? undefined
+              : {
+                  terminationReason: typeof fb.terminationReason === "string" ? fb.terminationReason : "unknown",
+                  iterations: typeof fb.iterations === "number" ? fb.iterations : 0,
+                  finalFeedback: typeof fb.finalFeedback === "string" ? fb.finalFeedback : "",
+                  passes: Array.isArray(fb.passes) ? fb.passes : [],
+                  ...(typeof fb.postMortem === "string" ? { postMortem: fb.postMortem } : {}),
+                },
+          };
+        },
       };
 
     case "verify":
@@ -186,6 +202,9 @@ function applyWiring(step: YamlStep): StepDefinition {
           reviewProviders: ctx.getOutputs("install").reviewProviders,
         }),
         skip: (ctx: PipelineContext) => {
+          // Never run further review/force-push cycles against an unapproved
+          // draft — the review budget is already exhausted.
+          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
           const pushOutputs = ctx.getOutputs("push");
           return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
         },

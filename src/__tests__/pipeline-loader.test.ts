@@ -300,23 +300,6 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.prTitle).toBe("ENG-42: Add profile page");
   });
 
-  it("applies push skip condition based on feedback-loop approval", () => {
-    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
-      existsSyncImpl: () => false,
-      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
-    });
-
-    const pushStep = pipeline.steps.find((s) => s.id === "push")!;
-
-    const ctxApproved = makeContext();
-    ctxApproved.setOutputs("feedback-loop", { approved: true });
-    expect(pushStep.skip?.(ctxApproved)).toBe(false);
-
-    const ctxRejected = makeContext();
-    ctxRejected.setOutputs("feedback-loop", { approved: false });
-    expect(pushStep.skip?.(ctxRejected)).toBe(true);
-  });
-
   it("applies post-push-review input wiring from clone and push outputs", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,
@@ -344,16 +327,33 @@ describe("loadPipelineDefinition", () => {
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
 
     const ctxPushed = makeContext();
+    ctxPushed.setOutputs("feedback-loop", { approved: true });
     ctxPushed.setOutputs("push", { branchPushed: true, prNumber: 42 });
     expect(step.skip?.(ctxPushed)).toBe(false);
 
     const ctxSkipped = makeContext();
+    ctxSkipped.setOutputs("feedback-loop", { approved: true });
     ctxSkipped.setOutputs("push", { branchPushed: false });
     expect(step.skip?.(ctxSkipped)).toBe(true);
 
     const ctxMissingPr = makeContext();
+    ctxMissingPr.setOutputs("feedback-loop", { approved: true });
     ctxMissingPr.setOutputs("push", { branchPushed: true, prNumber: null });
     expect(step.skip?.(ctxMissingPr)).toBe(true);
+  });
+
+  it("post-push-review skips when feedback-loop was not approved, even with a valid push", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
+
+    const ctx = makeContext();
+    ctx.setOutputs("feedback-loop", { approved: false });
+    ctx.setOutputs("push", { branchPushed: true, prNumber: 9 });
+    expect(step.skip?.(ctx)).toBe(true);
   });
 
   it("skips setup when no setup hook, runs it (with scriptPath) when present", () => {
@@ -431,5 +431,59 @@ describe("loadPipelineDefinition", () => {
 
     expect(executedSteps).toContain("notify");
     expect(executedSteps.indexOf("push")).toBeLessThan(executedSteps.indexOf("notify"));
+  });
+
+  describe("unapproved wiring", () => {
+    it("push never skips, and wires draft + reviewSummary from feedback-loop outputs", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      expect(push.skip).toBeUndefined();
+
+      const ctx = makeContext();
+      ctx.setOutputs("feedback-loop", {
+        approved: false,
+        iterations: 3,
+        finalFeedback: "nope",
+        terminationReason: "iterations_exhausted",
+        passes: [{ iteration: 1, implementTurns: 98, implementOutcome: "success", costUsd: 1, reviewApproved: false }],
+      });
+      const inputs = ctx.resolveInputs(push.inputs);
+      expect(inputs.draft).toBe(true);
+      expect((inputs.reviewSummary as { finalFeedback: string }).finalFeedback).toBe("nope");
+      expect((inputs.reviewSummary as { terminationReason: string }).terminationReason).toBe("iterations_exhausted");
+      expect((inputs.reviewSummary as { iterations: number }).iterations).toBe(3);
+      expect((inputs.reviewSummary as { passes: unknown[] }).passes).toHaveLength(1);
+    });
+
+    it("push wires draft=false and no reviewSummary when approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext();
+      ctx.setOutputs("feedback-loop", { approved: true, iterations: 1, finalFeedback: "ok", terminationReason: "approved", passes: [] });
+      const inputs = ctx.resolveInputs(push.inputs);
+      expect(inputs.draft).toBe(false);
+      expect(inputs.reviewSummary).toBeUndefined();
+    });
+
+    it("post-push-review skips when feedback-loop was not approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const ppr = pipeline.steps.find((s) => s.id === "post-push-review")!;
+      const ctx = makeContext();
+      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 9 });
+      expect(ppr.skip!(ctx)).toBe(true);
+    });
   });
 });

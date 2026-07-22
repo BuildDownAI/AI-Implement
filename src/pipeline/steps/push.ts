@@ -7,6 +7,16 @@ import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
 
+export const UNAPPROVED_TITLE_PREFIX = "[NEEDS REVIEW — unapproved] ";
+
+export interface ReviewSummary extends Record<string, unknown> {
+  terminationReason: string;
+  iterations: number;
+  finalFeedback: string;
+  passes: Array<{ iteration: number; implementTurns: number | null; implementOutcome: string; costUsd: number | null; reviewApproved: boolean | null }>;
+  postMortem?: string;
+}
+
 interface PushInputs extends Record<string, unknown> {
   workspaceDir: string;
   repoOwner: string;
@@ -18,6 +28,8 @@ interface PushInputs extends Record<string, unknown> {
   implementationSummary?: string;
   testsSummary?: string;
   sensitiveFiles?: { add?: string[]; allow?: string[] };
+  draft?: boolean;
+  reviewSummary?: ReviewSummary;
 }
 
 interface PushOutputs extends Record<string, unknown> {
@@ -25,6 +37,7 @@ interface PushOutputs extends Record<string, unknown> {
   prNumber: number | null;
   branchPushed: boolean;
   commitSha: string | null;
+  draft: boolean;
 }
 
 export const pushStep: StepModule<PushInputs, PushOutputs> = {
@@ -117,12 +130,13 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
     }
 
+    const draft = inputs.draft === true;
     // Span covers the POST and the 422 list-open-PRs fallback so re-runs (which
     // hit 422 and pay an extra round-trip) are timed in full, not just the POST.
     const pr = await span("pr-create", async () =>
-      createOrFindPullRequest({ repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody }),
+      createOrFindPullRequest({ repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody, draft }),
     );
-    return { prUrl: pr.url, prNumber: pr.number, branchPushed: true, commitSha };
+    return { prUrl: pr.url, prNumber: pr.number, branchPushed: true, commitSha, draft: pr.draft };
   },
 };
 
@@ -134,59 +148,60 @@ interface CreatePrInputs {
   branchName: string;
   baseBranch: string;
   prBody: string;
+  draft: boolean;
 }
 
 /** Create the PR, tolerating 422 (already exists) by finding the open PR. */
 async function createOrFindPullRequest(
-  { repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody }: CreatePrInputs,
-): Promise<{ url: string; number: number }> {
-  const prRes = await fetch(
-    `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        title: prTitle,
-        head: branchName,
-        base: baseBranch,
-        body: prBody,
-      }),
-    },
-  );
+  inputs: CreatePrInputs,
+): Promise<{ url: string; number: number; draft: boolean }> {
+  const { repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody, draft } = inputs;
 
-  if (prRes.ok) {
-    const pr = (await prRes.json()) as { html_url?: unknown; number?: unknown };
+  const create = async (title: string, asDraft: boolean): Promise<Response> =>
+    fetch(`https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${githubToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ title, head: branchName, base: baseBranch, body: prBody, ...(asDraft ? { draft: true } : {}) }),
+    });
+
+  const parseCreated = async (res: Response, asDraft: boolean): Promise<{ url: string; number: number; draft: boolean }> => {
+    const pr = (await res.json()) as { html_url?: unknown; number?: unknown };
     if (typeof pr.html_url !== "string" || typeof pr.number !== "number") {
       throw new Error("Unexpected PR creation response shape from GitHub API");
     }
-    return { url: pr.html_url, number: pr.number };
-  }
+    return { url: pr.html_url, number: pr.number, draft: asDraft };
+  };
+
+  const prRes = await create(prTitle, draft);
+  if (prRes.ok) return parseCreated(prRes, draft);
 
   if (prRes.status === 422) {
-    // PR already open — find it
+    // Ambiguous: either the PR already exists, or the repo plan rejects draft
+    // PRs. Check for an existing open PR first (existing behavior), then — if
+    // we were drafting — retry as a clearly-titled normal PR so the work is
+    // never vaporized on Free-plan private repos.
     const listRes = await fetch(
       `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls?head=${repoOwner}:${branchName}&state=open`,
       { headers: { Authorization: `Bearer ${githubToken}` } },
     );
     if (!listRes.ok) {
       const listBody = await listRes.text().catch(() => "");
-      throw new Error(
-        `PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`,
-      );
+      throw new Error(`PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`);
     }
     const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown }>;
     if (prs.length > 0) {
       const existing = prs[0];
       if (typeof existing.html_url === "string" && typeof existing.number === "number") {
-        return { url: existing.html_url, number: existing.number };
+        return { url: existing.html_url, number: existing.number, draft: false };
       }
     }
-    throw new Error(
-      `PR already exists (422) but no open PR found for branch ${branchName}`,
-    );
+    if (draft) {
+      const retryRes = await create(`${UNAPPROVED_TITLE_PREFIX}${prTitle}`, false);
+      if (retryRes.ok) return parseCreated(retryRes, false);
+      const retryBody = await retryRes.text().catch(() => "");
+      throw new Error(`Draft PR rejected (422) and non-draft fallback failed with HTTP ${retryRes.status}: ${retryBody}`);
+    }
+    throw new Error(`PR already exists (422) but no open PR found for branch ${branchName}`);
   }
 
   const body = await prRes.text().catch(() => "");
@@ -239,7 +254,10 @@ function buildPullRequestBody(
     stringValue(preflightOutputs.summary) ??
     "Automated verification was run by the AI-Implement pipeline before opening this PR.";
 
+  const unapprovedSection = buildUnapprovedSection(inputs.reviewSummary as ReviewSummary | undefined, inputs.draft === true);
+
   return [
+    ...(unapprovedSection ? [unapprovedSection, ""] : []),
     "## Summary",
     implementationSummary,
     "",
@@ -255,6 +273,35 @@ function buildPullRequestBody(
     `Fixes ${issueIdentifier}`,
     "",
     `Generated with AI-Implement · harness: Claude Code · model: ${context.data.model ?? "unknown"} · provider: ${context.data.provider ?? "anthropic"}`,
+  ].join("\n");
+}
+
+function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boolean): string | null {
+  if (!summary) return null;
+  const passRows = summary.passes
+    .map((p) => {
+      const cost = p.costUsd != null ? `$${p.costUsd.toFixed(2)}` : "—";
+      const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
+      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${cost} | ${review} |`;
+    })
+    .join("\n");
+  return [
+    "## ⚠️ Automated review did not approve",
+    "",
+    `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
+    "",
+    "**Reviewer's final feedback:**",
+    "",
+    ...summary.finalFeedback.split("\n").map((l) => `> ${l}`),
+    "",
+    "**Run stats:**",
+    "",
+    "| Pass | Implement outcome | Turns | Cost | Review |",
+    "|---|---|---|---|---|",
+    passRows,
+    ...(summary.postMortem ? ["", "<details><summary><strong>Post-mortem</strong></summary>", "", summary.postMortem, "", "</details>"] : []),
+    "",
+    "_Preflight and verify hooks were skipped for this unapproved run._",
   ].join("\n");
 }
 
