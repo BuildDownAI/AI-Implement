@@ -877,6 +877,62 @@ describe("runAutonomous", () => {
     expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
   });
 
+  it("gap-fill run (prNumber set, unapproved) skips push — outcome derivation still reports a coded failure with no prUrl", async () => {
+    // Mirrors pipeline-loader.ts's push skip condition for gap-fill runs: Claude owns git on
+    // the existing PR branch there, so an unapproved gap-fill must not run push against an
+    // already-clean tree (it would throw "Nothing to commit"). This verifies the skip and the
+    // existing outcome-derivation fallback compose correctly — no change to run-autonomous.ts.
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const pushRun = vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/1", prNumber: 1, branchPushed: true });
+    const pipeline: PipelineDefinition = {
+      id: "test",
+      steps: [
+        { id: "feedback-loop", type: "custom", moduleId: "feedback-loop" },
+        {
+          id: "push",
+          type: "custom",
+          moduleId: "push",
+          skip: (ctx) => Boolean(ctx.data.prNumber) && ctx.getOutputs("feedback-loop").approved !== true,
+        },
+      ],
+    };
+    const runner = new PipelineRunner()
+      .register("feedback-loop", {
+        run: vi.fn().mockResolvedValue({
+          approved: false,
+          iterations: 2,
+          finalFeedback: "still missing tests",
+          terminationReason: "iterations_exhausted",
+          passes: [],
+        }),
+      })
+      .register("push", { run: pushRun });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(pushRun).not.toHaveBeenCalled(); // push was skipped, not run against a clean tree
+    expect(result.exitCode).toBe(0); // job stays green — warning only
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      failureCode: string;
+      prUrl?: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
+    expect(body.prUrl).toBeUndefined();
+  });
+
   it("uses MAX_TURNS_EXHAUSTED when terminationReason is max_turns", async () => {
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");

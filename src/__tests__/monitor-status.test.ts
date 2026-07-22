@@ -20,6 +20,18 @@ describe("resolveTerminalStatus", () => {
     it("fails on a non-zero exit even when a PR exists (the exit code is authoritative)", () => {
       expect(resolveTerminalStatus(1, PR, false, "implementation")).toBe("failed");
     });
+
+    it("marks review_failed when the matched PR is an unapproved draft, even with no post-push review flag", () => {
+      expect(resolveTerminalStatus(0, PR, false, "implementation", true)).toBe("review_failed");
+    });
+
+    it("stays review_failed when both the draft flag and the post-push review flag are set", () => {
+      expect(resolveTerminalStatus(0, PR, true, "implementation", true)).toBe("review_failed");
+    });
+
+    it("defaults isDraftPr to false when omitted (unchanged behavior)", () => {
+      expect(resolveTerminalStatus(0, PR, false, "implementation")).toBe("completed");
+    });
   });
 
   describe("planning phase (read-only — no PR is ever produced)", () => {

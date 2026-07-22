@@ -427,7 +427,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       const provider = await providerForJob(registry, job);
       if (provider) await postSessionLogs(config, provider, job, context);
     },
-    findPrForIssue: (repo, issueIdentifier) => findPrForIssue(config, repo, issueIdentifier),
+    findPrForIssue: async (repo, issueIdentifier) =>
+      (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
   });
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
@@ -1591,7 +1592,7 @@ async function monitorGitHubActionsJob(
       // naming. Planning runs never open PRs — skip them so an implementation PR
       // from an earlier dispatch is not misattributed to a planning row.
       if (!prUrl && job.phase !== "planning") {
-        prUrl = await findPrForIssue(config, job.repo, job.issueIdentifier);
+        prUrl = (await findPrForIssue(config, job.repo, job.issueIdentifier))?.url ?? null;
       }
     }
 
@@ -1604,12 +1605,16 @@ async function monitorGitHubActionsJob(
   }
 }
 
-/** Search for an open PR whose branch starts with the issue identifier. */
+/**
+ * Search for an open PR whose branch starts with the issue identifier. Surfaces the PR's
+ * `draft` flag so callers can tell an unapproved-run draft PR apart from a normal one (see
+ * monitor-status.ts and the fly-machines/local-docker monitors).
+ */
 async function findPrForIssue(
   config: AppConfig,
   repo: string | null,
   issueIdentifier: string | null,
-): Promise<string | null> {
+): Promise<{ url: string; draft: boolean } | null> {
   const [owner, repoName] = (repo || "").split("/");
   if (!owner || !repoName || !issueIdentifier) return null;
 
@@ -1623,13 +1628,13 @@ async function findPrForIssue(
       },
     });
     if (prRes.ok) {
-      const prs = (await prRes.json()) as Array<{ html_url: string; head: { ref: string } }>;
+      const prs = (await prRes.json()) as Array<{ html_url: string; head: { ref: string }; draft?: boolean }>;
       // Accept both the legacy ${IDENTIFIER}/... branch shape and the TS
       // pipeline's ai-implement/${identifier}-... branch shape.
       const match = prs.find((pr) => {
         return branchMatchesIssueIdentifier(pr.head.ref, issueIdentifier);
       });
-      if (match) return match.html_url;
+      if (match) return { url: match.html_url, draft: match.draft === true };
     }
   } catch {
     // Non-critical
@@ -1715,11 +1720,16 @@ async function monitorFlyMachineJob(
     // Determine success/failure before destroying: move findPrForIssue before
     // destroyMachine so we can decide whether to fetch logs while the machine
     // is still accessible.
-    const prUrl = await findPrForIssue(config, job.repo, job.issueIdentifier);
+    const matchedPr = await findPrForIssue(config, job.repo, job.issueIdentifier);
+    const prUrl = matchedPr?.url ?? null;
+    // An unapproved run still pushes and opens a PR (exit 0), but leaves it a draft — the
+    // matched PR being a draft is as much "needs attention" as the pre-existing post-push-review
+    // check below, but the two must be handled differently: see the markReadyForReview guard.
+    const isDraftPr = matchedPr?.draft === true;
     // Use PR existence to distinguish success from failure:
     // if a PR was created, the session completed its job; otherwise it failed
     const reviewNeedsAttention = !!prUrl && postPushReviewNeedsAttention(job.id);
-    const jobStatus: JobStatus = resolveTerminalStatus(machineExitCode, prUrl, reviewNeedsAttention, job.phase);
+    const jobStatus: JobStatus = resolveTerminalStatus(machineExitCode, prUrl, reviewNeedsAttention, job.phase, isDraftPr);
 
     // Stamp pr_number on the machine before it's destroyed so reaper/audit
     // tools can read it. Only possible when machine is still accessible.
@@ -1768,11 +1778,19 @@ async function monitorFlyMachineJob(
     }
 
     if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
-      // On success, mark the Linear issue ready for review (swap AI-Working
-      // label for Ready for Review, post a PR-link comment). The poller won't
-      // re-dispatch issues with Ready for Review, so we don't need to clear
-      // the dedup entry.
-      await markReadyForReview(provider, job, prUrl);
+      if (isDraftPr) {
+        // Unapproved run: the runner callback (or, absent one, this job row + the
+        // status comment already posted above) owns the ticket transition for a
+        // draft PR. Overriding it with Ready for Review would silently promote an
+        // unreviewed change; resetting it would fight the callback's failure
+        // transition. Leave the ticket alone.
+      } else {
+        // On success, mark the Linear issue ready for review (swap AI-Working
+        // label for Ready for Review, post a PR-link comment). The poller won't
+        // re-dispatch issues with Ready for Review, so we don't need to clear
+        // the dedup entry.
+        await markReadyForReview(provider, job, prUrl);
+      }
     } else if (jobStatus === "failed") {
       // On failure/timeout, reset the Linear issue so it can be re-dispatched
       await resetTicket(provider, job);
@@ -1825,11 +1843,16 @@ async function monitorLocalDockerJob(
 
   if (state.exitCode === null) return;
 
-  const prUrl = state.exitCode === 0
+  const matchedPr = state.exitCode === 0
     ? await findPrForIssue(config, job.repo, job.issueIdentifier)
     : null;
+  const prUrl = matchedPr?.url ?? null;
+  // See the fly-machines monitor for why draft-ness is tracked separately from
+  // reviewNeedsAttention: both resolve to "review_failed", but only a draft PR must skip
+  // markReadyForReview/resetTicket below.
+  const isDraftPr = matchedPr?.draft === true;
   const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
-  const jobStatus = resolveTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention, job.phase);
+  const jobStatus = resolveTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention, job.phase, isDraftPr);
 
   if (jobStatus === "failed") {
     await postLocalContainerLogs(provider, job, state.exitCode === 0 ? "pr_not_found" : "container_failed");
@@ -1859,7 +1882,13 @@ async function monitorLocalDockerJob(
   }
 
   if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
-    await markReadyForReview(provider, job, prUrl);
+    if (isDraftPr) {
+      // Unapproved run: the runner callback (or, absent one, this job row + the
+      // status comment already posted above) owns the ticket transition for a
+      // draft PR — don't override it with Ready for Review.
+    } else {
+      await markReadyForReview(provider, job, prUrl);
+    }
   } else {
     await resetTicket(provider, job);
   }

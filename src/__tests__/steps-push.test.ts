@@ -720,6 +720,11 @@ describe("pushStep draft PRs", () => {
     expect(body.body).toContain("Missing tests for the retry path.");
     expect(body.body).toContain("iterations_exhausted");
     expect(body.body).toContain("Post-mortem");
+    // The test-plan line must not contradict the unapproved section above it: no
+    // testsSummary/preflight summary was supplied, so the fallback must say
+    // verification was skipped (unchecked box), not that it ran (checked box).
+    expect(body.body).toContain("- [ ] Automated verification was skipped — the review loop did not approve this change.");
+    expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
 
   it("falls back to a titled normal PR when the draft flag is rejected (422, no existing PR)", async () => {

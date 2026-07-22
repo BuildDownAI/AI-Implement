@@ -249,10 +249,16 @@ function buildPullRequestBody(
   const implementationSummary =
     stringValue(inputs.implementationSummary) ??
     `Implemented the requested work for ${issueIdentifier}: ${title}.`;
+  const explicitTestsSummary = stringValue(inputs.testsSummary) ?? stringValue(preflightOutputs.summary);
+  // No explicit/preflight summary to fall back on: say what actually happened. An unapproved
+  // run (reviewSummary present) skipped preflight/verify entirely — claiming verification ran
+  // would contradict the "Automated review did not approve" section above it.
   const testsSummary =
-    stringValue(inputs.testsSummary) ??
-    stringValue(preflightOutputs.summary) ??
-    "Automated verification was run by the AI-Implement pipeline before opening this PR.";
+    explicitTestsSummary ??
+    (inputs.reviewSummary
+      ? "Automated verification was skipped — the review loop did not approve this change."
+      : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  const testsSummaryChecked = explicitTestsSummary != null || !inputs.reviewSummary;
 
   const unapprovedSection = buildUnapprovedSection(inputs.reviewSummary as ReviewSummary | undefined, inputs.draft === true);
 
@@ -267,7 +273,7 @@ function buildPullRequestBody(
     changedFilesSummary ? `\nChanged files:\n${changedFilesSummary}` : "",
     "",
     "## Test plan",
-    `- [x] ${testsSummary}`,
+    `- [${testsSummaryChecked ? "x" : " "}] ${testsSummary}`,
     "- [ ] Manual: review the changed behavior against the ticket acceptance criteria.",
     "",
     `Fixes ${issueIdentifier}`,

@@ -434,14 +434,13 @@ describe("loadPipelineDefinition", () => {
   });
 
   describe("unapproved wiring", () => {
-    it("push never skips, and wires draft + reviewSummary from feedback-loop outputs", () => {
+    it("push on an initial run (no prNumber) never skips, and wires draft + reviewSummary from feedback-loop outputs", () => {
       const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
         existsSyncImpl: () => false,
         readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
       });
 
       const push = pipeline.steps.find((s) => s.id === "push")!;
-      expect(push.skip).toBeUndefined();
 
       const ctx = makeContext();
       ctx.setOutputs("feedback-loop", {
@@ -451,6 +450,7 @@ describe("loadPipelineDefinition", () => {
         terminationReason: "iterations_exhausted",
         passes: [{ iteration: 1, implementTurns: 98, implementOutcome: "success", costUsd: 1, reviewApproved: false }],
       });
+      expect(push.skip?.(ctx)).toBe(false);
       const inputs = ctx.resolveInputs(push.inputs);
       expect(inputs.draft).toBe(true);
       expect((inputs.reviewSummary as { finalFeedback: string }).finalFeedback).toBe("nope");
@@ -484,6 +484,44 @@ describe("loadPipelineDefinition", () => {
       ctx.setOutputs("feedback-loop", { approved: false });
       ctx.setOutputs("push", { branchPushed: true, prNumber: 9 });
       expect(ppr.skip!(ctx)).toBe(true);
+    });
+  });
+
+  describe("push skip for gap-fill runs", () => {
+    it("skips push when prNumber is set (gap-fill) and feedback-loop was not approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext({ prNumber: "42" });
+      ctx.setOutputs("feedback-loop", { approved: false });
+      expect(push.skip?.(ctx)).toBe(true);
+    });
+
+    it("does not skip push when prNumber is set (gap-fill) and feedback-loop approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext({ prNumber: "42" });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      expect(push.skip?.(ctx)).toBe(false);
+    });
+
+    it("does not skip push on an initial run (no prNumber) even when feedback-loop was not approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext();
+      ctx.setOutputs("feedback-loop", { approved: false });
+      expect(push.skip?.(ctx)).toBe(false);
     });
   });
 });

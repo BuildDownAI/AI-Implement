@@ -149,11 +149,19 @@ function applyWiring(step: YamlStep): StepDefinition {
       };
 
     case "push":
-      // Push always runs after the feedback loop: unapproved work ships as a
-      // draft PR (with the reviewer feedback in the body) instead of being
-      // silently discarded. "Nothing to commit" remains a loud failure.
+      // Push always runs after the feedback loop on an initial run: unapproved work ships
+      // as a draft PR (with the reviewer feedback in the body) instead of being silently
+      // discarded. Gap-fill runs are different: Claude commits and pushes to the *existing*
+      // PR branch itself (the pipeline never owns git there — see run-autonomous.ts's
+      // gap-fill prompt). If the feedback loop doesn't approve a gap-fill, the tree Claude
+      // left behind is already clean/unchanged, so running push here would just throw
+      // "Nothing to commit" and turn a handled outcome into a generic red failure. Skip push
+      // in that one case; run-autonomous.ts's outcome derivation already produces a proper
+      // failure callback (code, no prUrl, autopsy) when push never ran.
       return {
         ...step,
+        skip: (ctx: PipelineContext) =>
+          Boolean(ctx.data.prNumber) && ctx.getOutputs("feedback-loop").approved !== true,
         inputs: (ctx: PipelineContext) => {
           const fb = ctx.getOutputs("feedback-loop");
           const approved = fb.approved === true;

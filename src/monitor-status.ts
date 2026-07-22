@@ -21,16 +21,23 @@ export function workflowFileForJob(
  * across execution paths. `exitCode` is null only when it can't be read (a fly machine already
  * destroyed before we polled, or a clean exit 0 that Fly reports without an exit_code); a
  * definite non-zero exit is always a failure.
+ *
+ * `isDraftPr` covers the unapproved-run case: the runner still pushed and opened a PR (exit 0),
+ * but the feedback loop never approved it, so the PR it opened is a draft. That's the same
+ * "review_failed" outcome as `reviewNeedsAttention` (the pre-existing post-push-review check),
+ * but callers must not treat the two the same way afterward — a draft PR must not be handed to
+ * markReadyForReview/markPrReady (see the fly-machines/local-docker monitor call sites).
  */
 export function resolveTerminalStatus(
   exitCode: number | null,
   prUrl: string | null,
   reviewNeedsAttention: boolean,
   phase: string,
+  isDraftPr = false,
 ): JobStatus {
   if (exitCode !== null && exitCode !== 0) return "failed";
   // Planning is read-only — it posts a plan, never a PR — so a clean/unknown exit is success.
   if (phase === "planning") return "completed";
   if (!prUrl) return "failed";
-  return reviewNeedsAttention ? "review_failed" : "completed";
+  return reviewNeedsAttention || isDraftPr ? "review_failed" : "completed";
 }
