@@ -57,10 +57,6 @@ export async function postRunnerResult(params: {
   const callbackUrl = params.callbackUrl ?? process.env.RUNNER_CALLBACK_URL;
   const runToken = process.env.RUN_TOKEN;
   if (!callbackUrl || !runToken) return;
-  if (params.phase === "implementation" && params.outcome === "success" && !params.prUrl) {
-    console.warn("RUNNER_CALLBACK_URL set but no PR URL; skipping callback.");
-    return;
-  }
   let comments: Array<{ body: string }> = [];
   try {
     comments = collectRunnerComments(params.workspaceDir);
