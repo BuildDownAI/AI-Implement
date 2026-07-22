@@ -46,6 +46,8 @@ export async function postRunnerResult(params: {
   failureReason?: string;
   /** Machine-readable code set when a known guardrail trips (e.g. "SENSITIVE_FILES_BLOCKED"). */
   failureCode?: string;
+  /** True when a grouping-parent run produced no changes; skips prUrl requirement on the callback. */
+  noWork?: boolean;
   /**
    * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
    * Falls back to the legacy RUNNER_CALLBACK_URL env var (never set in GHA envelope mode,
@@ -67,6 +69,7 @@ export async function postRunnerResult(params: {
   if (params.prUrl) body.prUrl = params.prUrl;
   if (params.failureReason) body.failureReason = params.failureReason;
   if (params.failureCode) body.failureCode = params.failureCode;
+  if (params.noWork) body.noWork = params.noWork;
   const fetchFn = params.fetchImpl ?? fetch;
   try {
     const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {

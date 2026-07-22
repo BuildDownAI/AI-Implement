@@ -145,6 +145,9 @@ export interface ResolvedRunnerInputs {
   provider: string;
   claudeModel: string | undefined;
   logLevel: LogLevel;
+  /** True when this is a grouping parent's own closing-work run (from run_config.groupingParent
+   *  or AI_IMPLEMENT_GROUPING_PARENT env var). Lets push.ts finalize cleanly with no PR. */
+  groupingParent: boolean;
 }
 
 function parseEnvInt(raw: string | undefined, name: string): number | undefined {
@@ -206,6 +209,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     provider: env.PROVIDER || "anthropic",
     claudeModel: env.CLAUDE_MODEL?.trim() || undefined,
     logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
+    groupingParent: cfg.groupingParent === true,
   };
 }
 
@@ -276,6 +280,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     provider: env.PROVIDER || "anthropic",
     claudeModel: env.CLAUDE_MODEL?.trim() || undefined,
     logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
+    groupingParent: env.AI_IMPLEMENT_GROUPING_PARENT === "true",
   };
 }
 
@@ -303,6 +308,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     logLevel,
     provider,
     claudeModel,
+    groupingParent,
   } = resolveRunnerInputs(process.env);
   const branch = resolveBranch(workspaceDir);
 
@@ -395,6 +401,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       skillsRepo,
       sensitiveFiles,
       profiles,
+      groupingParent,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,
@@ -410,6 +417,22 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const pushOutputs = context.getOutputs("push");
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
     const approved = fbOutputs.approved === true;
+
+    // Case B: grouping-parent run where the agent produced genuinely no changes. Push returned
+    // a no-op (branchPushed=false, prUrl=null). Report success without a prUrl so the
+    // orchestrator finalizes the issue and merge-up.ts opens the feature→base roll-up PR.
+    if (context.data.groupingParent && pushOutputs.branchPushed === false && !prUrl) {
+      disposition = "no-op (grouping parent: no own work; finalized for roll-up)";
+      await postRunnerResult({
+        workspaceDir,
+        phase: runnerPhase,
+        outcome: "success",
+        noWork: true,
+        callbackUrl,
+        fetchImpl: opts.fetchImpl,
+      });
+      return { exitCode: 0 };
+    }
 
     if (approved && prUrl) {
       disposition = `PR ${prUrl} (approved after ${typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?"} iteration(s))`;

@@ -17,6 +17,10 @@ export interface RunnerResultBody {
   failureCode?: string;
   comments: Array<{ body: string }>;
   prUrl?: string;
+  /** True when a grouping-parent implementation run produced no changes (Case B).
+   *  Allows a successful callback without prUrl; the orchestrator finalizes the issue
+   *  directly so merge-up.ts can open the feature→base roll-up PR. */
+  noWork?: boolean;
 }
 
 export interface HandleRunnerResultInput {
@@ -175,7 +179,8 @@ export async function handleRunnerResult(
   if (
     input.body.outcome === "success" &&
     input.body.phase === "implementation" &&
-    !input.body.prUrl
+    !input.body.prUrl &&
+    !input.body.noWork
   ) {
     return bad(400, "missing_prUrl");
   }
@@ -250,14 +255,25 @@ export async function handleRunnerResult(
       updateJobStatus(job.id, "completed", "planning_callback");
     }
   } else if (input.body.phase === "implementation") {
-    try {
-      await provider.markPrReady(claims.issueId, mappingTeamKey, input.body.prUrl!);
-    } catch (err) {
-      warn("markPrReady", err);
-    }
-    const job = getJobByDispatchId(claims.dispatchId);
-    if (job) {
-      updateJobPrUrl(job.id, input.body.prUrl!);
+    if (input.body.noWork) {
+      // Grouping-parent no-op: the agent produced no changes. Finalize the issue
+      // directly (clearing AI-Working) so fetchFeatureNodeRollUps finds it completed
+      // and merge-up.ts can open the feature→base roll-up PR.
+      try {
+        await provider.markMerged(claims.issueId, mappingTeamKey);
+      } catch (err) {
+        warn("markMerged", err);
+      }
+    } else {
+      try {
+        await provider.markPrReady(claims.issueId, mappingTeamKey, input.body.prUrl!);
+      } catch (err) {
+        warn("markPrReady", err);
+      }
+      const job = getJobByDispatchId(claims.dispatchId);
+      if (job) {
+        updateJobPrUrl(job.id, input.body.prUrl!);
+      }
     }
   } else if (input.body.phase === "gap-analysis") {
     const job = getJobByDispatchId(claims.dispatchId);
