@@ -8,9 +8,13 @@ vi.mock("../pipeline/steps/implement.js", () => ({
   implementStep: { run: vi.fn() },
 }));
 
-vi.mock("../pipeline/steps/review.js", () => ({
-  reviewStep: { run: vi.fn() },
-}));
+vi.mock("../pipeline/steps/review.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../pipeline/steps/review.js")>();
+  return {
+    ...actual,
+    reviewStep: { run: vi.fn() },
+  };
+});
 
 import { spawnSync } from "node:child_process";
 import { implementStep } from "../pipeline/steps/implement.js";
@@ -485,5 +489,93 @@ describe("feedbackLoopStep caps", () => {
     );
 
     expect(outputs.iterations).toBe(5);
+  });
+});
+
+const MAX_TURNS_TELEMETRY = {
+  outcome: "max_turns" as const, numTurns: 50, durationMs: 60000,
+  costUsd: 2.5, tokensIn: 1000, tokensOut: 500,
+  toolTrace: ["Bash npm test", "Read /src/app.ts"],
+};
+
+function makeContextWithExecutor(invoke: ReturnType<typeof vi.fn>): DefaultPipelineContext {
+  return new DefaultPipelineContext(
+    {
+      jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
+      issueDescription: "Description", nonce: "nonce", orchestratorUrl: "http://localhost:8080",
+    },
+    { invoke },
+  );
+}
+
+describe("feedbackLoopStep termination reasons", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it("reports terminationReason=approved with per-pass stats", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({
+      ...IMPLEMENT_OUTPUTS,
+      telemetry: { outcome: "success", numTurns: 12, durationMs: 1, costUsd: 0.3, tokensIn: 1, tokensOut: 1, toolTrace: [] },
+    });
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.terminationReason).toBe("approved");
+    expect(outputs.passes).toEqual([
+      { iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true },
+    ]);
+  });
+
+  it("reports terminationReason=iterations_exhausted when all reviews reject", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValue(REJECTED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("iterations_exhausted");
+    expect(outputs.passes).toHaveLength(3);
+    expect(outputs.passes[0].reviewApproved).toBe(false);
+  });
+
+  it("reports terminationReason=review_error when the review step throws", async () => {
+    vi.mocked(reviewStep.run).mockRejectedValueOnce(new Error("Prompt is too long"));
+
+    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("review_error");
+    expect(outputs.iterations).toBe(1);
+  });
+
+  it("stops on max_turns, skips review, runs the post-mortem, and returns it", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nRan out of turns wiring X.", exitCode: 0, tokensUsed: 10 });
+
+    const outputs = await feedbackLoopStep.run(makeContextWithExecutor(invoke), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("max_turns");
+    expect(outputs.iterations).toBe(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+    expect(outputs.postMortem).toContain("Ran out of turns");
+    // Post-mortem is read-only and capped
+    const call = invoke.mock.calls[0][0];
+    expect(call.tools).toEqual(["Read", "Glob", "Grep", "Bash(curl *)"]);
+    expect(call.maxTurns).toBe(15);
+    expect(call.prompt).toContain("Bash npm test"); // tool trace embedded
+  });
+
+  it("post-mortem failure is non-fatal", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const invoke = vi.fn().mockRejectedValue(new Error("boom"));
+
+    const outputs = await feedbackLoopStep.run(makeContextWithExecutor(invoke), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.terminationReason).toBe("max_turns");
+    expect(outputs.postMortem).toBeUndefined();
   });
 });

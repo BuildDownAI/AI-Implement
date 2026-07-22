@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
-import type { PipelineContext, Step, StepModule, StepReporter } from "../types.js";
+import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { implementStep } from "./implement.js";
 import { reviewStep } from "./review.js";
+import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { capDiff } from "./review.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -28,10 +30,23 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   parentStepId?: string;
 }
 
+export type TerminationReason = "approved" | "iterations_exhausted" | "review_error" | "max_turns";
+
+export interface PassStat extends Record<string, unknown> {
+  iteration: number;
+  implementTurns: number | null;
+  implementOutcome: string;   // RunTelemetry outcome or "unknown"
+  costUsd: number | null;
+  reviewApproved: boolean | null; // null when review never ran on this pass
+}
+
 interface FeedbackLoopOutputs extends Record<string, unknown> {
   approved: boolean;
   iterations: number;
   finalFeedback: string;
+  terminationReason: TerminationReason;
+  passes: PassStat[];
+  postMortem?: string;
 }
 
 function buildImplementPrompt(
@@ -98,6 +113,82 @@ export function getDiff(workspaceDir: string): string {
   return result.stdout.toString();
 }
 
+const POST_MORTEM_MAX_TURNS = 15;
+
+function buildPostMortemPrompt(params: {
+  issueTitle: string;
+  issueDescription: string;
+  diff: string;
+  telemetry: RunTelemetry;
+  maxTurns: number;
+}): string {
+  const { issueTitle, issueDescription, diff, telemetry, maxTurns } = params;
+  const trace = (telemetry.toolTrace ?? []).join("\n") || "(no tool trace captured)";
+  return `An AI implementation session hit its turn cap (${telemetry.numTurns ?? "?"}/${maxTurns} turns) before completing. Write a concise post-mortem in markdown. You have read-only access to the workspace.
+
+Answer, with headers:
+1. **Where the turns went** — summarize the phases of work from the tool trace.
+2. **What is complete** — based on the diff.
+3. **What remains** — concrete missing pieces vs. the issue requirements.
+4. **Why it likely didn't converge** — over-broad scope, missing prerequisites, thin context, or environment friction. Be specific.
+
+Issue: ${issueTitle}
+
+Description:
+${issueDescription}
+
+## Working-tree diff
+\`\`\`diff
+${capDiff(diff)}
+\`\`\`
+
+## Tool trace (chronological)
+${trace}`;
+}
+
+/** Read-only post-mortem invocation. Non-fatal: returns null on any failure. */
+async function runPostMortem(
+  context: PipelineContext,
+  params: { issueTitle: string; issueDescription: string; diff: string; telemetry: RunTelemetry; maxTurns: number; model: string; iteration: number; parentStepId: string },
+  reporter: StepReporter,
+): Promise<string | null> {
+  const subStep: Step = {
+    id: `post-mortem.${params.iteration}`,
+    type: "custom",
+    status: "running",
+    started_at: new Date().toISOString(),
+    ended_at: null,
+    parent_step_id: params.parentStepId,
+    inputs: { iteration: params.iteration, maxTurns: params.maxTurns },
+    outputs: {},
+    logs_url: null,
+  };
+  await reporter.report(subStep);
+  try {
+    const result = await context.llmExecutor.invoke({
+      prompt: buildPostMortemPrompt(params),
+      model: params.model,
+      maxTurns: POST_MORTEM_MAX_TURNS,
+      tools: READ_ONLY_ALLOWED_TOOLS,
+    });
+    if (result.exitCode !== 0 || !result.stdout.trim()) {
+      throw new Error(`post-mortem invocation exited ${result.exitCode}`);
+    }
+    subStep.status = "passed";
+    subStep.ended_at = new Date().toISOString();
+    subStep.outputs = { length: result.stdout.length };
+    await reporter.report(subStep);
+    return result.stdout.trim();
+  } catch (err) {
+    subStep.status = "failed";
+    subStep.ended_at = new Date().toISOString();
+    subStep.outputs = { error: String(err) };
+    await reporter.report(subStep);
+    console.warn(`[feedback-loop] post-mortem failed (non-fatal): ${String(err)}`);
+    return null;
+  }
+}
+
 /**
  * Orchestrates the implement→review loop. Each iteration is reported as a sub-step
  * with parent_step_id pointing to the enclosing feedback-loop step id.
@@ -133,6 +224,9 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     let iteration = 0;
     let approved = false;
     let feedback = "";
+    let terminationReason: TerminationReason = "iterations_exhausted";
+    const passes: PassStat[] = [];
+    let postMortem: string | undefined;
 
     while (iteration < effectiveMaxIterations && !approved) {
       iteration++;
@@ -165,8 +259,9 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       };
       await reporter.report(implementSubStep);
 
+      let implementOutputs: Awaited<ReturnType<typeof implementStep.run>>;
       try {
-        const implementOutputs = await implementStep.run(
+        implementOutputs = await implementStep.run(
           context,
           {
             workspaceDir: String(inputs.workspaceDir),
@@ -190,7 +285,41 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         throw err;
       }
 
+      const implementTelemetry = implementOutputs.telemetry as RunTelemetry | undefined;
+      const pass: PassStat = {
+        iteration,
+        implementTurns: implementTelemetry?.numTurns ?? null,
+        implementOutcome: implementTelemetry?.outcome ?? "unknown",
+        costUsd: implementTelemetry?.costUsd ?? null,
+        reviewApproved: null,
+      };
+      passes.push(pass);
+
       const diff = getDiff(String(inputs.workspaceDir));
+
+      // Hard max_turns: the pass ran out of budget mid-work. Reviewing or
+      // re-implementing an over-scoped task just burns more passes — stop,
+      // post-mortem where the turns went, and let the pipeline open a draft PR.
+      if (implementTelemetry?.outcome === "max_turns") {
+        terminationReason = "max_turns";
+        feedback = `Implementation hit the ${effectiveMaxTurns}-turn cap before completing (${implementTelemetry.numTurns ?? "?"} turns used).`;
+        postMortem =
+          (await runPostMortem(
+            context,
+            {
+              issueTitle: String(inputs.issueTitle),
+              issueDescription: String(inputs.issueDescription),
+              diff,
+              telemetry: implementTelemetry,
+              maxTurns: effectiveMaxTurns,
+              model: resolvedReviewModel,
+              iteration,
+              parentStepId,
+            },
+            reporter,
+          )) ?? undefined;
+        break;
+      }
 
       // --- review sub-step ---
       const reviewSubStep: Step = {
@@ -232,6 +361,8 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
 
         approved = reviewOutputs.approved;
         feedback = reviewOutputs.feedback;
+        pass.reviewApproved = reviewOutputs.approved;
+        if (approved) terminationReason = "approved";
       } catch (err) {
         // A review failure (e.g. "Prompt is too long", a transient API error)
         // is NOT actionable feedback and must not discard a successful
@@ -243,14 +374,20 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         reviewSubStep.outputs = { error: String(err) };
         await reporter.report(reviewSubStep);
         console.warn(
-          `[feedback-loop] Review step failed on iteration ${iteration}; skipping review and proceeding to push: ${String(err)}`,
+          `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
         );
         approved = false;
         feedback = `Review step failed and was skipped: ${String(err)}`;
+        terminationReason = "review_error";
         break;
       }
     }
 
-    return { approved, iterations: iteration, finalFeedback: feedback };
+    if (!approved) {
+      console.warn(
+        `[feedback-loop] exited without approval (${terminationReason}) after ${iteration}/${effectiveMaxIterations} iteration(s). Final feedback: ${feedback || "(none)"}`,
+      );
+    }
+    return { approved, iterations: iteration, finalFeedback: feedback, terminationReason, passes, ...(postMortem ? { postMortem } : {}) };
   },
 };
