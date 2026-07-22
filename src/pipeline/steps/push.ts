@@ -188,11 +188,11 @@ async function createOrFindPullRequest(
       const listBody = await listRes.text().catch(() => "");
       throw new Error(`PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`);
     }
-    const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown }>;
+    const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown; draft?: unknown }>;
     if (prs.length > 0) {
       const existing = prs[0];
       if (typeof existing.html_url === "string" && typeof existing.number === "number") {
-        return { url: existing.html_url, number: existing.number, draft: false };
+        return { url: existing.html_url, number: existing.number, draft: existing.draft === true };
       }
     }
     if (draft) {

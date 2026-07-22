@@ -761,7 +761,7 @@ describe("pushStep draft PRs", () => {
       .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "exists" } as Response)
       .mockResolvedValueOnce({
         ok: true, status: 200,
-        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8 }],
+        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: true }],
         text: async () => "",
       } as Response);
 
@@ -772,6 +772,26 @@ describe("pushStep draft PRs", () => {
     );
 
     expect(outputs.prNumber).toBe(8);
+    expect(outputs.draft).toBe(true);
+  });
+
+  it("reports draft=false when the 422-resolved existing PR is not a draft", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "exists" } as Response)
+      .mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: false }],
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(false);
   });
 
   it("non-draft pushes send no draft flag and no unapproved section", async () => {
