@@ -411,8 +411,14 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
     const approved = fbOutputs.approved === true;
 
-    if (approved && prUrl) {
-      disposition = `PR ${prUrl} (approved after ${typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?"} iteration(s))`;
+    // A gap-fill run (prNumber set) never produces push outputs: the pipeline skips
+    // push because Claude commits and pushes to the existing PR branch itself. An
+    // approved gap-fill without a prUrl is therefore a success, not REVIEW_UNAPPROVED.
+    if (approved && (prUrl || prNumber)) {
+      const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?";
+      disposition = prUrl
+        ? `PR ${prUrl} (approved after ${iterations} iteration(s))`
+        : `gap-fill on PR #${prNumber} (approved after ${iterations} iteration(s))`;
       await postRunnerResult({
         workspaceDir,
         phase: runnerPhase,

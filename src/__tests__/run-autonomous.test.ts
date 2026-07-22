@@ -879,9 +879,9 @@ describe("runAutonomous", () => {
 
   it("gap-fill run (prNumber set, unapproved) skips push — outcome derivation still reports a coded failure with no prUrl", async () => {
     // Mirrors pipeline-loader.ts's push skip condition for gap-fill runs: Claude owns git on
-    // the existing PR branch there, so an unapproved gap-fill must not run push against an
+    // the existing PR branch there, so a gap-fill run must not run push against an
     // already-clean tree (it would throw "Nothing to commit"). This verifies the skip and the
-    // existing outcome-derivation fallback compose correctly — no change to run-autonomous.ts.
+    // outcome-derivation fallback compose correctly for the unapproved case.
     vi.stubEnv("PR_NUMBER", "42");
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
@@ -896,7 +896,7 @@ describe("runAutonomous", () => {
           id: "push",
           type: "custom",
           moduleId: "push",
-          skip: (ctx) => Boolean(ctx.data.prNumber) && ctx.getOutputs("feedback-loop").approved !== true,
+          skip: (ctx) => Boolean(ctx.data.prNumber),
         },
       ],
     };
@@ -930,6 +930,57 @@ describe("runAutonomous", () => {
     };
     expect(body.outcome).toBe("failure");
     expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
+    expect(body.prUrl).toBeUndefined();
+  });
+
+  it("gap-fill run (prNumber set, approved) with push skipped posts a gap-analysis success callback and exits 0", async () => {
+    // Approved gap-fill: Claude already committed and pushed to the existing PR branch
+    // itself, so push is skipped and there are no push outputs (no prUrl). That is a
+    // successful gap-analysis run — it must NOT fall down the REVIEW_UNAPPROVED path.
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const pushRun = vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/1", prNumber: 1, branchPushed: true });
+    const pipeline: PipelineDefinition = {
+      id: "test",
+      steps: [
+        { id: "feedback-loop", type: "custom", moduleId: "feedback-loop" },
+        {
+          id: "push",
+          type: "custom",
+          moduleId: "push",
+          skip: (ctx) => Boolean(ctx.data.prNumber),
+        },
+      ],
+    };
+    const runner = new PipelineRunner()
+      .register("feedback-loop", {
+        run: vi.fn().mockResolvedValue({ approved: true, iterations: 2, terminationReason: "approved", passes: [] }),
+      })
+      .register("push", { run: pushRun });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(pushRun).not.toHaveBeenCalled();
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+      failureCode?: string;
+      prUrl?: string;
+    };
+    expect(body.phase).toBe("gap-analysis");
+    expect(body.outcome).toBe("success");
+    expect(body.failureCode).toBeUndefined();
     expect(body.prUrl).toBeUndefined();
   });
 
