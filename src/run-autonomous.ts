@@ -400,6 +400,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     llmExecutor,
   );
 
+  let disposition: string | undefined;
+
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
     const runner = opts.runner ?? (await createDefaultRunner());
@@ -410,6 +412,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const approved = fbOutputs.approved === true;
 
     if (approved && prUrl) {
+      disposition = `PR ${prUrl} (approved after ${typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?"} iteration(s))`;
       await postRunnerResult({
         workspaceDir,
         phase: runnerPhase,
@@ -433,6 +436,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const failureReason =
       `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
       finalFeedback.slice(0, 500);
+
+    disposition = `${prUrl ? `draft PR ${prUrl}` : "no PR"} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
 
     writeRunAutopsy(workspaceDir, {
       issueIdentifier,
@@ -460,6 +465,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     return { exitCode: 0 };
   } catch (err) {
     console.error(`Pipeline failed: ${err}`);
+    disposition = `failed: ${err instanceof Error ? err.message : String(err)}`;
     await postRunnerResult({
       workspaceDir,
       phase: runnerPhase,
@@ -473,7 +479,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   } finally {
     try {
       if (timing.records().length > 0) {
-        console.error(formatSummary(timing, issueIdentifier));
+        console.error(formatSummary(timing, issueIdentifier, disposition));
       }
     } catch (summaryErr) {
       console.error(`timing summary failed: ${summaryErr}`);

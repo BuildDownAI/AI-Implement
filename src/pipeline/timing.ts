@@ -8,6 +8,8 @@ export interface TimingRecord {
   parentId: string | null;
   ms: number;
   kind: "step" | "span";
+  /** True when the step was skipped (rendered as "skipped", excluded from dominant). */
+  skipped?: boolean;
 }
 
 /** Human duration: sub-second precision below 10s, `MmSSs` at/above. */
@@ -52,11 +54,11 @@ const PREFIX = "[timing]";
  * listed beneath it, indented, in insertion order. The total counts top-level
  * steps only (children are already inside their parent's wall-clock).
  */
-export function formatSummary(collector: TimingCollector, identifier: string): string {
+export function formatSummary(collector: TimingCollector, identifier: string, disposition?: string): string {
   const records = collector.records();
   const topLevel = records.filter((r) => r.kind === "step" && r.parentId === null);
   const totalMs = topLevel.reduce((sum, r) => sum + r.ms, 0);
-  const dominant = topLevel.reduce<TimingRecord | null>(
+  const dominant = topLevel.filter((r) => !r.skipped).reduce<TimingRecord | null>(
     (max, r) => (max === null || r.ms > max.ms ? r : max),
     null,
   );
@@ -67,15 +69,19 @@ export function formatSummary(collector: TimingCollector, identifier: string): s
 
   for (const step of topLevel) {
     // Only flag a dominant step when there's more than one to compare against;
-    // a single-step run has nothing to be "dominant" over.
-    const mark = topLevel.length > 1 && step === dominant ? "   ⚠ dominant" : "";
-    lines.push(`${PREFIX}   ${step.label.padEnd(18)} ${formatDuration(step.ms).padStart(7)}${mark}`);
+    // a single-step run has nothing to be "dominant" over. Skipped steps are
+    // never dominant (they render "skipped" in place of a duration).
+    const mark = !step.skipped && topLevel.length > 1 && step === dominant ? "   ⚠ dominant" : "";
+    const duration = step.skipped ? "skipped" : formatDuration(step.ms);
+    lines.push(`${PREFIX}   ${step.label.padEnd(18)} ${duration.padStart(7)}${mark}`);
     const children = records.filter((r) => r.parentId === step.label);
     children.forEach((child, i) => {
       const branch = i === children.length - 1 ? "└" : "├";
       lines.push(`${PREFIX}     ${branch} ${child.label.padEnd(16)} ${formatDuration(child.ms).padStart(7)}`);
     });
   }
+
+  if (disposition) lines.push(`${PREFIX}   outcome: ${disposition}`);
 
   return lines.join("\n");
 }
@@ -149,6 +155,14 @@ export class TimingStepReporter implements StepReporter {
           });
         }
       }
+    } else if (step.status === "skipped") {
+      this.collector.record({
+        label: step.id,
+        parentId: step.parent_step_id,
+        ms: 0,
+        kind: "step",
+        skipped: true,
+      });
     }
     await this.inner.report(step);
   }
