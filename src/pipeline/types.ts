@@ -101,6 +101,8 @@ export interface RunTelemetry {
   costUsd: number | null;
   tokensIn: number | null;
   tokensOut: number | null;
+  /** Compact per-call tool trace ("ToolName input-summary"), capped; last entry may be a truncation marker. */
+  toolTrace?: string[];
 }
 
 export interface LLMResult {

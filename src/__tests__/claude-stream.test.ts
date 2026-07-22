@@ -3,6 +3,7 @@ import {
   parseLine,
   finalText,
   extractTelemetry,
+  extractToolTrace,
   formatEvent,
   summaryLine,
   type StreamEvent,
@@ -72,6 +73,7 @@ describe("extractTelemetry", () => {
       costUsd: 0.83,
       tokensIn: 182000,
       tokensOut: 4100,
+      toolTrace: ["Bash pnpm check"],
     });
   });
   it("maps error_max_turns to outcome=max_turns", () => {
@@ -87,6 +89,7 @@ describe("extractTelemetry", () => {
       costUsd: null,
       tokensIn: null,
       tokensOut: null,
+      toolTrace: [],
     });
   });
   it("tolerates a Bedrock result with no cost", () => {
@@ -159,5 +162,42 @@ describe("summaryLine", () => {
   it("shows max_turns outcome at summary level", () => {
     expect(summaryLine({ outcome: "max_turns", numTurns: 50, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null }))
       .toBe("[claude] result=max_turns turns=50");
+  });
+});
+
+describe("extractToolTrace", () => {
+  const toolTraceEvent = (name: string, input: Record<string, unknown>) => ({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", name, input }] },
+  });
+
+  it("collects tool calls as 'name input-summary' entries", () => {
+    const events = [
+      toolTraceEvent("Bash", { command: "npm test" }),
+      toolTraceEvent("Read", { file_path: "/src/app.ts" }),
+      { type: "result", subtype: "success" },
+    ];
+    expect(extractToolTrace(events)).toEqual(["Bash npm test", "Read /src/app.ts"]);
+  });
+
+  it("caps entries and appends a truncation marker", () => {
+    const events = Array.from({ length: 5 }, (_, i) => toolTraceEvent("Bash", { command: `cmd${i}` }));
+    const trace = extractToolTrace(events, 3);
+    expect(trace).toHaveLength(4);
+    expect(trace[3]).toBe("… 2 more tool calls truncated");
+  });
+
+  it("returns [] when there are no tool calls", () => {
+    expect(extractToolTrace([{ type: "result", subtype: "success" }])).toEqual([]);
+  });
+});
+
+describe("extractTelemetry toolTrace", () => {
+  it("includes the tool trace in telemetry", () => {
+    const events = [
+      { type: "assistant", message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "/a" } }] } },
+      { type: "result", subtype: "success", num_turns: 3 },
+    ];
+    expect(extractTelemetry(events).toolTrace).toEqual(["Read /a"]);
   });
 });
