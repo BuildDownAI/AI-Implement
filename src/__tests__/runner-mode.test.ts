@@ -177,4 +177,36 @@ describe("runner-mode", () => {
       expect(runnerMode.isRunnerMode(null)).toBe(false);
     });
   });
+
+  describe("resolveRunnerCallbackBaseUrl", () => {
+    it("returns the explicit env value regardless of mode", () => {
+      expect(
+        runnerMode.resolveRunnerCallbackBaseUrl({
+          RUNNER_CALLBACK_BASE_URL: "https://orch.example.com",
+          RUNNER_MODE: "local",
+          PORT: "9999",
+        }),
+      ).toEqual({ url: "https://orch.example.com", source: "env" });
+    });
+
+    it("defaults to host.docker.internal on the configured port when RUNNER_MODE=local", () => {
+      expect(
+        runnerMode.resolveRunnerCallbackBaseUrl({ RUNNER_MODE: "local", PORT: "3000" }),
+      ).toEqual({ url: "http://host.docker.internal:3000", source: "local-default" });
+    });
+
+    it("defaults the port to 8080 when PORT is unset", () => {
+      expect(
+        runnerMode.resolveRunnerCallbackBaseUrl({ RUNNER_MODE: "local" }),
+      ).toEqual({ url: "http://host.docker.internal:8080", source: "local-default" });
+    });
+
+    it("stays unset for non-local modes", () => {
+      for (const RUNNER_MODE of [undefined, "default", "gha", "fly", "shadow"]) {
+        expect(
+          runnerMode.resolveRunnerCallbackBaseUrl({ RUNNER_MODE, PORT: "3000" }),
+        ).toEqual({ url: null, source: "unset" });
+      }
+    });
+  });
 });

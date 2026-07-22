@@ -3,6 +3,7 @@ import {
   buildDockerEnvFileContent,
   buildDockerRunArgs,
   buildLocalRunnerEnv,
+  selectSweepableContainers,
   splitLocalRunnerEnv,
 } from "../local-docker.js";
 import type { LocalRunnerInput } from "../local-docker.js";
@@ -246,5 +247,31 @@ describe("buildDockerEnvFileContent", () => {
 
     expect(content).toContain("MULTILINE_SECRET=-----BEGIN-----\\nkey\\n-----END-----");
     expect(content).toContain("SESSION_TOKEN=session-token");
+  });
+});
+
+describe("selectSweepableContainers", () => {
+  const exited = (id: string, name: string, status = "Exited (0) 5 minutes ago") => ({ id, name, status });
+
+  it("selects exited containers not tied to an in-flight job", () => {
+    const containers = [exited("a".repeat(64), "ai-implement-san2-2-x1")];
+    expect(selectSweepableContainers(containers, [])).toEqual(containers);
+  });
+
+  it("protects containers whose full ID matches an in-flight job machineId", () => {
+    const id = "b".repeat(64);
+    expect(selectSweepableContainers([exited(id, "ai-implement-san2-3-x2")], [id])).toEqual([]);
+  });
+
+  it("protects containers when the in-flight machineId is a short-ID prefix", () => {
+    const full = "c".repeat(64);
+    expect(selectSweepableContainers([exited(full, "n")], [full.slice(0, 12)])).toEqual([]);
+    expect(selectSweepableContainers([exited(full.slice(0, 12), "n")], [full])).toEqual([]);
+  });
+
+  it("leaves recently exited containers alone (grace period)", () => {
+    const fresh = exited("d".repeat(64), "n", "Exited (0) 10 seconds ago");
+    const subSecond = exited("e".repeat(64), "n", "Exited (0) Less than a second ago");
+    expect(selectSweepableContainers([fresh, subSecond], [])).toEqual([]);
   });
 });

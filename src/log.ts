@@ -164,7 +164,7 @@ export function appendLog(entry: {
   trigger?: string;
 }): number {
   const db = getDb();
-  const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId).count + 1;
+  const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
     "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -205,9 +205,17 @@ export function getClaimedRunIds(): Set<number> {
   return new Set(rows.map((r) => r.run_id));
 }
 
-export function countPriorDispatches(issueId: string): { count: number; lastDispatchedAt: number | null } {
+/**
+ * Counts prior dispatches for an issue. When `phase` is given, only the
+ * matching phase family is counted: planning dispatches number independently
+ * from work dispatches (implementation + gap-analysis), so the routine
+ * planning→implementation handoff is attempt #1, not a "re-dispatch #2".
+ */
+export function countPriorDispatches(issueId: string, phase?: string): { count: number; lastDispatchedAt: number | null } {
+  const phaseClause =
+    phase === undefined ? "" : phase === "planning" ? " AND phase = 'planning'" : " AND phase != 'planning'";
   const row = getDb()
-    .prepare("SELECT COUNT(*) as count, MAX(dispatched_at) as last_at FROM dispatch_log WHERE issue_id = ?")
+    .prepare(`SELECT COUNT(*) as count, MAX(dispatched_at) as last_at FROM dispatch_log WHERE issue_id = ?${phaseClause}`)
     .get(issueId) as { count: number; last_at: number | null };
   return { count: row.count, lastDispatchedAt: row.last_at };
 }
