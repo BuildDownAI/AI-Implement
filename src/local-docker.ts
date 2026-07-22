@@ -169,6 +169,78 @@ export async function fetchLocalContainerLogs(containerId: string, lastN = 100):
   }
 }
 
+export interface ExitedContainer {
+  id: string;
+  name: string;
+  /** Human-readable docker status, e.g. "Exited (0) 5 minutes ago". */
+  status: string;
+}
+
+/** Lists exited ai-implement-* containers with full (untruncated) IDs. */
+export async function listExitedAiImplementContainers(): Promise<ExitedContainer[]> {
+  const { stdout } = await execFile("docker", [
+    "ps", "-a", "--no-trunc",
+    "--filter", "status=exited",
+    "--filter", "name=ai-implement-",
+    "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}",
+  ]);
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [id, name, ...rest] = line.split("\t");
+      return { id, name, status: rest.join("\t") };
+    });
+}
+
+/**
+ * Pure selection of exited containers that are safe to force-remove.
+ * Excludes containers still tied to an in-flight job (the monitor owns those:
+ * it inspects the exit code and posts logs before removing) and containers
+ * that exited seconds ago (grace period so a just-exited container of a
+ * not-yet-recorded or not-yet-monitored job is never reaped early).
+ */
+export function selectSweepableContainers(
+  containers: ExitedContainer[],
+  inFlightMachineIds: string[],
+): ExitedContainer[] {
+  return containers.filter((c) => {
+    const inFlight = inFlightMachineIds.some(
+      (id) => id === c.id || id.startsWith(c.id) || c.id.startsWith(id),
+    );
+    if (inFlight) return false;
+    if (/second/i.test(c.status)) return false;
+    return true;
+  });
+}
+
+/**
+ * Removes exited ai-implement containers no in-flight job owns. Needed because
+ * a planning job finalized by the runner callback goes terminal before the
+ * monitor's completion pass, so the monitor never removes its container.
+ * Returns the names of removed containers; docker being unavailable is not an
+ * error (returns []).
+ */
+export async function sweepExitedLocalContainers(inFlightMachineIds: string[]): Promise<string[]> {
+  let containers: ExitedContainer[];
+  try {
+    containers = await listExitedAiImplementContainers();
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const container of selectSweepableContainers(containers, inFlightMachineIds)) {
+    try {
+      await removeLocalContainer(container.id);
+      removed.push(container.name || container.id.slice(0, 12));
+    } catch (err) {
+      console.error(`[monitor] Failed to sweep exited local container ${container.name}:`, err);
+    }
+  }
+  return removed;
+}
+
 export async function removeLocalContainer(containerId: string): Promise<void> {
   try {
     await execFile("docker", ["rm", "-f", containerId]);

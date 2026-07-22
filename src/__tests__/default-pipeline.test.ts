@@ -56,6 +56,12 @@ describe("DEFAULT_PIPELINE baked custom root", () => {
   // custom/pipelines/autonomous.yml takes effect at import time.
   it("honors AI_IMPLEMENT_CUSTOM_ROOT at module-import time", async () => {
     const bakedRoot = mkdtempSync(join(tmpdir(), "ai-implement-baked-"));
+    // The workspace (cwd) root outranks the baked root, so run the import from
+    // an empty temp cwd — otherwise a repo that actually ships a
+    // custom/pipelines/autonomous.yml (any real fork) would win and break this
+    // test's baked-root assertion.
+    const emptyCwd = mkdtempSync(join(tmpdir(), "ai-implement-cwd-"));
+    const prevCwd = process.cwd();
     try {
       mkdirSync(join(bakedRoot, "custom", "pipelines"), { recursive: true });
       writeFileSync(
@@ -63,14 +69,17 @@ describe("DEFAULT_PIPELINE baked custom root", () => {
         "id: baked-loop\nsteps:\n  - id: clone\n    type: clone\n",
       );
       vi.stubEnv("AI_IMPLEMENT_CUSTOM_ROOT", bakedRoot);
+      process.chdir(emptyCwd);
       vi.resetModules();
       const { DEFAULT_PIPELINE } = await import("../pipeline/default-pipeline.js");
       expect(DEFAULT_PIPELINE.id).toBe("baked-loop");
       expect(DEFAULT_PIPELINE.steps.map((s) => s.id)).toEqual(["clone"]);
     } finally {
+      process.chdir(prevCwd);
       vi.unstubAllEnvs();
       vi.resetModules();
       rmSync(bakedRoot, { recursive: true, force: true });
+      rmSync(emptyCwd, { recursive: true, force: true });
     }
   });
 });

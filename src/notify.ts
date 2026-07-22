@@ -512,3 +512,18 @@ async function notifyCompletionTeams(
     throw new Error(`Teams webhook failed: ${res.status} — ${body}`);
   }
 }
+
+// ---------- Plain-text notification (best-effort; used where no issue context is available) ----------
+
+/** Posts a plain { text } payload — supported by both Slack and Teams incoming webhooks. */
+export async function notifyText(webhookUrl: string, message: string): Promise<void> {
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: message }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Webhook notification failed: ${res.status} — ${body}`);
+  }
+}

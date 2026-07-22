@@ -214,7 +214,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
 
         const machine = await createMachine(flyToken, flyApp, machineConfig);
 
-        const prior = countPriorDispatches(prLog.issueId);
+        const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
         const jobId = appendLog({
           issueId: prLog.issueId,
           issueIdentifier: prLog.issueIdentifier ?? undefined,
@@ -296,7 +296,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           continue;
         }
 
-        const prior = countPriorDispatches(prLog.issueId);
+        const prior = countPriorDispatches(prLog.issueId, "gap-analysis");
         const jobId = appendLog({
           issueId: prLog.issueId,
           issueIdentifier: prLog.issueIdentifier ?? undefined,

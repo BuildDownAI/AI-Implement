@@ -12,7 +12,7 @@ import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
-import { notify, notifyCompletion } from "./notify.js";
+import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -26,7 +26,7 @@ import { postStatusComment } from "./status-events.js";
 import { classifyCompletion, renderClassification } from "./completion-classification.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
-import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath } from "./runner-mode.js";
+import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
@@ -44,12 +44,14 @@ import {
   inspectLocalContainer,
   removeLocalContainer,
   startLocalRunnerContainer,
+  sweepExitedLocalContainers,
 } from "./local-docker.js";
 import { resolveTerminalStatus, workflowFileForJob } from "./monitor-status.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
+import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
@@ -113,7 +115,11 @@ function loadConfig(): AppConfig {
     console.warn("[main] GITHUB_WEBHOOK_SECRET not set — webhook endpoint will reject all requests");
   }
 
-  const runnerCallbackBaseUrl = process.env.RUNNER_CALLBACK_BASE_URL || null;
+  const callbackResolution = resolveRunnerCallbackBaseUrl(process.env);
+  const runnerCallbackBaseUrl = callbackResolution.url;
+  if (callbackResolution.source === "local-default") {
+    console.log(`[main] RUNNER_CALLBACK_BASE_URL not set — defaulting to ${runnerCallbackBaseUrl} (RUNNER_MODE=local)`);
+  }
   const runnerTokenSecret = process.env.RUNNER_TOKEN_SECRET || null;
   const gapFillTriggerSecret = process.env.GAP_FILL_TRIGGER_SECRET || null;
 
@@ -292,6 +298,23 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       }
     }
 
+    // Auto-merge child PRs into their grouping branch once checks pass (opt-in per project;
+    // never merges into defaultBranch — the top-of-tree PR stays human-reviewed). Best-effort.
+    try {
+      const autoMergeMappings = Object.values(teamRepoMap).filter((m) => m.autoMerge);
+      if (autoMergeMappings.length > 0) {
+        await runAutoMerges(autoMergeMappings, {
+          githubAppId: config.githubAppId,
+          githubAppPrivateKey: config.githubAppPrivateKey,
+          notify: config.notifyWebhookUrl
+            ? (message) => notifyText(config.notifyWebhookUrl!, message)
+            : undefined,
+        });
+      }
+    } catch (err) {
+      console.error("[auto-merge] step failed:", err);
+    }
+
     // Implementation issues have priority over planning issues for slot allocation.
     // Both consume slots from the same per-team capacity pool.
     const allCandidates = [...readyForImplementation, ...needsPlanning];
@@ -322,7 +345,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         if (isPlanning) {
           await dispatchPlanning(config, issueProvider, issue, mapping);
         } else {
-          const prior = countPriorDispatches(issue.id);
+          const prior = countPriorDispatches(issue.id, "implementation");
 
           // Implementation only dispatches after plan approval, so any planning row
           // still stuck in 'unknown' (orphaned by an orchestrator restart before its
@@ -380,6 +403,19 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Monitor in-flight jobs and send completion notifications
   await monitorJobs(config, registry);
+
+  // Local mode: reap exited containers no in-flight job owns. A planning job
+  // finalized by the runner callback goes terminal before the monitor's
+  // completion pass, so the monitor never removes its container.
+  if (getRunnerMode().mode === "local") {
+    const inFlightMachineIds = getInFlightJobs()
+      .map((j) => j.machineId)
+      .filter((id): id is string => Boolean(id));
+    const swept = await sweepExitedLocalContainers(inFlightMachineIds);
+    for (const name of swept) {
+      console.log(`[monitor] Swept exited local container ${name}`);
+    }
+  }
 
   // Sweep for orphaned/stale/aged-out Fly machines
   await sweepOrphanedMachines(reaperConfig(config, registry), {
@@ -660,7 +696,7 @@ async function dispatchPlanning(
     const flyToken = config.flySessionsToken;
     const flyApp = config.flySessionsApp;
 
-    const prior = countPriorDispatches(issue.id);
+    const prior = countPriorDispatches(issue.id, "planning");
 
     await dispatchSession(config, provider, issue, mapping, prior, runnerMode, {
       phase: "planning",
@@ -2194,7 +2230,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         continue;
       }
 
-      const prior = countPriorDispatches(fix.issueId);
+      const prior = countPriorDispatches(fix.issueId, "implementation");
       const jobId = appendLog({
         issueId: fix.issueId,
         issueIdentifier: fix.issueIdentifier ?? undefined,
