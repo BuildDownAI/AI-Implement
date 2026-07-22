@@ -16,6 +16,8 @@ export interface ResolveWorkflowContractInput {
   repo: string;
   workflowFile: string;
   token: string;
+  /** Branch the actual workflow_dispatch will target (mapping.defaultBranch). Probes this ref so the contract check agrees with the dispatch. */
+  ref: string;
   /** Injected for tests. Defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
   /** Injected for tests. Defaults to `Date.now`. */
@@ -25,17 +27,17 @@ export interface ResolveWorkflowContractInput {
 export async function resolveWorkflowContract(
   input: ResolveWorkflowContractInput,
 ): Promise<WorkflowContract> {
-  const { owner, repo, workflowFile, token } = input;
+  const { owner, repo, workflowFile, token, ref } = input;
   const fetchImpl = input.fetchImpl ?? fetch;
   const now = (input.nowMs ?? Date.now)();
 
-  const cacheKey = `${owner}/${repo}/${workflowFile}`;
+  const cacheKey = `${owner}/${repo}/${workflowFile}/${ref}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
     return cached.contract;
   }
 
-  const contract = await probeContract(owner, repo, workflowFile, token, fetchImpl);
+  const contract = await probeContract(owner, repo, workflowFile, ref, token, fetchImpl);
   cache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, contract });
   return contract;
 }
@@ -44,10 +46,11 @@ async function probeContract(
   owner: string,
   repo: string,
   workflowFile: string,
+  ref: string,
   token: string,
   fetchImpl: typeof fetch,
 ): Promise<WorkflowContract> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/.github/workflows/${workflowFile}`;
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/.github/workflows/${workflowFile}?ref=${encodeURIComponent(ref)}`;
   let res: Response;
   try {
     res = await fetchImpl(url, {

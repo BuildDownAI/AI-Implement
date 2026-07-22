@@ -18,7 +18,7 @@ export interface DrainCommentGapfillsInput {
   runnerTokenSecret: string | null;
   getInstallationToken(owner: string): Promise<string>;
   resolveRunnerImage(mapping: RepoMapping, ghToken: string): Promise<string | undefined>;
-  checkContract(opts: { owner: string; repo: string; workflowFile: string; token: string }): Promise<"legacy" | "envelope">;
+  checkContract(opts: { owner: string; repo: string; workflowFile: string; token: string; ref: string }): Promise<"legacy" | "envelope">;
   dispatch(token: string, mapping: RepoMapping, inputs: Record<string, string | undefined>): Promise<{ success: boolean; status: number; error?: string }>;
   postComment(token: string, owner: string, repo: string, prNumber: number, body: string): Promise<void>;
   onDispatchFailure(failure: { status: number; error?: string }, notifyType: string, notifyWebhookUrl: string | null, ctx: DispatchFailureContext): Promise<void>;
@@ -244,6 +244,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           repo: mapping.repo,
           workflowFile: mapping.workflowFile,
           token: ghToken,
+          ref: mapping.defaultBranch,
         });
 
         const gapFillInputs = contract === "envelope"
