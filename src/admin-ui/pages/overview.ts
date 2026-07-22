@@ -397,7 +397,7 @@ export const overviewScript = `
     if (!container) return;
     const pills = [
       { label: 'Linear', on: !!status.linear, hint: 'LINEAR_API_KEY' },
-      { label: 'Jira', on: !!status.jira, hint: 'JIRA_TOKEN + JIRA_CLOUD_ID + JIRA_SITE_URL' },
+      { label: 'Jira', on: !!status.jira, hint: 'JIRA_TOKEN + JIRA_SITE_URL + (JIRA_EMAIL or JIRA_CLOUD_ID)' },
       { label: 'Runner callback', on: !!status.runnerCallback, hint: 'RUNNER_CALLBACK_BASE_URL + RUNNER_TOKEN_SECRET' },
       { label: 'Gap-fill trigger', on: !!status.gapFillTrigger, hint: 'GAP_FILL_TRIGGER_SECRET' },
     ];

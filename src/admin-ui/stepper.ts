@@ -22,7 +22,7 @@ export const stepperHtml = `
             <option value="linear">Linear</option>
             <option value="jira">Jira</option>
           </select>
-          <div class="field-hint">Jira requires JIRA_TOKEN, JIRA_CLOUD_ID, and JIRA_SITE_URL env vars on the orchestrator.</div>
+          <div class="field-hint">Jira requires JIRA_TOKEN + JIRA_SITE_URL, plus either JIRA_EMAIL (Basic auth) or JIRA_CLOUD_ID (OAuth) env vars on the orchestrator.</div>
         </div>
       </div>
 
