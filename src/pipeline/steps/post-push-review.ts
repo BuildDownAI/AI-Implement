@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
+import { extractFirstJsonObject } from "../json-extract.js";
 import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
   collectExternalReviewFindingsFromGh,
@@ -282,29 +283,6 @@ function externalReviewFindingsCommentBlock(findings: ReviewLedgerFinding[]): st
     return issueFromString(`${location}${finding.body}`);
   });
   return `\n\nUnresolved external review findings:\n${formatIssueList(issues)}`;
-}
-
-function extractFirstJsonObject(text: string): Record<string, unknown> | null {
-  let depth = 0;
-  let start = -1;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === "{") {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (text[i] === "}") {
-      depth--;
-      if (depth === 0 && start !== -1) {
-        try {
-          const obj = JSON.parse(text.slice(start, i + 1)) as Record<string, unknown>;
-          if (obj && typeof obj === "object" && Object.keys(obj).length > 0) return obj;
-        } catch {
-          // keep scanning
-        }
-        start = -1;
-      }
-    }
-  }
-  return null;
 }
 
 function extractCommentIdWithMarker(stdout: string, marker: string): number | null {

@@ -1,5 +1,6 @@
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
+import { extractFirstJsonObject } from "../json-extract.js";
 
 interface ReviewInputs extends Record<string, unknown> {
   model?: string;
@@ -24,39 +25,6 @@ interface ReviewJson {
   score?: number;
   progress_delta?: number;
   feedback?: string;
-}
-
-/**
- * Scans `text` for balanced `{ ... }` blocks and returns the first one that
- * parses as valid JSON with at least one key. Avoids the greedy-regex pitfall
- * where a preamble containing `{}` causes the regex to match from the first
- * `{` to the last `}`. Empty objects `{}` are skipped as likely preamble noise.
- */
-function extractFirstJsonObject(text: string): object | null {
-  let depth = 0;
-  let start = -1;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === "{") {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (text[i] === "}") {
-      depth--;
-      if (depth === 0 && start !== -1) {
-        const candidate = text.slice(start, i + 1);
-        try {
-          const parsed = JSON.parse(candidate) as object;
-          // Skip empty objects — they are likely preamble artifacts, not the review JSON.
-          if (Object.keys(parsed).length > 0) {
-            return parsed;
-          }
-        } catch {
-          // Not valid JSON — keep scanning for the next balanced block.
-        }
-        start = -1;
-      }
-    }
-  }
-  return null;
 }
 
 /**
