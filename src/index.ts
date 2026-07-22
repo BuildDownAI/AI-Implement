@@ -552,6 +552,7 @@ async function dispatchGitHubActions(
     repo: mapping.repo,
     workflowFile: mapping.workflowFile,
     token: ghToken,
+    ref: mapping.defaultBranch,
   });
 
   const dispatchInputs = contract === "envelope"
@@ -892,6 +893,7 @@ async function dispatchPlanning(
     repo: mapping.repo,
     workflowFile: mapping.planningWorkflowFile,
     token: ghToken,
+    ref: mapping.defaultBranch,
   });
 
   const planningDispatchInputs = planningContract === "envelope"
@@ -2169,6 +2171,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         repo: mapping.repo,
         workflowFile: mapping.workflowFile,
         token: ghToken,
+        ref: mapping.defaultBranch,
       });
 
       const fixIssue = {
