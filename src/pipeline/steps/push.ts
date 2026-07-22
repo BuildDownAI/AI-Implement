@@ -30,6 +30,10 @@ interface PushInputs extends Record<string, unknown> {
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   draft?: boolean;
   reviewSummary?: ReviewSummary;
+  /** True when this is a grouping parent's own closing-work run. When the agent produces
+   *  no changes (no working-tree diff and no commits ahead of base), the step returns a
+   *  clean no-op instead of throwing, letting the orchestrator trigger the roll-up PR. */
+  groupingParent?: boolean;
 }
 
 interface PushOutputs extends Record<string, unknown> {
@@ -59,9 +63,22 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     }
 
     runGit(workspaceDir, ["checkout", "-B", branchName], githubToken, "git checkout");
-    if (!hasWorkingTreeChanges(workspaceDir, githubToken)) {
+
+    const hasWTChanges = hasWorkingTreeChanges(workspaceDir, githubToken);
+    // Only check commits-ahead when working tree is clean: if there ARE working-tree changes
+    // we always take the standard add→commit path regardless of prior commits.
+    const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseBranch, githubToken);
+
+    if (!hasWTChanges && !agentCommitted) {
+      if (inputs.groupingParent) {
+        // Case B: grouping-parent run that genuinely produced no changes. Return a clean
+        // no-op so the orchestrator can finalize the issue and merge-up.ts opens the
+        // feature→base roll-up PR instead of stalling the parent In Progress.
+        return { prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false };
+      }
       throw new Error("Nothing to commit: Claude left no file changes in the working tree");
     }
+
     runGit(workspaceDir, ["config", "user.name", "ai-implement[bot]"], githubToken, "git config user.name");
     runGit(
       workspaceDir,
@@ -69,26 +86,48 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       githubToken,
       "git config user.email",
     );
-    runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
-    // --diff-filter=d excludes staged deletions: removing an accidentally-committed
-    // secret (e.g. deleting a .env) is exactly what the guard wants to allow.
-    const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only", "--diff-filter=d"], {
-      cwd: workspaceDir,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    if (stagedResult.status !== 0) {
-      // Fail closed: an empty list on git failure would silently skip the guard.
-      const stderr = (stagedResult.stderr?.toString() ?? "").replaceAll(githubToken, "***");
-      throw new Error(`git diff --cached failed (exit ${stagedResult.status ?? "null"}): ${stderr}`);
+
+    let commitSha: string | null;
+    if (hasWTChanges) {
+      // Standard path: stage all changes → sensitive-file guard → commit.
+      runGit(workspaceDir, ["add", "-A"], githubToken, "git add");
+      // --diff-filter=d excludes staged deletions: removing an accidentally-committed
+      // secret (e.g. deleting a .env) is exactly what the guard wants to allow.
+      const stagedResult = spawnSync("git", ["diff", "--cached", "--name-only", "--diff-filter=d"], {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (stagedResult.status !== 0) {
+        // Fail closed: an empty list on git failure would silently skip the guard.
+        const stderr = (stagedResult.stderr?.toString() ?? "").replaceAll(githubToken, "***");
+        throw new Error(`git diff --cached failed (exit ${stagedResult.status ?? "null"}): ${stderr}`);
+      }
+      const stagedFiles = stagedResult.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
+      const sensitiveHits = findSensitiveFiles(stagedFiles, inputs.sensitiveFiles);
+      if (sensitiveHits.length > 0) {
+        throw new SensitiveFilesError(sensitiveHits);
+      }
+      runGit(workspaceDir, ["commit", "-m", buildCommitMessage(issueIdentifier, issueTitle)], githubToken, "git commit");
+      commitSha = resolveCommitSha(workspaceDir);
+    } else {
+      // Case A: agent committed its own changes — working tree is clean but commits exist
+      // ahead of base. The sensitive-file guard runs against the full committed diff below.
+      commitSha = resolveCommitSha(workspaceDir);
     }
-    const stagedFiles = stagedResult.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
-    const sensitiveHits = findSensitiveFiles(stagedFiles, inputs.sensitiveFiles);
-    if (sensitiveHits.length > 0) {
-      throw new SensitiveFilesError(sensitiveHits);
+
+    // Authoritative sensitive-file guard: scan the FULL committed diff (baseBranch..HEAD) —
+    // the complete set of files that will land in the PR — before push. This closes the
+    // mixed commit+working-tree gap where the standard path's --cached scan (newly-staged
+    // files only) would miss files the agent committed itself earlier in the run (present in
+    // HEAD but not the index). --diff-filter=d allows intentional deletions (e.g. removing a
+    // committed secret); getCommittedDiffFiles fails closed on git error.
+    const committedDiffFiles = getCommittedDiffFiles(workspaceDir, baseBranch, githubToken);
+    const committedSensitiveHits = findSensitiveFiles(committedDiffFiles, inputs.sensitiveFiles);
+    if (committedSensitiveHits.length > 0) {
+      throw new SensitiveFilesError(committedSensitiveHits);
     }
-    runGit(workspaceDir, ["commit", "-m", buildCommitMessage(issueIdentifier, issueTitle)], githubToken, "git commit");
-    const commitSha = resolveCommitSha(workspaceDir);
-    const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken);
+
+    const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken, agentCommitted ? baseBranch : undefined);
     const prBody = buildPullRequestBody(context, inputs, changedFilesSummary);
 
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
@@ -317,14 +356,61 @@ function stringValue(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function summarizeCommittedChanges(workspaceDir: string, githubToken: string): string {
-  const result = spawnSync("git", ["show", "--name-status", "--format=", "HEAD"], {
+/**
+ * True when HEAD has at least one commit not yet reachable from baseBranch.
+ * Used to detect Case A: the agent committed its own changes, leaving a clean
+ * working tree but commits ahead of the base branch.
+ */
+function hasCommitsAheadOfBase(workspaceDir: string, baseBranch: string, githubToken: string): boolean {
+  const result = spawnSync("git", ["rev-list", "--count", `${baseBranch}..HEAD`], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    // Fail closed: returning false here ("no commits ahead") would let a grouping-parent
+    // run take the Case-B no-op path and finalize the issue, silently discarding the agent's
+    // committed work. Every other guard in this file throws on git failure — match that.
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
+    throw new Error(`git rev-list ${baseBranch}..HEAD failed (exit ${result.status ?? "null"}): ${stderr}`);
+  }
+  const n = parseInt(result.stdout.toString().trim(), 10);
+  return !isNaN(n) && n > 0;
+}
+
+/**
+ * Returns the list of files changed in baseBranch..HEAD (excluding deletions via
+ * --diff-filter=d, consistent with the staged-diff sensitive-file guard). Used in
+ * Case A to run the security guard against the agent's own committed changes.
+ */
+function getCommittedDiffFiles(workspaceDir: string, baseBranch: string, githubToken: string): string[] {
+  const result = spawnSync(
+    "git",
+    ["diff", "--diff-filter=d", `${baseBranch}..HEAD`, "--name-only"],
+    { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  if (result.status !== 0) {
+    const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
+    throw new Error(`git diff ${baseBranch}..HEAD failed (exit ${result.status ?? "null"}): ${stderr}`);
+  }
+  return result.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
+}
+
+/**
+ * Summarize the committed changes for the PR body. When baseBranch is provided
+ * (Case A: agent committed), uses the full range diff to capture all agent commits.
+ * Otherwise (standard path: single orchestrator commit), uses git show HEAD.
+ */
+function summarizeCommittedChanges(workspaceDir: string, githubToken: string, baseBranch?: string): string {
+  const args = baseBranch
+    ? ["diff", "--name-status", `${baseBranch}..HEAD`]
+    : ["show", "--name-status", "--format=", "HEAD"];
+  const result = spawnSync("git", args, {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.status !== 0) {
     const stderr = (result.stderr?.toString() ?? "").replaceAll(githubToken, "***");
-    throw new Error(`git show failed (exit ${result.status ?? "null"}): ${stderr}`);
+    throw new Error(`git ${args[0]} failed (exit ${result.status ?? "null"}): ${stderr}`);
   }
 
   return formatGitNameStatusSummary(result.stdout.toString());

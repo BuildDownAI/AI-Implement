@@ -173,6 +173,7 @@ function applyWiring(step: YamlStep): StepDefinition {
             baseBranch: ctx.getOutputs("clone").branch,
             prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
             sensitiveFiles: ctx.data.sensitiveFiles,
+            groupingParent: ctx.data.groupingParent,
             draft: !approved,
             reviewSummary: approved
               ? undefined

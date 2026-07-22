@@ -194,6 +194,9 @@ export interface EnvelopeDispatchOpts {
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
   commentInstruction?: string;
   planningContext?: { parent?: string; siblings?: string; dependencies?: string };
+  /** True when this is a grouping parent's own closing-work dispatch. Threads into the runner
+   *  so push.ts can finalize cleanly when the agent produces no changes (Case B). */
+  groupingParent?: boolean;
 }
 
 /**
@@ -230,6 +233,7 @@ export function buildEnvelopeDispatchInputs(
       : {}),
     ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
+    ...(opts.groupingParent ? { groupingParent: true } : {}),
   };
 
   return {

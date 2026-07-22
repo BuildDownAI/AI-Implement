@@ -64,6 +64,9 @@ export interface PipelineContextData {
   profiles?: string[];
   /** Autonomous runner: per-project sensitive-file add/allow globs from the run_config envelope. */
   sensitiveFiles?: { add?: string[]; allow?: string[] };
+  /** Autonomous runner: true when this is a grouping parent's own closing-work run. Push.ts
+   *  uses this to finalize cleanly (no PR) when the agent produces no changes. */
+  groupingParent?: boolean;
   /** Autonomous runner: WORKFLOW.md hook script paths (relative to repo root). */
   hooks?: { setup?: string; verify?: string; teardown?: string };
 }

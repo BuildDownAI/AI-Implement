@@ -185,6 +185,19 @@ let pollInProgress = false;
 
 type DispatchableIssue = TicketIssue;
 
+/**
+ * True when the dispatch is a grouping parent's own closing-work run. Detected by checking
+ * whether featureBranchChain ends at the issue itself (providers set this when all AI-Implement
+ * children are terminal and the parent's own work can now run on its own feature branch).
+ * Used to set groupingParent=true in the run config so the runner can finalize cleanly when
+ * the agent produces no changes (Case B: pure container parents like AII-222).
+ */
+function isGroupingParentDispatch(issue: DispatchableIssue): boolean {
+  const chain = issue.featureBranchChain;
+  if (!chain || chain.length === 0) return false;
+  return chain[chain.length - 1].identifier === issue.identifier;
+}
+
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   if (pollInProgress) {
     console.log(`[poll] Skipping poll cycle — previous poll still running`);
@@ -564,6 +577,7 @@ async function dispatchGitHubActions(
         runToken,
         runProgressToken,
         runnerImage,
+        groupingParent: isGroupingParentDispatch(issue) || undefined,
       })
     : {
         issue_id: issue.id,
@@ -1164,6 +1178,7 @@ async function dispatchFlyMachine(
         ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
         ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
         ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+        ...(isGroupingParentDispatch(issue) ? { groupingParent: true } : {}),
       };
 
       const machineConfig = buildSessionMachineConfig({
@@ -1265,6 +1280,7 @@ async function dispatchLocalDocker(
         ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
         ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
         ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
+        ...(isGroupingParentDispatch(issue) ? { groupingParent: true } : {}),
       };
 
       const container = await startLocalRunnerContainer({

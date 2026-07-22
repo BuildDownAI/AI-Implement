@@ -20,6 +20,9 @@ export interface RunConfigV1 {
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   profiles?: string[];
   planningContext?: { parent?: string; siblings?: string; dependencies?: string };
+  /** True when this dispatch is a grouping parent's own closing-work run. The runner uses
+   *  this to finalize cleanly when the agent produces no changes (Case B). */
+  groupingParent?: boolean;
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -53,7 +56,7 @@ export function decodeRunConfig(encoded: string): RunConfigV1 {
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
-    profiles, planningContext } = cfg;
+    profiles, planningContext, groupingParent } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -67,5 +70,6 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (sensitiveFiles !== undefined) out.sensitiveFiles = sensitiveFiles;
   if (profiles !== undefined) out.profiles = profiles;
   if (planningContext !== undefined) out.planningContext = planningContext;
+  if (groupingParent !== undefined) out.groupingParent = groupingParent;
   return out;
 }
