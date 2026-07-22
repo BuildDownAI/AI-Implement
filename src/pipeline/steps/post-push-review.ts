@@ -581,9 +581,13 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
 function submitPrReview(
   ghSpawn: (args: string[]) => SpawnResult,
   prNumber: string,
-  event: "APPROVE" | "REQUEST_CHANGES",
   body: string,
 ): void {
+  // The reviewing identity is the same GitHub App installation that authored
+  // the PR, and GitHub rejects APPROVE/REQUEST_CHANGES on your own PR (422).
+  // COMMENT is the only review event allowed on a self-authored PR; the
+  // verdict itself is carried by the review body and the sticky PR comment.
+  const event = "COMMENT";
   const endpoint = `repos/:owner/:repo/pulls/${prNumber}/reviews`;
   const result = ghSpawn([
     "api",
@@ -851,7 +855,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
 
       if (approved) {
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
-        submitPrReview(ghSpawn, prNumber, "APPROVE", `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.`);
+        submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.`);
         postPrComment(
           ghSpawn,
           prNumber,
@@ -866,7 +870,6 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         submitPrReview(
           ghSpawn,
           prNumber,
-          "REQUEST_CHANGES",
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review found unresolved blockers.\n\n${formatIssueList(issues)}${externalReviewFindingsCommentBlock(externalFindings)}`,
         );
         postPrComment(
@@ -947,7 +950,6 @@ ${externalReviewFindingsBlock(externalFindings)}
         submitPrReview(
           ghSpawn,
           prNumber,
-          "REQUEST_CHANGES",
           `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement fix pass made no changes; blockers remain.${blockingIssuesBlock(issues, { heading: "Unresolved blocking issues:" })}${externalReviewFindingsCommentBlock(externalFindings)}`,
         );
         postPrComment(

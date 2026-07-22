@@ -102,8 +102,11 @@ export interface RunTelemetry {
   numTurns: number | null;
   durationMs: number | null;
   costUsd: number | null;
+  /** Total input tokens, including prompt-cache creation and cache reads. */
   tokensIn: number | null;
   tokensOut: number | null;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
   /** Compact per-call tool trace ("ToolName input-summary"), capped; last entry may be a truncation marker. */
   toolTrace?: string[];
 }
