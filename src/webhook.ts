@@ -483,6 +483,7 @@ async function handleIssueCommentWebhook(
       repo,
       workflowFile: mapping.workflowFile,
       token,
+      ref: mapping.defaultBranch,
     }).catch(() => "legacy" as const);
 
     if (contract !== "envelope") {

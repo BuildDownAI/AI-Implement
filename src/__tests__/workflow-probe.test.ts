@@ -42,6 +42,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
     });
     expect(mode).toBe("envelope");
@@ -54,6 +55,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
     });
     expect(mode).toBe("legacy");
@@ -66,6 +68,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
     });
     expect(mode).toBe("legacy");
@@ -78,6 +81,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
     });
     expect(mode).toBe("legacy");
@@ -90,6 +94,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
     });
     await resolveWorkflowContract({
@@ -97,6 +102,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
     });
     expect(fetchImpl).toHaveBeenCalledOnce();
@@ -112,6 +118,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
       nowMs,
     });
@@ -123,6 +130,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
       nowMs,
     });
@@ -139,6 +147,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl: fetchImplA,
     });
     const modeB = await resolveWorkflowContract({
@@ -146,6 +155,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-plan.yml",
       token: "t",
+      ref: "main",
       fetchImpl: fetchImplB,
     });
 
@@ -162,6 +172,7 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
     });
     expect(mode).toBe("legacy");
@@ -176,8 +187,53 @@ describe("resolveWorkflowContract", () => {
       repo: "r",
       workflowFile: "claude-implement.yml",
       token: "t",
+      ref: "main",
       fetchImpl,
     });
     expect(mode).toBe("legacy");
+  });
+
+  it("probes the given ref, not the repo's implicit default branch", async () => {
+    const fetchImpl = mockContents(ENVELOPE_YML);
+    await resolveWorkflowContract({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-plan.yml",
+      token: "t",
+      ref: "dev",
+      fetchImpl,
+    });
+
+    const [calledUrl] = fetchImpl.mock.calls[0] as [string];
+    expect(calledUrl).toBe(
+      "https://api.github.com/repos/o/r/contents/.github/workflows/claude-plan.yml?ref=dev",
+    );
+  });
+
+  it("keeps separate cache entries per ref, so a stale-ref dispatch can't reuse a live-ref probe", async () => {
+    const fetchImplMain = mockContents(LEGACY_YML);
+    const fetchImplDev = mockContents(ENVELOPE_YML);
+
+    const modeMain = await resolveWorkflowContract({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-plan.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl: fetchImplMain,
+    });
+    const modeDev = await resolveWorkflowContract({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-plan.yml",
+      token: "t",
+      ref: "dev",
+      fetchImpl: fetchImplDev,
+    });
+
+    expect(modeMain).toBe("legacy");
+    expect(modeDev).toBe("envelope");
+    expect(fetchImplMain).toHaveBeenCalledOnce();
+    expect(fetchImplDev).toHaveBeenCalledOnce();
   });
 });
