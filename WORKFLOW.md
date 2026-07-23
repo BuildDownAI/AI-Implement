@@ -2,14 +2,14 @@
 # Claude model used for implementation. Passed through verbatim to
 # `claude-code --model`, so any ID your configured provider accepts is fine.
 # Examples:
-#   Anthropic API / OAuth: claude-sonnet-4-6, claude-opus-4-7, claude-haiku-4-5-20251001
-#   AWS Bedrock:           anthropic.claude-sonnet-4-6-20250805-v1:0
+#   Anthropic API / OAuth: claude-sonnet-5, claude-opus-4-8, claude-haiku-4-5-20251001
+#   AWS Bedrock:           anthropic.claude-sonnet-5
 #                          or an inference-profile ARN (arn:aws:bedrock:...)
 # The default below works for the Anthropic provider. If this repo's mapping
 # is switched to provider=bedrock in the orchestrator admin UI, replace this
 # with a Bedrock model ID — the workflow will hard-fail otherwise, since
 # Bedrock IDs are account- and region-specific and have no safe default.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 
 # Optional: model used for the post-PR gap-analysis step. Pass through as above.
 # Default (if omitted): claude-haiku-4-5-20251001 for anthropic, same as `model`

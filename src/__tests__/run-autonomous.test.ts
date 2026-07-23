@@ -343,7 +343,7 @@ describe("runAutonomous", () => {
     expect(capturedModel).toBe("claude-haiku-4-5");
   });
 
-  it("falls back to claude-sonnet-4-6 when no model configured", async () => {
+  it("falls back to claude-sonnet-5 when no model configured", async () => {
     let capturedModel: string | undefined;
     const mod: StepModule = {
       run: vi.fn(async (ctx) => {
@@ -361,7 +361,7 @@ describe("runAutonomous", () => {
       llmExecutor: makeMockExecutor(0),
     });
 
-    expect(capturedModel).toBe("claude-sonnet-4-6");
+    expect(capturedModel).toBe("claude-sonnet-5");
   });
 
   it("invokes the provided llmExecutor when step calls it", async () => {
@@ -383,7 +383,7 @@ describe("runAutonomous", () => {
     });
 
     expect(executor.invoke).toHaveBeenCalledOnce();
-    expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-sonnet-4-6");
+    expect((executor.invoke as ReturnType<typeof vi.fn>).mock.calls[0][0].model).toBe("claude-sonnet-5");
   });
 
   it("fetches planning context from the orchestrator using the progress token", async () => {

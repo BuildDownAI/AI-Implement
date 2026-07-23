@@ -343,7 +343,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   }
   implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
-  const model = claudeModel || workflowModel || "claude-sonnet-4-6";
+  const model = claudeModel || workflowModel || "claude-sonnet-5";
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";

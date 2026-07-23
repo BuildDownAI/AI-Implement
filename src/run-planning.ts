@@ -88,7 +88,7 @@ export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exit
     SIBLINGS: envelopePlanningContext?.siblings ?? process.env.SIBLINGS?.trim() ?? "None",
     DEPENDENCIES: envelopePlanningContext?.dependencies ?? process.env.DEPENDENCIES?.trim() ?? "None",
   };
-  let model = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
+  let model = process.env.CLAUDE_MODEL || "claude-sonnet-5";
   let prompt = buildDefaultPlanningPrompt(subs);
   const planningMdPath = join(workspaceDir, "PLANNING.md");
   if (existsSync(planningMdPath)) {

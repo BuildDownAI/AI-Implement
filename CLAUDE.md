@@ -172,7 +172,7 @@ Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are
 ## Workflow templates
 
 `workflows/claude-implement.yml` is the main implementation workflow synced to target repos. It supports:
-- **WORKFLOW.md** — per-repo Claude prompt template; front matter carries `model:` (required for bedrock, defaults to `claude-sonnet-4-6` for anthropic) and optional `gap_analysis_model:`
+- **WORKFLOW.md** — per-repo Claude prompt template; front matter carries `model:` (required for bedrock, defaults to `claude-sonnet-5` for anthropic) and optional `gap_analysis_model:`
 - **Gap analysis** — secondary Claude invocation after each PR
 - **Comment trigger** — a PR comment that **starts with** `/ai-implement` on an envelope-generation repo is handled by the orchestrator webhook (`POST /api/github/webhook`). The orchestrator verifies the commenter has write/maintain/admin permission on the repo, posts a 👀 reaction as acknowledgement, and enqueues a gap-fill dispatch that runs through the same unified dispatch path as orchestrator-initiated runs. Any text after the `/ai-implement` token is forwarded as an operator instruction (rides `run_config.commentInstruction`). `/ai-implementfoo` and comments that merely contain the token mid-text do not fire. Legacy repos (whose `claude-implement.yml` does not have a `run_config:` input) are silently ignored by the webhook; they continue to use `comment-trigger.yml` if it is still present in the target repo.
 - **Triple auth** — bedrock (when orchestrator sets `provider=bedrock`), OAuth (`CLAUDE_CODE_OAUTH_TOKEN`), or API key (`ANTHROPIC_API_KEY`)
@@ -288,7 +288,7 @@ The Projects page **Sync workflows** action syncs `claude-implement.yml` (envelo
 
 ### Model IDs are passed through verbatim
 
-Neither workflow validates model IDs — whatever `model:` says in front matter goes directly to `claude-code --model`. This lets new Anthropic releases and Bedrock IDs (`anthropic.<name>-<date>-v1:0` or inference-profile ARNs) flow without a workflow template edit. Typos fail fast at Claude invocation time with a clear error. The seed `WORKFLOW.md` / `PLANNING.md` ship with `model: claude-sonnet-4-6`, so fresh target repos work out of the box on the Anthropic provider.
+Neither workflow validates model IDs — whatever `model:` says in front matter goes directly to `claude-code --model`. This lets new Anthropic releases and Bedrock IDs (`anthropic.<name>-<date>-v1:0` or inference-profile ARNs) flow without a workflow template edit. Typos fail fast at Claude invocation time with a clear error. The seed `WORKFLOW.md` / `PLANNING.md` ship with `model: claude-sonnet-5`, so fresh target repos work out of the box on the Anthropic provider.
 
 ### Using AWS Bedrock
 
@@ -302,7 +302,7 @@ To run a target repo against AWS Bedrock instead of the Anthropic API, use the G
 3. **In the target repo**, add two repository *variables* (Settings → Secrets and variables → Actions → Variables) so `/ai-implement` comment-triggered gap-fill runs route to the same provider as the orchestrator-initiated runs:
    - `AI_IMPLEMENT_PROVIDER` = `bedrock`
    - `AI_IMPLEMENT_AWS_REGION` = the same region used in the admin UI mapping
-4. **In the target repo's `WORKFLOW.md` (and `PLANNING.md` if planning is enabled)**, change `model:` from the Anthropic default (`claude-sonnet-4-6`) to a Bedrock model ID or inference-profile ARN. There is no safe default for Bedrock — the workflow will hard-fail if `model:` isn't set when `provider=bedrock`.
+4. **In the target repo's `WORKFLOW.md` (and `PLANNING.md` if planning is enabled)**, change `model:` from the Anthropic default (`claude-sonnet-5`) to a Bedrock model ID or inference-profile ARN. There is no safe default for Bedrock — the workflow will hard-fail if `model:` isn't set when `provider=bedrock`.
 
 IAM trust policy shape (use the `sub` condition to restrict to this specific repo):
 

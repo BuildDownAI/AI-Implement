@@ -4,7 +4,7 @@ import { implementStep } from "./implement.js";
 import { reviewStep } from "./review.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
-const DEFAULT_MODEL = "claude-sonnet-4-6";
+const DEFAULT_MODEL = "claude-sonnet-5";
 
 interface FeedbackLoopInputs extends Record<string, unknown> {
   workspaceDir: string;

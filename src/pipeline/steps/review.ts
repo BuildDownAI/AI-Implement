@@ -82,7 +82,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
 
     const result = await context.llmExecutor.invoke({
       prompt,
-      model: model ?? "claude-sonnet-4-6",
+      model: model ?? "claude-sonnet-5",
     });
 
     if (result.exitCode !== 0) {
