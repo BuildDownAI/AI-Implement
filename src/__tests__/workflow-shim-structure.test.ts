@@ -183,6 +183,12 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/provider=bedrock but AWS_BEDROCK_ROLE_ARN repo secret is not set/);
       expect(yaml.indexOf("Validate Bedrock inputs")).toBeLessThan(yaml.indexOf("Configure AWS credentials (Bedrock)"));
     });
+
+    it(`${f} passes PROVIDER and AWS_REGION to the run step env`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/PROVIDER:\s*\$\{\{\s*inputs\.provider\s*\}\}/);
+      expect(yaml).toMatch(/AWS_REGION:\s*\$\{\{\s*inputs\.aws_region\s*\}\}/);
+    });
   }
 
   it("comment trigger fires on a /ai-implement prefix and passes the remainder as an instruction", () => {
@@ -319,6 +325,12 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/configure-aws-credentials/);
       expect(yaml).toMatch(/if:\s*inputs\.provider == 'bedrock'/);
       expect(yaml).toMatch(/role-session-duration:\s*14400/);
+    });
+
+    it(`${f} passes PROVIDER and AWS_REGION to the run step env`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toMatch(/PROVIDER:\s*\$\{\{\s*inputs\.provider\s*\}\}/);
+      expect(yaml).toMatch(/AWS_REGION:\s*\$\{\{\s*inputs\.aws_region\s*\}\}/);
     });
   }
 });
