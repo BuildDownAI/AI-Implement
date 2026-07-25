@@ -28,6 +28,7 @@ describe("runPlanning", () => {
   let ws: string;
   beforeEach(() => {
     ws = mkdtempSync(join(tmpdir(), "plan-"));
+    delete process.env.AI_IMPLEMENT_RUN_CONFIG;
     setEnv();
   });
   afterEach(() => {

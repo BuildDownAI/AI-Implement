@@ -60,6 +60,11 @@ if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then
   fi
 fi
 export GITHUB_DEFAULT_BRANCH
+# For non-gap-fill runs, envelope baseBranch wins over dispatch-layer env (feature-branch grouping).
+if [ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then
+  _rb="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.baseBranch||"")}catch(e){}' 2>/dev/null||true)"
+  if [ -n "$_rb" ]; then log "run_config.baseBranch=${_rb}"; GITHUB_DEFAULT_BRANCH="$_rb"; fi
+fi
 git config --global user.name "ai-implement-bot"
 git config --global user.email "ai-implement-bot@users.noreply.github.com"
 git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
