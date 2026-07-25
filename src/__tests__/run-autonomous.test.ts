@@ -87,6 +87,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("PR_NUMBER", "");
     vi.stubEnv("AI_IMPLEMENT_COMMENT_INSTRUCTION", "");
     vi.stubEnv("AI_IMPLEMENT_SKILLS_REPO", "");
+    vi.stubEnv("AI_IMPLEMENT_RUN_CONFIG", "");
   });
 
   afterEach(() => {
@@ -154,6 +155,83 @@ describe("runAutonomous", () => {
     });
 
     expect(capturedBranch).toBe("development");
+  });
+
+  it("uses run_config.baseBranch as branch for non-gap-fill runs, overriding GITHUB_DEFAULT_BRANCH", async () => {
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv(
+      "AI_IMPLEMENT_RUN_CONFIG",
+      encodeRunConfig({
+        v: 1,
+        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+        baseBranch: "ai-implement/feature/ool-126",
+      }),
+    );
+
+    let capturedBranch: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedBranch = ctx.data.branch;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
+
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0) });
+
+    expect(capturedBranch).toBe("ai-implement/feature/ool-126");
+  });
+
+  it("falls back to GITHUB_DEFAULT_BRANCH when run_config.baseBranch is absent", async () => {
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "main");
+    vi.stubEnv(
+      "AI_IMPLEMENT_RUN_CONFIG",
+      encodeRunConfig({
+        v: 1,
+        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+      }),
+    );
+
+    let capturedBranch: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedBranch = ctx.data.branch;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
+
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0) });
+
+    expect(capturedBranch).toBe("main");
+  });
+
+  it("does not use run_config.baseBranch for gap-fill runs — uses GITHUB_DEFAULT_BRANCH (PR checkout branch)", async () => {
+    vi.stubEnv("GITHUB_DEFAULT_BRANCH", "ai-implement/ai-implement-aii-1-fix-something");
+    vi.stubEnv(
+      "AI_IMPLEMENT_RUN_CONFIG",
+      encodeRunConfig({
+        v: 1,
+        issue: { id: "issue-abc", identifier: "AII-1", title: "Test issue", description: "Issue description" },
+        baseBranch: "ai-implement/feature/ool-126",
+        prNumber: "42",
+      }),
+    );
+    vi.stubEnv("PR_NUMBER", "42");
+
+    let capturedBranch: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedBranch = ctx.data.branch;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-branch", mod);
+
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter(), llmExecutor: makeMockExecutor(0) });
+
+    // Gap-fill: uses the PR checkout branch (GITHUB_DEFAULT_BRANCH), not envelope baseBranch
+    expect(capturedBranch).toBe("ai-implement/ai-implement-aii-1-fix-something");
   });
 
   it("reads model from WORKFLOW.md front matter and passes it through context", async () => {

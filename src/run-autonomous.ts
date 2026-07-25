@@ -52,7 +52,11 @@ function currentGitBranch(workspaceDir: string): string | null {
   return branch || null;
 }
 
-function resolveBranch(workspaceDir: string): string {
+function resolveBranch(workspaceDir: string, baseBranch?: string, prNumber?: string): string {
+  // Envelope baseBranch is authoritative for non-gap-fill runs: it carries the grouping
+  // feature branch and must override whatever the dispatch layer set (GHA may set the
+  // wrong default branch). Gap-fill runs use the PR checkout branch instead.
+  if (baseBranch && !prNumber) return baseBranch;
   const branch =
     optionalEnv("GITHUB_DEFAULT_BRANCH") ??
     currentGitBranch(workspaceDir);
@@ -138,6 +142,7 @@ export interface ResolvedRunnerInputs {
   branchPrefix: string | undefined;
   skillsRepo: string | undefined;
   sensitiveFiles: { add?: string[]; allow?: string[] } | undefined;
+  baseBranch: string | undefined;
   profiles: string[];
   githubOwner: string;
   githubRepo: string;
@@ -200,6 +205,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     branchPrefix: safeBranchPrefix(cfg.branchPrefix),
     skillsRepo: cfg.skillsRepo,
     sensitiveFiles: cfg.sensitiveFiles,
+    baseBranch: cfg.baseBranch,
     profiles: cfg.profiles
       ? cfg.profiles
       : (env.AI_IMPLEMENT_PROFILES ?? "").split(",").map((p) => p.trim()).filter(Boolean),
@@ -273,6 +279,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     branchPrefix,
     skillsRepo,
     sensitiveFiles: undefined,
+    baseBranch: undefined,
     profiles,
     githubOwner,
     githubRepo,
@@ -304,13 +311,14 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     branchPrefix,
     skillsRepo,
     sensitiveFiles,
+    baseBranch,
     profiles,
     logLevel,
     provider,
     claudeModel,
     groupingParent,
   } = resolveRunnerInputs(process.env);
-  const branch = resolveBranch(workspaceDir);
+  const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
 
   // Planning context is fetched from the orchestrator's provider-agnostic
   // endpoint using the reusable progress token — the runner never calls the

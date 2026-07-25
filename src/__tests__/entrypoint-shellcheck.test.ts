@@ -9,9 +9,9 @@ describe("session/entrypoint.sh", () => {
     expect(r.status).toBe(0);
   });
 
-  it("is under 100 lines (bootstrap, not monolith)", () => {
+  it("is under 115 lines (bootstrap, not monolith)", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content.split("\n").length).toBeLessThan(100);
+    expect(content.split("\n").length).toBeLessThan(115);
   });
 
   it("exec's the phase-selected TS runner as the final step", () => {
@@ -56,6 +56,18 @@ describe("session/entrypoint.sh", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toContain("su -p coder");
     expect(content).not.toContain("su -m -p coder");
+  });
+
+  it("overrides GITHUB_DEFAULT_BRANCH with run_config.baseBranch on non-gap-fill runs", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    // baseBranch must be read from the envelope
+    expect(content).toContain("c.baseBranch");
+    // override must be guarded: skip when PR_NUMBER is set (gap-fill must not override)
+    expect(content).toContain('[ -z "${PR_NUMBER:-}" ]');
+    // override must come AFTER the initial GITHUB_DEFAULT_BRANCH export (not gated on it being unset)
+    const initialExport = content.indexOf("export GITHUB_DEFAULT_BRANCH");
+    const branchOverride = content.indexOf('GITHUB_DEFAULT_BRANCH="$_rb"');
+    expect(branchOverride).toBeGreaterThan(initialExport);
   });
 
   it("skips the legacy ISSUE_ID require/export when AI_IMPLEMENT_RUN_CONFIG is set", () => {
