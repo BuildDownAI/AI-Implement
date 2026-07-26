@@ -897,6 +897,65 @@ deck-stage, .dc-artboard { background: var(--bg-app); }
   font-size: 12.5px;
 }
 
+/* ── Login: panel + SSO tiles (AII-147) ────────────────────── */
+.login-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  width: 400px;
+  max-width: 92vw;
+}
+.login-title {
+  margin: 0;
+  text-align: center;
+  font-size: 1.5rem;
+  font-weight: 700;
+}
+.login-panel .login-box { width: 100%; }
+
+.divider-labeled { display: flex; align-items: center; margin: 16px 0; }
+.divider-labeled::before,
+.divider-labeled::after { content: ""; flex: 1; height: 1px; background: var(--border-subtle); }
+.divider-labeled span {
+  padding: 0 10px;
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--fg-tertiary);
+  white-space: nowrap;
+}
+
+#sso-buttons {
+  display: grid;
+  grid-template-columns:
+  repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+}
+.sso-label {
+  text-align: center;
+  text-transform: uppercase;
+  font-size: 13px;
+  color: var(--fg-secondary);
+  margin-bottom: 10px;
+}
+.sso-tile {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  padding: 14px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+  color: var(--fg-primary);
+  font-size: 12px; font-weight: 500;
+  text-decoration: none;
+  transition: background 80ms ease, border-color 80ms ease;
+  }
+.sso-tile:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+.sso-tile svg { width: 22px; height: 22px; display: block; }
+
+#auth-error { margin-bottom: 12px; }
+#access-code-box { margin-top: 16px; }
+.ac-row { display: flex; gap: 8px; }
+.ac-row .input { flex: 1; min-width: 0; }
+
 /* ── Native <dialog> for legacy mapping form ─────────────────────────── */
 dialog {
   border: none;
