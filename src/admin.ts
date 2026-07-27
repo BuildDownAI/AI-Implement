@@ -1,5 +1,4 @@
 import http from "node:http";
-import crypto from "node:crypto";
 import {
   getMappings,
   DEFAULT_MAX_IN_PROGRESS_AI_ISSUES,
@@ -25,7 +24,8 @@ import {
   isRunnerMode,
   setFlySecretsMinVersion,
 } from "./runner-mode.js";
-import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
@@ -111,8 +111,6 @@ function normalizeSensitiveGlobs(raw: unknown): string[] | null {
   return globs;
 }
 
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
 let _adminJiraClient: JiraClient | null = null;
 function getAdminJiraClient(): JiraClient | null {
   if (_adminJiraClient) return _adminJiraClient;
@@ -125,27 +123,6 @@ function getAdminJiraClient(): JiraClient | null {
   if (email ? !siteUrl : !cloudId) return null;
   _adminJiraClient = new JiraClient({ token, email, siteUrl, cloudId });
   return _adminJiraClient;
-}
-
-function createSession(): string {
-  const token = crypto.randomBytes(32).toString("hex");
-  getDb()
-    .prepare("INSERT INTO admin_sessions (token, expires_at) VALUES (?, ?)")
-    .run(token, Date.now() + SESSION_TTL_MS);
-  return token;
-}
-
-function isValidSession(token: string | undefined): boolean {
-  if (!token) return false;
-  const row = getDb()
-    .prepare("SELECT expires_at FROM admin_sessions WHERE token = ?")
-    .get(token) as { expires_at: number } | undefined;
-  if (!row) return false;
-  if (Date.now() > row.expires_at) {
-    getDb().prepare("DELETE FROM admin_sessions WHERE token = ?").run(token);
-    return false;
-  }
-  return true;
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -188,14 +165,8 @@ function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketing
   return { ticketingProvider: provider, ticketingConfig: config };
 }
 
-function getToken(req: http.IncomingMessage): string | undefined {
-  const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ")) return auth.slice(7);
-  return undefined;
-}
-
 export interface AdminConfig {
-  adminAccessCode: string;
+  adminAccessCode: string | null;
   flySessionsToken: string | null;
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
@@ -213,7 +184,7 @@ export function handleAdminRequest(
   const method = req.method || "GET";
 
   // Serve admin HTML
-  if (url === "/admin" && method === "GET") {
+  if (url.split("?")[0] === "/admin" && method === "GET") {
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(adminHtml);
     return true;
@@ -227,7 +198,7 @@ export function handleAdminRequest(
 
   // All other /api routes require auth
   if (url.startsWith("/api/")) {
-    if (!isValidSession(getToken(req))) {
+    if (!isValidSession(getRequestToken(req))) {
       json(res, 401, { error: "Unauthorized" });
       return true;
     }
@@ -662,11 +633,17 @@ async function handleDestroySession(
 async function handleAuth(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  accessCode: string,
+  accessCode: string | null,
 ): Promise<void> {
+  if (accessCode === null) {
+    json(res, 403, { error: "Access-code login is disabled" });
+    return;
+  }
+
   try {
     const body = JSON.parse(await readBody(req)) as { code?: string };
-    if (body.code === accessCode) {
+    if (typeof body.code === "string" && accessCodeMatches(body.code, accessCode)) {
+      console.warn("[admin] access-code login is deprecated; configure SSO (OAuth) providers instead");
       const token = createSession();
       json(res, 200, { token });
     } else {

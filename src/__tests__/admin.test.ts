@@ -106,7 +106,7 @@ afterEach(() => {
   try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
-function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminRequest>[2] {
+function adminConfig(accessCode: string | null): Parameters<typeof admin.handleAdminRequest>[2] {
   return {
     adminAccessCode: accessCode,
     flySessionsToken: null,
@@ -117,7 +117,7 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
   };
 }
 
-async function request(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
+async function request(url: string, method: string, accessCode: string | null, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   let requestBody = body;
   if (
     url === "/api/mappings" &&
@@ -136,7 +136,7 @@ async function request(url: string, method: string, accessCode: string, body?: u
   return requestRaw(url, method, accessCode, requestBody, token);
 }
 
-async function requestRaw(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
+async function requestRaw(url: string, method: string, accessCode: string | null, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
@@ -161,9 +161,32 @@ describe("admin auth", () => {
     expect(res.statusCode).toBe(403);
   });
 
+  it("returns 403 when access-code login is disabled (adminAccessCode is null)", async () => {
+    const res = await requestRaw("/api/auth", "POST", null, { code: "anything" });
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toMatch(/disabled/);
+  });
+
+  it("a null code cannot bypass a disabled access code", async () => {
+    const res = await requestRaw("/api/auth", "POST", null, { code: null });
+    expect(res.statusCode).toBe(403);
+  });
+
   it("returns 401 on protected routes without token", async () => {
     const res = await request("/api/mappings", "GET", "secret");
     expect(res.statusCode).toBe(401);
+  });
+
+  it("serves the SPA shell for GET /admin, ignoring any query string (e.g. the OAuth ?auth_error= redirect)", async () => {
+    // Control: the bare path serves the shell.
+    const plain = await requestRaw("/admin", "GET", "secret");
+    expect(plain.statusCode).toBe(200);
+    expect(plain.body).toContain('id="login-page"');
+
+    // Regression: a query string must not cause a 404 — the callback's failure redirect lands here.
+    const withQuery = await requestRaw("/admin?auth_error=denied", "GET", "secret");
+    expect(withQuery.statusCode).toBe(200);
+    expect(withQuery.body).toContain('id="login-page"');
   });
 
   it("session token survives a module reload (simulates server restart)", async () => {
