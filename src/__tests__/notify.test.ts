@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { notify, notifyCompletion } from "../notify.js";
-import type { Notification } from "../notify.js";
+import { notify, notifyCompletion, notifyDeploy } from "../notify.js";
+import type { DeployNotification, Notification } from "../notify.js";
 
 const notification: Notification = {
   issueIdentifier: "TEST-5",
@@ -271,6 +271,138 @@ describe("notifyCompletion", () => {
       vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "err" } as Response);
       await expect(
         notifyCompletion("teams", "https://hook.example.com", { ...completionBase, status: "completed" }),
+      ).rejects.toThrow("500");
+    });
+  });
+});
+
+describe("notifyDeploy", () => {
+  const deployBase: DeployNotification = {
+    kind: "deployed",
+    appName: "ai-implement-testing-orchestrator",
+    region: "iad",
+    imageRef: "registry.fly.io/ai-implement-testing-orchestrator:deployment-01H9RK9EYO9PGNBYAKGXSHV0PH",
+    downtimeMs: 42_000,
+  };
+
+  const sentBody = () => JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+  const slackText = (): string => sentBody().blocks[0].text.text;
+  const teamsFacts = (): Array<{ title: string; value: string }> =>
+    sentBody().attachments[0].content.body.find((b: { type: string }) => b.type === "FactSet").facts;
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  describe("slack", () => {
+    // The broadcast is the whole point of AII-255: the team must be pinged that dispatches are
+    // pausing. The two boot notices answer that ping, so they must stay quiet.
+    it("broadcasts to the channel on shutdown", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", {
+        ...deployBase, kind: "shutdown", downtimeMs: null,
+      });
+      expect(slackText()).toContain("<!channel>");
+      expect(slackText()).toContain("Orchestrator restarting");
+    });
+
+    it.each(["deployed", "restarted"] as const)("does not broadcast on %s", async (kind) => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kind });
+      expect(slackText()).not.toContain("<!channel>");
+    });
+
+    it("omits the version on shutdown and shows it once back up", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", {
+        ...deployBase, kind: "shutdown", downtimeMs: null,
+      });
+      expect(slackText()).not.toContain("Version:");
+
+      vi.mocked(fetch).mockClear();
+      await notifyDeploy("slack", "https://webhook.example.com/slack", deployBase);
+      expect(slackText()).toContain("Version:");
+    });
+
+    // Only the deployment tag is readable; the registry host is noise that would wrap the line.
+    it("renders the deployment tag rather than the whole image reference", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", deployBase);
+      expect(slackText()).toContain("`deployment-01H9RK9EYO9PGNBYAKGXSHV0PH`");
+      expect(slackText()).not.toContain("registry.fly.io");
+    });
+
+    it("falls back to the whole reference when it carries no tag", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", {
+        ...deployBase, imageRef: "some-untagged-reference",
+      });
+      expect(slackText()).toContain("`some-untagged-reference`");
+    });
+
+    it("renders downtime through formatDuration", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, downtimeMs: 125_000 });
+      expect(slackText()).toContain("Down for 2m 5s");
+    });
+
+    // A boot with no preceding shutdown record (hard kill, first boot) has nothing to measure.
+    it("omits downtime when it was not measured", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, downtimeMs: null });
+      expect(slackText()).not.toContain("Down for");
+    });
+
+    it("omits the region when unknown", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, region: null });
+      expect(slackText()).not.toContain("Region:");
+      expect(slackText()).toContain("App: `ai-implement-testing-orchestrator`");
+    });
+
+    it("uses slack by default when type is unrecognised", async () => {
+      await notifyDeploy("unknown-type", "https://webhook.example.com/hook", deployBase);
+      expect(sentBody().blocks).toBeDefined();
+    });
+
+    it("throws on non-ok response", async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: false, status: 500, text: async () => "err" } as Response);
+      await expect(
+        notifyDeploy("slack", "https://webhook.example.com/slack", deployBase),
+      ).rejects.toThrow("500");
+    });
+  });
+
+  describe("teams", () => {
+    it("carries app, region, version and downtime as facts", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", deployBase);
+      const byTitle = Object.fromEntries(teamsFacts().map((f) => [f.title, f.value]));
+      expect(byTitle).toEqual({
+        App: "ai-implement-testing-orchestrator",
+        Region: "iad",
+        Version: "deployment-01H9RK9EYO9PGNBYAKGXSHV0PH",
+        "Down for": "42s",
+      });
+    });
+
+    it("titles the card by event kind", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", { ...deployBase, kind: "restarted" });
+      expect(sentBody().attachments[0].content.body[0].text).toContain("Orchestrator back up");
+    });
+
+    it("omits the version fact on shutdown", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", {
+        ...deployBase, kind: "shutdown", downtimeMs: null,
+      });
+      expect(teamsFacts().some((f) => f.title === "Version")).toBe(false);
+    });
+
+    // Slack broadcast syntax has no Teams equivalent — it would render as literal text in the card.
+    it("never emits slack mention syntax", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", {
+        ...deployBase, kind: "shutdown", downtimeMs: null,
+      });
+      expect((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string).not.toContain("<!channel>");
+    });
+
+    it("throws on non-ok response", async () => {
+      vi.mocked(fetch).mockResolvedValue({ ok: false, status: 500, text: async () => "err" } as Response);
+      await expect(
+        notifyDeploy("teams", "https://webhook.example.com/teams", deployBase),
       ).rejects.toThrow("500");
     });
   });

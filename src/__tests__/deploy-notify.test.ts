@@ -1,0 +1,265 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as DedupModule from "../dedup.js";
+import type * as DeployNotifyModule from "../deploy-notify.js";
+import type * as NotifyModule from "../notify.js";
+
+// The formatters are covered by notify.test.ts; here we only care that the right
+// payload reaches them, so the whole notify module is replaced by a spy.
+vi.mock("../notify.js", () => ({ notifyDeploy: vi.fn() }));
+
+const IMAGE_A = "registry.fly.io/orch:deployment-AAA";
+const IMAGE_B = "registry.fly.io/orch:deployment-BBB";
+const LAST_IMAGE_REF_KEY = "deploy_last_image_ref";
+const LAST_SHUTDOWN_AT_KEY = "deploy_last_shutdown_at";
+
+const config = { notifyType: "slack", notifyWebhookUrl: "https://hook.example.com" };
+
+let dbPath: string;
+let dedup: typeof DedupModule;
+let deployNotify: typeof DeployNotifyModule;
+let notify: typeof NotifyModule;
+
+beforeEach(async () => {
+  vi.resetModules();
+  dbPath = path.join(os.tmpdir(), `deploy-notify-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
+  process.env.DEDUP_DB_PATH = dbPath;
+  dedup = await import("../dedup.js");
+  const runnerMode = await import("../runner-mode.js");
+  runnerMode.initSettingsTable();
+  deployNotify = await import("../deploy-notify.js");
+  notify = await import("../notify.js");
+});
+
+afterEach(() => {
+  dedup.closeDb();
+  vi.unstubAllEnvs();
+  vi.clearAllMocks();
+  try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
+});
+
+/** Puts the process in "running as a Fly Machine on this image" state. */
+function onFly(imageRef: string): void {
+  vi.stubEnv("FLY_IMAGE_REF", imageRef);
+  vi.stubEnv("FLY_APP_NAME", "ai-implement-testing-orchestrator");
+  vi.stubEnv("FLY_REGION", "iad");
+}
+
+function readKey(key: string): string | null {
+  const row = dedup.getDb().prepare("SELECT value FROM settings WHERE key = ?").get(key) as
+    | { value: string }
+    | undefined;
+  return row?.value ?? null;
+}
+
+function writeKey(key: string, value: string): void {
+  dedup.getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+}
+
+// ---------- The decision, as a table. No database, no clock, no network. ----------
+
+describe("decideBootNotification", () => {
+  const base = { currentImageRef: IMAGE_B, prevImageRef: IMAGE_A, lastShutdownAt: 1_000, now: 4_000 };
+
+  it("stays silent on the first boot of a fresh volume", () => {
+    expect(deployNotify.decideBootNotification({ ...base, prevImageRef: null })).toBeNull();
+  });
+
+  it("reports a deploy when the image ref changed", () => {
+    expect(deployNotify.decideBootNotification(base)).toEqual({ kind: "deployed", downtimeMs: 3_000 });
+  });
+
+  // A SIGKILLed process runs no handler, so there is no timestamp — but the stored ref
+  // survives from the last successful boot, so the classification still holds.
+  it("reports a deploy after a hard kill, without a downtime figure", () => {
+    expect(deployNotify.decideBootNotification({ ...base, lastShutdownAt: null })).toEqual({
+      kind: "deployed",
+      downtimeMs: null,
+    });
+  });
+
+  it("reports a restart when the ref is unchanged and a shutdown was announced", () => {
+    expect(deployNotify.decideBootNotification({ ...base, currentImageRef: IMAGE_A })).toEqual({
+      kind: "restarted",
+      downtimeMs: 3_000,
+    });
+  });
+
+  // Nothing told the channel this process stopped, so nothing needs to tell it we are back.
+  it("stays silent when the ref is unchanged and nothing announced a stop", () => {
+    expect(
+      deployNotify.decideBootNotification({ ...base, currentImageRef: IMAGE_A, lastShutdownAt: null }),
+    ).toBeNull();
+  });
+
+  it("clamps downtime to zero rather than reporting a negative duration", () => {
+    expect(deployNotify.decideBootNotification({ ...base, now: 500 })).toEqual({
+      kind: "deployed",
+      downtimeMs: 0,
+    });
+  });
+});
+
+// ---------- The shell around it ----------
+
+describe("recordShutdown", () => {
+  it("records a timestamp when running on Fly", () => {
+    onFly(IMAGE_A);
+    deployNotify.recordShutdown();
+    expect(Number(readKey(LAST_SHUTDOWN_AT_KEY))).toBeGreaterThan(0);
+  });
+
+  it("records nothing off Fly", () => {
+    deployNotify.recordShutdown();
+    expect(readKey(LAST_SHUTDOWN_AT_KEY)).toBeNull();
+  });
+});
+
+describe("postShutdownNotice", () => {
+  it("posts a shutdown notice with no downtime figure", async () => {
+    onFly(IMAGE_A);
+    await deployNotify.postShutdownNotice(config);
+
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    const [type, url, payload] = vi.mocked(notify.notifyDeploy).mock.calls[0];
+    expect(type).toBe("slack");
+    expect(url).toBe(config.notifyWebhookUrl);
+    expect(payload).toMatchObject({
+      kind: "shutdown",
+      appName: "ai-implement-testing-orchestrator",
+      region: "iad",
+      imageRef: IMAGE_A,
+      downtimeMs: null,
+    });
+  });
+
+  it("stays silent off Fly", async () => {
+    await deployNotify.postShutdownNotice(config);
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+  });
+
+  it("stays silent when no webhook is configured", async () => {
+    onFly(IMAGE_A);
+    await deployNotify.postShutdownNotice({ ...config, notifyWebhookUrl: null });
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+  });
+
+  // A dead webhook must never wedge a shutdown that Fly is already counting down.
+  it("swallows a webhook failure", async () => {
+    onFly(IMAGE_A);
+    vi.mocked(notify.notifyDeploy).mockRejectedValueOnce(new Error("Slack webhook failed: 500"));
+    await expect(deployNotify.postShutdownNotice(config)).resolves.toBeUndefined();
+  });
+});
+
+describe("postBootNotice", () => {
+  it("stays silent and writes nothing off Fly", async () => {
+    await deployNotify.postBootNotice(config);
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+    expect(readKey(LAST_IMAGE_REF_KEY)).toBeNull();
+  });
+
+  it("records the ref silently on a first boot", async () => {
+    onFly(IMAGE_A);
+    await deployNotify.postBootNotice(config);
+
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+    expect(readKey(LAST_IMAGE_REF_KEY)).toBe(IMAGE_A);
+  });
+
+  it("announces a deploy and advances the stored ref", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    await deployNotify.postBootNotice(config);
+
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kind: "deployed", imageRef: IMAGE_B });
+    expect(readKey(LAST_IMAGE_REF_KEY)).toBe(IMAGE_B);
+  });
+
+  // Otherwise a later restart would measure its downtime from a deploy that already resolved.
+  it("clears the shutdown record once it has been consumed", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    writeKey(LAST_SHUTDOWN_AT_KEY, String(Date.now() - 5_000));
+    onFly(IMAGE_B);
+    await deployNotify.postBootNotice(config);
+
+    expect(readKey(LAST_SHUTDOWN_AT_KEY)).toBeNull();
+  });
+
+  // State is bookkeeping, not a side effect of notifying: if it only advanced when a webhook
+  // was set, enabling notifications later would announce a deploy that happened weeks ago.
+  it("advances state even when no webhook is configured", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    await deployNotify.postBootNotice({ ...config, notifyWebhookUrl: null });
+
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+    expect(readKey(LAST_IMAGE_REF_KEY)).toBe(IMAGE_B);
+  });
+
+  it("swallows a webhook failure", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    vi.mocked(notify.notifyDeploy).mockRejectedValueOnce(new Error("Slack webhook failed: 500"));
+    await expect(deployNotify.postBootNotice(config)).resolves.toBeUndefined();
+  });
+
+  // index.ts calls this fire-and-forget so a hanging webhook cannot stall startup, which is
+  // only safe while every write sits above the first await. A webhook that never settles must
+  // therefore still leave the state fully advanced once control returns.
+  it("persists state synchronously, before the webhook is awaited", () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    writeKey(LAST_SHUTDOWN_AT_KEY, String(Date.now() - 5_000));
+    onFly(IMAGE_B);
+    vi.mocked(notify.notifyDeploy).mockReturnValueOnce(new Promise(() => { /* never settles */ }));
+
+    void deployNotify.postBootNotice(config); // deliberately not awaited
+
+    expect(readKey(LAST_IMAGE_REF_KEY)).toBe(IMAGE_B);
+    expect(readKey(LAST_SHUTDOWN_AT_KEY)).toBeNull();
+  });
+
+  it("ignores a corrupt shutdown timestamp rather than reporting a nonsense duration", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    writeKey(LAST_SHUTDOWN_AT_KEY, "not-a-number");
+    onFly(IMAGE_B);
+    await deployNotify.postBootNotice(config);
+
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ downtimeMs: null });
+  });
+});
+
+// ---------- The two halves in sequence, which is how they actually run ----------
+
+describe("shutdown → boot cycle", () => {
+  it("reports a deploy with measured downtime across a version change", async () => {
+    onFly(IMAGE_A);
+    await deployNotify.postBootNotice(config); // first boot: records IMAGE_A silently
+    vi.mocked(notify.notifyDeploy).mockClear();
+
+    deployNotify.recordShutdown();
+    await deployNotify.postShutdownNotice(config);
+
+    onFly(IMAGE_B); // the replacement machine
+    await deployNotify.postBootNotice(config);
+
+    const kinds = vi.mocked(notify.notifyDeploy).mock.calls.map((c) => c[2].kind);
+    expect(kinds).toEqual(["shutdown", "deployed"]);
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[1][2].downtimeMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("reports a restart when the same image comes back", async () => {
+    onFly(IMAGE_A);
+    await deployNotify.postBootNotice(config);
+    vi.mocked(notify.notifyDeploy).mockClear();
+
+    deployNotify.recordShutdown();
+    await deployNotify.postShutdownNotice(config);
+    await deployNotify.postBootNotice(config); // same IMAGE_A
+
+    const kinds = vi.mocked(notify.notifyDeploy).mock.calls.map((c) => c[2].kind);
+    expect(kinds).toEqual(["shutdown", "restarted"]);
+  });
+});

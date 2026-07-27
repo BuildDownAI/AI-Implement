@@ -2,6 +2,7 @@
 # (or use `clients/<slug>.toml` with the multi-client deploy workflow).
 app = "ai-implement"
 primary_region = "iad"
+kill_timeout = 15
 
 [build]
 

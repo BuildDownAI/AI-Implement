@@ -108,6 +108,7 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `dispatched` | Dedup — issue IDs dispatched in the last 24h |
 | `mappings` | Team key → GitHub repo config |
 | `dispatch_log` | Audit log, last 500 dispatches |
+| `settings` | Key-value store — runner mode, Fly session config, deploy-notification state |
 
 `dedup.ts` owns the DB singleton (`getDb()`). All other modules import `getDb` from `dedup.ts`.
 
@@ -168,6 +169,10 @@ Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are
 ## Notification adapter
 
 `src/notify.ts` exports a single `notify(type, webhookUrl, notification)` function. Set `NOTIFY_TYPE=slack` or `NOTIFY_TYPE=teams` to switch providers. Adding a new provider means adding a private function in `notify.ts` and a new case in the switch.
+
+The orchestrator also announces its own deploys. On shutdown it posts an `@channel` heads-up that dispatches are pausing; on the next boot it compares `FLY_IMAGE_REF` against the value it stored in the `settings` table and posts either "redeployed" (the image changed) or "restarted" (it did not), with how long it was down. A first boot on a fresh volume records the reference silently.
+
+Both notices are gated on `FLY_IMAGE_REF`, which only exists inside a Fly Machine — local runs never post. Failures are logged and swallowed, and the shutdown notice is bounded to a fraction of the shutdown budget so it cannot outlive `kill_timeout`.
 
 ## Workflow templates
 

@@ -13,6 +13,7 @@ import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
+import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -2630,6 +2631,11 @@ async function main(): Promise<void> {
 
   const server = startServer(config, registry);
 
+  // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
+  // Safe because everything postBootNotice persists happens synchronously before its first await,
+  // so the stored image ref is committed by the time this returns.
+  void postBootNotice(config);
+
   // Reconcile machines from any previous run before starting the poll loop
   await startupReconciliation(config, registry);
 
@@ -2641,26 +2647,35 @@ async function main(): Promise<void> {
     poll(config, registry);
   }, config.pollIntervalMs);
 
-  // Graceful shutdown
-  const shutdown = (signal: string) => {
+  // total amount of time allotted for a graceful shutdown, otherwise the shutdown is forced
+  const SHUTDOWN_BUDGET_MS = 10_000; // 10s
+  const shutdown = async (signal: string) => {
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
+
+    // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
+    setTimeout(() => {
+      console.error(`[main] Forced shutdown after timeout`);
+      closeDb();
+      process.exit(1);
+    }, SHUTDOWN_BUDGET_MS).unref();
+
+    // Written before closeDb() so the next boot can measure how long we were gone.
+    recordShutdown();
+    await Promise.race([
+      postShutdownNotice(config),
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
+    ]);
+
     server.close(() => {
       closeDb();
       console.log(`[main] Shutdown complete`);
       process.exit(0);
     });
-
-    // Force exit after 10 seconds if graceful shutdown hangs
-    setTimeout(() => {
-      console.error(`[main] Forced shutdown after timeout`);
-      closeDb();
-      process.exit(1);
-    }, 10_000).unref();
   };
 
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+  process.on("SIGINT", () => { void shutdown("SIGINT"); });
 }
 
 main().catch((err) => {
