@@ -19,7 +19,6 @@ function makeContext(overrides: Partial<Parameters<typeof DefaultPipelineContext
     issueDescription: "Description",
     nonce: "test-nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
     ...overrides,
   });
 }
@@ -287,9 +286,9 @@ describe("PipelineRunner — dynamic step loading via resolveModule()", () => {
       resolveModuleOptions: {
         customRoot: "/fake-workspace",
         builtinRoot: "/fake-builtin",
-        existsSyncImpl: (p) => p.includes(existingPath),
+        existsSyncImpl: (p) => p.replace(/\\/g, "/").includes(existingPath),
       },
-      importStepModule: async (p) => (p.includes(existingPath) ? importResult : undefined),
+      importStepModule: async (p) => (p.replace(/\\/g, "/").includes(existingPath) ? importResult : undefined),
       ...extraOptions,
     });
   }
@@ -315,11 +314,11 @@ describe("PipelineRunner — dynamic step loading via resolveModule()", () => {
       resolveModuleOptions: {
         customRoot: "/my-workspace",
         builtinRoot: "/builtin",
-        existsSyncImpl: (p) => p.includes("/my-workspace/custom/steps/hello.js"),
+        existsSyncImpl: (p) => p.replace(/\\/g, "/").includes("/my-workspace/custom/steps/hello.js"),
       },
       importStepModule: async (p) => {
         importedPaths.push(p);
-        return p.includes("custom") ? helloMod : undefined;
+        return p.replace(/\\/g, "/").includes("/my-workspace/custom") ? helloMod : undefined;
       },
     });
 
@@ -329,7 +328,7 @@ describe("PipelineRunner — dynamic step loading via resolveModule()", () => {
       new NoopStepReporter(),
     );
 
-    expect(importedPaths[0]).toContain("/my-workspace/custom/steps/hello.js");
+    expect(importedPaths[0].replace(/\\/g, "/")).toContain("/my-workspace/custom/steps/hello.js");
   });
 
   it("pre-registered modules take precedence over dynamic loading", async () => {
@@ -379,9 +378,9 @@ describe("PipelineRunner — dynamic step loading via resolveModule()", () => {
         customRoot: "/ws",
         builtinRoot: "/builtin",
         // Only the .ts path exists
-        existsSyncImpl: (p) => p.endsWith("custom/steps/hello.ts"),
+        existsSyncImpl: (p) => p.replace(/\\/g, "/").endsWith("custom/steps/hello.ts"),
       },
-      importStepModule: async (p) => (p.endsWith("custom/steps/hello.ts") ? helloMod : undefined),
+      importStepModule: async (p) => (p.replace(/\\/g, "/").endsWith("custom/steps/hello.ts") ? helloMod : undefined),
     });
 
     await runner.run(

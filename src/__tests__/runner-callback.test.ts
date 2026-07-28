@@ -3,17 +3,25 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
+import type * as LogModule from "../log.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
+import type * as StepLogModule from "../step-log.js";
+import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
+import { formatFailureComment } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
+import type { Step } from "../pipeline/types.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
 let dbPath: string;
 let dedup: typeof DedupModule;
+let log: typeof LogModule;
 let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
+let stepLog: typeof StepLogModule;
+let reviewStore: typeof ReviewLedgerStoreModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -23,12 +31,18 @@ beforeEach(async () => {
   );
   process.env.DEDUP_DB_PATH = dbPath;
   dedup = await import("../dedup.js");
+  log = await import("../log.js");
   runnerTokens = await import("../runner-tokens.js");
   runnerCallback = await import("../runner-callback.js");
+  stepLog = await import("../step-log.js");
+  reviewStore = await import("../review-ledger-store.js");
   dedup.getDb();
+  log.initLogTable();
+  stepLog.initStepLogTable();
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   dedup.closeDb();
   try {
     fs.unlinkSync(dbPath);
@@ -41,6 +55,18 @@ afterEach(() => {
 function makeResolve(provider: TicketingProvider | null) {
   return async (_mappingTeamKey: string) => provider;
 }
+
+const STEP: Step = {
+  id: "implement.1",
+  type: "implement",
+  status: "running",
+  started_at: "2026-05-27T00:00:00.000Z",
+  ended_at: null,
+  parent_step_id: "feedback-loop",
+  inputs: {},
+  outputs: {},
+  logs_url: null,
+};
 
 describe("handleRunnerResult — auth", () => {
   it("returns 401 when Authorization header is missing", async () => {
@@ -165,6 +191,38 @@ describe("handleRunnerResult — planning", () => {
     expect(fake.getPhase("i")).toBe("plan_complete");
   });
 
+  it("finalizes the dispatch-log job as completed on planning success", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Plan it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      phase: "planning",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobById(jobId);
+    expect(job?.status).toBe("completed");
+    expect(job?.completedAt).not.toBeNull();
+  });
+
   it("calls markPlanningFailed on failure", async () => {
     const { token } = runnerTokens.mintRunToken({
       issueId: "i",
@@ -189,6 +247,7 @@ describe("handleRunnerResult — planning", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPlanningFailed")?.args).toEqual([
       "i",
+      "ENG",
       "boom",
     ]);
   });
@@ -220,8 +279,43 @@ describe("handleRunnerResult — implementation", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPrReady")?.args).toEqual([
       "i",
+      "ENG",
       "https://github.com/o/r/pull/1",
     ]);
+  });
+
+  it("updates the dispatch log with the PR URL when the result token returns", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.prUrl).toBe("https://github.com/o/r/pull/1");
   });
 
   it("calls markImplementationFailed on failure", async () => {
@@ -248,7 +342,143 @@ describe("handleRunnerResult — implementation", () => {
     const calls = fake.recordedCalls();
     expect(
       calls.find((c) => c.method === "markImplementationFailed")?.args,
-    ).toEqual(["i", "tests fail"]);
+    ).toEqual(["i", "ENG", "tests fail"]);
+  });
+});
+
+describe("handleRunnerProgress", () => {
+  it("returns 401 before validating body when bearer token is invalid", async () => {
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: "Bearer invalid",
+      body: {} as never,
+      secret: SECRET,
+    });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).not.toBe("step_required");
+  });
+
+  it("persists a step report by reusable progress token", async () => {
+    const dispatchId = "dispatch-progress";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const first = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { step: STEP },
+      secret: SECRET,
+    });
+    const second = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { step: { ...STEP, status: "completed", ended_at: "2026-05-27T00:01:00.000Z" } },
+      secret: SECRET,
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(stepLog.getStepsByJobId(jobId)).toMatchObject([
+      {
+        stepId: "implement.1",
+        stepType: "implement",
+        status: "completed",
+        endedAt: "2026-05-27T00:01:00.000Z",
+      },
+    ]);
+  });
+});
+
+describe("handleRunnerPlanningContext", () => {
+  function mintProgress(issueId: string, mappingTeamKey: string) {
+    return runnerTokens.mintRunToken({
+      issueId,
+      mappingTeamKey,
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+  }
+
+  it("returns 401 when the bearer token is missing or invalid", async () => {
+    const res = await runnerCallback.handleRunnerPlanningContext({
+      authorization: "Bearer nope",
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects a one-shot result token (wrong audience)", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "result",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const res = await runnerCallback.handleRunnerPlanningContext({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("returns the provider's planning context for the token's issue", async () => {
+    const { token } = mintProgress("issue-xyz", "ENG");
+    const provider = new FakeProvider({ planningContext: "## Planning Context\n\nUse the widget pattern." });
+    const spy = vi.spyOn(provider, "fetchPlanningContext");
+
+    const res = await runnerCallback.handleRunnerPlanningContext({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
+      resolveProvider: makeResolve(provider),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.planningContext).toContain("Use the widget pattern.");
+    expect(spy).toHaveBeenCalledWith("issue-xyz");
+  });
+
+  it("does not consume the token — it can be fetched more than once", async () => {
+    const { token } = mintProgress("issue-xyz", "ENG");
+    const provider = new FakeProvider({ planningContext: "ctx" });
+    const call = () =>
+      runnerCallback.handleRunnerPlanningContext({
+        authorization: `Bearer ${token}`,
+        secret: SECRET,
+        resolveProvider: makeResolve(provider),
+      });
+    expect((await call()).status).toBe(200);
+    expect((await call()).status).toBe(200);
+  });
+
+  it("returns empty context (200) when the mapping was deleted", async () => {
+    const { token } = mintProgress("issue-xyz", "ENG");
+    const res = await runnerCallback.handleRunnerPlanningContext({
+      authorization: `Bearer ${token}`,
+      secret: SECRET,
+      resolveProvider: makeResolve(null),
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.planningContext).toBe("");
   });
 });
 
@@ -277,6 +507,93 @@ describe("handleRunnerResult — gap-analysis", () => {
     const calls = fake.recordedCalls();
     expect(calls.find((c) => c.method === "markPlanComplete")).toBeUndefined();
     expect(calls.find((c) => c.method === "markPrReady")).toBeUndefined();
+  });
+
+  it("resolves open review findings after a successful gap-analysis callback for the PR", async () => {
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix me",
+    });
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      repo: "org/repo",
+      dispatchId,
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+  });
+
+  it("does not resolve review findings that arrived after the gap-fill dispatch started", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-27T00:00:00.000Z"));
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Original feedback",
+    });
+    vi.setSystemTime(new Date("2026-05-27T00:01:00.000Z"));
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      repo: "org/repo",
+      dispatchId,
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+    vi.setSystemTime(new Date("2026-05-27T00:02:00.000Z"));
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review-thread",
+      severity: "blocking",
+      body: "New feedback that arrived while the gap-fill was running",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "success",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toMatchObject([
+      { body: "New feedback that arrived while the gap-fill was running" },
+    ]);
   });
 });
 
@@ -425,6 +742,162 @@ describe("handleRunnerResult — expired token", () => {
     });
     expect(res.status).toBe(401);
     expect(res.body.error).toBe("expired");
+  });
+});
+
+// ── formatFailureComment ──────────────────────────────────────────────────────
+
+describe("formatFailureComment", () => {
+  it("returns the raw reason when no failureCode is provided", () => {
+    expect(formatFailureComment(undefined, "tests fail")).toBe("tests fail");
+  });
+
+  it("returns a default summary when both are undefined", () => {
+    expect(formatFailureComment(undefined, undefined)).toBe("Unspecified failure.");
+  });
+
+  it("formats SENSITIVE_FILES_BLOCKED with a structured comment", () => {
+    const msg = formatFailureComment("SENSITIVE_FILES_BLOCKED", "Push blocked: 1 sensitive file(s):\n  .env  (.env file)");
+    expect(msg).toContain("🔒");
+    expect(msg).toContain("Blocked by security guardrail");
+    expect(msg).toContain(".env");
+    expect(msg).toContain(".gitignore");
+    expect(msg).toContain("troubleshooting"); // remediation now links the docs
+  });
+
+  it("formats SENSITIVE_FILES_BLOCKED even when failureReason is undefined", () => {
+    const msg = formatFailureComment("SENSITIVE_FILES_BLOCKED", undefined);
+    expect(msg).toContain("🔒");
+    expect(msg).toContain("Blocked by security guardrail");
+  });
+
+  it("passes unknown failure codes through as raw reason", () => {
+    expect(formatFailureComment("SOME_OTHER_CODE", "some error")).toBe("some error");
+  });
+});
+
+describe("handleRunnerResult — SENSITIVE_FILES_BLOCKED failure code", () => {
+  it("formats the comment with the security guardrail message and passes it to markImplementationFailed", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "Push blocked: 1 sensitive file(s) would be committed:\n  .env  (.env file)",
+        failureCode: "SENSITIVE_FILES_BLOCKED",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
+    expect(call).toBeDefined();
+    const [issueId, scopeKey, comment] = call!.args as [string, string, string];
+    expect(issueId).toBe("i");
+    expect(scopeKey).toBe("ENG");
+    expect(comment).toContain("🔒");
+    expect(comment).toContain("Blocked by security guardrail");
+    expect(comment).toContain(".env");
+  });
+
+  it("does not use the security guardrail format for other failures without failureCode", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "compilation error",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
+    const [, , comment] = call!.args as [string, string, string];
+    expect(comment).toBe("compilation error");
+    expect(comment).not.toContain("🔒");
+  });
+});
+
+describe("unapproved-run failure codes", () => {
+  it("formatFailureComment renders REVIEW_UNAPPROVED with the draft PR link", () => {
+    const comment = formatFailureComment(
+      "REVIEW_UNAPPROVED",
+      "Automated review did not approve (iterations_exhausted after 3 iteration(s)). Missing tests.",
+      "https://github.com/o/r/pull/9",
+    );
+    expect(comment).toContain("without review approval");
+    expect(comment).toContain("https://github.com/o/r/pull/9");
+    expect(comment).toContain("Missing tests.");
+    expect(comment).toContain("**Next step:**");
+  });
+
+  it("formatFailureComment renders MAX_TURNS_EXHAUSTED distinctly", () => {
+    const comment = formatFailureComment("MAX_TURNS_EXHAUSTED", "hit the cap", undefined);
+    expect(comment).toContain("turn cap");
+    expect(comment).toContain("No PR could be opened");
+  });
+
+  it("unknown failureCode still falls through to the generic summary", () => {
+    expect(formatFailureComment("SOMETHING_NEW", "boom", undefined)).toContain("boom");
+  });
+
+  it("records the draft PR url on the job for an implementation failure", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "nope",
+        prUrl: "https://github.com/o/r/pull/9",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.prUrl).toBe("https://github.com/o/r/pull/9");
+    const call = fake.recordedCalls().find((c) => c.method === "markImplementationFailed");
+    expect(call).toBeDefined();
+    const [, , comment] = call!.args as [string, string, string];
+    expect(comment).toContain("https://github.com/o/r/pull/9");
   });
 });
 

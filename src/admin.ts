@@ -10,6 +10,7 @@ import {
   DEFAULT_PLANNING_ENABLED,
   DEFAULT_PLANNING_WORKFLOW_FILE,
   DEFAULT_AUTO_APPROVE_PLANS,
+  DEFAULT_AUTO_MERGE,
   DEFAULT_PROVIDER,
   upsertMapping,
   updateMappingCap,
@@ -35,11 +36,80 @@ import { selectBlockers } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
+import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
-import { syncWorkflowTemplates } from "./workflow-sync.js";
+import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
+import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
+import picomatch from "picomatch";
+
+const SKILLS_REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+// NOTE: skillsRepo is syntax- and host-validated only — it is NOT sanitised. Any code that
+// later feeds this value to a subprocess (e.g. the `git clone` in the runner) MUST
+// pass it as a separate argv element, never interpolated into a shell string, to
+// avoid command injection.
+function normalizeSkillsRepo(raw: unknown): string | null {
+  if (raw == null) return null;
+  if (typeof raw !== "string") throw new Error("skillsRepo must be a string");
+  const v = raw.trim();
+  if (v === "") return null;
+  if (SKILLS_REPO_SHORTHAND.test(v)) return `https://github.com/${v}`;
+  // Only https://github.com remotes (and the owner/repo shorthand handled above, which
+  // implies github.com) are usable on the runner: clone auth is the orchestrator-minted
+  // GitHub App installation token embedded in the URL, and that credential must never
+  // be sent to any other host. An SSH (git@…) URL would need keys the runner doesn't
+  // have, so the install step just warns and installs nothing — a silent no-op. Reject
+  // both here rather than storing a value that looks accepted but does nothing (or
+  // worse) at dispatch. Exact host match, case-insensitive; www.github.com excluded —
+  // git remotes live on the apex host.
+  let host: string | null = null;
+  if (/^https:\/\/[^\s]+$/.test(v)) {
+    try {
+      host = new URL(v).hostname.toLowerCase();
+    } catch {
+      host = null;
+    }
+  }
+  if (host !== "github.com") throw new Error("skillsRepo must be 'owner/repo' shorthand or an https://github.com/... URL (the runner clones with a GitHub token, so other hosts and SSH git@ URLs are not supported)");
+  return v;
+}
+
+function normalizeSensitiveGlobs(raw: unknown): string[] | null {
+  if (raw == null) return null;
+  if (typeof raw !== "string" && !Array.isArray(raw)) {
+    throw new Error("must be a string or an array of strings");
+  }
+  const items = Array.isArray(raw) ? raw : raw.split("\n");
+  for (const item of items) {
+    if (typeof item !== "string") {
+      throw new Error("must be a string or an array of strings");
+    }
+  }
+  const globs = (items as string[]).map((g) => g.trim()).filter((g) => g.length > 0);
+  if (globs.length === 0) return null;
+  if (globs.length > 100) {
+    throw new Error(`too many globs (${globs.length}); maximum is 100 per list`);
+  }
+  for (const glob of globs) {
+    // Reject globs made up entirely of wildcards, path separators, and dots
+    // ("**", "**/*", "*", ".*", ...): they match everything and would disable
+    // the guardrail. Every glob must carry at least one literal path character.
+    if (glob.replace(/[*/.\s]/g, "").length === 0) {
+      throw new Error(`glob "${glob}" is not allowed (matches everything, which would disable the guardrail); each glob must contain a literal path character`);
+    }
+    if (glob.length > 256) {
+      throw new Error(`glob too long (${glob.length} chars): "${glob.slice(0, 30)}..."; maximum is 256 characters`);
+    }
+    try {
+      picomatch.makeRe(glob, { dot: true, debug: true });
+    } catch (err) {
+      throw new Error(`invalid glob "${glob}": ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return globs;
+}
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -47,9 +117,13 @@ let _adminJiraClient: JiraClient | null = null;
 function getAdminJiraClient(): JiraClient | null {
   if (_adminJiraClient) return _adminJiraClient;
   const token = process.env.JIRA_TOKEN;
+  if (!token) return null;
+  const email = process.env.JIRA_EMAIL;
+  const siteUrl = process.env.JIRA_SITE_URL;
   const cloudId = process.env.JIRA_CLOUD_ID;
-  if (!token || !cloudId) return null;
-  _adminJiraClient = new JiraClient({ token, cloudId });
+  // Basic auth needs a site URL; OAuth needs a cloud id.
+  if (email ? !siteUrl : !cloudId) return null;
+  _adminJiraClient = new JiraClient({ token, email, siteUrl, cloudId });
   return _adminJiraClient;
 }
 
@@ -125,7 +199,6 @@ export interface AdminConfig {
   flySessionsToken: string | null;
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
-  linearApiKey: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
 }
@@ -165,19 +238,26 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/mappings" && method === "POST") {
-      handleUpsertMapping(req, res, registry);
+      handleUpsertMapping(req, res, config, registry);
       return true;
     }
 
     const workflowSyncMatch = url.match(/^\/api\/mappings\/([^/]+)\/sync-workflows$/);
     if (workflowSyncMatch && method === "POST") {
       const teamKey = decodeURIComponent(workflowSyncMatch[1]);
-      handleSyncWorkflows(res, config, teamKey).catch((err) => {
-        console.error(`[admin] workflow sync failed for ${teamKey}:`, err);
-        if (!res.headersSent) {
-          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
-        }
-      });
+      handleSyncWorkflows(res, config, teamKey)
+      return true;
+    }
+
+    const syncStatusMatch = url.match(/^\/api\/mappings\/([^/]+)\/sync-status\/(\d+)$/);
+    if (syncStatusMatch && method === "GET") {
+      const teamKey = decodeURIComponent(syncStatusMatch[1]);
+      const jobId = Number.parseInt(syncStatusMatch[2], 10);
+      const job = getWorkflowSyncById(jobId);
+
+      // Require the job to belong to the team in the URL — so one team's status id can't be read via another team's path.
+      if (!job || job.teamKey !== teamKey) { json(res, 404, { error: "sync job not found" }); return true; }
+      json(res, 200, { id: job.id, status: job.status, result: job.result, error: job.error });
       return true;
     }
 
@@ -216,8 +296,15 @@ export function handleAdminRequest(
       return true;
     }
 
-    if (url === "/api/log" && method === "GET") {
-      json(res, 200, listLog());
+    if ((url === "/api/log" || url.startsWith("/api/log?")) && method === "GET") {
+      const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+      const p = new URLSearchParams(qs);
+      const sinceRaw = p.get("since");
+      const untilRaw = p.get("until");
+      // Invalid (non-numeric) values are ignored rather than rejected.
+      const since = sinceRaw && Number.isFinite(Number(sinceRaw)) ? Number(sinceRaw) : undefined;
+      const until = untilRaw && Number.isFinite(Number(untilRaw)) ? Number(untilRaw) : undefined;
+      json(res, 200, listLog({ since, until }));
       return true;
     }
 
@@ -347,12 +434,21 @@ export function handleAdminRequest(
 
     if (url === "/api/admin/config-status" && method === "GET") {
       json(res, 200, {
-        linear: !!process.env.LINEAR_API_KEY,
-        jira: !!(process.env.JIRA_TOKEN && process.env.JIRA_CLOUD_ID && process.env.JIRA_SITE_URL),
+        linear: !!(process.env.LINEAR_CLIENT_ID && process.env.LINEAR_CLIENT_SECRET),
+        jira: !!(
+          process.env.JIRA_TOKEN &&
+          process.env.JIRA_SITE_URL &&
+          (process.env.JIRA_EMAIL || process.env.JIRA_CLOUD_ID)
+        ),
         jiraSiteUrl: process.env.JIRA_SITE_URL ?? null,
         runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),
         gapFillTrigger: !!process.env.GAP_FILL_TRIGGER_SECRET,
       });
+      return true;
+    }
+
+    if (url.startsWith("/api/admin/github-install-state") && method === "GET") {
+      handleGithubInstallState(req, res, config);
       return true;
     }
 
@@ -379,7 +475,7 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
   if (providers.length === 0) {
-    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {} };
+    return { needsPlanning: [], readyForImplementation: [], inProgressCountsByScope: {}, parentsToFinalize: [] };
   }
   const snapshots = await Promise.all(providers.map((p) => p.fetchAIImplementSnapshot()));
   return {
@@ -391,6 +487,7 @@ async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplem
       }
       return acc;
     }, {}),
+    parentsToFinalize: snapshots.flatMap((s) => s.parentsToFinalize),
   };
 }
 
@@ -546,7 +643,7 @@ async function handleDestroySession(
         const mapping = job.teamKey ? getMappings()[job.teamKey] : undefined;
         if (mapping) {
           const provider = await registry.forMapping(mapping);
-          await provider.clearWorkingState(job.issueId);
+          await provider.clearWorkingState(job.issueId, job.teamKey!);
           deleteDispatched(job.issueId);
         } else {
           console.warn(
@@ -617,23 +714,22 @@ async function handlePatchMapping(
   }
 }
 
-async function handleSyncWorkflows(
+function handleSyncWorkflows(
   res: http.ServerResponse,
   config: AdminConfig,
   teamKey: string,
-): Promise<void> {
+): void {
   const mappings = getMappings();
   const mapping = mappings[teamKey];
   if (!mapping) {
     json(res, 404, { error: "Team not found" });
     return;
   }
-  const result = await syncWorkflowTemplates({
-    mapping,
-    githubAppId: config.githubAppId,
-    githubAppPrivateKey: config.githubAppPrivateKey,
-  });
-  json(res, 200, result);
+  const { id } = enqueueWorkflowSync(teamKey);
+  void runWorkflowSync(id, config).catch((err) =>
+    console.error(`[admin] workflow sync failed for ${teamKey}:`, err)
+  );
+  json(res, 202, { teamKey, syncJobId: id });
 }
 
 async function handleListSecrets(
@@ -940,6 +1036,7 @@ async function handleUnsetGlobalSecret(
 async function handleUpsertMapping(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  config: AdminConfig,
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
@@ -957,16 +1054,33 @@ async function handleUpsertMapping(
       planningEnabled?: boolean;
       planningWorkflowFile?: string;
       autoApprovePlans?: boolean;
+      autoMerge?: boolean;
       extraEnv?: Record<string, string>;
       provider?: string;
       awsRegion?: string | null;
       ticketingProvider?: string;
       ticketingConfig?: unknown;
       paused?: boolean;
+      maxTurns?: number | null;
+      maxIterations?: number | null;
+      maxJobMinutes?: number | null;
+      branchPrefix?: string | null;
+      skillsRepo?: string | null;
+      sensitiveAddPatterns?: string | string[] | null;
+      sensitiveAllowPatterns?: string | string[] | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
       json(res, 400, { error: "teamKey, owner, and repo are required" });
+      return;
+    }
+
+    const existingMapping = getMappings()[body.teamKey];
+    const defaultBranch = typeof body.defaultBranch === "string"
+      ? body.defaultBranch.trim()
+      : (existingMapping?.defaultBranch ?? "");
+    if (!defaultBranch) {
+      json(res, 400, { error: "defaultBranch is required" });
       return;
     }
 
@@ -1006,6 +1120,7 @@ async function handleUpsertMapping(
     const planningEnabled = body.planningEnabled ?? DEFAULT_PLANNING_ENABLED;
     const planningWorkflowFile = body.planningWorkflowFile ?? DEFAULT_PLANNING_WORKFLOW_FILE;
     const autoApprovePlans = body.autoApprovePlans ?? DEFAULT_AUTO_APPROVE_PLANS;
+    const autoMerge = body.autoMerge ?? DEFAULT_AUTO_MERGE;
 
     if (planningEnabled && !planningWorkflowFile) {
       json(res, 400, { error: "planningWorkflowFile is required when planningEnabled is true" });
@@ -1053,11 +1168,66 @@ async function handleUpsertMapping(
       return;
     }
 
+    const resolveCap = (
+      name: string,
+      value: number | null | undefined,
+    ): number | null => {
+      if (value === undefined || value === null) return null;
+      if (!Number.isInteger(value) || value < 1) {
+        throw new Error(`${name} must be a positive integer or null`);
+      }
+      return value;
+    };
+
+    let maxTurns: number | null;
+    let maxIterations: number | null;
+    let maxJobMinutes: number | null;
+    try {
+      maxTurns = resolveCap("maxTurns", body.maxTurns);
+      maxIterations = resolveCap("maxIterations", body.maxIterations);
+      maxJobMinutes = resolveCap("maxJobMinutes", body.maxJobMinutes);
+    } catch (err) {
+      json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+
+    let branchPrefix: string | null;
+    try {
+      branchPrefix = normalizeBranchPrefix(body.branchPrefix);
+    } catch (err) {
+      json(res, 400, { error: `branchPrefix invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    let skillsRepo: string | null;
+    try {
+      skillsRepo = normalizeSkillsRepo(body.skillsRepo);
+    } catch (err) {
+      json(res, 400, { error: `skillsRepo invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    let sensitiveAddPatterns: string[] | null;
+    try {
+      sensitiveAddPatterns = normalizeSensitiveGlobs(body.sensitiveAddPatterns);
+    } catch (err) {
+      json(res, 400, { error: `sensitiveAddPatterns invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
+    let sensitiveAllowPatterns: string[] | null;
+    try {
+      sensitiveAllowPatterns = normalizeSensitiveGlobs(body.sensitiveAllowPatterns);
+    } catch (err) {
+      json(res, 400, { error: `sensitiveAllowPatterns invalid: ${err instanceof Error ? err.message : String(err)}` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
       workflowFile: body.workflowFile || "claude-implement.yml",
-      defaultBranch: body.defaultBranch || "main",
+      defaultBranch,
       maxInProgressAiIssues,
       executionMode,
       sessionMode,
@@ -1066,6 +1236,7 @@ async function handleUpsertMapping(
       planningEnabled,
       planningWorkflowFile,
       autoApprovePlans,
+      autoMerge,
       extraEnv,
       provider,
       ticketingProvider: ticketing.ticketingProvider,
@@ -1075,12 +1246,28 @@ async function handleUpsertMapping(
       // so an Edit form that omits `paused` doesn't silently resume the project.
       paused: body.paused !== undefined
         ? body.paused === true
-        : (getMappings()[body.teamKey]?.paused ?? false),
+        : (existingMapping?.paused ?? false),
+      maxTurns,
+      maxIterations,
+      maxJobMinutes,
+      branchPrefix,
+      skillsRepo,
+      sensitiveAddPatterns,
+      sensitiveAllowPatterns,
     };
 
     upsertMapping(body.teamKey, mapping);
     registry.invalidate();
-    json(res, 200, { teamKey: body.teamKey, ...mapping });
+
+    // Kick the workflow sync off in the background and return immediately
+    // - the client polls GET /api/mappings/:teamKey/sync-status/:id for the outcome
+    // - the mapping is already persisted above, so the save itself succeeds regardless of how the sync resolves
+    const { id } = enqueueWorkflowSync(body.teamKey);
+    void runWorkflowSync(id, config).catch((err) =>
+      console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
+    );
+
+    json(res, 202, { teamKey: body.teamKey, ...mapping, syncJobId: id });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
@@ -1164,6 +1351,32 @@ async function handleListJiraFieldOptions(
       json(res, 200, []);
       return;
     }
+    json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleGithubInstallState(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  const query = new URL(req.url ?? "", "http://localhost").searchParams;
+  const owner = query.get("owner");
+  const repo = query.get("repo");
+  if (!owner || !repo) {
+    json(res, 400, { error: "owner and repo query params are required" });
+    return;
+  }
+  try {
+    const result = await probeInstallState({
+      appId: config.githubAppId,
+      privateKey: config.githubAppPrivateKey,
+      owner,
+      repo,
+    });
+    json(res, 200, result);
+  } catch (err) {
+    console.error(`[admin] install-state probe failed for ${owner}/${repo}:`, err);
     json(res, 500, { error: err instanceof Error ? err.message : String(err) });
   }
 }

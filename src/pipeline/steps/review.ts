@@ -1,5 +1,6 @@
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
+import { extractFirstJsonObject } from "../json-extract.js";
 
 interface ReviewInputs extends Record<string, unknown> {
   model?: string;
@@ -27,36 +28,21 @@ interface ReviewJson {
 }
 
 /**
- * Scans `text` for balanced `{ ... }` blocks and returns the first one that
- * parses as valid JSON with at least one key. Avoids the greedy-regex pitfall
- * where a preamble containing `{}` causes the regex to match from the first
- * `{` to the last `}`. Empty objects `{}` are skipped as likely preamble noise.
+ * Hard cap on diff characters embedded in the review prompt. A regenerated
+ * codegen diff can be hundreds of KB; without a cap the prompt exceeds the
+ * model's input limit and the whole invocation fails ("Prompt is too long").
+ * ~200k chars ≈ 50k tokens, leaving ample headroom in a 200k-token window.
  */
-function extractFirstJsonObject(text: string): object | null {
-  let depth = 0;
-  let start = -1;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === "{") {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (text[i] === "}") {
-      depth--;
-      if (depth === 0 && start !== -1) {
-        const candidate = text.slice(start, i + 1);
-        try {
-          const parsed = JSON.parse(candidate) as object;
-          // Skip empty objects — they are likely preamble artifacts, not the review JSON.
-          if (Object.keys(parsed).length > 0) {
-            return parsed;
-          }
-        } catch {
-          // Not valid JSON — keep scanning for the next balanced block.
-        }
-        start = -1;
-      }
-    }
-  }
-  return null;
+const MAX_REVIEW_DIFF_CHARS = 200_000;
+
+export function capDiff(diff: string): string {
+  if (diff.length <= MAX_REVIEW_DIFF_CHARS) return diff;
+  const cut = diff.lastIndexOf("\n", MAX_REVIEW_DIFF_CHARS);
+  // `> 0` (not `!== -1`) on purpose: fall back to the hard cap both when no
+  // newline precedes the boundary (-1) and in the degenerate case where the
+  // only one is at index 0, which would otherwise slice to an empty diff.
+  const boundary = cut > 0 ? cut : MAX_REVIEW_DIFF_CHARS;
+  return `${diff.slice(0, boundary)}\n\n... [diff truncated: showing first ${boundary} of ${diff.length} characters] ...`;
 }
 
 const REVIEW_PROMPT = (
@@ -69,7 +55,7 @@ const REVIEW_PROMPT = (
 
   if (issueTitle) prompt += `\n\nIssue: ${issueTitle}`;
   if (issueDescription) prompt += `\n\nDescription:\n${issueDescription}`;
-  if (diff) prompt += `\n\n## Implementation Diff\n\`\`\`diff\n${diff}\n\`\`\``;
+  if (diff) prompt += `\n\n## Implementation Diff\n\`\`\`diff\n${capDiff(diff)}\n\`\`\``;
 
   prompt += `\n\nRespond with a JSON object only:
 {

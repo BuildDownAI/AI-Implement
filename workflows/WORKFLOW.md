@@ -44,11 +44,17 @@ model: claude-sonnet-4-6
     setup      Path (relative to repo root) to a shell script that runs BEFORE Claude.
                Use this to start services, install dependencies, and run migrations.
                Export env vars via `echo "VAR=value" >> "$GITHUB_ENV"` — they persist
-               to Claude and all subsequent steps.
+               to Claude and all subsequent steps. Only the simple `VAR=value` form
+               is supported; GitHub Actions' heredoc multiline syntax (`VAR<<EOF`) is
+               NOT — such lines are ignored with a warning.
     verify     Path to a shell script that runs AFTER Claude, only on success.
                Use this to run tests or smoke checks.
     teardown   Path to a shell script that runs AFTER Claude, even on failure.
                Use this to stop containers or clean up resources.
+
+    NOTE: Hooks run only in GitHub Actions execution mode. On Fly/local modes the
+    workspace is empty when WORKFLOW.md is read (the repo is cloned later), so
+    setup/verify/teardown are silently skipped.
 
   SETUP AND TEARDOWN HOOKS
   ------------------------
@@ -146,6 +152,12 @@ what is still missing.
 After your changes are pushed, write a short note about what you addressed
 to `ai-output/comments/01-gap-fill-summary.md`. The orchestrator reads
 this file and posts it back to the ticketing issue.
+
+External review tools should communicate findings through native GitHub
+review surfaces: submit `CHANGES_REQUESTED` for blocking feedback, use inline
+PR review comments for file-specific issues, or post a structured PR review
+summary comment. Do not ask Copilot or another bot to fix the PR in comments;
+AI-Implement ingests GitHub review events and dispatches its own gap-fill run.
 
 ---
 

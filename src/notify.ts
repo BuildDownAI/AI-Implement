@@ -3,11 +3,29 @@ export interface ReaperBurstNotification {
   threshold: number;
 }
 
+export interface StuckGiveUpNotification {
+  issueIdentifier: string;
+  issueTitle: string;
+  issueUrl: string;
+  repoFullName: string;
+  runUrl: string | null;
+  attempts: number;
+  lastRunStatus: string; // "queued" | "in_progress" | "run_not_found"
+}
+
+// The run phases that produce a user-facing notification
+export type NotificationPhase = "planning" | "implementation" | "dispatch-failed";
+
 export interface Notification {
   issueIdentifier: string;
   issueTitle: string;
   issueUrl: string;
   repoFullName: string;
+  phase: NotificationPhase;
+  /** Only set for dispatch-failed: the workflow file that was being dispatched. */
+  workflowFile?: string;
+  /** Only set for dispatch-failed: human-readable hint (e.g. "re-sync required?"). */
+  hint?: string;
 }
 
 export interface CompletionNotification {
@@ -20,6 +38,33 @@ export interface CompletionNotification {
   prUrl: string | null;
   runUrl: string | null;
   durationMs?: number | null;
+  phase: NotificationPhase;
+  summary?: string;
+  detail?: string;
+  remediation?: string;
+  docsUrl?: string;
+}
+
+// Human label for a run phase, reused across notification kinds (dispatch, completion, …).
+// Keyed on NotificationPhase, so widening that union is a compile error here until the new phase gets a label — no silent fallthrough.
+const PHASE_LABELS: Record<NotificationPhase, string> = {
+  planning: "AI Planning",
+  implementation: "AI Implementation",
+  "dispatch-failed": "Dispatch Failed",
+};
+
+export async function notifyStuckGiveUp(
+  type: string,
+  webhookUrl: string,
+  n: StuckGiveUpNotification,
+): Promise<void> {
+  switch (type.toLowerCase()) {
+    case "teams":
+      return notifyStuckGiveUpTeams(webhookUrl, n);
+    case "slack":
+    default:
+      return notifyStuckGiveUpSlack(webhookUrl, n);
+  }
 }
 
 export async function notifyReaperBurst(
@@ -63,6 +108,14 @@ export async function notifyCompletion(
 // ---------- Dispatch notifications ----------
 
 async function notifySlack(webhookUrl: string, n: Notification): Promise<void> {
+  let text: string;
+  if (n.phase === "dispatch-failed") {
+    text = `*${PHASE_LABELS[n.phase]}* — \`${n.workflowFile ?? ""}\`\nRepo: \`${n.repoFullName}\``;
+    if (n.hint) text += `\n⚠️ Hint: ${n.hint}`;
+  } else {
+    text = `*${PHASE_LABELS[n.phase]} Dispatched*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\``;
+  }
+
   const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -70,10 +123,7 @@ async function notifySlack(webhookUrl: string, n: Notification): Promise<void> {
       blocks: [
         {
           type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `*AI Implementation Dispatched*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\``,
-          },
+          text: { type: "mrkdwn", text },
         },
       ],
     }),
@@ -86,6 +136,35 @@ async function notifySlack(webhookUrl: string, n: Notification): Promise<void> {
 }
 
 async function notifyTeams(webhookUrl: string, n: Notification): Promise<void> {
+  let bodyBlocks: unknown[];
+  if (n.phase === "dispatch-failed") {
+    const facts: Array<{ title: string; value: string }> = [
+      { title: "Workflow", value: n.workflowFile ?? "" },
+      { title: "Target Repo", value: n.repoFullName },
+    ];
+    if (n.hint) facts.push({ title: "Hint", value: n.hint });
+    bodyBlocks = [
+      { type: "TextBlock", text: PHASE_LABELS[n.phase], weight: "Bolder", size: "Medium" },
+      { type: "FactSet", facts },
+    ];
+  } else {
+    bodyBlocks = [
+      {
+        type: "TextBlock",
+        text: `${PHASE_LABELS[n.phase]} Dispatched`,
+        weight: "Bolder",
+        size: "Medium",
+      },
+      {
+        type: "FactSet",
+        facts: [
+          { title: "Issue", value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})` },
+          { title: "Target Repo", value: n.repoFullName },
+        ],
+      },
+    ];
+  }
+
   const card = {
     type: "message",
     attachments: [
@@ -95,27 +174,7 @@ async function notifyTeams(webhookUrl: string, n: Notification): Promise<void> {
           $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
           type: "AdaptiveCard",
           version: "1.4",
-          body: [
-            {
-              type: "TextBlock",
-              text: "AI Implementation Dispatched",
-              weight: "Bolder",
-              size: "Medium",
-            },
-            {
-              type: "FactSet",
-              facts: [
-                {
-                  title: "Issue",
-                  value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})`,
-                },
-                {
-                  title: "Target Repo",
-                  value: n.repoFullName,
-                },
-              ],
-            },
-          ],
+          body: bodyBlocks,
         },
       },
     ],
@@ -159,18 +218,19 @@ function completionEmoji(status: string): string {
   }
 }
 
-function completionLabel(status: string): string {
+function completionLabel(status: string, phase: NotificationPhase): string {
+  const phaseLabel = PHASE_LABELS[phase]; // "AI Planning" | "AI Implementation"
   switch (status) {
     case "completed":
-      return "AI Implementation Completed";
+      return `${phaseLabel} Completed`;
     case "review_failed":
-      return "AI Implementation Needs Review";
+      return `${phaseLabel} Needs Review`;
     case "failed":
-      return "AI Implementation Failed";
+      return `${phaseLabel} Failed`;
     case "timed_out":
-      return "AI Implementation Timed Out";
+      return `${phaseLabel} Timed Out`;
     default:
-      return "AI Implementation Finished";
+      return `${phaseLabel} Finished`;
   }
 }
 
@@ -194,7 +254,7 @@ async function notifyCompletionSlack(
   n: CompletionNotification,
 ): Promise<void> {
   const emoji = completionEmoji(n.status);
-  const label = completionLabel(n.status);
+  const label = completionLabel(n.status, n.phase);
 
   let text = `${emoji} *${label}*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\``;
   if (n.prUrl) {
@@ -206,6 +266,10 @@ async function notifyCompletionSlack(
   if (n.durationMs != null) {
     text += `\nDuration: ${formatDuration(n.durationMs)}`;
   }
+  if (n.summary) text += `\n\n${n.summary}`;
+  if (n.detail) text += `\n${n.detail}`;
+  if (n.remediation) text += `\n*Next step:* ${n.remediation}`;
+  if (n.docsUrl) text += `\n<${n.docsUrl}|Troubleshooting guide>`;
 
   const res = await fetch(webhookUrl, {
     method: "POST",
@@ -227,6 +291,78 @@ async function notifyCompletionSlack(
 }
 
 // ---------- Reaper burst alerts ----------
+
+async function notifyStuckGiveUpSlack(
+  webhookUrl: string,
+  n: StuckGiveUpNotification,
+): Promise<void> {
+  let text = `:rotating_light: *AI Implementation Stuck — Needs Human*\n<${n.issueUrl}|${n.issueIdentifier}: ${n.issueTitle}>\nRepo: \`${n.repoFullName}\`\nAttempts: ${n.attempts}\nLast status: \`${n.lastRunStatus}\``;
+  if (n.runUrl) {
+    text += `\nRun: <${n.runUrl}|View Workflow Run>`;
+  }
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Slack webhook failed: ${res.status} — ${body}`);
+  }
+}
+
+async function notifyStuckGiveUpTeams(
+  webhookUrl: string,
+  n: StuckGiveUpNotification,
+): Promise<void> {
+  const facts: Array<{ title: string; value: string }> = [
+    { title: "Issue", value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})` },
+    { title: "Repo", value: n.repoFullName },
+    { title: "Attempts", value: String(n.attempts) },
+    { title: "Last status", value: n.lastRunStatus },
+  ];
+  if (n.runUrl) {
+    facts.push({ title: "Run", value: `[View Workflow Run](${n.runUrl})` });
+  }
+
+  const card = {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        content: {
+          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: [
+            {
+              type: "TextBlock",
+              text: "&#x1F6A8; AI Implementation Stuck \u2014 Needs Human",
+              weight: "Bolder",
+              size: "Medium",
+            },
+            { type: "FactSet", facts },
+          ],
+        },
+      },
+    ],
+  };
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(card),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Teams webhook failed: ${res.status} — ${body}`);
+  }
+}
 
 async function notifyReaperBurstSlack(
   webhookUrl: string,
@@ -304,7 +440,7 @@ async function notifyCompletionTeams(
   n: CompletionNotification,
 ): Promise<void> {
   const icon = completionTeamsIcon(n.status);
-  const label = completionLabel(n.status);
+  const label = completionLabel(n.status, n.phase);
 
   const facts = [
     {
@@ -326,6 +462,12 @@ async function notifyCompletionTeams(
     facts.push({ title: "Duration", value: formatDuration(n.durationMs) });
   }
 
+  const classification: string[] = [];
+  if (n.summary) classification.push(n.summary);
+  if (n.detail) classification.push(n.detail);
+  if (n.remediation) classification.push(`**Next step:** ${n.remediation}`);
+  if (n.docsUrl) classification.push(`[Troubleshooting guide](${n.docsUrl})`);
+
   const card = {
     type: "message",
     attachments: [
@@ -346,6 +488,13 @@ async function notifyCompletionTeams(
               type: "FactSet",
               facts,
             },
+            ...(classification.length
+              ? [{
+                  type: "TextBlock",
+                  text: classification.join("\n\n"),
+                  wrap: true 
+                }]
+              : []),
           ],
         },
       },
@@ -361,5 +510,20 @@ async function notifyCompletionTeams(
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Teams webhook failed: ${res.status} — ${body}`);
+  }
+}
+
+// ---------- Plain-text notification (best-effort; used where no issue context is available) ----------
+
+/** Posts a plain { text } payload — supported by both Slack and Teams incoming webhooks. */
+export async function notifyText(webhookUrl: string, message: string): Promise<void> {
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: message }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Webhook notification failed: ${res.status} — ${body}`);
   }
 }

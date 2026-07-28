@@ -1,0 +1,244 @@
+import { describe, it, expect } from "vitest";
+import {
+  parseLine,
+  finalText,
+  extractTelemetry,
+  extractToolTrace,
+  formatEvent,
+  summaryLine,
+  type StreamEvent,
+} from "../pipeline/claude-stream.js";
+
+const initEvent: StreamEvent = { type: "system", subtype: "init", model: "claude-x", cwd: "/workspace" };
+const toolEvent: StreamEvent = {
+  type: "assistant",
+  message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pnpm check" } }] },
+};
+const textEvent: StreamEvent = {
+  type: "assistant",
+  message: { content: [{ type: "text", text: "All done." }] },
+};
+const resultSuccess: StreamEvent = {
+  type: "result",
+  subtype: "success",
+  result: "Final answer text",
+  num_turns: 12,
+  duration_ms: 372000,
+  total_cost_usd: 0.83,
+  usage: { input_tokens: 182000, output_tokens: 4100 },
+};
+
+describe("parseLine", () => {
+  it("parses a JSON line", () => {
+    expect(parseLine('{"type":"result"}')).toEqual({ type: "result" });
+  });
+  it("returns null for a non-JSON line", () => {
+    expect(parseLine("not json")).toBeNull();
+  });
+  it("returns null for a blank line", () => {
+    expect(parseLine("   ")).toBeNull();
+  });
+  it("returns null for valid JSON that is not an object", () => {
+    expect(parseLine('"just a string"')).toBeNull();
+    expect(parseLine("42")).toBeNull();
+    expect(parseLine("[1,2,3]")).toBeNull();
+  });
+});
+
+describe("finalText", () => {
+  it("returns the result event's text", () => {
+    expect(finalText([initEvent, resultSuccess])).toBe("Final answer text");
+  });
+  it("falls back to concatenated assistant text when no result event", () => {
+    expect(finalText([initEvent, textEvent])).toBe("All done.");
+  });
+  it("returns empty string for an empty event list", () => {
+    expect(finalText([])).toBe("");
+  });
+  it("preserves an embedded JSON object in the result text (review/fix consumers depend on this)", () => {
+    const text = 'Here is my review.\n{"approved":true,"score":95}';
+    const events: StreamEvent[] = [{ type: "result", subtype: "success", result: text }];
+    expect(finalText(events)).toBe(text);
+    expect(finalText(events)).toContain('{"approved":true,"score":95}');
+  });
+});
+
+describe("extractTelemetry", () => {
+  it("extracts metrics from a success result", () => {
+    const t = extractTelemetry([initEvent, toolEvent, resultSuccess]);
+    expect(t).toEqual({
+      outcome: "success",
+      numTurns: 12,
+      durationMs: 372000,
+      costUsd: 0.83,
+      tokensIn: 182000,
+      tokensOut: 4100,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
+      toolTrace: ["Bash pnpm check"],
+    });
+  });
+  it("maps error_max_turns to outcome=max_turns", () => {
+    const t = extractTelemetry([{ type: "result", subtype: "error_max_turns", num_turns: 50 }]);
+    expect(t.outcome).toBe("max_turns");
+    expect(t.numTurns).toBe(50);
+  });
+  it("returns outcome=unknown with nulls when no result event", () => {
+    expect(extractTelemetry([initEvent])).toEqual({
+      outcome: "unknown",
+      numTurns: null,
+      durationMs: null,
+      costUsd: null,
+      tokensIn: null,
+      tokensOut: null,
+      cacheReadTokens: null,
+      cacheCreationTokens: null,
+      toolTrace: [],
+    });
+  });
+  it("tolerates a Bedrock result with no cost", () => {
+    const t = extractTelemetry([{ type: "result", subtype: "success", num_turns: 3, usage: { input_tokens: 10, output_tokens: 2 } }]);
+    expect(t.costUsd).toBeNull();
+    expect(t.outcome).toBe("success");
+  });
+  it("counts cache-creation and cache-read tokens as input", () => {
+    const t = extractTelemetry([{
+      type: "result",
+      subtype: "success",
+      num_turns: 104,
+      usage: {
+        input_tokens: 90,
+        cache_creation_input_tokens: 400000,
+        cache_read_input_tokens: 12000000,
+        output_tokens: 89900,
+      },
+    }]);
+    expect(t.tokensIn).toBe(90 + 400000 + 12000000);
+    expect(t.cacheReadTokens).toBe(12000000);
+    expect(t.cacheCreationTokens).toBe(400000);
+    expect(t.tokensOut).toBe(89900);
+  });
+  it("leaves cache fields null when usage has no cache counters", () => {
+    const t = extractTelemetry([{ type: "result", subtype: "success", usage: { input_tokens: 10, output_tokens: 2 } }]);
+    expect(t.tokensIn).toBe(10);
+    expect(t.cacheReadTokens).toBeNull();
+    expect(t.cacheCreationTokens).toBeNull();
+  });
+});
+
+describe("formatEvent", () => {
+  it("formats an init event", () => {
+    expect(formatEvent({ type: "system", subtype: "init", model: "claude-x", cwd: "/workspace" }))
+      .toBe("[claude] init model=claude-x cwd=/workspace");
+  });
+  it("formats a tool_use as tool name + command", () => {
+    expect(
+      formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pnpm check" } }] } }),
+    ).toBe("[claude] tool Bash pnpm check");
+  });
+  it("truncates long tool input", () => {
+    const long = "x".repeat(500);
+    const out = formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Edit", input: { command: long } }] } });
+    expect(out!.length).toBeLessThanOrEqual(180);
+    expect(out!.endsWith("…")).toBe(true);
+  });
+  it("uses file_path for tools like Read", () => {
+    expect(
+      formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "src/app.ts" } }] } }),
+    ).toBe("[claude] tool Read src/app.ts");
+  });
+  it("renders a tool with no input without a trailing space", () => {
+    expect(
+      formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "ListMcp", input: {} }] } }),
+    ).toBe("[claude] tool ListMcp {}");
+  });
+  it("renders a tool with null input without a trailing space", () => {
+    expect(
+      formatEvent({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash" }] } }),
+    ).toBe("[claude] tool Bash");
+  });
+  it("renders a user event carrying a tool_result as tool_result", () => {
+    expect(
+      formatEvent({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } }),
+    ).toBe("[claude] tool_result");
+  });
+  it("returns null for the initial user prompt turn (no tool_result)", () => {
+    expect(
+      formatEvent({ type: "user", message: { content: [{ type: "text", text: "implement the thing" }] } }),
+    ).toBeNull();
+  });
+  it("returns null for a result event (summary handles it)", () => {
+    expect(formatEvent({ type: "result", subtype: "success" })).toBeNull();
+  });
+  it("returns null for an unknown event type", () => {
+    expect(formatEvent({ type: "whatever" })).toBeNull();
+  });
+});
+
+describe("summaryLine", () => {
+  it("renders a full success summary", () => {
+    expect(
+      summaryLine({ outcome: "success", numTurns: 12, durationMs: 372000, costUsd: 0.83, tokensIn: 182000, tokensOut: 4100 }),
+    ).toBe("[claude] result=success turns=12 duration=6m12s cost=$0.83 tokens=182.0k/4.1k (in/out)");
+  });
+  it("omits cost when null", () => {
+    const line = summaryLine({ outcome: "success", numTurns: 3, durationMs: 5000, costUsd: null, tokensIn: 10, tokensOut: 2 });
+    expect(line).not.toContain("cost=");
+    expect(line).toContain("result=success");
+  });
+  it("shows max_turns outcome at summary level", () => {
+    expect(summaryLine({ outcome: "max_turns", numTurns: 50, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null }))
+      .toBe("[claude] result=max_turns turns=50");
+  });
+  it("formats million-scale input and shows the cached share", () => {
+    expect(
+      summaryLine({
+        outcome: "success",
+        numTurns: 104,
+        durationMs: 1544000,
+        costUsd: 5.08,
+        tokensIn: 12400090,
+        tokensOut: 89900,
+        cacheReadTokens: 12000000,
+        cacheCreationTokens: 400000,
+      }),
+    ).toBe("[claude] result=success turns=104 duration=25m44s cost=$5.08 tokens=12.4M/89.9k (in/out, 97% cache reads)");
+  });
+});
+
+describe("extractToolTrace", () => {
+  const toolTraceEvent = (name: string, input: Record<string, unknown>) => ({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", name, input }] },
+  });
+
+  it("collects tool calls as 'name input-summary' entries", () => {
+    const events = [
+      toolTraceEvent("Bash", { command: "npm test" }),
+      toolTraceEvent("Read", { file_path: "/src/app.ts" }),
+      { type: "result", subtype: "success" },
+    ];
+    expect(extractToolTrace(events)).toEqual(["Bash npm test", "Read /src/app.ts"]);
+  });
+
+  it("caps entries and appends a truncation marker", () => {
+    const events = Array.from({ length: 5 }, (_, i) => toolTraceEvent("Bash", { command: `cmd${i}` }));
+    const trace = extractToolTrace(events, 3);
+    expect(trace).toHaveLength(4);
+    expect(trace[3]).toBe("… 2 more tool calls truncated");
+  });
+
+  it("returns [] when there are no tool calls", () => {
+    expect(extractToolTrace([{ type: "result", subtype: "success" }])).toEqual([]);
+  });
+});
+
+describe("extractTelemetry toolTrace", () => {
+  it("includes the tool trace in telemetry", () => {
+    const events = [
+      { type: "assistant", message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "/a" } }] } },
+      { type: "result", subtype: "success", num_turns: 3 },
+    ];
+    expect(extractTelemetry(events).toolTrace).toEqual(["Read /a"]);
+  });
+});

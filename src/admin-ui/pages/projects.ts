@@ -105,6 +105,15 @@ export const projectsHtml = `
             </div>
           </div>
           <div class="md-field">
+            <label>Profiles Field</label>
+            <select id="md-jira-profiles-field">
+              <option value="">(auto-discover by name "AI-Implement Profiles")</option>
+            </select>
+            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
+              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.
+            </div>
+          </div>
+          <div class="md-field">
             <label>Repo Field Value</label>
             <select id="md-jira-repo-value">
               <option value="">Select a Repo Field first</option>
@@ -120,8 +129,27 @@ export const projectsHtml = `
           <div class="md-field"><label>Owner</label><input id="md-owner" placeholder="acme-corp"></div>
           <div class="md-field"><label>Repo</label><input id="md-repo" placeholder="backend"></div>
           <div class="md-field"><label>Workflow File</label><input id="md-wf" value="claude-implement.yml"></div>
-          <div class="md-field"><label>Default Branch</label><input id="md-branch" value="main"></div>
+          <div class="md-field"><label>Default Branch</label><input id="md-branch" placeholder="development"></div>
           <div class="md-field"><label>Max AI Issues</label><input id="md-max-ai" type="number" min="1" value="3"></div>
+          <div class="md-field"><label>Max Turns <span class="text-tertiary" style="font-size:0.85em">(blank = 50)</span></label><input id="md-max-turns" type="number" min="1" step="1" placeholder="50"></div>
+          <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" step="1" placeholder="3"></div>
+          <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
+          <div class="md-field"><label>Branch Prefix <span class="text-tertiary" style="font-size:0.85em">(blank = none)</span></label><input id="md-branch-prefix" placeholder="pr"></div>
+          <div class="md-field">
+            <label>Skills Repo <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <input id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
+            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+          </div>
+          <div class="md-field">
+            <label>Additional sensitive patterns <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <textarea id="md-sensitive-add" rows="3" placeholder="one glob per line"></textarea>
+            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
+          </div>
+          <div class="md-field">
+            <label>Allowed exceptions <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <textarea id="md-sensitive-allow" rows="3" placeholder="one glob per line"></textarea>
+            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
+          </div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -157,6 +185,7 @@ export const projectsHtml = `
         <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
           <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-planning" type="checkbox" style="width:auto" onchange="onPlanningChange()"> Enabled</label>
           <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-approve" type="checkbox" style="width:auto" checked> Auto-approve</label>
+          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-merge" type="checkbox" style="width:auto"> Auto-merge child PRs</label>
           <div id="md-planning-wf-wrap" class="md-field hidden" style="flex:1;min-width:160px;margin-bottom:0">
             <label>Planning Workflow File</label><input id="md-planning-wf" value="claude-plan.yml">
           </div>
@@ -182,7 +211,7 @@ export const projectsHtml = `
       <div id="md-error" class="error hidden" style="margin-bottom:8px"></div>
       <div style="display:flex;gap:8px;justify-content:flex-end">
         <button class="btn btn-ghost" onclick="closeMappingDialog()">Cancel</button>
-        <button class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
+        <button id="md-save" class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
       </div>
     </div>
   </dialog>
@@ -211,6 +240,10 @@ export const projectsScript = `
     for (const [key, m] of Object.entries(mappingsData)) {
       const tr = document.createElement('tr');
       const ek = window.esc(key);
+      const recent = recentSync[key];
+      const syncCell = (recent && recent.prUrl)
+        ? '<a class="btn btn-sm btn-ghost" href="' + window.esc(recent.prUrl) + '" target="_blank" rel="noopener noreferrer" title="Workflow sync PR (just created)">Workflows synced — PR opened &#8599;</a> '
+        : '<button class="btn btn-sm btn-ghost" data-sync-btn data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> ';
       const execBadge = m.executionMode === 'fly-machines'
         ? '<span class="badge info">fly</span>'
         : '<span class="badge neutral">gha</span>';
@@ -236,7 +269,7 @@ export const projectsScript = `
           + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
           + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
           + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
-          + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> '
+          + syncCell
           + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
         + '</td>';
       tbody.appendChild(tr);
@@ -255,7 +288,7 @@ export const projectsScript = `
     document.getElementById('md-owner').value = m.owner || '';
     document.getElementById('md-repo').value = m.repo || '';
     document.getElementById('md-wf').value = m.workflowFile || 'claude-implement.yml';
-    document.getElementById('md-branch').value = m.defaultBranch || 'main';
+    document.getElementById('md-branch').value = m.defaultBranch || '';
     document.getElementById('md-max-ai').value = String(m.maxInProgressAiIssues ?? 3);
     document.getElementById('md-exec-mode').value = m.executionMode || 'github-actions';
     document.getElementById('md-session-mode').value = m.sessionMode || 'autonomous';
@@ -264,9 +297,17 @@ export const projectsScript = `
     document.getElementById('md-env').value = envToText(m.extraEnv);
     document.getElementById('md-planning').checked = !!m.planningEnabled;
     document.getElementById('md-auto-approve').checked = m.autoApprovePlans !== false;
+    document.getElementById('md-auto-merge').checked = m.autoMerge === true;
     document.getElementById('md-planning-wf').value = m.planningWorkflowFile || 'claude-plan.yml';
     document.getElementById('md-provider').value = m.provider || 'anthropic';
     document.getElementById('md-aws-region').value = m.awsRegion || '';
+    document.getElementById('md-max-turns').value = m.maxTurns == null ? '' : String(m.maxTurns);
+    document.getElementById('md-max-iter').value = m.maxIterations == null ? '' : String(m.maxIterations);
+    document.getElementById('md-max-job-min').value = m.maxJobMinutes == null ? '' : String(m.maxJobMinutes);
+    document.getElementById('md-branch-prefix').value = m.branchPrefix || '';
+    document.getElementById('md-skills-repo').value = m.skillsRepo || '';
+    document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
+    document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -276,12 +317,16 @@ export const projectsScript = `
     document.getElementById('md-jira-jql').value = (tp === 'jira' && tc.kind === 'jira' && tc.jql) ? tc.jql : '';
     const pendingStatus = (tp === 'jira' && tc.statusFieldOverride) ? tc.statusFieldOverride : '';
     const pendingRepoFld = (tp === 'jira' && tc.repoFieldOverride) ? tc.repoFieldOverride : '';
+    const pendingProfilesFld = (tp === 'jira' && tc.profilesFieldOverride) ? tc.profilesFieldOverride : '';
     const statusFldEl = document.getElementById('md-jira-status-field');
     const repoFldEl = document.getElementById('md-jira-repo-field');
+    const profilesFldEl = document.getElementById('md-jira-profiles-field');
     statusFldEl.dataset.pendingValue = pendingStatus;
     repoFldEl.dataset.pendingValue = pendingRepoFld;
+    profilesFldEl.dataset.pendingValue = pendingProfilesFld;
     statusFldEl.value = pendingStatus;
     repoFldEl.value = pendingRepoFld;
+    profilesFldEl.value = pendingProfilesFld;
     // Repo field value: stash for after the dropdown loads
     const pendingRepoVal = (tp === 'jira' && tc.kind === 'jira' && tc.repoFieldValue) ? tc.repoFieldValue : '';
     const sel = document.getElementById('md-jira-repo-value');
@@ -342,6 +387,7 @@ export const projectsScript = `
   async function loadJiraFields() {
     const statusSel = document.getElementById('md-jira-status-field');
     const repoSel = document.getElementById('md-jira-repo-field');
+    const profilesSel = document.getElementById('md-jira-profiles-field');
     if (jiraFieldsLoaded) return;
     try {
       const res = await window.api('/api/jira/fields');
@@ -352,12 +398,16 @@ export const projectsScript = `
       });
       const prevStatus = statusSel ? (statusSel.value || statusSel.dataset.pendingValue || '') : '';
       const prevRepo = repoSel ? (repoSel.value || repoSel.dataset.pendingValue || '') : '';
+      const prevProfiles = profilesSel ? (profilesSel.value || profilesSel.dataset.pendingValue || '') : '';
       const statusPlaceholder = statusSel && statusSel.options[0] ? statusSel.options[0] : null;
       const repoPlaceholder = repoSel && repoSel.options[0] ? repoSel.options[0] : null;
+      const profilesPlaceholder = profilesSel && profilesSel.options[0] ? profilesSel.options[0] : null;
       if (statusSel) statusSel.innerHTML = '';
       if (repoSel) repoSel.innerHTML = '';
+      if (profilesSel) profilesSel.innerHTML = '';
       if (statusSel && statusPlaceholder) statusSel.appendChild(statusPlaceholder);
       if (repoSel && repoPlaceholder) repoSel.appendChild(repoPlaceholder);
+      if (profilesSel && profilesPlaceholder) profilesSel.appendChild(profilesPlaceholder);
       for (const f of fields) {
         const labelText = f.name + ' (' + f.id + ')';
         if (statusSel) {
@@ -372,10 +422,17 @@ export const projectsScript = `
           o2.textContent = labelText;
           repoSel.appendChild(o2);
         }
+        if (profilesSel) {
+          const o3 = document.createElement('option');
+          o3.value = f.id;
+          o3.textContent = labelText;
+          profilesSel.appendChild(o3);
+        }
       }
       // Restore previously set values (e.g. from openMappingDialog before fields loaded)
       if (statusSel && prevStatus) statusSel.value = prevStatus;
       if (repoSel && prevRepo) repoSel.value = prevRepo;
+      if (profilesSel && prevProfiles) profilesSel.value = prevProfiles;
       jiraFieldsLoaded = true;
     } catch (err) {
       console.error('loadJiraFields failed:', err);
@@ -540,13 +597,19 @@ export const projectsScript = `
     const origKey = document.getElementById('md-team-key-orig').value;
     const isNew = !origKey;
     const teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
+    const defaultBranch = document.getElementById('md-branch').value.trim();
+    if (!defaultBranch) {
+      errEl.textContent = 'Default Branch is required.';
+      errEl.classList.remove('hidden');
+      return;
+    }
 
     const body = {
       teamKey,
       owner: document.getElementById('md-owner').value.trim(),
       repo: document.getElementById('md-repo').value.trim(),
       workflowFile: document.getElementById('md-wf').value.trim(),
-      defaultBranch: document.getElementById('md-branch').value.trim(),
+      defaultBranch,
       maxInProgressAiIssues: parseInt(document.getElementById('md-max-ai').value, 10),
       executionMode: document.getElementById('md-exec-mode').value,
       sessionMode: document.getElementById('md-session-mode').value,
@@ -554,10 +617,18 @@ export const projectsScript = `
       machineMemoryMb: parseInt(document.getElementById('md-mem').value, 10),
       planningEnabled: document.getElementById('md-planning').checked,
       autoApprovePlans: document.getElementById('md-auto-approve').checked,
+      autoMerge: document.getElementById('md-auto-merge').checked,
       planningWorkflowFile: document.getElementById('md-planning-wf').value.trim(),
       extraEnv: parseEnvText(document.getElementById('md-env').value),
       provider: document.getElementById('md-provider').value,
       awsRegion: document.getElementById('md-aws-region').value.trim() || null,
+      maxTurns: (function(){ var v = document.getElementById('md-max-turns').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      maxIterations: (function(){ var v = document.getElementById('md-max-iter').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
+      skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
+      sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
+      sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
@@ -571,12 +642,14 @@ export const projectsScript = `
       const repoFieldValue = sel.classList.contains('hidden') ? txt.value.trim() : sel.value.trim();
       const statusFieldOverride = document.getElementById('md-jira-status-field').value.trim() || null;
       const repoFieldOverride = document.getElementById('md-jira-repo-field').value.trim() || null;
+      const profilesFieldOverride = document.getElementById('md-jira-profiles-field').value.trim() || null;
       body.ticketingConfig = {
         kind: 'jira',
         jql: jql,
         repoFieldValue: repoFieldValue,
         statusFieldOverride: statusFieldOverride,
         repoFieldOverride: repoFieldOverride,
+        profilesFieldOverride: profilesFieldOverride,
       };
     }
 
@@ -606,15 +679,22 @@ export const projectsScript = `
       return;
     }
 
+    const saveBtn = document.getElementById('md-save');
+    const origSaveLabel = saveBtn ? saveBtn.textContent : '';
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
+
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
+    let data = {};
+    try { data = await res.json(); } catch (_) {}
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = origSaveLabel; }
     if (!res.ok) {
-      const msg = await res.text().catch(() => 'Unknown error');
-      errEl.textContent = 'Server error: ' + msg;
+      errEl.textContent = 'Server error: ' + (data.error || 'Unknown error');
       errEl.classList.remove('hidden');
       return;
     }
     closeMappingDialog();
     await loadMappings();
+    pollSyncStatus(teamKey, data.syncJobId);
   }
   window.saveMappingDialog = saveMappingDialog;
 
@@ -643,44 +723,106 @@ export const projectsScript = `
   }
   window.togglePause = togglePause;
 
+  let recentSync = {};
+  let syncPollTimers = {};
+  const SYNC_POLL_MS = 2000;
+  const SYNC_POLL_MAX_ATTEMPTS = 60; // ~2 min, then hand off to the background safety net
+
+  // Poll GET /api/mappings/:teamKey/sync-status/:jobId until the job is terminal
+  function pollSyncStatus(teamKey, jobId) {
+    if (!jobId) return;
+    stopSyncPoll(teamKey); // never run two pollers for one row
+
+    const initialBtn = findSyncBtn(teamKey);
+    if (initialBtn) { initialBtn.disabled = true; initialBtn.textContent = 'Syncing...'; }
+
+    let inFlight = false;
+    let attempts = 0;
+    syncPollTimers[teamKey] = setInterval(async function () {
+      if (inFlight) return; // a slow tick must not overlap the next one
+      inFlight = true;
+      try {
+        attempts++;
+        if (attempts > SYNC_POLL_MAX_ATTEMPTS) {
+          stopSyncPoll(teamKey);
+          await loadMappings();
+          flashRowSyncStatus(teamKey, 'Still syncing…');
+          return;
+        }
+        const res = await window.api('/api/mappings/' + encodeURIComponent(teamKey) + '/sync-status/' + jobId);
+        if (res.status === 404) { stopSyncPoll(teamKey); await loadMappings(); return; }
+        if (!res.ok) return; // transient server hiccup — retry next tick
+        const job = await res.json();
+        if (job.status === 'pending' || job.status === 'running') return; // keep waiting
+
+        stopSyncPoll(teamKey);
+        if (job.status === 'completed') {
+          noteSyncResult(teamKey, { ok: true, result: job.result });
+          await loadMappings();
+          if (!(job.result && job.result.prUrl)) flashRowSyncStatus(teamKey, 'Up to date');
+        } else { // failed
+          await loadMappings();
+          const msg = (job.error && job.error.message) || 'Workflow sync did not complete.';
+          alert(msg + ' Retry with the Sync workflows button on the project row.');
+        }
+      } catch (_) {
+        // network blip — leave the timer running for the next tick
+      } finally {
+        inFlight = false;
+      }
+    }, SYNC_POLL_MS);
+  }
+  window.pollSyncStatus = pollSyncStatus;
+  
   async function syncWorkflows(button) {
     const key = button.dataset.key;
-    const original = button.textContent;
     button.disabled = true;
     button.textContent = 'Syncing...';
     try {
-      const res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/sync-workflows', {
-        method: 'POST',
-      });
+      const res = await window.api('/api/mappings/' + encodeURIComponent(key) + '/sync-workflows', { method: 'POST' });
       let data = {};
       try { data = await res.json(); } catch (_) {}
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to sync workflows');
-      }
-      const labels = {
-        'up-to-date': 'Up to date',
-        'pr-existing': 'PR exists',
-        'pr-opened': 'PR opened',
-        'pr-updated': 'PR updated',
-      };
-      button.textContent = labels[data.status] || 'Synced';
-      if (data.prUrl) {
-        button.dataset.prUrl = data.prUrl;
-        button.title = data.prUrl;
-        window.open(data.prUrl, '_blank', 'noopener,noreferrer');
-      }
-      setTimeout(function () {
-        button.textContent = original;
-        button.disabled = false;
-      }, 4000);
+      if (!res.ok) { throw new Error(data.error || 'Failed to start sync'); }
+      pollSyncStatus(key, data.syncJobId);
     } catch (err) {
       button.textContent = 'Sync failed';
       button.disabled = false;
       alert(err && err.message ? err.message : String(err));
-      setTimeout(function () { button.textContent = original; }, 4000);
+      setTimeout(function () { button.textContent = 'Sync workflows'; }, 4000);
     }
   }
   window.syncWorkflows = syncWorkflows;
+
+  // Ephemeral, in-memory record of the most recent auto-sync result per team
+  // - written when a mapping is created/edited AND syncing was successful
+  // - cleared on page refresh, so the row reverts to the normal button.
+  function noteSyncResult(teamKey, sync) {
+    if (sync && sync.ok && sync.result && sync.result.prUrl) {
+      recentSync[teamKey] = { prUrl: sync.result.prUrl, status: sync.result.status };
+    }
+  }
+
+  // Transiently label a project row's Sync button
+  // - used after a create/edit that returned up-to-date (i.e. no PR to link to)
+  function flashRowSyncStatus(teamKey, label) {
+    const syncButton = findSyncBtn(teamKey);
+    if (syncButton) {
+      const originalText = syncButton.textContent;
+      syncButton.textContent = label;
+      syncButton.disabled = true;
+      setTimeout(function () { syncButton.textContent = originalText; syncButton.disabled = false; }, 4000);
+    }
+  }
+
+  function findSyncBtn(teamKey) {
+    const buttons = document.querySelectorAll('#mappings-body button[data-sync-btn]');
+    for (const btn of buttons) { if (btn.dataset.key === teamKey) return btn; }
+    return null;
+  }
+
+  function stopSyncPoll(teamKey) {
+    if (syncPollTimers[teamKey]) { clearInterval(syncPollTimers[teamKey]); delete syncPollTimers[teamKey]; }
+  }
 
   async function showSecrets(teamKey) {
     currentSecretsTeam = teamKey;

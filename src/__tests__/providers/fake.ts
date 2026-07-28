@@ -18,6 +18,8 @@ export interface FakeProviderOptions {
   latencyMs?: number;
   /** If true, lifecycle verb invocations are recorded for assertions. */
   recordCalls?: boolean;
+  /** Planning context returned by fetchPlanningContext. Default "". */
+  planningContext?: string;
 }
 
 export interface RecordedCall {
@@ -91,12 +93,12 @@ export class FakeProvider implements TicketingProvider {
     await this.tick("markPlanningStarted", [issueId, scopeKey]);
     this.transition(issueId, "planning");
   }
-  async markPlanComplete(issueId: string): Promise<void> {
-    await this.tick("markPlanComplete", [issueId]);
+  async markPlanComplete(issueId: string, scopeKey: string): Promise<void> {
+    await this.tick("markPlanComplete", [issueId, scopeKey]);
     this.transition(issueId, "plan_complete");
   }
-  async markPlanningFailed(issueId: string, reason: string): Promise<void> {
-    await this.tick("markPlanningFailed", [issueId, reason]);
+  async markPlanningFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
+    await this.tick("markPlanningFailed", [issueId, scopeKey, reason]);
     this.transition(issueId, "needs_planning");
     this.appendComment(issueId, `Planning failed: ${reason}`);
   }
@@ -104,23 +106,28 @@ export class FakeProvider implements TicketingProvider {
     await this.tick("markImplementing", [issueId, scopeKey]);
     this.transition(issueId, "implementing");
   }
-  async markPrReady(issueId: string, prUrl: string): Promise<void> {
-    await this.tick("markPrReady", [issueId, prUrl]);
+  async markPrReady(issueId: string, scopeKey: string, prUrl: string): Promise<void> {
+    await this.tick("markPrReady", [issueId, scopeKey, prUrl]);
     this.transition(issueId, "pr_ready");
     this.appendComment(issueId, `PR ready: ${prUrl}`);
   }
-  async markImplementationFailed(issueId: string, reason: string): Promise<void> {
-    await this.tick("markImplementationFailed", [issueId, reason]);
+  async markImplementationFailed(issueId: string, scopeKey: string, reason: string): Promise<void> {
+    await this.tick("markImplementationFailed", [issueId, scopeKey, reason]);
     this.transition(issueId, "plan_complete");
     this.appendComment(issueId, `Implementation failed: ${reason}`);
   }
-  async clearWorkingState(issueId: string): Promise<void> {
-    await this.tick("clearWorkingState", [issueId]);
+  async clearWorkingState(issueId: string, scopeKey: string): Promise<void> {
+    await this.tick("clearWorkingState", [issueId, scopeKey]);
     this.transition(issueId, "cleared");
   }
   async postComment(issueId: string, body: string): Promise<void> {
     await this.tick("postComment", [issueId, body]);
     this.appendComment(issueId, body);
+  }
+
+  async fetchPlanningContext(issueId: string): Promise<string> {
+    await this.tick("fetchPlanningContext", [issueId]);
+    return this.opts.planningContext ?? "";
   }
 
   issueUrl(issue: TicketIssue): string {

@@ -35,13 +35,12 @@ function makeContext(): DefaultPipelineContext {
     issueDescription: "Desc",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
   });
 }
 
 function mockRootPackageJson(extraMatches?: (p: string) => boolean) {
   vi.mocked(fs.existsSync).mockImplementation((p) => {
-    const rawPath = String(p);
+    const rawPath = String(p).replace(/\\/g, "/");
     return rawPath.endsWith("package.json") || extraMatches?.(rawPath) === true;
   });
 }
@@ -154,6 +153,110 @@ describe("installStep", () => {
     expect(outputs.packageManager).toBe("npm");
   });
 
+  it("parses known reviewProviders from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders:\n  - github-claude-code-review\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual(["github-claude-code-review"]);
+  });
+
+  it("ignores unknown reviewProviders from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders:\n  - unsupported-reviewer\n  - github-claude-code-review\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual(["github-claude-code-review"]);
+  });
+
+  it("parses quoted reviewProviders with trailing comments from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders:\n  - \"github-claude-code-review\" # enabled by repo config\n  - 'github-claude-code-review'\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual([
+      "github-claude-code-review",
+      "github-claude-code-review",
+    ]);
+  });
+
+  it("parses inline reviewProviders arrays from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders: [\"github-claude-code-review\"]\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual(["github-claude-code-review"]);
+  });
+
+  it("preserves explicit empty reviewProviders arrays from .ai-implement/config.yml", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue("reviewProviders: []\n");
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual([]);
+  });
+
+  it("treats unknown-only reviewProviders as explicit empty config", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      "reviewProviders:\n  - unsupported-reviewer\n",
+    );
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toEqual([]);
+  });
+
+  it("treats malformed reviewProviders config as absent", async () => {
+    mockRootPackageJson((p) => p.includes(".ai-implement/config.yml"));
+    vi.mocked(fs.readFileSync).mockReturnValue("reviewProviders: github-claude-code-review\n");
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.reviewProviders).toBeUndefined();
+  });
+
   it("returns empty repoModels when config.yml has no models section", async () => {
     mockRootPackageJson();
 
@@ -209,7 +312,7 @@ describe("installStep", () => {
 
   it("preserves configured packageManager when skipping without package.json", async () => {
     vi.mocked(fs.existsSync).mockImplementation((p) =>
-      String(p).includes(".ai-implement/config.yml"),
+      String(p).replace(/\\/g, "/").includes(".ai-implement/config.yml"),
     );
     vi.mocked(fs.readFileSync).mockReturnValue("packageManager: pnpm\n");
 

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveSessionImage, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -169,5 +169,110 @@ describe("resolveSessionImage", () => {
       fetchImpl,
     });
     expect(result).toEqual({ image: DEFAULT_IMAGE, source: "default" });
+  });
+});
+
+describe("resolveDefaultRunnerImage", () => {
+  it("prefers AI_IMPLEMENT_RUNNER_IMAGE over SESSION_IMAGE and reports SESSION_IMAGE as shadowed", () => {
+    const r = resolveDefaultRunnerImage({
+      AI_IMPLEMENT_RUNNER_IMAGE: "ghcr.io/acme/ai-implement-runner:v3",
+      SESSION_IMAGE: "ghcr.io/old/legacy:latest",
+    });
+    expect(r.image).toBe("ghcr.io/acme/ai-implement-runner:v3");
+    expect(r.sessionImageStatus).toBe("shadowed");
+    expect(r.explicit).toBe(true);
+  });
+
+  it("falls back to SESSION_IMAGE and reports it active when AI_IMPLEMENT_RUNNER_IMAGE is unset", () => {
+    const r = resolveDefaultRunnerImage({ SESSION_IMAGE: "ghcr.io/acme/runner:1" });
+    expect(r.image).toBe("ghcr.io/acme/runner:1");
+    expect(r.sessionImageStatus).toBe("active");
+    expect(r.explicit).toBe(true);
+  });
+
+  it("uses AI_IMPLEMENT_RUNNER_IMAGE with no SESSION_IMAGE warning", () => {
+    const r = resolveDefaultRunnerImage({ AI_IMPLEMENT_RUNNER_IMAGE: "ghcr.io/acme/runner:2" });
+    expect(r.image).toBe("ghcr.io/acme/runner:2");
+    expect(r.sessionImageStatus).toBe("unused");
+    expect(r.explicit).toBe(true);
+  });
+
+  it("falls back to the upstream image when neither is set", () => {
+    const r = resolveDefaultRunnerImage({});
+    expect(r.image).toBe("ghcr.io/builddownai/ai-implement-runner:latest");
+    expect(r.sessionImageStatus).toBe("unused");
+    expect(r.explicit).toBe(false);
+  });
+});
+
+describe("selectRunnerImageInput", () => {
+  it("forwards a per-repo override regardless of whether the orchestrator default is explicit", () => {
+    const resolved = { image: "ghcr.io/acme/my-runner:v3", source: "override" as const };
+    expect(selectRunnerImageInput({ resolved, runnerImageExplicit: false })).toBe(
+      "ghcr.io/acme/my-runner:v3",
+    );
+    expect(selectRunnerImageInput({ resolved, runnerImageExplicit: true })).toBe(
+      "ghcr.io/acme/my-runner:v3",
+    );
+  });
+
+  it("forwards the orchestrator default when a runner image is explicitly set", () => {
+    const resolved = { image: "ghcr.io/builddownai/ai-implement-runner:next", source: "default" as const };
+    expect(selectRunnerImageInput({ resolved, runnerImageExplicit: true })).toBe(
+      "ghcr.io/builddownai/ai-implement-runner:next",
+    );
+  });
+
+  it("forwards nothing when the image is the implicit default (no explicit env, no override)", () => {
+    // Leaving runner_image unset lets the target workflow keep its own resolution
+    // (its .ai-implement/image.yml, the AI_IMPLEMENT_RUNNER_IMAGE repo variable, then the
+    // built-in default), so repos that pin via that variable are not silently overridden.
+    const resolved = { image: DEFAULT_IMAGE, source: "default" as const };
+    expect(selectRunnerImageInput({ resolved, runnerImageExplicit: false })).toBeUndefined();
+  });
+});
+
+describe("resolveRunnerImageForDispatch", () => {
+  beforeEach(() => {
+    __clearRepoImageCacheForTests();
+  });
+
+  it("forwards a per-repo override even when the orchestrator default is implicit", async () => {
+    const fetchImpl = mockFetch(200, contentsApiResponse("image: ghcr.io/acme/my-runner:v3\n"));
+    const image = await resolveRunnerImageForDispatch({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: DEFAULT_IMAGE,
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+    expect(image).toBe("ghcr.io/acme/my-runner:v3");
+  });
+
+  it("forwards the orchestrator default when it is explicitly set (e.g. testing pinned to :next)", async () => {
+    const fetchImpl = mockFetch(404, null); // no per-repo override
+    const image = await resolveRunnerImageForDispatch({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
+      runnerImageExplicit: true,
+      fetchImpl,
+    });
+    expect(image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
+  });
+
+  it("forwards nothing when neither an override nor an explicit default is set", async () => {
+    const fetchImpl = mockFetch(404, null);
+    const image = await resolveRunnerImageForDispatch({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: DEFAULT_IMAGE,
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+    expect(image).toBeUndefined();
   });
 });

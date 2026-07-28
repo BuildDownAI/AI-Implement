@@ -182,9 +182,9 @@ export const overviewScript = `
   }
 
   function statusBadge(status) {
-    const map = { running: 'running', review_failed: 'warn', failed: 'fail', completed: 'success' };
+    const map = { running: 'running', review_failed: 'warn', failed: 'fail', 'dispatch-failed': 'fail', completed: 'success' };
     const kind = map[status] || 'neutral';
-    const label = status === 'review_failed' ? 'review failed' : status;
+    const label = status === 'review_failed' ? 'review failed' : status === 'dispatch-failed' ? 'dispatch failed' : status;
     return '<span class="badge ' + kind + '">' + window.esc(label) + '</span>';
   }
 
@@ -396,8 +396,8 @@ export const overviewScript = `
     const container = document.getElementById('overview-env-status');
     if (!container) return;
     const pills = [
-      { label: 'Linear', on: !!status.linear, hint: 'LINEAR_API_KEY' },
-      { label: 'Jira', on: !!status.jira, hint: 'JIRA_TOKEN + JIRA_CLOUD_ID + JIRA_SITE_URL' },
+      { label: 'Linear', on: !!status.linear, hint: 'LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET' },
+      { label: 'Jira', on: !!status.jira, hint: 'JIRA_TOKEN + JIRA_SITE_URL + (JIRA_EMAIL or JIRA_CLOUD_ID)' },
       { label: 'Runner callback', on: !!status.runnerCallback, hint: 'RUNNER_CALLBACK_BASE_URL + RUNNER_TOKEN_SECRET' },
       { label: 'Gap-fill trigger', on: !!status.gapFillTrigger, hint: 'GAP_FILL_TRIGGER_SECRET' },
     ];

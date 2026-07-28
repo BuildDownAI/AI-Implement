@@ -12,12 +12,6 @@ const VALID_STEP_TYPES = new Set<StepType>([
   "preflight",
   "push",
   "await_ci",
-  "explore-codebase",
-  "architecture-analysis",
-  "test-plan",
-  "work-unit-decomposition",
-  "cross-story-context",
-  "post-to-ticketing",
   "custom",
 ]);
 
@@ -94,12 +88,32 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "install-skills":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          skillsRepoUrl: ctx.data.skillsRepo ?? "",
+          githubToken: ctx.getOutputs("clone").githubToken,
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.skillsRepo,
+      };
+
     case "install":
       return {
         ...step,
         inputs: (ctx: PipelineContext) => ({
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
         }),
+      };
+
+    case "setup":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          scriptPath: ctx.data.hooks?.setup,
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.hooks?.setup,
       };
 
     case "feedback-loop":
@@ -117,6 +131,9 @@ function applyWiring(step: YamlStep): StepDefinition {
             planningContext: ctx.data.planningContext,
             repoImplementModel: repoModels?.implement,
             repoReviewModel: repoModels?.review,
+            provider: ctx.data.provider,
+            maxTurns: ctx.data.maxTurns,
+            maxIterations: ctx.data.maxIterations,
           };
         },
       };
@@ -132,18 +149,56 @@ function applyWiring(step: YamlStep): StepDefinition {
       };
 
     case "push":
+      // Push always runs after the feedback loop on an initial run: unapproved work ships
+      // as a draft PR (with the reviewer feedback in the body) instead of being silently
+      // discarded. Gap-fill runs are different: Claude commits and pushes to the *existing*
+      // PR branch itself (the pipeline never owns git there — see run-autonomous.ts's
+      // gap-fill prompt), so the tree is clean by the time push would run and it would just
+      // throw "Nothing to commit" — turning an approved gap-fill into a red failure. Skip
+      // push for every gap-fill run; run-autonomous.ts's outcome derivation handles both
+      // gap-fill outcomes without push outputs (approved → gap-analysis success, unapproved
+      // → coded failure callback with no prUrl plus autopsy).
+      return {
+        ...step,
+        skip: (ctx: PipelineContext) => Boolean(ctx.data.prNumber),
+        inputs: (ctx: PipelineContext) => {
+          const fb = ctx.getOutputs("feedback-loop");
+          const approved = fb.approved === true;
+          return {
+            workspaceDir: ctx.getOutputs("clone").workspaceDir,
+            repoOwner: ctx.getOutputs("clone").repoOwner,
+            repoRepo: ctx.getOutputs("clone").repoRepo,
+            githubToken: ctx.getOutputs("clone").githubToken,
+            branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
+            baseBranch: ctx.getOutputs("clone").branch,
+            prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
+            sensitiveFiles: ctx.data.sensitiveFiles,
+            groupingParent: ctx.data.groupingParent,
+            draft: !approved,
+            reviewSummary: approved
+              ? undefined
+              : {
+                  terminationReason: typeof fb.terminationReason === "string" ? fb.terminationReason : "unknown",
+                  iterations: typeof fb.iterations === "number" ? fb.iterations : 0,
+                  finalFeedback: typeof fb.finalFeedback === "string" ? fb.finalFeedback : "",
+                  passes: Array.isArray(fb.passes) ? fb.passes : [],
+                  ...(typeof fb.postMortem === "string" ? { postMortem: fb.postMortem } : {}),
+                },
+          };
+        },
+      };
+
+    case "verify":
       return {
         ...step,
         inputs: (ctx: PipelineContext) => ({
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
-          repoOwner: ctx.getOutputs("clone").repoOwner,
-          repoRepo: ctx.getOutputs("clone").repoRepo,
-          githubToken: ctx.getOutputs("clone").githubToken,
-          branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle),
-          baseBranch: ctx.getOutputs("clone").branch,
-          prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
+          scriptPath: ctx.data.hooks?.verify,
         }),
-        skip: (ctx: PipelineContext) => ctx.getOutputs("feedback-loop").approved !== true,
+        skip: (ctx: PipelineContext) => {
+          if (!ctx.data.hooks?.verify) return true;
+          return ctx.getOutputs("feedback-loop").approved !== true;
+        },
       };
 
     case "post-push-review":
@@ -152,8 +207,12 @@ function applyWiring(step: YamlStep): StepDefinition {
         inputs: (ctx: PipelineContext) => ({
           prNumber: String(ctx.getOutputs("push").prNumber ?? ""),
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          reviewProviders: ctx.getOutputs("install").reviewProviders,
         }),
         skip: (ctx: PipelineContext) => {
+          // Never run further review/force-push cycles against an unapproved
+          // draft — the review budget is already exhausted.
+          if (ctx.getOutputs("feedback-loop").approved !== true) return true;
           const pushOutputs = ctx.getOutputs("push");
           return pushOutputs.branchPushed !== true || !pushOutputs.prNumber;
         },

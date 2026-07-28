@@ -7,7 +7,13 @@ dist/
 *.sqlite
 *.pem
 *.pem.txt
+clients/*.toml
+!clients/example-client.toml
 .claude/
 .conductor/
 .wrangler/
 .worktrees/
+
+/.idea/**
+
+/data/dedup.**

@@ -1,7 +1,15 @@
 import crypto from "node:crypto";
+import { GitHubApiError } from "./github-errors.js";
+
+export interface InstallationDetails {
+  token: string;
+  installationId: number; // Currently inert — no caller reads this yet. Reserved for an OAuth follow-up (if approved), which will add a repo to a "selected repositories" install via the API and needs the installation id to target it
+  repositorySelection: "all" | "selected";
+}
 
 // Cache: org → { token, expiresAt }
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+let cachedAppSlug: string | null = null;
 
 /**
  * Wraps raw bytes in an ASN.1 TLV (tag-length-value) structure.
@@ -54,16 +62,21 @@ function parsePrivateKey(pem: string): crypto.KeyObject {
   return crypto.createPrivateKey(normalized);
 }
 
+// exp is minted this many seconds below GitHub's 600s cap (and iat backdated the same)
+// so a host clock running ahead of GitHub still validates. Larger drift needs a clock resync (NTP).
+const CLOCK_SKEW_TOLERANCE_S = 300;
+
 /**
  * Creates a signed JWT for authenticating as a GitHub App.
- * Valid for 10 minutes (GitHub's max is 10 min).
+ * Minted below GitHub's 10-min exp cap by CLOCK_SKEW_TOLERANCE_S so a host clock running ahead of GitHub still passes validation.
+ * Exported for unit tests that assert the iat/exp skew bounds.
  */
-function createAppJwt(appId: string, privateKey: string): string {
+export function createAppJwt(appId: string, privateKey: string): string {
   const now = Math.floor(Date.now() / 1000);
   const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
   const payload = Buffer.from(JSON.stringify({
-    iat: now - 60, // 60s clock skew buffer
-    exp: now + 600,
+    iat: now - CLOCK_SKEW_TOLERANCE_S, // 300s clock skew buffer (for hosts ahead of GitHub's time)
+    exp: now + 600 - CLOCK_SKEW_TOLERANCE_S,
     iss: appId,
   })).toString("base64url");
 
@@ -75,14 +88,137 @@ function createAppJwt(appId: string, privateKey: string): string {
   return `${signing}.${sig}`;
 }
 
+function githubAppHeaders(authValue: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${authValue}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "ai-implement",
+  };
+}
+
+/**
+ * Resolves the GitHub App installation for an owner and mints an installation token, returning both
+ * the token and the install metadata (repo selection + account type) the install-state probe needs.
+ * The org endpoint 404s on user accounts and vice versa, so try org first and fall back to user.
+ * 
+ * Uncached — getInstallationToken is the cached, token-only view.
+ */
+export async function getInstallation(
+  appId: string,
+  privateKey: string,
+  owner: string,
+): Promise<InstallationDetails> {
+  const normalizedKey = privateKey.replace(/\\n/g, "\n"); // handle \n literals from env vars
+  const jwt = createAppJwt(appId, normalizedKey);
+  const headers = githubAppHeaders(jwt);
+
+  let installPath = `/orgs/${owner}/installation`;
+  let installRes = await fetch(`https://api.github.com${installPath}`, { headers });
+  if (installRes.status === 404) {
+    installPath = `/users/${owner}/installation`;
+    installRes = await fetch(`https://api.github.com${installPath}`, { headers });
+  }
+  if (!installRes.ok) {
+    const body = await installRes.text();
+    // `path` (…/installation) lets classifySyncError tell a 404-not-installed from a 404-repo-not-found.
+    throw new GitHubApiError({
+      status: installRes.status,
+      path: installPath,
+      bodyText: body,
+      message: `GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`,
+    });
+  }
+  const install = (await installRes.json()) as {
+    id: number;
+    repository_selection?: "all" | "selected";
+  };
+
+  const tokenPath = `/app/installations/${install.id}/access_tokens`;
+  const tokenRes = await fetch(`https://api.github.com${tokenPath}`, { method: "POST", headers });
+  if (!tokenRes.ok) {
+    const body = await tokenRes.text();
+    throw new GitHubApiError({
+      status: tokenRes.status,
+      path: tokenPath,
+      bodyText: body,
+      message: `Failed to get installation token for owner "${owner}" (${tokenRes.status}): ${body}`,
+    });
+  }
+  const tokenData = (await tokenRes.json()) as { token: string };
+
+  return {
+    token: tokenData.token,
+    installationId: install.id,
+    repositorySelection: install.repository_selection === "all" ? "all" : "selected",
+  };
+}
+
+/**
+ * Whether the installation can see a given repo. Only meaningful when repositorySelection === "selected"
+ * (an "all" install sees everything, so the caller skips this). 
+ * 
+ * Pages through GET /installation/repositories with the install token, short-circuiting as soon as the repo is found.
+ */
+export async function installationIncludesRepo(token: string, repoName: string): Promise<boolean> {
+  const headers = githubAppHeaders(token);
+  const perPage = 100;
+  const target = repoName.toLowerCase();
+
+  for (let page = 1; ; page++) {
+    const path = `/installation/repositories?per_page=${perPage}&page=${page}`;
+    const res = await fetch(`https://api.github.com${path}`, { headers });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new GitHubApiError({
+        status: res.status,
+        path,
+        bodyText: body,
+        message: `Failed to list installation repositories (${res.status}): ${body}`,
+      });
+    }
+
+    const data = (await res.json()) as { total_count: number; repositories: Array<{ name: string }> };
+    if (data.repositories.some((r) => r.name.toLowerCase() === target)) return true;
+    // Stop once this page was short (the last page) or we've already covered total_count.
+    if (data.repositories.length < perPage || page * perPage >= data.total_count) return false;
+  }
+}
+
+/**
+ * The GitHub App's slug (the name in github.com/apps/<slug>/...). Immutable per app, so cached for the
+ * process lifetime. Authenticates as the app (JWT) and reads GET /app
+ * 
+ * Derived from the credentials the orchestrator already needs, so no extra config and zero new secrets.
+ */
+export async function getAppSlug(appId: string, privateKey: string): Promise<string> {
+  if (cachedAppSlug) return cachedAppSlug;
+
+  const normalizedKey = privateKey.replace(/\\n/g, "\n");
+  const jwt = createAppJwt(appId, normalizedKey);
+  const path = "/app";
+  const res = await fetch(`https://api.github.com${path}`, { headers: githubAppHeaders(jwt) });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new GitHubApiError({
+      status: res.status,
+      path,
+      bodyText: body,
+      message: `Failed to read GitHub App metadata (${res.status}): ${body}`,
+    });
+  }
+
+  const data = (await res.json()) as { slug: string };
+  cachedAppSlug = data.slug;
+  return cachedAppSlug;
+}
+
 /**
  * Returns a cached installation access token for the given owner.
  * Tokens are valid for 1 hour; we cache for 50 minutes.
- *
- * The GitHub App must be installed on the target owner. The owner can be
- * either an organisation or a personal user account; GitHub uses separate
- * REST endpoints for each, so we try the org endpoint first and fall back
- * to the user endpoint on 404.
+ * 
+ * Thin caching layer over getInstallation — the hot dispatch path only needs the token.
  */
 export async function getInstallationToken(
   appId: string,
@@ -93,44 +229,9 @@ export async function getInstallationToken(
   if (cached && Date.now() < cached.expiresAt) {
     return cached.token;
   }
-
-  // Normalize PEM key — handle \n literals from env vars
-  const normalizedKey = privateKey.replace(/\\n/g, "\n");
-  const jwt = createAppJwt(appId, normalizedKey);
-
-  const headers = {
-    Authorization: `Bearer ${jwt}`,
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "ai-implement",
-  };
-
-  // Resolve installation ID for the owner (org or user account).
-  // GitHub's `/orgs/{org}/installation` endpoint 404s on user accounts and
-  // vice versa; try org first since that's the more common deployment shape.
-  let installRes = await fetch(`https://api.github.com/orgs/${owner}/installation`, { headers });
-  if (installRes.status === 404) {
-    installRes = await fetch(`https://api.github.com/users/${owner}/installation`, { headers });
-  }
-  if (!installRes.ok) {
-    const body = await installRes.text();
-    throw new Error(`GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`);
-  }
-  const install = await installRes.json() as { id: number };
-
-  // Exchange for an installation access token
-  const tokenRes = await fetch(
-    `https://api.github.com/app/installations/${install.id}/access_tokens`,
-    { method: "POST", headers },
-  );
-  if (!tokenRes.ok) {
-    const body = await tokenRes.text();
-    throw new Error(`Failed to get installation token for owner "${owner}" (${tokenRes.status}): ${body}`);
-  }
-  const tokenData = await tokenRes.json() as { token: string; expires_at: string };
-
-  tokenCache.set(owner, { token: tokenData.token, expiresAt: Date.now() + 50 * 60 * 1000 });
-  return tokenData.token;
+  const { token } = await getInstallation(appId, privateKey, owner);
+  tokenCache.set(owner, { token, expiresAt: Date.now() + 50 * 60 * 1000 });
+  return token;
 }
 
 /** Clears the token cache (useful for testing). */

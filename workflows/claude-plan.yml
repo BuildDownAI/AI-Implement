@@ -1,43 +1,47 @@
-# Copy this file to .github/workflows/claude-plan.yml in each target repo.
-# This is managed by the ai-implement sync workflow — do not edit directly in target repos.
+# Synced to target repos by sync-workflow.yml.
+# All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
+# Do not edit in target repos.
 #
-# Required org secrets (Anthropic provider — default):
+# Required secrets:
 #   AI_IMPLEMENT_APP_ID      - GitHub App numeric ID
 #   AI_IMPLEMENT_PRIVATE_KEY - GitHub App PEM private key
-#   ANTHROPIC_API_KEY        - Anthropic API key (fallback if no OAuth token)
+#   ANTHROPIC_API_KEY        - Anthropic API key
 #   CLAUDE_CODE_OAUTH_TOKEN  - Claude Code OAuth token (preferred over API key)
-#   LINEAR_API_KEY           - Linear API key for fetching related issues and posting comments
 #
-# Optional org/repo variable:
-#   AI_IMPLEMENT_ALLOWED_BOTS - Override claude-code-action allowed_bots.
-#                               Defaults to this workflow's GitHub App slug.
+# Additional secret (Bedrock provider):
+#   AWS_BEDROCK_ROLE_ARN     - IAM role ARN trusted to GitHub OIDC; needs bedrock:InvokeModel
 #
-# Additional secret (Bedrock provider, when orchestrator sets provider=bedrock):
-#   AWS_BEDROCK_ROLE_ARN     - IAM role ARN that the GitHub OIDC provider can assume;
-#                              role must grant bedrock:InvokeModel on the relevant
-#                              inference profiles.
+# Optional repository or organization variables:
+#   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
+#   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
+#
+# Private runner images: the plan job pulls the runner image as its container.
+# When that image is private on GHCR the pull is authenticated with GITHUB_TOKEN via
+# the container `credentials:` block (hence `packages: read` in the permissions block).
+# The token can only read private packages owned by THIS repo's org, so a private
+# runner image must live in the same org; a different-org private image needs a PAT
+# swapped into `credentials.password`. Fly/local pull anonymously, so private runner
+# images are only usable in this GitHub Actions execution mode.
 
 name: Claude AI Planning
 
 on:
   workflow_dispatch:
     inputs:
-      issue_id:
-        description: "Linear issue UUID"
+      run_config:
+        description: "base64 JSON RunConfig envelope — see docs/workflow-envelope.md"
         required: true
         type: string
-      issue_identifier:
-        description: "Linear issue identifier (e.g., ENG-123)"
-        required: true
+      runner_image:
+        description: "Override the runner image for this run (must match ghcr.io/builddownai/*, the repo owner's ghcr.io/<owner>/*, or AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES)"
+        required: false
         type: string
-      issue_title:
-        description: "Linear issue title"
-        required: true
+        default: ""
+      job_timeout_minutes:
+        description: "Per-project job timeout in minutes, must be a positive integer (empty = 30)"
+        required: false
         type: string
-      issue_description:
-        description: "Linear issue description"
-        required: true
-        type: string
+        default: ""
       provider:
         description: "Claude provider: 'anthropic' (default) or 'bedrock'"
         required: false
@@ -48,13 +52,13 @@ on:
         required: false
         type: string
         default: ""
-      runner_callback_url:
-        description: "Base URL the orchestrator advertises for /runner/result; empty skips callback"
+      run_token:
+        description: "HMAC bearer token authorizing the result POST; empty skips callback"
         required: false
         type: string
         default: ""
-      run_token:
-        description: "HMAC bearer token authorizing the result POST; empty skips callback"
+      run_progress_token:
+        description: "HMAC bearer token authorizing progress POSTs; empty skips progress callback"
         required: false
         type: string
         default: ""
@@ -62,215 +66,98 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: read
 
 jobs:
-  plan:
+  validate-runner-image:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    outputs:
+      runner_image: ${{ steps.resolve.outputs.runner_image }}
     steps:
-      - uses: actions/create-github-app-token@v2
+      - name: Resolve and validate runner image
+        id: resolve
+        env:
+          REQUESTED_RUNNER_IMAGE: ${{ inputs.runner_image }}
+          CONFIGURED_RUNNER_IMAGE: ${{ vars.AI_IMPLEMENT_RUNNER_IMAGE }}
+          EXTRA_ALLOWED_PREFIXES: ${{ vars.AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [ -z "$owner" ]; then
+            echo "::error::GITHUB_REPOSITORY_OWNER is empty; cannot derive the owner image prefix." >&2
+            exit 1
+          fi
+
+          runner_image="${REQUESTED_RUNNER_IMAGE:-}"
+          if [ -z "$runner_image" ]; then
+            runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
+          fi
+          if [ -z "$runner_image" ]; then
+            runner_image="ghcr.io/builddownai/ai-implement-runner:latest"
+          fi
+
+          case "$runner_image" in
+            *[!A-Za-z0-9._:/@-]*)
+              echo "::error::runner_image \"$runner_image\" contains invalid characters for a container image reference." >&2
+              exit 1
+              ;;
+          esac
+
+          allowed_prefixes="ghcr.io/builddownai/,ghcr.io/${owner}/"
+          if [ -n "${EXTRA_ALLOWED_PREFIXES:-}" ]; then
+            allowed_prefixes="${allowed_prefixes},${EXTRA_ALLOWED_PREFIXES}"
+          fi
+
+          allowed=false
+          IFS=',' read -ra prefixes <<< "$allowed_prefixes"
+          for raw_prefix in "${prefixes[@]}"; do
+            prefix="$(echo "$raw_prefix" | xargs)"
+            [ -z "$prefix" ] && continue
+            # Literal prefix match — quote "$prefix" so glob metacharacters in an
+            # operator-supplied AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES can't widen it.
+            if [[ "$runner_image" == "$prefix"* ]]; then
+              allowed=true
+              break
+            fi
+          done
+
+          if [ "$allowed" != "true" ]; then
+            echo "::error::runner_image \"$runner_image\" is not allowed." >&2
+            echo "::error::Allowed prefixes:" >&2
+            for raw_prefix in "${prefixes[@]}"; do
+              prefix="$(echo "$raw_prefix" | xargs)"
+              [ -z "$prefix" ] && continue
+              echo "::error::- $prefix" >&2
+            done
+            echo "::error::To allow this image, set the repository or organization variable AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=<prefix>." >&2
+            echo "::error::Example: AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES=ghcr.io/acme/" >&2
+            echo "::error::Use comma-separated prefixes for multiple registries or namespaces." >&2
+            exit 1
+          fi
+
+          echo "runner_image=$runner_image" >> "$GITHUB_OUTPUT"
+
+  plan:
+    needs: validate-runner-image
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.job_timeout_minutes && fromJSON(inputs.job_timeout_minutes) || 30 }}
+    container:
+      image: ${{ needs.validate-runner-image.outputs.runner_image }}
+      # Authenticate the image pull so a private GHCR runner image owned by this
+      # repo's org can be pulled (packages: read scopes GITHUB_TOKEN for this).
+      # Harmless for the public default image. Cross-org private images need a PAT
+      # swapped in for the password — see the header comment.
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Generate GitHub App token
         id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
-
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Fetch related issues from Linear
-        id: fetch-related
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
-        run: |
-          FETCH_LOG=/tmp/related-fetch.log
-          : > "$FETCH_LOG"
-          # curl -fsS: fail on HTTP errors, suppress progress, keep error messages.
-          if ! RESPONSE=$(curl -fsS --max-time 30 -X POST https://api.linear.app/graphql \
-            -H "Content-Type: application/json" \
-            -H "Authorization: $LINEAR_API_KEY" \
-            --data-raw "$(jq -n --arg id "$ISSUE_ID" \
-              '{query: "query($id: String!) { issue(id: $id) { parent { id identifier title children { nodes { id identifier title } } } relations { nodes { type relatedIssue { id identifier title } } } } }", variables: {id: $id}}')" \
-            2>"$FETCH_LOG"); then
-            echo "::warning::Failed to fetch related issues from Linear — proceeding without them."
-            if [ -s "$FETCH_LOG" ]; then
-              echo "Linear fetch error details:"
-              sed 's/^/  /' "$FETCH_LOG"
-            fi
-            RESPONSE='{"data":{"issue":{"parent":null,"relations":{"nodes":[]}}}}'
-          fi
-
-          PARENT=$(echo "$RESPONSE" | jq -r \
-            'if .data.issue.parent then "- \(.data.issue.parent.identifier): \(.data.issue.parent.title)" else "" end' \
-            2>/dev/null || echo "")
-
-          SIBLINGS=$(echo "$RESPONSE" | jq -r \
-            --arg issueId "$ISSUE_ID" \
-            '[.data.issue.parent.children.nodes[]? | select(.id != $issueId) | "- \(.identifier): \(.title)"] | join("\n")' \
-            2>/dev/null || echo "")
-
-          DEPENDENCIES=$(echo "$RESPONSE" | jq -r \
-            '[.data.issue.relations.nodes[]? | "- [\(.type)] \(.relatedIssue.identifier): \(.relatedIssue.title)"] | join("\n")' \
-            2>/dev/null || echo "")
-
-          # Unique delimiter guards against Linear content that happens to contain a fixed token.
-          EOF_TOKEN=$(openssl rand -hex 8)
-          {
-            echo "parent<<RELATED_${EOF_TOKEN}"
-            echo "$PARENT"
-            echo "RELATED_${EOF_TOKEN}"
-            echo "siblings<<RELATED_${EOF_TOKEN}"
-            echo "$SIBLINGS"
-            echo "RELATED_${EOF_TOKEN}"
-            echo "dependencies<<RELATED_${EOF_TOKEN}"
-            echo "$DEPENDENCIES"
-            echo "RELATED_${EOF_TOKEN}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Prepare planning prompt
-        id: prepare-prompt
-        env:
-          ISSUE_ID: ${{ inputs.issue_id }}
-          ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
-          ISSUE_TITLE: ${{ inputs.issue_title }}
-          ISSUE_DESCRIPTION: ${{ inputs.issue_description }}
-          PROVIDER: ${{ inputs.provider }}
-          PARENT: ${{ steps.fetch-related.outputs.parent }}
-          SIBLINGS: ${{ steps.fetch-related.outputs.siblings }}
-          DEPENDENCIES: ${{ steps.fetch-related.outputs.dependencies }}
-        run: |
-          FRONTMATTER=""
-
-          # Set defaults so envsubst produces "None" for empty context
-          PARENT="${PARENT:-None}"
-          SIBLINGS="${SIBLINGS:-None}"
-          DEPENDENCIES="${DEPENDENCIES:-None}"
-
-          if [ -f "PLANNING.md" ]; then
-            echo "Using repo PLANNING.md as prompt template"
-            FRONTMATTER=$(awk '/^---/{found++; next} found==1{print}' PLANNING.md)
-            # Strip YAML front matter from body
-            awk 'BEGIN{in_fm=0; past_fm=0}
-                 !past_fm && /^---/ { if (!in_fm) { in_fm=1; next } else { in_fm=0; past_fm=1; next } }
-                 !in_fm { print }' \
-              PLANNING.md > /tmp/planning-body.md
-            # Strip HTML comments so meta-documentation isn't sent to Claude
-            perl -0777 -pe 's/<!--.*?-->//gs' /tmp/planning-body.md > /tmp/planning-stripped.md
-            envsubst '${ISSUE_ID} ${ISSUE_IDENTIFIER} ${ISSUE_TITLE} ${ISSUE_DESCRIPTION} ${PARENT} ${SIBLINGS} ${DEPENDENCIES}' \
-              < /tmp/planning-stripped.md > /tmp/claude-prompt.md
-          else
-            echo "No PLANNING.md found, using default prompt"
-            cat > /tmp/claude-prompt.md << 'PROMPT'
-          You are a senior software architect performing a read-only planning analysis. Do NOT create any branches, files, or pull requests. Do NOT write any code. Explore the codebase and produce structured planning comments.
-
-          **Issue:** ${ISSUE_IDENTIFIER} — ${ISSUE_TITLE}
-
-          **Description:**
-          ${ISSUE_DESCRIPTION}
-
-          ## Related context
-
-          **Parent issue:**
-          ${PARENT}
-
-          **Sibling stories:**
-          ${SIBLINGS}
-
-          **Dependencies:**
-          ${DEPENDENCIES}
-
-          ## Instructions
-
-          1. Use Read, Glob, and Grep to explore the codebase — understand the relevant existing code, patterns, files that would need to change, and potential risks.
-
-          2. Write each planning comment as a separate Markdown file under
-             `ai-output/comments/`, prefixed with a two-digit sequence number to
-             control order (e.g. `01-architecture.md`, `02-test-plan.md`,
-             `03-cross-story.md`). Do NOT post comments directly to the
-             ticketing system — the orchestrator handles posting after the
-             workflow completes.
-
-          3. Write EXACTLY these comments as files in order:
-
-          ### Comment 1 — Architecture Analysis
-
-          Header must be exactly: `## 🏗️ AI Planning: Architecture Analysis`
-
-          Required sections:
-          - **Approach**: 1-3 sentences describing the implementation strategy
-          - **Files to Create/Modify**: Specific file paths with a one-line description of each change
-          - **Key Decisions**: Architectural choices and rationale
-          - **Risks & Open Questions**: Edge cases, unknowns, potential problems
-
-          ### Comment 2 — Test Plan
-
-          Header must be exactly: `## 🧪 AI Planning: Test Plan`
-
-          Required sections:
-          - **Unit Tests**: Individual components or functions to test
-          - **Integration Tests**: End-to-end or cross-component scenarios
-          - **Manual Verification**: Step-by-step human verification checklist
-
-          ### Comment 3 — Cross-Story Context (conditional)
-
-          Only post this comment if ${DEPENDENCIES} or ${SIBLINGS} is not "None" AND there is meaningful coordination needed.
-
-          Header must be exactly: `## 🔗 AI Planning: Cross-Story Context`
-
-          Required sections:
-          - **Upstream Dependencies**: What must be done before this story
-          - **Downstream Impact**: Stories or systems that will depend on this work
-          - **Coordination Notes**: Specific actions needed to coordinate with other teams or stories
-
-          Base your analysis on what you actually find in the codebase — avoid generic boilerplate.
-          PROMPT
-            envsubst '${ISSUE_ID} ${ISSUE_IDENTIFIER} ${ISSUE_TITLE} ${ISSUE_DESCRIPTION} ${PARENT} ${SIBLINGS} ${DEPENDENCIES}' \
-              < /tmp/claude-prompt.md > /tmp/claude-prompt-rendered.md
-            mv /tmp/claude-prompt-rendered.md /tmp/claude-prompt.md
-          fi
-
-          # Model IDs are passed through verbatim to Claude Code — we no longer maintain
-          # an allowlist. This lets new Anthropic models and Bedrock model IDs (both
-          # "anthropic.<name>-<date>-v1:0" strings and inference-profile ARNs) flow
-          # without a workflow template edit. Claude Code rejects unknown IDs at
-          # invocation time with a clear error.
-          # Model defaults: anthropic gets a sensible default so existing target
-          # repos without a model: field keep working; bedrock hard-fails because
-          # there is no safe default (Bedrock IDs are region- and account-specific
-          # and include date stamps, so defaulting would always be wrong for some
-          # customer). The seed PLANNING.md already specifies a model so fresh
-          # repos never hit the default path.
-          MODEL=""
-          if [ -n "$FRONTMATTER" ]; then
-            MODEL=$(echo "$FRONTMATTER" | grep '^model:' | head -1 | sed 's/model:[[:space:]]*//' | tr -d '[:space:]')
-          fi
-          if [ -z "$MODEL" ]; then
-            if [ "$PROVIDER" = "bedrock" ]; then
-              echo "::error::PLANNING.md must specify a model: for bedrock provider."
-              echo "::error::Use a Bedrock model ID (e.g. 'anthropic.claude-sonnet-4-6-20250805-v1:0') or an inference-profile ARN."
-              exit 1
-            fi
-            MODEL="claude-sonnet-4-6"
-          fi
-          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
-
-          {
-            echo 'prompt<<CLAUDE_PROMPT_EOF'
-            cat /tmp/claude-prompt.md
-            echo 'CLAUDE_PROMPT_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Remove local Claude settings to avoid conflict with action
-        run: |
-          for f in .claude/settings.local.json .claude/settings.json; do
-            if [ -e "$f" ]; then
-              echo "::warning::Removing $f before AI run — repo-checked-in Claude settings are not honored by this workflow."
-            fi
-          done
-          git update-index --assume-unchanged .claude/settings.local.json 2>/dev/null || true
-          git update-index --assume-unchanged .claude/settings.json 2>/dev/null || true
-          rm -f .claude/settings.local.json .claude/settings.json
 
       - name: Validate Bedrock inputs
         if: inputs.provider == 'bedrock'
@@ -278,9 +165,6 @@ jobs:
           AWS_REGION: ${{ inputs.aws_region }}
           ROLE_ARN: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
         run: |
-          # Fail fast with a clear message before aws-actions/configure-aws-credentials
-          # surfaces a generic AWS SDK error. Both inputs are required for the
-          # Bedrock auth path — the IAM role is assumed via GitHub OIDC.
           if [ -z "$AWS_REGION" ]; then
             echo "::error::provider=bedrock but aws_region dispatch input is empty."
             echo "::error::Set awsRegion on this team's mapping in the orchestrator admin UI."
@@ -288,150 +172,35 @@ jobs:
           fi
           if [ -z "$ROLE_ARN" ]; then
             echo "::error::provider=bedrock but AWS_BEDROCK_ROLE_ARN repo secret is not set."
-            echo "::error::Add the IAM role ARN (trusted to the GitHub OIDC provider with bedrock:InvokeModel) at Settings → Secrets and variables → Actions."
+            echo "::error::Add the IAM role ARN trusted to GitHub OIDC with bedrock:InvokeModel permission."
             exit 1
           fi
 
-      - name: Detect auth method
-        id: auth-check
-        run: |
-          # Three-way auth routing. Precedence: bedrock (via explicit input) >
-          # oauth (CLAUDE_CODE_OAUTH_TOKEN secret) > api_key (ANTHROPIC_API_KEY).
-          if [ "$PROVIDER" = "bedrock" ]; then
-            echo "auth_method=bedrock" >> "$GITHUB_OUTPUT"
-          elif [ -n "$OAUTH_TOKEN" ]; then
-            echo "auth_method=oauth" >> "$GITHUB_OUTPUT"
-          else
-            echo "auth_method=api_key" >> "$GITHUB_OUTPUT"
-          fi
-        env:
-          PROVIDER: ${{ inputs.provider }}
-          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-
       - name: Configure AWS credentials (Bedrock)
-        if: steps.auth-check.outputs.auth_method == 'bedrock'
-        uses: aws-actions/configure-aws-credentials@v4
+        if: inputs.provider == 'bedrock'
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: ${{ inputs.aws_region }}
+          role-session-duration: 14400
 
-      - name: Run Claude (Bedrock)
-        if: steps.auth-check.outputs.auth_method == 'bedrock'
-        uses: anthropics/claude-code-action@v1
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
-        with:
-          use_bedrock: "true"
-          github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "${{ vars.AI_IMPLEMENT_ALLOWED_BOTS || steps.app-token.outputs.app-slug }}"
-          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep'"
-          prompt: ${{ steps.prepare-prompt.outputs.prompt }}
-
-      - name: Run Claude (OAuth token)
-        if: steps.auth-check.outputs.auth_method == 'oauth'
-        uses: anthropics/claude-code-action@v1
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "${{ vars.AI_IMPLEMENT_ALLOWED_BOTS || steps.app-token.outputs.app-slug }}"
-          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep'"
-          prompt: ${{ steps.prepare-prompt.outputs.prompt }}
-
-      - name: Run Claude (API key)
-        if: steps.auth-check.outputs.auth_method == 'api_key'
-        uses: anthropics/claude-code-action@v1
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ steps.app-token.outputs.token }}
-          allowed_bots: "${{ vars.AI_IMPLEMENT_ALLOWED_BOTS || steps.app-token.outputs.app-slug }}"
-          claude_args: "--dangerously-skip-permissions --model ${{ steps.prepare-prompt.outputs.model }} --max-turns 50 --allowedTools 'Read' --allowedTools 'Glob' --allowedTools 'Grep'"
-          prompt: ${{ steps.prepare-prompt.outputs.prompt }}
-
-      - name: Update Linear labels
-        if: always()
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          ISSUE_ID: ${{ inputs.issue_id }}
-          ISSUE_IDENTIFIER: ${{ inputs.issue_identifier }}
-          JOB_STATUS: ${{ job.status }}
+      - name: Mask runner callback tokens
         run: |
-          # Fetch current labels
-          RESPONSE=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-            -H "Content-Type: application/json" \
-            -H "Authorization: $LINEAR_API_KEY" \
-            -d "{\"query\":\"{ issue(id: \\\"$ISSUE_ID\\\") { labels { nodes { id name } } } }\"}")
-
-          # Remove AI-Planning from label set
-          LABEL_IDS=$(echo "$RESPONSE" | jq -c '[.data.issue.labels.nodes[] | select(.name != "AI-Planning") | .id]')
-
-          # On success, find or create Plan-Complete and add it
-          if [ "$JOB_STATUS" = "success" ]; then
-            PLAN_COMPLETE_ID=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-              -H "Content-Type: application/json" \
-              -H "Authorization: $LINEAR_API_KEY" \
-              -d '{"query":"{ issueLabels(filter: { name: { eq: \"Plan-Complete\" } }) { nodes { id } } }"}' \
-              | jq -r '.data.issueLabels.nodes[0].id')
-
-            if [ "$PLAN_COMPLETE_ID" = "null" ] || [ -z "$PLAN_COMPLETE_ID" ]; then
-              PLAN_COMPLETE_ID=$(curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-                -H "Content-Type: application/json" \
-                -H "Authorization: $LINEAR_API_KEY" \
-                -d '{"query":"mutation { issueLabelCreate(input: { name: \"Plan-Complete\", color: \"#7c3aed\" }) { issueLabel { id } } }"}' \
-                | jq -r '.data.issueLabelCreate.issueLabel.id')
-              echo "Created 'Plan-Complete' label: $PLAN_COMPLETE_ID"
-            fi
-
-            LABEL_IDS=$(echo "$LABEL_IDS" | jq --arg id "$PLAN_COMPLETE_ID" '. + [$id] | unique')
-            echo "Adding Plan-Complete label to $ISSUE_IDENTIFIER"
+          if [ -n "${{ inputs.run_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_token }}"
+          fi
+          if [ -n "${{ inputs.run_progress_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_progress_token }}"
           fi
 
-          curl -s --max-time 30 -X POST https://api.linear.app/graphql \
-            -H "Content-Type: application/json" \
-            -H "Authorization: $LINEAR_API_KEY" \
-            --data-raw "$(jq -n \
-              --argjson ids "$LABEL_IDS" \
-              --arg issueId "$ISSUE_ID" \
-              '{query: "mutation($id: String!, $labelIds: [String!]!) { issueUpdate(id: $id, input: { labelIds: $labelIds }) { success } }", variables: {id: $issueId, labelIds: $ids}}')"
-          echo "Updated labels on $ISSUE_IDENTIFIER (status: $JOB_STATUS)"
-
-      - name: Post results to orchestrator
-        if: always()
+      - name: Run planning
         env:
-          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          RUNNER_PHASE: planning
+          AI_IMPLEMENT_RUN_CONFIG: ${{ inputs.run_config }}
+          AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RUN_TOKEN: ${{ inputs.run_token }}
-          JOB_STATUS: ${{ job.status }}
-        run: |
-          set -uo pipefail
-          if [ -z "${RUNNER_CALLBACK_URL:-}" ] || [ -z "${RUN_TOKEN:-}" ]; then
-            echo "Runner callback URL or token not provided; skipping result POST."
-            exit 0
-          fi
-
-          mkdir -p ai-output/comments
-          COMMENTS=$(jq -n '[]')
-          shopt -s nullglob
-          for f in ai-output/comments/*.md; do
-            BODY=$(jq -Rs '.' < "$f")
-            COMMENTS=$(echo "$COMMENTS" | jq --argjson body "$BODY" '. + [{"body": $body}]')
-          done
-
-          if [ "$JOB_STATUS" = "success" ]; then
-            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" \
-              '{phase: "planning", outcome: "success", comments: $comments}')
-          else
-            REASON=$(tail -c 4000 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "job failed")
-            PAYLOAD=$(jq -n --argjson comments "$COMMENTS" --arg reason "$REASON" \
-              '{phase: "planning", outcome: "failure", failureReason: $reason, comments: $comments}')
-          fi
-
-          curl -fsS --max-time 30 -X POST "${RUNNER_CALLBACK_URL%/}/runner/result" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $RUN_TOKEN" \
-            --data-raw "$PAYLOAD"
+          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
+        run: /opt/ai-implement/entrypoint.sh

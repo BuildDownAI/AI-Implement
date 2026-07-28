@@ -1,21 +1,64 @@
 import type {
   AIImplementSnapshot,
+  FeatureBranchChainEntry,
+  FeatureNodeRollUp,
   IssueLifecycleState,
   TicketIssue,
   TicketingProvider,
   ProviderConfig,
 } from "./types.js";
 import { MissingProviderConfigError } from "./types.js";
+import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
+import { isLinearAuthConfigured, withLinearToken } from "../linear-app-auth.js";
+import { parseIssueConfig } from "../issue-config.js";
 
 interface GraphQLResponse<T> {
   data?: T;
   errors?: Array<{ message: string }>;
 }
 
+const AI_IMPLEMENT_LABEL = "AI-Implement";
+
+/** How far back to scan completed feature nodes for roll-up (bounds the query). */
+const ROLLUP_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+
+/** A node in the ancestor chain: identifier + description + labels, with a nullable parent. */
+type AncestorNode = {
+  identifier: string;
+  description?: string | null;
+  labels?: { nodes: Array<{ name: string }> };
+  parent?: AncestorNode | null;
+} | null;
+
+/**
+ * Walks up the ancestor chain from `parent` while each ancestor carries the AI-Implement
+ * label, returning the contiguous run of labeled ancestors base-most first, each paired with
+ * its grouping mode.
+ *
+ * Because this issue is itself an AI-Implement child, any labeled ancestor in this run is a
+ * grouping node (it has >=1 AI-Implement child — the one below it), so the run is exactly the
+ * nest of branches this issue's PR should cascade through, and every entry can name its own
+ * branch from its identifier + mode. The walk stops at the first unlabeled ancestor (its child
+ * cuts from the base branch, not a grouping branch).
+ */
+function labeledAncestorChain(parent: AncestorNode): FeatureBranchChainEntry[] {
+  const collected: FeatureBranchChainEntry[] = [];
+  let node = parent;
+  while (node) {
+    const hasLabel = (node.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
+    if (!hasLabel) break;
+    collected.push({
+      identifier: node.identifier,
+      mode: parseIssueConfig(node.description, node.identifier).config.featureBranch.mode,
+    });
+    node = node.parent ?? null;
+  }
+  return collected.reverse();
+}
+
 export class LinearProvider implements TicketingProvider {
   readonly id = "linear";
   private static readonly MOVABLE_STATE_TYPES = new Set(["triage", "backlog", "unstarted"]);
-  private readonly apiKey: string;
   private readonly workspaceUrl: string;
 
   // Caches keyed by team key (the scopeKey passed through the interface).
@@ -25,12 +68,12 @@ export class LinearProvider implements TicketingProvider {
   private readyForReviewLabelId: string | null = null;
   private teamIdByKey = new Map<string, string>();
   private inProgressStateByTeamKey = new Map<string, string>();
+  private completedStateByTeamKey = new Map<string, string>();
 
   constructor(config: ProviderConfig) {
-    if (!config.linearApiKey) {
-      throw new MissingProviderConfigError("linear", "linearApiKey");
+    if (!isLinearAuthConfigured()) {
+      throw new MissingProviderConfigError("linear", "linearClientId/linearClientSecret");
     }
-    this.apiKey = config.linearApiKey;
     this.workspaceUrl = config.linearWorkspaceUrl ?? "https://linear.app";
   }
 
@@ -67,18 +110,24 @@ export class LinearProvider implements TicketingProvider {
     };
   }
 
+  async fetchPlanningContext(issueId: string): Promise<string> {
+    return fetchLinearPlanningContext({ issueId });
+  }
+
   private async linearMutation<T>(
     query: string,
     variables: Record<string, unknown>,
   ): Promise<T> {
-    const res = await fetch("https://api.linear.app/graphql", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: this.apiKey,
-      },
-      body: JSON.stringify({ query, variables }),
-    });
+    const res = await withLinearToken((token) =>
+      fetch("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ query, variables }),
+      }),
+    );
 
     if (!res.ok) {
       const body = await res.text();
@@ -120,6 +169,45 @@ export class LinearProvider implements TicketingProvider {
             inverseRelations(first: 50) {
               nodes { type issue { state { type } } }
             }
+            # This issue's direct children, with labels + state — drives feature-node vs.
+            # leaf classification and the "parent waits for all AI children" gate.
+            # first:50 caps the count; parents with >50 children degrade gracefully.
+            children(first: 50) {
+              nodes {
+                identifier
+                state { type }
+                labels { nodes { name } }
+              }
+            }
+            # Ancestor chain — used to build the cascading grouping-branch chain. Each level
+            # carries description so its ai-implement.yml mode can be resolved. children are NOT
+            # needed: a branch name is a function of the ancestor's identifier + mode only.
+            # Nested to a fixed depth; deeper ancestries cut from the base branch.
+            parent {
+              identifier
+              description
+              labels { nodes { name } }
+              parent {
+                identifier
+                description
+                labels { nodes { name } }
+                parent {
+                  identifier
+                  description
+                  labels { nodes { name } }
+                  parent {
+                    identifier
+                    description
+                    labels { nodes { name } }
+                    parent {
+                      identifier
+                      description
+                      labels { nodes { name } }
+                    }
+                  }
+                }
+              }
+            }
           }
           pageInfo {
             hasNextPage
@@ -128,6 +216,14 @@ export class LinearProvider implements TicketingProvider {
         }
       }
     `;
+
+    type LinearLabelNodes = { nodes: Array<{ name: string }> };
+    type LinearAncestor = {
+      identifier: string;
+      description: string | null;
+      labels: LinearLabelNodes;
+      parent: LinearAncestor | null;
+    };
 
     type LinearIssueResponse = {
       id: string;
@@ -138,6 +234,8 @@ export class LinearProvider implements TicketingProvider {
       state: { id: string; name: string; type: string };
       labels: { nodes: Array<{ id: string; name: string }> };
       inverseRelations: { nodes: Array<{ type: string; issue: { state: { type: string } } }> };
+      children: { nodes: Array<{ identifier: string; state: { type: string }; labels: LinearLabelNodes }> };
+      parent: LinearAncestor | null;
     };
 
     type IssuePage = {
@@ -170,6 +268,7 @@ export class LinearProvider implements TicketingProvider {
     const inProgressCountsByScope: Record<string, number> = {};
     const needsPlanning: AIImplementSnapshot["needsPlanning"] = [];
     const readyForImplementation: AIImplementSnapshot["readyForImplementation"] = [];
+    const parentsToFinalize: AIImplementSnapshot["parentsToFinalize"] = [];
 
     for (const issue of allNodes) {
       const labelNames = new Set(issue.labels?.nodes?.map((l) => l.name) ?? []);
@@ -196,13 +295,58 @@ export class LinearProvider implements TicketingProvider {
         continue;
       }
 
-      const ticketIssue = {
+      // Feature-branch grouping (see src/feature-branch.ts). An AI-Implement issue is one of:
+      //   - leaf (no children)            → implement now; PR targets nearest grouping-node
+      //                                      ancestor branch (or base).
+      //   - grouping node (>=1 AI child)  → its own work waits until ALL its AI-Implement
+      //                                      children reach a terminal state, then implements
+      //                                      onto its OWN branch (ai-implement/<mode>/<key>,
+      //                                      mode from ai-implement.yml, default "feature").
+      //                                      While children are in flight the parent is
+      //                                      skipped (its branch is cut lazily when the first
+      //                                      child dispatches).
+      //   - waiting parent (children but  → skipped (race guard: the parent was labeled before
+      //     none AI-Implement yet)          its children were, so let it sit).
+      const children = issue.children?.nodes ?? [];
+      const aiChildren = children.filter((c) => (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL));
+      const ancestorChain = labeledAncestorChain(issue.parent);
+      const parsed = parseIssueConfig(issue.description, issue.identifier);
+      const mode = parsed.config.featureBranch.mode;
+
+      let featureBranchChain: FeatureBranchChainEntry[] | undefined;
+      if (children.length === 0) {
+        // Leaf. Its own ai-implement.yml (if any) is irrelevant — it owns no branch.
+        featureBranchChain = ancestorChain.length > 0 ? ancestorChain : undefined;
+      } else if (aiChildren.length > 0) {
+        const allAIChildrenTerminal = aiChildren.every(
+          (c) => c.state?.type === "completed" || c.state?.type === "canceled",
+        );
+        if (!allAIChildrenTerminal) {
+          console.log(`[linear] Skipping ${issue.identifier}: ${mode} grouping parent waiting on in-flight AI-Implement children`);
+          continue;
+        }
+        // All AI-Implement children done. If the spec is empty, finalize instead of dispatching.
+        const isBlankSpec = !parsed.description || parsed.description.trim() === "";
+        if (isBlankSpec) {
+          console.log(`[linear] Finalizing empty grouping parent ${issue.identifier} (no own work)`);
+          parentsToFinalize.push({ issueId: issue.id, identifier: issue.identifier, scopeKey: issue.team.key });
+          continue;
+        }
+        featureBranchChain = [...ancestorChain, { identifier: issue.identifier, mode }];
+      } else {
+        console.log(`[linear] Skipping ${issue.identifier}: parent labeled but no child has AI-Implement set yet`);
+        continue;
+      }
+
+      const ticketIssue: TicketIssue = {
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
-        description: issue.description,
+        description: parsed.description,
         scopeKey: issue.team.key,
         nativeStatus: `${issue.state.name} (${issue.state.type})`,
+        ...(issue.parent ? { parentRef: { identifier: issue.parent.identifier } } : {}),
+        ...(featureBranchChain ? { featureBranchChain } : {}),
       };
 
       if (labelNames.has("Plan-Complete")) {
@@ -212,8 +356,75 @@ export class LinearProvider implements TicketingProvider {
       }
     }
 
-    return { needsPlanning, readyForImplementation, inProgressCountsByScope };
+    return { needsPlanning, readyForImplementation, inProgressCountsByScope, parentsToFinalize };
   }
+
+  async fetchFeatureNodeRollUps(): Promise<FeatureNodeRollUp[]> {
+    // Recently-completed AI-Implement issues that are feature nodes (>=1 AI-Implement
+    // child) need their feature branch rolled up into the parent. Bound the scan to a
+    // recent window so the set stays small; the merge-up step skips already-merged
+    // branches cheaply via a branch comparison. A completed feature node implies its
+    // own closing work merged and all its children done.
+    const since = new Date(Date.now() - ROLLUP_LOOKBACK_MS).toISOString();
+    const data = await this.linearMutation<{
+      issues: {
+        nodes: Array<{
+          id: string;
+          identifier: string;
+          description: string | null;
+          team: { key: string };
+          children: { nodes: Array<{ identifier: string; labels: { nodes: Array<{ name: string }> } }> };
+          parent: { identifier: string; description: string | null; labels: { nodes: Array<{ name: string }> } } | null;
+        }>;
+      };
+    }>(
+      `query($since: DateTimeOrDuration!) {
+        issues(
+          first: 100
+          filter: {
+            labels: { name: { eq: "AI-Implement" } }
+            state: { type: { eq: "completed" } }
+            updatedAt: { gt: $since }
+          }
+        ) {
+          nodes {
+            id
+            identifier
+            description
+            team { key }
+            children(first: 50) { nodes { identifier labels { nodes { name } } } }
+            parent { identifier description labels { nodes { name } } }
+          }
+        }
+      }`,
+      { since },
+    );
+
+    const rollUps: FeatureNodeRollUp[] = [];
+    for (const node of data.issues?.nodes ?? []) {
+      const aiChildren = (node.children?.nodes ?? []).filter((c) =>
+        (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
+      );
+      if (aiChildren.length === 0) continue;
+      const parentIsFeatureNode =
+        !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
+      rollUps.push({
+        issueId: node.id,
+        identifier: node.identifier,
+        scopeKey: node.team.key,
+        mode: parseIssueConfig(node.description, node.identifier).config.featureBranch.mode,
+        parent: parentIsFeatureNode
+          ? {
+              identifier: node.parent!.identifier,
+              mode: parseIssueConfig(node.parent!.description, node.parent!.identifier).config.featureBranch.mode,
+            }
+          : null,
+        childIdentifiers: aiChildren.map((c) => c.identifier),
+      });
+    }
+    return rollUps;
+  }
+
   async fetchLifecycleStates(issueIds: string[]): Promise<Map<string, IssueLifecycleState>> {
     if (issueIds.length === 0) return new Map();
     const data = await this.linearMutation<{ issues: { nodes: Array<{ id: string; state: { type: string } }> } }>(
@@ -263,10 +474,9 @@ export class LinearProvider implements TicketingProvider {
 
     // Search case-insensitively across the workspace: Linear's uniqueness check
     // on issueLabelCreate is case-insensitive and treats a workspace-level label
-    // as conflicting with a team-level label of the same name. A strict
-    // case-sensitive, team-scoped search misses both cases and the create then
-    // fails with "duplicate label name". Prefer the team-scoped match if one
-    // exists, otherwise fall back to any workspace label with the same name.
+    // as conflicting with a team-level label of the same name. Prefer the
+    // requested team's label, otherwise reuse only a workspace-level label. A
+    // label scoped to a different team cannot be applied to this issue.
     const searchData = await this.linearMutation<{
       issueLabels: {
         nodes: Array<{ id: string; team: { id: string } | null }>;
@@ -282,10 +492,11 @@ export class LinearProvider implements TicketingProvider {
     const teamMatch = searchData.issueLabels.nodes.find(
       (n) => n.team?.id === teamId,
     );
-    const anyMatch = teamMatch ?? searchData.issueLabels.nodes[0];
-    if (anyMatch) {
-      cache.set(teamKey, anyMatch.id);
-      return anyMatch.id;
+    const workspaceMatch = searchData.issueLabels.nodes.find((n) => n.team === null || n.team === undefined);
+    const reusableMatch = teamMatch ?? workspaceMatch;
+    if (reusableMatch) {
+      cache.set(teamKey, reusableMatch.id);
+      return reusableMatch.id;
     }
 
     const createData = await this.linearMutation<{
@@ -359,6 +570,30 @@ export class LinearProvider implements TicketingProvider {
       throw new Error(`No "started" workflow state found for team ${teamId}`);
     }
     this.inProgressStateByTeamKey.set(teamKey, state.id);
+    return state.id;
+  }
+
+  private async getCompletedStateId(teamKey: string): Promise<string> {
+    const cached = this.completedStateByTeamKey.get(teamKey);
+    if (cached) return cached;
+    const teamId = await this.getTeamIdByKey(teamKey);
+    const data = await this.linearMutation<{
+      workflowStates: { nodes: Array<{ id: string; name: string; type: string }> };
+    }>(
+      `query($teamId: ID!) {
+        workflowStates(filter: { team: { id: { eq: $teamId } }, type: { eq: "completed" } }) {
+          nodes { id name type }
+        }
+      }`,
+      { teamId },
+    );
+    const state =
+      data.workflowStates.nodes.find((s) => s.name.toLowerCase() === "done") ??
+      data.workflowStates.nodes[0];
+    if (!state) {
+      throw new Error(`No "completed" workflow state found for team ${teamId}`);
+    }
+    this.completedStateByTeamKey.set(teamKey, state.id);
     return state.id;
   }
 
@@ -446,18 +681,19 @@ export class LinearProvider implements TicketingProvider {
 
   // ---------- lifecycle verbs ----------
 
-  async markPlanningStarted(issueId: string, scopeKey: string): Promise<void> {
+  async markPlanningStarted(issueId: string, _scopeKey: string): Promise<void> {
+    const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(
-      scopeKey,
+      teamKey,
       "AI-Planning",
       "#8B5CF6",
       this.aiPlanningLabelCache,
     );
     await this.addLabelToIssue(issueId, labelId);
-    await this.transitionToInProgressIfMovable(issueId, scopeKey);
+    await this.transitionToInProgressIfMovable(issueId, teamKey);
   }
 
-  async markPlanComplete(issueId: string): Promise<void> {
+  async markPlanComplete(issueId: string, _scopeKey: string): Promise<void> {
     await this.removeLabelByName(issueId, "AI-Planning");
     const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(
@@ -469,23 +705,24 @@ export class LinearProvider implements TicketingProvider {
     await this.addLabelToIssue(issueId, labelId);
   }
 
-  async markPlanningFailed(issueId: string, reason: string): Promise<void> {
+  async markPlanningFailed(issueId: string, _scopeKey: string, reason: string): Promise<void> {
     await this.removeLabelByName(issueId, "AI-Planning");
     await this.postComment(issueId, `⚠️ Planning failed: ${reason}`);
   }
 
-  async markImplementing(issueId: string, scopeKey: string): Promise<void> {
+  async markImplementing(issueId: string, _scopeKey: string): Promise<void> {
+    const teamKey = await this.getTeamKeyForIssue(issueId);
     const labelId = await this.ensureTeamLabel(
-      scopeKey,
+      teamKey,
       "AI-Working",
       "#F59E0B",
       this.aiWorkingLabelCache,
     );
     await this.addLabelToIssue(issueId, labelId);
-    await this.transitionToInProgressIfMovable(issueId, scopeKey);
+    await this.transitionToInProgressIfMovable(issueId, teamKey);
   }
 
-  async markPrReady(issueId: string, prUrl: string): Promise<void> {
+  async markPrReady(issueId: string, _scopeKey: string, prUrl: string): Promise<void> {
     const readyLabelId = await this.ensureWorkspaceReadyForReviewLabel();
 
     // Atomic label swap: remove AI-Working, add Ready for Review in a single
@@ -520,13 +757,48 @@ export class LinearProvider implements TicketingProvider {
     await this.postComment(issueId, `AI implementation PR: ${prUrl}`);
   }
 
-  async markImplementationFailed(issueId: string, reason: string): Promise<void> {
+  async markMerged(issueId: string, _scopeKey: string): Promise<void> {
+    const data = await this.linearMutation<{
+      issue: {
+        state: { type: string };
+        team: { key: string };
+        labels: { nodes: Array<{ id: string; name: string }> };
+      } | null;
+    }>(
+      `query($id: String!) {
+        issue(id: $id) {
+          state { type }
+          team { key }
+          labels { nodes { id name } }
+        }
+      }`,
+      { id: issueId },
+    );
+    const issue = data.issue;
+    if (!issue) return;
+    if (issue.state.type === "completed" || issue.state.type === "canceled") return;
+    const stateId = await this.getCompletedStateId(issue.team.key);
+    const labelIds = issue.labels.nodes
+      .filter((l) => l.name !== "Ready for Review")
+      .map((l) => l.id);
+    await this.linearMutation<{ issueUpdate: { success: boolean } }>(
+      `mutation($issueId: String!, $stateId: String!, $labelIds: [String!]!) {
+        issueUpdate(id: $issueId, input: { stateId: $stateId, labelIds: $labelIds }) {
+          success
+        }
+      }`,
+      { issueId, stateId, labelIds },
+    );
+  }
+
+  async markImplementationFailed(issueId: string, _scopeKey: string, reason: string): Promise<void> {
     await this.removeLabelByName(issueId, "AI-Working");
     await this.postComment(issueId, `⚠️ Implementation failed: ${reason}`);
   }
 
-  async clearWorkingState(issueId: string): Promise<void> {
+  async clearWorkingState(issueId: string, _scopeKey: string): Promise<void> {
     await this.removeLabelByName(issueId, "AI-Working");
+    await this.removeLabelByName(issueId, "AI-Planning");
   }
   async postComment(issueId: string, body: string): Promise<void> {
     const query = `

@@ -5,8 +5,28 @@ export const pipelinesHtml = `
       <h1 class="page-title">Pipelines</h1>
       <div class="page-subtitle">Recent dispatches — running pipelines appear at the top</div>
     </div>
-    <div class="page-header-actions">
-      <button class="btn btn-sm" onclick="loadLog()">&#8635; Refresh</button>
+    <div class="page-header-actions" style="display:flex;align-items:stretch;gap:8px;flex-wrap:wrap">
+      <fieldset style="border:1px solid var(--border);border-radius:6px;padding:2px 10px 6px;margin:0;display:flex;align-items:center;gap:6px">
+        <legend style="font-size:0.7em;color:var(--fg-tertiary);padding:0 4px;margin-left:2px">Time Filter</legend>
+        <select id="log-time-type" class="select" style="width:auto;height:30px" onchange="onTimeTypeChange()">
+          <option value="relative">Relative</option>
+          <option value="range">Time range</option>
+        </select>
+        <div id="log-rel-controls" style="display:flex;align-items:center;gap:4px">
+          <input id="log-rel-n" type="number" class="input" style="width:58px;height:30px;padding:0 7px" min="1" max="999" value="7" onchange="loadLog()">
+          <select id="log-rel-unit" class="select" style="width:auto;height:30px" onchange="loadLog()">
+            <option value="h">h</option>
+            <option value="d" selected>d</option>
+            <option value="w">w</option>
+          </select>
+        </div>
+        <div id="log-range-controls" style="display:none;align-items:center;gap:4px">
+          <input id="log-range-start" type="datetime-local" class="input" style="width:175px;height:30px;padding:0 7px" onchange="loadLog()">
+          <span style="color:var(--fg-tertiary)">&#8594;</span>
+          <input id="log-range-end" type="datetime-local" class="input" style="width:175px;height:30px;padding:0 7px" onchange="loadLog()">
+        </div>
+      </fieldset>
+      <button class="btn btn-sm" onclick="loadLog()" style="height:30px;align-self:flex-end;padding:0 12px;margin-bottom:6px">&#8635; Refresh</button>
     </div>
   </header>
   <div class="page-body">
@@ -34,17 +54,71 @@ export const pipelinesScript = `
     if (el) el.textContent = 'updated ' + new Date().toLocaleTimeString();
   }
 
+  function getTimeFilter() {
+    const type = document.getElementById('log-time-type').value;
+    if (type === 'relative') {
+      const n = parseInt(document.getElementById('log-rel-n').value, 10) || 7;
+      const unit = document.getElementById('log-rel-unit').value;
+      const ms = { h: 3600000, d: 86400000, w: 604800000 };
+      return '?since=' + (Date.now() - n * (ms[unit] || ms.d));
+    }
+    const start = document.getElementById('log-range-start').value;
+    const end   = document.getElementById('log-range-end').value;
+    const parts = [];
+    if (start) parts.push('since=' + new Date(start).getTime());
+    if (end)   parts.push('until=' + new Date(end).getTime());
+    return parts.length ? '?' + parts.join('&') : '';
+  }
+
+  function getFilterLabel() {
+    const type = document.getElementById('log-time-type').value;
+    if (type === 'relative') {
+      const n = parseInt(document.getElementById('log-rel-n').value, 10) || 7;
+      const unit = document.getElementById('log-rel-unit').value;
+      return 'last ' + n + unit;
+    }
+    const start = document.getElementById('log-range-start').value;
+    const end   = document.getElementById('log-range-end').value;
+    if (start && end) return new Date(start).toLocaleDateString() + ' → ' + new Date(end).toLocaleDateString();
+    if (start)        return 'from ' + new Date(start).toLocaleDateString();
+    if (end)          return 'until ' + new Date(end).toLocaleDateString();
+    return 'all time';
+  }
+
+  let _logRefreshInterval = null;
+
+  function startLogAutoRefresh() {
+    if (_logRefreshInterval) return;
+    _logRefreshInterval = setInterval(function () { loadLog(); }, 15000);
+  }
+
+  function stopLogAutoRefresh() {
+    if (_logRefreshInterval) { clearInterval(_logRefreshInterval); _logRefreshInterval = null; }
+  }
+
+  function onTimeTypeChange() {
+    const rel   = document.getElementById('log-rel-controls');
+    const range = document.getElementById('log-range-controls');
+    const isRange = document.getElementById('log-time-type').value === 'range';
+    rel.style.display   = isRange ? 'none' : 'flex';
+    range.style.display = isRange ? 'flex' : 'none';
+    if (isRange) { stopLogAutoRefresh(); } else { startLogAutoRefresh(); }
+    loadLog();
+  }
+  window.onTimeTypeChange = onTimeTypeChange;
+
   async function loadLog() {
     try {
-      const res = await window.api('/api/log');
+      const res = await window.api('/api/log' + getTimeFilter());
       const data = await res.json();
       const tbody = document.getElementById('log-body');
       const empty = document.getElementById('log-empty');
       const countEl = document.getElementById('log-count');
       tbody.innerHTML = '';
       if (data.length === 0) {
+        empty.textContent = 'No jobs in the selected time range';
         empty.classList.remove('hidden');
-        if (countEl) countEl.textContent = '0 jobs';
+        if (countEl) countEl.textContent = '0 jobs · ' + getFilterLabel();
         setLastUpdated('lu-log');
         return;
       }
@@ -57,6 +131,7 @@ export const pipelinesScript = `
         completed: 'success',
         review_failed: 'warn',
         failed: 'fail',
+        'dispatch-failed': 'fail',
         timed_out: 'warn'
       };
 
@@ -68,10 +143,14 @@ export const pipelinesScript = `
         return makeBadge(statusClass[status] || 'neutral', label);
       }
       function execBadge(mode, runnerMode) {
-        const short = mode === 'fly-machines' ? 'fly' : mode === 'planning' ? 'plan' : 'gha';
+        const short = mode === 'fly-machines' ? 'fly' : 'gha';
         const cls = short === 'fly' ? 'info' : 'neutral';
         return makeBadge(cls, short)
-          + (short !== 'plan' && runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
+          + (runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
+      }
+      function phaseBadge(phase) {
+        const p = phase === 'planning' ? 'plan' : 'impl';
+        return makeBadge(p === 'plan' ? 'info' : 'neutral', p);
       }
 
       // Group planning + implement phases that belong to the same job:
@@ -81,12 +160,12 @@ export const pipelinesScript = `
       for (let i = 0; i < data.length; i++) {
         if (consumed.has(i)) continue;
         const e = data[i];
-        if (e.executionMode !== 'planning') {
+        if (e.phase !== 'planning') {
           const dn = e.dispatchNumber || 1;
           const planIdx = data.findIndex(function (p, j) {
             return !consumed.has(j) && j !== i &&
               p.issueId === e.issueId &&
-              p.executionMode === 'planning' &&
+              p.phase === 'planning' &&
               (p.dispatchNumber || 1) === dn - 1;
           });
           if (planIdx !== -1) {
@@ -100,7 +179,7 @@ export const pipelinesScript = `
         consumed.add(i);
       }
 
-      if (countEl) countEl.textContent = grouped.length + ' job' + (grouped.length === 1 ? '' : 's');
+      if (countEl) countEl.textContent = grouped.length + ' job' + (grouped.length === 1 ? '' : 's') + ' · ' + getFilterLabel();
 
       for (const item of grouped) {
         const tr = document.createElement('tr');
@@ -116,11 +195,16 @@ export const pipelinesScript = `
           const dnBadge = isRedispatch
             ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn2 + '</span>'
             : '' + dn2;
-          const runnerCell = execBadge('planning') + ' <span style="color:#aaa">→</span> ' + execBadge(impl.executionMode, impl.runnerMode);
+          const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:#aaa">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
           const imageCell = impl.sessionImage
             ? '<td class="mono" title="' + window.esc(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
-          const combinedStatus = statusBadge(plan.status) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status);
+          // A grouped row exists only when an implement dispatch followed this plan,
+          // which requires plan approval — so a plan row stranded in a non-terminal
+          // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
+          const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
+            ? 'completed' : plan.status;
+          const combinedStatus = statusBadge(planStatus) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status);
           const prLink = impl.prUrl ? '<a href="' + window.esc(impl.prUrl) + '" target="_blank">View</a>' : '—';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
@@ -142,7 +226,7 @@ export const pipelinesScript = `
           const dnBadge = isRedispatch
             ? '<span style="color:#d63384;font-weight:bold" title="Re-dispatch">' + dn3 + '</span>'
             : '' + dn3;
-          const runnerCell = execBadge(entry.executionMode, entry.runnerMode);
+          const runnerCell = phaseBadge(entry.phase) + ' ' + execBadge(entry.executionMode, entry.runnerMode);
           const imageCell = entry.sessionImage
             ? '<td class="mono" title="' + window.esc(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
@@ -183,7 +267,7 @@ export const pipelinesScript = `
   window.registerPage('jobs', function () {
     loadLog();
     wireRowClicks();
-    setInterval(function () { loadLog(); }, 15000);
+    startLogAutoRefresh();
   });
 })();
 `;

@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RepoMapping } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
+import { GitHubApiError } from "./github-errors.js";
 
 const GH_HEADERS = {
   Accept: "application/vnd.github+json",
@@ -17,14 +18,16 @@ const ALWAYS_SYNC_FILES = [
     message: "Sync claude-implement.yml from ai-implement",
   },
   {
-    local: "workflows/comment-trigger.yml",
-    remote: ".github/workflows/comment-trigger.yml",
-    message: "Sync comment-trigger.yml from ai-implement",
-  },
-  {
     local: "workflows/claude-plan.yml",
     remote: ".github/workflows/claude-plan.yml",
     message: "Sync claude-plan.yml from ai-implement",
+  },
+] as const;
+
+const REMOVE_FILES = [
+  {
+    remote: ".github/workflows/comment-trigger.yml",
+    message: "Remove comment-trigger.yml — /ai-implement is now handled by the orchestrator",
   },
 ] as const;
 
@@ -64,6 +67,64 @@ export interface WorkflowSyncResult {
   prUrl: string | null;
 }
 
+// ── Error classification ──────────────────────────────────────────────────
+// Sync can fail at several points, each throwing a differently-shaped Error.
+// classifySyncError() funnels them into a small set of user-facing categories so the admin UI can
+// show actionable guidance instead of a raw "GitHub 403 /repos/...: {...}" dump.
+// Reused by BOTH the auto-sync-on-save path and the manual /sync-workflows endpoint.
+
+export type SyncErrorCategory =
+  | "app-not-installed"
+  | "repo-not-found"
+  | "permission-denied"
+  | "clock-skew-suspected"
+  | "unknown";
+
+export interface ClassifiedSyncError {
+  category: SyncErrorCategory;
+  message: string;
+}
+
+const SYNC_ERROR_MESSAGES: Record<Exclude<SyncErrorCategory, "unknown">, string> = {
+  "app-not-installed":
+    "The GitHub App is not installed on the target repository's owner. Install it on the target repo, then re-save or click Sync workflows.",
+  "repo-not-found":
+    "The target repository was not found, or the GitHub App cannot see it. Check the owner/repo and that the App is installed there.",
+  "permission-denied":
+    "The GitHub App lacks the permissions needed to sync. It needs Contents, Pull requests, and Workflows write access on the target repo.",
+  "clock-skew-suspected":
+    "GitHub rejected the App credentials (401). If the App is installed, check the orchestrator host clock — a clock running ahead of GitHub invalidates the App token.",
+};
+
+export function classifySyncError(err: unknown): ClassifiedSyncError {
+  if (err instanceof GitHubApiError) {
+    // 401 first: a bad/expired App JWT is rejected at GitHub's auth layer regardless of endpoint,
+    // so catch every 401 here before the 404 "not installed" check.
+    // Host clock skew is the usual cause — the JWT tolerates ±300s of drift (AII-199), so a 401 implies drift beyond that or bad credentials.
+    if (err.status === 401) return classify("clock-skew-suspected", err.message);
+    if (err.status === 403) return classify("permission-denied", err.message); // incl. missing `workflows` perm on .github/workflows PUT
+    
+    // Same status, different meaning by endpoint — disambiguate on the path.
+    if (err.status === 404 && err.path) {
+      if (/\/installation$/.test(err.path)) return classify("app-not-installed", err.message);
+      // Matches ONLY the bare-repo existence probe (`/repos/owner/repo`, the first repo call in syncWorkflowTemplates).
+      // Intentionally narrow: deeper 404s (e.g. a missing base branch at /repos/owner/repo/git/ref/heads/...) are not "repo not found" and correctly fall to unknown.
+      if (/^\/repos\/[^/]+\/[^/]+$/.test(err.path)) return classify("repo-not-found", err.message);
+    }
+    // A typed GitHub error whose status we don't categorize.
+    // Kept separate from the final catch-all (which handles non-GitHubApiError throws) so the two "unknown" cases can diverge later without silently affecting each other
+    return classify("unknown", err.message);
+  }
+  return classify("unknown", err instanceof Error ? err.message : String(err));
+}
+
+function classify(category: SyncErrorCategory, raw: string): ClassifiedSyncError {
+  return {
+    category,
+    message: category === "unknown" ? raw : SYNC_ERROR_MESSAGES[category],
+  };
+}
+
 interface RemoteFile {
   sha: string;
   content: string;
@@ -96,7 +157,7 @@ class GitHubClient {
     });
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`GitHub ${res.status} ${path}: ${text.slice(0, 500)}`);
+      throw new GitHubApiError({ status: res.status, path, bodyText: text });
     }
     if (res.status === 204) return undefined as T;
     return await res.json() as T;
@@ -114,11 +175,16 @@ class GitHubClient {
     if (res.status === 404) return null;
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`GitHub ${res.status} ${path}: ${text.slice(0, 500)}`);
+      throw new GitHubApiError({ status: res.status, path, bodyText: text });
     }
     if (res.status === 204) return undefined as T;
     return await res.json() as T;
   }
+}
+
+function buildSyncBranchName(prefix: string | null | undefined): string {
+  const cleaned = (prefix ?? "").trim().replace(/^\/+|\/+$/g, "");
+  return cleaned ? `${cleaned}/sync/ai-implement` : "sync/ai-implement";
 }
 
 function repoPath(mapping: RepoMapping): string {
@@ -226,9 +292,19 @@ async function ensureSyncBranch(params: {
   syncBranch: string;
 }): Promise<void> {
   const { gh, repo, baseBranch, syncBranch } = params;
-  const base = await gh.request<{ object: { sha: string } }>(
+  const base = await gh.maybeRequest<{ object: { sha: string } }>(
     `/repos/${repo}/git/ref/heads/${encodeRefPath(baseBranch)}`,
   );
+  if (!base) {
+    // Deliberately a plain Error, not a GitHubApiError: classifySyncError passes an
+    // unknown error's raw message through verbatim, so this descriptive text is exactly
+    // what the admin UI shows instead of an opaque "GitHub 404 /repos/.../git/ref/..." dump.
+    throw new Error(
+      `Base branch "${baseBranch}" does not exist in ${repo}. ` +
+        `The repository may be empty (no commits yet) or the configured branch name is wrong. ` +
+        `Push an initial commit or correct the branch name in the project settings.`,
+    );
+  }
   const syncRef = await gh.maybeRequest<{ object: { sha: string } }>(
     `/repos/${repo}/git/ref/heads/${encodeRefPath(syncBranch)}`,
   );
@@ -241,17 +317,20 @@ async function ensureSyncBranch(params: {
     return;
   }
 
-  const compare = await gh.maybeRequest<{ ahead_by: number }>(
-    `/repos/${repo}/compare/${encodeRefPath(baseBranch)}...${encodeRefPath(syncBranch)}`,
-  );
-  if ((compare?.ahead_by ?? 0) === 0) {
-    await gh.request(`/repos/${repo}/git/refs/heads/${encodeRefPath(syncBranch)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ sha: base.object.sha, force: true }),
-    });
-  }
+  // The sync branch is orchestrator-owned and disposable: always force-reset it to the
+  // current base so each re-sync produces a clean diff (base + freshly regenerated
+  // templates) and never layers onto stale state from a prior sync PR — whether that
+  // branch is ahead of, behind, or lingering after a merge.
+  await gh.request(`/repos/${repo}/git/refs/heads/${encodeRefPath(syncBranch)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ sha: base.object.sha, force: true }),
+  });
 }
 
+// NOTE: this matches only the CURRENT sync branch name. If a project's branchPrefix
+// changes (e.g. "pr" -> none, or "pr" -> "client/pr"), a sync PR previously opened on
+// the old branch name will not be found here and remains open; it must be closed
+// manually. Re-syncing always operates on the branch for the mapping's current prefix.
 async function findSyncPr(
   gh: GitHubClient,
   repo: string,
@@ -272,6 +351,9 @@ function syncPrBody(): string {
     "",
     "**Added once (never overwritten):**",
     ...SEED_ONCE_FILES.map((file) => `- \`${file.remote}\` — ${file.description}`),
+    "",
+    "**Removed:**",
+    ...REMOVE_FILES.map((file) => `- \`${file.remote}\``),
   ].join("\n");
 }
 
@@ -311,7 +393,7 @@ export async function syncWorkflowTemplates(
 ): Promise<WorkflowSyncResult> {
   const mapping = options.mapping;
   const targetRepo = repoPath(mapping);
-  const syncBranch = options.syncBranch ?? "sync/ai-implement";
+  const syncBranch = options.syncBranch ?? buildSyncBranchName(mapping.branchPrefix);
   const templatesRoot = options.templatesRoot ?? packageRoot();
   const getToken = options.getInstallationTokenImpl ?? getInstallationToken;
   const token = await getToken(options.githubAppId, options.githubAppPrivateKey, mapping.owner);
@@ -351,6 +433,17 @@ export async function syncWorkflowTemplates(
       message: file.message,
     });
     if (changed) changedFiles.push(file.remote);
+  }
+
+  for (const file of REMOVE_FILES) {
+    const remote = await getRemoteFile(gh, targetRepo, file.remote, syncBranch);
+    if (remote) {
+      await gh.request(`/repos/${targetRepo}/contents/${encodeRepoPath(file.remote)}`, {
+        method: "DELETE",
+        body: JSON.stringify({ message: file.message, sha: remote.sha, branch: syncBranch }),
+      });
+      changedFiles.push(file.remote);
+    }
   }
 
   const existingPr = await findSyncPr(gh, targetRepo, syncBranch);

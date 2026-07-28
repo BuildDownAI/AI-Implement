@@ -9,7 +9,8 @@ export type JobStatus =
   | "completed"
   | "review_failed"
   | "failed"
-  | "timed_out";
+  | "timed_out"
+  | "dispatch-failed";
 
 export interface Job {
   id: number;
@@ -19,6 +20,7 @@ export interface Job {
   teamKey: string | null;
   repo: string | null;
   dispatchedAt: number;
+  dispatchId: string | null;
   dispatchNumber: number;
   issueState: string | null;
   runId: number | null;
@@ -32,13 +34,16 @@ export interface Job {
   machineId: string | null;
   runnerMode: string | null;
   sessionImage: string | null;
+  phase: string;
+  contract: string | null;
 }
 
 // Keep old name exported for backwards compat with admin.ts
 export type LogEntry = Job;
 
 export function initLogTable(): void {
-  getDb().exec(`
+  const db = getDb();
+  db.exec(`
     CREATE TABLE IF NOT EXISTS dispatch_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       issue_id TEXT NOT NULL,
@@ -49,6 +54,13 @@ export function initLogTable(): void {
       dispatched_at INTEGER NOT NULL,
       dispatch_number INTEGER NOT NULL DEFAULT 1,
       issue_state TEXT
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stuck_attempts (
+      issue_id TEXT PRIMARY KEY,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at INTEGER
     )
   `);
   ensureLogColumns();
@@ -66,6 +78,10 @@ function ensureLogColumns(): void {
   }
   if (!names.has("run_id")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN run_id INTEGER");
+  }
+  if (!names.has("dispatch_id")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN dispatch_id TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_dispatch_id ON dispatch_log(dispatch_id)");
   }
   if (!names.has("status")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN status TEXT NOT NULL DEFAULT 'unknown'");
@@ -97,6 +113,15 @@ function ensureLogColumns(): void {
   if (!names.has("session_image")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN session_image TEXT");
   }
+  if (!names.has("phase")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN phase TEXT NOT NULL DEFAULT 'implementation'");
+  }
+  if (!names.has("contract")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN contract TEXT");
+  }
+  if (!names.has("trigger")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN trigger TEXT");
+  }
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -123,18 +148,26 @@ export function appendLog(entry: {
   teamKey?: string;
   repo?: string;
   issueState?: string;
+  dispatchId?: string;
   dispatchNumber?: number;
   machineNonce?: string;
   executionMode?: string;
   machineId?: string;
   runnerMode?: string;
   sessionImage?: string | null;
+  phase?: string;
+  /** Override the default 'dispatched' status (e.g. 'dispatch-failed'). */
+  status?: JobStatus;
+  /** Dispatch contract mode recorded for observability. */
+  contract?: "legacy" | "envelope";
+  /** Trigger source: 'comment' for orchestrator-mediated /ai-implement runs, null = orchestrator-initiated. */
+  trigger?: string;
 }): number {
   const db = getDb();
-  const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId).count + 1;
+  const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -142,13 +175,18 @@ export function appendLog(entry: {
     entry.teamKey ?? null,
     entry.repo ?? null,
     Date.now(),
+    entry.dispatchId ?? null,
     dispatchNumber,
     entry.issueState ?? null,
+    entry.status ?? "dispatched",
     entry.machineNonce ?? null,
     entry.executionMode ?? "github-actions",
     entry.machineId ?? null,
     entry.runnerMode ?? null,
     entry.sessionImage ?? null,
+    entry.phase ?? "implementation",
+    entry.contract ?? null,
+    entry.trigger ?? null,
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows
@@ -167,9 +205,17 @@ export function getClaimedRunIds(): Set<number> {
   return new Set(rows.map((r) => r.run_id));
 }
 
-export function countPriorDispatches(issueId: string): { count: number; lastDispatchedAt: number | null } {
+/**
+ * Counts prior dispatches for an issue. When `phase` is given, only the
+ * matching phase family is counted: planning dispatches number independently
+ * from work dispatches (implementation + gap-analysis), so the routine
+ * planning→implementation handoff is attempt #1, not a "re-dispatch #2".
+ */
+export function countPriorDispatches(issueId: string, phase?: string): { count: number; lastDispatchedAt: number | null } {
+  const phaseClause =
+    phase === undefined ? "" : phase === "planning" ? " AND phase = 'planning'" : " AND phase != 'planning'";
   const row = getDb()
-    .prepare("SELECT COUNT(*) as count, MAX(dispatched_at) as last_at FROM dispatch_log WHERE issue_id = ?")
+    .prepare(`SELECT COUNT(*) as count, MAX(dispatched_at) as last_at FROM dispatch_log WHERE issue_id = ?${phaseClause}`)
     .get(issueId) as { count: number; last_at: number | null };
   return { count: row.count, lastDispatchedAt: row.last_at };
 }
@@ -186,10 +232,13 @@ export function updateJobStatus(
   conclusion?: string | null,
   prUrl?: string | null,
 ): void {
-  const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out";
+  const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out" || status === "dispatch-failed";
+  // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
+  // caller has none — the GHA monitor often can't resolve a PR for dispatch runs and
+  // must not wipe the link on completion.
   getDb()
     .prepare(
-      "UPDATE dispatch_log SET status = ?, conclusion = ?, pr_url = ?, completed_at = ? WHERE id = ?",
+      "UPDATE dispatch_log SET status = ?, conclusion = ?, pr_url = COALESCE(?, pr_url), completed_at = ? WHERE id = ?",
     )
     .run(
       status,
@@ -198,6 +247,23 @@ export function updateJobStatus(
       isTerminal ? Date.now() : null,
       jobId,
     );
+}
+
+/**
+ * Finalizes planning jobs left in 'unknown' (the boot-time reset for GHA jobs whose
+ * run was never attached — e.g. the orchestrator restarted mid-run). Called when the
+ * same issue's IMPLEMENTATION phase dispatches: implementation only follows plan
+ * approval, so any still-'unknown' planning row demonstrably finished. Jobs the
+ * monitor still tracks ('dispatched'/'running') are left alone — the monitor will
+ * record their real outcome. Returns the number of rows finalized.
+ */
+export function completeOrphanedPlanningJobs(issueId: string): number {
+  const result = getDb()
+    .prepare(
+      "UPDATE dispatch_log SET status = 'completed', conclusion = COALESCE(conclusion, 'inferred_from_plan_approval'), completed_at = COALESCE(completed_at, ?) WHERE issue_id = ? AND phase = 'planning' AND status = 'unknown'",
+    )
+    .run(Date.now(), issueId);
+  return result.changes;
 }
 
 export function markJobNotified(jobId: number): void {
@@ -232,6 +298,15 @@ export function getInFlightJobs(): Job[] {
   );
 }
 
+export function getInFlightIssueIds(): Set<string> {
+  const rows = getDb()
+    .prepare(
+      "SELECT DISTINCT issue_id FROM dispatch_log WHERE status IN ('dispatched', 'running')",
+    )
+    .all() as Array<{ issue_id: string }>;
+  return new Set(rows.map((row) => row.issue_id));
+}
+
 /** Returns jobs that reached a terminal state but haven't been notified yet. */
 export function getUnnotifiedTerminalJobs(): Job[] {
   return mapRows(
@@ -243,14 +318,54 @@ export function getUnnotifiedTerminalJobs(): Job[] {
   );
 }
 
-export function listLog(limit = 100): Job[] {
+export function listLog(opts: { since?: number; until?: number; limit?: number } = {}): Job[] {
+  const { since, until } = opts;
+  // When a time filter is present, default to the full retained window so a
+  // range query isn't silently truncated to the newest 100 rows.
+  const limit = opts.limit ?? (since !== undefined || until !== undefined ? MAX_LOG_ENTRIES : 100);
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  if (since !== undefined) { conditions.push("dispatched_at >= ?"); params.push(since); }
+  if (until !== undefined) { conditions.push("dispatched_at <= ?"); params.push(until); }
+  const where = conditions.length ? " WHERE " + conditions.join(" AND ") : "";
+  params.push(limit);
   return mapRows(
     getDb()
-      .prepare(
-        "SELECT * FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?",
-      )
-      .all(limit) as RawRow[],
+      .prepare("SELECT * FROM dispatch_log" + where + " ORDER BY dispatched_at DESC LIMIT ?")
+      .all(...params) as RawRow[],
   );
+}
+
+export function getJobByDispatchId(dispatchId: string): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE dispatch_id = ? ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    )
+    .get(dispatchId) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
+export function updateJobPrUrl(jobId: number, prUrl: string): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET pr_url = ? WHERE id = ?")
+    .run(prUrl, jobId);
+}
+
+/**
+ * Returns the most recent dispatch log entry for a given PR.
+ * Used to recover issue metadata for orchestrator-mediated comment gap-fills.
+ */
+export function getLatestDispatchForPr(owner: string, repo: string, prNumber: number): Job | null {
+  const fullRepo = `${owner}/${repo}`;
+  const prUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}`;
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE repo = ? AND pr_url = ? ORDER BY dispatched_at DESC LIMIT 1",
+    )
+    .get(fullRepo, prUrl) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
 }
 
 interface RawRow {
@@ -261,6 +376,7 @@ interface RawRow {
   team_key: string | null;
   repo: string | null;
   dispatched_at: number;
+  dispatch_id: string | null;
   dispatch_number: number;
   issue_state: string | null;
   run_id: number | null;
@@ -274,6 +390,9 @@ interface RawRow {
   machine_id: string | null;
   runner_mode: string | null;
   session_image: string | null;
+  phase: string | null;
+  contract: string | null;
+  trigger: string | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -285,6 +404,7 @@ function mapRows(rows: RawRow[]): Job[] {
     teamKey: row.team_key,
     repo: row.repo,
     dispatchedAt: row.dispatched_at,
+    dispatchId: row.dispatch_id ?? null,
     dispatchNumber: row.dispatch_number ?? 1,
     issueState: row.issue_state ?? null,
     runId: row.run_id ?? null,
@@ -298,6 +418,8 @@ function mapRows(rows: RawRow[]): Job[] {
     machineId: row.machine_id ?? null,
     runnerMode: row.runner_mode ?? null,
     sessionImage: (row.session_image as string | null) ?? null,
+    phase: row.phase ?? "implementation",
+    contract: row.contract ?? null,
   }));
 }
 
@@ -315,7 +437,7 @@ export interface PullSummary {
 }
 
 export function getPulls(): PullSummary[] {
-  const rows = listLog(500).filter((j) => j.prUrl);
+  const rows = listLog({ limit: 500 }).filter((j) => j.prUrl);
   const byUrl = new Map<string, PullSummary>();
   for (const j of rows) {
     const ts = j.dispatchedAt;
@@ -384,4 +506,35 @@ export function invalidateNonce(jobId: number): void {
   getDb()
     .prepare("UPDATE dispatch_log SET machine_nonce = NULL WHERE id = ?")
     .run(jobId);
+}
+
+/** Returns the current stuck-attempt count for an issue, or 0 if none. */
+export function getStuckAttempts(issueId: string): number {
+  const row = getDb()
+    .prepare("SELECT attempts FROM stuck_attempts WHERE issue_id = ?")
+    .get(issueId) as { attempts: number } | undefined;
+  return row?.attempts ?? 0;
+}
+
+/** Increments the stuck-attempt counter, stamps last_attempt_at, and returns the new count. */
+export function incrementStuckAttempts(issueId: string): number {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO stuck_attempts (issue_id, attempts, last_attempt_at)
+    VALUES (?, 1, ?)
+    ON CONFLICT(issue_id) DO UPDATE SET
+      attempts = attempts + 1,
+      last_attempt_at = excluded.last_attempt_at
+  `).run(issueId, Date.now());
+  const row = db
+    .prepare("SELECT attempts FROM stuck_attempts WHERE issue_id = ?")
+    .get(issueId) as { attempts: number };
+  return row.attempts;
+}
+
+/** Resets the stuck-attempt counter for an issue (call on success). */
+export function resetStuckAttempts(issueId: string): void {
+  getDb()
+    .prepare("DELETE FROM stuck_attempts WHERE issue_id = ?")
+    .run(issueId);
 }

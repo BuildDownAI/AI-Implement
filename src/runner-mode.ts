@@ -1,5 +1,15 @@
 import { getDb } from "./dedup.js";
 
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      RUNNER_MODE?: string;
+      RUNNER_CALLBACK_BASE_URL?: string;
+      PORT?: string;
+    }
+  }
+}
+
 export const VALID_RUNNER_MODES = ["default", "gha", "fly", "local", "shadow"] as const;
 export type RunnerMode = typeof VALID_RUNNER_MODES[number];
 export const DEFAULT_RUNNER_MODE: RunnerMode = "default";
@@ -67,6 +77,47 @@ export function resolveExecutionPath(
   if (runnerMode === "gha") return "github-actions";
   // "default": honour per-team setting
   return mappingMode;
+}
+
+/**
+ * Planning-specific execution path resolution. Identical to resolveExecutionPath
+ * except shadow ("both") collapses to "github-actions": planning posts user-visible
+ * Linear comments, so a shadow second backend would double-post.
+ */
+export function resolvePlanningExecutionPath(
+  runnerMode: RunnerMode,
+  mappingMode: "github-actions" | "fly-machines",
+): "github-actions" | "fly-machines" | "local-docker" {
+  const path = resolveExecutionPath(runnerMode, mappingMode);
+  if (path === "both") return "github-actions";
+  return path;
+}
+
+export interface RunnerCallbackBaseUrlResult {
+  url: string | null;
+  /** "env" = explicit RUNNER_CALLBACK_BASE_URL; "local-default" = derived for RUNNER_MODE=local. */
+  source: "env" | "local-default" | "unset";
+}
+
+/**
+ * Resolves the runner-callback base URL. An explicit RUNNER_CALLBACK_BASE_URL
+ * always wins. When it's unset and RUNNER_MODE=local (the `npm run dev:local`
+ * contract — env var only, never the DB setting, since host.docker.internal
+ * is only known-correct for an orchestrator running on the Docker host), the
+ * URL is derived from the orchestrator's own HTTP port: local containers are
+ * started with `--add-host host.docker.internal:host-gateway`, so the callback
+ * target is known a-priori. Without it, planning runs complete but can never
+ * report results, so the orchestrator re-dispatches planning forever.
+ */
+export function resolveRunnerCallbackBaseUrl(
+  env: Pick<NodeJS.ProcessEnv, "RUNNER_CALLBACK_BASE_URL" | "RUNNER_MODE" | "PORT">,
+): RunnerCallbackBaseUrlResult {
+  if (env.RUNNER_CALLBACK_BASE_URL) return { url: env.RUNNER_CALLBACK_BASE_URL, source: "env" };
+  if (env.RUNNER_MODE === "local") {
+    const port = parseInt(env.PORT || "8080", 10);
+    return { url: `http://host.docker.internal:${port}`, source: "local-default" };
+  }
+  return { url: null, source: "unset" };
 }
 
 /** Persists the runner mode to the DB. Env var override is unaffected. */

@@ -40,6 +40,22 @@ export interface MachineConfig {
   processes?: MachineProcess[];
 }
 
+export interface MachineExitEvent {
+  exit_code?: number;
+  guest_exit_code?: number;
+  guest_signal?: number;
+  signal?: number;
+  oom_killed?: boolean;
+}
+
+export interface MachineEvent {
+  type: string;
+  status?: string;
+  source?: string;
+  timestamp?: number;
+  request?: { exit_event?: MachineExitEvent };
+}
+
 export interface Machine {
   id: string;
   name: string;
@@ -48,6 +64,7 @@ export interface Machine {
   created_at: string;
   updated_at: string;
   config: MachineConfig;
+  events?: MachineEvent[];
 }
 
 export interface CreateMachineOpts {
@@ -136,6 +153,23 @@ export async function stopMachine(
     const body = await res.text();
     throw new Error(`Failed to stop machine ${machineId} (${res.status}): ${body}`);
   }
+}
+
+/**
+ * Process exit code from a stopped machine's terminal event, or null when unreadable.
+ * Verified against live Fly machines (2026-07):
+ *   - clean exit N≠0 → type "exit",  exit_event.exit_code = N   (guest_exit_code omitted)
+ *   - clean exit 0   → exit_event has NO exit_code (Fly omits the zero) → null → treated as clean
+ *   - killed / OOM   → type "crash", exit_event.exit_code = -1  (+ guest_signal)
+ * 
+ * Match on the exit_event field (type is "exit" OR "crash"); events are newest-first; prefer
+ * exit_code (the field a clean non-zero exit populates).
+ * Fully optional-chained, so any shape drift degrades to null rather than throwing.
+ * (Session machines run auto_destroy:false, so a normally-exited machine stays `stopped` with this event present.)
+ */
+export function readMachineExitCode(machine: Machine): number | null {
+  const exit = machine.events?.find((e) => e.request?.exit_event)?.request?.exit_event;
+  return exit?.exit_code ?? exit?.guest_exit_code ?? null;
 }
 
 export async function destroyMachine(
@@ -335,14 +369,13 @@ export interface SessionMachineInput {
   owner: string;
   repo: string;
   defaultBranch: string;
-  linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
-  githubAppId: string;
-  githubAppPrivateKey: string;
+  githubToken: string;
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
+  phase?: "implementation" | "planning";
   region?: string;
   cpus?: number;
   memoryMb?: number;
@@ -367,16 +400,13 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     GITHUB_OWNER: input.owner,
     GITHUB_REPO: input.repo,
     GITHUB_DEFAULT_BRANCH: input.defaultBranch,
-    GITHUB_APP_ID: input.githubAppId,
-    GITHUB_APP_PRIVATE_KEY: input.githubAppPrivateKey,
+    GITHUB_TOKEN: input.githubToken,
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
     SESSION_MODE: input.sessionMode ?? "autonomous",
+    RUNNER_PHASE: input.phase ?? "implementation",
   };
 
-  if (input.linearApiKey) {
-    env.LINEAR_API_KEY = input.linearApiKey;
-  }
   if (input.claudeOAuthToken) {
     env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   }

@@ -1,11 +1,14 @@
 import { PipelineRunner } from "./runner.js";
 import type { PipelineDefinition, StepModule } from "./types.js";
 import { cloneStep } from "./steps/clone.js";
+import { installSkillsStep } from "./steps/install-skills.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { installStep } from "./steps/install.js";
 import { postPushReviewStep } from "./steps/post-push-review.js";
 import { preflightStep } from "./steps/preflight.js";
 import { pushStep } from "./steps/push.js";
+import { setupStep } from "./steps/setup.js";
+import { verifyStep } from "./steps/verify.js";
 import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { resolveModuleImport, type ImportModuleOptions } from "./resolve-module.js";
 
@@ -19,10 +22,13 @@ export const DEFAULT_PIPELINE: PipelineDefinition = loadPipelineDefinition(
 
 const BUILTIN_STEPS: Array<[string, StepModule]> = [
   ["clone", cloneStep],
+  ["install-skills", installSkillsStep],
   ["install", installStep],
+  ["setup", setupStep],
   ["feedback-loop", feedbackLoopStep],
   ["preflight", preflightStep],
   ["push", pushStep],
+  ["verify", verifyStep],
   ["post-push-review", postPushReviewStep],
 ];
 

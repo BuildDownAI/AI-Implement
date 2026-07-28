@@ -7,7 +7,8 @@ Thanks for your interest. This is a small project; most contributions land via P
 ```bash
 git clone https://github.com/BuildDownAI/AI-Implement.git
 cd AI-Implement
-cp .env.example .env       # fill in LINEAR_API_KEY + GitHub App creds for local testing
+asdf install                 # or use .nvmrc / .node-version with your Node manager
+cp .env.example .env       # fill in LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET + GitHub App creds for local testing
 npm install
 npm run dev                # polling + HTTP server on :8080
 npm run dev:local          # dev server + local Docker implementation jobs
@@ -15,7 +16,11 @@ npm test                   # vitest
 npm run typecheck          # tsc --noEmit
 ```
 
-Node 24 is the supported runtime (see `.tool-versions`). Earlier versions may work but aren't tested.
+Node 24 is the supported runtime (see `.tool-versions`, `.nvmrc`, and
+`.node-version`). The package uses `better-sqlite3`, a native addon, so install
+dependencies with the same Node major used to run the service. If you switch
+Node versions after installing dependencies, run `npm ci` or
+`npm rebuild better-sqlite3` before starting the app.
 
 `npm run dev:local` first runs `npm run build:runner:local`, which builds
 `Dockerfile.session` as `ai-implement-runner:local`. Docker must be running.

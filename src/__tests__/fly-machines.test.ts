@@ -16,6 +16,7 @@ import {
   updateMachineMetadata,
 } from "../fly-machines.js";
 import type { SessionMachineInput } from "../fly-machines.js";
+import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
 
 const TOKEN = "fly-test-token";
 const APP = "ai-implement-sessions-test";
@@ -424,11 +425,9 @@ describe("buildSessionMachineConfig", () => {
     owner: "test-org",
     repo: "test-repo",
     defaultBranch: "main",
-    githubAppId: "12345",
-    githubAppPrivateKey: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----",
+    githubToken: "ghs_test_token",
     sessionToken: "tok_abc",
     machineNonce: "nonce_def",
-    linearApiKey: "lin_api_test",
     anthropicApiKey: "sk-ant-test",
   };
 
@@ -443,9 +442,11 @@ describe("buildSessionMachineConfig", () => {
     expect(env.GITHUB_OWNER).toBe("test-org");
     expect(env.GITHUB_REPO).toBe("test-repo");
     expect(env.GITHUB_DEFAULT_BRANCH).toBe("main");
-    expect(env.GITHUB_APP_ID).toBe("12345");
+    expect(env.GITHUB_TOKEN).toBe("ghs_test_token");
+    // The App private key must never reach a runner — only the short-lived install token.
+    expect(env.GITHUB_APP_ID).toBeUndefined();
+    expect(env.GITHUB_APP_PRIVATE_KEY).toBeUndefined();
     expect(env.SESSION_MODE).toBe("autonomous");
-    expect(env.LINEAR_API_KEY).toBe("lin_api_test");
     expect(env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
   });
 
@@ -488,6 +489,16 @@ describe("buildSessionMachineConfig", () => {
   it("defaults sessionMode to autonomous", () => {
     const result = buildSessionMachineConfig(baseInput);
     expect(result.config.env!.SESSION_MODE).toBe("autonomous");
+  });
+
+  it("defaults RUNNER_PHASE to implementation", () => {
+    const result = buildSessionMachineConfig(baseInput);
+    expect(result.config.env!.RUNNER_PHASE).toBe("implementation");
+  });
+
+  it("sets RUNNER_PHASE=planning when phase is planning", () => {
+    const result = buildSessionMachineConfig({ ...baseInput, phase: "planning" });
+    expect(result.config.env!.RUNNER_PHASE).toBe("planning");
   });
 
   it("sets auto_destroy false and no-restart policy", () => {
@@ -621,6 +632,122 @@ describe("buildSessionMachineConfig", () => {
   it("omits expected_ttl_seconds from metadata when not provided", () => {
     const result = buildSessionMachineConfig(baseInput);
     expect(result.config.metadata!.expected_ttl_seconds).toBeUndefined();
+  });
+
+  describe("AI_IMPLEMENT_RUN_CONFIG envelope", () => {
+    it("passes through AI_IMPLEMENT_RUN_CONFIG from extraEnv and is decodable", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
+        runnerPhase: "implementation",
+        maxTurns: 30,
+        maxIterations: 2,
+        branchPrefix: "pr",
+        skillsRepo: "org/skills",
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+      };
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+        extraEnv: {
+          AI_IMPLEMENT_MAX_TURNS: "30",
+          AI_IMPLEMENT_MAX_ITERATIONS: "2",
+          AI_IMPLEMENT_BRANCH_PREFIX: "pr",
+          AI_IMPLEMENT_SKILLS_REPO: "org/skills",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
+        },
+      });
+      const env = result.config.env!;
+
+      expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG);
+      expect(decoded.issue.id).toBe("uuid-123");
+      expect(decoded.issue.identifier).toBe("ENG-42");
+      expect(decoded.maxTurns).toBe(30);
+      expect(decoded.maxIterations).toBe(2);
+      expect(decoded.branchPrefix).toBe("pr");
+      expect(decoded.skillsRepo).toBe("org/skills");
+      expect(decoded.runnerCallbackUrl).toBe("https://orchestrator.example.com/callback");
+      expect(decoded.runnerPhase).toBe("implementation");
+    });
+
+    it("flat legacy vars remain alongside the envelope", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
+        runnerPhase: "implementation",
+        maxTurns: 30,
+        branchPrefix: "pr",
+        skillsRepo: "org/skills",
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+      };
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+        runToken: "run-tok",
+        extraEnv: {
+          AI_IMPLEMENT_MAX_TURNS: "30",
+          AI_IMPLEMENT_BRANCH_PREFIX: "pr",
+          AI_IMPLEMENT_SKILLS_REPO: "org/skills",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig),
+        },
+      });
+      const env = result.config.env!;
+
+      expect(env.ISSUE_ID).toBe("uuid-123");
+      expect(env.RUNNER_CALLBACK_URL).toBe("https://orchestrator.example.com/callback");
+      expect(env.AI_IMPLEMENT_MAX_TURNS).toBe("30");
+      expect(env.AI_IMPLEMENT_BRANCH_PREFIX).toBe("pr");
+      expect(env.AI_IMPLEMENT_SKILLS_REPO).toBe("org/skills");
+      expect(env.AI_IMPLEMENT_RUN_CONFIG).toBeDefined();
+    });
+
+    it("planning session envelope has runnerPhase=planning and no branchPrefix/skillsRepo", () => {
+      const planningConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "uuid-123", identifier: "ENG-42", title: "Add feature X", description: "Implement the feature" },
+        runnerPhase: "planning",
+        maxTurns: 20,
+        runnerCallbackUrl: "https://orchestrator.example.com/callback",
+      };
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        phase: "planning",
+        extraEnv: {
+          PARENT: "ENG-40",
+          SIBLINGS: "",
+          DEPENDENCIES: "",
+          AI_IMPLEMENT_MAX_TURNS: "20",
+          AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(planningConfig),
+        },
+      });
+      const env = result.config.env!;
+
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG);
+      expect(decoded.runnerPhase).toBe("planning");
+      expect(decoded.branchPrefix).toBeUndefined();
+      expect(decoded.skillsRepo).toBeUndefined();
+      expect(env.PARENT).toBe("ENG-40");
+      expect(env.AI_IMPLEMENT_MAX_TURNS).toBe("20");
+    });
+
+    it("secrets are not present in the decoded envelope", () => {
+      const runConfig: RunConfigV1 = {
+        v: 1,
+        issue: { id: "uuid-123", identifier: "ENG-42", title: "T", description: "D" },
+        runnerPhase: "implementation",
+      };
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        extraEnv: { AI_IMPLEMENT_RUN_CONFIG: encodeRunConfig(runConfig) },
+      });
+      const env = result.config.env!;
+      const decoded = decodeRunConfig(env.AI_IMPLEMENT_RUN_CONFIG) as Record<string, unknown>;
+      expect(decoded.SESSION_TOKEN).toBeUndefined();
+      expect(decoded.GITHUB_TOKEN).toBeUndefined();
+      expect(decoded.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(decoded.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    });
   });
 
   it("smoke test: metadata has all required keys with correct types", () => {

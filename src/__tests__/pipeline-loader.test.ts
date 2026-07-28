@@ -27,8 +27,14 @@ const BUILTIN_PIPELINE_YAML = `id: autonomous-loop
 steps:
   - id: clone
     type: clone
+  - id: install-skills
+    type: custom
+    moduleId: install-skills
   - id: install
     type: install
+  - id: setup
+    type: custom
+    moduleId: setup
   - id: feedback-loop
     type: custom
     moduleId: feedback-loop
@@ -36,6 +42,9 @@ steps:
     type: preflight
   - id: push
     type: push
+  - id: verify
+    type: custom
+    moduleId: verify
   - id: post-push-review
     type: custom
     moduleId: post-push-review
@@ -54,7 +63,6 @@ function makeContext(overrides: Partial<PipelineContextData> = {}): DefaultPipel
     issueDescription: "Desc",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
     ...overrides,
   });
 }
@@ -69,10 +77,13 @@ describe("loadPipelineDefinition", () => {
     expect(pipeline.id).toBe("autonomous-loop");
     expect(pipeline.steps.map((s) => s.id)).toEqual([
       "clone",
+      "install-skills",
       "install",
+      "setup",
       "feedback-loop",
       "preflight",
       "push",
+      "verify",
       "post-push-review",
     ]);
   });
@@ -105,7 +116,31 @@ describe("loadPipelineDefinition", () => {
       },
     });
 
-    expect(resolvedPath).toContain("custom/pipelines/autonomous.yml");
+    expect(resolvedPath.replace(/\\/g, "/")).toContain("custom/pipelines/autonomous.yml");
+  });
+
+  it("uses a baked-root custom/pipelines/autonomous.yml when the workspace has none", () => {
+    let resolvedPath = "";
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      customRoot: "/workspace",
+      bakedRoot: "/baked",
+      existsSyncImpl: (p) => p.replace(/\\/g, "/").startsWith("/baked/"),
+      readFileSyncImpl: (path, _enc) => {
+        resolvedPath = path;
+        return CUSTOM_PIPELINE_YAML;
+      },
+    });
+
+    expect(resolvedPath.replace(/\\/g, "/")).toBe("/baked/custom/pipelines/autonomous.yml");
+    expect(pipeline.id).toBe("custom-loop");
+    expect(pipeline.steps.map((s) => s.id)).toEqual([
+      "clone",
+      "install",
+      "feedback-loop",
+      "preflight",
+      "push",
+      "notify",
+    ]);
   });
 
   it("resolves to the builtin path when no custom override exists", () => {
@@ -119,7 +154,28 @@ describe("loadPipelineDefinition", () => {
       },
     });
 
-    expect(resolvedPath).toBe("/app/pipelines/autonomous.yml");
+    expect(resolvedPath.replace(/\\/g, "/")).toBe("/app/pipelines/autonomous.yml");
+  });
+
+  it("skips install-skills when skillsRepo is unset, runs it when set", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "install-skills")!;
+
+    const ctxNoSkills = makeContext();
+    ctxNoSkills.setOutputs("clone", { githubToken: "tok" });
+    expect(step.skip?.(ctxNoSkills)).toBe(true);
+
+    const ctxWithSkills = makeContext({ skillsRepo: "https://github.com/org/skills" });
+    ctxWithSkills.setOutputs("clone", { githubToken: "tok" });
+    expect(step.skip?.(ctxWithSkills)).toBe(false);
+
+    const inputs = ctxWithSkills.resolveInputs(step.inputs);
+    expect(inputs.skillsRepoUrl).toBe("https://github.com/org/skills");
+    expect(inputs.githubToken).toBe("tok");
   });
 
   it("applies install input wiring from clone outputs", () => {
@@ -244,23 +300,6 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.prTitle).toBe("ENG-42: Add profile page");
   });
 
-  it("applies push skip condition based on feedback-loop approval", () => {
-    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
-      existsSyncImpl: () => false,
-      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
-    });
-
-    const pushStep = pipeline.steps.find((s) => s.id === "push")!;
-
-    const ctxApproved = makeContext();
-    ctxApproved.setOutputs("feedback-loop", { approved: true });
-    expect(pushStep.skip?.(ctxApproved)).toBe(false);
-
-    const ctxRejected = makeContext();
-    ctxRejected.setOutputs("feedback-loop", { approved: false });
-    expect(pushStep.skip?.(ctxRejected)).toBe(true);
-  });
-
   it("applies post-push-review input wiring from clone and push outputs", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,
@@ -269,12 +308,14 @@ describe("loadPipelineDefinition", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctx.setOutputs("install", { reviewProviders: ["github-claude-code-review"] });
     ctx.setOutputs("push", { prNumber: 42, branchPushed: true });
 
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
     const inputs = ctx.resolveInputs(step.inputs);
     expect(inputs.workspaceDir).toBe("/tmp/repo");
     expect(inputs.prNumber).toBe("42");
+    expect(inputs.reviewProviders).toEqual(["github-claude-code-review"]);
   });
 
   it("applies post-push-review skip condition based on push output", () => {
@@ -286,16 +327,81 @@ describe("loadPipelineDefinition", () => {
     const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
 
     const ctxPushed = makeContext();
+    ctxPushed.setOutputs("feedback-loop", { approved: true });
     ctxPushed.setOutputs("push", { branchPushed: true, prNumber: 42 });
     expect(step.skip?.(ctxPushed)).toBe(false);
 
     const ctxSkipped = makeContext();
+    ctxSkipped.setOutputs("feedback-loop", { approved: true });
     ctxSkipped.setOutputs("push", { branchPushed: false });
     expect(step.skip?.(ctxSkipped)).toBe(true);
 
     const ctxMissingPr = makeContext();
+    ctxMissingPr.setOutputs("feedback-loop", { approved: true });
     ctxMissingPr.setOutputs("push", { branchPushed: true, prNumber: null });
     expect(step.skip?.(ctxMissingPr)).toBe(true);
+  });
+
+  it("post-push-review skips when feedback-loop was not approved, even with a valid push", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "post-push-review")!;
+
+    const ctx = makeContext();
+    ctx.setOutputs("feedback-loop", { approved: false });
+    ctx.setOutputs("push", { branchPushed: true, prNumber: 9 });
+    expect(step.skip?.(ctx)).toBe(true);
+  });
+
+  it("skips setup when no setup hook, runs it (with scriptPath) when present", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "setup")!;
+
+    const ctxNoHook = makeContext();
+    ctxNoHook.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    expect(step.skip?.(ctxNoHook)).toBe(true);
+
+    const ctxWithHook = makeContext({ hooks: { setup: "scripts/setup.sh" } });
+    ctxWithHook.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    expect(step.skip?.(ctxWithHook)).toBe(false);
+    const inputs = ctxWithHook.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.scriptPath).toBe("scripts/setup.sh");
+  });
+
+  it("skips verify when no verify hook, or when feedback-loop not approved", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "verify")!;
+
+    // No hook -> skip even if approved.
+    const ctxNoHook = makeContext();
+    ctxNoHook.setOutputs("feedback-loop", { approved: true });
+    expect(step.skip?.(ctxNoHook)).toBe(true);
+
+    // Hook present but loop not approved -> skip.
+    const ctxNotApproved = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctxNotApproved.setOutputs("feedback-loop", { approved: false });
+    expect(step.skip?.(ctxNotApproved)).toBe(true);
+
+    // Hook present and approved -> run, with scriptPath wired.
+    const ctxRun = makeContext({ hooks: { verify: "scripts/verify.sh" } });
+    ctxRun.setOutputs("clone", { workspaceDir: "/tmp/repo" });
+    ctxRun.setOutputs("feedback-loop", { approved: true });
+    expect(step.skip?.(ctxRun)).toBe(false);
+    const inputs = ctxRun.resolveInputs(step.inputs);
+    expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.scriptPath).toBe("scripts/verify.sh");
   });
 
   it("custom pipeline with extra step is used by the pipeline runner", async () => {
@@ -325,5 +431,100 @@ describe("loadPipelineDefinition", () => {
 
     expect(executedSteps).toContain("notify");
     expect(executedSteps.indexOf("push")).toBeLessThan(executedSteps.indexOf("notify"));
+  });
+
+  describe("unapproved wiring", () => {
+    it("push on an initial run (no prNumber) never skips, and wires draft + reviewSummary from feedback-loop outputs", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+
+      const ctx = makeContext();
+      ctx.setOutputs("feedback-loop", {
+        approved: false,
+        iterations: 3,
+        finalFeedback: "nope",
+        terminationReason: "iterations_exhausted",
+        passes: [{ iteration: 1, implementTurns: 98, implementOutcome: "success", costUsd: 1, reviewApproved: false }],
+      });
+      expect(push.skip?.(ctx)).toBe(false);
+      const inputs = ctx.resolveInputs(push.inputs);
+      expect(inputs.draft).toBe(true);
+      expect((inputs.reviewSummary as { finalFeedback: string }).finalFeedback).toBe("nope");
+      expect((inputs.reviewSummary as { terminationReason: string }).terminationReason).toBe("iterations_exhausted");
+      expect((inputs.reviewSummary as { iterations: number }).iterations).toBe(3);
+      expect((inputs.reviewSummary as { passes: unknown[] }).passes).toHaveLength(1);
+    });
+
+    it("push wires draft=false and no reviewSummary when approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext();
+      ctx.setOutputs("feedback-loop", { approved: true, iterations: 1, finalFeedback: "ok", terminationReason: "approved", passes: [] });
+      const inputs = ctx.resolveInputs(push.inputs);
+      expect(inputs.draft).toBe(false);
+      expect(inputs.reviewSummary).toBeUndefined();
+    });
+
+    it("post-push-review skips when feedback-loop was not approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const ppr = pipeline.steps.find((s) => s.id === "post-push-review")!;
+      const ctx = makeContext();
+      ctx.setOutputs("feedback-loop", { approved: false });
+      ctx.setOutputs("push", { branchPushed: true, prNumber: 9 });
+      expect(ppr.skip!(ctx)).toBe(true);
+    });
+  });
+
+  describe("push skip for gap-fill runs", () => {
+    it("skips push when prNumber is set (gap-fill) and feedback-loop was not approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext({ prNumber: "42" });
+      ctx.setOutputs("feedback-loop", { approved: false });
+      expect(push.skip?.(ctx)).toBe(true);
+    });
+
+    it("skips push when prNumber is set (gap-fill) even when feedback-loop approved", () => {
+      // Gap-fill runs never own git: Claude commits and pushes to the existing PR
+      // branch itself, so the tree is clean by the time push would run — running it
+      // would throw "Nothing to commit" and turn an approved gap-fill into a failure.
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext({ prNumber: "42" });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      expect(push.skip?.(ctx)).toBe(true);
+    });
+
+    it("does not skip push on an initial run (no prNumber) even when feedback-loop was not approved", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext();
+      ctx.setOutputs("feedback-loop", { approved: false });
+      expect(push.skip?.(ctx)).toBe(false);
+    });
   });
 });

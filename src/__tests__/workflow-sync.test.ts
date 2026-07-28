@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import type { RepoMapping } from "../config.js";
-import { syncWorkflowTemplates } from "../workflow-sync.js";
+import { syncWorkflowTemplates, classifySyncError } from "../workflow-sync.js";
+import { GitHubApiError } from "../github-errors.js";
 
 const mapping: RepoMapping = {
   owner: "acme",
@@ -24,6 +25,10 @@ const mapping: RepoMapping = {
   ticketingConfig: { kind: "linear" },
   awsRegion: null,
   paused: false,
+  maxTurns: null,
+  maxIterations: null,
+  maxJobMinutes: null,
+  branchPrefix: null,
 };
 
 let tempRoot: string | null = null;
@@ -37,7 +42,6 @@ function makeTemplatesRoot(): string {
   tempRoot = mkdtempSync(join(tmpdir(), "workflow-sync-"));
   mkdirSync(join(tempRoot, "workflows"), { recursive: true });
   writeFileSync(join(tempRoot, "workflows/claude-implement.yml"), "implement-yml\n");
-  writeFileSync(join(tempRoot, "workflows/comment-trigger.yml"), "comment-yml\n");
   writeFileSync(join(tempRoot, "workflows/claude-plan.yml"), "plan-yml\n");
   writeFileSync(join(tempRoot, "workflows/WORKFLOW.md"), "workflow-md\n");
   writeFileSync(join(tempRoot, "workflows/PLANNING.md"), "planning-md\n");
@@ -146,6 +150,13 @@ function makeGithubFetch(opts?: {
       branches[branch].aheadBy = 1;
       return response(200, { content: { path: remotePath } });
     }
+    if (contentsMatch && method === "DELETE") {
+      const remotePath = decodeURIComponent(contentsMatch[1]);
+      const branch = body.branch;
+      delete branches[branch].files[remotePath];
+      branches[branch].aheadBy = 1;
+      return response(200, { commit: { sha: "del-sha" } });
+    }
 
     if (path === "/repos/acme/app/pulls" && method === "GET") {
       return response(200, pulls);
@@ -192,7 +203,6 @@ describe("syncWorkflowTemplates", () => {
     expect(result.prUrl).toBe("https://github.com/acme/app/pull/123");
     expect(result.changedFiles).toEqual([
       ".github/workflows/claude-implement.yml",
-      ".github/workflows/comment-trigger.yml",
       ".github/workflows/claude-plan.yml",
       "WORKFLOW.md",
       "PLANNING.md",
@@ -224,7 +234,6 @@ describe("syncWorkflowTemplates", () => {
 
     expect(result.changedFiles).toEqual([
       ".github/workflows/claude-implement.yml",
-      ".github/workflows/comment-trigger.yml",
       ".github/workflows/claude-plan.yml",
     ]);
     expect(fake.branches["sync/ai-implement"].files["WORKFLOW.md"]).toBe("custom workflow\n");
@@ -235,7 +244,6 @@ describe("syncWorkflowTemplates", () => {
     const templatesRoot = makeTemplatesRoot();
     const syncedFiles = {
       ".github/workflows/claude-implement.yml": "implement-yml\n",
-      ".github/workflows/comment-trigger.yml": "comment-yml\n",
       ".github/workflows/claude-plan.yml": "plan-yml\n",
       "WORKFLOW.md": "workflow-md\n",
       "PLANNING.md": "planning-md\n",
@@ -293,7 +301,6 @@ describe("syncWorkflowTemplates", () => {
     const templatesRoot = makeTemplatesRoot();
     const syncedFiles = {
       ".github/workflows/claude-implement.yml": "implement-yml\n",
-      ".github/workflows/comment-trigger.yml": "comment-yml\n",
       ".github/workflows/claude-plan.yml": "plan-yml\n",
       "WORKFLOW.md": "workflow-md\n",
       "PLANNING.md": "planning-md\n",
@@ -323,16 +330,23 @@ describe("syncWorkflowTemplates", () => {
     expect(result.changedFiles).toEqual([]);
   });
 
-  it("preserves an existing sync branch that is ahead of base", async () => {
+  it("force-resets a stale sync branch that is ahead of base to produce a clean diff", async () => {
     const templatesRoot = makeTemplatesRoot();
     const fake = makeGithubFetch({
       syncFiles: {
-        "operator-note.txt": "keep me\n",
+        ".github/workflows/claude-implement.yml": "OLD-implement\n",
+        "stale-leftover.txt": "stale\n",
       },
       syncAheadBy: 2,
+      existingPr: {
+        number: 55,
+        html_url: "https://github.com/acme/app/pull/55",
+        head: "sync/ai-implement",
+        base: { ref: "main" },
+      },
     });
 
-    await syncWorkflowTemplates({
+    const result = await syncWorkflowTemplates({
       mapping,
       githubAppId: "app-id",
       githubAppPrivateKey: "private-key",
@@ -341,8 +355,25 @@ describe("syncWorkflowTemplates", () => {
       getInstallationTokenImpl: async () => "token",
     });
 
-    expect(fake.branches["sync/ai-implement"].files["operator-note.txt"]).toBe("keep me\n");
-    expect(fake.calls.some((call) => call.method === "PATCH" && call.path.includes("/git/refs/heads/"))).toBe(false);
+    // The existing open PR is reused, not duplicated.
+    expect(result.status).toBe("pr-updated");
+    expect(result.prNumber).toBe(55);
+    expect(fake.pulls).toHaveLength(1);
+
+    // The branch was force-reset to the current base before templates were applied.
+    expect(
+      fake.calls.some(
+        (call) =>
+          call.method === "PATCH" &&
+          call.path.includes("/git/refs/heads/") &&
+          (call.body as { sha?: string; force?: boolean }).sha === "base-sha" &&
+          (call.body as { sha?: string; force?: boolean }).force === true,
+      ),
+    ).toBe(true);
+
+    // Stale non-template leftover is gone; current template content is present.
+    expect(fake.branches["sync/ai-implement"].files["stale-leftover.txt"]).toBeUndefined();
+    expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-implement.yml"]).toBe("implement-yml\n");
   });
 
   it("throws when an always-synced workflow template is missing", async () => {
@@ -358,5 +389,198 @@ describe("syncWorkflowTemplates", () => {
       fetchImpl: fake.fetchImpl,
       getInstallationTokenImpl: async () => "token",
     })).rejects.toThrow("Missing workflow template: workflows/claude-plan.yml");
+  });
+
+  it("throws a descriptive error when the base branch does not exist", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    // The fake repo only has "main"; a mapping pointing at "develop" hits a 404 on the ref lookup.
+    const fake = makeGithubFetch();
+
+    await expect(syncWorkflowTemplates({
+      mapping: { ...mapping, defaultBranch: "develop" },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    })).rejects.toThrow(
+      'Base branch "develop" does not exist in acme/app. ' +
+        "The repository may be empty (no commits yet) or the configured branch name is wrong. " +
+        "Push an initial commit or correct the branch name in the project settings.",
+    );
+  });
+
+  it("surfaces the missing-base-branch message verbatim through classifySyncError (the sync-status path)", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch();
+
+    // Mirrors runWorkflowSync in workflow-sync-queue.ts, which stores
+    // classifySyncError(err) on the failed job; the admin UI renders its .message.
+    const err = await syncWorkflowTemplates({
+      mapping: { ...mapping, defaultBranch: "develop" },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    }).then(() => null, (e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const classified = classifySyncError(err);
+    expect(classified.category).toBe("unknown");
+    expect(classified.message).toBe((err as Error).message);
+    expect(classified.message).toContain('Base branch "develop" does not exist in acme/app');
+  });
+
+  it("prefixes the sync branch when the mapping sets a branchPrefix", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch();
+
+    const result = await syncWorkflowTemplates({
+      mapping: { ...mapping, branchPrefix: "pr" },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.syncBranch).toBe("pr/sync/ai-implement");
+    expect(fake.branches["pr/sync/ai-implement"]).toBeDefined();
+    expect(fake.pulls[0].head).toBe("pr/sync/ai-implement");
+  });
+
+  it("uses the unprefixed sync branch when the mapping has no branchPrefix", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch();
+
+    const result = await syncWorkflowTemplates({
+      mapping: { ...mapping, branchPrefix: null },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.syncBranch).toBe("sync/ai-implement");
+  });
+
+  it("does not prefix an explicitly provided syncBranch", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const fake = makeGithubFetch();
+
+    const result = await syncWorkflowTemplates({
+      mapping: { ...mapping, branchPrefix: "pr" },
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      syncBranch: "sync/ai-implement",
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.syncBranch).toBe("sync/ai-implement");
+  });
+
+  it("REMOVE_FILES: removes comment-trigger.yml when present on sync branch", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      ".github/workflows/comment-trigger.yml": "old-comment-trigger\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.changedFiles).toContain(".github/workflows/comment-trigger.yml");
+    expect(fake.branches["sync/ai-implement"].files[".github/workflows/comment-trigger.yml"]).toBeUndefined();
+    expect(fake.calls.some((call) => call.method === "DELETE" && call.path.includes("comment-trigger.yml"))).toBe(true);
+  });
+
+  it("REMOVE_FILES: no-ops when comment-trigger.yml is absent from sync branch", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.changedFiles).not.toContain(".github/workflows/comment-trigger.yml");
+    expect(fake.calls.every((call) => call.method !== "DELETE")).toBe(true);
+  });
+
+  it("REMOVE_FILES: removed file is the sole entry in changedFiles, triggering PR creation", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      ".github/workflows/comment-trigger.yml": "old-comment-trigger\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.status).toBe("pr-opened");
+    expect(result.changedFiles).toEqual([".github/workflows/comment-trigger.yml"]);
+  });
+
+});
+
+describe("classifySyncError", () => {
+  it("repo-not-found for a 404 on the bare repo path", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 404, path: "/repos/acme/app" })).category).toBe("repo-not-found");
+  });
+
+  it("app-not-installed for a 404 on an installation path", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 404, path: "/users/acme/installation" })).category).toBe("app-not-installed");
+  });
+
+  it("clock-skew-suspected for a 401 (never app-not-installed)", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 401, path: "/orgs/acme/installation" })).category).toBe("clock-skew-suspected");
+  });
+
+  it("permission-denied for a 403 on a contents path", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 403, path: "/repos/acme/app/contents/.github/workflows/claude-implement.yml" })).category).toBe("permission-denied");
+  });
+
+  it("unknown for a 404 on a non-repo, non-installation path", () => {
+    expect(classifySyncError(new GitHubApiError({ status: 404, path: "/repos/acme/app/contents/WORKFLOW.md" })).category).toBe("unknown");
+  });
+  
+  it("unknown with the raw message for a non-GitHubApiError", () => {
+    const r = classifySyncError(new Error("boom"));
+    expect(r.category).toBe("unknown");
+    expect(r.message).toBe("boom");
   });
 });

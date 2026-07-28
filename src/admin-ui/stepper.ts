@@ -22,7 +22,7 @@ export const stepperHtml = `
             <option value="linear">Linear</option>
             <option value="jira">Jira</option>
           </select>
-          <div class="field-hint">Jira requires JIRA_TOKEN, JIRA_CLOUD_ID, and JIRA_SITE_URL env vars on the orchestrator.</div>
+          <div class="field-hint">Jira requires JIRA_TOKEN + JIRA_SITE_URL, plus either JIRA_EMAIL (Basic auth) or JIRA_CLOUD_ID (OAuth) env vars on the orchestrator.</div>
         </div>
       </div>
 
@@ -63,6 +63,13 @@ export const stepperHtml = `
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.</div>
           </div>
           <div class="field">
+            <label class="field-label">Profiles Field</label>
+            <select class="input" id="np-jira-profiles-field">
+              <option value="">(auto-discover by name "AI-Implement Profiles")</option>
+            </select>
+            <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.</div>
+          </div>
+          <div class="field">
             <label class="field-label">Repo Field Value</label>
             <select class="input" id="np-jira-repo-value" onchange="updateStepperNextButton()">
               <option value="">Select a Repo Field first</option>
@@ -80,7 +87,11 @@ export const stepperHtml = `
           <div class="alert-icon">&#8505;</div>
           <div style="flex:1">
             <div class="alert-title">GitHub App required</div>
-            <div class="alert-desc">Make sure the AI-Implement GitHub App is installed on the target repository before creating this project.</div>
+            <div class="alert-desc">The AI-Implement GitHub App must be installed on the target repo before it can sync. Enter the owner and repo, then check the installation.</div>
+            <div id="np-install-state" style="margin-top:10px;font-size:12px"></div>
+            <div class="alert-actions" style="margin-top:10px">
+              <button type="button" class="btn btn-sm" id="np-install-check" onclick="checkInstallState()">Check installation</button>
+            </div>
           </div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
@@ -93,6 +104,26 @@ export const stepperHtml = `
             <label class="field-label">Repository Name</label>
             <input class="input mono" id="np-repo" placeholder="backend" autocomplete="off" oninput="updateStepperNextButton()">
             <div class="field-hint">Repository name only (no owner prefix).</div>
+          </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Default Branch</label>
+            <input class="input mono" id="np-defaultBranch" placeholder="development" autocomplete="off" oninput="updateStepperNextButton()">
+            <div class="field-hint">Branch used for workflow dispatches, runner clones, and implementation PR bases.</div>
+          </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Skills Repo <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
+            <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
+            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+          </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Additional sensitive patterns <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
+            <textarea class="input mono" id="np-sensitive-add" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
+            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
+          </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Allowed exceptions <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
+            <textarea class="input mono" id="np-sensitive-allow" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
+            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
           </div>
         </div>
       </div>
@@ -169,6 +200,10 @@ export const stepperHtml = `
             <input type="checkbox" id="np-autoApprove" checked style="width:auto">
             Auto-approve plans — skip the manual approval step and proceed to implementation automatically.
           </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer">
+            <input type="checkbox" id="np-autoMerge" style="width:auto">
+            Auto-merge child PRs — automatically merge child PRs into their grouping branch once checks pass.
+          </label>
         </div>
       </div>
 
@@ -224,6 +259,22 @@ export const stepperHtml = `
             <div data-review="repo" class="mono"></div>
           </div>
           <div class="np-review-row">
+            <div class="np-review-label">Default branch</div>
+            <div data-review="defaultBranch" class="mono"></div>
+          </div>
+          <div class="np-review-row">
+            <div class="np-review-label">Skills Repo</div>
+            <div data-review="skillsRepo" class="mono"></div>
+          </div>
+          <div class="np-review-row">
+            <div class="np-review-label">Sensitive add patterns</div>
+            <div data-review="sensitiveAddPatterns"></div>
+          </div>
+          <div class="np-review-row">
+            <div class="np-review-label">Allowed exceptions</div>
+            <div data-review="sensitiveAllowPatterns"></div>
+          </div>
+          <div class="np-review-row">
             <div class="np-review-label">Runner</div>
             <div data-review="runner"></div>
           </div>
@@ -276,10 +327,11 @@ export const stepperScript = `
     jiraRepoFieldValue: '',
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
-    teamKey: '', owner: '', repo: '',
+    jiraProfilesFieldOverride: '',
+    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
-    planningEnabled: true, autoApprovePlans: true,
+    planningEnabled: true, autoApprovePlans: true, autoMerge: false,
     maxInProgressAiIssues: 3,
     secrets: [],
   };
@@ -293,9 +345,14 @@ export const stepperScript = `
     data.jiraRepoFieldValue = '';
     data.jiraStatusFieldOverride = '';
     data.jiraRepoFieldOverride = '';
+    data.jiraProfilesFieldOverride = '';
     data.teamKey = '';
     data.owner = '';
     data.repo = '';
+    data.defaultBranch = '';
+    data.skillsRepo = '';
+    data.sensitiveAddPatterns = '';
+    data.sensitiveAllowPatterns = '';
     data.executionMode = 'github-actions';
     data.machineCpus = 2;
     data.machineMemoryMb = 4096;
@@ -304,11 +361,12 @@ export const stepperScript = `
     data.awsRegion = '';
     data.planningEnabled = true;
     data.autoApprovePlans = true;
+    data.autoMerge = false;
     data.maxInProgressAiIssues = 3;
     data.secrets = [];
 
     // Clear inputs
-    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-awsRegion'];
+    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-skills-repo', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion'];
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
@@ -325,6 +383,8 @@ export const stepperScript = `
     if (planningEl) planningEl.checked = true;
     const autoApproveEl = document.getElementById('np-autoApprove');
     if (autoApproveEl) autoApproveEl.checked = true;
+    const amEl = document.getElementById('np-autoMerge');
+    if (amEl) amEl.checked = false;
 
     // Reset runner cards
     for (const card of document.querySelectorAll('[data-runner]')) {
@@ -362,6 +422,8 @@ export const stepperScript = `
     if (statusFldEl) statusFldEl.value = '';
     const repoFldEl = document.getElementById('np-jira-repo-field');
     if (repoFldEl) repoFldEl.value = '';
+    const profilesFldEl = document.getElementById('np-jira-profiles-field');
+    if (profilesFldEl) profilesFldEl.value = '';
     const jqlStatus = document.getElementById('np-jira-jql-status');
     if (jqlStatus) { jqlStatus.textContent = ''; jqlStatus.style.color = ''; }
     const linearCfg = document.getElementById('np-linear-config');
@@ -471,10 +533,65 @@ export const stepperScript = `
     } else if (step === 2) {
       const ow = (document.getElementById('np-owner') || {}).value || '';
       const rp = (document.getElementById('np-repo') || {}).value || '';
-      if (!ow.trim() || !rp.trim()) ok = false;
+      const br = (document.getElementById('np-defaultBranch') || {}).value || '';
+      if (!ow.trim() || !rp.trim() || !br.trim()) ok = false;
+      resetInstallState();
     }
     if (ok) nextBtn.removeAttribute('disabled');
     else nextBtn.setAttribute('disabled', '');
+  }
+
+  async function checkInstallState() {
+    const owner = ((document.getElementById('np-owner') || {}).value || '').trim();
+    const repo = ((document.getElementById('np-repo') || {}).value || '').trim();
+    const out = document.getElementById('np-install-state');
+    const btn = document.getElementById('np-install-check');
+    if (!out || !btn) return;
+    if (!owner || !repo) {
+      out.innerHTML = '<span style="color:var(--fg-tertiary)">Enter owner and repo first.</span>';
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Checking…';
+    out.innerHTML = '';
+    try {
+      const res = await window.api('/api/admin/github-install-state?owner=' + encodeURIComponent(owner) + '&repo=' + encodeURIComponent(repo));
+      const data = await res.json();
+      if (!res.ok) {
+        out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check: ' + window.esc(data.error || 'unknown error') + '</span>';
+        return;
+      }
+      out.innerHTML = renderInstallState(data);
+    } catch (_) {
+      out.innerHTML = '<span style="color:var(--st-fail-fg)">Could not check installation.</span>';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Re-check';
+    }
+  }
+  
+  function renderInstallState(data) {
+    const state = data.state;
+    if (state === 'ready') {
+      return '<span class="badge success">Ready</span> The App is installed and can access this repo.';
+    }
+    if (state === 'app-not-installed') {
+      return '<span class="badge warn">Action needed</span> The App is not installed on this owner. '
+        + '<a class="text-accent" href="' + window.esc(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Install the App &#8599;</a> then Re-check.';
+    }
+    if (state === 'repo-not-selected') {
+      return '<span class="badge warn">Action needed</span> The App is installed, but this repo is not in its selected repositories. '
+      + '<a class="text-accent" href="' + window.esc(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Add this repo &#8599;</a> then Re-check.';
+    }
+    return '';
+  }
+
+  // Clears a stale probe result when owner/repo change, so a "Ready" for the old repo can't linger.
+  function resetInstallState() {
+    const out = document.getElementById('np-install-state');
+    const btn = document.getElementById('np-install-check');
+    if (out) out.innerHTML = '';
+    if (btn) btn.textContent = 'Check installation';
   }
 
   function stepperBack() {
@@ -505,8 +622,10 @@ export const stepperScript = `
         else if (txt) data.jiraRepoFieldValue = txt.value.trim();
         const sf = document.getElementById('np-jira-status-field');
         const rf = document.getElementById('np-jira-repo-field');
+        const pf = document.getElementById('np-jira-profiles-field');
         if (sf) data.jiraStatusFieldOverride = sf.value.trim();
         if (rf) data.jiraRepoFieldOverride = rf.value.trim();
+        if (pf) data.jiraProfilesFieldOverride = pf.value.trim();
       } else {
         const tkEl = document.getElementById('np-teamKey');
         if (tkEl) data.teamKey = tkEl.value.trim();
@@ -514,8 +633,16 @@ export const stepperScript = `
     } else if (n === 2) {
       const owEl = document.getElementById('np-owner');
       const reEl = document.getElementById('np-repo');
+      const brEl = document.getElementById('np-defaultBranch');
+      const srEl = document.getElementById('np-skills-repo');
+      const saEl = document.getElementById('np-sensitive-add');
+      const salEl = document.getElementById('np-sensitive-allow');
       if (owEl) data.owner = owEl.value.trim();
       if (reEl) data.repo = reEl.value.trim();
+      if (brEl) data.defaultBranch = brEl.value.trim();
+      if (srEl) data.skillsRepo = srEl.value.trim();
+      if (saEl) data.sensitiveAddPatterns = saEl.value.trim();
+      if (salEl) data.sensitiveAllowPatterns = salEl.value.trim();
     } else if (n === 3) {
       const smEl = document.getElementById('np-sessionMode');
       const cpEl = document.getElementById('np-cpus');
@@ -527,9 +654,11 @@ export const stepperScript = `
       const arEl = document.getElementById('np-awsRegion');
       const plEl = document.getElementById('np-planning');
       const aaEl = document.getElementById('np-autoApprove');
+      const amEl = document.getElementById('np-autoMerge');
       if (arEl) data.awsRegion = arEl.value.trim();
       if (plEl) data.planningEnabled = plEl.checked;
       if (aaEl) data.autoApprovePlans = aaEl.checked;
+      if (amEl) data.autoMerge = amEl.checked;
     } else if (n === 5) {
       const maxEl = document.getElementById('np-maxAi');
       if (maxEl) data.maxInProgressAiIssues = parseInt(maxEl.value, 10);
@@ -575,6 +704,7 @@ export const stepperScript = `
     } else if (n === 2) {
       if (!data.owner) { showError('GitHub Owner is required.'); return false; }
       if (!data.repo) { showError('Repository Name is required.'); return false; }
+      if (!data.defaultBranch) { showError('Default Branch is required.'); return false; }
     } else if (n === 3) {
       // executionMode is set via card selection — always valid
     } else if (n === 4) {
@@ -616,6 +746,7 @@ export const stepperScript = `
       cfgText = 'JQL: ' + (window.esc(jqlPreview) || '&mdash;') + ' &middot; repo=' + (window.esc(data.jiraRepoFieldValue) || '&mdash;');
       if (data.jiraStatusFieldOverride) cfgText += ' &middot; statusField=' + window.esc(data.jiraStatusFieldOverride);
       if (data.jiraRepoFieldOverride) cfgText += ' &middot; repoField=' + window.esc(data.jiraRepoFieldOverride);
+      if (data.jiraProfilesFieldOverride) cfgText += ' &middot; profilesField=' + window.esc(data.jiraProfilesFieldOverride);
     } else {
       cfgText = 'team=' + (window.esc(data.teamKey) || '&mdash;');
     }
@@ -623,6 +754,10 @@ export const stepperScript = `
 
     set('teamKey', window.esc(effectiveTeamKey()) || '&mdash;');
     set('repo', window.esc(data.owner) + '/' + window.esc(data.repo));
+    set('defaultBranch', window.esc(data.defaultBranch) || '&mdash;');
+    set('skillsRepo', data.skillsRepo ? window.esc(data.skillsRepo) : '&mdash;');
+    set('sensitiveAddPatterns', data.sensitiveAddPatterns ? (data.sensitiveAddPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' pattern(s)') : '&mdash;');
+    set('sensitiveAllowPatterns', data.sensitiveAllowPatterns ? (data.sensitiveAllowPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' exception(s)') : '&mdash;');
 
     let runnerText = window.esc(data.executionMode);
     if (data.executionMode === 'fly-machines') {
@@ -720,8 +855,9 @@ export const stepperScript = `
   async function stepperLoadJiraFields() {
     const statusSel = document.getElementById('np-jira-status-field');
     const repoSel = document.getElementById('np-jira-repo-field');
+    const profilesSel = document.getElementById('np-jira-profiles-field');
     if (jiraFieldsLoaded) return;
-    if (!statusSel && !repoSel) return;
+    if (!statusSel && !repoSel && !profilesSel) return;
     try {
       const res = await window.api('/api/jira/fields');
       if (!res.ok) return;
@@ -731,12 +867,16 @@ export const stepperScript = `
       });
       const prevStatus = statusSel ? (statusSel.value || statusSel.dataset.pendingValue || '') : '';
       const prevRepo = repoSel ? (repoSel.value || repoSel.dataset.pendingValue || '') : '';
+      const prevProfiles = profilesSel ? (profilesSel.value || profilesSel.dataset.pendingValue || '') : '';
       const statusPlaceholder = statusSel && statusSel.options[0] ? statusSel.options[0] : null;
       const repoPlaceholder = repoSel && repoSel.options[0] ? repoSel.options[0] : null;
+      const profilesPlaceholder = profilesSel && profilesSel.options[0] ? profilesSel.options[0] : null;
       if (statusSel) statusSel.innerHTML = '';
       if (repoSel) repoSel.innerHTML = '';
+      if (profilesSel) profilesSel.innerHTML = '';
       if (statusSel && statusPlaceholder) statusSel.appendChild(statusPlaceholder);
       if (repoSel && repoPlaceholder) repoSel.appendChild(repoPlaceholder);
+      if (profilesSel && profilesPlaceholder) profilesSel.appendChild(profilesPlaceholder);
       for (const f of fields) {
         const labelText = f.name + ' (' + f.id + ')';
         if (statusSel) {
@@ -751,9 +891,16 @@ export const stepperScript = `
           o2.textContent = labelText;
           repoSel.appendChild(o2);
         }
+        if (profilesSel) {
+          const o3 = document.createElement('option');
+          o3.value = f.id;
+          o3.textContent = labelText;
+          profilesSel.appendChild(o3);
+        }
       }
       if (statusSel && prevStatus) statusSel.value = prevStatus;
       if (repoSel && prevRepo) repoSel.value = prevRepo;
+      if (profilesSel && prevProfiles) profilesSel.value = prevProfiles;
       jiraFieldsLoaded = true;
     } catch (err) {
       console.error('stepperLoadJiraFields failed:', err);
@@ -926,7 +1073,7 @@ export const stepperScript = `
       owner: data.owner,
       repo: data.repo,
       workflowFile: 'claude-implement.yml',
-      defaultBranch: 'main',
+      defaultBranch: data.defaultBranch,
       maxInProgressAiIssues: data.maxInProgressAiIssues,
       executionMode: data.executionMode,
       sessionMode: data.sessionMode,
@@ -934,10 +1081,14 @@ export const stepperScript = `
       machineMemoryMb: data.machineMemoryMb,
       planningEnabled: data.planningEnabled,
       autoApprovePlans: data.autoApprovePlans,
+      autoMerge: data.autoMerge ?? false,
       planningWorkflowFile: 'claude-plan.yml',
       extraEnv: {},
       provider: data.provider,
       awsRegion: data.provider === 'bedrock' ? (data.awsRegion || null) : null,
+      skillsRepo: data.skillsRepo || null,
+      sensitiveAddPatterns: data.sensitiveAddPatterns || null,
+      sensitiveAllowPatterns: data.sensitiveAllowPatterns || null,
       ticketingProvider: data.ticketingProvider,
       ticketingConfig: data.ticketingProvider === 'jira'
         ? {
@@ -946,14 +1097,21 @@ export const stepperScript = `
             repoFieldValue: data.jiraRepoFieldValue,
             statusFieldOverride: data.jiraStatusFieldOverride || null,
             repoFieldOverride: data.jiraRepoFieldOverride || null,
+            profilesFieldOverride: data.jiraProfilesFieldOverride || null,
           }
         : { kind: 'linear' },
     };
 
+    const createBtn = document.getElementById('np-create');
+    const origCreateLabel = createBtn ? createBtn.textContent : '';
+    if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Creating...'; }
+    
     const res = await window.api('/api/mappings', { method: 'POST', body: JSON.stringify(body) });
+    let resData = {};
+    try { resData = await res.json(); } catch (_) {}
+    if (createBtn) { createBtn.disabled = false; createBtn.textContent = origCreateLabel; }
     if (!res.ok) {
-      const msg = await res.text().catch(function () { return 'Unknown error'; });
-      showError('Failed to create project: ' + msg);
+      showError('Failed to create project: ' + (resData.error || 'Unknown error'));
       return;
     }
 
@@ -973,14 +1131,18 @@ export const stepperScript = `
     }
 
     closeNewProjectStepper();
+    if (window.loadMappings) await window.loadMappings();
+    if (window.pollSyncStatus) window.pollSyncStatus(teamKey, resData.syncJobId);
+
+    // Project was created but some secrets failed — warn but don't block.
+    const notices = [];
     if (secretFailures > 0) {
-      // Project was created but some secrets failed — warn but don't block
-      // Use a brief timeout so the modal closes first
-      setTimeout(function () {
-        alert('Project created, but ' + secretFailures + ' secret(s) failed to save. You can add them via the Secrets button on the Projects page.');
-      }, 100);
+      notices.push(secretFailures + ' secret(s) failed to save. Add them via the Secrets button on the Projects page.');
     }
-    if (window.loadMappings) window.loadMappings();
+    if (notices.length) {
+      // Use a brief timeout so the modal closes first
+      setTimeout(function () { alert('Project created.\\n\\n' + notices.join('\\n\\n')); }, 100);
+    }
   }
 
   window.openNewProjectStepper = openNewProjectStepper;
@@ -996,5 +1158,6 @@ export const stepperScript = `
   window.onStepperRepoFieldChange = onStepperRepoFieldChange;
   window.stepperValidateJql = stepperValidateJql;
   window.updateStepperNextButton = updateStepperNextButton;
+  window.checkInstallState = checkInstallState;
 })();
 `;

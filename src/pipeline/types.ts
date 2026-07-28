@@ -1,5 +1,3 @@
-import type { ProviderId } from "../providers/types.js";
-
 export type StepStatus = "running" | "passed" | "failed" | "skipped" | "cancelled";
 
 export type StepType =
@@ -10,12 +8,6 @@ export type StepType =
   | "preflight"
   | "push"
   | "await_ci"
-  | "explore-codebase"
-  | "architecture-analysis"
-  | "test-plan"
-  | "work-unit-decomposition"
-  | "cross-story-context"
-  | "post-to-ticketing"
   | "custom";
 
 export interface Step {
@@ -38,14 +30,6 @@ export interface PipelineContextData {
   issueDescription: string;
   nonce: string;
   orchestratorUrl: string;
-  /** Ticketing provider for the runner to use when posting comments. */
-  ticketingProvider: ProviderId;
-  /** Planning pipeline: parent issue as "- IDENTIFIER: Title" or "None" */
-  parent?: string;
-  /** Planning pipeline: sibling stories, newline-separated or "None" */
-  siblings?: string;
-  /** Planning pipeline: related issues as "- [type] IDENTIFIER: Title", newline-separated or "None" */
-  dependencies?: string;
   /** Optional model override for Claude invocations (e.g. "claude-opus-4-5"). */
   model?: string;
   /** Autonomous runner: absolute path to the cloned workspace. */
@@ -64,6 +48,27 @@ export interface PipelineContextData {
   githubToken?: string;
   /** Autonomous runner: base branch to clone. Implementation branches are derived per issue. */
   branch?: string;
+  /** Autonomous runner: Claude provider ("anthropic" | "bedrock"), from PROVIDER env. */
+  provider?: string;
+  /** Autonomous runner: cap on Claude turns per implement pass (from env). */
+  maxTurns?: number;
+  /** Autonomous runner: cap on implement/review iterations (from env). */
+  maxIterations?: number;
+  /** Autonomous runner: optional branch-name prefix (from AI_IMPLEMENT_BRANCH_PREFIX). */
+  branchPrefix?: string;
+  /** Autonomous runner: URL of the skills repo to clone and install into ~/.claude/skills/. */
+  skillsRepo?: string;
+  /** Autonomous runner: per-issue AI-Implement profile names (from AI_IMPLEMENT_PROFILES).
+   *  Always set by run-autonomous ([] when the env var is absent). No built-in step reads
+   *  it — it is the contract surface for image-baked custom/ steps. */
+  profiles?: string[];
+  /** Autonomous runner: per-project sensitive-file add/allow globs from the run_config envelope. */
+  sensitiveFiles?: { add?: string[]; allow?: string[] };
+  /** Autonomous runner: true when this is a grouping parent's own closing-work run. Push.ts
+   *  uses this to finalize cleanly (no PR) when the agent produces no changes. */
+  groupingParent?: boolean;
+  /** Autonomous runner: WORKFLOW.md hook script paths (relative to repo root). */
+  hooks?: { setup?: string; verify?: string; teardown?: string };
 }
 
 export interface PipelineContext {
@@ -90,11 +95,28 @@ export interface StepModule<
   run(context: PipelineContext, inputs: I, reporter: StepReporter): Promise<O>;
 }
 
+export type LogLevel = "summary" | "stream";
+
+export interface RunTelemetry {
+  outcome: "success" | "max_turns" | "error" | "unknown";
+  numTurns: number | null;
+  durationMs: number | null;
+  costUsd: number | null;
+  /** Total input tokens, including prompt-cache creation and cache reads. */
+  tokensIn: number | null;
+  tokensOut: number | null;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
+  /** Compact per-call tool trace ("ToolName input-summary"), capped; last entry may be a truncation marker. */
+  toolTrace?: string[];
+}
+
 export interface LLMResult {
   stdout: string;
   stderr?: string;
   exitCode: number;
   tokensUsed: number;
+  telemetry?: RunTelemetry;
 }
 
 export interface LLMExecutor {

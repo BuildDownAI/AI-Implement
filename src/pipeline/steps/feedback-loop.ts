@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
-import type { PipelineContext, Step, StepModule, StepReporter } from "../types.js";
+import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { implementStep } from "./implement.js";
 import { reviewStep } from "./review.js";
+import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
+import { capDiff } from "./review.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -21,15 +23,30 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   /** Repo-level review model from .ai-implement/config.yml, injected by the install step. */
   repoReviewModel?: string;
   maxIterations?: number;
+  maxTurns?: number;
+  provider?: string;
   planningContext?: string;
   implementationPrompt?: string;
   parentStepId?: string;
+}
+
+export type TerminationReason = "approved" | "iterations_exhausted" | "review_error" | "max_turns";
+
+export interface PassStat extends Record<string, unknown> {
+  iteration: number;
+  implementTurns: number | null;
+  implementOutcome: string;   // RunTelemetry outcome or "unknown"
+  costUsd: number | null;
+  reviewApproved: boolean | null; // null when review never ran on this pass
 }
 
 interface FeedbackLoopOutputs extends Record<string, unknown> {
   approved: boolean;
   iterations: number;
   finalFeedback: string;
+  terminationReason: TerminationReason;
+  passes: PassStat[];
+  postMortem?: string;
 }
 
 function buildImplementPrompt(
@@ -50,13 +67,126 @@ function buildImplementPrompt(
   return basePrompt;
 }
 
-function getDiff(workspaceDir: string): string {
-  const result = spawnSync("git", ["diff", "HEAD"], {
+/**
+ * Pathspecs excluded from the review diff. Generated artifacts (relay
+ * `__generated__`, codegen `generated/` dirs) and lockfiles can each be
+ * hundreds of KB after a `db:sync` / codegen run, blowing the reviewer's
+ * prompt past the model context window. They are committed by the push step
+ * regardless — this only controls what the reviewer is shown.
+ */
+const REVIEW_DIFF_EXCLUDES = [
+  ":(exclude,glob)**/__generated__/**",
+  ":(exclude,glob)**/generated/**",
+  ":(exclude,glob)**/pnpm-lock.yaml",
+  ":(exclude,glob)**/package-lock.json",
+  ":(exclude,glob)**/yarn.lock",
+];
+
+export function getDiff(workspaceDir: string): string {
+  // Mark all untracked files as "intent to add" so git diff HEAD includes them
+  // as new-file additions. Without this, untracked files (e.g. newly created
+  // .mcp.json, .claude/settings.json) are invisible to the diff and the reviewer
+  // falsely rejects the implementation as "uncommitted". The push step runs
+  // git add -A unconditionally, so leaving intent-to-add markers is harmless.
+  spawnSync("git", ["add", "-N", "."], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
   });
-  if (result.status !== 0) return "";
+
+  const result = spawnSync(
+    "git",
+    ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
+    {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.status !== 0) {
+    // A non-zero exit means the reviewer sees an empty diff and may spuriously
+    // approve. Behaviour is unchanged (still return ""), but surface it so the
+    // failure is observable in the runner logs rather than silent.
+    console.warn(
+      `[getDiff] git diff failed (exit ${result.status ?? "null"}): ${result.stderr?.toString().trim() ?? ""}`,
+    );
+    return "";
+  }
   return result.stdout.toString();
+}
+
+const POST_MORTEM_MAX_TURNS = 15;
+
+function buildPostMortemPrompt(params: {
+  issueTitle: string;
+  issueDescription: string;
+  diff: string;
+  telemetry: RunTelemetry;
+  maxTurns: number;
+}): string {
+  const { issueTitle, issueDescription, diff, telemetry, maxTurns } = params;
+  const trace = (telemetry.toolTrace ?? []).join("\n") || "(no tool trace captured)";
+  return `An AI implementation session hit its turn cap (${telemetry.numTurns ?? "?"}/${maxTurns} turns) before completing. Write a concise post-mortem in markdown. You have read-only access to the workspace.
+
+Answer, with headers:
+1. **Where the turns went** — summarize the phases of work from the tool trace.
+2. **What is complete** — based on the diff.
+3. **What remains** — concrete missing pieces vs. the issue requirements.
+4. **Why it likely didn't converge** — over-broad scope, missing prerequisites, thin context, or environment friction. Be specific.
+
+Issue: ${issueTitle}
+
+Description:
+${issueDescription}
+
+## Working-tree diff
+\`\`\`diff
+${capDiff(diff)}
+\`\`\`
+
+## Tool trace (chronological)
+${trace}`;
+}
+
+/** Read-only post-mortem invocation. Non-fatal: returns null on any failure. */
+async function runPostMortem(
+  context: PipelineContext,
+  params: { issueTitle: string; issueDescription: string; diff: string; telemetry: RunTelemetry; maxTurns: number; model: string; iteration: number; parentStepId: string },
+  reporter: StepReporter,
+): Promise<string | null> {
+  const subStep: Step = {
+    id: `post-mortem.${params.iteration}`,
+    type: "custom",
+    status: "running",
+    started_at: new Date().toISOString(),
+    ended_at: null,
+    parent_step_id: params.parentStepId,
+    inputs: { iteration: params.iteration, maxTurns: params.maxTurns },
+    outputs: {},
+    logs_url: null,
+  };
+  await reporter.report(subStep);
+  try {
+    const result = await context.llmExecutor.invoke({
+      prompt: buildPostMortemPrompt(params),
+      model: params.model,
+      maxTurns: POST_MORTEM_MAX_TURNS,
+      tools: READ_ONLY_ALLOWED_TOOLS,
+    });
+    if (result.exitCode !== 0 || !result.stdout.trim()) {
+      throw new Error(`post-mortem invocation exited ${result.exitCode}`);
+    }
+    subStep.status = "passed";
+    subStep.ended_at = new Date().toISOString();
+    subStep.outputs = { length: result.stdout.length };
+    await reporter.report(subStep);
+    return result.stdout.trim();
+  } catch (err) {
+    subStep.status = "failed";
+    subStep.ended_at = new Date().toISOString();
+    subStep.outputs = { error: String(err) };
+    await reporter.report(subStep);
+    console.warn(`[feedback-loop] post-mortem failed (non-fatal): ${String(err)}`);
+    return null;
+  }
 }
 
 /**
@@ -72,8 +202,9 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
   ): Promise<FeedbackLoopOutputs> {
     const parentStepId =
       typeof inputs.parentStepId === "string" ? inputs.parentStepId : "feedback-loop";
-    const maxIterations =
-      typeof inputs.maxIterations === "number" ? inputs.maxIterations : DEFAULT_MAX_ITERATIONS;
+    const effectiveMaxIterations =
+      inputs.maxIterations ?? (inputs.provider === "bedrock" ? 2 : DEFAULT_MAX_ITERATIONS);
+    const effectiveMaxTurns = inputs.maxTurns ?? 50;
 
     // Fallback hierarchy: explicit per-step > unified `model` input > repo config > tenant default > hard default
     const tenantModel = context.data.model;
@@ -93,8 +224,11 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     let iteration = 0;
     let approved = false;
     let feedback = "";
+    let terminationReason: TerminationReason = "iterations_exhausted";
+    const passes: PassStat[] = [];
+    let postMortem: string | undefined;
 
-    while (iteration < maxIterations && !approved) {
+    while (iteration < effectiveMaxIterations && !approved) {
       iteration++;
 
       const implementPrompt = buildImplementPrompt(
@@ -117,6 +251,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           workspaceDir: inputs.workspaceDir,
           prompt: implementPrompt,
           model: resolvedImplementModel,
+          maxTurns: effectiveMaxTurns,
           planningContext: inputs.planningContext,
         },
         outputs: {},
@@ -124,13 +259,15 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       };
       await reporter.report(implementSubStep);
 
+      let implementOutputs: Awaited<ReturnType<typeof implementStep.run>>;
       try {
-        const implementOutputs = await implementStep.run(
+        implementOutputs = await implementStep.run(
           context,
           {
             workspaceDir: String(inputs.workspaceDir),
             prompt: implementPrompt,
             model: resolvedImplementModel,
+            maxTurns: effectiveMaxTurns,
             planningContext:
               inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined,
           },
@@ -148,7 +285,41 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         throw err;
       }
 
+      const implementTelemetry = implementOutputs.telemetry as RunTelemetry | undefined;
+      const pass: PassStat = {
+        iteration,
+        implementTurns: implementTelemetry?.numTurns ?? null,
+        implementOutcome: implementTelemetry?.outcome ?? "unknown",
+        costUsd: implementTelemetry?.costUsd ?? null,
+        reviewApproved: null,
+      };
+      passes.push(pass);
+
       const diff = getDiff(String(inputs.workspaceDir));
+
+      // Hard max_turns: the pass ran out of budget mid-work. Reviewing or
+      // re-implementing an over-scoped task just burns more passes — stop,
+      // post-mortem where the turns went, and let the pipeline open a draft PR.
+      if (implementTelemetry?.outcome === "max_turns") {
+        terminationReason = "max_turns";
+        feedback = `Implementation hit the ${effectiveMaxTurns}-turn cap before completing (${implementTelemetry.numTurns ?? "?"} turns used).`;
+        postMortem =
+          (await runPostMortem(
+            context,
+            {
+              issueTitle: String(inputs.issueTitle),
+              issueDescription: String(inputs.issueDescription),
+              diff,
+              telemetry: implementTelemetry,
+              maxTurns: effectiveMaxTurns,
+              model: resolvedReviewModel,
+              iteration,
+              parentStepId,
+            },
+            reporter,
+          )) ?? undefined;
+        break;
+      }
 
       // --- review sub-step ---
       const reviewSubStep: Step = {
@@ -190,15 +361,33 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
 
         approved = reviewOutputs.approved;
         feedback = reviewOutputs.feedback;
+        pass.reviewApproved = reviewOutputs.approved;
+        if (approved) terminationReason = "approved";
       } catch (err) {
+        // A review failure (e.g. "Prompt is too long", a transient API error)
+        // is NOT actionable feedback and must not discard a successful
+        // implementation. Record the failure, stop the loop, and let the
+        // pipeline push the working tree — retrying implementation would only
+        // burn another pass producing the same un-reviewable diff.
         reviewSubStep.status = "failed";
         reviewSubStep.ended_at = new Date().toISOString();
         reviewSubStep.outputs = { error: String(err) };
         await reporter.report(reviewSubStep);
-        throw err;
+        console.warn(
+          `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
+        );
+        approved = false;
+        feedback = `Review step failed and was skipped: ${String(err)}`;
+        terminationReason = "review_error";
+        break;
       }
     }
 
-    return { approved, iterations: iteration, finalFeedback: feedback };
+    if (!approved) {
+      console.warn(
+        `[feedback-loop] exited without approval (${terminationReason}) after ${iteration}/${effectiveMaxIterations} iteration(s). Final feedback: ${feedback || "(none)"}`,
+      );
+    }
+    return { approved, iterations: iteration, finalFeedback: feedback, terminationReason, passes, ...(postMortem ? { postMortem } : {}) };
   },
 };

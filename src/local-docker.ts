@@ -9,8 +9,7 @@ const execFile = promisify(nodeExecFile);
 const SECRET_ENV_KEYS = new Set([
   "ANTHROPIC_API_KEY",
   "CLAUDE_CODE_OAUTH_TOKEN",
-  "GITHUB_APP_PRIVATE_KEY",
-  "LINEAR_API_KEY",
+  "GITHUB_TOKEN",
   "RUN_TOKEN",
   "SESSION_TOKEN",
 ]);
@@ -24,14 +23,13 @@ export interface LocalRunnerInput {
   owner: string;
   repo: string;
   defaultBranch: string;
-  linearApiKey?: string;
   anthropicApiKey?: string;
   claudeOAuthToken?: string;
-  githubAppId: string;
-  githubAppPrivateKey: string;
+  githubToken: string;
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
+  phase?: "implementation" | "planning";
   orchestratorUrl?: string;
   runnerCallbackUrl?: string;
   runToken?: string;
@@ -58,14 +56,13 @@ export function buildLocalRunnerEnv(input: LocalRunnerInput): Record<string, str
     GITHUB_OWNER: input.owner,
     GITHUB_REPO: input.repo,
     GITHUB_DEFAULT_BRANCH: input.defaultBranch,
-    GITHUB_APP_ID: input.githubAppId,
-    GITHUB_APP_PRIVATE_KEY: input.githubAppPrivateKey,
+    GITHUB_TOKEN: input.githubToken,
     SESSION_TOKEN: input.sessionToken,
     MACHINE_NONCE: input.machineNonce,
     SESSION_MODE: input.sessionMode ?? "autonomous",
+    RUNNER_PHASE: input.phase ?? "implementation",
   };
 
-  if (input.linearApiKey) env.LINEAR_API_KEY = input.linearApiKey;
   if (input.claudeOAuthToken) env.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthToken;
   if (input.anthropicApiKey) env.ANTHROPIC_API_KEY = input.anthropicApiKey;
   if (input.orchestratorUrl) env.ORCHESTRATOR_URL = input.orchestratorUrl;
@@ -170,6 +167,78 @@ export async function fetchLocalContainerLogs(containerId: string, lastN = 100):
   } catch (err) {
     throw new Error(`Failed to fetch local Docker logs for ${containerId}: ${errorMessage(err)}`);
   }
+}
+
+export interface ExitedContainer {
+  id: string;
+  name: string;
+  /** Human-readable docker status, e.g. "Exited (0) 5 minutes ago". */
+  status: string;
+}
+
+/** Lists exited ai-implement-* containers with full (untruncated) IDs. */
+export async function listExitedAiImplementContainers(): Promise<ExitedContainer[]> {
+  const { stdout } = await execFile("docker", [
+    "ps", "-a", "--no-trunc",
+    "--filter", "status=exited",
+    "--filter", "name=ai-implement-",
+    "--format", "{{.ID}}\t{{.Names}}\t{{.Status}}",
+  ]);
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [id, name, ...rest] = line.split("\t");
+      return { id, name, status: rest.join("\t") };
+    });
+}
+
+/**
+ * Pure selection of exited containers that are safe to force-remove.
+ * Excludes containers still tied to an in-flight job (the monitor owns those:
+ * it inspects the exit code and posts logs before removing) and containers
+ * that exited seconds ago (grace period so a just-exited container of a
+ * not-yet-recorded or not-yet-monitored job is never reaped early).
+ */
+export function selectSweepableContainers(
+  containers: ExitedContainer[],
+  inFlightMachineIds: string[],
+): ExitedContainer[] {
+  return containers.filter((c) => {
+    const inFlight = inFlightMachineIds.some(
+      (id) => id === c.id || id.startsWith(c.id) || c.id.startsWith(id),
+    );
+    if (inFlight) return false;
+    if (/second/i.test(c.status)) return false;
+    return true;
+  });
+}
+
+/**
+ * Removes exited ai-implement containers no in-flight job owns. Needed because
+ * a planning job finalized by the runner callback goes terminal before the
+ * monitor's completion pass, so the monitor never removes its container.
+ * Returns the names of removed containers; docker being unavailable is not an
+ * error (returns []).
+ */
+export async function sweepExitedLocalContainers(inFlightMachineIds: string[]): Promise<string[]> {
+  let containers: ExitedContainer[];
+  try {
+    containers = await listExitedAiImplementContainers();
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const container of selectSweepableContainers(containers, inFlightMachineIds)) {
+    try {
+      await removeLocalContainer(container.id);
+      removed.push(container.name || container.id.slice(0, 12));
+    } catch (err) {
+      console.error(`[monitor] Failed to sweep exited local container ${container.name}:`, err);
+    }
+  }
+  return removed;
 }
 
 export async function removeLocalContainer(containerId: string): Promise<void> {

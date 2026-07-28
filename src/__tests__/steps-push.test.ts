@@ -9,7 +9,7 @@ vi.mock("node:child_process", () => ({
 
 import { spawnSync } from "node:child_process";
 
-function makeContext(): DefaultPipelineContext {
+function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
   return new DefaultPipelineContext({
     jobId: 1,
     issueId: "issue-1",
@@ -18,7 +18,7 @@ function makeContext(): DefaultPipelineContext {
     issueDescription: "Desc",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
-    ticketingProvider: "linear",
+    ...overrides,
   });
 }
 
@@ -77,6 +77,26 @@ describe("pushStep", () => {
     expect(outputs.prNumber).toBe(7);
     expect(outputs.branchPushed).toBe(true);
     expect(outputs.commitSha).toBe("abc123");
+  });
+
+  it("uses the context branch as the PR base when baseBranch input is omitted", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext({ branch: "development" }),
+      { ...BASE_INPUTS, baseBranch: undefined },
+      new NoopStepReporter(),
+    );
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { base: string };
+    expect(body.base).toBe("development");
   });
 
   it("returns existing PR info on 422 (PR already open)", async () => {
@@ -219,6 +239,69 @@ describe("pushStep", () => {
     expect(body.body).toContain("Generated with AI-Implement");
     expect(body.body).not.toContain("## What was implemented");
     expect(body.body).not.toContain("## AI review");
+  });
+
+  it("footer includes harness, model, and provider with explicit values", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext({ model: "claude-opus-4-5", provider: "bedrock" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("Generated with AI-Implement · harness: Claude Code · model: claude-opus-4-5 · provider: bedrock");
+  });
+
+  it("footer degrades to model: unknown when model is absent", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("Generated with AI-Implement");
+    expect(body.body).toContain("model: unknown");
+  });
+
+  it("footer defaults to provider: anthropic when provider is absent", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    await pushStep.run(makeContext({ model: "claude-sonnet-4-6" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain("provider: anthropic");
+  });
+
+  it("footer includes Bedrock ARN-style model ID verbatim", async () => {
+    mockGitSuccess();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/1", number: 1 }),
+    } as Response);
+
+    const bedrockModel = "anthropic.claude-opus-4-5-20260101-v1:0";
+    await pushStep.run(makeContext({ model: bedrockModel, provider: "bedrock" }), BASE_INPUTS, new NoopStepReporter());
+
+    const fetchCall = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(fetchCall[1]?.body as string) as { body: string };
+    expect(body.body).toContain(`model: ${bedrockModel}`);
+    expect(body.body).toContain("provider: bedrock");
   });
 
   it("checks out implementation branch and commits working tree changes before pushing", async () => {
@@ -374,6 +457,170 @@ describe("pushStep", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("blocks the push when a sensitive file is staged", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, "src/app.ts\n.env\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not block a staged deletion of a sensitive file", async () => {
+    // git itself omits deletions when --diff-filter=d is passed; simulate that:
+    // the deleted .env only shows up if the filter flag is missing.
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " D .env\n M src/app.ts\n");
+      if (gitArgs[0] === "diff") {
+        return gitArgs.includes("--diff-filter=d")
+          ? spawnResult(0, "src/app.ts\n")
+          : spawnResult(0, "src/app.ts\n.env\n");
+      }
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\nD\t.env\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/9");
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["diff", "--cached", "--name-only", "--diff-filter=d"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+  });
+
+  it("throws when listing staged files fails instead of skipping the sensitive-file guard", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "diff") return spawnResult(128, "", "fatal: bad revision");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/git diff --cached failed/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("(c1) allow-list suppresses a default sensitive-file hit", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\t.env\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
+      new NoopStepReporter(),
+    );
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/9");
+  });
+
+  it("(c2) allow-list does not suppress an unrelated sensitive-file hit", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M id_rsa\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, "id_rsa\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, sensitiveFiles: { allow: [".env"] } },
+        new NoopStepReporter(),
+      ),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("(c3) no sensitiveFiles config → existing default behavior unchanged", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("add-pattern hit carries client-configured pattern description", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M config.secret\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, "config.secret\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, sensitiveFiles: { add: ["*.secret"] } },
+        new NoopStepReporter(),
+      ),
+    ).rejects.toThrow(/client-configured pattern \(\*\.secret\)/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("allow-list glob suppresses a matching variant (.env.local)", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M .env.local\n");
+      if (gitArgs[0] === "diff") return spawnResult(0, ".env.local\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\t.env.local\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sensitiveFiles: { allow: [".env.*"] } },
+      new NoopStepReporter(),
+    );
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/9");
+  });
+
   it("refuses to push over the base branch", async () => {
     await expect(
       pushStep.run(
@@ -383,5 +630,415 @@ describe("pushStep", () => {
       ),
     ).rejects.toThrow(/Refusing to push implementation branch/);
     expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it("logs a token-redacted push trace at stream log level", async () => {
+    const prev = process.env.AI_IMPLEMENT_LOG_LEVEL;
+    process.env.AI_IMPLEMENT_LOG_LEVEL = "stream";
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Trace output echoes the tokenized remote URL on both streams; stdout has
+      // no trailing newline so the separator fix is exercised too.
+      const tokenizedUrl = `https://x-access-token:gh-token@github.com/acme/app.git`;
+      vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+        const gitArgs = args as string[];
+        if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+        if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+        if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+        if (gitArgs[0] === "ls-remote") {
+          return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+        }
+        if (gitArgs[0] === "push") {
+          return spawnResult(
+            0,
+            `Pushing to ${tokenizedUrl}`,
+            `region_enter send-pack ${tokenizedUrl}\n`,
+          );
+        }
+        return spawnResult(0);
+      });
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+        text: async () => "",
+      } as Response);
+
+      await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      const traceCall = errorSpy.mock.calls
+        .map((c) => String(c[0]))
+        .find((msg) => msg.includes("[git-push trace]"));
+      expect(traceCall).toBeDefined();
+      expect(traceCall).not.toContain("gh-token");
+      expect(traceCall).toContain("***");
+      // stdout and stderr are separated by a newline, not run together.
+      expect(traceCall).toMatch(/Pushing to[^\n]*\nregion_enter/);
+    } finally {
+      errorSpy.mockRestore();
+      if (prev === undefined) delete process.env.AI_IMPLEMENT_LOG_LEVEL;
+      else process.env.AI_IMPLEMENT_LOG_LEVEL = prev;
+    }
+  });
+});
+
+const REVIEW_SUMMARY = {
+  terminationReason: "iterations_exhausted",
+  iterations: 3,
+  finalFeedback: "Missing tests for the retry path.",
+  passes: [
+    { iteration: 1, implementTurns: 98, implementOutcome: "success", costUsd: 3.21, reviewApproved: false },
+  ],
+  postMortem: "## Post-mortem\nScope too broad.",
+};
+
+describe("pushStep draft PRs", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("creates a draft PR with an unapproved section in the body", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(true);
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+    expect(body.draft).toBe(true);
+    expect(body.body).toContain("Automated review did not approve");
+    expect(body.body).toContain("Missing tests for the retry path.");
+    expect(body.body).toContain("iterations_exhausted");
+    expect(body.body).toContain("Post-mortem");
+    // The test-plan line must not contradict the unapproved section above it: no
+    // testsSummary/preflight summary was supplied, so the fallback must say
+    // verification was skipped (unchecked box), not that it ran (checked box).
+    expect(body.body).toContain("- [ ] Automated verification was skipped — the review loop did not approve this change.");
+    expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  });
+
+  it("falls back to a titled normal PR when the draft flag is rejected (422, no existing PR)", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      // draft create → 422
+      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "draft not supported" } as Response)
+      // list open PRs → none
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [], text: async () => "" } as Response)
+      // retry without draft → created
+      .mockResolvedValueOnce({
+        ok: true, status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/10", number: 10 }),
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, prTitle: "ENG-42: Test", draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(false);
+    expect(outputs.prNumber).toBe(10);
+    const [, retryInit] = vi.mocked(fetch).mock.calls[2];
+    const retryBody = JSON.parse(String(retryInit?.body));
+    expect(retryBody.draft).toBeUndefined();
+    expect(retryBody.title).toBe("[NEEDS REVIEW — unapproved] ENG-42: Test");
+  });
+
+  it("still resolves an already-open PR on 422 when drafting", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "exists" } as Response)
+      .mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: true }],
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prNumber).toBe(8);
+    expect(outputs.draft).toBe(true);
+  });
+
+  it("reports draft=false when the 422-resolved existing PR is not a draft", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "exists" } as Response)
+      .mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => [{ html_url: "https://github.com/acme/app/pull/8", number: 8, draft: false }],
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: REVIEW_SUMMARY },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(false);
+  });
+
+  it("non-draft pushes send no draft flag and no unapproved section", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.draft).toBe(false);
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+    expect(body.draft).toBeUndefined();
+    expect(body.body).not.toContain("Automated review did not approve");
+  });
+});
+
+// ---- Case A: agent committed its own changes ----
+
+describe("pushStep — Case A (agent-committed changes)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  function mockAgentCommitted(sha = "abc123") {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, ""); // clean working tree
+      if (gitArgs[0] === "rev-list") return spawnResult(0, "1\n"); // 1 commit ahead
+      if (gitArgs[0] === "diff" && gitArgs[1] === "--diff-filter=d") {
+        // Committed file list for sensitive-file guard
+        return spawnResult(0, "src/app.ts\n");
+      }
+      if (gitArgs[0] === "diff" && gitArgs[1] === "--name-status") {
+        // PR body summary (range diff)
+        return spawnResult(0, "M\tsrc/app.ts\n");
+      }
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, `${sha}\n`);
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      }
+      return spawnResult(0);
+    });
+  }
+
+  it("pushes agent-committed work without throwing 'Nothing to commit'", async () => {
+    mockAgentCommitted("commitA");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/11", number: 11 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/11");
+    expect(outputs.branchPushed).toBe(true);
+    expect(outputs.commitSha).toBe("commitA");
+    // Must NOT have called git add or git commit — agent already committed
+    expect(spawnSync).not.toHaveBeenCalledWith("git", ["add", "-A"], expect.anything());
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git", expect.arrayContaining(["commit"]), expect.anything(),
+    );
+  });
+
+  it("runs the sensitive-file guard against the committed diff in Case A", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, ""); // clean working tree
+      if (gitArgs[0] === "rev-list") return spawnResult(0, "1\n");
+      if (gitArgs[0] === "diff" && gitArgs[1] === "--diff-filter=d") {
+        // Guard list: committed a sensitive file
+        return spawnResult(0, "src/app.ts\n.env\n");
+      }
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("uses the range diff for the PR body summary in Case A", async () => {
+    mockAgentCommitted();
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/12", number: 12 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    // Should use git diff --name-status main..HEAD (not git show HEAD)
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["diff", "--name-status", "main..HEAD"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining(["show"]),
+      expect.anything(),
+    );
+  });
+});
+
+// ---- Case B: grouping parent with no own work ----
+
+describe("pushStep — Case B (grouping parent no-op)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  function mockNoChanges() {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, ""); // clean working tree
+      if (gitArgs[0] === "rev-list") return spawnResult(0, "0\n"); // no commits ahead
+      return spawnResult(0);
+    });
+  }
+
+  it("returns a clean no-op (no PR, branchPushed=false) for a grouping parent with no changes", async () => {
+    mockNoChanges();
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, groupingParent: true },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prUrl).toBeNull();
+    expect(outputs.prNumber).toBeNull();
+    expect(outputs.branchPushed).toBe(false);
+    expect(outputs.commitSha).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does NOT create a PR (never calls fetch) on a grouping-parent no-op", async () => {
+    mockNoChanges();
+
+    await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, groupingParent: true },
+      new NoopStepReporter(),
+    );
+
+    expect(fetch).not.toHaveBeenCalled();
+    // No git commit or push either
+    expect(spawnSync).not.toHaveBeenCalledWith("git", ["add", "-A"], expect.anything());
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git", expect.arrayContaining(["push"]), expect.anything(),
+    );
+  });
+
+  it("still throws 'Nothing to commit' for a leaf run with no changes (groupingParent unset)", async () => {
+    mockNoChanges();
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Nothing to commit/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("still throws 'Nothing to commit' for a leaf run with groupingParent=false", async () => {
+    mockNoChanges();
+
+    await expect(
+      pushStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, groupingParent: false },
+        new NoopStepReporter(),
+      ),
+    ).rejects.toThrow(/Nothing to commit/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("pushes normally when a grouping parent DOES have working-tree changes", async () => {
+    // groupingParent=true but the agent left uncommitted changes → standard path
+    mockGitSuccess("sha-gp");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/13", number: 13 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, groupingParent: true },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prUrl).toBe("https://github.com/acme/app/pull/13");
+    expect(outputs.branchPushed).toBe(true);
+  });
+});
+
+// ---- Review hardening: fail-closed git checks + mixed-state sensitive scan ----
+
+describe("pushStep — hardening (review findings)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("fails CLOSED when git rev-list errors on a grouping-parent run (never silently no-ops)", async () => {
+    // Regression: hasCommitsAheadOfBase used to return false on git error, which would make a
+    // grouping-parent run take the Case-B no-op → markMerged → silently discard committed work.
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, ""); // clean working tree
+      if (gitArgs[0] === "rev-list") return spawnResult(128, "", "fatal: bad revision 'main..HEAD'");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), { ...BASE_INPUTS, groupingParent: true }, new NoopStepReporter()),
+    ).rejects.toThrow(/git rev-list .*failed/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("catches a committed secret in a MIXED commit+working-tree state (unified committed-diff scan)", async () => {
+    // The agent committed a secret earlier in the run AND left other uncommitted edits. The
+    // dirty path's --cached scan only sees newly-staged files (no secret); the unified
+    // baseBranch..HEAD scan must still catch the already-committed .env.
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n"); // dirty working tree
+      if (gitArgs[0] === "diff" && gitArgs.includes("--cached")) {
+        return spawnResult(0, "src/app.ts\n"); // staged files — no secret here
+      }
+      if (gitArgs[0] === "diff" && gitArgs.includes("main..HEAD")) {
+        return spawnResult(0, "src/app.ts\n.env\n"); // full committed diff — secret committed earlier
+      }
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "sha\n");
+      return spawnResult(0);
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/Push blocked/);
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

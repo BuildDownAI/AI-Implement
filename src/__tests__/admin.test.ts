@@ -9,9 +9,23 @@ import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
 import type * as LogModule from "../log.js";
 import type * as StepLogModule from "../step-log.js";
+import type * as InstallStateModule from "../github-install-state.js";
+import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketIssue } from "../providers/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
+
+vi.mock("../workflow-sync.js", () => ({
+  syncWorkflowTemplates: vi.fn(),
+  classifySyncError: (err: unknown) => ({
+    category: "unknown",
+    message: err instanceof Error ? err.message : String(err),
+  }),
+}));
+
+vi.mock("../github-install-state.js", () => ({
+  probeInstallState: vi.fn(),
+}));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
@@ -64,6 +78,8 @@ let dedup: typeof DedupModule;
 let runnerMode: typeof RunnerModeModule;
 let log: typeof LogModule;
 let stepLog: typeof StepLogModule;
+let installState: typeof InstallStateModule;
+let queue: typeof WorkflowSyncQueueModule;
 let provider: FakeProvider;
 
 beforeEach(async () => {
@@ -77,6 +93,8 @@ beforeEach(async () => {
   runnerMode = await import("../runner-mode.js");
   log = await import("../log.js");
   stepLog = await import("../step-log.js");
+  installState = await import("../github-install-state.js");
+  queue = await import("../workflow-sync-queue.js");
   config.initMappingsTable();
   log.initLogTable();
   stepLog.initStepLogTable();
@@ -94,13 +112,31 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
     flySessionsToken: null,
     flySessionsApp: null,
     flySessionsRegion: null,
-    linearApiKey: "test-linear-key",
     githubAppId: "test-app-id",
     githubAppPrivateKey: "test-private-key",
   };
 }
 
 async function request(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
+  let requestBody = body;
+  if (
+    url === "/api/mappings" &&
+    method === "POST" &&
+    requestBody &&
+    typeof requestBody === "object" &&
+    !Array.isArray(requestBody) &&
+    "teamKey" in requestBody &&
+    "owner" in requestBody &&
+    "repo" in requestBody &&
+    !("defaultBranch" in requestBody)
+  ) {
+    // Existing mapping tests pre-date the required defaultBranch field; keep them focused on their original assertions.
+    requestBody = { defaultBranch: "main", ...requestBody };
+  }
+  return requestRaw(url, method, accessCode, requestBody, token);
+}
+
+async function requestRaw(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
@@ -150,7 +186,6 @@ describe("admin auth", () => {
       flySessionsToken: null,
       flySessionsApp: null,
       flySessionsRegion: null,
-      linearApiKey: "test",
       githubAppId: "test",
       githubAppPrivateKey: "test",
     }, makeFakeRegistry(provider));
@@ -178,7 +213,7 @@ describe("admin mappings", () => {
   it("creates a mapping with custom maxInProgressAiIssues", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "APP", owner: "org", repo: "app", maxInProgressAiIssues: 5 }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).maxInProgressAiIssues).toBe(5);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
@@ -188,7 +223,7 @@ describe("admin mappings", () => {
   it("defaults maxInProgressAiIssues to 3 when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "API", owner: "org", repo: "api" }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).maxInProgressAiIssues).toBe(3);
   });
 
@@ -203,6 +238,43 @@ describe("admin mappings", () => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", { teamKey: "APP" }, token);
     expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects mapping creation without a default branch", async () => {
+    const token = await login("secret");
+    const res = await request(
+      "/api/mappings",
+      "POST",
+      "secret",
+      { teamKey: "APP", owner: "org", repo: "app", defaultBranch: "" },
+      token,
+    );
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("defaultBranch");
+  });
+
+  it("preserves an existing mapping defaultBranch when an upsert omits it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DEV",
+      owner: "org",
+      repo: "app",
+      defaultBranch: "development",
+    }, token);
+    expect(create.statusCode).toBe(202);
+
+    const update = await requestRaw("/api/mappings", "POST", "secret", {
+      teamKey: "DEV",
+      owner: "org",
+      repo: "app-renamed",
+    }, token);
+    expect(update.statusCode).toBe(202);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).DEV).toMatchObject({
+      repo: "app-renamed",
+      defaultBranch: "development",
+    });
   });
 
   it("updates the cap via PATCH", async () => {
@@ -291,7 +363,7 @@ describe("admin mappings", () => {
       teamKey: "FLY", owner: "org", repo: "fly-repo",
       executionMode: "fly-machines", sessionMode: "hybrid", machineCpus: 4, machineMemoryMb: 8192,
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const data = JSON.parse(create.body);
     expect(data.executionMode).toBe("fly-machines");
     expect(data.sessionMode).toBe("hybrid");
@@ -307,7 +379,7 @@ describe("admin mappings", () => {
   it("defaults v2 fields when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "DEF", owner: "org", repo: "def-repo" }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const data = JSON.parse(create.body);
     expect(data.executionMode).toBe("github-actions");
     expect(data.sessionMode).toBe("autonomous");
@@ -349,7 +421,7 @@ describe("admin mappings", () => {
       teamKey: "AII", owner: "org", repo: "ai-implement",
       extraEnv: { DEDUP_DB_PATH: "/tmp/dedup.sqlite" },
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).extraEnv).toEqual({ DEDUP_DB_PATH: "/tmp/dedup.sqlite" });
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
@@ -359,7 +431,7 @@ describe("admin mappings", () => {
   it("defaults extraEnv to empty object when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "DEF", owner: "org", repo: "def" }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).extraEnv).toEqual({});
   });
 
@@ -368,7 +440,7 @@ describe("admin mappings", () => {
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "AAP", owner: "org", repo: "aap-repo", autoApprovePlans: false,
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).autoApprovePlans).toBe(false);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
@@ -378,11 +450,31 @@ describe("admin mappings", () => {
   it("defaults autoApprovePlans to true when omitted", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", { teamKey: "AAPD", owner: "org", repo: "aapd-repo" }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     expect(JSON.parse(create.body).autoApprovePlans).toBe(true);
 
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(JSON.parse(list.body).AAPD.autoApprovePlans).toBe(true);
+  });
+
+  it("defaults autoMerge to false when omitted", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", { teamKey: "AMD", owner: "org", repo: "amd-repo" }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).autoMerge).toBe(false);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).AMD.autoMerge).toBe(false);
+  });
+
+  it("persists autoMerge:true when explicitly enabled (per-project opt-in)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", { teamKey: "AMON", owner: "org", repo: "amon-repo", autoMerge: true }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).autoMerge).toBe(true);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).AMON.autoMerge).toBe(true);
   });
 
   it("rejects planningEnabled:true with empty planningWorkflowFile", async () => {
@@ -409,7 +501,7 @@ describe("admin mappings", () => {
     const create = await request("/api/mappings", "POST", "secret", {
       teamKey: "DEF", owner: "org", repo: "def",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const body = JSON.parse(create.body);
     expect(body.provider).toBe("anthropic");
     expect(body.awsRegion).toBeNull();
@@ -421,7 +513,7 @@ describe("admin mappings", () => {
       teamKey: "BED", owner: "org", repo: "bedrock-repo",
       provider: "bedrock", awsRegion: "us-west-2",
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const body = JSON.parse(create.body);
     expect(body.provider).toBe("bedrock");
     expect(body.awsRegion).toBe("us-west-2");
@@ -470,6 +562,65 @@ describe("admin mappings", () => {
     expect(JSON.parse(res.body).error).toMatch(/bedrock.*fly-machines/);
   });
 
+  it("creates a mapping with maxTurns/maxIterations/maxJobMinutes and round-trips them", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPS", owner: "org", repo: "caps-repo",
+      maxTurns: 40, maxIterations: 2, maxJobMinutes: 30,
+    }, token);
+    expect(create.statusCode).toBe(202);
+    const body = JSON.parse(create.body);
+    expect(body.maxTurns).toBe(40);
+    expect(body.maxIterations).toBe(2);
+    expect(body.maxJobMinutes).toBe(30);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    const m = JSON.parse(list.body).CAPS;
+    expect(m.maxTurns).toBe(40);
+    expect(m.maxIterations).toBe(2);
+    expect(m.maxJobMinutes).toBe(30);
+  });
+
+  it("defaults maxTurns/maxIterations/maxJobMinutes to null when omitted", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPD", owner: "org", repo: "capd-repo",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    const body = JSON.parse(create.body);
+    expect(body.maxTurns).toBeNull();
+    expect(body.maxIterations).toBeNull();
+    expect(body.maxJobMinutes).toBeNull();
+  });
+
+  it("rejects maxTurns:0 with 400 mentioning maxTurns", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad", maxTurns: 0,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/maxTurns/);
+  });
+
+  it("rejects maxIterations:-1 with 400 mentioning maxIterations", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "BAD", owner: "org", repo: "bad", maxIterations: -1,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/maxIterations/);
+  });
+
+  it("accepts null maxTurns explicitly and stores null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "CAPN", owner: "org", repo: "capn-repo",
+      maxTurns: null,
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).maxTurns).toBeNull();
+  });
+
   it("upsertMapping accepts a Jira ticketingProvider with valid config", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {
@@ -481,7 +632,7 @@ describe("admin mappings", () => {
         repoFieldValue: "org/jira-app",
       },
     }, token);
-    expect(create.statusCode).toBe(200);
+    expect(create.statusCode).toBe(202);
     const list = await request("/api/mappings", "GET", "secret", undefined, token);
     expect(list.statusCode).toBe(200);
     const entry = JSON.parse(list.body).JIRA1;
@@ -493,6 +644,7 @@ describe("admin mappings", () => {
       repoFieldValue: "org/jira-app",
       statusFieldOverride: null,
       repoFieldOverride: null,
+      profilesFieldOverride: null,
     });
   });
 
@@ -505,6 +657,297 @@ describe("admin mappings", () => {
     }, token);
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toMatch(/kind/);
+  });
+
+  it("persists a valid branchPrefix and returns it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX", owner: "org", repo: "app", branchPrefix: "pr",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).branchPrefix).toBe("pr");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).PFX.branchPrefix).toBe("pr");
+  });
+
+  it("normalizes surrounding slashes on branchPrefix", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX2", owner: "org", repo: "app", branchPrefix: "/pr/",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).branchPrefix).toBe("pr");
+  });
+
+  it("treats a blank branchPrefix as null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFX3", owner: "org", repo: "app", branchPrefix: "  ",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).branchPrefix).toBeNull();
+  });
+
+  it("rejects an invalid branchPrefix", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "PFXBAD", owner: "org", repo: "app", branchPrefix: "has space",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("branchPrefix");
+  });
+
+  it("expands skillsRepo shorthand to GitHub HTTPS URL at storage time", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR1", owner: "org", repo: "app", skillsRepo: "acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SR1.skillsRepo).toBe("https://github.com/acme/skills");
+  });
+
+  it("persists a valid skillsRepo HTTPS URL and returns it", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR2", owner: "org", repo: "app", skillsRepo: "https://github.com/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
+  });
+
+  it("rejects an SSH skillsRepo URL (the runner can only clone via https token)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR3", owner: "org", repo: "app", skillsRepo: "git@github.com:acme/skills.git",
+    }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toMatch(/skillsRepo/i);
+  });
+
+  it("treats a blank skillsRepo as null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR4", owner: "org", repo: "app", skillsRepo: "   ",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBeNull();
+  });
+
+  it("rejects an invalid skillsRepo", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRBAD", owner: "org", repo: "app", skillsRepo: "not a valid repo",
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("skillsRepo");
+  });
+
+  it("rejects a non-string skillsRepo", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRBAD2", owner: "org", repo: "app", skillsRepo: 123,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("skillsRepo");
+  });
+
+  it("rejects a non-github HTTPS skillsRepo URL (the runner's token must never leave github.com)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR5", owner: "org", repo: "app", skillsRepo: "https://gitlab.com/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+  });
+
+  it("rejects a lookalike-host skillsRepo URL (github.com prefix on another domain)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR6", owner: "org", repo: "app", skillsRepo: "https://github.com.evil.example/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+  });
+
+  it("rejects a www.github.com skillsRepo URL (git remotes live on the apex host)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR7", owner: "org", repo: "app", skillsRepo: "https://www.github.com/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+  });
+
+  it("accepts a github.com skillsRepo URL regardless of host case", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR8", owner: "org", repo: "app", skillsRepo: "https://GitHub.com/acme/skills.git",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://GitHub.com/acme/skills.git");
+  });
+
+  it("clears skillsRepo when an existing mapping is updated to null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRUPD", owner: "org", repo: "app", skillsRepo: "acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).skillsRepo).toBe("https://github.com/acme/skills");
+
+    const clear = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRUPD", owner: "org", repo: "app", skillsRepo: null,
+    }, token);
+    expect(clear.statusCode).toBe(202);
+    expect(JSON.parse(clear.body).skillsRepo).toBeNull();
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SRUPD.skillsRepo).toBeNull();
+  });
+
+  it("clears skillsRepo when an existing mapping is updated to blank", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRUPD2", owner: "org", repo: "app", skillsRepo: "acme/skills",
+    }, token);
+
+    const clear = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SRUPD2", owner: "org", repo: "app", skillsRepo: "   ",
+    }, token);
+    expect(clear.statusCode).toBe(202);
+    expect(JSON.parse(clear.body).skillsRepo).toBeNull();
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SRUPD2.skillsRepo).toBeNull();
+  });
+
+  it("accepts newline-separated sensitiveAddPatterns string and persists as array", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGAP1", owner: "org", repo: "app",
+      sensitiveAddPatterns: "*.secrets.toml\n.env.local",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAddPatterns).toEqual(["*.secrets.toml", ".env.local"]);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SGAP1.sensitiveAddPatterns).toEqual(["*.secrets.toml", ".env.local"]);
+  });
+
+  it("accepts sensitiveAllowPatterns as an array and persists it", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGAL1", owner: "org", repo: "app",
+      sensitiveAllowPatterns: [".env", ".env.*"],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAllowPatterns).toEqual([".env", ".env.*"]);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).SGAL1.sensitiveAllowPatterns).toEqual([".env", ".env.*"]);
+  });
+
+  it("treats blank sensitiveAddPatterns as null", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGNULL", owner: "org", repo: "app",
+      sensitiveAddPatterns: "   \n  ",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAddPatterns).toBeNull();
+  });
+
+  it("treats absent sensitiveAddPatterns/sensitiveAllowPatterns as null (regression guard)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGNONE", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAddPatterns).toBeNull();
+    expect(JSON.parse(res.body).sensitiveAllowPatterns).toBeNull();
+  });
+
+  it("rejects bare ** in sensitiveAddPatterns with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD1", owner: "org", repo: "app",
+      sensitiveAddPatterns: ["secrets/", "**"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("**");
+  });
+
+  it("rejects a glob longer than 256 chars with 400", async () => {
+    const token = await login("secret");
+    const longGlob = "a".repeat(257);
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD2", owner: "org", repo: "app",
+      sensitiveAddPatterns: [longGlob],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain(longGlob.slice(0, 30));
+  });
+
+  it("rejects more than 100 globs in sensitiveAllowPatterns with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD3", owner: "org", repo: "app",
+      sensitiveAllowPatterns: Array.from({ length: 101 }, (_, i) => `pattern-${i}.txt`),
+    }, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a picomatch-invalid glob with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD4", owner: "org", repo: "app",
+      sensitiveAddPatterns: ["[z-a]"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("[z-a]");
+  });
+
+  it("rejects an all-wildcard glob (**/*) in sensitiveAllowPatterns with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD5", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["**/*"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("**/*");
+  });
+
+  it("rejects a bare * glob (matches everything) with 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD6", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["*"],
+    }, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-string sensitiveAddPatterns value with a clean 400 (no raw TypeError)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGBAD7", owner: "org", repo: "app",
+      sensitiveAddPatterns: 123,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("string");
+  });
+
+  it("accepts wildcard-heavy globs that still contain a literal path component (202)", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SGOK", owner: "org", repo: "app",
+      sensitiveAllowPatterns: ["**/secrets.env", ".env.*"],
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).sensitiveAllowPatterns).toEqual(["**/secrets.env", ".env.*"]);
   });
 });
 
@@ -576,7 +1019,6 @@ describe("admin secrets", () => {
       flySessionsToken: "fly-token",
       flySessionsApp: "ai-implement-sessions",
       flySessionsRegion: null,
-      linearApiKey: "test-linear-key",
       githubAppId: "test-app-id",
       githubAppPrivateKey: "test-private-key",
     };
@@ -840,7 +1282,6 @@ describe("admin global secrets", () => {
       flySessionsToken: "fly-token",
       flySessionsApp: "ai-implement-sessions",
       flySessionsRegion: null,
-      linearApiKey: "test-linear-key",
       githubAppId: "test-app-id",
       githubAppPrivateKey: "test-private-key",
     };
@@ -1236,6 +1677,76 @@ describe("admin pipelines-steps endpoint", () => {
   });
 });
 
+describe("admin log", () => {
+  it("GET /api/log includes phase defaulting to 'implementation'", async () => {
+    log.appendLog({ issueId: "LNR-1", issueIdentifier: "LNR-1", repo: "org/repo" });
+    const token = await login("secret");
+    const res = await request("/api/log", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data).toHaveLength(1);
+    expect(data[0].phase).toBe("implementation");
+  });
+
+  it("GET /api/log includes phase 'planning' when set", async () => {
+    log.appendLog({ issueId: "LNR-2", issueIdentifier: "LNR-2", repo: "org/repo", phase: "planning" });
+    const token = await login("secret");
+    const res = await request("/api/log", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data[0].phase).toBe("planning");
+  });
+
+  /** Appends a job and pins its dispatched_at to the given timestamp. */
+  function seedJobAt(issueId: string, dispatchedAt: number): void {
+    const jobId = log.appendLog({ issueId, issueIdentifier: issueId, repo: "org/repo" });
+    dedup.getDb()
+      .prepare("UPDATE dispatch_log SET dispatched_at = ? WHERE id = ?")
+      .run(dispatchedAt, jobId);
+  }
+
+  it("GET /api/log?since= filters out jobs dispatched before the bound", async () => {
+    seedJobAt("LNR-OLD", 1_000);
+    seedJobAt("LNR-NEW", 3_000);
+    const token = await login("secret");
+    const res = await request("/api/log?since=2000", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data.map((j: { issueId: string }) => j.issueId)).toEqual(["LNR-NEW"]);
+  });
+
+  it("GET /api/log?until= filters out jobs dispatched after the bound", async () => {
+    seedJobAt("LNR-OLD", 1_000);
+    seedJobAt("LNR-NEW", 3_000);
+    const token = await login("secret");
+    const res = await request("/api/log?until=2000", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data.map((j: { issueId: string }) => j.issueId)).toEqual(["LNR-OLD"]);
+  });
+
+  it("GET /api/log?since=&until= returns only the inclusive window", async () => {
+    seedJobAt("LNR-A", 1_000);
+    seedJobAt("LNR-B", 2_000);
+    seedJobAt("LNR-C", 3_000);
+    const token = await login("secret");
+    const res = await request("/api/log?since=2000&until=2000", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data.map((j: { issueId: string }) => j.issueId)).toEqual(["LNR-B"]);
+  });
+
+  it("GET /api/log ignores non-numeric since/until instead of erroring", async () => {
+    seedJobAt("LNR-A", 1_000);
+    seedJobAt("LNR-B", 3_000);
+    const token = await login("secret");
+    const res = await request("/api/log?since=banana&until=", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(data).toHaveLength(2);
+  });
+});
+
 describe("classifyTemplate", () => {
   it("flags a body that curls api.linear.app/graphql with LINEAR_API_KEY as stale", async () => {
     const { classifyTemplate } = await import("../admin.js");
@@ -1269,5 +1780,130 @@ describe("classifyTemplate", () => {
       Do NOT post to Linear directly.
     `;
     expect(classifyTemplate(body)).toBe("current");
+  });
+});
+
+describe("async sync on mapping upsert", () => {
+  it("returns 202 with a syncJobId, no inline sync field, and persists the mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret",
+      { teamKey: "SYNCOK", owner: "org", repo: "app", defaultBranch: "main" }, token);
+
+    // The save no longer waits on the sync — it returns 202 (Accepted) with a job id to poll.
+    expect(res.statusCode).toBe(202);
+    const body = JSON.parse(res.body);
+    expect(body.teamKey).toBe("SYNCOK");
+    expect(typeof body.syncJobId).toBe("number");
+    expect(body.sync).toBeUndefined(); // the old inline blocking result is gone
+
+    const list = JSON.parse((await request("/api/mappings", "GET", "secret", undefined, token)).body);
+    expect(list.SYNCOK).toBeDefined(); // mapping persisted regardless of the (background) sync outcome
+  });
+
+  it("manual sync-workflows returns 202 with a syncJobId", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret",
+      { teamKey: "MAN", owner: "org", repo: "app", defaultBranch: "main" }, token);
+
+    const res = await request("/api/mappings/MAN/sync-workflows", "POST", "secret", undefined, token);
+    expect(res.statusCode).toBe(202);
+    expect(typeof JSON.parse(res.body).syncJobId).toBe("number");
+  });
+
+  it("manual sync-workflows returns 404 for an unknown team", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings/NOPE/sync-workflows", "POST", "secret", undefined, token);
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+describe("sync-status endpoint", () => {
+  it("returns 401 without an auth token", async () => {
+    const res = await request("/api/mappings/ENG/sync-status/1", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 404 for an unknown job id", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings/ENG/sync-status/99999", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("returns 404 when the job id belongs to a different team", async () => {
+    const token = await login("secret");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    // Same id, wrong team in the path -> the row-ownership guard rejects it.
+    const res = await request(`/api/mappings/OTHER/sync-status/${id}`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("reflects a completed job with its result (200, not an error status)", async () => {
+    const token = await login("secret");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "completed", {
+      result: {
+        status: "pr-opened",
+        targetRepo: "org/app",
+        baseBranch: "main",
+        syncBranch: "sync/ai-implement",
+        changedFiles: [".github/workflows/claude-implement.yml"],
+        prNumber: 42,
+        prUrl: "https://github.com/org/app/pull/42",
+      },
+    });
+
+    const res = await request(`/api/mappings/ENG/sync-status/${id}`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({
+      id,
+      status: "completed",
+      result: { prUrl: "https://github.com/org/app/pull/42" },
+    });
+  });
+
+  it("reflects a failed job with its error as data (still 200)", async () => {
+    const token = await login("secret");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "failed", {
+      error: { category: "app-not-installed", message: "App not installed" },
+    });
+
+    const res = await request(`/api/mappings/ENG/sync-status/${id}`, "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({
+      id,
+      status: "failed",
+      error: { message: "App not installed" },
+    });
+  });
+});
+
+describe("github-install-state endpoint", () => {
+  it("returns 401 without an auth token", async () => {
+    const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 400 when owner or repo is missing", async () => {
+    const token = await login("secret");
+    const res = await request("/api/admin/github-install-state?owner=acme", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 200 with the probe result", async () => {
+    const token = await login("secret");
+    vi.mocked(installState.probeInstallState).mockResolvedValueOnce({ state: "ready", installationId: 7 });
+
+    const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ state: "ready", installationId: 7 });
+  });
+
+  it("returns 500 when the probe throws (e.g. a rethrown credential error)", async () => {
+    const token = await login("secret");
+    vi.mocked(installState.probeInstallState).mockRejectedValueOnce(new Error("bad jwt"));
+
+    const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(500);
   });
 });
