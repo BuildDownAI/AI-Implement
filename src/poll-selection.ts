@@ -6,8 +6,54 @@ export interface Blocker {
   issueIdentifier: string;
   issueTitle: string;
   teamKey: string;
-  reason: "no-mapping" | "dedup" | "concurrency";
+  reason: "no-mapping" | "dedup" | "concurrency" | "file-overlap";
   detail: string;
+}
+
+const FILE_LINE_RE = /^\s*[-*]\s*(?:Create|Modify|Test|Delete):\s*`([^`\s:]+)/gim;
+
+/** Declared file paths from an issue body's Files section. Empty set = unparseable (fail-open). */
+export function parseDeclaredFiles(description: string | null): Set<string> {
+  const out = new Set<string>();
+  if (!description) return out;
+  for (const m of description.matchAll(FILE_LINE_RE)) out.add(m[1]);
+  return out;
+}
+
+const groupingBranchOf = (i: TicketIssue) =>
+  i.featureBranchChain?.length ? i.featureBranchChain[i.featureBranchChain.length - 1] : null;
+
+/** Fail-open guard: defer candidates whose declared files intersect an in-flight sibling's
+ *  (same last grouping-branch entry). Candidates with no declared files never defer. */
+export function selectFileOverlapDeferrals(
+  candidates: TicketIssue[],
+  inFlightSiblings: TicketIssue[],
+): Blocker[] {
+  const blockers: Blocker[] = [];
+  for (const c of candidates) {
+    const branch = groupingBranchOf(c);
+    if (!branch) continue;
+    const mine = parseDeclaredFiles(c.description);
+    if (mine.size === 0) continue;
+    for (const s of inFlightSiblings) {
+      const sb = groupingBranchOf(s);
+      if (!sb || sb.identifier !== branch.identifier || sb.mode !== branch.mode) continue;
+      const theirs = parseDeclaredFiles(s.description);
+      const shared = [...mine].filter((f) => theirs.has(f));
+      if (shared.length) {
+        blockers.push({
+          issueId: c.id,
+          issueIdentifier: c.identifier,
+          issueTitle: c.title,
+          teamKey: c.scopeKey,
+          reason: "file-overlap",
+          detail: `Declared files overlap in-flight sibling ${s.identifier}: ${shared.slice(0, 5).join(", ")}. Deferred until it merges.`,
+        });
+        break;
+      }
+    }
+  }
+  return blockers;
 }
 
 export function selectBlockers(
