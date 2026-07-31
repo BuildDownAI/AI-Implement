@@ -3,11 +3,22 @@ import { getInstallationToken } from "./github-app-auth.js";
 import {
   listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest,
 } from "./github.js";
+import {
+  countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
+} from "./comment-gapfill-queue.js";
 
 export interface AutoMergeDeps {
   githubAppId: string;
   githubAppPrivateKey: string;
   notify?: (message: string) => Promise<void>;
+}
+
+export const MAX_CONFLICT_RESOLUTION_ATTEMPTS = 2;
+export type StalledChildKind = "conflict" | "other";
+
+/** Named seam: AII-263 (max_turns/draft stalls) extends this classification later. */
+export function classifyStalledChild(mergeResult: string): StalledChildKind {
+  return mergeResult === "blocked" || mergeResult === "conflict" ? "conflict" : "other";
 }
 
 /** Only ai-implement/feature/* and ai-implement/multi-issue/* are grouping branches.
@@ -53,7 +64,27 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
           await deps.notify(`Auto-merged child PR #${pr.number} into \`${pr.base}\` (${owner}/${repo})`).catch(() => {});
         }
       } else {
-        console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: ${result} — leaving for a human`);
+        const kind = classifyStalledChild(result);
+        if (kind === "conflict") {
+          if (hasPendingConflictResolution(owner, repo, pr.number)) {
+            console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: resolution in flight`);
+          } else {
+            const attempts = countConflictAttempts(owner, repo, pr.number);
+            if (attempts >= MAX_CONFLICT_RESOLUTION_ATTEMPTS) {
+              console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: conflict resolution cap (${attempts}) exhausted — leaving for a human`);
+              if (deps.notify) {
+                await deps.notify(
+                  `Conflict on PR #${pr.number} → \`${pr.base}\` (${owner}/${repo}): ${attempts} resolution attempt${attempts === 1 ? "" : "s"} exhausted — leaving for a human.`
+                ).catch(() => {});
+              }
+            } else {
+              enqueueConflictResolution({ owner, repo, prNumber: pr.number, featureBranch: pr.base });
+              console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: enqueued conflict resolution (attempt ${attempts + 1})`);
+            }
+          }
+        } else {
+          console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: ${result} — leaving for a human`);
+        }
       }
     } catch (err) {
       console.error(`[auto-merge] Failed on PR #${pr.number} (${owner}/${repo}):`, err);
