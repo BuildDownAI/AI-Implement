@@ -11,7 +11,7 @@ import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { selectIssuesToDispatch } from "./poll-selection.js";
+import { selectIssuesToDispatch, selectFileOverlapDeferrals } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
@@ -381,12 +381,20 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       isDispatchBlocked,
     );
 
+    const inFlightSiblings = allCandidates.filter((i) => inFlightIssueIds.has(i.id));
+    const fileOverlapDeferrals = selectFileOverlapDeferrals(toProcess, inFlightSiblings);
+    const deferredIds = new Set(fileOverlapDeferrals.map((b) => b.issueId));
+    for (const b of fileOverlapDeferrals) {
+      console.log(`[poll] Deferring ${b.issueIdentifier}: ${b.detail}`);
+    }
+    const readyToDispatch = deferredIds.size > 0 ? toProcess.filter((i) => !deferredIds.has(i.id)) : toProcess;
+
     for (const issue of allCandidates) {
       if (teamRepoMap[issue.scopeKey]) continue;
       console.log(`[poll] No repo mapping for team ${issue.scopeKey}, skipping ${issue.identifier}`);
     }
 
-    for (const issue of toProcess) {
+    for (const issue of readyToDispatch) {
       try {
         const mapping = teamRepoMap[issue.scopeKey]!;
         const issueProvider = await registry.forMapping(mapping);
