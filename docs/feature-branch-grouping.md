@@ -273,3 +273,49 @@ Feature-branch grouping is supported on **both providers**:
 - **Don't restart the orchestrator mid-run.** A restart drops in-flight job tracking,
   leaving dispatched issues stuck with `AI-Working` plus a dedup row. Recover by removing
   `AI-Working` in Linear and deleting the dedup entry (`DELETE /api/dedup/<issue-uuid>`).
+
+---
+
+## 10. Conflict recovery & prevention
+
+### Cascade conflict recovery
+
+When a child PR lands dirty on its grouping branch (merge conflicts detected during
+auto-merge), the cascade self-heals without operator intervention:
+
+1. **Detection** — at roll-up / auto-merge time, the orchestrator calls
+   `classifyStalledChild` to determine whether a stalled child is conflicted. This is an
+   intentional seam: **AII-263 plugs the full conflict-detection logic in here**; before
+   AII-263 ships, the seam always reports "not conflicted" (fail-open, no false recoveries).
+
+2. **Re-queue** — on a positive conflict classification, the orchestrator inserts a
+   **synthetic queue entry** with a negative `comment_id` (a sentinel that distinguishes
+   automated recovery from a human `/ai-implement` comment). This routes the issue through
+   the normal comment-gapfill rail: the runner receives the branch + PR context and is asked
+   to resolve the conflicts and re-push.
+
+3. **Attempt cap** — each synthetic entry carries the current attempt count. The queue
+   accounting increments this on every re-queue so the cap is enforced across restarts. The
+   **maximum is 2 automated attempts** per issue. This prevents unbounded retry loops when a
+   conflict cannot be auto-resolved (e.g. semantic conflicts the agent cannot safely decide).
+
+4. **Notify-on-exhaustion** — when the attempt cap is reached and the conflict persists, the
+   orchestrator fires a standard notification and leaves the issue in its current state for a
+   human to resolve. The `AI-Working` label is cleared so the issue doesn't stay stuck in
+   the capacity counter.
+
+### Dispatch guard (declared-file overlap)
+
+Before dispatching a same-feature-node sibling (another leaf or child issue targeting the
+same grouping branch), the orchestrator checks whether the candidate issue's declared
+`Files:` paths overlap with the paths declared by any currently in-flight sibling issue:
+
+- **Overlap detected** → dispatch is deferred until the in-flight sibling's PR merges and
+  the issue reaches Done. This prevents two runners from making conflicting edits to the same
+  files simultaneously on the same feature branch.
+- **Fail-open** → if the candidate or in-flight sibling has no `Files:` declaration, or if
+  the path-comparison step errors, the guard skips and the sibling dispatches normally. The
+  guard never blocks work when it cannot make a confident determination.
+
+The guard applies only within the same feature node (same grouping branch). Siblings that
+target different feature branches are not affected.
