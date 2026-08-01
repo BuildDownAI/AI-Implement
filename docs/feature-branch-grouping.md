@@ -284,9 +284,10 @@ When a child PR lands dirty on its grouping branch (merge conflicts detected dur
 auto-merge), the cascade self-heals without operator intervention:
 
 1. **Detection** — at roll-up / auto-merge time, the orchestrator calls
-   `classifyStalledChild` to determine whether a stalled child is conflicted. This is an
-   intentional seam: **AII-263 plugs the full conflict-detection logic in here**; before
-   AII-263 ships, the seam always reports "not conflicted" (fail-open, no false recoveries).
+   `classifyStalledChild` to determine whether a stalled child is conflicted. The function
+   already classifies `conflict` and `blocked` merge results as recoverable conflicts. This
+   is an intentional seam: **AII-263 will extend the classification** with additional stall
+   kinds (max_turns / draft-PR stalls); it does not supply the initial detection logic.
 
 2. **Re-queue** — on a positive conflict classification, the orchestrator inserts a
    **synthetic queue entry** with a negative `comment_id` (a sentinel that distinguishes
@@ -294,15 +295,18 @@ auto-merge), the cascade self-heals without operator intervention:
    the normal comment-gapfill rail: the runner receives the branch + PR context and is asked
    to resolve the conflicts and re-push.
 
-3. **Attempt cap** — each synthetic entry carries the current attempt count. The queue
-   accounting increments this on every re-queue so the cap is enforced across restarts. The
-   **maximum is 2 automated attempts** per issue. This prevents unbounded retry loops when a
-   conflict cannot be auto-resolved (e.g. semantic conflicts the agent cannot safely decide).
+3. **Attempt cap** — synthetic entries do not carry an attempt counter. Instead, the cap is
+   **derived** by counting the PR's existing synthetic (negative `comment_id`) rows via
+   `countConflictAttempts`; `enqueueConflictResolution` computes a deterministic synthetic id
+   from `owner/repo#pr#conflict#attempt` and the queue's `INSERT OR IGNORE` provides
+   in-flight dedup so a concurrent poll tick cannot double-enqueue. A re-dirty PR after a
+   successful resolve counts as a fresh attempt. The **maximum is 2 automated attempts**
+   (`MAX_CONFLICT_RESOLUTION_ATTEMPTS`). This prevents unbounded retry loops when a conflict
+   cannot be auto-resolved (e.g. semantic conflicts the agent cannot safely decide).
 
 4. **Notify-on-exhaustion** — when the attempt cap is reached and the conflict persists, the
-   orchestrator fires a standard notification and leaves the issue in its current state for a
-   human to resolve. The `AI-Working` label is cleared so the issue doesn't stay stuck in
-   the capacity counter.
+   orchestrator logs and fires a standard notification, then leaves the PR for a human to
+   resolve. No labels are changed.
 
 ### Dispatch guard (declared-file overlap)
 
