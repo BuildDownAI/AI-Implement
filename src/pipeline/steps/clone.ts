@@ -15,7 +15,7 @@ interface CloneInputs extends Record<string, unknown> {
 interface CloneOutputs extends Record<string, unknown> {
   workspaceDir: string;
   clonedRef: string;
-  cloneMethod: "fresh" | "incremental";
+  cloneMethod: "fresh" | "incremental" | "mounted";
   repoOwner: string;
   repoRepo: string;
   branch: string;
@@ -29,6 +29,20 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     _reporter: StepReporter,
   ): Promise<CloneOutputs> {
     const { repoOwner, repoRepo, branch, githubToken, workspaceDir } = inputs;
+
+    if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
+      // Workspace is bind-mounted by the dev harness — skip fetch/clone entirely.
+      // Still seed scratch exclusions and resolve the current HEAD so downstream
+      // steps get a consistent clonedRef.
+      prepareScratchExclusion(workspaceDir);
+      const headResult = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const clonedRef = headResult.status === 0 ? headResult.stdout.toString().trim() : "unknown";
+      return { workspaceDir, clonedRef, cloneMethod: "mounted", repoOwner, repoRepo, branch, githubToken };
+    }
+
     const remote = `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`;
 
     let cloneMethod: "fresh" | "incremental";

@@ -18,6 +18,7 @@
     "dev": "npm run check:node && tsx --env-file-if-exists=.env src/index.ts",
     "build:runner:local": "DOCKER_BUILDKIT=1 docker build -f Dockerfile.session -t ai-implement-runner:local .",
     "dev:local": "npm run check:node && npm run build:runner:local && RUNNER_MODE=local LOCAL_RUNNER_IMAGE=ai-implement-runner:local tsx --env-file-if-exists=.env src/index.ts",
+    "dev:run": "npm run check:node && tsx --env-file-if-exists=.env src/dev-harness/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

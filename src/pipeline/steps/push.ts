@@ -50,6 +50,15 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     inputs: PushInputs,
     _reporter: StepReporter,
   ): Promise<PushOutputs> {
+    if (
+      process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted" &&
+      process.env.AI_IMPLEMENT_DEV_NO_PUSH === "true"
+    ) {
+      // Dev harness no-push mode: leave working-tree changes in the bind-mounted
+      // workspace for inspection with `git diff`. Skip push and PR creation.
+      return { prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false };
+    }
+
     const { workspaceDir, repoOwner, repoRepo, githubToken, branchName } = inputs;
     const { issueIdentifier, issueTitle } = context.data;
     const baseBranch = String(inputs.baseBranch ?? context.data.branch ?? "").trim();
