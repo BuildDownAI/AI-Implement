@@ -7,7 +7,6 @@ async function main(): Promise<void> {
   let workspace = "";
   let task = "";
   let image: string | undefined;
-  let push = false;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -17,14 +16,12 @@ async function main(): Promise<void> {
       task = args[++i] as string;
     } else if (arg === "--image" && args[i + 1]) {
       image = args[++i];
-    } else if (arg === "--push") {
-      push = true;
     }
   }
 
   if (!workspace || !task) {
     process.stderr.write(
-      "Usage: npm run dev:run -- --workspace <dir> --task <task.md> [--push] [--image <image>]\n",
+      "Usage: npm run dev:run -- --workspace <dir> --task <task.md> [--image <image>]\n",
     );
     process.exit(1);
   }
@@ -33,7 +30,6 @@ async function main(): Promise<void> {
     workspace: resolve(workspace),
     task: resolve(task),
     image,
-    push,
   });
 
   process.stderr.write(

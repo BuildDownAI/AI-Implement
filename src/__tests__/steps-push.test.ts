@@ -1043,12 +1043,11 @@ describe("pushStep — hardening (review findings)", () => {
   });
 });
 
-describe("pushStep — mounted workspace no-push mode", () => {
+describe("pushStep — mounted workspace never pushes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.stubGlobal("fetch", vi.fn());
     vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
-    vi.stubEnv("AI_IMPLEMENT_DEV_NO_PUSH", "true");
   });
 
   afterEach(() => {
@@ -1068,9 +1067,9 @@ describe("pushStep — mounted workspace no-push mode", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("does NOT skip when only AI_IMPLEMENT_WORKSPACE_MODE is set without NO_PUSH flag", async () => {
-    vi.stubEnv("AI_IMPLEMENT_DEV_NO_PUSH", "");
-    // Without the no-push flag the step falls through to normal push logic,
+  it("does NOT skip when AI_IMPLEMENT_WORKSPACE_MODE is not mounted", async () => {
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "");
+    // Outside mounted mode the step falls through to normal push logic,
     // which needs git state. Provide enough for it to throw on "nothing to commit".
     vi.mocked(spawnSync).mockReturnValue({
       status: 0,

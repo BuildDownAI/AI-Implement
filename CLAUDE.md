@@ -97,8 +97,6 @@ Admin UI: `http://localhost:8080/admin` (requires an OAuth provider configured *
 
 ```bash
 npm run dev:run -- --workspace ../target-repo --task task.md
-# With push enabled:
-npm run dev:run -- --workspace ../target-repo --task task.md --push
 ```
 
 **Task file format** (`task.md`):
@@ -118,7 +116,7 @@ Issue description / implementation instructions go here.
 **How it works:**
 - `--workspace <dir>` bind-mounts the local checkout at `/workspace` inside the container.
 - The clone step detects `AI_IMPLEMENT_WORKSPACE_MODE=mounted` and skips `git fetch/reset` entirely, so uncommitted edits to `WORKFLOW.md` and hook scripts take effect immediately.
-- Push is disabled by default (`AI_IMPLEMENT_DEV_NO_PUSH=true`); the mutated working tree is left in the mount for inspection with `git diff`. Add `--push` to enable normal push behavior (requires real GitHub credentials and a valid `repo:` in the task file).
+- Mounted mode **never pushes** — the push step is a no-op whenever `AI_IMPLEMENT_WORKSPACE_MODE=mounted`. The mount is your live checkout, dirty by design (the uncommitted `WORKFLOW.md`/hook edits under test), so a push would sweep in-progress work into the commit. The mutated working tree is left in the mount for inspection with `git diff`; commit/push the parts you want to keep yourself.
 - Logs are streamed to the terminal in real time. Per-run artifacts (log, diff, telemetry) are saved to `.dev-runs/<timestamp>/` (gitignored).
 
 **Library API** (for programmatic use or a future MCP wrapper — `src/dev-harness/`):

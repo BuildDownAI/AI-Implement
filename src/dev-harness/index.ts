@@ -26,8 +26,6 @@ export interface DevRunOptions {
   task: string;
   /** Runner image. Defaults to LOCAL_RUNNER_IMAGE env var or ai-implement-runner:local. */
   image?: string;
-  /** Push changes to GitHub after the run. Default: false (leave diff in mounted workspace). */
-  push?: boolean;
   /** Anthropic API key. Falls back to ANTHROPIC_API_KEY env var. */
   anthropicApiKey?: string;
   /** Claude OAuth token. Falls back to CLAUDE_CODE_OAUTH_TOKEN env var. */
@@ -97,12 +95,14 @@ async function writeDevSecretEnvFile(secretEnv: Record<string, string>): Promise
 
 /**
  * Launch a dev runner container against a local workspace. Returns a handle
- * used to stream logs and collect results. No orchestrator, no tracker, no push
- * by default.
+ * used to stream logs and collect results. No orchestrator, no tracker, no push.
  *
  * The container receives AI_IMPLEMENT_WORKSPACE_MODE=mounted so the clone step
- * skips git fetch/reset. The workspace is bind-mounted at /workspace, meaning
- * uncommitted WORKFLOW.md and hook script edits take effect immediately.
+ * skips git fetch/reset and the push step is a no-op — the mount is the user's
+ * live (dirty-by-design) checkout, so pushing from it is never safe; the run's
+ * changes stay in the working tree for inspection. The workspace is bind-mounted
+ * at /workspace, meaning uncommitted WORKFLOW.md and hook script edits take
+ * effect immediately.
  */
 export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
   const workspace = resolve(opts.workspace);
@@ -168,7 +168,6 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     MACHINE_NONCE: runId,
     SESSION_MODE: "autonomous",
     RUNNER_PHASE: "implementation",
-    ...(opts.push ? {} : { AI_IMPLEMENT_DEV_NO_PUSH: "true" }),
     ...(anthropicApiKey ? { ANTHROPIC_API_KEY: anthropicApiKey } : {}),
     ...(claudeOAuthToken ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOAuthToken } : {}),
     ...(opts.env ?? {}),
