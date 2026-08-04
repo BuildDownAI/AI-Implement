@@ -326,11 +326,20 @@ target different feature branches are not affected.
 
 ## 11. Operational notes (AII-264 test rounds)
 
-- **Labeling order matters — designate the parent LAST.** A parent labeled before its first
-  child exists has no children to classify against, is treated as a **leaf**, and dispatches
-  standalone (observed: a junk standalone PR). Required ordering: create parent → create
-  children (+ relations) → label children → **label the parent last of all**. The planning
-  skills (bd-mega-build-up) already mandate this; it applies equally to hand-filed trees.
+- **Labeling order matters — build the whole tree first, then label parent BEFORE children.**
+  Required ordering: create the parent **unlabeled** → create all children as sub-issues
+  (+ every relation) → **label the parent** → label the children. Two races motivate it, and
+  the code resolves both in favor of this order:
+  - A parent labeled before its first child *exists* has no children to classify against, is
+    treated as a **leaf**, and dispatches standalone (observed: a junk standalone PR). Hence:
+    the complete tree exists before any label goes on.
+  - A child labeled while its parent is *unlabeled* resolves an **empty ancestor chain**
+    (`labeledAncestorChain` stops at the first unlabeled ancestor) and cuts its PR from the
+    **base branch**, silently bypassing grouping. Labeling the parent first has no such
+    window: a labeled parent whose children carry no label yet is a *waiting parent* — the
+    race guard skips it until a child is labeled.
+  (Earlier guidance said "label the parent last"; that guarded the relations-not-yet-set race,
+  which step 2 above already eliminates, while opening the empty-chain race. Superseded.)
 - **Parents hold while their roll-up PR is open.** A grouping parent whose top-of-tree
   `feature → base` PR is open is not dispatchable (the orchestrator probes for the open PR
   before dispatch and holds, dedup untouched) — re-dispatching it produced junk closing PRs /
