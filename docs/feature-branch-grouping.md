@@ -355,6 +355,13 @@ target different feature branches are not affected.
 - **Children get a grace re-check before `pr_not_found`.** A child job's clean exit with no
   visible PR is usually the monitor racing the PR search index — the monitor defers one cycle
   (2-minute window) and re-checks before declaring `pr_not_found` and resetting the ticket.
+- **A run whose PR already MERGED is a success.** Auto-merge routinely lands a fast
+  child's PR before the monitor's first post-exit check; the post-exit lookup therefore
+  searches `state=all` (skipping closed-unmerged PRs from torn-down earlier attempts) and a
+  merged match routes straight to the Done-reconcile queue — never Ready for Review, never
+  `pr_not_found`, never a reset (the r6 OOL-182/183/184 loop). The merge-poll additionally
+  treats ANY terminal job row with a recorded PR as a reconcile candidate, keyed by
+  repo+PR — so a misclassified row cannot orphan a merged PR's ticket.
 - **Recovery gap-fills always run via GitHub Actions**, regardless of a mapping's
   local-docker execution mode (the drain implements fly + GHA only; the target is a remote
   PR branch either way).

@@ -1,4 +1,42 @@
 import type { JobStatus } from "./log.js";
+import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+
+export interface RunPrCandidate {
+  html_url: string;
+  state: "open" | "closed";
+  merged_at: string | null;
+  draft?: boolean;
+  head: { ref: string };
+}
+
+export interface RunPrMatch {
+  url: string;
+  draft: boolean;
+  /** True when the PR already merged — the run SUCCEEDED and the ticket must route to the
+   *  Done-reconcile, never to pr_not_found (AII-264 r6: auto-merge routinely lands a fast
+   *  child's PR before the monitor's first post-exit check). */
+  merged: boolean;
+}
+
+/**
+ * AII-264 r6: pick the PR that belongs to a run from a state=all listing (expected in
+ * updated-desc order). Open and MERGED PRs both count — a merged PR is the strongest
+ * possible success signal. Closed-unmerged PRs are skipped: a torn-down PR from an earlier
+ * attempt must not mark a later run successful.
+ */
+export function pickPrForRun(
+  prs: RunPrCandidate[],
+  issueIdentifier: string | null | undefined,
+): RunPrMatch | null {
+  if (!issueIdentifier) return null;
+  for (const pr of prs) {
+    if (!branchMatchesIssueIdentifier(pr.head.ref, issueIdentifier)) continue;
+    const merged = pr.merged_at !== null && pr.merged_at !== undefined;
+    if (pr.state === "closed" && !merged) continue;
+    return { url: pr.html_url, draft: pr.draft === true && !merged, merged };
+  }
+  return null;
+}
 
 /**
  * The workflow whose run list a GHA job's run ID must be searched in. Planning

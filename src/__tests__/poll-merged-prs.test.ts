@@ -47,6 +47,30 @@ describe("prNumberFromUrl", () => {
 });
 
 describe("detectMergedPrs", () => {
+  it("reconciles a job-row misread: 'failed' row with a recorded PR that actually merged (AII-264 r6)", async () => {
+    const jobId = log.appendLog({ issueId: "i-r6", issueIdentifier: "OOL-183", repo: "o/r" });
+    log.updateJobStatus(jobId, "failed", "pr_not_found", "https://github.com/o/r/pull/3610");
+    await mod.detectMergedPrs({
+      getPullRequestState: vi.fn(async () => ({ merged: true, state: "closed" as const })),
+      tokenForOwner: async () => "tok",
+      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+    });
+    expect(recon.getPendingReconciliations()).toHaveLength(1);
+    expect(recon.getPendingReconciliations()[0].issueIdentifier).toBe("OOL-183");
+  });
+
+  it("still ignores rows with no recorded PR (nothing to key on)", async () => {
+    log.appendLog({ issueId: "i-nopr", issueIdentifier: "OOL-184", repo: "o/r" });
+    const getPullRequestState = vi.fn(async () => ({ merged: true, state: "closed" as const }));
+    await mod.detectMergedPrs({
+      getPullRequestState,
+      tokenForOwner: async () => "tok",
+      mappingForRepo: () => ({ owner: "o", repo: "r" } as never),
+    });
+    expect(getPullRequestState).not.toHaveBeenCalled();
+    expect(recon.getPendingReconciliations()).toHaveLength(0);
+  });
+
   it("enqueues a reconciliation for a merged PR", async () => {
     seedCompletedJob(5);
     const getPullRequestState = vi.fn(async () => ({ merged: true, state: "closed" as const }));

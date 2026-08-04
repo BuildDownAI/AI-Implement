@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PR_NOT_FOUND_GRACE_MS,
+  pickPrForRun,
   clearPrNotFoundGrace,
   decideCleanExitOutcome,
   resolveTerminalStatus,
@@ -139,5 +140,63 @@ describe("decideCleanExitOutcome", () => {
       expect(d.jobStatus).toBe(resolveTerminalStatus(0, null, false, "gap-analysis"));
       expect(d.deferForPrRecheck).toBe(false);
     });
+  });
+});
+
+// AII-264 r6: a run whose PR already MERGED is a SUCCESS — the child-side twin of the r5
+// parent finalize fix. pickPrForRun is the shared post-exit PR matcher (state=all listing).
+describe("pickPrForRun", () => {
+  const pr = (over: Record<string, unknown>) => ({
+    html_url: "https://github.com/org/repo/pull/42",
+    state: "open" as const,
+    merged_at: null,
+    draft: false,
+    head: { ref: "ai-implement/ool-182-fast-child" },
+    ...over,
+  });
+
+  it("matches an open PR for the run's branch (unchanged behavior)", () => {
+    expect(pickPrForRun([pr({})], "OOL-182")).toEqual({
+      url: "https://github.com/org/repo/pull/42", draft: false, merged: false,
+    });
+  });
+
+  it("matches a MERGED PR — the r6 auto-merge-beat-the-monitor case is a success", () => {
+    const merged = pr({ state: "closed", merged_at: "2026-08-04T12:00:00Z" });
+    expect(pickPrForRun([merged], "OOL-182")).toEqual({
+      url: "https://github.com/org/repo/pull/42", draft: false, merged: true,
+    });
+  });
+
+  it("skips a closed-unmerged PR — a torn-down earlier attempt is not this run's success", () => {
+    const tornDown = pr({ state: "closed", merged_at: null });
+    expect(pickPrForRun([tornDown], "OOL-182")).toBeNull();
+  });
+
+  it("skips closed-unmerged but still finds a later merged match in the listing", () => {
+    const tornDown = pr({ state: "closed", merged_at: null, html_url: "https://github.com/org/repo/pull/40" });
+    const merged = pr({ state: "closed", merged_at: "2026-08-04T12:00:00Z" });
+    expect(pickPrForRun([tornDown, merged], "OOL-182")?.url).toBe("https://github.com/org/repo/pull/42");
+  });
+
+  it("ignores PRs for other issues' branches", () => {
+    expect(pickPrForRun([pr({ head: { ref: "ai-implement/ool-999-other" } })], "OOL-182")).toBeNull();
+  });
+
+  it("a merged PR is never draft (draft flag from a stale listing is overridden)", () => {
+    const merged = pr({ state: "closed", merged_at: "2026-08-04T12:00:00Z", draft: true });
+    expect(pickPrForRun([merged], "OOL-182")?.draft).toBe(false);
+  });
+
+  it("returns null for a missing identifier or empty listing", () => {
+    expect(pickPrForRun([], "OOL-182")).toBeNull();
+    expect(pickPrForRun([pr({})], null)).toBeNull();
+  });
+
+  it("regression (r6 loop shape): merged PR found → decideCleanExitOutcome completes, no defer, no pr_not_found", () => {
+    const match = pickPrForRun([pr({ state: "closed", merged_at: "2026-08-04T12:00:00Z" })], "OOL-182");
+    expect(match?.merged).toBe(true);
+    const d = decideCleanExitOutcome({ id: 906, phase: "implementation", groupingParent: false }, 0, match!.url, false, false, 1_000);
+    expect(d).toEqual({ jobStatus: "completed", finalizeGroupingParent: false, deferForPrRecheck: false });
   });
 });

@@ -32,7 +32,7 @@ import { createMachine, getMachine, listMachines, destroyMachine, generateSessio
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
-import { initReconciliationTable } from "./reconciliation.js";
+import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
@@ -51,7 +51,8 @@ import {
   sweepExitedLocalContainers,
 } from "./local-docker.js";
 import { clearPrNotFoundGrace, decideCleanExitOutcome, workflowFileForJob } from "./monitor-status.js";
-import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
+import { pickPrForRun } from "./monitor-status.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
@@ -61,7 +62,7 @@ import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
-import { detectMergedPrs } from "./poll-merged-prs.js";
+import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 
 // ---------- Configuration ----------
 
@@ -1668,6 +1669,7 @@ async function monitorGitHubActionsJob(
 
     // Try to find PR URL for successful runs
     let prUrl: string | null = null;
+    let fallbackPrMatch: RunPrMatch | null = null;
     if (jobStatus === "completed") {
       try {
         prUrl = await findPrForRun(ghToken, owner, repo, job.runId);
@@ -1676,16 +1678,23 @@ async function monitorGitHubActionsJob(
       }
       // workflow_dispatch runs report the ref they were dispatched on (the default
       // branch) as head_branch, so findPrForRun misses the PR the runner created
-      // during the run. Fall back to matching an open PR by the issue's branch
-      // naming. Planning runs never open PRs — skip them so an implementation PR
-      // from an earlier dispatch is not misattributed to a planning row.
+      // during the run. Fall back to matching a PR (open or already merged — AII-264 r6)
+      // by the issue's branch naming. Planning runs never open PRs — skip them so an
+      // implementation PR from an earlier dispatch is not misattributed to a planning row.
       if (!prUrl && job.phase !== "planning") {
-        prUrl = (await findPrForIssue(config, job.repo, job.issueIdentifier))?.url ?? null;
+        fallbackPrMatch = await findPrForIssue(config, job.repo, job.issueIdentifier);
+        prUrl = fallbackPrMatch?.url ?? null;
       }
     }
 
     updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl);
     console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) → ${jobStatus} (${runStatus.conclusion})`);
+
+    // AII-264 r6: the run's PR already merged (auto-merge beat this check) — route straight
+    // to the Done-reconcile so the ticket completes even if the merge-poll never sees it.
+    if (fallbackPrMatch?.merged && prUrl) {
+      reconcileAlreadyMergedPr(job, prUrl);
+    }
 
     // AII-264 r5: a grouping parent's clean GHA run with no PR is Case-B (the runner's push
     // step no-op'd because the agent produced no changes). Without a reachable callback the
@@ -1710,13 +1719,17 @@ async function findPrForIssue(
   config: AppConfig,
   repo: string | null,
   issueIdentifier: string | null,
-): Promise<{ url: string; draft: boolean } | null> {
+): Promise<RunPrMatch | null> {
   const [owner, repoName] = (repo || "").split("/");
   if (!owner || !repoName || !issueIdentifier) return null;
 
   try {
     const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-    const prSearchUrl = `https://api.github.com/repos/${owner}/${repoName}/pulls?state=open&per_page=10`;
+    // AII-264 r6: state=all, not state=open — auto-merge routinely lands a fast child's PR
+    // before the monitor's first post-exit check, and a merged PR is a SUCCESS, not
+    // pr_not_found. Matching/selection (incl. skipping closed-unmerged PRs from torn-down
+    // earlier attempts) lives in pickPrForRun.
+    const prSearchUrl = `https://api.github.com/repos/${owner}/${repoName}/pulls?state=all&sort=updated&direction=desc&per_page=30`;
     const prRes = await fetch(prSearchUrl, {
       headers: {
         Authorization: `Bearer ${ghToken}`,
@@ -1724,13 +1737,8 @@ async function findPrForIssue(
       },
     });
     if (prRes.ok) {
-      const prs = (await prRes.json()) as Array<{ html_url: string; head: { ref: string }; draft?: boolean }>;
-      // Accept both the legacy ${IDENTIFIER}/... branch shape and the TS
-      // pipeline's ai-implement/${identifier}-... branch shape.
-      const match = prs.find((pr) => {
-        return branchMatchesIssueIdentifier(pr.head.ref, issueIdentifier);
-      });
-      if (match) return { url: match.html_url, draft: match.draft === true };
+      const prs = (await prRes.json()) as RunPrCandidate[];
+      return pickPrForRun(prs, issueIdentifier);
     }
   } catch {
     // Non-critical
@@ -1823,8 +1831,10 @@ async function monitorFlyMachineJob(
     // check below, but the two must be handled differently: see the markReadyForReview guard.
     const isDraftPr = matchedPr?.draft === true;
     // Use PR existence to distinguish success from failure:
-    // if a PR was created, the session completed its job; otherwise it failed
-    const reviewNeedsAttention = !!prUrl && postPushReviewNeedsAttention(job.id);
+    // if a PR was created, the session completed its job; otherwise it failed.
+    // A PR that already MERGED (auto-merge beat this check) is unconditionally a success —
+    // the review stage is over, so needs-attention no longer applies.
+    const reviewNeedsAttention = !matchedPr?.merged && !!prUrl && postPushReviewNeedsAttention(job.id);
     // AII-264 r5: a grouping parent's clean no-PR exit is Case-B finalize, not pr_not_found;
     // a child's clean no-PR exit gets a bounded grace re-check (PR-visibility race).
     const decision = decideCleanExitOutcome(job, machineExitCode, prUrl, reviewNeedsAttention, isDraftPr, Date.now());
@@ -1884,7 +1894,11 @@ async function monitorFlyMachineJob(
       });
     }
 
-    if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
+    if (matchedPr?.merged && prUrl) {
+      // AII-264 r6: the PR already merged — Ready for Review would be a lie and a reset
+      // would loop an already-landed child. Route straight to the Done-reconcile.
+      reconcileAlreadyMergedPr(job, prUrl);
+    } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
       if (isDraftPr) {
         // Unapproved run: the runner callback (or, absent one, this job row + the
         // status comment already posted above) owns the ticket transition for a
@@ -1958,7 +1972,8 @@ async function monitorLocalDockerJob(
   // reviewNeedsAttention: both resolve to "review_failed", but only a draft PR must skip
   // markReadyForReview/resetTicket below.
   const isDraftPr = matchedPr?.draft === true;
-  const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
+  // A PR that already MERGED (auto-merge beat this check) is unconditionally a success.
+  const reviewNeedsAttention = !matchedPr?.merged && state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
   // AII-264 r5: a grouping parent's clean no-PR exit is Case-B finalize, not pr_not_found;
   // a child's clean no-PR exit gets a bounded grace re-check (PR-visibility race). The
   // exited container is left in place while deferred so the next pass can re-inspect it.
@@ -1999,6 +2014,10 @@ async function monitorLocalDockerJob(
 
   if (decision.finalizeGroupingParent) {
     await finalizeNoOpGroupingParent(provider, job);
+  } else if (matchedPr?.merged && prUrl) {
+    // AII-264 r6: the PR already merged — route straight to the Done-reconcile,
+    // never Ready for Review, never reset.
+    reconcileAlreadyMergedPr(job, prUrl);
   } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
     if (isDraftPr) {
       // Unapproved run: the runner callback (or, absent one, this job row + the
@@ -2032,6 +2051,28 @@ async function finalizeNoOpGroupingParent(provider: TicketingProvider | null, jo
   } catch (err) {
     console.error(`[monitor] Failed to finalize grouping parent ${job.issueIdentifier}:`, err);
   }
+}
+
+/**
+ * AII-264 r6: the run's PR was already merged (auto-merge beat the monitor's first
+ * post-exit check — routine for fast children). That is a SUCCESS with the review stage
+ * already over: route straight to the Done-reconcile (same queue the merge-poll and
+ * webhook feed) instead of markReadyForReview, and never reset. Keyed by repo+PR, so a
+ * later job-row mangling cannot orphan the ticket — the queue row survives independently.
+ */
+function reconcileAlreadyMergedPr(job: Job, prUrl: string): void {
+  const prNumber = prNumberFromUrl(prUrl);
+  if (prNumber === null || !job.repo) return;
+  if (hasReconciliationForPr(job.repo, prNumber)) return;
+  enqueueReconciliation({
+    issueId: job.issueId,
+    issueIdentifier: job.issueIdentifier,
+    prNumber,
+    repo: job.repo,
+    mergeCommitSha: "",
+  });
+  resetStuckAttempts(job.issueId);
+  console.log(`[monitor] PR #${prNumber} for ${job.issueIdentifier} already merged — queued Done-reconcile (no reset)`);
 }
 
 /** Mark a Linear issue as Ready for Review after a successful job. */
