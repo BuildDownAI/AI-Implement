@@ -323,3 +323,20 @@ same grouping branch), the orchestrator checks whether the candidate issue's dec
 
 The guard applies only within the same feature node (same grouping branch). Siblings that
 target different feature branches are not affected.
+
+## 11. Operational notes (AII-264 test rounds)
+
+- **Labeling order matters — designate the parent LAST.** A parent labeled before its first
+  child exists has no children to classify against, is treated as a **leaf**, and dispatches
+  standalone (observed: a junk standalone PR). Required ordering: create parent → create
+  children (+ relations) → label children → **label the parent last of all**. The planning
+  skills (bd-mega-build-up) already mandate this; it applies equally to hand-filed trees.
+- **Parents hold while their roll-up PR is open.** A grouping parent whose top-of-tree
+  `feature → base` PR is open is not dispatchable (the orchestrator probes for the open PR
+  before dispatch and holds, dedup untouched) — re-dispatching it produced junk closing PRs /
+  pr_not_found churn. The hold releases when the PR merges or closes.
+- **Recovery gap-fills always run via GitHub Actions**, regardless of a mapping's
+  local-docker execution mode (the drain implements fly + GHA only; the target is a remote
+  PR branch either way).
+- **Conflict-resolution attempts count at enqueue** — persistent dispatch failures burn the
+  cap by design, trading unbounded retry for the alerted bounded give-up path.

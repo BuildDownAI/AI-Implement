@@ -348,6 +348,8 @@ Operational requirements: re-sync `claude-implement.yml` to the target repo (for
 
 **Conflict recovery:** When a child PR lands dirty (merge conflicts) on its grouping branch, the cascade self-heals automatically. The orchestrator re-queues the issue through the comment-gapfill rail (a synthetic negative-`comment_id` entry, capped at 2 attempts per issue via queue accounting). On exhaustion it logs, fires the `notify` hook, and leaves the PR for a human. The conflict-classification seam is `classifyStalledChild` — it already classifies `conflict`/`blocked` merge results as recoverable conflicts; AII-263 will later extend the seam with additional stall kinds (max_turns / draft-PR stalls).
 
+**Roll-up hold:** A grouping parent whose top-of-tree roll-up PR is open is held from dispatch (dedup untouched) until that PR merges or closes — re-dispatching such parents produced junk closing PRs / pr_not_found churn loops.
+
 **Dispatch guard:** Before dispatching a same-feature-node sibling, the orchestrator checks whether its declared `Files:` paths (from the issue description) overlap with a currently in-flight sibling's paths; if they do, dispatch is deferred until the in-flight sibling completes. The check fails open — if path data is unavailable or the check errors, the sibling dispatches normally.
 
 ### Issue completion on PR merge

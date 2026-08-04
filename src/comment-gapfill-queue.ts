@@ -99,6 +99,12 @@ export function syntheticConflictCommentId(owner: string, repo: string, prNumber
   return -(((h >>> 0) % 2_000_000_000) + 1);
 }
 
+/** Counts EVERY synthetic row regardless of status — including rows whose dispatch
+ *  failed before any resolution ran ("No dispatch log"). Deliberate (AII-264 r3):
+ *  dispatch failures for the same PR are typically persistent, so letting them burn
+ *  the cap converts a would-be infinite enqueue/fail loop into the proven bounded
+ *  give-up + notify path (same philosophy as AII-118's bounded remediation). The
+ *  cost — a cap exhausted with zero real attempts — is alerted, not silent. */
 export function countConflictAttempts(owner: string, repo: string, prNumber: number): number {
   const row = getDb().prepare(
     "SELECT COUNT(*) AS n FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0",

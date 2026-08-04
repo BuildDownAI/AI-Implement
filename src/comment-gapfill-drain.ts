@@ -76,6 +76,12 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       }
 
       const execPath = resolveExecutionPath(opts.runnerMode, mapping.executionMode);
+      // NOTE (AII-264 r3, documented asymmetry): this drain implements fly-machines and
+      // github-actions only — a resolved "local-docker" path falls through to the GHA
+      // branch below. Recovery/comment gap-fills on a local-docker mapping therefore
+      // dispatch via GitHub Actions. Deliberate: gap-fills target an existing remote PR
+      // branch, which the GHA runner reaches identically; a local-docker gap-fill path
+      // would add a third dispatch surface for no behavioral difference.
 
       let runnerCallbackUrl = "";
       let runToken = "";

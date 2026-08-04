@@ -53,7 +53,7 @@ import {
 import { resolveTerminalStatus, workflowFileForJob } from "./monitor-status.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
-import { resolveBaseBranch } from "./feature-branch.js";
+import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
 import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
@@ -449,6 +449,18 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           // dispatches agree on one base, and never creates the branch twice. The token
           // is per-owner cached, so the in-dispatch-fn fetches below are cache hits.
           const baseGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+          // AII-264 r3: a grouping parent with an OPEN top-of-tree roll-up PR has no
+          // dispatchable work — hold it (dedup untouched) until the PR merges or closes.
+          // Checked BEFORE resolveBaseBranch so the hold never (re)creates branches.
+          if (isGroupingParentDispatch(issue)) {
+            const rollUp = await findOpenRollUpPr({ ghToken: baseGhToken, issue, mapping });
+            if (rollUp) {
+              console.log(`[poll] Holding ${issue.identifier}: roll-up PR #${rollUp.number} is open — no parent work until it merges/closes`);
+              continue;
+            }
+          }
+
           const baseBranch = await resolveBaseBranch({ ghToken: baseGhToken, issue, mapping });
 
           if (execPath === "both") {
