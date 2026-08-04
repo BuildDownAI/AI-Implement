@@ -308,3 +308,48 @@ describe("selectFileOverlapDeferrals", () => {
     expect(blocker.detail).toContain("src/a.ts");
   });
 });
+
+describe("same-batch overlap + in-flight sourcing (AII-278)", () => {
+  const chain = [{ identifier: "P-1", mode: "feature" as const }];
+  const mk = (id: string, desc: string | null) =>
+    makeIssue(id, id, "T", { description: desc, featureBranchChain: chain });
+
+  it("defers the second of two SAME-BATCH candidates declaring the same file", () => {
+    const a = mk("C-1", "- Modify: `src/shared.ts`");
+    const b = mk("C-2", "- Modify: `src/shared.ts`\n- Create: `src/other.ts`");
+    const d = selectFileOverlapDeferrals([b, a], []); // order-independent: identifier sort accepts C-1 first
+    expect(d).toHaveLength(1);
+    expect(d[0].issueIdentifier).toBe("C-2");
+    expect(d[0].reason).toBe("file-overlap");
+    expect(d[0].detail).toContain("C-1");
+  });
+
+  it("three-way batch: first accepted, both later overlappers deferred", () => {
+    const a = mk("C-1", "- Modify: `src/shared.ts`");
+    const b = mk("C-2", "- Modify: `src/shared.ts`");
+    const c = mk("C-3", "- Modify: `src/shared.ts`");
+    const d = selectFileOverlapDeferrals([c, b, a], []);
+    expect(d.map((x) => x.issueIdentifier).sort()).toEqual(["C-2", "C-3"]);
+  });
+
+  it("same-batch candidates on DIFFERENT grouping branches never defer each other", () => {
+    const other = [{ identifier: "P-2", mode: "feature" as const }];
+    const a = mk("C-1", "- Modify: `src/shared.ts`");
+    const b = { ...mk("C-2", "- Modify: `src/shared.ts`"), featureBranchChain: other };
+    expect(selectFileOverlapDeferrals([a, b], [])).toHaveLength(0);
+  });
+
+  it("batch candidate defers against an in-flight (non-candidate) sibling's declared files", () => {
+    const inFlight = mk("C-9", "- Modify: `src/shared.ts`");
+    const cand = mk("C-2", "- Modify: `src/shared.ts`");
+    const d = selectFileOverlapDeferrals([cand], [inFlight]);
+    expect(d).toHaveLength(1);
+    expect(d[0].detail).toContain("C-9");
+  });
+
+  it("fail-open within the batch: undeclared candidates never defer or cause deferrals", () => {
+    const a = mk("C-1", "no files section here");
+    const b = mk("C-2", "- Modify: `src/shared.ts`");
+    expect(selectFileOverlapDeferrals([a, b], [])).toHaveLength(0);
+  });
+});

@@ -25,32 +25,51 @@ const groupingBranchOf = (i: TicketIssue) =>
 
 /** Fail-open guard: defer candidates whose declared files intersect an in-flight sibling's
  *  (same last grouping-branch entry). Candidates with no declared files never defer. */
+/** Fail-open guard: defer candidates whose declared files intersect an IN-FLIGHT
+ *  sibling's — or an already-accepted candidate's in the SAME poll batch (the
+ *  dominant fan-out case: one blocker releasing N siblings simultaneously, which
+ *  the original in-flight-only check missed entirely — alpacaWheel test Finding 2).
+ *  Candidates are processed in identifier order so acceptance is deterministic
+ *  across cycles. Candidates with no declared files never defer (and never cause
+ *  deferrals). */
 export function selectFileOverlapDeferrals(
   candidates: TicketIssue[],
   inFlightSiblings: TicketIssue[],
 ): Blocker[] {
   const blockers: Blocker[] = [];
-  for (const c of candidates) {
+  // accumulated claims per grouping branch: file -> claiming issue identifier
+  const claims = new Map<string, Map<string, string>>();
+  const branchKey = (b: { identifier: string; mode: string }) => `${b.mode}/${b.identifier}`;
+  const claim = (issue: TicketIssue) => {
+    const b = groupingBranchOf(issue);
+    if (!b) return;
+    const files = parseDeclaredFiles(issue.description);
+    if (files.size === 0) return;
+    const m = claims.get(branchKey(b)) ?? new Map<string, string>();
+    for (const f of files) if (!m.has(f)) m.set(f, issue.identifier);
+    claims.set(branchKey(b), m);
+  };
+  for (const s of inFlightSiblings) claim(s);
+
+  const ordered = [...candidates].sort((a, b) => a.identifier.localeCompare(b.identifier));
+  for (const c of ordered) {
     const branch = groupingBranchOf(c);
     if (!branch) continue;
     const mine = parseDeclaredFiles(c.description);
     if (mine.size === 0) continue;
-    for (const s of inFlightSiblings) {
-      const sb = groupingBranchOf(s);
-      if (!sb || sb.identifier !== branch.identifier || sb.mode !== branch.mode) continue;
-      const theirs = parseDeclaredFiles(s.description);
-      const shared = [...mine].filter((f) => theirs.has(f));
-      if (shared.length) {
-        blockers.push({
-          issueId: c.id,
-          issueIdentifier: c.identifier,
-          issueTitle: c.title,
-          teamKey: c.scopeKey,
-          reason: "file-overlap",
-          detail: `Declared files overlap in-flight sibling ${s.identifier}: ${shared.slice(0, 5).join(", ")}. Deferred until it merges.`,
-        });
-        break;
-      }
+    const m = claims.get(branchKey(branch));
+    const shared = m ? [...mine].filter((f) => m.has(f)) : [];
+    if (shared.length && m) {
+      blockers.push({
+        issueId: c.id,
+        issueIdentifier: c.identifier,
+        issueTitle: c.title,
+        teamKey: c.scopeKey,
+        reason: "file-overlap",
+        detail: `Declared files overlap sibling ${m.get(shared[0])}: ${shared.slice(0, 5).join(", ")}. Deferred until it merges.`,
+      });
+    } else {
+      claim(c); // accepted: its files now block later batch candidates
     }
   }
   return blockers;
