@@ -37,6 +37,10 @@ export interface Job {
   sessionImage: string | null;
   phase: string;
   contract: string | null;
+  /** True when the dispatch was a grouping parent's own closing-work run (chain ends at
+   *  self). Lets the monitors treat a clean exit with no PR as Case-B finalize instead of
+   *  pr_not_found (AII-264 r5). */
+  groupingParent: boolean;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -123,6 +127,9 @@ function ensureLogColumns(): void {
   if (!names.has("trigger")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN trigger TEXT");
   }
+  if (!names.has("grouping_parent")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN grouping_parent INTEGER NOT NULL DEFAULT 0");
+  }
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -163,12 +170,14 @@ export function appendLog(entry: {
   contract?: "legacy" | "envelope";
   /** Trigger source: 'comment' for orchestrator-mediated /ai-implement runs, null = orchestrator-initiated. */
   trigger?: string;
+  /** True when this dispatch is a grouping parent's own closing-work run (AII-264 r5). */
+  groupingParent?: boolean;
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -188,6 +197,7 @@ export function appendLog(entry: {
     entry.phase ?? "implementation",
     entry.contract ?? null,
     entry.trigger ?? null,
+    entry.groupingParent ? 1 : 0,
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows
@@ -408,6 +418,7 @@ interface RawRow {
   phase: string | null;
   contract: string | null;
   trigger: string | null;
+  grouping_parent: number | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -435,6 +446,7 @@ function mapRows(rows: RawRow[]): Job[] {
     sessionImage: (row.session_image as string | null) ?? null,
     phase: row.phase ?? "implementation",
     contract: row.contract ?? null,
+    groupingParent: row.grouping_parent === 1,
   }));
 }
 

@@ -344,6 +344,17 @@ target different feature branches are not affected.
   `feature → base` PR is open is not dispatchable (the orchestrator probes for the open PR
   before dispatch and holds, dedup untouched) — re-dispatching it produced junk closing PRs /
   pr_not_found churn. The hold releases when the PR merges or closes.
+- **A grouping parent's no-op closing run FINALIZES — it is not a failure.** Most parents
+  exist to group, not to code: their closing run often correctly produces no changes, and the
+  runner's push step deliberately no-ops (Case B). All three monitors (GHA, Fly, local Docker)
+  now treat a clean exit with no PR on a `grouping_parent` job as finalize — `markMerged` the
+  issue so merge-up opens the feature→base roll-up PR (after which the roll-up hold above
+  takes over) — instead of `pr_not_found` → reset → re-dispatch (the r5 OOL-175 loop). The
+  runner-callback `noWork` path did this already; the monitor path is what fires when the
+  callback is unreachable (every local run).
+- **Children get a grace re-check before `pr_not_found`.** A child job's clean exit with no
+  visible PR is usually the monitor racing the PR search index — the monitor defers one cycle
+  (2-minute window) and re-checks before declaring `pr_not_found` and resetting the ticket.
 - **Recovery gap-fills always run via GitHub Actions**, regardless of a mapping's
   local-docker execution mode (the drain implements fly + GHA only; the target is a remote
   PR branch either way).

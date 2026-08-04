@@ -50,7 +50,7 @@ import {
   startLocalRunnerContainer,
   sweepExitedLocalContainers,
 } from "./local-docker.js";
-import { resolveTerminalStatus, workflowFileForJob } from "./monitor-status.js";
+import { clearPrNotFoundGrace, decideCleanExitOutcome, workflowFileForJob } from "./monitor-status.js";
 import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
@@ -708,6 +708,7 @@ async function dispatchGitHubActions(
     runnerMode,
     sessionImage: runnerImage ?? null,
     contract,
+    groupingParent: isGroupingParentDispatch(issue),
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -1145,6 +1146,7 @@ async function dispatchSession(
     runnerMode,
     sessionImage: result.sessionImage,
     phase: opts.phase,
+    groupingParent: opts.phase === "implementation" && isGroupingParentDispatch(issue),
   });
 
   if (!opts.shadow) {
@@ -1684,6 +1686,14 @@ async function monitorGitHubActionsJob(
 
     updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl);
     console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) → ${jobStatus} (${runStatus.conclusion})`);
+
+    // AII-264 r5: a grouping parent's clean GHA run with no PR is Case-B (the runner's push
+    // step no-op'd because the agent produced no changes). Without a reachable callback the
+    // parent would strand In Progress — finalize it here so merge-up opens the roll-up PR.
+    if (jobStatus === "completed" && !prUrl && job.phase !== "planning" && job.groupingParent) {
+      const provider = await providerForJob(registry, job);
+      await finalizeNoOpGroupingParent(provider, job);
+    }
   }
   // If status is queued or in_progress, ensure job is marked running
   else if (job.status === "dispatched") {
@@ -1815,7 +1825,14 @@ async function monitorFlyMachineJob(
     // Use PR existence to distinguish success from failure:
     // if a PR was created, the session completed its job; otherwise it failed
     const reviewNeedsAttention = !!prUrl && postPushReviewNeedsAttention(job.id);
-    const jobStatus: JobStatus = resolveTerminalStatus(machineExitCode, prUrl, reviewNeedsAttention, job.phase, isDraftPr);
+    // AII-264 r5: a grouping parent's clean no-PR exit is Case-B finalize, not pr_not_found;
+    // a child's clean no-PR exit gets a bounded grace re-check (PR-visibility race).
+    const decision = decideCleanExitOutcome(job, machineExitCode, prUrl, reviewNeedsAttention, isDraftPr, Date.now());
+    if (decision.deferForPrRecheck) {
+      console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) exited 0 with no PR — re-checking before declaring pr_not_found`);
+      return;
+    }
+    const jobStatus: JobStatus = decision.jobStatus;
 
     // Stamp pr_number on the machine before it's destroyed so reaper/audit
     // tools can read it. Only possible when machine is still accessible.
@@ -1848,9 +1865,13 @@ async function monitorFlyMachineJob(
     }
 
     const durationMs = Date.now() - job.dispatchedAt;
-    updateJobStatus(job.id, jobStatus, machineConclusion, prUrl);
+    updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : machineConclusion, prUrl);
     invalidateNonce(job.id);
+    clearPrNotFoundGrace(job.id);
     console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (${machineConclusion}, PR: ${prUrl || "none"})`);
+    if (decision.finalizeGroupingParent) {
+      await finalizeNoOpGroupingParent(provider, job);
+    }
 
     // Post machine_destroyed status comment to Linear (best-effort, skip shadow jobs)
     if (job.runnerMode !== "shadow" && job.issueId) {
@@ -1938,7 +1959,15 @@ async function monitorLocalDockerJob(
   // markReadyForReview/resetTicket below.
   const isDraftPr = matchedPr?.draft === true;
   const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
-  const jobStatus = resolveTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention, job.phase, isDraftPr);
+  // AII-264 r5: a grouping parent's clean no-PR exit is Case-B finalize, not pr_not_found;
+  // a child's clean no-PR exit gets a bounded grace re-check (PR-visibility race). The
+  // exited container is left in place while deferred so the next pass can re-inspect it.
+  const decision = decideCleanExitOutcome(job, state.exitCode, prUrl, reviewNeedsAttention, isDraftPr, Date.now());
+  if (decision.deferForPrRecheck) {
+    console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) exited 0 with no PR — re-checking before declaring pr_not_found`);
+    return;
+  }
+  const jobStatus = decision.jobStatus;
 
   if (jobStatus === "failed") {
     await postLocalContainerLogs(provider, job, state.exitCode === 0 ? "pr_not_found" : "container_failed");
@@ -1954,8 +1983,9 @@ async function monitorLocalDockerJob(
   }
 
   const durationMs = Date.now() - job.dispatchedAt;
-  updateJobStatus(job.id, jobStatus, `exit_${state.exitCode}`, prUrl);
+  updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : `exit_${state.exitCode}`, prUrl);
   invalidateNonce(job.id);
+  clearPrNotFoundGrace(job.id);
   console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (exit ${state.exitCode}, PR: ${prUrl || "none"})`);
 
   if (job.issueId) {
@@ -1967,7 +1997,9 @@ async function monitorLocalDockerJob(
     });
   }
 
-  if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
+  if (decision.finalizeGroupingParent) {
+    await finalizeNoOpGroupingParent(provider, job);
+  } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
     if (isDraftPr) {
       // Unapproved run: the runner callback (or, absent one, this job row + the
       // status comment already posted above) owns the ticket transition for a
@@ -1977,6 +2009,28 @@ async function monitorLocalDockerJob(
     }
   } else {
     await resetTicket(provider, job);
+  }
+}
+
+/**
+ * AII-264 r5: finalize a grouping parent whose closing run produced no changes (Case B).
+ * Mirrors the runner-callback `noWork` path: markMerged clears AI-Working and completes the
+ * issue, so fetchFeatureNodeRollUps finds the feature node done and merge-up.ts opens the
+ * feature→base roll-up PR — after which the r3 roll-up hold keeps the parent parked. The
+ * stuck-attempt counter is reset so a prior pr_not_found streak can't re-arm the watchdog.
+ */
+async function finalizeNoOpGroupingParent(provider: TicketingProvider | null, job: Job): Promise<void> {
+  if (!provider || !job.issueId) return;
+  if (!job.teamKey) {
+    console.error(`[monitor] Cannot finalize grouping parent ${job.issueIdentifier}: job has no teamKey`);
+    return;
+  }
+  try {
+    await provider.markMerged(job.issueId, job.teamKey);
+    resetStuckAttempts(job.issueId);
+    console.log(`[monitor] Grouping parent ${job.issueIdentifier}: closing run produced no changes — finalized for roll-up (no reset)`);
+  } catch (err) {
+    console.error(`[monitor] Failed to finalize grouping parent ${job.issueIdentifier}:`, err);
   }
 }
 
