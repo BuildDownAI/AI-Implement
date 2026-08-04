@@ -2633,6 +2633,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         flySessionsRegion: config.flySessionsRegion,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
+        pollNow: () => {
+          if (pollInProgress) return { started: false };
+          console.log("[poll] Immediate poll requested via admin UI");
+          void poll(config, registry);
+          return { started: true };
+        },
       }, registry)) return;
     }
 

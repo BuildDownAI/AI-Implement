@@ -6,6 +6,7 @@ export const overviewHtml = `
       <div class="page-subtitle" id="overview-subtitle">&mdash;</div>
     </div>
     <div class="page-header-actions">
+      <button class="btn btn-sm" id="overview-poll-now" onclick="pollNowClick()">&#9889; Poll now</button>
       <button class="btn btn-sm" onclick="loadOverview()">&#8635; Refresh</button>
     </div>
   </header>
@@ -476,6 +477,27 @@ export const overviewScript = `
   }
 
   window.loadOverview = loadOverview;
+
+  async function pollNowClick() {
+    const btn = document.getElementById('overview-poll-now');
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    try {
+      const res = await window.api('/api/poll-now', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) btn.textContent = (data && data.error) || 'Unavailable';
+      else btn.textContent = data.started ? 'Poll started' : 'Poll already running';
+    } catch (err) {
+      btn.textContent = 'Failed';
+      console.error('pollNow failed:', err);
+    }
+    setTimeout(function () {
+      btn.innerHTML = original;
+      btn.disabled = false;
+      loadOverview();
+    }, 2500);
+  }
+  window.pollNowClick = pollNowClick;
 
   window.registerPage('overview', function () {
     loadOverview();

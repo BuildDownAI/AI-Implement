@@ -172,6 +172,8 @@ export interface AdminConfig {
   flySessionsRegion: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
+  /** Triggers an immediate poll cycle; reports false if one is already running. Unset in tests that don't exercise it. */
+  pollNow?: () => { started: boolean };
 }
 
 export function handleAdminRequest(
@@ -315,6 +317,16 @@ export function handleAdminRequest(
       const n = parseInt(limitParam ?? "20", 10);
       const limit = Math.min(100, Number.isFinite(n) && n > 0 ? n : 20);
       json(res, 200, listReaperActions(limit));
+      return true;
+    }
+
+    if (url === "/api/poll-now" && method === "POST") {
+      if (!config.pollNow) {
+        json(res, 503, { error: "Poll trigger not available" });
+        return true;
+      }
+      const result = config.pollNow();
+      json(res, 200, result.started ? { started: true } : { started: false, reason: "poll_in_progress" });
       return true;
     }
 

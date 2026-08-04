@@ -1930,3 +1930,50 @@ describe("github-install-state endpoint", () => {
     expect(res.statusCode).toBe(500);
   });
 });
+
+describe("admin poll-now", () => {
+  async function pollNowRequest(
+    pollNow: (() => { started: boolean }) | undefined,
+    token?: string,
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest("/api/poll-now", "POST", token ? { authorization: `Bearer ${token}` } : {});
+    const res = new MockResponse();
+    admin.handleAdminRequest(
+      req as never,
+      res as never,
+      { ...adminConfig("secret"), pollNow },
+      makeFakeRegistry(provider),
+    );
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  it("triggers a poll cycle and reports it started", async () => {
+    const token = await login("secret");
+    const pollNow = vi.fn(() => ({ started: true }));
+    const res = await pollNowRequest(pollNow, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ started: true });
+    expect(pollNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports poll_in_progress when a cycle is already running", async () => {
+    const token = await login("secret");
+    const res = await pollNowRequest(() => ({ started: false }), token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ started: false, reason: "poll_in_progress" });
+  });
+
+  it("requires auth", async () => {
+    const pollNow = vi.fn(() => ({ started: true }));
+    const res = await pollNowRequest(pollNow);
+    expect(res.statusCode).toBe(401);
+    expect(pollNow).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 when the poll trigger is not wired", async () => {
+    const token = await login("secret");
+    const res = await pollNowRequest(undefined, token);
+    expect(res.statusCode).toBe(503);
+  });
+});
