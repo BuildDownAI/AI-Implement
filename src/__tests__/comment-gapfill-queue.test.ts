@@ -293,3 +293,46 @@ describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
     expect(queue.hasPendingConflictResolution("o", "r4", 6)).toBe(true);
   });
 });
+
+describe("startup sweep for pre-fix orphaned rows (AII-279)", () => {
+  it("terminalizes dispatched rows whose linked comment job is already terminal", async () => {
+    const log = await import("../log.js");
+    log.initLogTable();
+    const id = queue.enqueueConflictResolution({ owner: "o", repo: "rs", prNumber: 33, featureBranch: "ai-implement/feature/p" });
+    queue.markCommentGapfillProcessed(id, "dispatched");
+    // job terminalized BEFORE the AII-277 hook existed (simulated: direct SQL, no hook side-effects)
+    const jobId = log.appendLog({
+      issueId: "iss", issueIdentifier: "T-33", issueTitle: "t", teamKey: "T",
+      repo: "o/rs", dispatchId: "d-33", issueState: "in_progress",
+      executionMode: "github-actions", phase: "gap-analysis", trigger: "comment",
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/o/rs/pull/33");
+    dedup.getDb().prepare("UPDATE dispatch_log SET status='completed' WHERE id=?").run(jobId);
+    expect(queue.hasPendingConflictResolution("o", "rs", 33)).toBe(true); // wedged
+    const swept = queue.sweepOrphanedGapfillRows();
+    expect(swept).toBe(1);
+    expect(queue.hasPendingConflictResolution("o", "rs", 33)).toBe(false);
+  });
+
+  it("leaves rows with in-flight jobs untouched; absent-job rows go failed", async () => {
+    const log = await import("../log.js");
+    log.initLogTable();
+    // in-flight
+    const a = queue.enqueueConflictResolution({ owner: "o", repo: "ra", prNumber: 1, featureBranch: "ai-implement/feature/p" });
+    queue.markCommentGapfillProcessed(a, "dispatched");
+    const j = log.appendLog({
+      issueId: "i1", issueIdentifier: "T-1", issueTitle: "t", teamKey: "T",
+      repo: "o/ra", dispatchId: "d-1", issueState: "in_progress",
+      executionMode: "github-actions", phase: "gap-analysis", trigger: "comment",
+    });
+    log.updateJobPrUrl(j, "https://github.com/o/ra/pull/1");
+    dedup.getDb().prepare("UPDATE dispatch_log SET status='running' WHERE id=?").run(j);
+    // absent job entirely
+    const b = queue.enqueueConflictResolution({ owner: "o", repo: "rb", prNumber: 2, featureBranch: "ai-implement/feature/p" });
+    queue.markCommentGapfillProcessed(b, "dispatched");
+    const swept = queue.sweepOrphanedGapfillRows();
+    expect(swept).toBe(1);
+    expect(queue.hasPendingConflictResolution("o", "ra", 1)).toBe(true);   // untouched
+    expect(queue.hasPendingConflictResolution("o", "rb", 2)).toBe(false);  // failed
+  });
+});

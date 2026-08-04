@@ -58,6 +58,7 @@ import { runMergeUps } from "./merge-up.js";
 import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
+import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs } from "./poll-merged-prs.js";
@@ -2676,6 +2677,7 @@ async function main(): Promise<void> {
   // Initialize DB tables before loadConfig() so DB-backed settings are readable on first boot
   initMappingsTable();
   initLogTable();
+  sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
   initReconciliationTable();
   initStepLogTable();

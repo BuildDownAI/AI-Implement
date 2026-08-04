@@ -149,3 +149,30 @@ export function markCommentGapfillRunTerminal(
   ).run(outcome, Date.now(), repoFull, prNumber);
   return res.changes;
 }
+
+/** One-time startup sweep (AII-279): rows stuck in 'dispatched' from BEFORE the
+ *  AII-277 terminal hook existed can never heal through updateJobStatus (their
+ *  job already terminalized). Terminalize each dispatched row by its latest
+ *  comment-triggered job for the same repo+PR: completed job -> completed;
+ *  failed/absent job -> failed. Rows whose job is still in flight are untouched.
+ *  Attempt counting is status-independent, so the sweep cannot distort the cap. */
+export function sweepOrphanedGapfillRows(): number {
+  const db = getDb();
+  const rows = db.prepare(
+    "SELECT id, owner, repo, pr_number FROM comment_gapfill_queue WHERE status = 'dispatched'",
+  ).all() as Array<{ id: number; owner: string; repo: string; pr_number: number }>;
+  let swept = 0;
+  for (const r of rows) {
+    const job = db.prepare(
+      "SELECT status FROM dispatch_log WHERE trigger = 'comment' AND repo = ? " +
+      "AND pr_url LIKE ? ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    ).get(`${r.owner}/${r.repo}`, `%/pull/${r.pr_number}`) as { status: string } | undefined;
+    if (job && (job.status === "dispatched" || job.status === "running")) continue; // genuinely in flight
+    const outcome = job?.status === "completed" ? "completed" : "failed";
+    db.prepare("UPDATE comment_gapfill_queue SET status = ?, processed_at = ? WHERE id = ?")
+      .run(outcome, Date.now(), r.id);
+    console.log(`[gapfill] startup sweep: row for ${r.owner}/${r.repo}#${r.pr_number} -> ${outcome} (pre-fix orphan)`);
+    swept++;
+  }
+  return swept;
+}

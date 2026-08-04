@@ -77,10 +77,13 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
           } else {
             const attempts = countConflictAttempts(owner, repo, pr.number);
             if (attempts >= MAX_CONFLICT_RESOLUTION_ATTEMPTS) {
-              console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: conflict resolution cap (${attempts}) exhausted — leaving for a human`);
               const capKey = `${owner}/${repo}#${pr.number}`;
-              if (deps.notify && !capExhaustedNotified.has(capKey)) {
+              const firstSighting = !capExhaustedNotified.has(capKey);
+              if (firstSighting) {
                 capExhaustedNotified.add(capKey);
+                console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: conflict resolution cap (${attempts}) exhausted — leaving for a human`);
+              }
+              if (deps.notify && firstSighting) {
                 await deps.notify(
                   `Conflict on PR #${pr.number} → \`${pr.base}\` (${owner}/${repo}): ${attempts} resolution attempt${attempts === 1 ? "" : "s"} exhausted — leaving for a human.`
                 ).catch(() => {});
