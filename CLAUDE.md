@@ -89,7 +89,7 @@ npm run dev:local      # rebuilds local session image, then runs local Docker jo
 ```
 
 Health check: `curl http://localhost:8080/`
-Admin UI: `http://localhost:8080/admin` (requires ADMIN_ACCESS_CODE)
+Admin UI: `http://localhost:8080/admin` (requires an OAuth provider configured **or** ADMIN_ACCESS_CODE set)
 
 ## Running tests
 
@@ -108,6 +108,7 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `dispatched` | Dedup — issue IDs dispatched in the last 24h |
 | `mappings` | Team key → GitHub repo config |
 | `dispatch_log` | Audit log, last 500 dispatches |
+| `settings` | Key-value store — runner mode, Fly session config, deploy-notification state |
 
 `dedup.ts` owns the DB singleton (`getDb()`). All other modules import `getDb` from `dedup.ts`.
 
@@ -121,7 +122,11 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `GITHUB_APP_PRIVATE_KEY` | Yes | GitHub App RSA private key (PEM, `\n`-escaped) |
 | `NOTIFY_TYPE` | No | `slack` (default) or `teams` |
 | `NOTIFY_WEBHOOK_URL` | No | Webhook URL; notifications skipped if unset |
-| `ADMIN_ACCESS_CODE` | No | Admin UI password; UI disabled if unset |
+| `ADMIN_ACCESS_CODE` | No | **Deprecated** admin-UI password fallback (prefer SSO below). UI is enabled if this **or** any OAuth provider is set. |
+| `OAUTH_REDIRECT_BASE_URL` | No | Base URL for OAuth redirect URIs (`https://<app>.fly.dev`; `http://localhost:8080` locally) |
+| `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | No | Google OIDC credentials — enables the Google SSO button |
+| `MICROSOFT_OAUTH_CLIENT_ID` / `MICROSOFT_OAUTH_CLIENT_SECRET` / `MICROSOFT_OAUTH_TENANT` | No | Microsoft (Entra) OIDC credentials; `_TENANT` is the directory (tenant) ID |
+| `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` | No | Comma-separated allowlist; a verified identity must match a domain or email (fail-closed) |
 | `DEDUP_DB_PATH` | No | SQLite path (default `/data/dedup.sqlite`) |
 | `POLL_INTERVAL_MS` | No | Poll interval ms (default `60000`) |
 | `PORT` | No | HTTP port (default `8080`) |
@@ -143,6 +148,12 @@ The **Sync workflows** button on each project row re-runs the sync manually at a
 
 The GitHub App must have **Workflows** permission in addition to **Contents** permission. GitHub rejects writes under `.github/workflows/` without it, so the sync will fail (surfaced as a "permission denied" message) before opening or updating the target-repo PR.
 
+## Admin authentication
+
+The admin UI supports **SSO via OIDC** (Google + Microsoft) with a **deprecated shared access-code** fallback. The UI is enabled when at least one is configured, and returns 503 when neither is.
+
+- **SSO (preferred):** configure one or more providers (`GOOGLE_OAUTH_*` / `MICROSOFT_OAUTH_*`) plus `OAUTH_REDIRECT_BASE_URL`, and an allowlist (`OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS`). Sign-in yields an httpOnly session cookie; authorization is **fail-closed** against the email/domain allowlist — a verified `email` must match `OAUTH_ALLOWED_EMAILS`, or its domain must match `OAUTH_ALLOWED_DOMAINS`. The session stores the provider's stable `sub` as its identity reference (email is mutable). Claims are normalized across providers in `src/oauth/oidc.ts`.
+- **Access code (deprecated):** `ADMIN_ACCESS_CODE` remains for local dev/bootstrapping. It uses a timing-safe compare and logs a deprecation warning on each use.
 
 ## admin-ui
 
@@ -168,6 +179,10 @@ Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are
 ## Notification adapter
 
 `src/notify.ts` exports a single `notify(type, webhookUrl, notification)` function. Set `NOTIFY_TYPE=slack` or `NOTIFY_TYPE=teams` to switch providers. Adding a new provider means adding a private function in `notify.ts` and a new case in the switch.
+
+The orchestrator also announces its own deploys. On shutdown it posts an `@channel` heads-up that dispatches are pausing; on the next boot it compares `FLY_IMAGE_REF` against the value it stored in the `settings` table and posts either "redeployed" (the image changed) or "restarted" (it did not), with how long it was down. A first boot on a fresh volume records the reference silently.
+
+Both notices are gated on `FLY_IMAGE_REF`, which only exists inside a Fly Machine — local runs never post. Failures are logged and swallowed, and the shutdown notice is bounded to a fraction of the shutdown budget so it cannot outlive `kill_timeout`.
 
 ## Workflow templates
 

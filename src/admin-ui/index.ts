@@ -57,11 +57,25 @@ const shell = `<div id="admin-page" class="app-shell hidden">
 
 const body = `<body>
 <div id="login-page" class="login-wrap">
-  <div class="login-box card">
-    <h2>Admin Access</h2>
-    <input type="password" id="access-code" placeholder="Access code" autofocus>
-    <button class="btn btn-primary" onclick="login()">Enter</button>
-    <div id="login-error" class="error hidden"></div>
+  <div class="login-panel">
+    <h1 class="login-title">Admin Access</h1>
+    <div class="login-box card">
+      <div id="auth-error" class="error hidden"></div>
+      <div id="sso-label" class="sso-label hidden">Sign in with your provider</div>
+      <div id="sso-buttons"></div>
+      <div id="login-divider" class="divider-labeled hidden"><span>or use an access code</span></div>
+      <div id="access-code-notice" class="warning hidden">
+        Signing in with an access code is <strong>deprecated</strong>.<br>
+        Configure SSO via the <span class="mono">&lt;provider&gt;_OAUTH_*</span> environment variables for per-user login.
+      </div>
+      <div id="access-code-box">
+        <div class="ac-row">
+          <input type="password" id="access-code" class="input" placeholder="Access code (deprecated)">
+          <button class="btn btn-primary" onclick="login()">Enter</button>
+        </div>
+        <div id="login-error" class="error hidden"></div>
+      </div>
+    </div>
   </div>
 </div>
 ${shell}

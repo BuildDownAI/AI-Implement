@@ -13,6 +13,7 @@ import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "
 import type { TicketIssue } from "./providers/types.js";
 import { selectIssuesToDispatch } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
+import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -20,6 +21,9 @@ import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanning
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
+import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
+import { configureAuthorizationPolicy } from "./oauth/authorize.js";
+import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
@@ -66,6 +70,7 @@ interface AppConfig {
   notifyWebhookUrl: string | null;
   notifyType: string;
   adminAccessCode: string | null;
+  oauthRedirectBaseUrl: string | null;
   pollIntervalMs: number;
   healthPort: number;
   // Fly Machines (optional — only needed if any mapping uses fly-machines mode)
@@ -97,10 +102,41 @@ function loadConfig(): AppConfig {
     if (!val) throw new Error(`Missing required env var: ${key}`);
     return val;
   };
-
+  
+  // Microsoft's tid-based "email verified" only holds for a single-tenant issuer
+  // so it's dropped as an OAuth provider if a multi-tenant env value is provided
+  let oauthProviders = providersFromEnv(process.env);
+  const msMultiTenant = oauthProviders.some((p) => p.id === "microsoft") &&
+    ["common", "organizations", "consumers"].includes((process.env.MICROSOFT_OAUTH_TENANT || "").toLowerCase());
+  if (msMultiTenant) {
+    oauthProviders = oauthProviders.filter((p) => p.id !== "microsoft");
+    console.warn("[main] MICROSOFT_OAUTH_TENANT is a multi-tenant value — Microsoft SSO disabled. Pin a specific tenant GUID (single-tenant).");
+  }
+  
+  // Resolved admin-auth posture — now that both access-code and SSO are known.
   const adminAccessCode = process.env.ADMIN_ACCESS_CODE || null;
-  if (!adminAccessCode) {
-    console.warn("[main] ADMIN_ACCESS_CODE not set — admin UI disabled");
+  const oauthConfigured = oauthProviders.length > 0; // derive from the list, not the not-yet-seeded singleton
+  if (!adminAccessCode && !oauthConfigured) {
+    console.warn("[main] admin UI disabled — set ADMIN_ACCESS_CODE and/or configure OAuth providers");
+  } else {
+    const modes: string[] = [];
+    if (oauthConfigured) {
+      configureOAuthProviders(oauthProviders);
+      configureAuthorizationPolicy({
+        allowedDomains: (process.env.OAUTH_ALLOWED_DOMAINS || "").split(",").map((s) => s.trim()).filter(Boolean),
+        allowedEmails: (process.env.OAUTH_ALLOWED_EMAILS || "").split(",").map((s) => s.trim()).filter(Boolean),
+      });
+
+      modes.push(`SSO (${oauthProviders.map((p) => p.id).join(", ")})`);
+    }
+    if (adminAccessCode) modes.push("access code");
+
+    console.log(`[main] admin auth: ${modes.join(" + ")}`);
+  }
+
+  const oauthRedirectBaseUrl = process.env.OAUTH_REDIRECT_BASE_URL || null;
+  if (oauthConfigured && !oauthRedirectBaseUrl) {
+    console.warn("[main] OAuth providers configured but OAUTH_REDIRECT_BASE_URL not set — SSO redirect URIs can't be built");
   }
 
   const notifyWebhookUrl = process.env.NOTIFY_WEBHOOK_URL || null;
@@ -147,6 +183,7 @@ function loadConfig(): AppConfig {
     notifyWebhookUrl,
     notifyType,
     adminAccessCode,
+    oauthRedirectBaseUrl,
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
     healthPort: parseInt(process.env.PORT || "8080", 10),
     flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
@@ -2539,12 +2576,53 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
       return;
     }
 
-    // Admin routes
-    if (url === "/admin" || url.startsWith("/api/")) {
-      if (!config.adminAccessCode) {
+    // OAuth / SSO — its own auth model (public providers endpoint + the OAuth flow);
+    // mounted before the admin 503-gate so it works when ADMIN_ACCESS_CODE is unset.
+    if (url.startsWith("/api/auth/")) {
+      const pathname = url.split("?")[0];
+      // `secure` reflects the real scheme from Fly's proxy-set x-forwarded-proto.
+      // The app is only reachable through that proxy, so the header is trusted; don't copy this to a directly-exposed server.
+      const secure = String(req.headers["x-forwarded-proto"] ?? "").includes("https");
+
+      if (pathname === "/api/auth/providers" && req.method === "GET") {
+        handleOAuthProviders(res, config.adminAccessCode !== null);
+        return;
+      }
+      if (pathname === "/api/auth/logout" && req.method === "POST") {
+        handleOAuthLogout(req, res, secure);
+        return;
+      }
+      const m = pathname.match(/^\/api\/auth\/([^/]+)\/(start|callback)$/);
+      if (m && req.method === "GET") {
+        const [, providerId, action] = m;
+        if (!config.oauthRedirectBaseUrl) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "OAuth is not configured (OAUTH_REDIRECT_BASE_URL is unset)." }));
+          return;
+        }
+        const oauthResult = action === "start"
+          ? handleOAuthStart(req, res, providerId, config.oauthRedirectBaseUrl)
+          : handleOAuthCallback(req, res, providerId, config.oauthRedirectBaseUrl, secure);
+        oauthResult.catch((err) => {
+          console.error("[oauth] Unhandled error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+
+    // Admin routes - match on the path only, so query params can still be read when needed
+    if (url.split("?")[0] === "/admin" || url.startsWith("/api/")) {
+      if (!config.adminAccessCode && !isOAuthConfigured()) {
         res.writeHead(503, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
-          error: "Admin UI is disabled because the ADMIN_ACCESS_CODE secret is not set. Set it and redeploy to enable the admin UI.",
+          error: "Admin UI is disabled. Configure SSO (OAuth providers + the OAUTH_ALLOWED_* allowlist) or set ADMIN_ACCESS_CODE, then redeploy to enable the Admin UI.",
         }));
         return;
       }
@@ -2555,6 +2633,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         flySessionsRegion: config.flySessionsRegion,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
+        pollNow: () => {
+          if (pollInProgress) return { started: false };
+          console.log("[poll] Immediate poll requested via admin UI");
+          void poll(config, registry);
+          return { started: true };
+        },
       }, registry)) return;
     }
 
@@ -2630,6 +2714,11 @@ async function main(): Promise<void> {
 
   const server = startServer(config, registry);
 
+  // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
+  // Safe because everything postBootNotice persists happens synchronously before its first await,
+  // so the stored image ref is committed by the time this returns.
+  void postBootNotice(config);
+
   // Reconcile machines from any previous run before starting the poll loop
   await startupReconciliation(config, registry);
 
@@ -2641,26 +2730,35 @@ async function main(): Promise<void> {
     poll(config, registry);
   }, config.pollIntervalMs);
 
-  // Graceful shutdown
-  const shutdown = (signal: string) => {
+  // total amount of time allotted for a graceful shutdown, otherwise the shutdown is forced
+  const SHUTDOWN_BUDGET_MS = 10_000; // 10s
+  const shutdown = async (signal: string) => {
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
+
+    // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
+    setTimeout(() => {
+      console.error(`[main] Forced shutdown after timeout`);
+      closeDb();
+      process.exit(1);
+    }, SHUTDOWN_BUDGET_MS).unref();
+
+    // Written before closeDb() so the next boot can measure how long we were gone.
+    recordShutdown();
+    await Promise.race([
+      postShutdownNotice(config),
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
+    ]);
+
     server.close(() => {
       closeDb();
       console.log(`[main] Shutdown complete`);
       process.exit(0);
     });
-
-    // Force exit after 10 seconds if graceful shutdown hangs
-    setTimeout(() => {
-      console.error(`[main] Forced shutdown after timeout`);
-      closeDb();
-      process.exit(1);
-    }, 10_000).unref();
   };
 
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+  process.on("SIGINT", () => { void shutdown("SIGINT"); });
 }
 
 main().catch((err) => {
