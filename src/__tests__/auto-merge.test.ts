@@ -250,3 +250,20 @@ describe("conflict detection in autoMergeRepo", () => {
     expect(notify).not.toHaveBeenCalled();
   });
 });
+
+describe("cap-exhausted notify-once (AII-277 Finding 4)", () => {
+  it("notifies once per PR across repeated cycles", async () => {
+    const { resetCapExhaustedNotifications } = await import("../auto-merge.js");
+    resetCapExhaustedNotifications();
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr({ number: 77 })] as never);
+    vi.mocked(mergePullRequest).mockResolvedValue("conflict" as never);
+    vi.mocked(hasPendingConflictResolution).mockReturnValue(false);
+    vi.mocked(countConflictAttempts).mockReturnValue(MAX_CONFLICT_RESOLUTION_ATTEMPTS);
+    const notify = vi.fn(async () => {});
+    for (let i = 0; i < 3; i++) {
+      await runAutoMerges([mapping()], { ...deps(), notify });
+    }
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(enqueueConflictResolution)).not.toHaveBeenCalled();
+  });
+});

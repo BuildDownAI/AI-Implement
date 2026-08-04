@@ -1,4 +1,5 @@
 import { getDb } from "./dedup.js";
+import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -233,6 +234,20 @@ export function updateJobStatus(
   prUrl?: string | null,
 ): void {
   const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out" || status === "dispatch-failed";
+  // AII-277: a comment-triggered (gap-fill) run reaching a terminal state must
+  // terminalize its queue row, or hasPendingConflictResolution stays true
+  // forever and conflict-recovery attempt 2 is unreachable (observed livelock).
+  if (isTerminal) {
+    const job = getDb().prepare("SELECT repo, trigger, pr_url FROM dispatch_log WHERE id = ?").get(jobId) as
+      | { repo: string; trigger: string | null; pr_url: string | null } | undefined;
+    const prUrlForRow = prUrl ?? job?.pr_url ?? null;
+    const m = prUrlForRow ? /\/pull\/(\d+)$/.exec(prUrlForRow) : null;
+    if (job?.trigger === "comment" && m) {
+      const outcome = status === "completed" ? "completed" : "failed";
+      const n = markCommentGapfillRunTerminal(job.repo, Number(m[1]), outcome);
+      if (n > 0) console.log(`[gapfill] terminalized ${n} queue row(s) for ${job.repo}#${m[1]} -> ${outcome}`);
+    }
+  }
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
   // caller has none — the GHA monitor often can't resolve a PR for dispatch runs and
   // must not wipe the link on completion.

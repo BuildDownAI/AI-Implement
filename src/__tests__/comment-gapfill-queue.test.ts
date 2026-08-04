@@ -237,3 +237,59 @@ describe("conflict resolution helpers", () => {
     expect(rows[0].instruction).toContain("ai-implement/feature/aii-200");
   });
 });
+
+describe("gap-fill run terminalization (AII-277 livelock fix)", () => {
+  it("marks the dispatched conflict row completed when its run terminalizes", () => {
+    const id = queue.enqueueConflictResolution({ owner: "o", repo: "r", prNumber: 9, featureBranch: "ai-implement/feature/p-1" });
+    queue.markCommentGapfillProcessed(id, "dispatched");
+    expect(queue.hasPendingConflictResolution("o", "r", 9)).toBe(true);
+    queue.markCommentGapfillRunTerminal("o/r", 9, "completed");
+    expect(queue.hasPendingConflictResolution("o", "r", 9)).toBe(false);
+    expect(queue.countConflictAttempts("o", "r", 9)).toBe(1);
+  });
+
+  it("updateJobStatus terminal transition on a comment-triggered job terminalizes the queue row (all-paths choke point)", async () => {
+    const log = await import("../log.js");
+    log.initLogTable();
+    const rowId = queue.enqueueConflictResolution({ owner: "o", repo: "r2", prNumber: 12, featureBranch: "ai-implement/feature/p-2" });
+    queue.markCommentGapfillProcessed(rowId, "dispatched");
+    const jobId = log.appendLog({
+      issueId: "iss-12", issueIdentifier: "T-12", issueTitle: "t", teamKey: "T",
+      repo: "o/r2", dispatchId: "d-12", issueState: "in_progress",
+      executionMode: "github-actions", phase: "gap-analysis", trigger: "comment",
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/o/r2/pull/12");
+    expect(queue.hasPendingConflictResolution("o", "r2", 12)).toBe(true);
+    log.updateJobStatus(jobId, "completed", "success");
+    expect(queue.hasPendingConflictResolution("o", "r2", 12)).toBe(false);
+    const second = queue.enqueueConflictResolution({ owner: "o", repo: "r2", prNumber: 12, featureBranch: "ai-implement/feature/p-2" });
+    expect(second).not.toBe(rowId);
+    expect(queue.countConflictAttempts("o", "r2", 12)).toBe(2);
+  });
+
+  it("failed run marks the row failed; non-comment jobs never touch queue rows", async () => {
+    const log = await import("../log.js");
+    log.initLogTable();
+    const rowId = queue.enqueueConflictResolution({ owner: "o", repo: "r3", prNumber: 5, featureBranch: "ai-implement/feature/p-3" });
+    queue.markCommentGapfillProcessed(rowId, "dispatched");
+    const jobId = log.appendLog({
+      issueId: "iss-5", issueIdentifier: "T-5", issueTitle: "t", teamKey: "T",
+      repo: "o/r3", dispatchId: "d-5", issueState: "in_progress",
+      executionMode: "github-actions", phase: "gap-analysis", trigger: "comment",
+    });
+    log.updateJobPrUrl(jobId, "https://github.com/o/r3/pull/5");
+    log.updateJobStatus(jobId, "timed_out", "machine_timeout");
+    expect(queue.hasPendingConflictResolution("o", "r3", 5)).toBe(false);
+
+    const other = queue.enqueueConflictResolution({ owner: "o", repo: "r4", prNumber: 6, featureBranch: "ai-implement/feature/p-4" });
+    queue.markCommentGapfillProcessed(other, "dispatched");
+    const j2 = log.appendLog({
+      issueId: "iss-6", issueIdentifier: "T-6", issueTitle: "t", teamKey: "T",
+      repo: "o/r4", dispatchId: "d-6", issueState: "in_progress",
+      executionMode: "github-actions", phase: "implementation",
+    });
+    log.updateJobPrUrl(j2, "https://github.com/o/r4/pull/6");
+    log.updateJobStatus(j2, "completed", "success");
+    expect(queue.hasPendingConflictResolution("o", "r4", 6)).toBe(true);
+  });
+});

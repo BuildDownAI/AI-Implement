@@ -14,6 +14,12 @@ export interface AutoMergeDeps {
 }
 
 export const MAX_CONFLICT_RESOLUTION_ATTEMPTS = 2;
+
+// AII-277 (Finding 4): cap-exhausted notifications fired every poll cycle for the
+// same PR (observed ~60s Slack spam). Notify once per PR per process; a restart
+// re-notifies at most once more. The log line stays every cycle (cheap, greppable).
+const capExhaustedNotified = new Set<string>();
+export function resetCapExhaustedNotifications(): void { capExhaustedNotified.clear(); }
 export type StalledChildKind = "conflict" | "other";
 
 /** Named seam: AII-263 (max_turns/draft stalls) extends this classification later. */
@@ -72,7 +78,9 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
             const attempts = countConflictAttempts(owner, repo, pr.number);
             if (attempts >= MAX_CONFLICT_RESOLUTION_ATTEMPTS) {
               console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: conflict resolution cap (${attempts}) exhausted — leaving for a human`);
-              if (deps.notify) {
+              const capKey = `${owner}/${repo}#${pr.number}`;
+              if (deps.notify && !capExhaustedNotified.has(capKey)) {
+                capExhaustedNotified.add(capKey);
                 await deps.notify(
                   `Conflict on PR #${pr.number} → \`${pr.base}\` (${owner}/${repo}): ${attempts} resolution attempt${attempts === 1 ? "" : "s"} exhausted — leaving for a human.`
                 ).catch(() => {});

@@ -1,6 +1,6 @@
 import { getDb } from "./dedup.js";
 
-export type CommentGapfillStatus = "pending" | "dispatched" | "skipped" | "failed";
+export type CommentGapfillStatus = "pending" | "dispatched" | "skipped" | "failed" | "completed";
 
 export interface CommentGapfillQueueItem {
   id: number;
@@ -130,4 +130,22 @@ export function enqueueConflictResolution(input: { owner: string; repo: string; 
     commenter: CONFLICT_COMMENTER,
     instruction: conflictResolutionInstruction(input.featureBranch),
   });
+}
+
+/** Terminalize the dispatched gap-fill row(s) for a repo+PR when their run
+ *  finishes (AII-277). Called from the updateJobStatus choke point in log.ts —
+ *  the single spot every execution path (GHA / Fly / local / timeouts / admin)
+ *  passes through — so a successfully-dispatched conflict resolution can't
+ *  wedge `hasPendingConflictResolution` forever (the livelock the alpacaWheel
+ *  test exposed: PR #3533). `repoFull` is "owner/name" as stored on the job. */
+export function markCommentGapfillRunTerminal(
+  repoFull: string,
+  prNumber: number,
+  outcome: "completed" | "failed",
+): number {
+  const res = getDb().prepare(
+    "UPDATE comment_gapfill_queue SET status = ?, processed_at = ? " +
+    "WHERE owner || '/' || repo = ? AND pr_number = ? AND status = 'dispatched'",
+  ).run(outcome, Date.now(), repoFull, prNumber);
+  return res.changes;
 }
