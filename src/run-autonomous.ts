@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
@@ -125,6 +125,29 @@ ${instruction}`;
 
 export function resolveLogLevel(raw: string | undefined): LogLevel {
   return raw === "stream" ? "stream" : "summary";
+}
+
+/** Single-quote a shell value, escaping embedded single-quotes. */
+function shellQuote(val: string): string {
+  return "'" + val.replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * Write a bash init file at `dest` that sources ~/.bashrc then exports any
+ * env vars present in `current` that differ from `before`. Used by --shell to
+ * make hook-exported GITHUB_ENV vars visible in the docker exec session.
+ */
+function writeShellEnvFile(dest: string, before: Record<string, string | undefined>): void {
+  const lines: string[] = [
+    "# Dev-run shell init: sources ~/.bashrc then re-applies hook env exports",
+    "[ -f ~/.bashrc ] && . ~/.bashrc",
+  ];
+  for (const [key, val] of Object.entries(process.env)) {
+    if (val !== undefined && val !== before[key]) {
+      lines.push(`export ${key}=${shellQuote(val)}`);
+    }
+  }
+  writeFileSync(dest, lines.join("\n") + "\n");
 }
 
 export interface ResolvedRunnerInputs {
@@ -417,10 +440,21 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
 
   let disposition: string | undefined;
 
+  const untilStep = optionalEnv("AI_IMPLEMENT_UNTIL_STEP") ?? undefined;
+  const shellMode = process.env.AI_IMPLEMENT_SHELL_MODE === "true";
+  // Snapshot env before the pipeline runs so we can diff after to find hook exports.
+  const envSnap: Record<string, string | undefined> = shellMode ? { ...process.env } : {};
+
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
     const runner = opts.runner ?? (await createDefaultRunner());
-    await runWithTiming(timing, () => runner.run(pipeline, context, reporter));
+    await runWithTiming(timing, () => runner.run(pipeline, context, reporter, { stopAfterStep: untilStep }));
+
+    if (untilStep) {
+      disposition = `staged: stopped after step "${untilStep}"`;
+      return { exitCode: 0 };
+    }
+
     const fbOutputs = context.getOutputs("feedback-loop");
     const pushOutputs = context.getOutputs("push");
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
@@ -533,6 +567,16 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         console.error(`teardown hook error: ${teardownErr}`);
       }
     }
+    if (shellMode) {
+      // Write a bash init file so `docker exec bash --init-file` picks up env
+      // vars exported by hooks via $GITHUB_ENV. Runs after teardown so all hook
+      // exports are captured. Non-fatal if it fails.
+      try {
+        writeShellEnvFile("/tmp/dev-run-env.sh", envSnap);
+      } catch (envFileErr) {
+        console.error(`[dev:run] failed to write shell env file: ${envFileErr}`);
+      }
+    }
   }
 }
 
@@ -544,7 +588,18 @@ function resolveRunnerPhase(rawPhase: string | undefined, prNumber: string): "im
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   runAutonomous()
-    .then((r) => process.exit(r.exitCode))
+    .then(async (r) => {
+      if (process.env.AI_IMPLEMENT_SHELL_MODE === "true") {
+        // Signal the dev-harness CLI that the pipeline has finished and the
+        // container is ready for interactive inspection. The CLI will attach
+        // a bash session via `docker exec -it` and remove the container when
+        // the user exits. The exit code is embedded so the CLI can preserve it.
+        process.stdout.write(`[dev:run] shell-ready exit=${r.exitCode}\n`);
+        // Keep the container alive until the Docker daemon kills the process.
+        await new Promise<never>(() => {});
+      }
+      process.exit(r.exitCode);
+    })
     .catch((err) => {
       console.error(err);
       process.exit(1);

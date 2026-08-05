@@ -68,6 +68,7 @@ export class PipelineRunner {
     pipeline: PipelineDefinition,
     context: PipelineContext,
     reporter: StepReporter,
+    opts: { stopAfterStep?: string } = {},
   ): Promise<void> {
     for (const definition of pipeline.steps) {
       if (definition.skip?.(context)) {
@@ -122,6 +123,10 @@ export class PipelineRunner {
         context.setOutputs(definition.id, step.outputs);
         await reporter.report(step);
         throw err;
+      }
+
+      if (opts.stopAfterStep && opts.stopAfterStep === definition.id) {
+        return;
       }
     }
   }

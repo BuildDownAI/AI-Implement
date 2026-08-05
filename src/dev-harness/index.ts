@@ -38,6 +38,18 @@ export interface DevRunOptions {
   artifactsDir?: string;
   /** Extra env vars injected into the container. */
   env?: Record<string, string>;
+  /**
+   * Run only up through this named step (by step id), then stop. The critical
+   * case is "setup": clone/mount → install → setup hook, no Claude invocation,
+   * zero tokens. Exit code reflects the last step's result.
+   */
+  untilStep?: string;
+  /**
+   * After the last executed step, keep the container alive and attach an
+   * interactive bash session via `docker exec -it`. The container is removed
+   * when the shell exits. Requires the terminal to be a TTY.
+   */
+  shell?: boolean;
 }
 
 export interface DevRunHandle {
@@ -156,6 +168,8 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     AI_IMPLEMENT_WORKSPACE_MODE: "mounted",
     AI_IMPLEMENT_LOG_LEVEL: logLevel,
     AI_IMPLEMENT_RUN_CONFIG: runConfig,
+    ...(opts.untilStep ? { AI_IMPLEMENT_UNTIL_STEP: opts.untilStep } : {}),
+    ...(opts.shell ? { AI_IMPLEMENT_SHELL_MODE: "true" } : {}),
     ISSUE_ID: issueId,
     ISSUE_IDENTIFIER: task.identifier,
     ISSUE_TITLE: task.title,
@@ -233,6 +247,48 @@ export async function streamLogs(
     proc.stdout?.on("data", emit);
     proc.stderr?.on("data", emit);
     proc.on("close", () => resolve());
+  });
+}
+
+const SHELL_READY_RE = /^\[dev:run\] shell-ready exit=(\d+)$/;
+
+/**
+ * Stream container logs until either the container exits or the shell-ready
+ * sentinel "[dev:run] shell-ready exit=N" is emitted. Returns whether the
+ * sentinel was found and, if so, the pipeline exit code embedded in it.
+ * Non-sentinel log lines are forwarded to onLine as usual.
+ */
+export async function streamLogsUntilShellReady(
+  handle: DevRunHandle,
+  onLine: (line: string) => void,
+): Promise<{ ready: boolean; exitCode: number | null }> {
+  return new Promise<{ ready: boolean; exitCode: number | null }>((resolve) => {
+    const proc = spawn("docker", ["logs", "-f", handle.containerId], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let resolved = false;
+    const finish = (result: { ready: boolean; exitCode: number | null }) => {
+      if (!resolved) {
+        resolved = true;
+        proc.kill();
+        resolve(result);
+      }
+    };
+    const emit = (data: Buffer) => {
+      for (const line of data.toString().split("\n")) {
+        const t = line.trimEnd();
+        if (!t) continue;
+        const m = t.match(SHELL_READY_RE);
+        if (m) {
+          finish({ ready: true, exitCode: parseInt(m[1], 10) });
+          return;
+        }
+        onLine(t);
+      }
+    };
+    proc.stdout?.on("data", emit);
+    proc.stderr?.on("data", emit);
+    proc.on("close", () => finish({ ready: false, exitCode: null }));
   });
 }
 
