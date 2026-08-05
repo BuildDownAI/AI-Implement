@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { pushStep } from "../pipeline/steps/push.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -1040,5 +1040,49 @@ describe("pushStep — hardening (review findings)", () => {
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/Push blocked/);
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("pushStep — mounted workspace never pushes", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("returns a no-op result without touching git or GitHub", async () => {
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.prUrl).toBeNull();
+    expect(outputs.prNumber).toBeNull();
+    expect(outputs.branchPushed).toBe(false);
+    expect(outputs.commitSha).toBeNull();
+    expect(outputs.draft).toBe(false);
+    // No git or HTTP calls.
+    expect(spawnSync).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does NOT skip when AI_IMPLEMENT_WORKSPACE_MODE is not mounted", async () => {
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "");
+    // Outside mounted mode the step falls through to normal push logic,
+    // which needs git state. Provide enough for it to throw on "nothing to commit".
+    vi.mocked(spawnSync).mockReturnValue({
+      status: 0,
+      stdout: Buffer.from(""),
+      stderr: Buffer.from(""),
+      pid: 0,
+      output: [],
+      signal: null,
+      error: undefined,
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(); // normal logic runs, fails on nothing-to-commit
   });
 });

@@ -50,6 +50,15 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     inputs: PushInputs,
     _reporter: StepReporter,
   ): Promise<PushOutputs> {
+    if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
+      // Dev-harness mounted workspace: never push. The mount is the user's live
+      // checkout, dirty by design (uncommitted WORKFLOW.md/hook edits under test),
+      // so a push would sweep their in-progress work into the commit. Changes are
+      // left in the mount for inspection with `git diff`; shipping them is the
+      // user's call. Skip push and PR creation.
+      return { prUrl: null, prNumber: null, branchPushed: false, commitSha: null, draft: false };
+    }
+
     const { workspaceDir, repoOwner, repoRepo, githubToken, branchName } = inputs;
     const { issueIdentifier, issueTitle } = context.data;
     const baseBranch = String(inputs.baseBranch ?? context.data.branch ?? "").trim();

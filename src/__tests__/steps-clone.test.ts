@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { cloneStep } from "../pipeline/steps/clone.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -151,5 +151,66 @@ describe("cloneStep", () => {
 
     expect(outputs.githubToken).toBe("secret-token");
     expect(outputs.workspaceDir).toBe("/tmp/workspace");
+  });
+
+  describe("mounted workspace mode (AI_IMPLEMENT_WORKSPACE_MODE=mounted)", () => {
+    beforeEach(() => {
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("skips git fetch/clone and returns cloneMethod=mounted", async () => {
+      mockSpawn([{ status: 0, stdout: "mountedsha\n" }]); // only rev-parse is called
+
+      const outputs = await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("mounted");
+      expect(outputs.clonedRef).toBe("mountedsha");
+    });
+
+    it("does not call existsSync or attempt a clone/fetch", async () => {
+      mockSpawn([{ status: 0, stdout: "sha\n" }]);
+
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      expect(fs.existsSync).not.toHaveBeenCalled();
+      // Only one spawnSync call (rev-parse HEAD), not the two/three from a real clone.
+      const { spawnSync: spy } = await import("node:child_process");
+      const calls = vi.mocked(spy).mock.calls;
+      expect(calls.length).toBe(1);
+      expect(calls[0][1]).toEqual(["rev-parse", "HEAD"]);
+    });
+
+    it("still calls prepareScratchExclusion in mounted mode", async () => {
+      mockSpawn([{ status: 0, stdout: "sha\n" }]);
+
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      expect(prepareScratchExclusion).toHaveBeenCalledWith("/tmp/workspace");
+    });
+
+    it("passes through all inputs in outputs even when mounted", async () => {
+      mockSpawn([{ status: 0, stdout: "sha\n" }]);
+
+      const outputs = await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      expect(outputs.repoOwner).toBe("acme");
+      expect(outputs.repoRepo).toBe("app");
+      expect(outputs.branch).toBe("main");
+      expect(outputs.githubToken).toBe("secret-token");
+      expect(outputs.workspaceDir).toBe("/tmp/workspace");
+    });
+
+    it("returns clonedRef=unknown when rev-parse fails in mounted mode", async () => {
+      mockSpawn([{ status: 128, stderr: "not a git repo" }]);
+
+      const outputs = await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("mounted");
+      expect(outputs.clonedRef).toBe("unknown");
+    });
   });
 });

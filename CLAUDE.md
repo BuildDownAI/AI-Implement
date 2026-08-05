@@ -91,6 +91,49 @@ npm run dev:local      # rebuilds local session image, then runs local Docker jo
 Health check: `curl http://localhost:8080/`
 Admin UI: `http://localhost:8080/admin` (requires an OAuth provider configured **or** ADMIN_ACCESS_CODE set)
 
+## Local dev harness
+
+`npm run dev:run` launches a single runner container directly against a local target-repo checkout — no orchestrator, no poll loop, no tracker. Ideal for iterating on `WORKFLOW.md` and `setup:` hook scripts.
+
+```bash
+npm run dev:run -- --workspace ../target-repo --task task.md
+```
+
+**Task file format** (`task.md`):
+```markdown
+---
+identifier: PROJ-123   # optional; defaults to DEV-<timestamp>
+title: Add login        # required
+maxTurns: 30            # optional
+maxIterations: 2        # optional
+repo: owner/repo        # optional; auto-detected from git remote
+branch: main            # optional; auto-detected from current HEAD
+---
+
+Issue description / implementation instructions go here.
+```
+
+**How it works:**
+- `--workspace <dir>` bind-mounts the local checkout at `/workspace` inside the container.
+- The clone step detects `AI_IMPLEMENT_WORKSPACE_MODE=mounted` and skips `git fetch/reset` entirely, so uncommitted edits to `WORKFLOW.md` and hook scripts take effect immediately.
+- Mounted mode **never pushes** — the push step is a no-op whenever `AI_IMPLEMENT_WORKSPACE_MODE=mounted`. The mount is your live checkout, dirty by design (the uncommitted `WORKFLOW.md`/hook edits under test), so a push would sweep in-progress work into the commit. The mutated working tree is left in the mount for inspection with `git diff`; commit/push the parts you want to keep yourself.
+- Logs are streamed to the terminal in real time. Per-run artifacts (log, diff, telemetry) are saved to `.dev-runs/<timestamp>/` (gitignored).
+
+**Library API** (for programmatic use or a future MCP wrapper — `src/dev-harness/`):
+```typescript
+import { startDevRun, streamLogs, getRunResult, collectRunArtifacts } from "./src/dev-harness/index.js";
+const handle = await startDevRun({ workspace, task });
+await streamLogs(handle, console.log);
+const result = await getRunResult(handle);
+await collectRunArtifacts(handle, result.exitCode);
+```
+
+**Artifacts per run** (`.dev-runs/<timestamp>/`):
+- `run.log` — full container output
+- `changes.diff` — `git diff` of the mounted workspace after the run
+- `diffstat.txt` — `git diff --stat` summary
+- `telemetry.json` — exit code, timing, issue metadata
+
 ## Running tests
 
 ```bash
