@@ -1059,6 +1059,7 @@ async function handleUpsertMapping(
       skillsRepo?: string | null;
       sensitiveAddPatterns?: string | string[] | null;
       sensitiveAllowPatterns?: string | string[] | null;
+      dependencyTokenScope?: string | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1214,6 +1215,19 @@ async function handleUpsertMapping(
       return;
     }
 
+    let dependencyTokenScope: "installation" | null;
+    const rawScope = body.dependencyTokenScope;
+    if (rawScope === undefined) {
+      dependencyTokenScope = existingMapping?.dependencyTokenScope ?? null;
+    } else if (rawScope === null || rawScope === "") {
+      dependencyTokenScope = null;
+    } else if (rawScope === "installation") {
+      dependencyTokenScope = "installation";
+    } else {
+      json(res, 400, { error: `dependencyTokenScope invalid: must be null or "installation"` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -1245,6 +1259,7 @@ async function handleUpsertMapping(
       skillsRepo,
       sensitiveAddPatterns,
       sensitiveAllowPatterns,
+      dependencyTokenScope,
     };
 
     upsertMapping(body.teamKey, mapping);

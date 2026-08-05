@@ -150,6 +150,14 @@ export const projectsHtml = `
             <textarea id="md-sensitive-allow" rows="3" placeholder="one glob per line"></textarea>
             <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
           </div>
+          <div class="md-field">
+            <label>Dependency Token Scope <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <select id="md-dep-token-scope">
+              <option value="">Off (default)</option>
+              <option value="installation">All repos the App can access (read-only)</option>
+            </select>
+            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos.</div>
+          </div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -308,6 +316,7 @@ export const projectsScript = `
     document.getElementById('md-skills-repo').value = m.skillsRepo || '';
     document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
     document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
+    document.getElementById('md-dep-token-scope').value = m.dependencyTokenScope || '';
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -629,6 +638,7 @@ export const projectsScript = `
       skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
+      dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
