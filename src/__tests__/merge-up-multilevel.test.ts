@@ -1,8 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { runMergeUps } from "../merge-up.js";
+import { resetRollUpHandledMarkers, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
 
+vi.mock("../dedup.js", async () => {
+  const Database = (await import("better-sqlite3")).default;
+  const db = new Database(":memory:");
+  return { getDb: () => db };
+});
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(async () => "tok"),
 }));
@@ -45,6 +50,7 @@ const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetRollUpHandledMarkers();
   vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
   vi.mocked(createPullRequest).mockResolvedValue({ number: 7, url: "https://gh/pr/7" });
   vi.mocked(mergeBranch).mockResolvedValue("merged");
