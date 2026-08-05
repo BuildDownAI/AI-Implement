@@ -1218,6 +1218,7 @@ async function handleUpsertMapping(
     let dependencyTokenScope: "installation" | null;
     const rawScope = body.dependencyTokenScope;
     if (rawScope === undefined) {
+      // Preserve stored value on omit — silently clearing an opt-in permission grant is the worse failure mode.
       dependencyTokenScope = existingMapping?.dependencyTokenScope ?? null;
     } else if (rawScope === null || rawScope === "") {
       dependencyTokenScope = null;

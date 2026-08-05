@@ -156,7 +156,7 @@ export const projectsHtml = `
               <option value="">Off (default)</option>
               <option value="installation">All repos the App can access (read-only)</option>
             </select>
-            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos.</div>
+            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos. (Not yet enforced — takes effect once dependency-token vending ships.)</div>
           </div>
         </fieldset>
         <fieldset>
