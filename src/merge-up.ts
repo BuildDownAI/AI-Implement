@@ -1,5 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { FeatureNodeRollUp } from "./providers/types.js";
+import { getDb } from "./dedup.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
 import { compareBranches, createPullRequest, deleteBranch, findPullRequestByBranches, mergeBranch } from "./github.js";
@@ -32,6 +33,40 @@ export interface MergeUpDeps {
    *  scopeKey is the roll-up's authoritative capacity-bucket key (Jira needs it to pick the
    *  right mapping; Linear ignores it). */
   finalizeMerged: (issueId: string, scopeKey: string) => Promise<void>;
+}
+
+// AII-286: persisted handled-marker for merged top-of-tree roll-ups. fetchFeatureNodeRollUps
+// keeps a completed feature node in the candidate set for the full 14-day lookback, so
+// without a marker the merged path re-ran its PR lookup + deleteBranch (4xx on the gone
+// branch) + Linear read per candidate per poll — and re-logged "merged; deleted branch +
+// finalized" forever. Persisted (not in-memory log-once) because this path performs actions;
+// the marker short-circuits BEFORE any GitHub/Linear call and survives restarts.
+const HANDLED_KEY_PREFIX = "mergeup:handled:";
+
+function handledKey(owner: string, repo: string, branch: string): string {
+  return `${HANDLED_KEY_PREFIX}${owner}/${repo}:${branch}`;
+}
+
+function ensureSettingsTable(): void {
+  getDb().exec(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+}
+
+export function isRollUpHandled(owner: string, repo: string, branch: string): boolean {
+  ensureSettingsTable();
+  return getDb().prepare("SELECT 1 FROM settings WHERE key = ?").get(handledKey(owner, repo, branch)) !== undefined;
+}
+
+export function markRollUpHandled(owner: string, repo: string, branch: string): void {
+  ensureSettingsTable();
+  getDb()
+    .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    .run(handledKey(owner, repo, branch), new Date().toISOString());
+}
+
+/** Test hook: clear all persisted handled-markers. */
+export function resetRollUpHandledMarkers(): void {
+  ensureSettingsTable();
+  getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run(`${HANDLED_KEY_PREFIX}%`);
 }
 
 // Log-once guard for closed-without-merging (vetoed) roll-up PRs — the skip itself must
@@ -88,12 +123,16 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
     return;
   }
 
-  // Top of the tree: check PR state first — robust to squash/rebase merge where git
+  // Top of the tree: already handled? Short-circuit before any GitHub/Linear call (AII-286).
+  if (isRollUpHandled(owner, repo, branch)) return;
+
+  // Check PR state first — robust to squash/rebase merge where git
   // ancestry alone falsely shows the feature branch as "ahead" of base.
   const pr = await findPullRequestByBranches(ghToken, owner, repo, branch, target);
   if (pr?.merged) {
     await deleteBranch(ghToken, owner, repo, branch);
     await deps.finalizeMerged(rollUp.issueId, rollUp.scopeKey);
+    markRollUpHandled(owner, repo, branch);
     console.log(`[merge-up] ${branch} merged; deleted branch + finalized ${rollUp.identifier}`);
     return;
   }

@@ -1,8 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { resetClosedVetoLogGuard, runMergeUps } from "../merge-up.js";
+import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
 
+vi.mock("../dedup.js", async () => {
+  const Database = (await import("better-sqlite3")).default;
+  const db = new Database(":memory:");
+  return { getDb: () => db };
+});
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(async () => "tok"),
 }));
@@ -41,6 +46,7 @@ const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetRollUpHandledMarkers();
   resetClosedVetoLogGuard();
   vi.mocked(findOpenPullRequest).mockResolvedValue(null);
   vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
@@ -208,6 +214,30 @@ describe("runMergeUps", () => {
       expect(vetoLines).toHaveLength(1);
       // the veto is still respected on every cycle — no PR ever re-opened
       expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("handles a merged roll-up exactly once — repeats short-circuit with zero API calls (AII-286)", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 108, url: "https://gh/pr/108", state: "closed", merged: true,
+    });
+    const finalizeMerged = vi.fn(async () => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 3; i++) {
+        await runMergeUps(
+          [rollUp({ issueId: "uuid-286", identifier: "OOL-126", parent: null })],
+          deps(() => mapping(), finalizeMerged),
+        );
+      }
+      // first pass acts + logs; passes 2-3 short-circuit BEFORE any GitHub/Linear call
+      expect(vi.mocked(findPullRequestByBranches)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deleteBranch)).toHaveBeenCalledTimes(1);
+      expect(finalizeMerged).toHaveBeenCalledTimes(1);
+      const lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("deleted branch + finalized"));
+      expect(lines).toHaveLength(1);
     } finally {
       logSpy.mockRestore();
     }
