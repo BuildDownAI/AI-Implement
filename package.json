@@ -24,6 +24,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^11.0.0",
     "openid-client": "^6.8.4",
     "picomatch": "^4.0.0",

@@ -41,6 +41,7 @@ import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult }
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
+import { handleMcpRequest } from "./mcp.js";
 import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import {
@@ -96,6 +97,7 @@ interface AppConfig {
   gapFillTriggerSecret: string | null;
   localRunnerImage: string;
   localRunnerOrchestratorUrl: string | null;
+  mcpAccessToken: string | null;
 }
 
 function loadConfig(): AppConfig {
@@ -214,6 +216,7 @@ function loadConfig(): AppConfig {
     gapFillTriggerSecret,
     localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
+    mcpAccessToken: process.env.MCP_ACCESS_TOKEN || null,
   };
 }
 
@@ -2690,6 +2693,18 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[trigger/gap-fill] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // MCP endpoint — static bearer token authenticated (MCP_ACCESS_TOKEN)
+    if (url === "/mcp") {
+      handleMcpRequest(req, res, config.mcpAccessToken).catch((err) => {
+        console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));
