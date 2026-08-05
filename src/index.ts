@@ -11,7 +11,7 @@ import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { selectIssuesToDispatch, selectFileOverlapDeferrals } from "./poll-selection.js";
+import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
@@ -219,10 +219,6 @@ function loadConfig(): AppConfig {
 
 // ---------- Polling logic ----------
 
-// AII-278: candidates seen in prior polls, so in-flight (AI-Working) siblings'
-// declared files remain visible to the dispatch guard across cycles.
-const seenCandidatesById = new Map<string, TicketIssue>();
-
 let pollCount = 0;
 let pollInProgress = false;
 
@@ -390,12 +386,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     // AII-278 Finding 3: in-flight issues carry AI-Working and drop OUT of the
     // candidate snapshot, so filtering allCandidates made the in-flight set
     // near-always empty. Remember every candidate we've seen this process and
-    // resolve in-flight ids through that cache instead (advisory + fail-open:
-    // a restart forgets pre-restart candidates and the guard simply fail-opens).
-    for (const i of allCandidates) seenCandidatesById.set(i.id, i);
-    const inFlightSiblings = [...inFlightIssueIds]
-      .map((id) => seenCandidatesById.get(id))
-      .filter((i): i is TicketIssue => Boolean(i));
+    // resolve in-flight ids through that cache instead (shared with the admin
+    // blockers preview via poll-selection.ts).
+    rememberCandidates(allCandidates);
+    const inFlightSiblings = resolveInFlightSiblings(inFlightIssueIds);
     const fileOverlapDeferrals = selectFileOverlapDeferrals(toProcess, inFlightSiblings);
     const deferredIds = new Set(fileOverlapDeferrals.map((b) => b.issueId));
     for (const b of fileOverlapDeferrals) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals } from "../poll-selection.js";
+import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
 
@@ -351,5 +351,44 @@ describe("same-batch overlap + in-flight sourcing (AII-278)", () => {
     const a = mk("C-1", "no files section here");
     const b = mk("C-2", "- Modify: `src/shared.ts`");
     expect(selectFileOverlapDeferrals([a, b], [])).toHaveLength(0);
+  });
+});
+
+// PR #202 review finding #2: the planning template's inline `Files:` convention must parse —
+// otherwise every orchestrator-planned issue silently fail-opens on the dispatch guard.
+describe("parseDeclaredFiles — inline Files: convention (planning template shape)", () => {
+  it("parses the PLANNING.md work-unit form (backticked, parenthetical annotation, trailing period)", () => {
+    const body = "- **WU-3: Short name** — brief description. Files: `src/file.ts` (update), `tests/integration/foo.test.ts`. Depends on: WU-1.";
+    expect(parseDeclaredFiles(body)).toEqual(new Set(["src/file.ts", "tests/integration/foo.test.ts"]));
+  });
+
+  it("parses the implement.ts emitted form (bare comma-joined, no backticks)", () => {
+    expect(parseDeclaredFiles("Files: src/a.ts, src/b.ts")).toEqual(new Set(["src/a.ts", "src/b.ts"]));
+  });
+
+  it("both conventions in one body union together", () => {
+    const body = "## Files\n- Modify: `src/x.ts`\n\nFiles: `src/y.ts`.";
+    expect(parseDeclaredFiles(body)).toEqual(new Set(["src/x.ts", "src/y.ts"]));
+  });
+
+  it("ignores prose after an inline list and non-path tokens (still fail-open on junk)", () => {
+    expect(parseDeclaredFiles("Files: none yet")).toEqual(new Set());
+  });
+});
+
+// PR #202 review finding #1 (admin-side remnant): the shared cache resolves in-flight
+// siblings identically for the poll loop and the admin blockers preview.
+describe("shared seen-candidates cache (rememberCandidates / resolveInFlightSiblings)", () => {
+  it("resolves an in-flight id remembered in a prior cycle; unknown ids fail open", () => {
+    resetSeenCandidates();
+    const chain = [{ identifier: "P-1", mode: "feature" as const }];
+    const sib = makeIssue("in-flight-1", "C-9", "T", { description: "- Modify: `src/shared.ts`", featureBranchChain: chain });
+    rememberCandidates([sib]);
+    expect(resolveInFlightSiblings(["in-flight-1", "never-seen"])).toEqual([sib]);
+    // and the guard actually defers against the resolved sibling
+    const cand = makeIssue("cand-1", "C-10", "T", { description: "- Modify: `src/shared.ts`", featureBranchChain: chain });
+    const d = selectFileOverlapDeferrals([cand], resolveInFlightSiblings(["in-flight-1"]));
+    expect(d).toHaveLength(1);
+    resetSeenCandidates();
   });
 });

@@ -32,7 +32,7 @@ import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { selectBlockers, selectFileOverlapDeferrals } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
@@ -478,7 +478,9 @@ async function handleListBlockers(
       snapshot.inProgressCountsByScope,
       (id) => dispatchedSet.has(id),
     );
-    const inFlightSiblings = allIssues.filter((i) => inFlightIds.has(i.id));
+    // In-flight issues drop out of the snapshot (AI-Working), so resolve them through the
+    // shared seen-candidates cache — same as the poll loop (PR #202 review finding #1).
+    const inFlightSiblings = resolveInFlightSiblings(inFlightIds);
     const fileOverlapCandidates = allIssues.filter(
       (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && teamRepoMap[i.scopeKey],
     );

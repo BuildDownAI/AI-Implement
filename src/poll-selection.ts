@@ -12,12 +12,56 @@ export interface Blocker {
 
 const FILE_LINE_RE = /^\s*[-*]\s*(?:Create|Modify|Test|Delete):\s*`([^`\s:]+)/gim;
 
-/** Declared file paths from an issue body's Files section. Empty set = unparseable (fail-open). */
+// The orchestrator's own planning output declares files inline, not as verb bullets:
+// PLANNING.md work units carry `Files: `a.ts`, `b.ts` (update).` and implement.ts emits
+// `Files: a.ts, b.ts`. Without this form the guard silently fail-opens on every
+// planning-generated issue (PR #202 review finding #2).
+// Mid-line, case-sensitive: the work-unit form embeds "… description. Files: `a.ts` (update),
+// `b.ts`. Depends on: WU-1." inside a bullet line.
+const FILES_INLINE_RE = /(?:\*\*)?\bFiles(?:\*\*)?:\s*([^\n]+)/g;
+
+/** Declared file paths from an issue body's Files section. Empty set = unparseable (fail-open).
+ *  Accepts both conventions: bullet lines (`- Modify: \`path\``, the skills/dispatch-guard
+ *  contract) and inline lists (`Files: \`a.ts\`, b.ts (update)`, the planning-template shape). */
 export function parseDeclaredFiles(description: string | null): Set<string> {
   const out = new Set<string>();
   if (!description) return out;
   for (const m of description.matchAll(FILE_LINE_RE)) out.add(m[1]);
+  for (const m of description.matchAll(FILES_INLINE_RE)) {
+    for (const raw of m[1].split(",")) {
+      // Strip backticks and parenthetical annotations, cut trailing prose at the first
+      // sentence boundary ("foo.test.ts. Depends on: WU-1" → "foo.test.ts"), then drop
+      // sentence punctuation.
+      const cleaned = raw.replace(/`/g, "").replace(/\([^)]*\)/g, "").trim()
+        .split(/\.\s+/)[0].replace(/[.;]+$/, "").trim();
+      // Keep only path-shaped tokens — prose ("No dependencies") has spaces or no dot/slash.
+      if (cleaned && !cleaned.includes(" ") && /[./]/.test(cleaned)) out.add(cleaned);
+    }
+  }
   return out;
+}
+
+// AII-278: candidates seen in prior polls, so in-flight (AI-Working) siblings' declared
+// files remain visible to the dispatch guard across cycles. Shared here so the poll loop
+// and the admin blockers preview resolve in-flight siblings identically (an in-flight issue
+// drops OUT of the candidate snapshot, so filtering the snapshot yields a near-always-empty
+// set — PR #202 review finding #1's admin-side remnant). Advisory + fail-open: a restart
+// forgets pre-restart candidates and the guard simply fail-opens.
+const seenCandidatesById = new Map<string, TicketIssue>();
+
+export function rememberCandidates(issues: TicketIssue[]): void {
+  for (const i of issues) seenCandidatesById.set(i.id, i);
+}
+
+export function resolveInFlightSiblings(inFlightIds: Iterable<string>): TicketIssue[] {
+  return [...inFlightIds]
+    .map((id) => seenCandidatesById.get(id))
+    .filter((i): i is TicketIssue => Boolean(i));
+}
+
+/** Test hook: clear the seen-candidates cache. */
+export function resetSeenCandidates(): void {
+  seenCandidatesById.clear();
 }
 
 const groupingBranchOf = (i: TicketIssue) =>
