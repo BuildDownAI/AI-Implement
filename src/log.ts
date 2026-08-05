@@ -1,4 +1,5 @@
 import { getDb } from "./dedup.js";
+import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -36,6 +37,10 @@ export interface Job {
   sessionImage: string | null;
   phase: string;
   contract: string | null;
+  /** True when the dispatch was a grouping parent's own closing-work run (chain ends at
+   *  self). Lets the monitors treat a clean exit with no PR as Case-B finalize instead of
+   *  pr_not_found (AII-264 r5). */
+  groupingParent: boolean;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -122,6 +127,9 @@ function ensureLogColumns(): void {
   if (!names.has("trigger")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN trigger TEXT");
   }
+  if (!names.has("grouping_parent")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN grouping_parent INTEGER NOT NULL DEFAULT 0");
+  }
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -162,12 +170,14 @@ export function appendLog(entry: {
   contract?: "legacy" | "envelope";
   /** Trigger source: 'comment' for orchestrator-mediated /ai-implement runs, null = orchestrator-initiated. */
   trigger?: string;
+  /** True when this dispatch is a grouping parent's own closing-work run (AII-264 r5). */
+  groupingParent?: boolean;
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -187,6 +197,7 @@ export function appendLog(entry: {
     entry.phase ?? "implementation",
     entry.contract ?? null,
     entry.trigger ?? null,
+    entry.groupingParent ? 1 : 0,
   );
 
   // Keep only the most recent MAX_LOG_ENTRIES rows
@@ -233,6 +244,20 @@ export function updateJobStatus(
   prUrl?: string | null,
 ): void {
   const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out" || status === "dispatch-failed";
+  // AII-277: a comment-triggered (gap-fill) run reaching a terminal state must
+  // terminalize its queue row, or hasPendingConflictResolution stays true
+  // forever and conflict-recovery attempt 2 is unreachable (observed livelock).
+  if (isTerminal) {
+    const job = getDb().prepare("SELECT repo, trigger, pr_url FROM dispatch_log WHERE id = ?").get(jobId) as
+      | { repo: string; trigger: string | null; pr_url: string | null } | undefined;
+    const prUrlForRow = prUrl ?? job?.pr_url ?? null;
+    const m = prUrlForRow ? /\/pull\/(\d+)$/.exec(prUrlForRow) : null;
+    if (job?.trigger === "comment" && m) {
+      const outcome = status === "completed" ? "completed" : "failed";
+      const n = markCommentGapfillRunTerminal(job.repo, Number(m[1]), outcome);
+      if (n > 0) console.log(`[gapfill] terminalized ${n} queue row(s) for ${job.repo}#${m[1]} -> ${outcome}`);
+    }
+  }
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
   // caller has none — the GHA monitor often can't resolve a PR for dispatch runs and
   // must not wipe the link on completion.
@@ -393,6 +418,7 @@ interface RawRow {
   phase: string | null;
   contract: string | null;
   trigger: string | null;
+  grouping_parent: number | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -420,6 +446,7 @@ function mapRows(rows: RawRow[]): Job[] {
     sessionImage: (row.session_image as string | null) ?? null,
     phase: row.phase ?? "implementation",
     contract: row.contract ?? null,
+    groupingParent: row.grouping_parent === 1,
   }));
 }
 

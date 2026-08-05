@@ -11,7 +11,7 @@ import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { selectIssuesToDispatch } from "./poll-selection.js";
+import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { remediateStuckJob } from "./stuck-watchdog.js";
@@ -32,7 +32,7 @@ import { createMachine, getMachine, listMachines, destroyMachine, generateSessio
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
 import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
-import { initReconciliationTable } from "./reconciliation.js";
+import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
@@ -50,17 +50,19 @@ import {
   startLocalRunnerContainer,
   sweepExitedLocalContainers,
 } from "./local-docker.js";
-import { resolveTerminalStatus, workflowFileForJob } from "./monitor-status.js";
-import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+import { clearPrNotFoundGrace, decideCleanExitOutcome, workflowFileForJob } from "./monitor-status.js";
+import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
+import { pickPrForRun } from "./monitor-status.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
-import { resolveBaseBranch } from "./feature-branch.js";
+import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { runMergeUps } from "./merge-up.js";
 import { runAutoMerges } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
+import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
-import { detectMergedPrs } from "./poll-merged-prs.js";
+import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 
 // ---------- Configuration ----------
 
@@ -381,12 +383,26 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       isDispatchBlocked,
     );
 
+    // AII-278 Finding 3: in-flight issues carry AI-Working and drop OUT of the
+    // candidate snapshot, so filtering allCandidates made the in-flight set
+    // near-always empty. Remember every candidate we've seen this process and
+    // resolve in-flight ids through that cache instead (shared with the admin
+    // blockers preview via poll-selection.ts).
+    rememberCandidates(allCandidates);
+    const inFlightSiblings = resolveInFlightSiblings(inFlightIssueIds);
+    const fileOverlapDeferrals = selectFileOverlapDeferrals(toProcess, inFlightSiblings);
+    const deferredIds = new Set(fileOverlapDeferrals.map((b) => b.issueId));
+    for (const b of fileOverlapDeferrals) {
+      console.log(`[poll] Deferring ${b.issueIdentifier}: ${b.detail}`);
+    }
+    const readyToDispatch = deferredIds.size > 0 ? toProcess.filter((i) => !deferredIds.has(i.id)) : toProcess;
+
     for (const issue of allCandidates) {
       if (teamRepoMap[issue.scopeKey]) continue;
       console.log(`[poll] No repo mapping for team ${issue.scopeKey}, skipping ${issue.identifier}`);
     }
 
-    for (const issue of toProcess) {
+    for (const issue of readyToDispatch) {
       try {
         const mapping = teamRepoMap[issue.scopeKey]!;
         const issueProvider = await registry.forMapping(mapping);
@@ -428,6 +444,18 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           // dispatches agree on one base, and never creates the branch twice. The token
           // is per-owner cached, so the in-dispatch-fn fetches below are cache hits.
           const baseGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+          // AII-264 r3: a grouping parent with an OPEN top-of-tree roll-up PR has no
+          // dispatchable work — hold it (dedup untouched) until the PR merges or closes.
+          // Checked BEFORE resolveBaseBranch so the hold never (re)creates branches.
+          if (isGroupingParentDispatch(issue)) {
+            const rollUp = await findOpenRollUpPr({ ghToken: baseGhToken, issue, mapping });
+            if (rollUp) {
+              console.log(`[poll] Holding ${issue.identifier}: roll-up PR #${rollUp.number} is open — no parent work until it merges/closes`);
+              continue;
+            }
+          }
+
           const baseBranch = await resolveBaseBranch({ ghToken: baseGhToken, issue, mapping });
 
           if (execPath === "both") {
@@ -675,6 +703,7 @@ async function dispatchGitHubActions(
     runnerMode,
     sessionImage: runnerImage ?? null,
     contract,
+    groupingParent: isGroupingParentDispatch(issue),
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -1112,6 +1141,7 @@ async function dispatchSession(
     runnerMode,
     sessionImage: result.sessionImage,
     phase: opts.phase,
+    groupingParent: opts.phase === "implementation" && isGroupingParentDispatch(issue),
   });
 
   if (!opts.shadow) {
@@ -1633,6 +1663,7 @@ async function monitorGitHubActionsJob(
 
     // Try to find PR URL for successful runs
     let prUrl: string | null = null;
+    let fallbackPrMatch: RunPrMatch | null = null;
     if (jobStatus === "completed") {
       try {
         prUrl = await findPrForRun(ghToken, owner, repo, job.runId);
@@ -1641,16 +1672,31 @@ async function monitorGitHubActionsJob(
       }
       // workflow_dispatch runs report the ref they were dispatched on (the default
       // branch) as head_branch, so findPrForRun misses the PR the runner created
-      // during the run. Fall back to matching an open PR by the issue's branch
-      // naming. Planning runs never open PRs — skip them so an implementation PR
-      // from an earlier dispatch is not misattributed to a planning row.
+      // during the run. Fall back to matching a PR (open or already merged — AII-264 r6)
+      // by the issue's branch naming. Planning runs never open PRs — skip them so an
+      // implementation PR from an earlier dispatch is not misattributed to a planning row.
       if (!prUrl && job.phase !== "planning") {
-        prUrl = (await findPrForIssue(config, job.repo, job.issueIdentifier))?.url ?? null;
+        fallbackPrMatch = await findPrForIssue(config, job.repo, job.issueIdentifier);
+        prUrl = fallbackPrMatch?.url ?? null;
       }
     }
 
     updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl);
     console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) → ${jobStatus} (${runStatus.conclusion})`);
+
+    // AII-264 r6: the run's PR already merged (auto-merge beat this check) — route straight
+    // to the Done-reconcile so the ticket completes even if the merge-poll never sees it.
+    if (fallbackPrMatch?.merged && prUrl) {
+      reconcileAlreadyMergedPr(job, prUrl);
+    }
+
+    // AII-264 r5: a grouping parent's clean GHA run with no PR is Case-B (the runner's push
+    // step no-op'd because the agent produced no changes). Without a reachable callback the
+    // parent would strand In Progress — finalize it here so merge-up opens the roll-up PR.
+    if (jobStatus === "completed" && !prUrl && job.phase !== "planning" && job.groupingParent) {
+      const provider = await providerForJob(registry, job);
+      await finalizeNoOpGroupingParent(provider, job);
+    }
   }
   // If status is queued or in_progress, ensure job is marked running
   else if (job.status === "dispatched") {
@@ -1667,13 +1713,17 @@ async function findPrForIssue(
   config: AppConfig,
   repo: string | null,
   issueIdentifier: string | null,
-): Promise<{ url: string; draft: boolean } | null> {
+): Promise<RunPrMatch | null> {
   const [owner, repoName] = (repo || "").split("/");
   if (!owner || !repoName || !issueIdentifier) return null;
 
   try {
     const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-    const prSearchUrl = `https://api.github.com/repos/${owner}/${repoName}/pulls?state=open&per_page=10`;
+    // AII-264 r6: state=all, not state=open — auto-merge routinely lands a fast child's PR
+    // before the monitor's first post-exit check, and a merged PR is a SUCCESS, not
+    // pr_not_found. Matching/selection (incl. skipping closed-unmerged PRs from torn-down
+    // earlier attempts) lives in pickPrForRun.
+    const prSearchUrl = `https://api.github.com/repos/${owner}/${repoName}/pulls?state=all&sort=updated&direction=desc&per_page=30`;
     const prRes = await fetch(prSearchUrl, {
       headers: {
         Authorization: `Bearer ${ghToken}`,
@@ -1681,13 +1731,8 @@ async function findPrForIssue(
       },
     });
     if (prRes.ok) {
-      const prs = (await prRes.json()) as Array<{ html_url: string; head: { ref: string }; draft?: boolean }>;
-      // Accept both the legacy ${IDENTIFIER}/... branch shape and the TS
-      // pipeline's ai-implement/${identifier}-... branch shape.
-      const match = prs.find((pr) => {
-        return branchMatchesIssueIdentifier(pr.head.ref, issueIdentifier);
-      });
-      if (match) return { url: match.html_url, draft: match.draft === true };
+      const prs = (await prRes.json()) as RunPrCandidate[];
+      return pickPrForRun(prs, issueIdentifier);
     }
   } catch {
     // Non-critical
@@ -1780,9 +1825,18 @@ async function monitorFlyMachineJob(
     // check below, but the two must be handled differently: see the markReadyForReview guard.
     const isDraftPr = matchedPr?.draft === true;
     // Use PR existence to distinguish success from failure:
-    // if a PR was created, the session completed its job; otherwise it failed
-    const reviewNeedsAttention = !!prUrl && postPushReviewNeedsAttention(job.id);
-    const jobStatus: JobStatus = resolveTerminalStatus(machineExitCode, prUrl, reviewNeedsAttention, job.phase, isDraftPr);
+    // if a PR was created, the session completed its job; otherwise it failed.
+    // A PR that already MERGED (auto-merge beat this check) is unconditionally a success —
+    // the review stage is over, so needs-attention no longer applies.
+    const reviewNeedsAttention = !matchedPr?.merged && !!prUrl && postPushReviewNeedsAttention(job.id);
+    // AII-264 r5: a grouping parent's clean no-PR exit is Case-B finalize, not pr_not_found;
+    // a child's clean no-PR exit gets a bounded grace re-check (PR-visibility race).
+    const decision = decideCleanExitOutcome(job, machineExitCode, prUrl, reviewNeedsAttention, isDraftPr, Date.now());
+    if (decision.deferForPrRecheck) {
+      console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) exited 0 with no PR — re-checking before declaring pr_not_found`);
+      return;
+    }
+    const jobStatus: JobStatus = decision.jobStatus;
 
     // Stamp pr_number on the machine before it's destroyed so reaper/audit
     // tools can read it. Only possible when machine is still accessible.
@@ -1815,9 +1869,13 @@ async function monitorFlyMachineJob(
     }
 
     const durationMs = Date.now() - job.dispatchedAt;
-    updateJobStatus(job.id, jobStatus, machineConclusion, prUrl);
+    updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : machineConclusion, prUrl);
     invalidateNonce(job.id);
+    clearPrNotFoundGrace(job.id);
     console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (${machineConclusion}, PR: ${prUrl || "none"})`);
+    if (decision.finalizeGroupingParent) {
+      await finalizeNoOpGroupingParent(provider, job);
+    }
 
     // Post machine_destroyed status comment to Linear (best-effort, skip shadow jobs)
     if (job.runnerMode !== "shadow" && job.issueId) {
@@ -1830,7 +1888,11 @@ async function monitorFlyMachineJob(
       });
     }
 
-    if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
+    if (matchedPr?.merged && prUrl) {
+      // AII-264 r6: the PR already merged — Ready for Review would be a lie and a reset
+      // would loop an already-landed child. Route straight to the Done-reconcile.
+      reconcileAlreadyMergedPr(job, prUrl);
+    } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
       if (isDraftPr) {
         // Unapproved run: the runner callback (or, absent one, this job row + the
         // status comment already posted above) owns the ticket transition for a
@@ -1904,8 +1966,17 @@ async function monitorLocalDockerJob(
   // reviewNeedsAttention: both resolve to "review_failed", but only a draft PR must skip
   // markReadyForReview/resetTicket below.
   const isDraftPr = matchedPr?.draft === true;
-  const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
-  const jobStatus = resolveTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention, job.phase, isDraftPr);
+  // A PR that already MERGED (auto-merge beat this check) is unconditionally a success.
+  const reviewNeedsAttention = !matchedPr?.merged && state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
+  // AII-264 r5: a grouping parent's clean no-PR exit is Case-B finalize, not pr_not_found;
+  // a child's clean no-PR exit gets a bounded grace re-check (PR-visibility race). The
+  // exited container is left in place while deferred so the next pass can re-inspect it.
+  const decision = decideCleanExitOutcome(job, state.exitCode, prUrl, reviewNeedsAttention, isDraftPr, Date.now());
+  if (decision.deferForPrRecheck) {
+    console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) exited 0 with no PR — re-checking before declaring pr_not_found`);
+    return;
+  }
+  const jobStatus = decision.jobStatus;
 
   if (jobStatus === "failed") {
     await postLocalContainerLogs(provider, job, state.exitCode === 0 ? "pr_not_found" : "container_failed");
@@ -1921,8 +1992,9 @@ async function monitorLocalDockerJob(
   }
 
   const durationMs = Date.now() - job.dispatchedAt;
-  updateJobStatus(job.id, jobStatus, `exit_${state.exitCode}`, prUrl);
+  updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : `exit_${state.exitCode}`, prUrl);
   invalidateNonce(job.id);
+  clearPrNotFoundGrace(job.id);
   console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (exit ${state.exitCode}, PR: ${prUrl || "none"})`);
 
   if (job.issueId) {
@@ -1934,7 +2006,13 @@ async function monitorLocalDockerJob(
     });
   }
 
-  if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
+  if (decision.finalizeGroupingParent) {
+    await finalizeNoOpGroupingParent(provider, job);
+  } else if (matchedPr?.merged && prUrl) {
+    // AII-264 r6: the PR already merged — route straight to the Done-reconcile,
+    // never Ready for Review, never reset.
+    reconcileAlreadyMergedPr(job, prUrl);
+  } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
     if (isDraftPr) {
       // Unapproved run: the runner callback (or, absent one, this job row + the
       // status comment already posted above) owns the ticket transition for a
@@ -1945,6 +2023,50 @@ async function monitorLocalDockerJob(
   } else {
     await resetTicket(provider, job);
   }
+}
+
+/**
+ * AII-264 r5: finalize a grouping parent whose closing run produced no changes (Case B).
+ * Mirrors the runner-callback `noWork` path: markMerged clears AI-Working and completes the
+ * issue, so fetchFeatureNodeRollUps finds the feature node done and merge-up.ts opens the
+ * feature→base roll-up PR — after which the r3 roll-up hold keeps the parent parked. The
+ * stuck-attempt counter is reset so a prior pr_not_found streak can't re-arm the watchdog.
+ */
+async function finalizeNoOpGroupingParent(provider: TicketingProvider | null, job: Job): Promise<void> {
+  if (!provider || !job.issueId) return;
+  if (!job.teamKey) {
+    console.error(`[monitor] Cannot finalize grouping parent ${job.issueIdentifier}: job has no teamKey`);
+    return;
+  }
+  try {
+    await provider.markMerged(job.issueId, job.teamKey);
+    resetStuckAttempts(job.issueId);
+    console.log(`[monitor] Grouping parent ${job.issueIdentifier}: closing run produced no changes — finalized for roll-up (no reset)`);
+  } catch (err) {
+    console.error(`[monitor] Failed to finalize grouping parent ${job.issueIdentifier}:`, err);
+  }
+}
+
+/**
+ * AII-264 r6: the run's PR was already merged (auto-merge beat the monitor's first
+ * post-exit check — routine for fast children). That is a SUCCESS with the review stage
+ * already over: route straight to the Done-reconcile (same queue the merge-poll and
+ * webhook feed) instead of markReadyForReview, and never reset. Keyed by repo+PR, so a
+ * later job-row mangling cannot orphan the ticket — the queue row survives independently.
+ */
+function reconcileAlreadyMergedPr(job: Job, prUrl: string): void {
+  const prNumber = prNumberFromUrl(prUrl);
+  if (prNumber === null || !job.repo) return;
+  if (hasReconciliationForPr(job.repo, prNumber)) return;
+  enqueueReconciliation({
+    issueId: job.issueId,
+    issueIdentifier: job.issueIdentifier,
+    prNumber,
+    repo: job.repo,
+    mergeCommitSha: "",
+  });
+  resetStuckAttempts(job.issueId);
+  console.log(`[monitor] PR #${prNumber} for ${job.issueIdentifier} already merged — queued Done-reconcile (no reset)`);
 }
 
 /** Mark a Linear issue as Ready for Review after a successful job. */
@@ -2656,6 +2778,7 @@ async function main(): Promise<void> {
   // Initialize DB tables before loadConfig() so DB-backed settings are readable on first boot
   initMappingsTable();
   initLogTable();
+  sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
   initReconciliationTable();
   initStepLogTable();

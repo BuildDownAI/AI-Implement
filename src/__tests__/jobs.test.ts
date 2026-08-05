@@ -24,6 +24,17 @@ afterEach(() => {
 });
 
 describe("jobs table", () => {
+  it("appendLog persists groupingParent and round-trips it on the Job (AII-264 r5)", () => {
+    const parentId = log.appendLog({ issueId: "parent-1", groupingParent: true });
+    const childId = log.appendLog({ issueId: "child-1" });
+
+    const jobs = log.listLog();
+    const parent = jobs.find((j) => j.id === parentId);
+    const child = jobs.find((j) => j.id === childId);
+    expect(parent?.groupingParent).toBe(true);
+    expect(child?.groupingParent).toBe(false);
+  });
+
   it("appendLog creates a job with dispatched status and returns an id", () => {
     const jobId = log.appendLog({
       issueId: "issue-1",

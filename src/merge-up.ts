@@ -34,6 +34,15 @@ export interface MergeUpDeps {
   finalizeMerged: (issueId: string, scopeKey: string) => Promise<void>;
 }
 
+// Log-once guard for closed-without-merging (vetoed) roll-up PRs — the skip itself must
+// repeat every poll (that's the veto being respected), but the log line should not.
+const closedVetoLogged = new Set<string>();
+
+/** Test hook: reset the closed-veto log-once guard. */
+export function resetClosedVetoLogGuard(): void {
+  closedVetoLogged.clear();
+}
+
 export async function runMergeUps(rollUps: FeatureNodeRollUp[], deps: MergeUpDeps): Promise<void> {
   for (const rollUp of rollUps) {
     try {
@@ -90,11 +99,16 @@ async function rollUpOne(rollUp: FeatureNodeRollUp, deps: MergeUpDeps): Promise<
   }
   if (pr?.state === "open") return; // awaiting human merge
   // A human may have closed the PR without merging (a deliberate veto). Respect that
-  // decision — do not re-open on every poll cycle while the branch stays ahead.
+  // decision — do not re-open on every poll cycle while the branch stays ahead. The veto
+  // is permanent, so log it once per process, not once per poll forever.
   if (pr && pr.state === "closed" && !pr.merged) {
-    console.log(
-      `[merge-up] Skipping feature→base PR for ${rollUp.identifier}: PR #${pr.number} was closed without merging`,
-    );
+    const vetoKey = `${rollUp.identifier}#${pr.number}`;
+    if (!closedVetoLogged.has(vetoKey)) {
+      closedVetoLogged.add(vetoKey);
+      console.log(
+        `[merge-up] Skipping feature→base PR for ${rollUp.identifier}: PR #${pr.number} was closed without merging (respecting the veto; logged once)`,
+      );
+    }
     return;
   }
 

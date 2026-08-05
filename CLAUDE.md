@@ -346,6 +346,12 @@ Parts: classification + roll-up discovery in `src/providers/linear.ts`; `TicketI
 
 Operational requirements: re-sync `claude-implement.yml` to the target repo (for the `base_branch` input); a **publicly reachable** runner callback (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`) so planning auto-advances and the cascade self-drives; and pair the runner image with the orchestrator channel (testing → `SESSION_IMAGE=…:next`).
 
+**Conflict recovery:** When a child PR lands dirty (merge conflicts) on its grouping branch, the cascade self-heals automatically. The orchestrator re-queues the issue through the comment-gapfill rail (a synthetic negative-`comment_id` entry, capped at 2 attempts per issue via queue accounting). On exhaustion it logs, fires the `notify` hook, and leaves the PR for a human. The conflict-classification seam is `classifyStalledChild` — it already classifies `conflict`/`blocked` merge results as recoverable conflicts; AII-263 will later extend the seam with additional stall kinds (max_turns / draft-PR stalls).
+
+**Roll-up hold:** A grouping parent whose top-of-tree roll-up PR is open is held from dispatch (dedup untouched) until that PR merges or closes — re-dispatching such parents produced junk closing PRs / pr_not_found churn loops. Upstream of the hold, a grouping parent's closing run that exits cleanly with **no changes** is finalized (`markMerged` → merge-up opens the roll-up PR) rather than classified `pr_not_found` — the monitors mirror the runner-callback `noWork` path via the job's `grouping_parent` flag. Non-parent jobs that exit cleanly without a visible PR get a bounded grace re-check before `pr_not_found` is declared.
+
+**Dispatch guard:** Before dispatching a same-feature-node sibling, the orchestrator checks whether its declared `Files:` paths (from the issue description) overlap with a currently in-flight sibling's paths; if they do, dispatch is deferred until the in-flight sibling completes. The check fails open — if path data is unavailable or the check errors, the sibling dispatches normally.
+
 ### Issue completion on PR merge
 
 When an AI-Implement PR merges, the orchestrator moves the tracker issue to a completed state (Linear: the team's `Done` state, else the first completed-type state; Jira: the AI-Implement status field value `Merged`) and clears the `Ready for Review` label. This runs even for paused projects.

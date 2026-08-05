@@ -98,3 +98,33 @@ describe("resolveBaseBranch", () => {
     expect(warn).toHaveBeenCalled();
   });
 });
+
+describe("findOpenRollUpPr (parent no-work churn guard)", () => {
+  const mapping = { owner: "o", repo: "r", defaultBranch: "testing" } as never;
+  const parent = (id: string) => ({
+    id, identifier: id, title: "t", description: null, scopeKey: "T", nativeStatus: "todo",
+    featureBranchChain: [{ identifier: id, mode: "feature" as const }],
+  }) as never;
+
+  it("returns the PR when an open roll-up exists for the parent's feature branch", async () => {
+    const finder = vi.fn(async () => ({ number: 42, url: "u", state: "open" as const, merged: false }));
+    const { findOpenRollUpPr } = await import("../feature-branch.js");
+    const pr = await findOpenRollUpPr({ ghToken: "tok", issue: parent("P-1"), mapping, finder });
+    expect(pr).toEqual({ number: 42, url: "u" });
+    expect(finder).toHaveBeenCalledWith("tok", "o", "r", "ai-implement/feature/p-1", "testing");
+  });
+
+  it("returns null for merged/closed roll-ups and for non-parent (leaf) chains", async () => {
+    const { findOpenRollUpPr } = await import("../feature-branch.js");
+    const merged = vi.fn(async () => ({ number: 1, url: "u", state: "closed" as const, merged: true }));
+    expect(await findOpenRollUpPr({ ghToken: "t", issue: parent("P-2"), mapping, finder: merged })).toBeNull();
+    // leaf: chain ends at an ancestor, not itself -> guard does not apply, finder never called
+    const leafFinder = vi.fn();
+    const leaf = { ...(parent("C-1") as object), featureBranchChain: [{ identifier: "P-9", mode: "feature" }] } as never;
+    expect(await findOpenRollUpPr({ ghToken: "t", issue: leaf, mapping, finder: leafFinder })).toBeNull();
+    expect(leafFinder).not.toHaveBeenCalled();
+    // empty chain
+    const bare = { ...(parent("X-1") as object), featureBranchChain: [] } as never;
+    expect(await findOpenRollUpPr({ ghToken: "t", issue: bare, mapping, finder: leafFinder })).toBeNull();
+  });
+});

@@ -273,3 +273,97 @@ Feature-branch grouping is supported on **both providers**:
 - **Don't restart the orchestrator mid-run.** A restart drops in-flight job tracking,
   leaving dispatched issues stuck with `AI-Working` plus a dedup row. Recover by removing
   `AI-Working` in Linear and deleting the dedup entry (`DELETE /api/dedup/<issue-uuid>`).
+
+---
+
+## 10. Conflict recovery & prevention
+
+### Cascade conflict recovery
+
+When a child PR lands dirty on its grouping branch (merge conflicts detected during
+auto-merge), the cascade self-heals without operator intervention:
+
+1. **Detection** — at roll-up / auto-merge time, the orchestrator calls
+   `classifyStalledChild` to determine whether a stalled child is conflicted. The function
+   already classifies `conflict` and `blocked` merge results as recoverable conflicts. This
+   is an intentional seam: **AII-263 will extend the classification** with additional stall
+   kinds (max_turns / draft-PR stalls); it does not supply the initial detection logic.
+
+2. **Re-queue** — on a positive conflict classification, the orchestrator inserts a
+   **synthetic queue entry** with a negative `comment_id` (a sentinel that distinguishes
+   automated recovery from a human `/ai-implement` comment). This routes the issue through
+   the normal comment-gapfill rail: the runner receives the branch + PR context and is asked
+   to resolve the conflicts and re-push.
+
+3. **Attempt cap** — synthetic entries do not carry an attempt counter. Instead, the cap is
+   **derived** by counting the PR's existing synthetic (negative `comment_id`) rows via
+   `countConflictAttempts`; `enqueueConflictResolution` computes a deterministic synthetic id
+   from `owner/repo#pr#conflict#attempt` and the queue's `INSERT OR IGNORE` provides
+   in-flight dedup so a concurrent poll tick cannot double-enqueue. A re-dirty PR after a
+   successful resolve counts as a fresh attempt. The **maximum is 2 automated attempts**
+   (`MAX_CONFLICT_RESOLUTION_ATTEMPTS`). This prevents unbounded retry loops when a conflict
+   cannot be auto-resolved (e.g. semantic conflicts the agent cannot safely decide).
+
+4. **Notify-on-exhaustion** — when the attempt cap is reached and the conflict persists, the
+   orchestrator logs and fires a standard notification, then leaves the PR for a human to
+   resolve. No labels are changed.
+
+### Dispatch guard (declared-file overlap)
+
+Before dispatching a same-feature-node sibling (another leaf or child issue targeting the
+same grouping branch), the orchestrator checks whether the candidate issue's declared
+`Files:` paths overlap with the paths declared by any currently in-flight sibling issue:
+
+- **Overlap detected** → dispatch is deferred until the in-flight sibling's PR merges and
+  the issue reaches Done. This prevents two runners from making conflicting edits to the same
+  files simultaneously on the same feature branch.
+- **Fail-open** → if the candidate or in-flight sibling has no `Files:` declaration, or if
+  the path-comparison step errors, the guard skips and the sibling dispatches normally. The
+  guard never blocks work when it cannot make a confident determination.
+
+The guard applies only within the same feature node (same grouping branch). Siblings that
+target different feature branches are not affected.
+
+## 11. Operational notes (AII-264 test rounds)
+
+- **Labeling order matters — build the whole tree first, then label parent BEFORE children.**
+  Required ordering: create the parent **unlabeled** → create all children as sub-issues
+  (+ every relation) → **label the parent** → label the children. Two races motivate it, and
+  the code resolves both in favor of this order:
+  - A parent labeled before its first child *exists* has no children to classify against, is
+    treated as a **leaf**, and dispatches standalone (observed: a junk standalone PR). Hence:
+    the complete tree exists before any label goes on.
+  - A child labeled while its parent is *unlabeled* resolves an **empty ancestor chain**
+    (`labeledAncestorChain` stops at the first unlabeled ancestor) and cuts its PR from the
+    **base branch**, silently bypassing grouping. Labeling the parent first has no such
+    window: a labeled parent whose children carry no label yet is a *waiting parent* — the
+    race guard skips it until a child is labeled.
+  (Earlier guidance said "label the parent last"; that guarded the relations-not-yet-set race,
+  which step 2 above already eliminates, while opening the empty-chain race. Superseded.)
+- **Parents hold while their roll-up PR is open.** A grouping parent whose top-of-tree
+  `feature → base` PR is open is not dispatchable (the orchestrator probes for the open PR
+  before dispatch and holds, dedup untouched) — re-dispatching it produced junk closing PRs /
+  pr_not_found churn. The hold releases when the PR merges or closes.
+- **A grouping parent's no-op closing run FINALIZES — it is not a failure.** Most parents
+  exist to group, not to code: their closing run often correctly produces no changes, and the
+  runner's push step deliberately no-ops (Case B). All three monitors (GHA, Fly, local Docker)
+  now treat a clean exit with no PR on a `grouping_parent` job as finalize — `markMerged` the
+  issue so merge-up opens the feature→base roll-up PR (after which the roll-up hold above
+  takes over) — instead of `pr_not_found` → reset → re-dispatch (the r5 OOL-175 loop). The
+  runner-callback `noWork` path did this already; the monitor path is what fires when the
+  callback is unreachable (every local run).
+- **Children get a grace re-check before `pr_not_found`.** A child job's clean exit with no
+  visible PR is usually the monitor racing the PR search index — the monitor defers one cycle
+  (2-minute window) and re-checks before declaring `pr_not_found` and resetting the ticket.
+- **A run whose PR already MERGED is a success.** Auto-merge routinely lands a fast
+  child's PR before the monitor's first post-exit check; the post-exit lookup therefore
+  searches `state=all` (skipping closed-unmerged PRs from torn-down earlier attempts) and a
+  merged match routes straight to the Done-reconcile queue — never Ready for Review, never
+  `pr_not_found`, never a reset (the r6 OOL-182/183/184 loop). The merge-poll additionally
+  treats ANY terminal job row with a recorded PR as a reconcile candidate, keyed by
+  repo+PR — so a misclassified row cannot orphan a merged PR's ticket.
+- **Recovery gap-fills always run via GitHub Actions**, regardless of a mapping's
+  local-docker execution mode (the drain implements fly + GHA only; the target is a remote
+  PR branch either way).
+- **Conflict-resolution attempts count at enqueue** — persistent dispatch failures burn the
+  cap by design, trading unbounded retry for the alerted bounded give-up path.

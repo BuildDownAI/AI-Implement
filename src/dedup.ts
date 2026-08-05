@@ -210,6 +210,9 @@ export function getDb(): Database.Database {
       )
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_status ON comment_gapfill_queue(status, created_at)`);
+    // PR #202 review (minor): countConflictAttempts / hasPendingConflictResolution /
+    // markCommentGapfillRunTerminal all filter by repo+PR — give them an index.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_pr ON comment_gapfill_queue(owner, repo, pr_number)`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS workflow_sync_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

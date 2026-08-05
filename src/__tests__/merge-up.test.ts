@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { runMergeUps } from "../merge-up.js";
+import { resetClosedVetoLogGuard, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
 
@@ -41,6 +41,7 @@ const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetClosedVetoLogGuard();
   vi.mocked(findOpenPullRequest).mockResolvedValue(null);
   vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
   vi.mocked(createPullRequest).mockResolvedValue({ number: 7, url: "https://gh/pr/7" });
@@ -191,6 +192,25 @@ describe("runMergeUps", () => {
       deps(() => mapping(), finalizeMerged),
     );
     expect(finalizeMerged).toHaveBeenCalledWith("uuid-p", "OOL");
+  });
+
+  it("logs the closed-without-merging veto once per process, not once per poll (r7 cleanup)", async () => {
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 55, url: "https://gh/pr/55", state: "closed", merged: false,
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 3; i++) {
+        await runMergeUps([rollUp({ identifier: "OOL-106", parent: null })], deps(() => mapping()));
+      }
+      const vetoLines = logSpy.mock.calls.filter((c) => String(c[0]).includes("closed without merging"));
+      expect(vetoLines).toHaveLength(1);
+      // the veto is still respected on every cycle — no PR ever re-opened
+      expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("does not re-open the top-level PR after a human closed it without merging (veto)", async () => {

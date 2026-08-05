@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue } from "./providers/types.js";
-import { ensureBranchExists } from "./github.js";
+import { ensureBranchExists, findPullRequestByBranches } from "./github.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
 
 /**
@@ -57,5 +57,32 @@ export async function resolveBaseBranch(opts: {
       err,
     );
     return mapping.defaultBranch;
+  }
+}
+
+/** AII-264 r3 churn-loop guard: a grouping parent whose top-of-tree roll-up PR is
+ *  OPEN (awaiting human review) must not be dispatchable — every re-dispatch finds
+ *  no meaningful work and either opens a junk closing PR or exits pr_not_found,
+ *  after which the watchdog reset re-arms it (observed as a hard ~3-minute loop on
+ *  two parents at once, each iteration a full runner session). Returns the open
+ *  roll-up PR when the hold applies; null (fail-open) otherwise — including on
+ *  probe errors, so an API hiccup never wedges a legitimate dispatch. */
+export async function findOpenRollUpPr(opts: {
+  ghToken: string;
+  issue: TicketIssue;
+  mapping: RepoMapping;
+  finder?: typeof findPullRequestByBranches;
+}): Promise<{ number: number; url: string } | null> {
+  const chain = opts.issue.featureBranchChain ?? [];
+  if (chain.length === 0) return null;
+  const last = chain[chain.length - 1];
+  if (last.identifier !== opts.issue.identifier) return null; // leaf dispatch — guard is parent-only
+  const head = buildGroupingBranchName(last.identifier, last.mode);
+  const finder = opts.finder ?? findPullRequestByBranches;
+  try {
+    const pr = await finder(opts.ghToken, opts.mapping.owner, opts.mapping.repo, head, opts.mapping.defaultBranch);
+    return pr && pr.state === "open" ? { number: pr.number, url: pr.url } : null;
+  } catch {
+    return null;
   }
 }

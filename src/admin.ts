@@ -27,12 +27,12 @@ import {
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
+import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { selectBlockers } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
@@ -471,11 +471,25 @@ async function handleListBlockers(
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
-    const blockers = selectBlockers(
+    const inFlightIds = getInFlightIssueIds();
+    const baseBlockers = selectBlockers(
       allIssues,
       teamRepoMap,
       snapshot.inProgressCountsByScope,
       (id) => dispatchedSet.has(id),
+    );
+    // In-flight issues drop out of the snapshot (AI-Working), so resolve them through the
+    // shared seen-candidates cache — same as the poll loop (PR #202 review finding #1).
+    const inFlightSiblings = resolveInFlightSiblings(inFlightIds);
+    const fileOverlapCandidates = allIssues.filter(
+      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && teamRepoMap[i.scopeKey],
+    );
+    const fileOverlapBlockers = selectFileOverlapDeferrals(fileOverlapCandidates, inFlightSiblings);
+    const blockers = [...baseBlockers, ...fileOverlapBlockers].sort(
+      (a, b) =>
+        a.reason.localeCompare(b.reason) ||
+        a.teamKey.localeCompare(b.teamKey) ||
+        a.issueIdentifier.localeCompare(b.issueIdentifier),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
     const byReason: Record<string, number> = {};
