@@ -1,38 +1,32 @@
-import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
+import { verifyMcpToken } from "./mcp-oauth.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
 }
 
-function tokenMatches(submitted: string, configured: string): boolean {
-  const a = crypto.createHash("sha256").update(submitted).digest();
-  const b = crypto.createHash("sha256").update(configured).digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
 export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  mcpAccessToken: string | null,
   kgSidecarUrl: string | null,
+  baseUrl: string | null,
 ): Promise<void> {
-  if (!mcpAccessToken) {
-    json(res, 503, { error: "MCP endpoint not configured: MCP_ACCESS_TOKEN is not set" });
+  // Require both the sidecar and OAuth base URL to be configured
+  if (!kgSidecarUrl || !baseUrl) {
+    json(res, 503, { error: "MCP endpoint not configured: KG_SIDECAR_URL or OAUTH_REDIRECT_BASE_URL is not set" });
     return;
   }
 
   const auth = req.headers.authorization;
   const submitted = auth?.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!tokenMatches(submitted, mcpAccessToken)) {
-    json(res, 401, { error: "unauthorized" });
-    return;
-  }
-
-  if (!kgSidecarUrl) {
-    json(res, 503, { error: "MCP endpoint not configured: KG_SIDECAR_URL is not set" });
+  if (!verifyMcpToken(submitted)) {
+    res.writeHead(401, {
+      "Content-Type": "application/json",
+      "WWW-Authenticate": `Bearer realm="MCP", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
+    });
+    res.end(JSON.stringify({ error: "unauthorized" }));
     return;
   }
 

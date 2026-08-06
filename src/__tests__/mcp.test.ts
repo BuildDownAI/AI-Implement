@@ -1,7 +1,18 @@
 import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleMcpRequest } from "../mcp.js";
+
+// Mock mcp-oauth so we can control token verification without a real DB
+vi.mock("../mcp-oauth.js", () => ({
+  verifyMcpToken: vi.fn(),
+}));
+
+const BASE_URL = "https://orchestrator.example.com";
+const SIDECAR_URL = "http://127.0.0.1:8765/mcp";
 
 class MockRequest extends PassThrough {
   url = "/mcp";
@@ -57,13 +68,13 @@ class MockResponse extends Writable {
   }
 }
 
-const SIDECAR_URL = "http://127.0.0.1:8765/mcp";
-
 let mockHttpRequest: ReturnType<typeof vi.fn>;
+let mcpOauth: typeof import("../mcp-oauth.js");
 
-beforeEach(() => {
+beforeEach(async () => {
   mockHttpRequest = vi.fn();
   vi.spyOn(http, "request").mockImplementation(mockHttpRequest as never);
+  mcpOauth = await import("../mcp-oauth.js");
 });
 
 afterEach(() => {
@@ -111,65 +122,57 @@ function setupProxyError(errorCode: string): void {
 
 async function callMcp(
   headers: Record<string, string>,
-  token: string | null,
+  tokenValid: boolean,
   sidecarUrl: string | null = SIDECAR_URL,
+  baseUrl: string | null = BASE_URL,
   method = "POST",
   body?: string,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
+  (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
+    tokenValid ? { email: "user@example.com", sub: "sub1", provider: "google" } : null,
+  );
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
-  handleMcpRequest(req as never, res as never, token, sidecarUrl);
+  handleMcpRequest(req as never, res as never, sidecarUrl, baseUrl);
   await res.done;
   return { statusCode: res.statusCode, body: res.body, responseHeaders: res.responseHeaders };
 }
 
 describe("handleMcpRequest", () => {
-  describe("unset token", () => {
-    it("returns 503 when mcpAccessToken is null", async () => {
-      const result = await callMcp({}, null);
-      expect(result.statusCode).toBe(503);
-      expect(JSON.parse(result.body).error).toContain("MCP_ACCESS_TOKEN");
-    });
-
-    it("does not proxy when token is not configured", async () => {
-      await callMcp({}, null);
-      expect(mockHttpRequest).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("missing / wrong token", () => {
-    it("returns 401 when Authorization header is absent", async () => {
-      const result = await callMcp({}, "secret");
-      expect(result.statusCode).toBe(401);
-      expect(JSON.parse(result.body).error).toBe("unauthorized");
-    });
-
-    it("returns 401 for wrong bearer token", async () => {
-      const result = await callMcp({ authorization: "Bearer wrong" }, "secret");
-      expect(result.statusCode).toBe(401);
-      expect(JSON.parse(result.body).error).toBe("unauthorized");
-    });
-
-    it("returns 401 for non-Bearer auth scheme", async () => {
-      const result = await callMcp({ authorization: "Basic dXNlcjpwYXNz" }, "secret");
-      expect(result.statusCode).toBe(401);
-    });
-
-    it("does not proxy on auth failure", async () => {
-      await callMcp({ authorization: "Bearer wrong" }, "secret");
-      expect(mockHttpRequest).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("KG_SIDECAR_URL unset", () => {
+  describe("not configured (missing sidecar or baseUrl)", () => {
     it("returns 503 when kgSidecarUrl is null", async () => {
-      const result = await callMcp({ authorization: "Bearer tok" }, "tok", null);
+      const result = await callMcp({ authorization: "Bearer tok" }, true, null);
       expect(result.statusCode).toBe(503);
       expect(JSON.parse(result.body).error).toContain("KG_SIDECAR_URL");
     });
 
-    it("does not proxy when kgSidecarUrl is null", async () => {
-      await callMcp({ authorization: "Bearer tok" }, "tok", null);
+    it("returns 503 when baseUrl is null", async () => {
+      const result = await callMcp({ authorization: "Bearer tok" }, true, SIDECAR_URL, null);
+      expect(result.statusCode).toBe(503);
+    });
+
+    it("does not proxy when not configured", async () => {
+      await callMcp({ authorization: "Bearer tok" }, true, null);
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("token validation", () => {
+    it("returns 401 with WWW-Authenticate when token is missing", async () => {
+      const result = await callMcp({}, false);
+      expect(result.statusCode).toBe(401);
+      expect(result.responseHeaders["WWW-Authenticate"]).toContain("oauth-protected-resource");
+      expect(JSON.parse(result.body).error).toBe("unauthorized");
+    });
+
+    it("returns 401 for invalid bearer token", async () => {
+      const result = await callMcp({ authorization: "Bearer invalid" }, false);
+      expect(result.statusCode).toBe(401);
+      expect(result.responseHeaders["WWW-Authenticate"]).toContain(BASE_URL);
+    });
+
+    it("does not proxy on auth failure", async () => {
+      await callMcp({ authorization: "Bearer invalid" }, false);
       expect(mockHttpRequest).not.toHaveBeenCalled();
     });
   });
@@ -177,13 +180,13 @@ describe("handleMcpRequest", () => {
   describe("proxy forwarding", () => {
     it("forwards the request method to the sidecar", async () => {
       const { capturedOpts } = setupProxyMock({});
-      await callMcp({ authorization: "Bearer tok" }, "tok", SIDECAR_URL, "GET");
+      await callMcp({ authorization: "Bearer tok" }, true, SIDECAR_URL, BASE_URL, "GET");
       expect(capturedOpts.value?.method).toBe("GET");
     });
 
     it("forwards DELETE method to the sidecar", async () => {
       const { capturedOpts } = setupProxyMock({});
-      await callMcp({ authorization: "Bearer tok" }, "tok", SIDECAR_URL, "DELETE");
+      await callMcp({ authorization: "Bearer tok" }, true, SIDECAR_URL, BASE_URL, "DELETE");
       expect(capturedOpts.value?.method).toBe("DELETE");
     });
 
@@ -191,7 +194,7 @@ describe("handleMcpRequest", () => {
       const { capturedOpts } = setupProxyMock({});
       await callMcp(
         { authorization: "Bearer tok", "content-type": "application/json" },
-        "tok",
+        true,
       );
       const hdrs = capturedOpts.value!.headers as Record<string, string>;
       expect(hdrs.authorization).toBeUndefined();
@@ -200,7 +203,7 @@ describe("handleMcpRequest", () => {
 
     it("strips incoming host header and sets it to the sidecar host", async () => {
       const { capturedOpts } = setupProxyMock({});
-      await callMcp({ authorization: "Bearer tok", host: "external.host.com" }, "tok");
+      await callMcp({ authorization: "Bearer tok", host: "external.host.com" }, true);
       const hdrs = capturedOpts.value!.headers as Record<string, string>;
       expect(hdrs.host).toBe("127.0.0.1:8765");
     });
@@ -212,8 +215,9 @@ describe("handleMcpRequest", () => {
 
       await callMcp(
         { authorization: "Bearer tok", "content-type": "application/json" },
-        "tok",
+        true,
         SIDECAR_URL,
+        BASE_URL,
         "POST",
         '{"method":"tools/list","id":1}',
       );
@@ -223,7 +227,7 @@ describe("handleMcpRequest", () => {
 
     it("writes the sidecar response status code back to the client", async () => {
       setupProxyMock({ statusCode: 200, chunks: ['{"tools":[]}'] });
-      const result = await callMcp({ authorization: "Bearer tok" }, "tok");
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
       expect(result.statusCode).toBe(200);
     });
 
@@ -233,7 +237,7 @@ describe("handleMcpRequest", () => {
         responseHeaders: { "content-type": "application/json" },
         chunks: ['{"result":"ok"}'],
       });
-      const result = await callMcp({ authorization: "Bearer tok" }, "tok");
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
       expect(result.body).toBe('{"result":"ok"}');
     });
 
@@ -246,7 +250,7 @@ describe("handleMcpRequest", () => {
           'data: {"type":"end"}\n\n',
         ],
       });
-      const result = await callMcp({ authorization: "Bearer tok" }, "tok");
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
       expect(result.statusCode).toBe(200);
       expect(result.responseHeaders["content-type"]).toBe("text/event-stream");
       expect(result.body).toContain('data: {"type":"text","text":"hello"}');
@@ -271,23 +275,26 @@ describe("handleMcpRequest", () => {
         return mockProxyReq;
       });
 
+      (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue({
+        email: "u@e.ai", sub: "s", provider: "google",
+      });
       const req = new MockRequest("GET", { authorization: "Bearer tok" });
       const res = new MockResponse();
-      handleMcpRequest(req as never, res as never, "tok", SIDECAR_URL);
+      handleMcpRequest(req as never, res as never, SIDECAR_URL, BASE_URL);
       await res.done;
       expect(res.headersSent).toBe(true);
     });
 
     it("returns 502 on connection refused", async () => {
       setupProxyError("ECONNREFUSED");
-      const result = await callMcp({ authorization: "Bearer tok" }, "tok");
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
       expect(result.statusCode).toBe(502);
       expect(JSON.parse(result.body).error).toContain("connection refused");
     });
 
     it("returns 502 on other sidecar errors", async () => {
       setupProxyError("ETIMEDOUT");
-      const result = await callMcp({ authorization: "Bearer tok" }, "tok");
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
       expect(result.statusCode).toBe(502);
       expect(JSON.parse(result.body).error).toBeDefined();
     });

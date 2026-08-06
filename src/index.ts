@@ -42,6 +42,15 @@ import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js"
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
+import {
+  initMcpOAuthTables,
+  handleMcpProtectedResourceMetadata,
+  handleMcpAuthorizationServerMetadata,
+  handleMcpClientRegistration,
+  handleMcpAuthorize,
+  handleMcpOidcCallback,
+  handleMcpTokenRequest,
+} from "./mcp-oauth.js";
 import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import {
@@ -97,7 +106,6 @@ interface AppConfig {
   gapFillTriggerSecret: string | null;
   localRunnerImage: string;
   localRunnerOrchestratorUrl: string | null;
-  mcpAccessToken: string | null;
   kgSidecarUrl: string | null;
 }
 
@@ -217,7 +225,6 @@ function loadConfig(): AppConfig {
     gapFillTriggerSecret,
     localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
-    mcpAccessToken: process.env.MCP_ACCESS_TOKEN || null,
     kgSidecarUrl: process.env.KG_SIDECAR_URL || null,
   };
 }
@@ -2724,9 +2731,81 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
       return;
     }
 
-    // MCP endpoint — static bearer token authenticated (MCP_ACCESS_TOKEN)
+    // MCP well-known metadata endpoints (public — no auth required)
+    if (url.split("?")[0] === "/.well-known/oauth-protected-resource" && req.method === "GET") {
+      if (!config.oauthRedirectBaseUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" }));
+        return;
+      }
+      handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
+      return;
+    }
+    if (url.split("?")[0] === "/.well-known/oauth-authorization-server" && req.method === "GET") {
+      if (!config.oauthRedirectBaseUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" }));
+        return;
+      }
+      handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
+      return;
+    }
+
+    // MCP OAuth routes — dynamic client registration, authorization, token exchange
+    if (url.startsWith("/mcp/") || url === "/mcp/register" || url === "/mcp/authorize" || url === "/mcp/token") {
+      const pathname = url.split("?")[0];
+      if (!config.oauthRedirectBaseUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" }));
+        return;
+      }
+      if (pathname === "/mcp/register" && req.method === "POST") {
+        handleMcpClientRegistration(req, res).catch((err) => {
+          console.error("[mcp-oauth] register error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      if (pathname === "/mcp/authorize" && req.method === "GET") {
+        handleMcpAuthorize(req, res, config.oauthRedirectBaseUrl).catch((err) => {
+          console.error("[mcp-oauth] authorize error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
+      if (callbackMatch && req.method === "GET") {
+        const [, providerId] = callbackMatch;
+        handleMcpOidcCallback(req, res, providerId, config.oauthRedirectBaseUrl).catch((err) => {
+          console.error("[mcp-oauth] callback error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      if (pathname === "/mcp/token" && req.method === "POST") {
+        handleMcpTokenRequest(req, res).catch((err) => {
+          console.error("[mcp-oauth] token error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+    }
+
+    // MCP endpoint — OAuth bearer token authenticated
     if (url === "/mcp") {
-      handleMcpRequest(req, res, config.mcpAccessToken, config.kgSidecarUrl).catch((err) => {
+      handleMcpRequest(req, res, config.kgSidecarUrl, config.oauthRedirectBaseUrl).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -2821,6 +2900,7 @@ async function main(): Promise<void> {
   initSettingsTable();
   initReconciliationTable();
   initStepLogTable();
+  initMcpOAuthTables();
 
   const config = loadConfig();
 
