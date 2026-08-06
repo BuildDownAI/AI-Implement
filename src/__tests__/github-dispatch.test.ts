@@ -47,6 +47,10 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxJobMinutes: null,
     branchPrefix: null,
     skillsRepo: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    autoMerge: false,
+    dependencyTokenScope: null,
     ...overrides,
   };
 }
@@ -318,6 +322,60 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
     });
 
     expect(inputs.run_token).toBe("plan-tok");
+  });
+});
+
+// ---------- Case (c2): dependencyTokenScope dispatch stamping ----------
+
+describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => {
+  it("stamps dependencyTokenScope in run_config when mapping enables it", () => {
+    const mapping = makeMapping({ dependencyTokenScope: "installation" });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.dependencyTokenScope).toBe("installation");
+  });
+
+  it("omits dependencyTokenScope from run_config when mapping has null", () => {
+    const mapping = makeMapping({ dependencyTokenScope: null });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.dependencyTokenScope).toBeUndefined();
+    expect("dependencyTokenScope" in decoded).toBe(false);
+  });
+
+  it("does not stamp dependencyTokenScope for planning dispatch", () => {
+    const mapping = makeMapping({ dependencyTokenScope: "installation" });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "planning",
+      runToken: "plan-tok",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.dependencyTokenScope).toBeUndefined();
+    expect("dependencyTokenScope" in decoded).toBe(false);
+  });
+
+  it("stamps dependencyTokenScope for gap-analysis dispatch", () => {
+    const mapping = makeMapping({ dependencyTokenScope: "installation" });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "gap-analysis",
+      prNumber: "99",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.dependencyTokenScope).toBe("installation");
   });
 });
 
