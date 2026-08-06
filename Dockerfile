@@ -1,4 +1,6 @@
-FROM node:24-alpine AS builder
+# Keep the Node version aligned with the repo pins and the image immutable;
+# better-sqlite3 is a native addon whose lifecycle behavior can change across Node releases.
+FROM node:24.15.0-alpine@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f AS builder
 
 WORKDIR /app
 
@@ -12,7 +14,7 @@ COPY src/ ./src/
 RUN npm run build
 
 # ---------- Production stage ----------
-FROM node:24-alpine
+FROM node:24.15.0-alpine@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f
 
 WORKDIR /app
 
