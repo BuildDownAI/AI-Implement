@@ -402,6 +402,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       githubRepo,
       githubToken,
       branch,
+      baseBranch,
       provider,
       maxTurns,
       maxIterations,
