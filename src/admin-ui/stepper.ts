@@ -125,6 +125,14 @@ export const stepperHtml = `
             <textarea class="input mono" id="np-sensitive-allow" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
             <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
           </div>
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Dependency Token Scope <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
+            <select class="input" id="np-dep-token-scope">
+              <option value="">Off (default)</option>
+              <option value="installation">All repos the App can access (read-only)</option>
+            </select>
+            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos. (Not yet enforced — takes effect once dependency-token vending ships.)</div>
+          </div>
         </div>
       </div>
 
@@ -275,6 +283,10 @@ export const stepperHtml = `
             <div data-review="sensitiveAllowPatterns"></div>
           </div>
           <div class="np-review-row">
+            <div class="np-review-label">Dep. Token Scope</div>
+            <div data-review="dependencyTokenScope"></div>
+          </div>
+          <div class="np-review-row">
             <div class="np-review-label">Runner</div>
             <div data-review="runner"></div>
           </div>
@@ -328,7 +340,7 @@ export const stepperScript = `
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
     jiraProfilesFieldOverride: '',
-    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
+    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '', dependencyTokenScope: null,
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
@@ -353,6 +365,7 @@ export const stepperScript = `
     data.skillsRepo = '';
     data.sensitiveAddPatterns = '';
     data.sensitiveAllowPatterns = '';
+    data.dependencyTokenScope = null;
     data.executionMode = 'github-actions';
     data.machineCpus = 2;
     data.machineMemoryMb = 4096;
@@ -367,6 +380,8 @@ export const stepperScript = `
 
     // Clear inputs
     const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-skills-repo', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion'];
+    const depScopeEl = document.getElementById('np-dep-token-scope');
+    if (depScopeEl) depScopeEl.value = '';
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
@@ -643,6 +658,8 @@ export const stepperScript = `
       if (srEl) data.skillsRepo = srEl.value.trim();
       if (saEl) data.sensitiveAddPatterns = saEl.value.trim();
       if (salEl) data.sensitiveAllowPatterns = salEl.value.trim();
+      const dtsEl = document.getElementById('np-dep-token-scope');
+      if (dtsEl) data.dependencyTokenScope = dtsEl.value || null;
     } else if (n === 3) {
       const smEl = document.getElementById('np-sessionMode');
       const cpEl = document.getElementById('np-cpus');
@@ -758,6 +775,7 @@ export const stepperScript = `
     set('skillsRepo', data.skillsRepo ? window.esc(data.skillsRepo) : '&mdash;');
     set('sensitiveAddPatterns', data.sensitiveAddPatterns ? (data.sensitiveAddPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' pattern(s)') : '&mdash;');
     set('sensitiveAllowPatterns', data.sensitiveAllowPatterns ? (data.sensitiveAllowPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' exception(s)') : '&mdash;');
+    set('dependencyTokenScope', data.dependencyTokenScope ? window.esc(data.dependencyTokenScope) : '&mdash;');
 
     let runnerText = window.esc(data.executionMode);
     if (data.executionMode === 'fly-machines') {
@@ -1089,6 +1107,7 @@ export const stepperScript = `
       skillsRepo: data.skillsRepo || null,
       sensitiveAddPatterns: data.sensitiveAddPatterns || null,
       sensitiveAllowPatterns: data.sensitiveAllowPatterns || null,
+      dependencyTokenScope: data.dependencyTokenScope || null,
       ticketingProvider: data.ticketingProvider,
       ticketingConfig: data.ticketingProvider === 'jira'
         ? {

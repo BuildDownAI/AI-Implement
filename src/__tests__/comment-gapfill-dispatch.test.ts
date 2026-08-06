@@ -67,6 +67,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     skillsRepo: null,
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
     ...overrides,
   };
 }
