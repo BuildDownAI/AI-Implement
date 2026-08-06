@@ -16,6 +16,108 @@ export interface StuckWatchdogConfig {
 }
 
 /**
+ * Shared ticket-cleanup core: increment the stuck-attempts counter and either
+ * requeue (within budget) or give-up (over budget). Returns the updated count.
+ *
+ * Does NOT stop the runner, update job status, or log — all of which vary
+ * between the timeout and failure paths and are handled by each caller.
+ */
+async function boundedCleanup(
+  config: StuckWatchdogConfig,
+  provider: TicketingProvider | null,
+  job: Job,
+  runUrl: string | null,
+  lastRunStatus: string,
+): Promise<number> {
+  const attempts = incrementStuckAttempts(job.issueId!);
+
+  if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
+    if (provider) {
+      try {
+        await provider.clearWorkingState(job.issueId!, job.teamKey ?? "");
+        deleteDispatched(job.issueId!);
+        console.log(`[monitor] Reset ticket ${job.issueIdentifier} for requeue`);
+      } catch (err) {
+        console.error(`[monitor] Failed to reset ticket ${job.issueIdentifier}:`, err);
+      }
+    }
+  } else {
+    if (provider) {
+      try {
+        await provider.clearWorkingState(job.issueId!, job.teamKey ?? "");
+      } catch (err) {
+        console.error(`[monitor] Failed to clear working state for ${job.issueIdentifier}:`, err);
+      }
+    }
+
+    const identifier = job.issueIdentifier || job.issueId!;
+    let issueUrl = `https://linear.app/issue/${identifier}`;
+    if (provider) {
+      try {
+        const issueArg: TicketIssue = {
+          id: job.issueId!,
+          identifier,
+          title: job.issueTitle || "",
+          description: null,
+          scopeKey: job.teamKey ?? "",
+          nativeStatus: "",
+        };
+        issueUrl = provider.issueUrl(issueArg);
+      } catch {
+        // use fallback
+      }
+    }
+
+    if (config.notifyWebhookUrl) {
+      try {
+        await notifyStuckGiveUp(config.notifyType, config.notifyWebhookUrl, {
+          issueIdentifier: identifier,
+          issueTitle: job.issueTitle || "Unknown",
+          issueUrl,
+          repoFullName: job.repo || "unknown",
+          runUrl,
+          attempts,
+          lastRunStatus,
+        });
+      } catch (err) {
+        console.error(
+          `[monitor] Failed to send stuck giveup notification for ${job.issueIdentifier}:`,
+          err,
+        );
+      }
+    }
+
+    if (provider) {
+      const lines = [
+        `**AI Implementation Stuck — Needs Human**`,
+        ``,
+        `This issue has failed to complete ${attempts} times and has been removed from automated retry.`,
+        ``,
+        `| | |`,
+        `|---|---|`,
+        `| Issue | ${identifier} |`,
+        `| Repo | \`${job.repo || "unknown"}\` |`,
+        `| Attempts | ${attempts} |`,
+        `| Last run status | \`${lastRunStatus}\` |`,
+        ...(runUrl ? [`| Last run | ${runUrl} |`] : []),
+        ``,
+        `Please investigate and re-label when ready to re-dispatch.`,
+      ];
+      try {
+        await provider.postComment(job.issueId!, lines.join("\n"));
+      } catch (err) {
+        console.error(
+          `[monitor] Failed to post stuck giveup comment for ${job.issueIdentifier}:`,
+          err,
+        );
+      }
+    }
+  }
+
+  return attempts;
+}
+
+/**
  * Remediates a stuck job with bounded retry logic (3-attempt budget).
  *
  * Attempts 1-3: stop the runner, mark timed_out/stuck_requeued, reset ticket
@@ -67,12 +169,13 @@ export async function remediateStuckJob(
     }
   }
 
-  const attempts = incrementStuckAttempts(job.issueId);
   const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
   const runUrl =
     job.runId && job.repo
       ? `https://github.com/${job.repo}/actions/runs/${job.runId}`
       : null;
+
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
 
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
     updateJobStatus(job.id, "timed_out", "stuck_requeued");
@@ -80,92 +183,52 @@ export async function remediateStuckJob(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
         `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — requeueing`,
     );
-
-    if (provider) {
-      try {
-        await provider.clearWorkingState(job.issueId, job.teamKey ?? "");
-        deleteDispatched(job.issueId);
-        console.log(`[monitor] Reset ticket ${job.issueIdentifier} for requeue`);
-      } catch (err) {
-        console.error(`[monitor] Failed to reset ticket ${job.issueIdentifier}:`, err);
-      }
-    }
   } else {
     updateJobStatus(job.id, "timed_out", "stuck_giveup");
     console.warn(
       `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
         `(attempt ${attempts}) — giving up, needs human`,
     );
+  }
+}
 
-    if (provider) {
-      try {
-        await provider.clearWorkingState(job.issueId, job.teamKey ?? "");
-      } catch (err) {
-        console.error(`[monitor] Failed to clear working state for ${job.issueIdentifier}:`, err);
-      }
-    }
+/**
+ * Bounded cleanup for a terminal failure where the runner has already stopped
+ * (no cancel step needed — job is already dead). Job status is already "failed"
+ * and is not changed here.
+ *
+ * Attempts 1-3: clear AI-Working + dedup so a later poll (or a human re-label)
+ * can re-dispatch.
+ *
+ * Attempt 4+: clear AI-Working only (dedup stays to prevent re-dispatch), fire
+ * notifyStuckGiveUp, and post a comment. Reuses incrementStuckAttempts so the
+ * budget spans both timeouts and failures for the same issue.
+ */
+export async function remediateFailedJob(
+  config: StuckWatchdogConfig,
+  provider: TicketingProvider | null,
+  job: Job,
+  lastRunStatus: string,
+): Promise<void> {
+  if (!job.issueId) return;
 
-    const identifier = job.issueIdentifier || job.issueId;
-    let issueUrl = `https://linear.app/issue/${identifier}`;
-    if (provider) {
-      try {
-        const issueArg: TicketIssue = {
-          id: job.issueId,
-          identifier,
-          title: job.issueTitle || "",
-          description: null,
-          scopeKey: job.teamKey ?? "",
-          nativeStatus: "",
-        };
-        issueUrl = provider.issueUrl(issueArg);
-      } catch {
-        // use fallback
-      }
-    }
+  const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
+  const runUrl =
+    job.runId && job.repo
+      ? `https://github.com/${job.repo}/actions/runs/${job.runId}`
+      : null;
 
-    if (config.notifyWebhookUrl) {
-      try {
-        await notifyStuckGiveUp(config.notifyType, config.notifyWebhookUrl, {
-          issueIdentifier: identifier,
-          issueTitle: job.issueTitle || "Unknown",
-          issueUrl,
-          repoFullName: job.repo || "unknown",
-          runUrl,
-          attempts,
-          lastRunStatus,
-        });
-      } catch (err) {
-        console.error(
-          `[monitor] Failed to send stuck giveup notification for ${job.issueIdentifier}:`,
-          err,
-        );
-      }
-    }
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
 
-    if (provider) {
-      const lines = [
-        `**AI Implementation Stuck — Needs Human**`,
-        ``,
-        `This issue has failed to complete ${attempts} times and has been removed from automated retry.`,
-        ``,
-        `| | |`,
-        `|---|---|`,
-        `| Issue | ${identifier} |`,
-        `| Repo | \`${job.repo || "unknown"}\` |`,
-        `| Attempts | ${attempts} |`,
-        `| Last run status | \`${lastRunStatus}\` |`,
-        ...(runUrl ? [`| Last run | ${runUrl} |`] : []),
-        ``,
-        `Please investigate and re-label when ready to re-dispatch.`,
-      ];
-      try {
-        await provider.postComment(job.issueId, lines.join("\n"));
-      } catch (err) {
-        console.error(
-          `[monitor] Failed to post stuck giveup comment for ${job.issueIdentifier}:`,
-          err,
-        );
-      }
-    }
+  if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) failed after ${elapsedMin}m ` +
+        `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — clearing for requeue`,
+    );
+  } else {
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) failed after ${elapsedMin}m ` +
+        `(attempt ${attempts}) — giving up, needs human`,
+    );
   }
 }

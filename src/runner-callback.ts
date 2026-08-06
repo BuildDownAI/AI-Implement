@@ -1,6 +1,7 @@
 import { getJobByDispatchId, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
+import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { upsertStepRecord } from "./step-log.js";
 import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
@@ -28,6 +29,8 @@ export interface HandleRunnerResultInput {
   body: RunnerResultBody;
   secret: string;
   resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
+  /** When provided, bounded failure cleanup (remediateFailedJob) runs after markImplementationFailed. */
+  watchdogConfig?: StuckWatchdogConfig;
 }
 
 export interface HandleRunnerResultOutput {
@@ -232,11 +235,21 @@ export async function handleRunnerResult(
       } catch (err) {
         warn("markImplementationFailed", err);
       }
-      // A coded unapproved failure still carries a draft PR — link it on the
-      // job row so the admin UI and merge-detection can see it.
-      if (typeof input.body.prUrl === "string" && input.body.prUrl) {
-        const job = getJobByDispatchId(claims.dispatchId);
-        if (job) updateJobPrUrl(job.id, input.body.prUrl);
+      const job = getJobByDispatchId(claims.dispatchId);
+      if (job) {
+        // A coded unapproved failure still carries a draft PR — link it on the
+        // job row so the admin UI and merge-detection can see it.
+        if (typeof input.body.prUrl === "string" && input.body.prUrl) {
+          updateJobPrUrl(job.id, input.body.prUrl);
+        }
+        if (input.watchdogConfig) {
+          await remediateFailedJob(
+            input.watchdogConfig,
+            provider,
+            job,
+            input.body.failureCode ?? input.body.failureReason ?? "failure",
+          );
+        }
       }
     }
     // gap-analysis failure: no status transition (PR already terminal)

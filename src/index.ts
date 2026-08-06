@@ -14,7 +14,7 @@ import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
-import { remediateStuckJob } from "./stuck-watchdog.js";
+import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
@@ -1721,6 +1721,11 @@ async function monitorGitHubActionsJob(
       const provider = await providerForJob(registry, job);
       await finalizeNoOpGroupingParent(provider, job);
     }
+
+    if (jobStatus === "failed") {
+      const provider = await providerForJob(registry, job);
+      await remediateFailedJob(watchdogConfig, provider, job, runStatus.conclusion ?? "failure");
+    }
   }
   // If status is queued or in_progress, ensure job is marked running
   else if (job.status === "dispatched") {
@@ -1939,8 +1944,13 @@ async function monitorFlyMachineJob(
         await markReadyForReview(provider, job, prUrl);
       }
     } else if (jobStatus === "failed") {
-      // On failure/timeout, reset the Linear issue so it can be re-dispatched
-      await resetTicket(provider, job);
+      const flyWatchdogConfig: StuckWatchdogConfig = {
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+        notifyType: config.notifyType,
+        notifyWebhookUrl: config.notifyWebhookUrl,
+      };
+      await remediateFailedJob(flyWatchdogConfig, provider, job, machineConclusion);
     }
   }
 }
@@ -2061,7 +2071,13 @@ async function monitorLocalDockerJob(
       await markReadyForReview(provider, job, prUrl);
     }
   } else {
-    await resetTicket(provider, job);
+    const localWatchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+    await remediateFailedJob(localWatchdogConfig, provider, job, `exit_${state.exitCode}`);
   }
 }
 
@@ -2610,6 +2626,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
             const mapping = getMappings()[mappingTeamKey];
             if (!mapping) return null;
             return await registry.forMapping(mapping);
+          },
+          watchdogConfig: {
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            notifyType: config.notifyType,
+            notifyWebhookUrl: config.notifyWebhookUrl,
           },
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
