@@ -901,6 +901,93 @@ describe("unapproved-run failure codes", () => {
   });
 });
 
+describe("watchdogConfig — remediateFailedJob gating", () => {
+  const watchdogConfig = {
+    githubAppId: "app-id",
+    githubAppPrivateKey: "key",
+    notifyType: "slack",
+    notifyWebhookUrl: null,
+  };
+
+  it("skips remediateFailedJob when prUrl is set (draft-PR coded failure)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "t",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "nope",
+        prUrl: "https://github.com/o/r/pull/9",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    // clearWorkingState is what remediateFailedJob calls via boundedCleanup;
+    // it must NOT fire when a draft PR is already open.
+    const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
+    expect(clearCall).toBeUndefined();
+  });
+
+  it("runs remediateFailedJob when watchdogConfig is set and no prUrl", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "t",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "build failed",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
+    expect(clearCall).toBeDefined();
+  });
+});
+
 describe("handleRunnerResult — token replay", () => {
   it("returns 409 on already_consumed token", async () => {
     const { token } = runnerTokens.mintRunToken({

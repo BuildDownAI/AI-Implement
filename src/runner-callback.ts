@@ -242,7 +242,11 @@ export async function handleRunnerResult(
         if (typeof input.body.prUrl === "string" && input.body.prUrl) {
           updateJobPrUrl(job.id, input.body.prUrl);
         }
-        if (input.watchdogConfig) {
+        // Skip bounded cleanup for coded failures that already pushed a draft PR
+        // (REVIEW_UNAPPROVED / MAX_TURNS_EXHAUSTED): clearing AI-Working + dedup
+        // would re-queue an issue that already has an open draft PR, contradicting
+        // the "leave for human" intent. Mirror the Fly/local monitor's isDraftPr guard.
+        if (input.watchdogConfig && !input.body.prUrl) {
           await remediateFailedJob(
             input.watchdogConfig,
             provider,
