@@ -53,6 +53,14 @@ export async function handleMcpRequest(
 
   const proxyReq = transport.request(options, (proxyRes) => {
     res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers as http.OutgoingHttpHeaders);
+    proxyRes.on("error", (err) => {
+      console.error("[mcp] KG sidecar response error:", err);
+      if (!res.headersSent) {
+        json(res, 502, { error: "KG sidecar error" });
+      } else {
+        res.destroy(err);
+      }
+    });
     proxyRes.pipe(res);
   });
 

@@ -33,10 +33,15 @@ class MockResponse extends Writable {
       this._resolver = resolve;
     });
     this.on("finish", () => this._resolver());
+    this.on("close", () => this._resolver());
   }
 
   _write(chunk: Buffer, _enc: string, cb: () => void): void {
     this._chunks.push(chunk);
+    cb();
+  }
+
+  _destroy(_err: Error | null, cb: (error?: Error | null) => void): void {
     cb();
   }
 
@@ -246,6 +251,31 @@ describe("handleMcpRequest", () => {
       expect(result.responseHeaders["content-type"]).toBe("text/event-stream");
       expect(result.body).toContain('data: {"type":"text","text":"hello"}');
       expect(result.body).toContain('data: {"type":"end"}');
+    });
+
+    it("destroys the response when proxyRes emits an error mid-stream", async () => {
+      const mockProxyReq = new PassThrough();
+      const mockProxyRes = new PassThrough();
+      Object.assign(mockProxyRes, {
+        statusCode: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+
+      mockHttpRequest.mockImplementationOnce((_options: http.RequestOptions, cb: (res: unknown) => void) => {
+        process.nextTick(() => {
+          cb(mockProxyRes);
+          process.nextTick(() => {
+            mockProxyRes.emit("error", Object.assign(new Error("connection reset"), { code: "ECONNRESET" }));
+          });
+        });
+        return mockProxyReq;
+      });
+
+      const req = new MockRequest("GET", { authorization: "Bearer tok" });
+      const res = new MockResponse();
+      handleMcpRequest(req as never, res as never, "tok", SIDECAR_URL);
+      await res.done;
+      expect(res.headersSent).toBe(true);
     });
 
     it("returns 502 on connection refused", async () => {
