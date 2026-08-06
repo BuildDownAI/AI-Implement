@@ -52,6 +52,17 @@ describe("session/entrypoint.sh", () => {
     expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(git branch --show-current\)"/);
   });
 
+  it("decodes prNumber from the envelope before the gap-fill checkout when PR_NUMBER is empty", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    // Decode line must extract prNumber from the envelope JSON
+    expect(content).toMatch(/node -e.*c\.prNumber/);
+    // Decode must precede the gh pr checkout guard
+    const decodeIdx = content.indexOf("c.prNumber");
+    const checkoutIdx = content.indexOf("gh pr checkout");
+    expect(decodeIdx).toBeGreaterThan(-1);
+    expect(decodeIdx).toBeLessThan(checkoutIdx);
+  });
+
   it("does not pass duplicate preserve-environment flags to su", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toContain("su -p coder");
