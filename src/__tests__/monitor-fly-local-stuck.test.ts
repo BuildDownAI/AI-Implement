@@ -99,7 +99,7 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
 
       expect(stopRunner).toHaveBeenCalledOnce();
       expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -148,7 +148,7 @@ describe("remediateStuckJob — Fly machine timeout path", () => {
 
       await remediateStuckJob(mockConfig, provider, makeJob(), "machine_timeout", stopRunner);
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
       expect(deleteDispatched).not.toHaveBeenCalled();
     });
 
@@ -194,7 +194,7 @@ describe("remediateStuckJob — local-docker timeout path", () => {
 
       expect(stopRunner).toHaveBeenCalledOnce();
       expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_requeued");
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
       expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
       expect(notifyStuckGiveUp).not.toHaveBeenCalled();
     });
@@ -234,7 +234,7 @@ describe("remediateStuckJob — local-docker timeout path", () => {
 
       await remediateStuckJob(mockConfig, provider, job, "container_timeout", stopRunner);
 
-      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc");
+      expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
       expect(deleteDispatched).not.toHaveBeenCalled();
     });
 
