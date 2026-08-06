@@ -1,7 +1,6 @@
 import crypto from "node:crypto";
 import http from "node:http";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import https from "node:https";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -18,6 +17,7 @@ export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   mcpAccessToken: string | null,
+  kgSidecarUrl: string | null,
 ): Promise<void> {
   if (!mcpAccessToken) {
     json(res, 503, { error: "MCP endpoint not configured: MCP_ACCESS_TOKEN is not set" });
@@ -31,12 +31,41 @@ export async function handleMcpRequest(
     return;
   }
 
-  const server = new McpServer({ name: "ai-implement-orchestrator", version: "1.0.0" });
-  server.registerTool("ping", { description: "Returns pong" }, async () => ({
-    content: [{ type: "text" as const, text: "pong" }],
-  }));
+  if (!kgSidecarUrl) {
+    json(res, 503, { error: "MCP endpoint not configured: KG_SIDECAR_URL is not set" });
+    return;
+  }
 
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  await server.connect(transport);
-  await transport.handleRequest(req, res);
+  const target = new URL(kgSidecarUrl);
+  const transport = target.protocol === "https:" ? https : http;
+
+  const forwardHeaders = { ...req.headers };
+  delete forwardHeaders.authorization;
+  delete forwardHeaders.host;
+
+  const options: http.RequestOptions = {
+    hostname: target.hostname,
+    port: target.port || (target.protocol === "https:" ? "443" : "80"),
+    path: target.pathname + target.search,
+    method: req.method,
+    headers: { ...forwardHeaders, host: target.host },
+  };
+
+  const proxyReq = transport.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers as http.OutgoingHttpHeaders);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on("error", (err: NodeJS.ErrnoException) => {
+    if (res.headersSent) return;
+    if (err.code === "ECONNREFUSED") {
+      console.error(`[mcp] KG sidecar connection refused at ${kgSidecarUrl}`);
+      json(res, 502, { error: "KG sidecar unavailable: connection refused" });
+    } else {
+      console.error("[mcp] KG sidecar error:", err);
+      json(res, 502, { error: "KG sidecar error" });
+    }
+  });
+
+  req.pipe(proxyReq);
 }

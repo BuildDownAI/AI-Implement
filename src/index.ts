@@ -98,6 +98,7 @@ interface AppConfig {
   localRunnerImage: string;
   localRunnerOrchestratorUrl: string | null;
   mcpAccessToken: string | null;
+  kgSidecarUrl: string | null;
 }
 
 function loadConfig(): AppConfig {
@@ -217,6 +218,7 @@ function loadConfig(): AppConfig {
     localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
     mcpAccessToken: process.env.MCP_ACCESS_TOKEN || null,
+    kgSidecarUrl: process.env.KG_SIDECAR_URL || null,
   };
 }
 
@@ -2724,7 +2726,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
 
     // MCP endpoint — static bearer token authenticated (MCP_ACCESS_TOKEN)
     if (url === "/mcp") {
-      handleMcpRequest(req, res, config.mcpAccessToken).catch((err) => {
+      handleMcpRequest(req, res, config.mcpAccessToken, config.kgSidecarUrl).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

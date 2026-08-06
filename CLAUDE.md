@@ -171,6 +171,7 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `MICROSOFT_OAUTH_CLIENT_ID` / `MICROSOFT_OAUTH_CLIENT_SECRET` / `MICROSOFT_OAUTH_TENANT` | No | Microsoft (Entra) OIDC credentials; `_TENANT` is the directory (tenant) ID |
 | `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` | No | Comma-separated allowlist; a verified identity must match a domain or email (fail-closed) |
 | `MCP_ACCESS_TOKEN` | No | **Temporary** static bearer token for the `/mcp` endpoint (AII-296 step 1). Unset → 503. Replaced by OAuth in step 3 of the parent. |
+| `KG_SIDECAR_URL` | No | URL of the private KG sidecar (streamable-HTTP MCP transport), e.g. `http://127.0.0.1:8765/mcp`. Unset → 503 on `/mcp`. The sidecar should be reachable only from loopback; the orchestrator proxies auth-verified requests verbatim and strips the `Authorization` header before forwarding. |
 | `DEDUP_DB_PATH` | No | SQLite path (default `/data/dedup.sqlite`) |
 | `POLL_INTERVAL_MS` | No | Poll interval ms (default `60000`) |
 | `PORT` | No | HTTP port (default `8080`) |
