@@ -97,9 +97,10 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         GIT_USERNAME: "x-access-token",
         GIT_PASSWORD: githubToken,
       };
+      const baseBranchRefspec = `+refs/heads/${inputs.baseBranch}:refs/remotes/origin/${inputs.baseBranch}`;
       const fetchBase = spawnSync(
         "git",
-        ["fetch", "--depth", "1", "origin", inputs.baseBranch],
+        ["fetch", "--depth", "1", "origin", baseBranchRefspec],
         { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitAuthEnv },
       );
       if (fetchBase.status !== 0) {
@@ -115,7 +116,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         if (mergeBase.status !== 0) {
           const unshallow = spawnSync(
             "git",
-            ["fetch", "--unshallow", "origin", inputs.baseBranch],
+            ["fetch", "--unshallow", "origin", baseBranchRefspec],
             { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitAuthEnv },
           );
           if (unshallow.status !== 0) {

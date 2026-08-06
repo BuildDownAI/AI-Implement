@@ -176,7 +176,7 @@ describe("cloneStep", () => {
       expect(outputs.cloneMethod).toBe("fresh");
       expect(outputs.clonedRef).toBe("abc123");
       const calls = vi.mocked(spawnSync).mock.calls;
-      expect(calls[1][1]).toEqual(["fetch", "--depth", "1", "origin", "main"]);
+      expect(calls[1][1]).toEqual(["fetch", "--depth", "1", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
       expect(calls[2][1]).toEqual(["merge-base", "origin/main", "HEAD"]);
     });
 
@@ -195,7 +195,7 @@ describe("cloneStep", () => {
 
       expect(outputs.cloneMethod).toBe("incremental");
       const calls = vi.mocked(spawnSync).mock.calls;
-      expect(calls[2][1]).toEqual(["fetch", "--depth", "1", "origin", "main"]);
+      expect(calls[2][1]).toEqual(["fetch", "--depth", "1", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
       expect(calls[3][1]).toEqual(["merge-base", "origin/main", "HEAD"]);
     });
 
@@ -214,7 +214,7 @@ describe("cloneStep", () => {
 
       expect(outputs.clonedRef).toBe("abc123");
       const calls = vi.mocked(spawnSync).mock.calls;
-      expect(calls[3][1]).toEqual(["fetch", "--unshallow", "origin", "main"]);
+      expect(calls[3][1]).toEqual(["fetch", "--unshallow", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
     });
 
     it("logs and continues when base-branch fetch fails (fail soft)", async () => {
