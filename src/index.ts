@@ -1246,6 +1246,7 @@ async function dispatchFlyMachine(
         ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
         ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
         ...(isGroupingParentDispatch(issue) ? { groupingParent: true } : {}),
+        ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
       };
 
       const machineConfig = buildSessionMachineConfig({
@@ -1348,6 +1349,7 @@ async function dispatchLocalDocker(
         ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
         ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
         ...(isGroupingParentDispatch(issue) ? { groupingParent: true } : {}),
+        ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
       };
 
       const container = await startLocalRunnerContainer({

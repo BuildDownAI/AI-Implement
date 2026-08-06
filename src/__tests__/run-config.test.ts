@@ -16,6 +16,7 @@ const full: RunConfigV1 = {
   sensitiveFiles: { add: ["*.secrets.toml"], allow: [".env", ".env.*"] },
   profiles: ["backend", "webapp"],
   planningContext: { parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" },
+  dependencyTokenScope: "installation",
 };
 
 describe("run-config envelope", () => {
@@ -97,5 +98,29 @@ describe("run-config envelope", () => {
     const decoded = decodeRunConfig(encodeRunConfig(min));
     expect(decoded.profiles).toBeUndefined();
     expect(decoded.planningContext).toBeUndefined();
+  });
+
+  it("round-trips dependencyTokenScope: installation", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-3", title: "t", description: "" },
+      dependencyTokenScope: "installation",
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).dependencyTokenScope).toBe("installation");
+  });
+
+  it("absent dependencyTokenScope decodes as undefined (no key materialized)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-4", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.dependencyTokenScope).toBeUndefined();
+    expect("dependencyTokenScope" in decoded).toBe(false);
+  });
+
+  it("pickKnownKeys preserves dependencyTokenScope and drops bogus extra keys", () => {
+    const withExtra = { ...full, bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.dependencyTokenScope).toBe("installation");
+    expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
   });
 });

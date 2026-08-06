@@ -231,6 +231,7 @@ export function buildEnvelopeDispatchInputs(
     ...(mapping.sensitiveAddPatterns != null || mapping.sensitiveAllowPatterns != null
       ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
       : {}),
+    ...(mapping.dependencyTokenScope != null && opts.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
     ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
     ...(opts.groupingParent ? { groupingParent: true } : {}),
