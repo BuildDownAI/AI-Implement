@@ -209,4 +209,38 @@ describe("runner-mode", () => {
       }
     });
   });
+
+  describe("checkForcedPathEligibility (AII-306)", () => {
+    const ghaMapping = { executionMode: "github-actions" as const, provider: "anthropic" };
+    const bedrockMapping = { executionMode: "github-actions" as const, provider: "bedrock" };
+
+    it("forced fly + bedrock mapping → ineligible, reason names bedrock", () => {
+      const r = runnerMode.checkForcedPathEligibility("fly", bedrockMapping, true);
+      expect(r.eligible).toBe(false);
+      expect(r.reason).toMatch(/bedrock/i);
+    });
+
+    it("forced fly + no sessions app → ineligible, reason names FLY_SESSIONS_APP", () => {
+      const r = runnerMode.checkForcedPathEligibility("fly", ghaMapping, false);
+      expect(r.eligible).toBe(false);
+      expect(r.reason).toMatch(/FLY_SESSIONS_APP/);
+    });
+
+    it("forced fly + fly-capable mapping → eligible", () => {
+      const r = runnerMode.checkForcedPathEligibility("fly", ghaMapping, true);
+      expect(r).toEqual({ eligible: true, reason: null });
+    });
+
+    it("non-forcing modes are always eligible (default/gha), even for bedrock without sessions app", () => {
+      for (const mode of ["default", "gha"] as const) {
+        expect(runnerMode.checkForcedPathEligibility(mode, bedrockMapping, false).eligible).toBe(true);
+      }
+    });
+
+    it("bedrock ineligibility wins over missing sessions app in the reason", () => {
+      const r = runnerMode.checkForcedPathEligibility("fly", bedrockMapping, false);
+      expect(r.eligible).toBe(false);
+      expect(r.reason).toMatch(/bedrock/i);
+    });
+  });
 });

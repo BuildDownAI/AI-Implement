@@ -220,6 +220,14 @@ When adding a new page: create the page module, append both strings to the lists
 
 Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still stubbed in `src/admin-ui/pages/stubs.ts` with "Coming soon" placeholders (badged "Not implemented yet" or "Partially implemented") that explain what exists today and link to the related built pages.
 
+## Backend outage playbook (runner-mode failover)
+
+When GitHub Actions (or Fly) is degraded, the global **runner mode** is the failover lever: `/admin#runners` (or `POST /api/runner-mode`) with `fly` forces every new dispatch onto Fly Machines; `gha` forces GitHub Actions; `default` restores per-project modes. In-flight runs keep their monitors — only new dispatches reroute.
+
+- **Prerequisite for `fly`:** the orchestrator must have a Fly session backend (`FLY_SESSIONS_APP` + Fly API token) and the mapping must be Fly-capable. **Ineligible mappings are skipped at dispatch** (provider=`bedrock` is GHA-only; no sessions app configured) — they stay queued, dedup untouched, with one log line per poll, and are listed in the Runners-page override banner and the `GET /api/runner-mode` response (`ineligible`).
+- Every mode change is logged (`old → new`) and fires a plain-text notification when `NOTIFY_WEBHOOK_URL` is set.
+- Flip back to `default` after the outage; skipped issues dispatch normally on the next poll.
+
 ## Notification adapter
 
 `src/notify.ts` exports a single `notify(type, webhookUrl, notification)` function. Set `NOTIFY_TYPE=slack` or `NOTIFY_TYPE=teams` to switch providers. Adding a new provider means adding a private function in `notify.ts` and a new case in the switch.

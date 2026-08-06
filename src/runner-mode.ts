@@ -79,6 +79,34 @@ export function resolveExecutionPath(
   return mappingMode;
 }
 
+export interface ForcedPathEligibility {
+  eligible: boolean;
+  reason: string | null;
+}
+
+/**
+ * AII-306: when the global runner mode FORCES a path a mapping cannot run on,
+ * the dispatch must be skipped (issue stays queued) instead of launching a run
+ * that cannot work. Pure — no I/O. Only mode "fly" forces an incapable path
+ * today: bedrock is GHA-only, and Fly machine creation needs a sessions app.
+ * Non-forcing modes (and "gha"/"local", which every mapping can run) are
+ * always eligible.
+ */
+export function checkForcedPathEligibility(
+  runnerMode: RunnerMode,
+  mapping: { executionMode: "github-actions" | "fly-machines"; provider?: string },
+  hasFlySessionsApp: boolean,
+): ForcedPathEligibility {
+  if (runnerMode !== "fly") return { eligible: true, reason: null };
+  if (mapping.provider === "bedrock") {
+    return { eligible: false, reason: "provider=bedrock is GHA-only (no role-assumption on Fly)" };
+  }
+  if (!hasFlySessionsApp) {
+    return { eligible: false, reason: "no Fly sessions app configured (FLY_SESSIONS_APP)" };
+  }
+  return { eligible: true, reason: null };
+}
+
 /**
  * Planning-specific execution path resolution. Identical to resolveExecutionPath
  * except shadow ("both") collapses to "github-actions": planning posts user-visible
