@@ -85,6 +85,8 @@ function applyWiring(step: YamlStep): StepDefinition {
           branch: ctx.data.branch,
           githubToken: ctx.data.githubToken,
           workspaceDir: ctx.data.workspaceDir,
+          baseBranch: ctx.data.baseBranch,
+          prNumber: ctx.data.prNumber,
         }),
       };
 

@@ -48,6 +48,8 @@ export interface PipelineContextData {
   githubToken?: string;
   /** Autonomous runner: base branch to clone. Implementation branches are derived per issue. */
   branch?: string;
+  /** Autonomous runner: PR base branch for gap-fill runs (where branch holds the PR impl branch). */
+  baseBranch?: string;
   /** Autonomous runner: Claude provider ("anthropic" | "bedrock"), from PROVIDER env. */
   provider?: string;
   /** Autonomous runner: cap on Claude turns per implement pass (from env). */
