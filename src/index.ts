@@ -30,7 +30,7 @@ import { postStatusComment } from "./status-events.js";
 import { classifyCompletion, renderClassification } from "./completion-classification.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
-import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl } from "./runner-mode.js";
+import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
@@ -442,6 +442,18 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           const { mode: runnerMode } = getRunnerMode();
           const execPath = resolveExecutionPath(runnerMode, mapping.executionMode);
 
+          // AII-306: a forced global mode can point at a backend this mapping
+          // cannot run on (bedrock is GHA-only; Fly needs a sessions app).
+          // Skip — issue stays queued, dedup untouched — instead of
+          // dispatching a run that cannot work.
+          const eligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
+          if (!eligibility.eligible) {
+            console.log(
+              `[poll] Skipping ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${eligibility.reason}`,
+            );
+            continue;
+          }
+
           // Resolve the base branch once per issue (feature-branch grouping). Doing it
           // here — before the exec-path switch — guarantees the "both" shadow path's two
           // dispatches agree on one base, and never creates the branch twice. The token
@@ -747,6 +759,15 @@ async function dispatchPlanning(
   // Shadow collapses to GHA-only: planning posts user-visible Linear comments,
   // so a shadow second backend would double-post.
   const execPath = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
+
+  // AII-306: same forced-mode eligibility guard as implementation dispatch.
+  const planningEligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
+  if (!planningEligibility.eligible) {
+    console.log(
+      `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}`,
+    );
+    return;
+  }
 
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) for all execution paths.
   const planningContextInputs = await buildPlanningContextInputs({
@@ -2770,6 +2791,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         flySessionsRegion: config.flySessionsRegion,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
+        notifyWebhookUrl: config.notifyWebhookUrl,
       }, registry)) return;
     }
 

@@ -132,8 +132,15 @@ export const runnersScript = `
 
     if (runnerMode.mode !== 'default') {
       const bannerKind = runnerMode.mode === 'shadow' ? 'warn' : 'info';
+      // AII-306: ineligible mappings are skipped at dispatch under a force — surface them.
+      let ineligibleHtml = '';
+      if (Array.isArray(runnerMode.ineligible) && runnerMode.ineligible.length > 0) {
+        ineligibleHtml = '<div class="alert-desc" style="margin-top:4px"><strong>Skipped (ineligible for this mode):</strong> ' +
+          runnerMode.ineligible.map(function (m) { return window.esc(m.teamKey) + ' — ' + window.esc(m.reason); }).join('; ') +
+          '. These projects queue until the override clears.</div>';
+      }
       bannerEl.className = 'alert ' + bannerKind;
-      bannerEl.innerHTML = '<div style="flex:1"><div class="alert-title">Runner mode override active: ' + window.esc(runnerMode.mode) + '</div><div class="alert-desc">All projects route through ' + window.esc(runnerMode.mode) + ' regardless of their per-project mode.</div></div>';
+      bannerEl.innerHTML = '<div style="flex:1"><div class="alert-title">Runner mode override active: ' + window.esc(runnerMode.mode) + '</div><div class="alert-desc">All projects route through ' + window.esc(runnerMode.mode) + ' regardless of their per-project mode.</div>' + ineligibleHtml + '</div>';
       bannerEl.hidden = false;
     }
 
