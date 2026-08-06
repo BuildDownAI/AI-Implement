@@ -25,6 +25,7 @@ import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./
 import { configureAuthorizationPolicy } from "./oauth/authorize.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { handleTokenRequest } from "./token-vending.js";
+import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { classifyCompletion, renderClassification } from "./completion-classification.js";
@@ -2496,6 +2497,33 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
     // Token vending — no admin auth (used by session machines)
     if (url === "/api/token" && req.method === "POST") {
       handleTokenRequest(req, res, config.githubAppId, config.githubAppPrivateKey);
+      return;
+    }
+
+    // Dependency token vending — runner progress token authenticated, scoped contents:read mint
+    if (url === "/api/runner/dependency-token" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const result = await handleDependencyTokenRequest({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          githubAppId: config.githubAppId,
+          githubAppPrivateKey: config.githubAppPrivateKey,
+          resolveMapping: (key) => getMappings()[key],
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[dependency-token] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
       return;
     }
 
