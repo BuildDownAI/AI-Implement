@@ -69,6 +69,10 @@ export interface PipelineContextData {
   groupingParent?: boolean;
   /** Autonomous runner: WORKFLOW.md hook script paths (relative to repo root). */
   hooks?: { setup?: string; verify?: string; teardown?: string };
+  /** Autonomous runner: callback URL for runner result/progress posts (from runnerCallbackUrl / RUNNER_CALLBACK_URL). */
+  callbackUrl?: string;
+  /** Autonomous runner: per-project dependency-repo read access scope (from run_config envelope). */
+  dependencyTokenScope?: "installation";
 }
 
 export interface PipelineContext {

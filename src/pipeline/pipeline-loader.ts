@@ -98,6 +98,17 @@ function applyWiring(step: YamlStep): StepDefinition {
         skip: (ctx: PipelineContext) => !ctx.data.skillsRepo,
       };
 
+    case "dependency-auth":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          dependencyTokenScope: ctx.data.dependencyTokenScope,
+          callbackUrl: ctx.data.callbackUrl,
+          progressToken: process.env.RUN_PROGRESS_TOKEN?.trim() || null,
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.dependencyTokenScope,
+      };
+
     case "install":
       return {
         ...step,
