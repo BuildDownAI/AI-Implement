@@ -3,6 +3,7 @@ import { GitHubApiError } from "./github-errors.js";
 
 export interface InstallationDetails {
   token: string;
+  expiresAt: number; // ms since epoch; parsed from the token response's expires_at field (0 if absent/invalid)
   installationId: number; // Currently inert — no caller reads this yet. Reserved for an OAuth follow-up (if approved), which will add a repo to a "selected repositories" install via the API and needs the installation id to target it
   repositorySelection: "all" | "selected";
 }
@@ -145,10 +146,14 @@ export async function getInstallation(
       message: `Failed to get installation token for owner "${owner}" (${tokenRes.status}): ${body}`,
     });
   }
-  const tokenData = (await tokenRes.json()) as { token: string };
+  const tokenData = (await tokenRes.json()) as { token: string; expires_at?: string };
+
+  const parsedMs = tokenData.expires_at ? new Date(tokenData.expires_at).getTime() : NaN;
+  const expiresAt = Number.isFinite(parsedMs) ? parsedMs : 0;
 
   return {
     token: tokenData.token,
+    expiresAt,
     installationId: install.id,
     repositorySelection: install.repository_selection === "all" ? "all" : "selected",
   };
@@ -214,10 +219,16 @@ export async function getAppSlug(appId: string, privateKey: string): Promise<str
   return cachedAppSlug;
 }
 
+// Applied to the token's actual expires_at before caching so we never hand out a token that's about
+// to expire. Falls back to a 50-minute default when the response omits expires_at.
+const SAFETY_MARGIN_MS = 5 * 60 * 1000;
+const FALLBACK_TTL_MS = 50 * 60 * 1000;
+
 /**
  * Returns a cached installation access token for the given owner.
- * Tokens are valid for 1 hour; we cache for 50 minutes.
- * 
+ * Cache TTL is derived from the token response's expires_at minus a 5-minute safety margin.
+ * Falls back to a 50-minute TTL if expires_at is absent or unparseable.
+ *
  * Thin caching layer over getInstallation — the hot dispatch path only needs the token.
  */
 export async function getInstallationToken(
@@ -229,8 +240,9 @@ export async function getInstallationToken(
   if (cached && Date.now() < cached.expiresAt) {
     return cached.token;
   }
-  const { token } = await getInstallation(appId, privateKey, owner);
-  tokenCache.set(owner, { token, expiresAt: Date.now() + 50 * 60 * 1000 });
+  const { token, expiresAt } = await getInstallation(appId, privateKey, owner);
+  const cacheExpiresAt = expiresAt > 0 ? expiresAt - SAFETY_MARGIN_MS : Date.now() + FALLBACK_TTL_MS;
+  tokenCache.set(owner, { token, expiresAt: cacheExpiresAt });
   return token;
 }
 

@@ -177,6 +177,54 @@ describe("getInstallationToken", () => {
     const token = await getInstallationToken(APP_ID, escapedKey, "my-org");
     expect(token).toBe("ghs_pkcs1_esc");
   });
+
+  it("derives cache TTL from expires_at minus a 5-minute safety margin", async () => {
+    const T0 = 1_700_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(T0);
+
+    const expiresAt = new Date(T0 + 30 * 60 * 1000).toISOString(); // 30 min from T0
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "tok1", expires_at: expiresAt } },
+    ]));
+
+    await getInstallationToken(APP_ID, privateKey, "org");
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    // At T0 + 24min: cache expires at T0 + 25min (30 - 5 margin) → still valid
+    vi.spyOn(Date, "now").mockReturnValue(T0 + 24 * 60 * 1000);
+    const t2 = await getInstallationToken(APP_ID, privateKey, "org");
+    expect(t2).toBe("tok1");
+    expect(fetch).toHaveBeenCalledTimes(2); // cache hit
+
+    // At T0 + 26min: past the 25-min cache window → re-fetch
+    vi.spyOn(Date, "now").mockReturnValue(T0 + 26 * 60 * 1000);
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "tok2", expires_at: expiresAt } },
+    ]));
+    const t3 = await getInstallationToken(APP_ID, privateKey, "org");
+    expect(t3).toBe("tok2");
+    expect(fetch).toHaveBeenCalledTimes(4); // re-fetched after derived expiry
+  });
+
+  it("falls back to 50-minute TTL when expires_at is absent or invalid", async () => {
+    const T0 = 1_700_000_000_000;
+    vi.spyOn(Date, "now").mockReturnValue(T0);
+
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "tok", expires_at: "" } }, // empty → fallback to 50 min
+    ]));
+
+    await getInstallationToken(APP_ID, privateKey, "org");
+
+    // At T0 + 49min: within the 50-min fallback window → cache still valid
+    vi.spyOn(Date, "now").mockReturnValue(T0 + 49 * 60 * 1000);
+    const t2 = await getInstallationToken(APP_ID, privateKey, "org");
+    expect(t2).toBe("tok");
+    expect(fetch).toHaveBeenCalledTimes(2); // still cached
+  });
 });
 
 describe("getInstallation", () => {
@@ -190,6 +238,7 @@ describe("getInstallation", () => {
 
     expect(result).toEqual({
       token: "ghs_inst",
+      expiresAt: 0, // expires_at was "" in the mock → fallback to 0
       installationId: 55,
       repositorySelection: "selected",
     });

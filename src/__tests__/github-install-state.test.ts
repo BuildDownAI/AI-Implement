@@ -43,6 +43,7 @@ describe("probeInstallState", () => {
   it("ready: an 'all' install short-circuits without listing repos", async () => {
     vi.mocked(getInstallation).mockResolvedValueOnce({
       token: "ghs_x",
+      expiresAt: 0,
       installationId: 7,
       repositorySelection: "all",
     });
@@ -56,6 +57,7 @@ describe("probeInstallState", () => {
   it("ready: a 'selected' install that includes the repo", async () => {
     vi.mocked(getInstallation).mockResolvedValueOnce({
       token: "ghs_x",
+      expiresAt: 0,
       installationId: 8,
       repositorySelection: "selected",
     });
@@ -70,6 +72,7 @@ describe("probeInstallState", () => {
   it("repo-not-selected: a selected install missing the repo -> the same install-flow URL", async () => {
     vi.mocked(getInstallation).mockResolvedValueOnce({
       token: "ghs_x",
+      expiresAt: 0,
       installationId: 9,
       repositorySelection: "selected",
     });
