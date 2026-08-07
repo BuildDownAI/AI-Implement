@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
-import type { StepModule, StepReporter } from "../types.js";
+import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
+import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
   collectExternalReviewFindingsFromGh,
@@ -24,6 +25,8 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   ghSpawn?: (args: string[]) => SpawnResult;
   gitSpawn?: (args: string[]) => SpawnResult;
   sleep?: (ms: number) => Promise<void>;
+  /** Injectable credential refresh for tests. */
+  refreshCredentials?: () => Promise<void>;
 }
 
 type ExternalReviewState = "skipped" | "absent" | "running" | "completed";
@@ -51,6 +54,32 @@ const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
 const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
 const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 300000;
+
+async function refreshCredentialsBeforePush(
+  context: PipelineContext,
+  inputs: PostPushReviewInputs,
+): Promise<void> {
+  if (inputs.refreshCredentials) {
+    await inputs.refreshCredentials();
+    return;
+  }
+
+  const currentToken = process.env.GITHUB_TOKEN?.trim()
+    || process.env.GH_TOKEN?.trim()
+    || context.data.githubToken?.trim();
+  const owner = context.data.githubOwner?.trim();
+  const repo = context.data.githubRepo?.trim();
+  if (!currentToken || !owner || !repo) return;
+
+  await refreshRunnerGithubCredentials({
+    currentToken,
+    orchestratorUrl: context.data.orchestratorUrl,
+    machineNonce: context.data.nonce,
+    owner,
+    repo,
+    workspaceDir: inputs.workspaceDir,
+  });
+}
 
 interface ReviewFinding {
   iteration: number;
@@ -975,6 +1004,10 @@ ${externalReviewFindingsBlock(externalFindings)}
 
       const branchName = currentBranchName(gitSpawn);
       const remoteRef = `refs/heads/${branchName}`;
+      // A fix pass can run long enough to outlive the token minted by pushStep.
+      // Re-vend at the actual write boundary; transient vending failures retain
+      // the latest token already present in the environment and origin URL.
+      await refreshCredentialsBeforePush(context, inputs);
       const expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
       const push = gitSpawn([
         "push",

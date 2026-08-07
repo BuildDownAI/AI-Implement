@@ -336,7 +336,7 @@ describe("runAutonomous", () => {
     expect(capturedPrompt).toContain("Do NOT commit, push, or open a pull request");
   });
 
-  it("does not append new-implementation git instructions for gap-fill runs", async () => {
+  it("appends a credential refresh command for gap-fill pushes", async () => {
     vi.stubEnv("PR_NUMBER", "42");
 
     let capturedPrompt: string | undefined;
@@ -358,6 +358,9 @@ describe("runAutonomous", () => {
 
     expect(capturedPrompt).toContain("Gap-fill run");
     expect(capturedPrompt).not.toContain("Pipeline-owned Git and PR handling");
+    expect(capturedPrompt).toContain("Runner GitHub credential refresh");
+    expect(capturedPrompt).toContain("refresh-runner-github-credentials.js");
+    expect(capturedPrompt).toContain("Immediately before every `git push`");
     expect(capturedPrompt).not.toContain("Operator instruction for this run");
   });
 

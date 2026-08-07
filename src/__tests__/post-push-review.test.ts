@@ -158,8 +158,12 @@ describe("postPushReviewStep", () => {
     const notApproved = JSON.stringify({ approved: false, issues: ["bug"], feedback: "fix the bug", score: 4, progress_delta: 0 });
     const ghComments: string[] = [];
     const gitPushCalls: string[][] = [];
+    const pushOrder: string[] = [];
     const gitSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "push") gitPushCalls.push(args);
+      if (args[0] === "push") {
+        gitPushCalls.push(args);
+        pushOrder.push("push");
+      }
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
@@ -176,9 +180,12 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const ctx = makeCtx(vi.fn(async () => ({ stdout: notApproved, exitCode: 0, tokensUsed: 100 })));
+    const refreshCredentials = vi.fn(async () => {
+      pushOrder.push("refresh");
+    });
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, refreshCredentials },
       { report: vi.fn(async () => undefined) },
     );
     expect(out.approved).toBe(false);
@@ -190,6 +197,8 @@ describe("postPushReviewStep", () => {
       "HEAD:refs/heads/ai-implement/aii-200-x",
       "--force-with-lease=refs/heads/ai-implement/aii-200-x:beadfeed",
     ]);
+    expect(refreshCredentials).toHaveBeenCalledTimes(1);
+    expect(pushOrder).toEqual(["refresh", "push"]);
     expect(ghComments.some((c) => c.includes("fix-complete") && c.includes("abc1234"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Changes pushed:") && c.includes("Modified: `app/api/parse/route.ts`"))).toBe(true);
     expect(ghComments.some((c) => c.includes("Added: `app/api/parse/route.test.ts`"))).toBe(true);

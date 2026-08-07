@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { prepareScratchExclusion } from "../scratch-exclude.js";
+import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 
 interface CloneInputs extends Record<string, unknown> {
   repoOwner: string;
@@ -12,6 +13,8 @@ interface CloneInputs extends Record<string, unknown> {
   workspaceDir: string;
   baseBranch?: string;
   prNumber?: string;
+  orchestratorUrl?: string;
+  machineNonce?: string;
 }
 
 interface CloneOutputs extends Record<string, unknown> {
@@ -141,6 +144,18 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     }
     const clonedRef = revResult.stdout.toString().trim();
 
-    return { workspaceDir, clonedRef, cloneMethod, repoOwner, repoRepo, branch, githubToken };
+    // Give long-running and gap-fill sessions a newly minted token immediately
+    // after clone. Push refreshes again at its own write boundary; gap-fill
+    // prompts refresh the origin again immediately before Claude-owned pushes.
+    const activeGithubToken = await refreshRunnerGithubCredentials({
+      currentToken: githubToken,
+      orchestratorUrl: inputs.orchestratorUrl,
+      machineNonce: inputs.machineNonce,
+      owner: repoOwner,
+      repo: repoRepo,
+      workspaceDir,
+    });
+
+    return { workspaceDir, clonedRef, cloneMethod, repoOwner, repoRepo, branch, githubToken: activeGithubToken };
   },
 };

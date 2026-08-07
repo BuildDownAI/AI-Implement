@@ -213,6 +213,8 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.githubToken).toBe("tok");
     expect(inputs.branch).toBe("main");
     expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.orchestratorUrl).toBe("http://localhost:8080");
+    expect(inputs.machineNonce).toBe("nonce");
   });
 
   it("applies feedback-loop input wiring from clone, install, and ctx.data", () => {
@@ -295,6 +297,8 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.repoOwner).toBe("acme");
     expect(inputs.repoRepo).toBe("api");
     expect(inputs.githubToken).toBe("tok");
+    expect(inputs.orchestratorUrl).toBe("http://localhost:8080");
+    expect(inputs.machineNonce).toBe("nonce");
     expect(inputs.branchName).toBe("ai-implement/eng-42-add-profile-page");
     expect(inputs.baseBranch).toBe("main");
     expect(inputs.prTitle).toBe("ENG-42: Add profile page");

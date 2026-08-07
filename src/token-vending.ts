@@ -1,6 +1,6 @@
 import http from "node:http";
 import { getJobByNonce } from "./log.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { refreshInstallationToken } from "./github-app-auth.js";
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -46,7 +46,7 @@ export async function handleTokenRequest(
       return;
     }
 
-    const token = await getInstallationToken(githubAppId, githubAppPrivateKey, body.owner);
+    const token = await refreshInstallationToken(githubAppId, githubAppPrivateKey, body.owner);
     const expiresAt = new Date(Date.now() + 55 * 60 * 1000).toISOString();
 
     json(res, 200, { token, expires_at: expiresAt });

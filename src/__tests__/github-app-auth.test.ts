@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { getInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt } from "../github-app-auth.js";
+import { getInstallationToken, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt } from "../github-app-auth.js";
 
 // Generate a real RSA key pair for tests so JWT signing works correctly
 const { privateKey } = generateKeyPairSync("rsa", {
@@ -96,6 +96,20 @@ describe("getInstallationToken", () => {
     expect(t1).toBe("ghs_cached");
     expect(t2).toBe("ghs_cached");
     expect(fetch).toHaveBeenCalledTimes(2); // only called once per token, not twice per call
+  });
+
+  it("force-refreshes and replaces a still-valid cached token", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 42 } },
+      { ok: true, json: { token: "ghs_boot", expires_at: "" } },
+      { ok: true, json: { id: 42 } },
+      { ok: true, json: { token: "ghs_fresh", expires_at: "" } },
+    ]));
+
+    expect(await getInstallationToken(APP_ID, privateKey, "my-org")).toBe("ghs_boot");
+    expect(await refreshInstallationToken(APP_ID, privateKey, "my-org")).toBe("ghs_fresh");
+    expect(await getInstallationToken(APP_ID, privateKey, "my-org")).toBe("ghs_fresh");
+    expect(fetch).toHaveBeenCalledTimes(4);
   });
 
   it("maintains separate caches per owner", async () => {

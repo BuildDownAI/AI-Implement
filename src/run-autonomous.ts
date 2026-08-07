@@ -1,6 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
@@ -99,7 +100,20 @@ ${issueDescription}`;
 }
 
 function appendPipelineOwnedGitInstructions(prompt: string, prNumber: string): string {
-  if (prNumber) return prompt;
+  if (prNumber) {
+    if (prompt.includes("Runner GitHub credential refresh")) return prompt;
+    const refreshScript = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "refresh-runner-github-credentials.js",
+    );
+    return `${prompt.trimEnd()}
+
+## Runner GitHub credential refresh
+
+Immediately before every \`git push\`, run \`node ${JSON.stringify(refreshScript)}\`.
+This re-vends the GitHub token and updates \`origin\`; if vending is temporarily
+unavailable, it keeps the latest token already stored in \`origin\`.`;
+  }
   if (prompt.includes("Pipeline-owned Git")) return prompt;
   return `${prompt.trimEnd()}
 
