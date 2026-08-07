@@ -3,6 +3,7 @@ import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
+import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -22,6 +23,8 @@ interface PushInputs extends Record<string, unknown> {
   repoOwner: string;
   repoRepo: string;
   githubToken: string;
+  orchestratorUrl?: string;
+  machineNonce?: string;
   branchName: string;
   baseBranch?: string;
   prTitle?: string;
@@ -139,12 +142,26 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken, agentCommitted ? baseBranch : undefined);
     const prBody = buildPullRequestBody(context, inputs, changedFilesSummary);
 
+    // The dispatch-time installation token may already be close to its one-hour
+    // expiry. Fly/local-docker runners re-vend immediately before the first
+    // authenticated remote write; GHA has no orchestrator URL/nonce and keeps
+    // using its workflow-minted token. A vending outage falls back to the boot
+    // token so an otherwise-valid credential can still complete the run.
+    const activeGithubToken = await refreshRunnerGithubCredentials({
+      currentToken: githubToken,
+      orchestratorUrl: inputs.orchestratorUrl,
+      machineNonce: inputs.machineNonce,
+      owner: repoOwner,
+      repo: repoRepo,
+      workspaceDir,
+    });
+
     // Embed token in URL but use stdio: "pipe" so it is never printed to inherited
     // stdout/stderr. Token is redacted from any error messages.
-    const remote = `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`;
+    const remote = `https://x-access-token:${activeGithubToken}@github.com/${repoOwner}/${repoRepo}.git`;
     const remoteRef = `refs/heads/${branchName}`;
     const expectedRemoteSha = await span("git-ls-remote", async () =>
-      resolveRemoteBranchSha(workspaceDir, remote, branchName, githubToken),
+      resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken),
     );
     const tracePush = process.env.AI_IMPLEMENT_LOG_LEVEL === "stream";
     const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
@@ -170,11 +187,11 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
         .map((s) => s.trim())
         .filter(Boolean)
         .join("\n")
-        .replaceAll(githubToken, "***");
+        .replaceAll(activeGithubToken, "***");
       if (trace) console.error(`[git-push trace]\n${trace}`);
     }
     if (pushResult.status !== 0) {
-      const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(githubToken, "***");
+      const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(activeGithubToken, "***");
       throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
     }
 
@@ -182,7 +199,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     // Span covers the POST and the 422 list-open-PRs fallback so re-runs (which
     // hit 422 and pay an extra round-trip) are timed in full, not just the POST.
     const pr = await span("pr-create", async () =>
-      createOrFindPullRequest({ repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody, draft }),
+      createOrFindPullRequest({ repoOwner, repoRepo, githubToken: activeGithubToken, prTitle, branchName, baseBranch, prBody, draft }),
     );
     return { prUrl: pr.url, prNumber: pr.number, branchPushed: true, commitSha, draft: pr.draft };
   },

@@ -160,6 +160,42 @@ describe("cloneStep", () => {
     expect(outputs.workspaceDir).toBe("/tmp/workspace");
   });
 
+  it("refreshes credentials after clone so gap-fill runs inherit a current token", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.stubEnv("GITHUB_TOKEN", "secret-token");
+    vi.stubEnv("GH_TOKEN", "secret-token");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token" }),
+    } as Response));
+    mockSpawn([
+      { status: 0 },
+      { status: 0, stdout: "sha1\n" },
+      { status: 0 },
+    ]);
+
+    try {
+      const outputs = await cloneStep.run(makeContext(), {
+        ...PR_INPUTS,
+        orchestratorUrl: "https://orchestrator.example",
+        machineNonce: "machine-nonce",
+        baseBranch: undefined,
+      }, new NoopStepReporter());
+
+      expect(outputs.githubToken).toBe("fresh-token");
+      expect(process.env.GH_TOKEN).toBe("fresh-token");
+      expect(spawnSync).toHaveBeenLastCalledWith(
+        "git",
+        ["remote", "set-url", "origin", "https://x-access-token:fresh-token@github.com/acme/app.git"],
+        expect.objectContaining({ cwd: "/tmp/workspace" }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+  });
+
   describe("PR-targeted (gap-fill) runs: base branch fetch", () => {
     it("fetches base branch after clone and verifies merge-base on a fresh clone", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);

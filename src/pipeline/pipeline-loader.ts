@@ -87,6 +87,8 @@ function applyWiring(step: YamlStep): StepDefinition {
           workspaceDir: ctx.data.workspaceDir,
           baseBranch: ctx.data.baseBranch,
           prNumber: ctx.data.prNumber,
+          orchestratorUrl: ctx.data.orchestratorUrl,
+          machineNonce: ctx.data.nonce,
         }),
       };
 
@@ -171,6 +173,8 @@ function applyWiring(step: YamlStep): StepDefinition {
             repoOwner: ctx.getOutputs("clone").repoOwner,
             repoRepo: ctx.getOutputs("clone").repoRepo,
             githubToken: ctx.getOutputs("clone").githubToken,
+            orchestratorUrl: ctx.data.orchestratorUrl,
+            machineNonce: ctx.data.nonce,
             branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
             baseBranch: ctx.getOutputs("clone").branch,
             prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,

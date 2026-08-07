@@ -8,7 +8,7 @@ import type * as LogModule from "../log.js";
 import type * as DedupModule from "../dedup.js";
 
 vi.mock("../github-app-auth.js", () => ({
-  getInstallationToken: vi.fn(),
+  refreshInstallationToken: vi.fn(),
   clearTokenCache: vi.fn(),
 }));
 
@@ -53,7 +53,7 @@ let tokenVending: typeof TokenVendingModule;
 let log: typeof LogModule;
 let dedup: typeof DedupModule;
 
-let mockGetInstallationToken: ReturnType<typeof vi.fn>;
+let mockRefreshInstallationToken: ReturnType<typeof vi.fn>;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -63,7 +63,7 @@ beforeEach(async () => {
   log = await import("../log.js");
   tokenVending = await import("../token-vending.js");
   const ghAuth = await import("../github-app-auth.js");
-  mockGetInstallationToken = vi.mocked(ghAuth.getInstallationToken);
+  mockRefreshInstallationToken = vi.mocked(ghAuth.refreshInstallationToken);
   log.initLogTable();
 });
 
@@ -89,14 +89,14 @@ describe("token-vending", () => {
       repo: "acme/my-repo",
       machineNonce: "valid-nonce-123",
     });
-    mockGetInstallationToken.mockResolvedValueOnce("ghs_test_token");
+    mockRefreshInstallationToken.mockResolvedValueOnce("ghs_test_token");
 
     const res = await callTokenEndpoint({ nonce: "valid-nonce-123", owner: "acme" });
     expect(res.statusCode).toBe(200);
     const data = JSON.parse(res.body);
     expect(data.token).toBe("ghs_test_token");
     expect(data.expires_at).toBeTruthy();
-    expect(mockGetInstallationToken).toHaveBeenCalledWith("app-id", "fake-private-key", "acme");
+    expect(mockRefreshInstallationToken).toHaveBeenCalledWith("app-id", "fake-private-key", "acme");
   });
 
   it("returns 403 for unknown nonce", async () => {
@@ -147,7 +147,7 @@ describe("token-vending", () => {
       machineNonce: "fail-nonce",
     });
 
-    mockGetInstallationToken.mockRejectedValueOnce(new Error("Bad credentials"));
+    mockRefreshInstallationToken.mockRejectedValueOnce(new Error("Bad credentials"));
 
     const res = await callTokenEndpoint({ nonce: "fail-nonce", owner: "acme" });
     expect(res.statusCode).toBe(500);
