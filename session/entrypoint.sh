@@ -73,6 +73,7 @@ git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
 REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
 log "Cloning ${GITHUB_OWNER}/${GITHUB_REPO}..."
 git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" /workspace
+git config --global --add safe.directory /workspace
 cd /workspace
 if [ -n "$PR_NUMBER" ]; then
   log "Gap-fill: checking out PR #$PR_NUMBER"
@@ -85,7 +86,6 @@ fi
 chown -R coder:coder /workspace
 cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
-git config --global --add safe.directory /workspace
 
 # ── 6. Invoke TS pipeline ────────────────────────────────────────────────────
 export WORKSPACE_DIR=/workspace
