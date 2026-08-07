@@ -1,10 +1,22 @@
+import { spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+
+/** Installed location of the credential helper shell script (baked into the session image). */
+const CREDENTIAL_HELPER_PATH = "/opt/ai-implement/git-credential-helper.sh";
 
 interface DependencyAuthInputs extends Record<string, unknown> {
   dependencyTokenScope: string | undefined;
   callbackUrl: string | null | undefined;
   /** Test-only injectable fetch implementation. */
   fetchImpl?: typeof fetch;
+  /** Test-only injectable spawnSync implementation. */
+  spawnSyncImpl?: typeof spawnSync;
+  /** Test-only injectable fs.writeFileSync implementation. */
+  writeFileSyncImpl?: (path: string, data: string) => void;
+  /** Override credential helper executable path (test environments only). */
+  credentialHelperPath?: string;
 }
 
 interface DependencyAuthOutputs extends Record<string, unknown> {
@@ -19,7 +31,7 @@ export interface DependencyTokenResponse {
 
 /**
  * Fetches a short-lived read-only dependency token from the orchestrator.
- * Exported separately so the next-issue's credential-helper can call it again
+ * Exported separately so the credential helper can call the same endpoint
  * on token expiry without going through the step wrapper.
  */
 export async function fetchDependencyToken(params: {
@@ -54,7 +66,15 @@ export const dependencyAuthStep: StepModule<DependencyAuthInputs, DependencyAuth
     inputs: DependencyAuthInputs,
     _reporter: StepReporter,
   ): Promise<DependencyAuthOutputs> {
-    const { dependencyTokenScope, callbackUrl, fetchImpl } = inputs;
+    const {
+      dependencyTokenScope,
+      callbackUrl,
+      fetchImpl,
+      spawnSyncImpl: spawnFn = spawnSync,
+      writeFileSyncImpl: writeFn = writeFileSync,
+      credentialHelperPath = CREDENTIAL_HELPER_PATH,
+    } = inputs;
+
     // Read the bearer secret directly from the environment so it never appears
     // in step inputs, which are persisted to the step log and served by the admin API.
     const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
@@ -87,6 +107,38 @@ export const dependencyAuthStep: StepModule<DependencyAuthInputs, DependencyAuth
       // to the step log or served by the admin API.
       context.data.dependencyToken = result.token;
       context.data.dependencyTokenExpiresAt = result.expires_at;
+
+      // Write a token cache file that the credential helper reads on each git
+      // invocation.  The helper overwrites this file when it refreshes.
+      const tokenFilePath = join("/tmp", `ai-implement-dep-token-${process.pid}.json`);
+      writeFn(tokenFilePath, JSON.stringify({ token: result.token, expires_at: result.expires_at }));
+      process.env.GIT_DEPENDENCY_TOKEN_FILE = tokenFilePath;
+      process.env.GIT_DEPENDENCY_CALLBACK_URL = callbackUrl;
+
+      // Register credential helper for https://github.com so git-based composer
+      // installs can reach private sibling repos.
+      // Safety: clone.ts and push.ts build remote URLs as
+      //   https://x-access-token:<TOKEN>@github.com/…
+      // Git bypasses credential helpers when the URL already carries a userinfo
+      // component, so this helper is NEVER consulted for the target repo's own
+      // clone or push operations — only for unauthenticated HTTPS requests.
+      const configResult = spawnFn(
+        "git",
+        ["config", "--global", "credential.https://github.com.helper", credentialHelperPath],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      if ((configResult.status ?? 1) !== 0) {
+        console.warn(
+          `[dependency-auth] failed to register git credential helper (exit ${configResult.status ?? "null"})`,
+        );
+      }
+
+      // Export COMPOSER_AUTH for composer's API-based (dist) downloads.
+      // This is a snapshot of the token at fetch time; valid for approximately
+      // one hour (matching the 55-min synthetic expires_at from the endpoint).
+      // Dependency installs run early in the pipeline, so this is acceptable
+      // in practice — adding refresh machinery for COMPOSER_AUTH is not needed.
+      process.env.COMPOSER_AUTH = JSON.stringify({ "github-oauth": { "github.com": result.token } });
 
       console.log(`[dependency-auth] token fetched; expires=${result.expires_at}`);
       return { acquired: true, expiresAt: result.expires_at };
