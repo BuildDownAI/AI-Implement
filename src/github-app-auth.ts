@@ -211,8 +211,8 @@ export async function getScopedInstallationToken(
   const install = await resolveInstallationId(headers, owner);
 
   const bodyData: Record<string, unknown> = {};
-  if (options?.permissions) bodyData.permissions = options.permissions;
-  if (options?.repositories) bodyData.repositories = options.repositories;
+  if (options?.permissions && Object.keys(options.permissions).length > 0) bodyData.permissions = options.permissions;
+  if (options?.repositories && options.repositories.length > 0) bodyData.repositories = options.repositories;
   const hasBody = Object.keys(bodyData).length > 0;
 
   const tokenPath = `/app/installations/${install.id}/access_tokens`;

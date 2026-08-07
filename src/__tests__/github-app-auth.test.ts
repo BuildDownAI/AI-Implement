@@ -366,6 +366,42 @@ describe("getScopedInstallationToken", () => {
     expect((opts as RequestInit).body).toBeUndefined();
   });
 
+  it("treats an empty permissions object as absent (no body sent)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_empty_perms", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: {} });
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
+  it("treats an empty repositories array as absent (no body sent)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_empty_repos", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: [] });
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
+  it("treats both empty permissions and empty repositories as absent (no body sent)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_empty_both", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: {}, repositories: [] });
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
   it("returns a cached token on identical options (cache hit)", async () => {
     vi.mocked(fetch).mockImplementation(mockFetch([
       { ok: true, json: { id: 1 } },
