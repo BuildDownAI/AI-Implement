@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -154,6 +154,46 @@ describe("session/git-credential-helper.sh", () => {
       expect(cached.token).toBe("refreshed-tok");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is not consulted when the git URL already contains embedded credentials (AC #5)", () => {
+    // Safety property: clone.ts and push.ts embed credentials directly in the
+    // remote URL (https://x-access-token:TOKEN@github.com/…).  Git's
+    // credential_fill() short-circuits immediately when username+password are
+    // already set on the credential struct — which is what happens when git
+    // parses an embedded-credential URL — so the helper is never invoked.
+    //
+    // We verify this by registering a sentinel-writing credential helper for
+    // https://github.com and then calling `git credential fill` with all fields
+    // pre-supplied (replicating what git does internally after parsing the URL).
+    // The sentinel file must NOT exist after the call.
+    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    try {
+      const sentinelFile = join(dir, "sentinel");
+      const helperScript = join(dir, "sentinel-helper.sh");
+      const gitconfigFile = join(dir, ".gitconfig");
+
+      writeFileSync(helperScript, `#!/bin/bash\ntouch "${sentinelFile}"\n`);
+      chmodSync(helperScript, 0o755);
+
+      // Register sentinel for https://github.com — same scope as the real helper.
+      writeFileSync(gitconfigFile, `[credential "https://github.com"]\n\thelper = ${helperScript}\n`);
+
+      // Provide a fully-specified credential (protocol + host + username + password).
+      // git credential fill returns immediately without invoking any helper because
+      // there is nothing left to fill — mirroring the embedded-credential URL path.
+      const r = spawnSync("git", ["credential", "fill"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        input: "protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghs_test_tok\n\n",
+        env: { ...process.env, GIT_CONFIG_GLOBAL: gitconfigFile },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.toString()).toContain("password=ghs_test_tok");
+      // The sentinel must not exist — the helper was never consulted.
+      expect(existsSync(sentinelFile)).toBe(false);
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
