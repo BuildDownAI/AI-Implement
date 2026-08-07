@@ -52,6 +52,17 @@ describe("session/entrypoint.sh", () => {
     expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(git branch --show-current\)"/);
   });
 
+  it("marks the cloned workspace safe before the gap-fill PR checkout", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    const cloneIdx = content.indexOf('git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH"');
+    const safeDirectoryIdx = content.indexOf("git config --global --add safe.directory /workspace");
+    const checkoutIdx = content.indexOf('gh pr checkout "$PR_NUMBER"');
+
+    expect(cloneIdx).toBeGreaterThan(-1);
+    expect(safeDirectoryIdx).toBeGreaterThan(cloneIdx);
+    expect(safeDirectoryIdx).toBeLessThan(checkoutIdx);
+  });
+
   it("decodes prNumber from the envelope before the gap-fill checkout when PR_NUMBER is empty", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     // Decode line must extract prNumber from the envelope JSON
