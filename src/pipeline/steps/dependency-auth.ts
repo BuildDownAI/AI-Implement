@@ -3,14 +3,13 @@ import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 interface DependencyAuthInputs extends Record<string, unknown> {
   dependencyTokenScope: string | undefined;
   callbackUrl: string | null | undefined;
-  progressToken: string | null | undefined;
   /** Test-only injectable fetch implementation. */
   fetchImpl?: typeof fetch;
 }
 
 interface DependencyAuthOutputs extends Record<string, unknown> {
-  dependencyToken: string | null;
-  dependencyTokenExpiresAt: string | null;
+  acquired: boolean;
+  expiresAt: string | null;
 }
 
 export interface DependencyTokenResponse {
@@ -51,23 +50,26 @@ export async function fetchDependencyToken(params: {
 
 export const dependencyAuthStep: StepModule<DependencyAuthInputs, DependencyAuthOutputs> = {
   async run(
-    _context: PipelineContext,
+    context: PipelineContext,
     inputs: DependencyAuthInputs,
     _reporter: StepReporter,
   ): Promise<DependencyAuthOutputs> {
-    const { dependencyTokenScope, callbackUrl, progressToken, fetchImpl } = inputs;
+    const { dependencyTokenScope, callbackUrl, fetchImpl } = inputs;
+    // Read the bearer secret directly from the environment so it never appears
+    // in step inputs, which are persisted to the step log and served by the admin API.
+    const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
 
     if (!dependencyTokenScope) {
       console.log("[dependency-auth] no scope configured; skipping");
-      return { dependencyToken: null, dependencyTokenExpiresAt: null };
+      return { acquired: false, expiresAt: null };
     }
     if (!callbackUrl) {
       console.log("[dependency-auth] no callback URL; skipping");
-      return { dependencyToken: null, dependencyTokenExpiresAt: null };
+      return { acquired: false, expiresAt: null };
     }
     if (!progressToken) {
       console.log("[dependency-auth] no progress token (RUN_PROGRESS_TOKEN); skipping");
-      return { dependencyToken: null, dependencyTokenExpiresAt: null };
+      return { acquired: false, expiresAt: null };
     }
 
     try {
@@ -81,16 +83,18 @@ export const dependencyAuthStep: StepModule<DependencyAuthInputs, DependencyAuth
         console.log(`::add-mask::${result.token}`);
       }
 
+      // Store on context rather than in outputs so the token is never persisted
+      // to the step log or served by the admin API.
+      context.data.dependencyToken = result.token;
+      context.data.dependencyTokenExpiresAt = result.expires_at;
+
       console.log(`[dependency-auth] token fetched; expires=${result.expires_at}`);
-      return {
-        dependencyToken: result.token,
-        dependencyTokenExpiresAt: result.expires_at,
-      };
+      return { acquired: true, expiresAt: result.expires_at };
     } catch (err) {
       console.warn(
         `[dependency-auth] failed to fetch token: ${err instanceof Error ? err.message : String(err)}`,
       );
-      return { dependencyToken: null, dependencyTokenExpiresAt: null };
+      return { acquired: false, expiresAt: null };
     }
   },
 };

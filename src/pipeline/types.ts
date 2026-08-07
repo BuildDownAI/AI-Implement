@@ -73,6 +73,10 @@ export interface PipelineContextData {
   callbackUrl?: string;
   /** Autonomous runner: per-project dependency-repo read access scope (from run_config envelope). */
   dependencyTokenScope?: "installation";
+  /** Autonomous runner: short-lived read token minted by the dependency-auth step; set on context rather than returned as a step output so it is never persisted to the step log. */
+  dependencyToken?: string;
+  /** Autonomous runner: expiry timestamp for the dependency token (ISO 8601). */
+  dependencyTokenExpiresAt?: string;
 }
 
 export interface PipelineContext {

@@ -59,6 +59,7 @@ const BASE_ENV = {
 
 beforeEach(() => {
   vi.stubEnv("GITHUB_ACTIONS", "");
+  vi.stubEnv("RUN_PROGRESS_TOKEN", "tok");
 });
 
 afterEach(() => {
@@ -116,13 +117,12 @@ describe("dependencyAuthStep no-op conditions", () => {
       {
         dependencyTokenScope: undefined,
         callbackUrl: "https://orch.example",
-        progressToken: "tok",
       },
       new NoopStepReporter(),
     );
     logSpy.mockRestore();
-    expect(out.dependencyToken).toBeNull();
-    expect(out.dependencyTokenExpiresAt).toBeNull();
+    expect(out.acquired).toBe(false);
+    expect(out.expiresAt).toBeNull();
   });
 
   it("no-ops when callbackUrl is absent", async () => {
@@ -132,29 +132,28 @@ describe("dependencyAuthStep no-op conditions", () => {
       {
         dependencyTokenScope: "installation",
         callbackUrl: null,
-        progressToken: "tok",
       },
       new NoopStepReporter(),
     );
     logSpy.mockRestore();
-    expect(out.dependencyToken).toBeNull();
-    expect(out.dependencyTokenExpiresAt).toBeNull();
+    expect(out.acquired).toBe(false);
+    expect(out.expiresAt).toBeNull();
   });
 
-  it("no-ops when progressToken is absent", async () => {
+  it("no-ops when RUN_PROGRESS_TOKEN is absent", async () => {
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
       ctx(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        progressToken: null,
       },
       new NoopStepReporter(),
     );
     logSpy.mockRestore();
-    expect(out.dependencyToken).toBeNull();
-    expect(out.dependencyTokenExpiresAt).toBeNull();
+    expect(out.acquired).toBe(false);
+    expect(out.expiresAt).toBeNull();
   });
 });
 
@@ -162,6 +161,7 @@ describe("dependencyAuthStep no-op conditions", () => {
 
 describe("dependencyAuthStep successful fetch", () => {
   it("POSTs to <callbackBase>/api/runner/dependency-token with bearer header", async () => {
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "progress-tok");
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const captureFetch: typeof fetch = async (url, init) => {
       calls.push({ url: url as string, init: init ?? {} });
@@ -173,7 +173,6 @@ describe("dependencyAuthStep successful fetch", () => {
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example/",
-        progressToken: "progress-tok",
         fetchImpl: captureFetch,
       },
       new NoopStepReporter(),
@@ -184,79 +183,78 @@ describe("dependencyAuthStep successful fetch", () => {
     expect((calls[0].init.headers as Record<string, string>)["Authorization"]).toBe("Bearer progress-tok");
   });
 
-  it("stores token and expires_at in outputs", async () => {
+  it("sets token on context.data and returns acquired=true with expiresAt", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const context = ctx();
     const out = await dependencyAuthStep.run(
-      ctx(),
+      context,
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        progressToken: "tok",
         fetchImpl: mockFetch(200, { token: "dep-tok-123", expires_at: "2030-06-01T12:00:00Z" }),
       },
       new NoopStepReporter(),
     );
     logSpy.mockRestore();
-    expect(out.dependencyToken).toBe("dep-tok-123");
-    expect(out.dependencyTokenExpiresAt).toBe("2030-06-01T12:00:00Z");
+    expect(out.acquired).toBe(true);
+    expect(out.expiresAt).toBe("2030-06-01T12:00:00Z");
+    expect(context.data.dependencyToken).toBe("dep-tok-123");
+    expect(context.data.dependencyTokenExpiresAt).toBe("2030-06-01T12:00:00Z");
   });
 });
 
 // ─── (4) Failure is non-fatal ─────────────────────────────────────────────────
 
 describe("dependencyAuthStep failure handling", () => {
-  it("warns and returns null on non-200 response", async () => {
+  it("warns and returns acquired=false on non-200 response", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
       ctx(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        progressToken: "tok",
         fetchImpl: mockFetch(403, {}),
       },
       new NoopStepReporter(),
     );
     const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
     warnSpy.mockRestore();
-    expect(out.dependencyToken).toBeNull();
-    expect(out.dependencyTokenExpiresAt).toBeNull();
+    expect(out.acquired).toBe(false);
+    expect(out.expiresAt).toBeNull();
     expect(warnings.some((w) => /dependency-auth.*failed.*token/i.test(w))).toBe(true);
   });
 
-  it("warns and returns null on malformed JSON body", async () => {
+  it("warns and returns acquired=false on malformed JSON body", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
       ctx(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        progressToken: "tok",
         fetchImpl: mockFetch(200, { not_a_token: true }),
       },
       new NoopStepReporter(),
     );
     const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
     warnSpy.mockRestore();
-    expect(out.dependencyToken).toBeNull();
+    expect(out.acquired).toBe(false);
     expect(warnings.some((w) => /dependency-auth.*failed.*token/i.test(w))).toBe(true);
   });
 
-  it("warns and returns null on thrown network error", async () => {
+  it("warns and returns acquired=false on thrown network error", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const out = await dependencyAuthStep.run(
       ctx(),
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        progressToken: "tok",
         fetchImpl: throwingFetch(new Error("ECONNREFUSED")),
       },
       new NoopStepReporter(),
     );
     const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
     warnSpy.mockRestore();
-    expect(out.dependencyToken).toBeNull();
+    expect(out.acquired).toBe(false);
     expect(warnings.some((w) => /dependency-auth.*failed.*token/i.test(w))).toBe(true);
   });
 });
@@ -272,7 +270,6 @@ describe("dependencyAuthStep GitHub Actions masking", () => {
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        progressToken: "tok",
         fetchImpl: mockFetch(200, { token: "secret-dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
       },
       new NoopStepReporter(),
@@ -290,7 +287,6 @@ describe("dependencyAuthStep GitHub Actions masking", () => {
       {
         dependencyTokenScope: "installation",
         callbackUrl: "https://orch.example",
-        progressToken: "tok",
         fetchImpl: mockFetch(200, { token: "secret-dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
       },
       new NoopStepReporter(),
@@ -332,7 +328,32 @@ describe("dependency-auth custom step override", () => {
   });
 });
 
-// ─── (8) fetchDependencyToken unit tests ──────────────────────────────────────
+// ─── (8) Secret leakage regression ───────────────────────────────────────────
+
+describe("dependency-auth secret leakage regression", () => {
+  it("step inputs do not contain the progress token, outputs do not contain the dependency token", async () => {
+    const progressTokenValue = "LIVE_PROGRESS_SECRET_TOKEN";
+    const dependencyTokenValue = "LIVE_DEPENDENCY_SECRET_TOKEN";
+    vi.stubEnv("RUN_PROGRESS_TOKEN", progressTokenValue);
+
+    const resolvedInputs = {
+      dependencyTokenScope: "installation" as const,
+      callbackUrl: "https://orch.example",
+      fetchImpl: mockFetch(200, { token: dependencyTokenValue, expires_at: "2030-01-01T00:00:00Z" }),
+    };
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const outputs = await dependencyAuthStep.run(ctx(), resolvedInputs, new NoopStepReporter());
+    logSpy.mockRestore();
+
+    // Inputs must not carry the live progress token (it is read from env inside the step)
+    expect(JSON.stringify(resolvedInputs)).not.toContain(progressTokenValue);
+    // Outputs must not carry the dependency token (it is stored on context.data instead)
+    expect(JSON.stringify(outputs)).not.toContain(dependencyTokenValue);
+  });
+});
+
+// ─── (9) fetchDependencyToken unit tests ──────────────────────────────────────
 
 describe("fetchDependencyToken", () => {
   it("throws on non-200 response", async () => {

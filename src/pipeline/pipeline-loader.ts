@@ -104,7 +104,9 @@ function applyWiring(step: YamlStep): StepDefinition {
         inputs: (ctx: PipelineContext) => ({
           dependencyTokenScope: ctx.data.dependencyTokenScope,
           callbackUrl: ctx.data.callbackUrl,
-          progressToken: process.env.RUN_PROGRESS_TOKEN?.trim() || null,
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
         }),
         skip: (ctx: PipelineContext) => !ctx.data.dependencyTokenScope,
       };
