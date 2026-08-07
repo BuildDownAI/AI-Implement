@@ -24,7 +24,7 @@ vi.mock("../notify.js", () => ({
   notifyStuckGiveUp: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { remediateStuckJob, STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
+import { remediateStuckJob, remediateFailedJob, STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
 import { cancelWorkflowRun } from "../github.js";
 import { incrementStuckAttempts, updateJobStatus } from "../log.js";
 import { deleteDispatched } from "../dedup.js";
@@ -301,5 +301,94 @@ describe("remediateStuckJob — cancelWorkflowRun not called when stopRunner is 
 
     expect(cancelWorkflowRun).not.toHaveBeenCalled();
     expect(stopRunner).toHaveBeenCalledOnce();
+  });
+});
+
+describe("remediateFailedJob — under-budget requeue (attempts 1-3)", () => {
+  it("increments stuck attempts, clears working state and dedup on first failure", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+
+    await remediateFailedJob(mockConfig, provider, makeJob(), "failure");
+
+    expect(incrementStuckAttempts).toHaveBeenCalledWith("issue-abc");
+    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+
+  it("does not update job status (caller's responsibility)", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+
+    await remediateFailedJob(mockConfig, provider, makeJob(), "failure");
+
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+
+  it("does not cancel any workflow run (runner is already dead)", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(1);
+    const provider = makeProvider();
+
+    await remediateFailedJob(mockConfig, provider, makeJob({ runId: 99 }), "failure");
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it(`requeues at max budget (attempt ${STUCK_JOB_MAX_ATTEMPTS})`, async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS);
+    const provider = makeProvider();
+
+    await remediateFailedJob(mockConfig, provider, makeJob(), "failure");
+
+    expect(deleteDispatched).toHaveBeenCalledWith("issue-abc");
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+});
+
+describe("remediateFailedJob — hard-stop (attempt 4+ = budget exhausted)", () => {
+  it("clears working state but preserves dedup on hard-stop", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
+    const provider = makeProvider();
+
+    await remediateFailedJob(mockConfig, provider, makeJob(), "failure");
+
+    expect(provider.clearWorkingState).toHaveBeenCalledWith("issue-abc", "AII");
+    expect(deleteDispatched).not.toHaveBeenCalled();
+  });
+
+  it("fires notifyStuckGiveUp with the failure lastRunStatus on hard-stop", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
+    const provider = makeProvider();
+
+    await remediateFailedJob(mockConfig, provider, makeJob(), "machine_failed");
+
+    expect(notifyStuckGiveUp).toHaveBeenCalledOnce();
+    const [, , payload] = vi.mocked(notifyStuckGiveUp).mock.calls[0];
+    expect(payload.lastRunStatus).toBe("machine_failed");
+    expect(payload.attempts).toBe(STUCK_JOB_MAX_ATTEMPTS + 1);
+    expect(payload.issueIdentifier).toBe("AII-99");
+  });
+
+  it("posts a comment containing 'Needs Human' on hard-stop", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
+    const provider = makeProvider();
+
+    await remediateFailedJob(mockConfig, provider, makeJob(), "failure");
+
+    expect(provider.postComment).toHaveBeenCalledOnce();
+    const [issueId, body] = vi.mocked(provider.postComment as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(issueId).toBe("issue-abc");
+    expect(body).toContain("Needs Human");
+    expect(body).toContain("AII-99");
+  });
+
+  it("does not update job status on hard-stop", async () => {
+    vi.mocked(incrementStuckAttempts).mockReturnValue(STUCK_JOB_MAX_ATTEMPTS + 1);
+    const provider = makeProvider();
+
+    await remediateFailedJob(mockConfig, provider, makeJob(), "failure");
+
+    expect(updateJobStatus).not.toHaveBeenCalled();
   });
 });
