@@ -77,6 +77,9 @@ git config --global --add safe.directory /workspace
 cd /workspace
 if [ -n "$PR_NUMBER" ]; then
   log "Gap-fill: checking out PR #$PR_NUMBER"
+  # --depth + --branch narrows origin's fetch refspec to the cloned base branch.
+  # gh pr checkout needs the PR head to count as a trackable remote branch.
+  git config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
   gh pr checkout "$PR_NUMBER"
   GITHUB_DEFAULT_BRANCH="$(git branch --show-current)"
   export GITHUB_DEFAULT_BRANCH
