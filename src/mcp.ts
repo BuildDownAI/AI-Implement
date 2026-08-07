@@ -1,42 +1,73 @@
-import crypto from "node:crypto";
 import http from "node:http";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import https from "node:https";
+import { verifyMcpToken } from "./mcp-oauth.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
 }
 
-function tokenMatches(submitted: string, configured: string): boolean {
-  const a = crypto.createHash("sha256").update(submitted).digest();
-  const b = crypto.createHash("sha256").update(configured).digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
 export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  mcpAccessToken: string | null,
+  kgSidecarUrl: string | null,
+  baseUrl: string | null,
 ): Promise<void> {
-  if (!mcpAccessToken) {
-    json(res, 503, { error: "MCP endpoint not configured: MCP_ACCESS_TOKEN is not set" });
+  // Require both the sidecar and OAuth base URL to be configured
+  if (!kgSidecarUrl || !baseUrl) {
+    json(res, 503, { error: "MCP endpoint not configured: KG_SIDECAR_URL or OAUTH_REDIRECT_BASE_URL is not set" });
     return;
   }
 
   const auth = req.headers.authorization;
   const submitted = auth?.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!tokenMatches(submitted, mcpAccessToken)) {
-    json(res, 401, { error: "unauthorized" });
+  if (!verifyMcpToken(submitted)) {
+    res.writeHead(401, {
+      "Content-Type": "application/json",
+      "WWW-Authenticate": `Bearer realm="MCP", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
+    });
+    res.end(JSON.stringify({ error: "unauthorized" }));
     return;
   }
 
-  const server = new McpServer({ name: "ai-implement-orchestrator", version: "1.0.0" });
-  server.registerTool("ping", { description: "Returns pong" }, async () => ({
-    content: [{ type: "text" as const, text: "pong" }],
-  }));
+  const target = new URL(kgSidecarUrl);
+  const transport = target.protocol === "https:" ? https : http;
 
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  await server.connect(transport);
-  await transport.handleRequest(req, res);
+  const forwardHeaders = { ...req.headers };
+  delete forwardHeaders.authorization;
+  delete forwardHeaders.host;
+
+  const options: http.RequestOptions = {
+    hostname: target.hostname,
+    port: target.port || (target.protocol === "https:" ? "443" : "80"),
+    path: target.pathname + target.search,
+    method: req.method,
+    headers: { ...forwardHeaders, host: target.host },
+  };
+
+  const proxyReq = transport.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers as http.OutgoingHttpHeaders);
+    proxyRes.on("error", (err) => {
+      console.error("[mcp] KG sidecar response error:", err);
+      if (!res.headersSent) {
+        json(res, 502, { error: "KG sidecar error" });
+      } else {
+        res.destroy(err);
+      }
+    });
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on("error", (err: NodeJS.ErrnoException) => {
+    if (res.headersSent) return;
+    if (err.code === "ECONNREFUSED") {
+      console.error(`[mcp] KG sidecar connection refused at ${kgSidecarUrl}`);
+      json(res, 502, { error: "KG sidecar unavailable: connection refused" });
+    } else {
+      console.error("[mcp] KG sidecar error:", err);
+      json(res, 502, { error: "KG sidecar error" });
+    }
+  });
+
+  req.pipe(proxyReq);
 }

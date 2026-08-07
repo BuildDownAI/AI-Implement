@@ -19,7 +19,7 @@ describe("orchestrator runtime version", () => {
     expect(nodeImages).toHaveLength(2);
     expect(new Set(nodeImages).size).toBe(1);
     expect(nodeImages[0]).toMatch(
-      new RegExp(`^node:${nodeVersion.replaceAll(".", "\\.")}-alpine@sha256:[a-f0-9]{64}$`),
+      new RegExp(`^node:${nodeVersion.replaceAll(".", "\\.")}-slim@sha256:[a-f0-9]{64}$`),
     );
   });
 });

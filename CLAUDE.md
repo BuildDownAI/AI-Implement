@@ -50,6 +50,9 @@ src/
   admin.ts          — admin HTTP API (auth + CRUD)
   admin-html.ts     — re-exports the assembled admin HTML from admin-ui/index.ts
   admin-ui/         — string-composed admin SPA (see "admin-ui" section below)
+  mcp.ts            — OAuth-authenticated MCP proxy to KG sidecar
+  mcp-oauth.ts      — RFC 6749 authorization server for /mcp (client reg, PKCE, token exchange)
+  oauth/            — OIDC engine + shared admin-UI and MCP login routes
   __tests__/        — Vitest unit tests
 
 workflows/          — templates synced to target repos
@@ -77,6 +80,10 @@ docs/
   solutions/  — documented solutions to past problems (bugs, best practices, workflow
                 patterns), by category with YAML frontmatter (module, tags, problem_type);
                 relevant when implementing or debugging in documented areas
+
+docker-entrypoint.sh  — container entrypoint: starts KG sidecar on loopback before Node
+kg/                   — KG sidecar artifacts (manually populated pre-build; see "KG sidecar")
+  .gitkeep            — placeholder; replaced with actual server code + snapshot artifacts
 ```
 
 ## Running locally
@@ -152,6 +159,10 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `mappings` | Team key → GitHub repo config |
 | `dispatch_log` | Audit log, last 500 dispatches |
 | `settings` | Key-value store — runner mode, Fly session config, deploy-notification state |
+| `mcp_clients` | MCP OAuth — registered clients (RFC 7591 dynamic registration) |
+| `mcp_oauth_states` | MCP OAuth — in-flight OIDC transactions (10-minute TTL) |
+| `mcp_auth_codes` | MCP OAuth — short-lived authorization codes (5-minute TTL) |
+| `mcp_tokens` | MCP OAuth — issued Bearer access tokens (1-hour TTL) |
 
 `dedup.ts` owns the DB singleton (`getDb()`). All other modules import `getDb` from `dedup.ts`.
 
@@ -170,11 +181,73 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | No | Google OIDC credentials — enables the Google SSO button |
 | `MICROSOFT_OAUTH_CLIENT_ID` / `MICROSOFT_OAUTH_CLIENT_SECRET` / `MICROSOFT_OAUTH_TENANT` | No | Microsoft (Entra) OIDC credentials; `_TENANT` is the directory (tenant) ID |
 | `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` | No | Comma-separated allowlist; a verified identity must match a domain or email (fail-closed) |
-| `MCP_ACCESS_TOKEN` | No | **Temporary** static bearer token for the `/mcp` endpoint (AII-296 step 1). Unset → 503. Replaced by OAuth in step 3 of the parent. |
+| `KG_SIDECAR_URL` | No | URL of the private KG sidecar (streamable-HTTP MCP transport), e.g. `http://127.0.0.1:8765/mcp`. Unset → 503 on `/mcp`. The sidecar should be reachable only from loopback; the orchestrator proxies auth-verified requests verbatim and strips the `Authorization` header before forwarding. |
 | `DEDUP_DB_PATH` | No | SQLite path (default `/data/dedup.sqlite`) |
 | `POLL_INTERVAL_MS` | No | Poll interval ms (default `60000`) |
 | `PORT` | No | HTTP port (default `8080`) |
 | `AI_IMPLEMENT_LOG_LEVEL` | No | Runner log verbosity: `summary` (default) or `stream`. `stream` tees per-turn tool activity to the log. Telemetry (turns/cost/tokens/outcome) is captured at both levels. |
+
+## KG sidecar and MCP endpoint
+
+The orchestrator bundles a Python-based KG (knowledge-graph) sidecar that serves `kg_*` tools. MCP clients (e.g. Claude Code) reach those tools via the orchestrator's `/mcp` endpoint — an OAuth-authenticated proxy implemented in `src/mcp.ts`. The sidecar is started by `docker-entrypoint.sh` on `127.0.0.1:8765` before Node, then `KG_SIDECAR_URL` is exported so `src/index.ts` picks it up automatically. Sidecar failure (crash, timeout, absent artifacts) is **non-fatal**: the orchestrator boots normally and `/mcp` returns 503; all other routes are unaffected.
+
+### Single-machine deploy shape
+
+The sidecar runs **inside** the orchestrator container on loopback — no separate service, no public port. `docker-entrypoint.sh` starts the sidecar, polls `http://127.0.0.1:8765/mcp` for up to 30 s, and exports `KG_SIDECAR_URL=http://127.0.0.1:8765/mcp` if it becomes ready. Node then starts with that variable already set. For local dev (`npm run dev`), start the sidecar manually and set `KG_SIDECAR_URL` in `.env`; or leave it blank (no `/mcp`).
+
+### MCP OAuth flow
+
+The `/mcp` endpoint returns 401 with `WWW-Authenticate` pointing to `/.well-known/oauth-protected-resource`. A compliant MCP client discovers the authorization server from there and completes the RFC 6749 authorization code + PKCE flow implemented in `src/mcp-oauth.ts`:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /mcp/register` | RFC 7591 dynamic client registration — returns `client_id` |
+| `GET /mcp/authorize` | Start PKCE auth flow → delegates to configured OIDC provider |
+| `GET /mcp/callback/{provider}` | OIDC callback — applies allowlist, mints 5-min auth code |
+| `POST /mcp/token` | Exchange auth code + PKCE verifier for a 1-hour Bearer token |
+| `GET /.well-known/oauth-protected-resource` | RFC resource metadata — points clients to the AS |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata |
+
+Authorization is **fail-closed**: a verified identity must pass the same `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` allowlist as the admin UI. Tokens live 1 hour; the client re-authenticates after expiry.
+
+**Configuring MCP OAuth** — register two additional redirect URIs in the OIDC provider consoles (alongside the admin-UI redirect URIs):
+- `${OAUTH_REDIRECT_BASE_URL}/mcp/callback/google`
+- `${OAUTH_REDIRECT_BASE_URL}/mcp/callback/microsoft`
+
+`OAUTH_REDIRECT_BASE_URL` and at least one OIDC provider must be configured; `/mcp/authorize` returns 503 when neither is set.
+
+### Decision (a) — base image
+
+`Dockerfile` uses `node:24-slim` (Debian bookworm) instead of `node:24-alpine`. fastembed and onnxruntime ship pre-built glibc wheels; Alpine's musl libc makes those wheels fail to install without a full from-source build. Slim costs ~30 MB more but makes the sidecar viable without cross-compilation.
+
+### Decision (b) — KG artifact acquisition (manual pre-build step)
+
+The KG repository is private. Neither path — build-arg clone token (credential visible in image history / build logs) or automated vendored copy — is workable in CI without operator action. **KG artifacts must be populated manually** before building the image:
+
+1. Obtain the KG server code and snapshot artifacts from the private KG repository.
+2. Place them under `kg/` in this repository (replacing `kg/.gitkeep`):
+   - **`kg/start.sh`** (preferred) — vendor-provided startup script; must bind to `127.0.0.1:8765`. The entrypoint calls this with `sh kg/start.sh`.
+   - **`kg/server.py` + `kg/requirements.txt`** (fallback) — bare Python entry point; `docker build` creates a venv at `kg/.venv` and installs requirements at build time. The entrypoint runs `kg/.venv/bin/python kg/server.py`.
+3. Run `docker build .` — the venv is created if `kg/requirements.txt` is present; the layer is skipped (with a log line) if only the placeholder remains.
+4. Verify with `docker run --rm -p 8080:8080 <image>` that `/mcp` serves `kg_*` tools.
+
+`kg/` is excluded from workflow sync and never copied to target repos.
+
+### Memory sizing
+
+Fastembed embedding models load into process memory at startup. A typical small model (e.g. BAAI/bge-small-en-v1.5, ~130 MB on disk) expands to ~300–400 MB resident once loaded. Combined with the orchestrator's Node.js footprint (~100–150 MB), **256 MB Fly machines are too small** and will OOM-kill the sidecar or the orchestrator.
+
+**Recommended minimum: 512 MB.** For comfortable headroom (larger models, concurrent requests): **1 GB.**
+
+Update `fly.toml` before deploying a sidecar-enabled image:
+
+```toml
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"   # minimum with KG sidecar; 1024mb recommended
+```
+
+The `fly.toml` in this repository still shows `256mb` as the base default (for sidecar-less deployments). Adjust per-client in `clients/<slug>.toml`.
 
 ## Adding a new target repo
 
