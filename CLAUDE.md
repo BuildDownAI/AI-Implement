@@ -50,6 +50,9 @@ src/
   admin.ts          — admin HTTP API (auth + CRUD)
   admin-html.ts     — re-exports the assembled admin HTML from admin-ui/index.ts
   admin-ui/         — string-composed admin SPA (see "admin-ui" section below)
+  mcp.ts            — OAuth-authenticated MCP proxy to KG sidecar
+  mcp-oauth.ts      — RFC 6749 authorization server for /mcp (client reg, PKCE, token exchange)
+  oauth/            — OIDC engine + shared admin-UI and MCP login routes
   __tests__/        — Vitest unit tests
 
 workflows/          — templates synced to target repos
@@ -156,6 +159,10 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `mappings` | Team key → GitHub repo config |
 | `dispatch_log` | Audit log, last 500 dispatches |
 | `settings` | Key-value store — runner mode, Fly session config, deploy-notification state |
+| `mcp_clients` | MCP OAuth — registered clients (RFC 7591 dynamic registration) |
+| `mcp_oauth_states` | MCP OAuth — in-flight OIDC transactions (10-minute TTL) |
+| `mcp_auth_codes` | MCP OAuth — short-lived authorization codes (5-minute TTL) |
+| `mcp_tokens` | MCP OAuth — issued Bearer access tokens (1-hour TTL) |
 
 `dedup.ts` owns the DB singleton (`getDb()`). All other modules import `getDb` from `dedup.ts`.
 
@@ -180,9 +187,34 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `PORT` | No | HTTP port (default `8080`) |
 | `AI_IMPLEMENT_LOG_LEVEL` | No | Runner log verbosity: `summary` (default) or `stream`. `stream` tees per-turn tool activity to the log. Telemetry (turns/cost/tokens/outcome) is captured at both levels. |
 
-## KG sidecar — build preparation and memory sizing
+## KG sidecar and MCP endpoint
 
-The orchestrator image bundles a Python-based KG (knowledge-graph) sidecar that serves `kg_*` tools over the `/mcp` endpoint. The sidecar is started by `docker-entrypoint.sh` on `127.0.0.1:8765` before Node, then `KG_SIDECAR_URL` is exported so `src/index.ts` picks it up automatically. Sidecar failure (crash, timeout, absent artifacts) is **non-fatal**: the orchestrator boots normally and `/mcp` returns 503; all other routes are unaffected.
+The orchestrator bundles a Python-based KG (knowledge-graph) sidecar that serves `kg_*` tools. MCP clients (e.g. Claude Code) reach those tools via the orchestrator's `/mcp` endpoint — an OAuth-authenticated proxy implemented in `src/mcp.ts`. The sidecar is started by `docker-entrypoint.sh` on `127.0.0.1:8765` before Node, then `KG_SIDECAR_URL` is exported so `src/index.ts` picks it up automatically. Sidecar failure (crash, timeout, absent artifacts) is **non-fatal**: the orchestrator boots normally and `/mcp` returns 503; all other routes are unaffected.
+
+### Single-machine deploy shape
+
+The sidecar runs **inside** the orchestrator container on loopback — no separate service, no public port. `docker-entrypoint.sh` starts the sidecar, polls `http://127.0.0.1:8765/mcp` for up to 30 s, and exports `KG_SIDECAR_URL=http://127.0.0.1:8765/mcp` if it becomes ready. Node then starts with that variable already set. For local dev (`npm run dev`), start the sidecar manually and set `KG_SIDECAR_URL` in `.env`; or leave it blank (no `/mcp`).
+
+### MCP OAuth flow
+
+The `/mcp` endpoint returns 401 with `WWW-Authenticate` pointing to `/.well-known/oauth-protected-resource`. A compliant MCP client discovers the authorization server from there and completes the RFC 6749 authorization code + PKCE flow implemented in `src/mcp-oauth.ts`:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /mcp/register` | RFC 7591 dynamic client registration — returns `client_id` |
+| `GET /mcp/authorize` | Start PKCE auth flow → delegates to configured OIDC provider |
+| `GET /mcp/callback/{provider}` | OIDC callback — applies allowlist, mints 5-min auth code |
+| `POST /mcp/token` | Exchange auth code + PKCE verifier for a 1-hour Bearer token |
+| `GET /.well-known/oauth-protected-resource` | RFC resource metadata — points clients to the AS |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata |
+
+Authorization is **fail-closed**: a verified identity must pass the same `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` allowlist as the admin UI. Tokens live 1 hour; the client re-authenticates after expiry.
+
+**Configuring MCP OAuth** — register two additional redirect URIs in the OIDC provider consoles (alongside the admin-UI redirect URIs):
+- `${OAUTH_REDIRECT_BASE_URL}/mcp/callback/google`
+- `${OAUTH_REDIRECT_BASE_URL}/mcp/callback/microsoft`
+
+`OAUTH_REDIRECT_BASE_URL` and at least one OIDC provider must be configured; `/mcp/authorize` returns 503 when neither is set.
 
 ### Decision (a) — base image
 
