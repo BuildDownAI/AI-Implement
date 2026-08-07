@@ -63,6 +63,17 @@ describe("session/entrypoint.sh", () => {
     expect(safeDirectoryIdx).toBeLessThan(checkoutIdx);
   });
 
+  it("expands the shallow clone refspec before tracking a gap-fill PR branch", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    const refspecIdx = content.indexOf(
+      "git config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'",
+    );
+    const checkoutIdx = content.indexOf('gh pr checkout "$PR_NUMBER"');
+
+    expect(refspecIdx).toBeGreaterThan(-1);
+    expect(refspecIdx).toBeLessThan(checkoutIdx);
+  });
+
   it("decodes prNumber from the envelope before the gap-fill checkout when PR_NUMBER is empty", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     // Decode line must extract prNumber from the envelope JSON
