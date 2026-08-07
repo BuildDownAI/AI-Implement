@@ -145,8 +145,8 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     const clonedRef = revResult.stdout.toString().trim();
 
     // Give long-running and gap-fill sessions a newly minted token immediately
-    // after clone. Push refreshes again at its own write boundary, but gap-fill
-    // runs deliberately skip pushStep and let Claude push the existing PR branch.
+    // after clone. Push refreshes again at its own write boundary; gap-fill
+    // prompts refresh the origin again immediately before Claude-owned pushes.
     const activeGithubToken = await refreshRunnerGithubCredentials({
       currentToken: githubToken,
       orchestratorUrl: inputs.orchestratorUrl,

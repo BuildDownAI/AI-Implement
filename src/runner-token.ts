@@ -43,14 +43,14 @@ export async function refreshRunnerGithubToken(
     });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    console.warn(`[runner-token] Token refresh unavailable (${reason}); using the boot token.`);
+    console.warn(`[runner-token] Token refresh unavailable (${reason}); using the previous token.`);
     return inputs.currentToken;
   }
 
   if (!response.ok) {
     if (response.status >= 500) {
       console.warn(
-        `[runner-token] Token refresh failed with HTTP ${response.status}; using the boot token.`,
+        `[runner-token] Token refresh failed with HTTP ${response.status}; using the previous token.`,
       );
       return inputs.currentToken;
     }

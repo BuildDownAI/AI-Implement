@@ -1,7 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
-import { refreshRunnerGithubToken } from "../runner-token.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:child_process", () => ({
+  spawnSync: vi.fn(),
+}));
+
+import { spawnSync } from "node:child_process";
+import { refreshRunnerGithubCredentials, refreshRunnerGithubToken } from "../runner-token.js";
 
 describe("refreshRunnerGithubToken", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("vends a token with the machine nonce and repository owner", async () => {
     const fetchImpl = vi.fn().mockResolvedValue({
       ok: true,
@@ -38,6 +48,40 @@ describe("refreshRunnerGithubToken", () => {
       owner: "BuildDownAI",
       fetchImpl,
     })).resolves.toBe("boot-token");
+  });
+
+  it("reapplies the previous token to the environment and origin when vending is unavailable", async () => {
+    const fetchImpl = vi.fn().mockRejectedValue(new Error("connection refused"));
+    vi.mocked(spawnSync).mockReturnValue({
+      status: 0,
+      stdout: Buffer.alloc(0),
+      stderr: Buffer.alloc(0),
+    } as ReturnType<typeof spawnSync>);
+    vi.stubEnv("GITHUB_TOKEN", "stale-env-token");
+    vi.stubEnv("GH_TOKEN", "stale-env-token");
+
+    await expect(refreshRunnerGithubCredentials({
+      currentToken: "previous-token",
+      orchestratorUrl: "https://orchestrator.example",
+      machineNonce: "machine-nonce",
+      owner: "BuildDownAI",
+      repo: "AI-Implement",
+      workspaceDir: "/workspace",
+      fetchImpl,
+    })).resolves.toBe("previous-token");
+
+    expect(process.env.GITHUB_TOKEN).toBe("previous-token");
+    expect(process.env.GH_TOKEN).toBe("previous-token");
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      [
+        "remote",
+        "set-url",
+        "origin",
+        "https://x-access-token:previous-token@github.com/BuildDownAI/AI-Implement.git",
+      ],
+      expect.objectContaining({ cwd: "/workspace" }),
+    );
   });
 
   it("rejects nonce and owner validation failures instead of masking them", async () => {
