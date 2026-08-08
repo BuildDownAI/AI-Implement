@@ -245,7 +245,7 @@ When the `kg_token` secret is absent or empty the build succeeds and logs `[kg] 
 
 **When testing moves to Fly native auto-deploy (AII-256):** the build secret must be configured in that deploy path (e.g. as a Fly build secret or CI secret) so automated deployments continue to produce sidecar-enabled images.
 
-`kg/` is excluded from workflow sync and never copied to target repos. The `kg/.gitkeep` placeholder remains in git; the actual KG code is cloned at build time and never committed.
+`kg/` is excluded from workflow sync and never copied to target repos. The `kg/.gitkeep` placeholder remains in git; the actual KG code and snapshot are cloned at build time and never committed. After the venv install, the Dockerfile runs `kg_ingest.materialize` (with a `--no-embed` lexical-only fallback) so the sidecar-enabled image contains `/app/kg/out/graph.trig` (non-empty) — `kg_hybrid_search` returns results immediately on boot without requiring a separate data-load step. Embeddings are baked at build time (semantic search works); lexical-only search is the fallback if the embedding step fails.
 
 ### Memory sizing
 

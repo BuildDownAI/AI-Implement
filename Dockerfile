@@ -72,7 +72,7 @@ RUN --mount=type=secret,id=kg_token,required=false \
                /tmp/kg-src \
         && unset KG_TOKEN \
         && mkdir -p /app/kg \
-        && for d in kg_query kg_ingest out; do \
+        && for d in kg_query kg_ingest snapshot; do \
                [ -d /tmp/kg-src/$d ] && cp -r /tmp/kg-src/$d /app/kg/ || true; \
            done \
         && [ -f /tmp/kg-src/requirements.txt ] && cp /tmp/kg-src/requirements.txt /app/kg/ || true \
@@ -88,6 +88,14 @@ RUN if [ -f /app/kg/requirements.txt ]; then \
         && /app/kg/.venv/bin/pip install --no-cache-dir -r /app/kg/requirements.txt; \
     else \
         echo "[kg] requirements.txt absent — sidecar will be unavailable at runtime"; \
+    fi
+RUN if [ -x /app/kg/.venv/bin/python ] && [ -d /app/kg/snapshot/parts ]; then \
+        echo "[kg] materializing out/graph.trig (+embeddings) from committed snapshot" \
+        && cd /app/kg \
+        && PYTHONPATH=. .venv/bin/python -m kg_ingest.materialize \
+           || PYTHONPATH=. .venv/bin/python -m kg_ingest.materialize --no-embed; \
+    else \
+        echo "[kg] no venv or snapshot — skipping materialize (sidecar-less)"; \
     fi
 
 # Create data directory (Fly volume will mount here)
