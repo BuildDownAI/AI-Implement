@@ -21,6 +21,21 @@ export const runnersHtml = `
     </div>
 
     <div class="card">
+      <div class="card-header"><h2 class="card-title">Runner mode</h2></div>
+      <div class="card-body">
+        <div id="runner-mode-env-warning" class="warning hidden">&#x26A0; RUNNER_MODE env var is set &#x2014; UI toggle has no effect until it is unset.</div>
+        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+          <span class="seg" id="runner-mode-controls">
+            <button class="btn btn-sm" id="btn-mode-default" data-mode="default" onclick="window.setRunnerMode('default')">Project</button>
+            <button class="btn btn-sm" id="btn-mode-gha" data-mode="gha" onclick="window.setRunnerMode('gha')">GHA</button>
+            <button class="btn btn-sm" id="btn-mode-fly" data-mode="fly" onclick="window.setRunnerMode('fly')">Fly</button>
+            <button class="btn btn-sm" id="btn-mode-shadow" data-mode="shadow" onclick="window.setRunnerMode('shadow')">Shadow</button>
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header">
         <h2 class="card-title">Fly Machines — live sessions</h2>
         <div class="card-subtitle"><a href="#sessions" class="text-accent">Manage on Sessions page →</a></div>
@@ -70,6 +85,10 @@ export const runnersScript = `
     } catch (e) {
       return fallback;
     }
+  }
+
+  function modeLabel(mode) {
+    return mode === 'default' ? 'Project' : mode;
   }
 
   function kindForMode(mode) {
@@ -127,8 +146,23 @@ export const runnersScript = `
 
     // Runner mode KPI
     const modeBadgeKind = kindForMode(runnerMode.mode);
-    document.getElementById('kpi-runner-mode').innerHTML = '<span class="badge ' + modeBadgeKind + '"><span class="dot"></span>' + window.esc(runnerMode.mode) + '</span>';
+    document.getElementById('kpi-runner-mode').innerHTML = '<span class="badge ' + modeBadgeKind + '"><span class="dot"></span>' + window.esc(modeLabel(runnerMode.mode)) + '</span>';
     document.getElementById('kpi-runner-source').textContent = '(' + runnerMode.source + ')';
+
+    // Runner mode controls
+    const envWarning = document.getElementById('runner-mode-env-warning');
+    if (envWarning) {
+      if (runnerMode.source === 'env') {
+        envWarning.classList.remove('hidden');
+      } else {
+        envWarning.classList.add('hidden');
+      }
+    }
+    const btns = document.querySelectorAll('#runner-mode-controls .btn');
+    btns.forEach(function (b) {
+      b.classList.toggle('btn-primary', b.dataset.mode === runnerMode.mode);
+      b.disabled = runnerMode.source === 'env';
+    });
 
     if (runnerMode.mode !== 'default') {
       const bannerKind = runnerMode.mode === 'shadow' ? 'warn' : 'info';
@@ -219,10 +253,20 @@ export const runnersScript = `
     }
 
     // Subtitle
-    document.getElementById('runners-subtitle').textContent = liveSessions.length + ' live · ' + runnerMode.mode + ' mode';
+    document.getElementById('runners-subtitle').textContent = liveSessions.length + ' live · ' + modeLabel(runnerMode.mode) + ' mode';
+  }
+
+  async function setRunnerMode(mode) {
+    try {
+      await window.api('/api/runner-mode', { method: 'POST', body: JSON.stringify({ mode }) });
+      loadRunners();
+    } catch (err) {
+      console.error('setRunnerMode failed:', err);
+    }
   }
 
   window.loadRunners = loadRunners;
+  window.setRunnerMode = setRunnerMode;
   window.registerPage('runners', function () { loadRunners(); setInterval(loadRunners, 30000); });
 })();
 `;
