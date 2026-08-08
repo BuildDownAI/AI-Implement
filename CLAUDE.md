@@ -257,7 +257,13 @@ When the `kg_token` secret is absent or empty the build succeeds and logs `[kg] 
 
 **When testing moves to Fly native auto-deploy (AII-256):** the build secret must be configured in that deploy path (e.g. as a Fly build secret or CI secret) so automated deployments continue to produce sidecar-enabled images.
 
-`kg/` is excluded from workflow sync and never copied to target repos. The `kg/.gitkeep` placeholder remains in git; the actual KG code and snapshot are cloned at build time and never committed. After the venv install, the Dockerfile runs `kg_ingest.materialize` (with a `--no-embed` lexical-only fallback) so the sidecar-enabled image contains `/app/kg/out/graph.trig` (non-empty) — `kg_hybrid_search` returns results immediately on boot without requiring a separate data-load step. Embeddings are baked at build time (semantic search works); lexical-only search is the fallback if the embedding step fails.
+`kg/` is excluded from workflow sync and never copied to target repos. The `kg/.gitkeep` placeholder remains in git; the actual KG code and snapshot are cloned at build time and never committed. After the venv install, the Dockerfile performs three distinct build steps:
+
+1. **Model bake** — warms the fastembed model (`BAAI/bge-small-en-v1.5`) into a baked cache at `FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache`. This eliminates network fetches at runtime: the query-embedding path reads the baked cache from the image. If this step fails, the build prints `[kg] WARNING: EMBEDDINGS BUILD FAILED` and continues graph-only; the sidecar starts in lexical-only mode.
+2. **Graph materialize** — runs `kg_ingest.materialize --no-embed` to produce `out/graph.trig`. This step is a hard failure: a broken graph is not usable.
+3. **Embed** — runs `kg_ingest.materialize` (full) using the same `FASTEMBED_CACHE_PATH`. If this step fails, the build prints `[kg] WARNING: EMBEDDINGS BUILD FAILED` and continues graph-only. A successful embed step produces `out/graph.trig` with semantic vectors; lexical-only search is the fallback if the embed step fails.
+
+The `start.sh` script generated at build time exports `FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache` so the running sidecar also reads the baked cache rather than downloading the model on first query. `kg_hybrid_search` returns results immediately on boot without a separate data-load step. Verify a sidecar-enabled deploy by asserting `degraded:false` in a `kg_hybrid_search` response (not just that `/mcp` answers).
 
 ### Memory sizing
 

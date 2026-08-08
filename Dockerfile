@@ -78,7 +78,7 @@ RUN --mount=type=secret,id=kg_token,required=false \
         && for f in requirements.txt sources.yml; do \
                [ -f /tmp/kg-src/$f ] && cp /tmp/kg-src/$f /app/kg/ || true; \
            done \
-        && printf '#!/bin/sh\ncd "$(dirname "$0")"\nexport KG_HTTP=1 KG_HTTP_PORT=8765 KG_HTTP_HOST=127.0.0.1 KG_BACKEND=rdflib PYTHONPATH=.\nexec .venv/bin/python -m kg_query.server\n' > /app/kg/start.sh \
+        && printf '#!/bin/sh\ncd "$(dirname "$0")"\nexport KG_HTTP=1 KG_HTTP_PORT=8765 KG_HTTP_HOST=127.0.0.1 KG_BACKEND=rdflib PYTHONPATH=. FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache\nexec .venv/bin/python -m kg_query.server\n' > /app/kg/start.sh \
         && chmod +x /app/kg/start.sh \
         && rm -rf /tmp/kg-src; \
     else \
@@ -91,11 +91,23 @@ RUN if [ -f /app/kg/requirements.txt ]; then \
     else \
         echo "[kg] requirements.txt absent — sidecar will be unavailable at runtime"; \
     fi
+RUN if [ -x /app/kg/.venv/bin/python ]; then \
+        echo "[kg] warming fastembed model BAAI/bge-small-en-v1.5 into baked cache" \
+        && FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache \
+           /app/kg/.venv/bin/python -c \
+             "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')" \
+        || echo "[kg] WARNING: EMBEDDINGS BUILD FAILED — model warm failed; image will run lexical-only"; \
+    else \
+        echo "[kg] no venv — skipping model warm (sidecar-less)"; \
+    fi
 RUN if [ -x /app/kg/.venv/bin/python ] && [ -d /app/kg/snapshot/parts ]; then \
-        echo "[kg] materializing out/graph.trig (+embeddings) from committed snapshot" \
+        echo "[kg] materializing out/graph.trig from committed snapshot (graph only)" \
         && cd /app/kg \
-        && PYTHONPATH=. .venv/bin/python -m kg_ingest.materialize \
-           || PYTHONPATH=. .venv/bin/python -m kg_ingest.materialize --no-embed; \
+        && PYTHONPATH=. .venv/bin/python -m kg_ingest.materialize --no-embed \
+        && ( echo "[kg] embedding graph with baked fastembed cache" \
+             && FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache \
+                PYTHONPATH=. .venv/bin/python -m kg_ingest.materialize \
+             || echo "[kg] WARNING: EMBEDDINGS BUILD FAILED — embed step failed; image ships graph-only (lexical search only)" ); \
     else \
         echo "[kg] no venv or snapshot — skipping materialize (sidecar-less)"; \
     fi
