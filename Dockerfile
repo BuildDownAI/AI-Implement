@@ -44,23 +44,44 @@ COPY --from=builder /app/dist ./dist
 COPY pipelines/ ./pipelines/
 COPY workflows/ ./workflows/
 
-# Decision (b): KG artifact acquisition is a MANUAL PRE-BUILD STEP.
+# Decision (b): KG artifact acquisition via BuildKit build secret (fail-soft).
 #
-# The KG repository is private. Neither a build-arg clone token (credential
-# visible in image history / build logs) nor an automated vendored copy is
-# workable in CI without operator action. This is therefore surfaced as a
-# documented manual step rather than automated.
+# The KG repository is private. A BuildKit --build-secret mount keeps the
+# GitHub token out of image history and build logs — it is readable only inside
+# the RUN that uses it and is never written to any ENV/ARG.
 #
-# To enable the sidecar:
-#   1. Populate ./kg/ with the KG server code + snapshot artifacts.
-#      See CLAUDE.md "KG sidecar — build preparation" for the exact steps.
-#   2. Ensure kg/start.sh (or kg/server.py + kg/requirements.txt) is present.
-#   3. Run `docker build .` — the venv is created here if requirements.txt exists.
+# To build WITH the sidecar (requires read access to BuildDownAI/knowledge-graph-ai-implement):
+#   docker build --secret id=kg_token,env=GH_TOKEN .
+#   fly deploy --remote-only --build-secret kg_token="$(gh auth token)"
 #
-# Without KG artifacts (only kg/.gitkeep), the venv step is skipped and the
-# sidecar is unavailable at runtime; /mcp returns 503 and everything else
-# continues normally.
+# To build WITHOUT the sidecar (sidecar-less / degraded /mcp 503):
+#   docker build .
+#   fly deploy --remote-only
+#
+# When the secret is absent the build succeeds and logs "sidecar-less build".
+# All other routes remain healthy; only /mcp returns 503.
 COPY kg/ /app/kg/
+RUN --mount=type=secret,id=kg_token,required=false \
+    if [ -f /run/secrets/kg_token ] && [ -s /run/secrets/kg_token ]; then \
+        echo "[kg] secret present — cloning BuildDownAI/knowledge-graph-ai-implement" \
+        && apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+        && rm -rf /var/lib/apt/lists/* \
+        && KG_TOKEN="$(cat /run/secrets/kg_token)" \
+        && git clone --depth 1 \
+               "https://x-access-token:${KG_TOKEN}@github.com/BuildDownAI/knowledge-graph-ai-implement.git" \
+               /tmp/kg-src \
+        && unset KG_TOKEN \
+        && mkdir -p /app/kg \
+        && for d in kg_query kg_ingest out; do \
+               [ -d /tmp/kg-src/$d ] && cp -r /tmp/kg-src/$d /app/kg/ || true; \
+           done \
+        && [ -f /tmp/kg-src/requirements.txt ] && cp /tmp/kg-src/requirements.txt /app/kg/ || true \
+        && printf '#!/bin/sh\ncd "$(dirname "$0")"\nexport KG_HTTP=1 KG_HTTP_PORT=8765 KG_HTTP_HOST=127.0.0.1 KG_BACKEND=rdflib PYTHONPATH=.\nexec .venv/bin/python -m kg_query.server\n' > /app/kg/start.sh \
+        && chmod +x /app/kg/start.sh \
+        && rm -rf /tmp/kg-src; \
+    else \
+        echo "[kg] sidecar-less build — kg_token secret absent or empty, /mcp will return 503"; \
+    fi
 RUN if [ -f /app/kg/requirements.txt ]; then \
         echo "[kg] installing Python dependencies into /app/kg/.venv" \
         && python3 -m venv /app/kg/.venv \

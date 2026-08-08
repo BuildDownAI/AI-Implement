@@ -220,18 +220,32 @@ Authorization is **fail-closed**: a verified identity must pass the same `OAUTH_
 
 `Dockerfile` uses `node:24-slim` (Debian bookworm) instead of `node:24-alpine`. fastembed and onnxruntime ship pre-built glibc wheels; Alpine's musl libc makes those wheels fail to install without a full from-source build. Slim costs ~30 MB more but makes the sidecar viable without cross-compilation.
 
-### Decision (b) — KG artifact acquisition (manual pre-build step)
+### Decision (b) — KG artifact acquisition via BuildKit build secret (fail-soft)
 
-The KG repository is private. Neither path — build-arg clone token (credential visible in image history / build logs) or automated vendored copy — is workable in CI without operator action. **KG artifacts must be populated manually** before building the image:
+The KG repository is private. A **BuildKit `--build-secret` mount** clones it at build time. The token is only readable inside the mounted `RUN` layer and is never written to `ARG`, `ENV`, or image history.
 
-1. Obtain the KG server code and snapshot artifacts from the private KG repository.
-2. Place them under `kg/` in this repository (replacing `kg/.gitkeep`):
-   - **`kg/start.sh`** (preferred) — vendor-provided startup script; must bind to `127.0.0.1:8765`. The entrypoint calls this with `sh kg/start.sh`.
-   - **`kg/server.py` + `kg/requirements.txt`** (fallback) — bare Python entry point; `docker build` creates a venv at `kg/.venv` and installs requirements at build time. The entrypoint runs `kg/.venv/bin/python kg/server.py`.
-3. Run `docker build .` — the venv is created if `kg/requirements.txt` is present; the layer is skipped (with a log line) if only the placeholder remains.
-4. Verify with `docker run --rm -p 8080:8080 <image>` that `/mcp` serves `kg_*` tools.
+**Build with the KG sidecar enabled** (requires a GitHub token with read access to `BuildDownAI/knowledge-graph-ai-implement`):
 
-`kg/` is excluded from workflow sync and never copied to target repos.
+```bash
+# Local Docker build:
+docker build --secret id=kg_token,env=GH_TOKEN .
+
+# Fly deploy (the standard command for testing/production):
+fly deploy --remote-only --build-secret kg_token="$(gh auth token)"
+```
+
+**Build without the KG sidecar** (sidecar-less / degraded — `/mcp` returns 503, all other routes remain healthy):
+
+```bash
+docker build .
+fly deploy --remote-only
+```
+
+When the `kg_token` secret is absent or empty the build succeeds and logs `[kg] sidecar-less build`. The entrypoint skips sidecar startup and the orchestrator boots normally.
+
+**When testing moves to Fly native auto-deploy (AII-256):** the build secret must be configured in that deploy path (e.g. as a Fly build secret or CI secret) so automated deployments continue to produce sidecar-enabled images.
+
+`kg/` is excluded from workflow sync and never copied to target repos. The `kg/.gitkeep` placeholder remains in git; the actual KG code is cloned at build time and never committed.
 
 ### Memory sizing
 
@@ -247,7 +261,7 @@ Update `fly.toml` before deploying a sidecar-enabled image:
   memory = "512mb"   # minimum with KG sidecar; 1024mb recommended
 ```
 
-The `fly.toml` in this repository still shows `256mb` as the base default (for sidecar-less deployments). Adjust per-client in `clients/<slug>.toml`.
+The `fly.toml` in this repository shows `512mb` as the base default (sufficient for sidecar-enabled deployments; sidecar-less deployments could use 256mb but 512mb is harmless). Adjust per-client in `clients/<slug>.toml`.
 
 ## Adding a new target repo
 
