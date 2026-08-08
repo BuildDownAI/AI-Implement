@@ -231,8 +231,20 @@ The KG repository is private. A **BuildKit `--build-secret` mount** clones it at
 docker build --secret id=kg_token,env=GH_TOKEN .
 
 # Fly deploy (the standard command for testing/production):
-fly deploy --remote-only --build-secret kg_token="$(gh auth token)"
+#   --no-cache is REQUIRED: a --build-secret is NOT part of the layer cache key,
+#   so without it a repeat deploy silently reuses a stale (possibly sidecar-less)
+#   image and the clone/materialize RUN never re-executes.
+#   Also: export GH_TOKEN first — `GH_TOKEN=... fly deploy ... "$GH_TOKEN"` does
+#   NOT work (the inline prefix doesn't affect same-line expansion → empty secret).
+export GH_TOKEN="$(gh auth token)"
+fly deploy --remote-only --no-cache --build-secret kg_token="$GH_TOKEN"
 ```
+
+The sidecar clone copies the KG's `sources.yml` (which pins the IRI `namespace:`)
+alongside the code — without it the server falls back to the placeholder
+namespace and every type-filtered `kg_*` tool silently returns empty (the graph
+loads, but queries match nothing). Verify a deploy with a real query
+(`kg_search` returns non-empty), not just that `/mcp` answers.
 
 **Build without the KG sidecar** (sidecar-less / degraded — `/mcp` returns 503, all other routes remain healthy):
 

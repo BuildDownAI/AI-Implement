@@ -75,7 +75,9 @@ RUN --mount=type=secret,id=kg_token,required=false \
         && for d in kg_query kg_ingest snapshot; do \
                [ -d /tmp/kg-src/$d ] && cp -r /tmp/kg-src/$d /app/kg/ || true; \
            done \
-        && [ -f /tmp/kg-src/requirements.txt ] && cp /tmp/kg-src/requirements.txt /app/kg/ || true \
+        && for f in requirements.txt sources.yml; do \
+               [ -f /tmp/kg-src/$f ] && cp /tmp/kg-src/$f /app/kg/ || true; \
+           done \
         && printf '#!/bin/sh\ncd "$(dirname "$0")"\nexport KG_HTTP=1 KG_HTTP_PORT=8765 KG_HTTP_HOST=127.0.0.1 KG_BACKEND=rdflib PYTHONPATH=.\nexec .venv/bin/python -m kg_query.server\n' > /app/kg/start.sh \
         && chmod +x /app/kg/start.sh \
         && rm -rf /tmp/kg-src; \
