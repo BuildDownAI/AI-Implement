@@ -168,6 +168,8 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     MACHINE_NONCE: runId,
     SESSION_MODE: "autonomous",
     RUNNER_PHASE: "implementation",
+    ...(process.getuid ? { AI_IMPLEMENT_HOST_UID: String(process.getuid()) } : {}),
+    ...(process.getgid ? { AI_IMPLEMENT_HOST_GID: String(process.getgid()) } : {}),
     ...(anthropicApiKey ? { ANTHROPIC_API_KEY: anthropicApiKey } : {}),
     ...(claudeOAuthToken ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOAuthToken } : {}),
     ...(opts.env ?? {}),
