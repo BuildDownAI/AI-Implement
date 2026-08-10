@@ -18,6 +18,7 @@
 
 import crypto from "node:crypto";
 import type http from "node:http";
+import { isIP } from "node:net";
 import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
@@ -135,9 +136,10 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
     return false;
   }
 
-  const host = parsed.hostname.toLowerCase();
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (parsed.protocol === "http:") {
-    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+    const ipVersion = isIP(host);
+    return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
   }
 
   if (parsed.protocol !== "https:") {
@@ -241,7 +243,7 @@ export async function handleMcpClientRegistration(
   ) {
     return json(res, 400, {
       error: "invalid_redirect_uri",
-      error_description: "redirect_uris must use loopback HTTP or an explicitly allowed HTTPS origin",
+      error_description: "redirect_uris must use a loopback IP literal over HTTP or an explicitly allowed HTTPS origin",
     });
   }
 
