@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "linear-eudoxus": { "type": "http", "url": "https://mcp.linear.app/mcp" },
-    "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/" }
+    "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/" },
+    "orch-ai-implement-testing": { "type": "http", "url": "https://ai-implement-testing-orchestrator.fly.dev/mcp" }
   }
 }

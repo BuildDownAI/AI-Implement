@@ -21,6 +21,16 @@ Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, e
 > `linear-eudoxus` is a distinctly-named project server with its own token on **eudoxus**, so the two
 > never collide.
 
+## Knowledge graph
+
+Bindings for the KG skills (kg_search, kg_hybrid_search, etc.):
+
+- kg.present: true
+- kg.orchestrator: orch-ai-implement-testing
+- kg.mcp_server: `orch-ai-implement-testing` (project `.mcp.json`; pre-approved in `.claude/settings.json`)
+- kg.search_tool: kg_hybrid_search
+- kg.source_repo: BuildDownAI/knowledge-graph-ai-implement
+
 ## Architecture
 
 ```
