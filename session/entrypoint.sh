@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # entrypoint.sh — Thin bootstrap. All pipeline logic lives in TS at /app/dist.
-# Responsibilities: env validation per mode, token acquisition, clone, chown,
-# then exec the phase-appropriate TS entry (run-autonomous.js / run-planning.js)
-# under dbus + non-root.
+# Responsibilities: env validation, workspace bootstrap, then exec the
+# phase-appropriate TS entry under dbus + non-root.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib.sh"
 trap 'log "ERROR: line $LINENO failed: $BASH_COMMAND (exit $?)"' ERR
+WORKSPACE_DIR="${WORKSPACE_DIR:-/workspace}"
+WORKSPACE_MODE="${AI_IMPLEMENT_WORKSPACE_MODE:-cloned}"
 
 # ── 1. Mode detection ────────────────────────────────────────────────────────
 if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
@@ -49,7 +50,6 @@ export GITHUB_OWNER GITHUB_REPO
 export PR_NUMBER="${PR_NUMBER:-}"
 
 # ── 3. Token acquisition ─────────────────────────────────────────────────────
-# Both GHA (workflow-minted) and fly/local (orchestrator-minted) receive GITHUB_TOKEN directly.
 export GH_TOKEN="$GITHUB_TOKEN"
 
 # ── 4. Git config + clone ────────────────────────────────────────────────────
@@ -61,7 +61,6 @@ if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then
   fi
 fi
 export GITHUB_DEFAULT_BRANCH
-# For non-gap-fill runs, envelope baseBranch wins over dispatch-layer env (feature-branch grouping).
 if [ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then
   _rb="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.baseBranch||"")}catch(e){}' 2>/dev/null||true)"
   if [ -n "$_rb" ]; then log "run_config.baseBranch=${_rb}"; GITHUB_DEFAULT_BRANCH="$_rb"; fi
@@ -70,28 +69,36 @@ git config --global user.name "ai-implement-bot"
 git config --global user.email "ai-implement-bot@users.noreply.github.com"
 git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
 
-REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
-log "Cloning ${GITHUB_OWNER}/${GITHUB_REPO}..."
-git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" /workspace
-git config --global --add safe.directory /workspace
-cd /workspace
-if [ -n "$PR_NUMBER" ]; then
-  log "Gap-fill: checking out PR #$PR_NUMBER"
-  # --depth + --branch narrows origin's fetch refspec to the cloned base branch.
-  # gh pr checkout needs the PR head to count as a trackable remote branch.
-  git config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
-  gh pr checkout "$PR_NUMBER"
-  GITHUB_DEFAULT_BRANCH="$(git branch --show-current)"
-  export GITHUB_DEFAULT_BRANCH
+if [ "$WORKSPACE_MODE" = "mounted" ]; then
+  log "Using bind-mounted workspace at $WORKSPACE_DIR"
+  git config --global --add safe.directory "$WORKSPACE_DIR"
+  cd "$WORKSPACE_DIR"
+else
+  REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
+  log "Cloning ${GITHUB_OWNER}/${GITHUB_REPO}..."
+  git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" "$WORKSPACE_DIR"
+  git config --global --add safe.directory "$WORKSPACE_DIR"
+  cd "$WORKSPACE_DIR"
+  if [ -n "$PR_NUMBER" ]; then
+    log "Gap-fill: checking out PR #$PR_NUMBER"
+    git config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+    gh pr checkout "$PR_NUMBER"
+    GITHUB_DEFAULT_BRANCH="$(git branch --show-current)"
+    export GITHUB_DEFAULT_BRANCH
+  fi
 fi
 
 # ── 5. Workspace ownership for non-root Claude ───────────────────────────────
-chown -R coder:coder /workspace
+if [ "$WORKSPACE_MODE" = "mounted" ]; then
+  prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
+else
+  chown -R coder:coder "$WORKSPACE_DIR"
+fi
 cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 
 # ── 6. Invoke TS pipeline ────────────────────────────────────────────────────
-export WORKSPACE_DIR=/workspace
+export WORKSPACE_DIR
 RUNNER_PHASE="${RUNNER_PHASE:-implementation}"
 export RUNNER_PHASE
 # Only "planning" has a dedicated entry. "implementation" and "gap-analysis"

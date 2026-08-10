@@ -1,6 +1,20 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function writeShim(binDir: string, name: string, body: string): void {
+  const shim = join(binDir, name);
+  writeFileSync(shim, `#!/usr/bin/env bash\n${body}\n`);
+  chmodSync(shim, 0o755);
+}
 
 describe("session/entrypoint.sh", () => {
   it("passes shellcheck cleanly", () => {
@@ -55,7 +69,7 @@ describe("session/entrypoint.sh", () => {
   it("marks the cloned workspace safe before the gap-fill PR checkout", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     const cloneIdx = content.indexOf('git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH"');
-    const safeDirectoryIdx = content.indexOf("git config --global --add safe.directory /workspace");
+    const safeDirectoryIdx = content.indexOf('git config --global --add safe.directory "$WORKSPACE_DIR"', cloneIdx);
     const checkoutIdx = content.indexOf('gh pr checkout "$PR_NUMBER"');
 
     expect(cloneIdx).toBeGreaterThan(-1);
@@ -108,5 +122,51 @@ describe("session/entrypoint.sh", () => {
     expect(content).toMatch(/if \[ -n "\$\{AI_IMPLEMENT_RUN_CONFIG:-\}" \]; then/);
     expect(content).toContain('require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION');
     expect(content).toContain("export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION");
+  });
+
+  it("consumes mounted workspace mode before clone and never changes bind-mount ownership", () => {
+    const root = mkdtempSync(join(tmpdir(), "entrypoint-mounted-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    const workspace = join(root, "workspace");
+    const commandLog = join(root, "commands.log");
+    spawnSync("mkdir", ["-p", binDir, workspace]);
+
+    for (const name of ["git", "usermod", "groupmod", "chown", "cp", "dbus-run-session"]) {
+      writeShim(binDir, name, `printf '%s %s\\n' '${name}' \"$*\" >> \"$COMMAND_LOG\"`);
+    }
+    writeShim(binDir, "getent", "printf 'hostgroup:x:2345:\\n'");
+    writeShim(binDir, "id", "[ \"${1:-}\" = '-gn' ] && printf 'hostgroup\\n'");
+
+    const result = spawnSync("bash", ["session/entrypoint.sh"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        COMMAND_LOG: commandLog,
+        WORKSPACE_DIR: workspace,
+        AI_IMPLEMENT_MODE: "local",
+        AI_IMPLEMENT_WORKSPACE_MODE: "mounted",
+        AI_IMPLEMENT_HOST_UID: "1234",
+        AI_IMPLEMENT_HOST_GID: "2345",
+        ANTHROPIC_API_KEY: "test-key",
+        GITHUB_TOKEN: "test-token",
+        GITHUB_OWNER: "BuildDownAI",
+        GITHUB_REPO: "fixture",
+        GITHUB_DEFAULT_BRANCH: "testing",
+        ISSUE_ID: "issue-id",
+        ISSUE_IDENTIFIER: "DEV-1",
+        ISSUE_TITLE: "Test",
+        ISSUE_DESCRIPTION: "Test mounted mode",
+      },
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    const commands = readFileSync(commandLog, "utf8");
+    expect(commands).not.toMatch(/git clone/);
+    expect(commands).not.toContain(`chown -R coder:coder ${workspace}`);
+    expect(commands).toContain(`git config --global --add safe.directory ${workspace}`);
+    expect(commands).toContain("usermod -o -u 1234 coder");
+    expect(commands).toContain("dbus-run-session -- su -p coder");
   });
 });

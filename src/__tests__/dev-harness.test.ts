@@ -137,6 +137,29 @@ describe("startDevRun", () => {
     expect(capturedArgs).toContain("AI_IMPLEMENT_WORKSPACE_MODE=mounted");
   });
 
+  it("passes the host uid and gid so the container user can write without chowning the mount", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    makeSpawnSyncMock("");
+
+    const capturedArgs: string[] = [];
+    vi.mocked(rawExecFile).mockImplementation(
+      (_cmd: unknown, args: unknown, cb: unknown) => {
+        capturedArgs.push(...(args as string[]));
+        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
+          stdout: "cid\n",
+          stderr: "",
+        });
+        return {} as ReturnType<typeof rawExecFile>;
+      },
+    );
+
+    await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
+
+    expect(capturedArgs).toContain(`AI_IMPLEMENT_HOST_UID=${process.getuid!()}`);
+    expect(capturedArgs).toContain(`AI_IMPLEMENT_HOST_GID=${process.getgid!()}`);
+  });
+
   it("includes workspace bind-mount arg in docker run command", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
