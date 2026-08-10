@@ -234,15 +234,19 @@ The KG repository is private. A **BuildKit `--build-secret` mount** clones it at
 # Local Docker build:
 docker build --secret id=kg_token,env=GH_TOKEN .
 
-# Fly deploy (the standard command for testing/production):
-#   --no-cache is REQUIRED: a --build-secret is NOT part of the layer cache key,
-#   so without it a repeat deploy silently reuses a stale (possibly sidecar-less)
-#   image and the clone/materialize RUN never re-executes.
-#   Also: export GH_TOKEN first — `GH_TOKEN=... fly deploy ... "$GH_TOKEN"` does
-#   NOT work (the inline prefix doesn't affect same-line expansion → empty secret).
-export GH_TOKEN="$(gh auth token)"
-fly deploy --remote-only --no-cache --build-secret kg_token="$GH_TOKEN"
+# Fly deploy — ALWAYS use the wrapper script (it encodes the required flags and
+# verifies the deployed sidecar actually serves):
+./scripts/deploy-orchestrator.sh                      # testing orchestrator (default)
+./scripts/deploy-orchestrator.sh <other-app-name>     # any other orchestrator app
 ```
+
+> **Never deploy with a plain `fly deploy`** — it silently produces a sidecar-less
+> image (`/mcp` → 503). The script exists because this has happened three times:
+> the KG clone needs the build secret, `--no-cache` is required (a build secret is
+> not part of the layer cache key, so repeat deploys silently reuse stale layers),
+> and `GH_TOKEN` must be exported (an inline prefix passes an empty secret). The
+> script ends by asserting `/mcp` answers 401 — a deploy that ships without a
+> working sidecar fails loudly instead of being discovered days later.
 
 The sidecar clone copies the KG's `sources.yml` (which pins the IRI `namespace:`)
 alongside the code — without it the server falls back to the placeholder
