@@ -23,7 +23,10 @@ describe("runDevHarnessCli", () => {
       streamLogsUntilShellReady: vi.fn().mockResolvedValue({ ready: true, exitCode: 0 }),
       getRunStatus: vi.fn(),
       collectRunArtifacts: vi.fn(async () => { events.push("artifacts"); }),
-      spawnDocker: vi.fn((args) => { events.push(args[0] === "rm" ? "remove" : "shell"); }),
+      spawnDocker: vi.fn((args) => {
+        events.push(args[0] === "rm" ? "remove" : "shell");
+        return 0;
+      }),
       writeStdout: vi.fn(),
       writeStderr: vi.fn(),
       now: () => Date.now(),
@@ -35,6 +38,32 @@ describe("runDevHarnessCli", () => {
     );
 
     expect(exitCode).toBe(0);
+    expect(events).toEqual(["shell", "artifacts", "remove"]);
+  });
+
+  it("returns the docker exec failure after collecting artifacts and removing the container", async () => {
+    const events: string[] = [];
+    const deps: DevHarnessCliDependencies = {
+      startDevRun: vi.fn().mockResolvedValue(makeHandle()),
+      streamLogs: vi.fn().mockResolvedValue(undefined),
+      streamLogsUntilShellReady: vi.fn().mockResolvedValue({ ready: true, exitCode: 0 }),
+      getRunStatus: vi.fn(),
+      collectRunArtifacts: vi.fn(async () => { events.push("artifacts"); }),
+      spawnDocker: vi.fn((args) => {
+        events.push(args[0] === "rm" ? "remove" : "shell");
+        return args[0] === "exec" ? 125 : 0;
+      }),
+      writeStdout: vi.fn(),
+      writeStderr: vi.fn(),
+      now: () => Date.now(),
+    };
+
+    const exitCode = await runDevHarnessCli(
+      ["--workspace", "/tmp/workspace", "--task", "/tmp/task.md", "--shell"],
+      deps,
+    );
+
+    expect(exitCode).toBe(125);
     expect(events).toEqual(["shell", "artifacts", "remove"]);
   });
 });

@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runAutonomous, resolveLogLevel } from "../run-autonomous.js";
+import { runAutonomous, resolveLogLevel, waitForContainerRemoval } from "../run-autonomous.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { encodeRunConfig } from "../run-config.js";
@@ -1454,6 +1454,17 @@ describe("runAutonomous", () => {
       expect(feedbackMod.run).toHaveBeenCalledOnce();
       expect(pushMod.run).toHaveBeenCalledOnce();
     });
+  });
+});
+
+describe("waitForContainerRemoval", () => {
+  it("registers a referenced timer so an unresolved promise cannot let Node exit", () => {
+    const schedule = vi.fn();
+
+    void waitForContainerRemoval(schedule);
+
+    expect(schedule).toHaveBeenCalledOnce();
+    expect(schedule).toHaveBeenCalledWith(expect.any(Function), 60_000);
   });
 });
 
