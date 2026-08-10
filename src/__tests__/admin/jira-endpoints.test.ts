@@ -70,6 +70,7 @@ const fetchMock = vi.fn();
 const origToken = process.env.JIRA_TOKEN;
 const origCloud = process.env.JIRA_CLOUD_ID;
 const origSite = process.env.JIRA_SITE_URL;
+const origEmail = process.env.JIRA_EMAIL;
 const origClientId = process.env.LINEAR_CLIENT_ID;
 const origClientSecret = process.env.LINEAR_CLIENT_SECRET;
 
@@ -77,6 +78,7 @@ beforeEach(async () => {
   vi.resetModules();
   fetchMock.mockReset();
   global.fetch = fetchMock as unknown as typeof fetch;
+  delete process.env.JIRA_EMAIL;
   dbPath = path.join(os.tmpdir(), `admin-jira-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   process.env.DEDUP_DB_PATH = dbPath;
   provider = new FakeProvider();
@@ -107,6 +109,8 @@ afterEach(() => {
   else process.env.JIRA_CLOUD_ID = origCloud;
   if (origSite === undefined) delete process.env.JIRA_SITE_URL;
   else process.env.JIRA_SITE_URL = origSite;
+  if (origEmail === undefined) delete process.env.JIRA_EMAIL;
+  else process.env.JIRA_EMAIL = origEmail;
   if (origClientId === undefined) delete process.env.LINEAR_CLIENT_ID;
   else process.env.LINEAR_CLIENT_ID = origClientId;
   if (origClientSecret === undefined) delete process.env.LINEAR_CLIENT_SECRET;
