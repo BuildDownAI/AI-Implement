@@ -340,6 +340,8 @@ describe("dependency-auth secret leakage regression", () => {
       dependencyTokenScope: "installation" as const,
       callbackUrl: "https://orch.example",
       fetchImpl: mockFetch(200, { token: dependencyTokenValue, expires_at: "2030-01-01T00:00:00Z" }),
+      spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
+      writeFileSyncImpl: vi.fn(),
     };
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -398,5 +400,201 @@ describe("fetchDependencyToken", () => {
       fetchImpl: captureFetch,
     });
     expect(calls[0]).toBe("https://orch.example/api/runner/dependency-token");
+  });
+});
+
+// ─── (10) Credential helper registration ─────────────────────────────────────
+
+describe("dependencyAuthStep credential helper registration", () => {
+  let origTokenFile: string | undefined;
+  let origCallbackUrl: string | undefined;
+  let origComposerAuth: string | undefined;
+
+  beforeEach(() => {
+    origTokenFile = process.env.GIT_DEPENDENCY_TOKEN_FILE;
+    origCallbackUrl = process.env.GIT_DEPENDENCY_CALLBACK_URL;
+    origComposerAuth = process.env.COMPOSER_AUTH;
+    delete process.env.GIT_DEPENDENCY_TOKEN_FILE;
+    delete process.env.GIT_DEPENDENCY_CALLBACK_URL;
+    delete process.env.COMPOSER_AUTH;
+  });
+
+  afterEach(() => {
+    if (origTokenFile !== undefined) process.env.GIT_DEPENDENCY_TOKEN_FILE = origTokenFile;
+    else delete process.env.GIT_DEPENDENCY_TOKEN_FILE;
+    if (origCallbackUrl !== undefined) process.env.GIT_DEPENDENCY_CALLBACK_URL = origCallbackUrl;
+    else delete process.env.GIT_DEPENDENCY_CALLBACK_URL;
+    if (origComposerAuth !== undefined) process.env.COMPOSER_AUTH = origComposerAuth;
+    else delete process.env.COMPOSER_AUTH;
+  });
+
+  it("registers git credential helper for https://github.com on successful fetch", async () => {
+    const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
+    const mockSpawn = vi.fn().mockImplementation((cmd: string, args: string[]) => {
+      spawnCalls.push({ cmd, args });
+      return { status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") };
+    });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await dependencyAuthStep.run(
+      ctx(),
+      {
+        dependencyTokenScope: "installation",
+        callbackUrl: "https://orch.example",
+        fetchImpl: mockFetch(200, { token: "dep-tok", expires_at: "2030-01-01T00:00:00Z" }),
+        spawnSyncImpl: mockSpawn,
+        writeFileSyncImpl: vi.fn(),
+        credentialHelperPath: "/opt/ai-implement/git-credential-helper.sh",
+      },
+      new NoopStepReporter(),
+    );
+    logSpy.mockRestore();
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0].cmd).toBe("git");
+    expect(spawnCalls[0].args).toEqual([
+      "config",
+      "--global",
+      "credential.https://github.com.helper",
+      "/opt/ai-implement/git-credential-helper.sh",
+    ]);
+  });
+
+  it("writes token cache file and sets GIT_DEPENDENCY_TOKEN_FILE + GIT_DEPENDENCY_CALLBACK_URL", async () => {
+    const writeCalls: Array<{ path: string; data: string; options?: { mode?: number } }> = [];
+    const mockWrite = vi.fn().mockImplementation((path: string, data: string, options?: { mode?: number }) => {
+      writeCalls.push({ path, data, options });
+    });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await dependencyAuthStep.run(
+      ctx(),
+      {
+        dependencyTokenScope: "installation",
+        callbackUrl: "https://orch.example///",
+        fetchImpl: mockFetch(200, { token: "dep-tok-file", expires_at: "2030-06-01T12:00:00Z" }),
+        spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
+        writeFileSyncImpl: mockWrite,
+      },
+      new NoopStepReporter(),
+    );
+    logSpy.mockRestore();
+
+    expect(writeCalls).toHaveLength(1);
+    const written = JSON.parse(writeCalls[0].data) as { token: string; expires_at: string };
+    expect(written.token).toBe("dep-tok-file");
+    expect(written.expires_at).toBe("2030-06-01T12:00:00Z");
+    expect(writeCalls[0].options).toEqual({ mode: 0o600 });
+    expect(process.env.GIT_DEPENDENCY_TOKEN_FILE).toBe(writeCalls[0].path);
+    expect(process.env.GIT_DEPENDENCY_CALLBACK_URL).toBe("https://orch.example");
+  });
+
+  it("exports COMPOSER_AUTH with valid JSON containing the token", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await dependencyAuthStep.run(
+      ctx(),
+      {
+        dependencyTokenScope: "installation",
+        callbackUrl: "https://orch.example",
+        fetchImpl: mockFetch(200, { token: "composer-tok", expires_at: "2030-01-01T00:00:00Z" }),
+        spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
+        writeFileSyncImpl: vi.fn(),
+      },
+      new NoopStepReporter(),
+    );
+    logSpy.mockRestore();
+
+    expect(process.env.COMPOSER_AUTH).toBeDefined();
+    const parsed = JSON.parse(process.env.COMPOSER_AUTH!) as unknown;
+    expect(parsed).toEqual({ "github-oauth": { "github.com": "composer-tok" } });
+  });
+
+  it("does not register helper or set env vars when feature is off (no scope)", async () => {
+    const mockSpawn = vi.fn();
+    const mockWrite = vi.fn();
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await dependencyAuthStep.run(
+      ctx(),
+      {
+        dependencyTokenScope: undefined,
+        callbackUrl: "https://orch.example",
+        spawnSyncImpl: mockSpawn,
+        writeFileSyncImpl: mockWrite,
+      },
+      new NoopStepReporter(),
+    );
+    logSpy.mockRestore();
+
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(process.env.GIT_DEPENDENCY_TOKEN_FILE).toBeUndefined();
+    expect(process.env.COMPOSER_AUTH).toBeUndefined();
+  });
+
+  it("does not register helper or set env vars when token fetch fails", async () => {
+    const mockSpawn = vi.fn();
+    const mockWrite = vi.fn();
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await dependencyAuthStep.run(
+      ctx(),
+      {
+        dependencyTokenScope: "installation",
+        callbackUrl: "https://orch.example",
+        fetchImpl: mockFetch(403, {}),
+        spawnSyncImpl: mockSpawn,
+        writeFileSyncImpl: mockWrite,
+      },
+      new NoopStepReporter(),
+    );
+    warnSpy.mockRestore();
+
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(process.env.GIT_DEPENDENCY_TOKEN_FILE).toBeUndefined();
+    expect(process.env.COMPOSER_AUTH).toBeUndefined();
+  });
+
+  it("continues and returns acquired=true even when git config registration fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const out = await dependencyAuthStep.run(
+      ctx(),
+      {
+        dependencyTokenScope: "installation",
+        callbackUrl: "https://orch.example",
+        fetchImpl: mockFetch(200, { token: "tok", expires_at: "2030-01-01T00:00:00Z" }),
+        spawnSyncImpl: vi.fn().mockReturnValue({ status: 1, stdout: Buffer.from(""), stderr: Buffer.from("error") }),
+        writeFileSyncImpl: vi.fn(),
+      },
+      new NoopStepReporter(),
+    );
+    logSpy.mockRestore();
+    const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+    warnSpy.mockRestore();
+
+    expect(out.acquired).toBe(true);
+    expect(warnings.some((w) => /credential helper/i.test(w))).toBe(true);
+  });
+
+  it("COMPOSER_AUTH does not appear in step outputs (token not leaked)", async () => {
+    const tokenValue = "SECRET_COMPOSER_TOKEN_VALUE";
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const outputs = await dependencyAuthStep.run(
+      ctx(),
+      {
+        dependencyTokenScope: "installation",
+        callbackUrl: "https://orch.example",
+        fetchImpl: mockFetch(200, { token: tokenValue, expires_at: "2030-01-01T00:00:00Z" }),
+        spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
+        writeFileSyncImpl: vi.fn(),
+      },
+      new NoopStepReporter(),
+    );
+    logSpy.mockRestore();
+
+    expect(JSON.stringify(outputs)).not.toContain(tokenValue);
   });
 });
