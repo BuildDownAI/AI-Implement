@@ -42,8 +42,18 @@ adopt_workspace_ownership() {
   # defeat the non-root requirement, so leave it and let the probe decide.
   if [ "$uid" != "0" ] && [ "$uid" != "$(id -u coder)" ]; then
     # -o permits a uid/gid another image user already holds (base image: node=1000).
-    groupmod -o -g "$gid" coder 2>/dev/null || true
-    usermod -o -u "$uid" -g "$gid" coder
+    # Guard gid 0 symmetrically: assigning coder to the root group is as hazardous
+    # as numbering it to uid 0, so skip the group change and keep coder's existing gid.
+    if [ "$gid" != "0" ]; then
+      groupmod -o -g "$gid" coder 2>/dev/null || true
+      usermod -o -u "$uid" -g "$gid" coder
+    else
+      usermod -o -u "$uid" coder
+    fi
+    # Re-chown coder's container-local home: the on-disk uid/gid no longer matches
+    # the renumbered coder after usermod, so coder would lose write access to $HOME
+    # (new entries under ~/.claude, ~/.npm, ~/.cache, etc. would fail with EACCES).
+    chown -R coder:coder /home/coder
     log "Adopted workspace ownership: coder is now ${uid}:${gid}"
   fi
 
