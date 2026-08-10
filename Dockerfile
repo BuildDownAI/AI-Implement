@@ -6,7 +6,7 @@
 #
 # Keep the Node version aligned with the repo pins (.node-version / .nvmrc).
 # better-sqlite3 is a native addon whose lifecycle behavior can change across Node releases.
-FROM node:24.15.0-slim@sha256:152aceace5c03e2597988763165ee33e3fd3633636db0fc983cd2e126b02cfde AS builder
+FROM node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d AS builder
 
 WORKDIR /app
 
@@ -27,7 +27,7 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ---------- Production ----------
-FROM node:24.15.0-slim@sha256:152aceace5c03e2597988763165ee33e3fd3633636db0fc983cd2e126b02cfde
+FROM node:24.15.0-slim@sha256:4e6b70dd6cbfc88c8157ba19aa3d9f9cce6ba4703576d55459e45efcbc9c5f5d
 
 WORKDIR /app
 
