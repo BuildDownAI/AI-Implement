@@ -1352,6 +1352,11 @@ describe("runAutonomous", () => {
   });
 
   describe("AI_IMPLEMENT_UNTIL_STEP staged execution", () => {
+    beforeEach(() => {
+      vi.stubEnv("AI_IMPLEMENT_MODE", "local");
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+    });
+
     it("stops after the named step and returns exitCode 0 without running later steps", async () => {
       vi.stubEnv("AI_IMPLEMENT_UNTIL_STEP", "setup");
 
@@ -1422,6 +1427,32 @@ describe("runAutonomous", () => {
 
       expect(result.exitCode).toBe(0);
       expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+    });
+
+    it("ignores staged execution env outside the local mounted dev harness", async () => {
+      vi.stubEnv("AI_IMPLEMENT_MODE", "fly");
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "cloned");
+      vi.stubEnv("AI_IMPLEMENT_UNTIL_STEP", "setup");
+      vi.stubEnv("AI_IMPLEMENT_SHELL_MODE", "true");
+      const feedbackMod: StepModule = { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1 }) };
+      const pushMod: StepModule = { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/pr/1" }) };
+      const { pipeline, runner } = makeStepsPipeline([
+        ["setup", { run: vi.fn().mockResolvedValue({}) }],
+        ["feedback-loop", feedbackMod],
+        ["push", pushMod],
+      ]);
+
+      const result = await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(feedbackMod.run).toHaveBeenCalledOnce();
+      expect(pushMod.run).toHaveBeenCalledOnce();
     });
   });
 });
