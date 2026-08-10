@@ -24,9 +24,13 @@ import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
 
 // Token and state lifetimes
-export const MCP_TOKEN_TTL_MS = 60 * 60 * 1000;        // 1 hour
-const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;              // 10 minutes
-const AUTH_CODE_TTL_MS = 5 * 60 * 1000;                 // 5 minutes
+export const MCP_TOKEN_TTL_MS: number = (() => {
+  const envSeconds = parseInt(process.env.MCP_ACCESS_TOKEN_TTL ?? "", 10);
+  return Number.isFinite(envSeconds) && envSeconds > 0 ? envSeconds * 1000 : 60 * 60 * 1000;
+})();
+const MCP_REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;                  // 10 minutes
+const AUTH_CODE_TTL_MS = 5 * 60 * 1000;                     // 5 minutes
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -84,11 +88,26 @@ export function initMcpOAuthTables(): void {
       expires_at INTEGER NOT NULL
     )
   `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS mcp_refresh_tokens (
+      token_hash TEXT PRIMARY KEY,
+      client_id  TEXT NOT NULL,
+      email      TEXT NOT NULL,
+      sub        TEXT NOT NULL,
+      provider   TEXT NOT NULL,
+      family_id  TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      used_at    INTEGER
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mcp_refresh_tokens_family ON mcp_refresh_tokens(family_id)`);
   // Sweep stale rows on startup
   const now = Date.now();
   db.prepare("DELETE FROM mcp_oauth_states WHERE expires_at < ?").run(now);
   db.prepare("DELETE FROM mcp_auth_codes WHERE expires_at < ?").run(now);
   db.prepare("DELETE FROM mcp_tokens WHERE expires_at < ?").run(now);
+  db.prepare("DELETE FROM mcp_refresh_tokens WHERE expires_at < ?").run(now);
 }
 
 // ---------- Token verification ----------
@@ -138,7 +157,7 @@ export function handleMcpAuthorizationServerMetadata(
     token_endpoint: `${baseUrl}/mcp/token`,
     registration_endpoint: `${baseUrl}/mcp/register`,
     response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
   });
@@ -192,7 +211,7 @@ export async function handleMcpClientRegistration(
       redirect_uris: redirectUris,
       ...(clientName ? { client_name: clientName } : {}),
       token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code"],
+      grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
     }),
   );
@@ -362,7 +381,7 @@ export async function handleMcpOidcCallback(
 
 // ---------- Token endpoint ----------
 
-/** POST /mcp/token — exchange an authorization code for an MCP access token. */
+/** POST /mcp/token — exchange an authorization code or refresh token for MCP tokens. */
 export async function handleMcpTokenRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -375,11 +394,23 @@ export async function handleMcpTokenRequest(
   }
 
   const params = parseFormOrJson(body, req.headers["content-type"]);
-  const { grant_type, code, redirect_uri, client_id, code_verifier } = params;
+  const { grant_type } = params;
 
-  if (grant_type !== "authorization_code") {
-    return json(res, 400, { error: "unsupported_grant_type" });
+  if (grant_type === "authorization_code") {
+    return handleAuthorizationCodeGrant(params, res);
   }
+  if (grant_type === "refresh_token") {
+    return handleRefreshTokenGrant(params, res);
+  }
+  return json(res, 400, { error: "unsupported_grant_type" });
+}
+
+function handleAuthorizationCodeGrant(
+  params: Record<string, string>,
+  res: http.ServerResponse,
+): void {
+  const { code, redirect_uri, client_id, code_verifier } = params;
+
   if (!code || !redirect_uri || !client_id || !code_verifier) {
     return json(res, 400, { error: "invalid_request", error_description: "Missing required parameters" });
   }
@@ -417,23 +448,121 @@ export async function handleMcpTokenRequest(
     return json(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
   }
 
-  // Mint MCP access token
-  const token = crypto.randomBytes(32).toString("hex");
   const now = Date.now();
-  db
-    .prepare(
-      "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .run(token, codeRow.email, codeRow.sub, codeRow.provider, now, now + MCP_TOKEN_TTL_MS);
+
+  // Mint access token
+  const accessToken = crypto.randomBytes(32).toString("hex");
+  db.prepare(
+    "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run(accessToken, codeRow.email, codeRow.sub, codeRow.provider, now, now + MCP_TOKEN_TTL_MS);
+
+  // Mint refresh token
+  const refreshToken = crypto.randomBytes(32).toString("hex");
+  const familyId = crypto.randomBytes(16).toString("hex");
+  db.prepare(
+    "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(
+    hashToken(refreshToken), client_id, codeRow.email, codeRow.sub, codeRow.provider,
+    familyId, now, now + MCP_REFRESH_TOKEN_TTL_MS,
+  );
 
   json(res, 200, {
-    access_token: token,
+    access_token: accessToken,
     token_type: "Bearer",
     expires_in: Math.floor(MCP_TOKEN_TTL_MS / 1000),
+    refresh_token: refreshToken,
+  });
+}
+
+function handleRefreshTokenGrant(
+  params: Record<string, string>,
+  res: http.ServerResponse,
+): void {
+  const { refresh_token, client_id } = params;
+
+  if (!refresh_token || !client_id) {
+    return json(res, 400, { error: "invalid_request", error_description: "Missing required parameters" });
+  }
+
+  const db = getDb();
+  const tokenHash = hashToken(refresh_token);
+  const row = db.prepare("SELECT * FROM mcp_refresh_tokens WHERE token_hash = ?").get(tokenHash) as {
+    client_id: string;
+    email: string;
+    sub: string;
+    provider: string;
+    family_id: string;
+    expires_at: number;
+    used_at: number | null;
+  } | undefined;
+
+  if (!row) {
+    return json(res, 400, { error: "invalid_grant", error_description: "Invalid refresh token" });
+  }
+  if (Date.now() > row.expires_at) {
+    db.prepare("DELETE FROM mcp_refresh_tokens WHERE token_hash = ?").run(tokenHash);
+    return json(res, 400, { error: "invalid_grant", error_description: "Refresh token expired" });
+  }
+  if (row.client_id !== client_id) {
+    return json(res, 400, { error: "invalid_grant", error_description: "client_id mismatch" });
+  }
+  if (row.used_at !== null) {
+    // Replay attack — revoke entire rotation chain
+    db.prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(row.family_id);
+    console.warn(`[mcp-oauth] refresh token replay detected — family ${row.family_id} revoked`);
+    return json(res, 400, { error: "invalid_grant", error_description: "Refresh token already used" });
+  }
+
+  // Allowlist re-check (fail-closed: user removed from allowlist must not outlive their access token)
+  const decision = authorize({
+    provider: row.provider,
+    sub: row.sub,
+    email: row.email,
+    emailVerified: true,
+    name: null,
+    hd: null,
+    tid: null,
+    rawClaims: {},
+  });
+  if (!decision.ok) {
+    db.prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(row.family_id);
+    console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
+    return json(res, 400, { error: "invalid_grant", error_description: "Identity no longer authorized" });
+  }
+
+  const now = Date.now();
+
+  // Mark old token as used (kept until expiry for replay detection)
+  db.prepare("UPDATE mcp_refresh_tokens SET used_at = ? WHERE token_hash = ?").run(now, tokenHash);
+
+  // Mint new access token
+  const accessToken = crypto.randomBytes(32).toString("hex");
+  db.prepare(
+    "INSERT INTO mcp_tokens (token, email, sub, provider, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run(accessToken, row.email, row.sub, row.provider, now, now + MCP_TOKEN_TTL_MS);
+
+  // Mint new refresh token in the same rotation chain
+  const newRefreshToken = crypto.randomBytes(32).toString("hex");
+  db.prepare(
+    "INSERT INTO mcp_refresh_tokens (token_hash, client_id, email, sub, provider, family_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(
+    hashToken(newRefreshToken), client_id, row.email, row.sub, row.provider,
+    row.family_id, now, now + MCP_REFRESH_TOKEN_TTL_MS,
+  );
+
+  json(res, 200, {
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: Math.floor(MCP_TOKEN_TTL_MS / 1000),
+    refresh_token: newRefreshToken,
   });
 }
 
 // ---------- Helpers ----------
+
+function hashToken(token: string): string {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
