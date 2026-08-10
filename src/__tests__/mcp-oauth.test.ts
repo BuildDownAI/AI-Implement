@@ -199,6 +199,8 @@ describe("handleMcpAuthorizationServerMetadata", () => {
     expect(body.token_endpoint).toBe(`${BASE_URL}/mcp/token`);
     expect(body.registration_endpoint).toBe(`${BASE_URL}/mcp/register`);
     expect(body.code_challenge_methods_supported).toContain("S256");
+    expect(body.grant_types_supported).toContain("authorization_code");
+    expect(body.grant_types_supported).toContain("refresh_token");
   });
 });
 
@@ -215,6 +217,8 @@ describe("handleMcpClientRegistration", () => {
     expect(typeof data.client_id).toBe("string");
     expect(data.redirect_uris).toEqual(["http://localhost/cb"]);
     expect(data.client_name).toBe("My Client");
+    expect(data.grant_types).toContain("authorization_code");
+    expect(data.grant_types).toContain("refresh_token");
   });
 
   it("rejects missing redirect_uris", async () => {
@@ -377,18 +381,34 @@ describe("handleMcpOidcCallback", () => {
   });
 });
 
+// Top-level helper: full code-exchange flow returning client_id + both tokens
+async function fullFlow(): Promise<{ code: string; codeVerifier: string; clientId: string }> {
+  const clientId = await registerClient();
+  const { codeVerifier } = await startAuthorize(clientId);
+  (oidc.completeAuth as ReturnType<typeof vi.fn>).mockResolvedValue(identity());
+  const { code } = await doCallback();
+  return { code: code!, codeVerifier, clientId };
+}
+
+async function exchangeCode(code: string, codeVerifier: string, clientId: string): Promise<{ accessToken: string; refreshToken: string }> {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: "http://localhost:8080/callback",
+    client_id: clientId,
+    code_verifier: codeVerifier,
+  }).toString();
+  const req = mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
+  const res = new MockResponse();
+  await mcpOauth.handleMcpTokenRequest(req, asRes(res));
+  const data = JSON.parse(res.body);
+  return { accessToken: data.access_token, refreshToken: data.refresh_token };
+}
+
 // ---------- Unit: token endpoint ----------
 
 describe("handleMcpTokenRequest", () => {
-  async function fullFlow(): Promise<{ code: string; codeVerifier: string; clientId: string }> {
-    const clientId = await registerClient();
-    const { codeVerifier } = await startAuthorize(clientId);
-    (oidc.completeAuth as ReturnType<typeof vi.fn>).mockResolvedValue(identity());
-    const { code } = await doCallback();
-    return { code: code!, codeVerifier, clientId };
-  }
-
-  it("issues an access token on valid code + PKCE", async () => {
+  it("issues an access token and refresh token on valid code + PKCE", async () => {
     const { code, codeVerifier, clientId } = await fullFlow();
     const body = new URLSearchParams({
       grant_type: "authorization_code",
@@ -405,6 +425,7 @@ describe("handleMcpTokenRequest", () => {
     expect(typeof data.access_token).toBe("string");
     expect(data.token_type).toBe("Bearer");
     expect(data.expires_in).toBeGreaterThan(0);
+    expect(typeof data.refresh_token).toBe("string");
   });
 
   it("rejects wrong code_verifier (PKCE failure)", async () => {
@@ -481,6 +502,112 @@ describe("handleMcpTokenRequest", () => {
     const res = new MockResponse();
     await mcpOauth.handleMcpTokenRequest(req, asRes(res));
     expect(res.statusCode).toBe(200);
+  });
+});
+
+// ---------- Unit: refresh_token grant ----------
+
+describe("handleMcpTokenRequest — refresh_token grant", () => {
+  async function getTokens(): Promise<{ accessToken: string; refreshToken: string; clientId: string }> {
+    const { code, codeVerifier, clientId } = await fullFlow();
+    const { accessToken, refreshToken } = await exchangeCode(code, codeVerifier, clientId);
+    return { accessToken, refreshToken, clientId };
+  }
+
+  function makeRefreshReq(refreshToken: string, clientId: string): http.IncomingMessage {
+    const body = new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }).toString();
+    return mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
+  }
+
+  it("issues new access + refresh tokens on valid refresh token", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    expect(res.statusCode).toBe(200);
+    const data = JSON.parse(res.body);
+    expect(typeof data.access_token).toBe("string");
+    expect(data.token_type).toBe("Bearer");
+    expect(data.expires_in).toBeGreaterThan(0);
+    expect(typeof data.refresh_token).toBe("string");
+    expect(data.refresh_token).not.toBe(refreshToken); // rotated
+  });
+
+  it("new access token is usable for verification", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    const { access_token } = JSON.parse(res.body);
+    const idResult = mcpOauth.verifyMcpToken(access_token);
+    expect(idResult).not.toBeNull();
+    expect(idResult?.email).toBe("ada@eudoxus.ai");
+  });
+
+  it("rotated refresh token can be used again (chain continues)", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    const res1 = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res1));
+    const { refresh_token: refreshToken2 } = JSON.parse(res1.body);
+
+    const res2 = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken2, clientId), asRes(res2));
+    expect(res2.statusCode).toBe(200);
+    expect(typeof JSON.parse(res2.body).refresh_token).toBe("string");
+  });
+
+  it("rejects reuse of a rotated-away refresh token and revokes the chain", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    // First use (valid rotation)
+    const res1 = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res1));
+    expect(res1.statusCode).toBe(200);
+    const { refresh_token: refreshToken2 } = JSON.parse(res1.body);
+
+    // Replay the original (already-rotated) token — should revoke the chain
+    const res2 = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res2));
+    expect(res2.statusCode).toBe(400);
+    expect(JSON.parse(res2.body).error).toBe("invalid_grant");
+
+    // The new token from the legitimate rotation should also be revoked
+    const res3 = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken2, clientId), asRes(res3));
+    expect(res3.statusCode).toBe(400);
+    expect(JSON.parse(res3.body).error).toBe("invalid_grant");
+  });
+
+  it("re-checks the allowlist and refuses if user is removed", async () => {
+    const { refreshToken, clientId } = await getTokens();
+    // Remove user from allowlist
+    authz.configureAuthorizationPolicy({ allowedDomains: [], allowedEmails: [] });
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("invalid_grant");
+  });
+
+  it("rejects unknown refresh token", async () => {
+    const { clientId } = await getTokens();
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq("notarealtoken", clientId), asRes(res));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("invalid_grant");
+  });
+
+  it("rejects when client_id mismatches", async () => {
+    const { refreshToken } = await getTokens();
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, "wrong-client-id"), asRes(res));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("invalid_grant");
+  });
+
+  it("rejects when refresh_token is missing", async () => {
+    const body = new URLSearchParams({ grant_type: "refresh_token", client_id: "someclient" }).toString();
+    const req = mkReq("/mcp/token", "POST", { "content-type": "application/x-www-form-urlencoded" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpTokenRequest(req, asRes(res));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("invalid_request");
   });
 });
 
