@@ -70,6 +70,10 @@ export class PipelineRunner {
     reporter: StepReporter,
     opts: { stopAfterStep?: string } = {},
   ): Promise<void> {
+    if (opts.stopAfterStep && !pipeline.steps.some((step) => step.id === opts.stopAfterStep)) {
+      throw new Error(`Unknown stopAfterStep "${opts.stopAfterStep}" in pipeline "${pipeline.id}"`);
+    }
+
     for (const definition of pipeline.steps) {
       if (definition.skip?.(context)) {
         const skipped: Step = {
@@ -85,6 +89,7 @@ export class PipelineRunner {
         };
         await reporter.report(skipped);
         context.setOutputs(definition.id, {});
+        if (opts.stopAfterStep === definition.id) return;
         continue;
       }
 
@@ -155,4 +160,3 @@ async function defaultImportStepModule(resolvedPath: string): Promise<StepModule
   }
   return undefined;
 }
-

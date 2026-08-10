@@ -127,6 +127,10 @@ export function resolveLogLevel(raw: string | undefined): LogLevel {
   return raw === "stream" ? "stream" : "summary";
 }
 
+export function isLocalDevHarness(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.AI_IMPLEMENT_MODE === "local" && env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted";
+}
+
 /** Single-quote a shell value, escaping embedded single-quotes. */
 function shellQuote(val: string): string {
   return "'" + val.replace(/'/g, "'\\''") + "'";
@@ -440,8 +444,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
 
   let disposition: string | undefined;
 
-  const untilStep = optionalEnv("AI_IMPLEMENT_UNTIL_STEP") ?? undefined;
-  const shellMode = process.env.AI_IMPLEMENT_SHELL_MODE === "true";
+  const devHarnessMode = isLocalDevHarness();
+  const untilStep = devHarnessMode ? optionalEnv("AI_IMPLEMENT_UNTIL_STEP") ?? undefined : undefined;
+  const shellMode = devHarnessMode && process.env.AI_IMPLEMENT_SHELL_MODE === "true";
   // Snapshot env before the pipeline runs so we can diff after to find hook exports.
   const envSnap: Record<string, string | undefined> = shellMode ? { ...process.env } : {};
 
@@ -589,7 +594,7 @@ function resolveRunnerPhase(rawPhase: string | undefined, prNumber: string): "im
 if (import.meta.url === `file://${process.argv[1]}`) {
   runAutonomous()
     .then(async (r) => {
-      if (process.env.AI_IMPLEMENT_SHELL_MODE === "true") {
+      if (isLocalDevHarness() && process.env.AI_IMPLEMENT_SHELL_MODE === "true") {
         // Signal the dev-harness CLI that the pipeline has finished and the
         // container is ready for interactive inspection. The CLI will attach
         // a bash session via `docker exec -it` and remove the container when

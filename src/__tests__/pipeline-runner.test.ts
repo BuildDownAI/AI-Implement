@@ -270,7 +270,23 @@ describe("PipelineRunner", () => {
       expect(afterMod.run).not.toHaveBeenCalled();
     });
 
-    it("stopAfterStep: no-op when the named step is not in the pipeline", async () => {
+    it("stopAfterStep: stops when the named boundary step is skipped", async () => {
+      const afterSetupMod = makeModule({});
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "setup", type: "custom", moduleId: "setup", skip: () => true },
+          { id: "after-setup", type: "custom", moduleId: "after-setup" },
+        ],
+      };
+      const runner = new PipelineRunner().register("after-setup", afterSetupMod);
+
+      await runner.run(pipeline, makeContext(), new NoopStepReporter(), { stopAfterStep: "setup" });
+
+      expect(afterSetupMod.run).not.toHaveBeenCalled();
+    });
+
+    it("stopAfterStep: rejects an unknown boundary instead of running the full pipeline", async () => {
       const allMods = [makeModule({}), makeModule({}), makeModule({})];
       const pipeline: PipelineDefinition = {
         id: "test",
@@ -286,9 +302,11 @@ describe("PipelineRunner", () => {
         .register("install", allMods[1])
         .register("setup", allMods[2]);
 
-      await runner.run(pipeline, makeContext(), new NoopStepReporter(), { stopAfterStep: "nonexistent" });
+      await expect(
+        runner.run(pipeline, makeContext(), new NoopStepReporter(), { stopAfterStep: "nonexistent" }),
+      ).rejects.toThrow('Unknown stopAfterStep "nonexistent"');
 
-      for (const mod of allMods) expect(mod.run).toHaveBeenCalledOnce();
+      for (const mod of allMods) expect(mod.run).not.toHaveBeenCalled();
     });
 
     it("throws when no module is registered for the step type", async () => {
