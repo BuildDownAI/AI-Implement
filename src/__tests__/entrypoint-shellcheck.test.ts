@@ -158,6 +158,62 @@ describe("session/git-credential-helper.sh", () => {
     }
   });
 
+  it("strips trailing slash from GIT_DEPENDENCY_CALLBACK_URL before constructing the refresh URL", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const tokenFile = join(dir, "token.json");
+
+    const requestPaths: string[] = [];
+    const server = http.createServer((_req, res) => {
+      requestPaths.push(_req.url ?? "");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          token: "refreshed-tok",
+          expires_at: new Date(Date.now() + 55 * 60 * 1000).toISOString(),
+        }),
+      );
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const port = (server.address() as AddressInfo).port;
+
+      const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 min — near expiry
+      writeFileSync(tokenFile, JSON.stringify({ token: "stale-tok", expires_at: expiresAt }));
+
+      const stdout = await new Promise<string>((resolve, reject) => {
+        const child = spawn("bash", ["session/git-credential-helper.sh", "get"], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: {
+            ...process.env,
+            GIT_DEPENDENCY_TOKEN_FILE: tokenFile,
+            GIT_DEPENDENCY_CALLBACK_URL: `http://127.0.0.1:${port}/`, // trailing slash
+            RUN_PROGRESS_TOKEN: "progress-tok",
+          },
+        });
+        child.stdin.write("protocol=https\nhost=github.com\n\n");
+        child.stdin.end();
+        let out = "";
+        child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+        child.on("close", (code) => {
+          if (code !== 0) reject(new Error(`helper exited ${code}`));
+          else resolve(out);
+        });
+        child.on("error", reject);
+        setTimeout(() => reject(new Error("helper timed out")), 15000);
+      });
+
+      expect(requestPaths).toHaveLength(1);
+      // Must be exactly /api/runner/dependency-token — not //api/runner/dependency-token.
+      // This test fails if the defensive CALLBACK_URL="${CALLBACK_URL%/}" strip is removed.
+      expect(requestPaths[0]).toBe("/api/runner/dependency-token");
+      expect(stdout).toContain("password=refreshed-tok");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("is not consulted when the git URL already contains embedded credentials (AC #5)", () => {
     // Safety property: clone.ts and push.ts embed credentials directly in the
     // remote URL (https://x-access-token:TOKEN@github.com/…).  Git's

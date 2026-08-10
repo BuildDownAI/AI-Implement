@@ -341,7 +341,7 @@ describe("dependency-auth secret leakage regression", () => {
       callbackUrl: "https://orch.example",
       fetchImpl: mockFetch(200, { token: dependencyTokenValue, expires_at: "2030-01-01T00:00:00Z" }),
       spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
-      writeFileSyncImpl: vi.fn(),
+      writeFileSyncImpl: vi.fn() as (path: string, data: string, options: { mode: number }) => void,
     };
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -486,6 +486,25 @@ describe("dependencyAuthStep credential helper registration", () => {
     expect(written.expires_at).toBe("2030-06-01T12:00:00Z");
     expect(writeCalls[0].options).toEqual({ mode: 0o600 });
     expect(process.env.GIT_DEPENDENCY_TOKEN_FILE).toBe(writeCalls[0].path);
+    expect(process.env.GIT_DEPENDENCY_CALLBACK_URL).toBe("https://orch.example");
+  });
+
+  it("strips trailing slash(es) from callbackUrl before setting GIT_DEPENDENCY_CALLBACK_URL", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await dependencyAuthStep.run(
+      ctx(),
+      {
+        dependencyTokenScope: "installation",
+        callbackUrl: "https://orch.example//",
+        fetchImpl: mockFetch(200, { token: "tok", expires_at: "2030-01-01T00:00:00Z" }),
+        spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
+        writeFileSyncImpl: vi.fn(),
+      },
+      new NoopStepReporter(),
+    );
+    logSpy.mockRestore();
+    // The shell helper appends /api/runner/dependency-token directly; a trailing
+    // slash in the env var would produce //api/runner/dependency-token.
     expect(process.env.GIT_DEPENDENCY_CALLBACK_URL).toBe("https://orch.example");
   });
 
