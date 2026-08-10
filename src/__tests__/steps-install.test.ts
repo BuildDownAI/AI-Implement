@@ -65,6 +65,27 @@ describe("installStep", () => {
     expect(spawn).toHaveBeenCalledWith("npm", ["ci"], expect.anything());
   });
 
+  it("skips the install for a mounted workspace but still reports the package manager", async () => {
+    // The mounted workspace is the developer's live checkout: `npm ci` would delete
+    // their node_modules and rebuild native modules for linux-x64. preflight reads
+    // packageManager from these outputs, so it has to survive the skip.
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+    mockRootPackageJson((p) => p.endsWith("yarn.lock"));
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.packageManager).toBe("yarn");
+    expect(outputs.installMethod).toBe("skipped: mounted workspace");
+    expect(outputs.durationMs).toBe(0);
+    expect(spawn).not.toHaveBeenCalled();
+
+    vi.unstubAllEnvs();
+  });
+
   it("detects yarn when yarn.lock exists", async () => {
     mockRootPackageJson((p) => p.endsWith("yarn.lock"));
 

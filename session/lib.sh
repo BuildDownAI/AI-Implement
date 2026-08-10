@@ -29,3 +29,24 @@ require_one_of() {
   done
   fail "At least one of $* must be set"
 }
+
+# Make a bind-mounted workspace writable by `coder` without changing its ownership:
+# move coder onto the mount's uid/gid rather than chown-ing the host's files.
+# Usage: adopt_workspace_ownership <dir>
+adopt_workspace_ownership() {
+  local dir="$1" uid gid
+  uid="$(stat -c %u "$dir")"
+  gid="$(stat -c %g "$dir")"
+
+  # uid 0 means the mount presents as root-owned; re-numbering coder to 0 would
+  # defeat the non-root requirement, so leave it and let the probe decide.
+  if [ "$uid" != "0" ] && [ "$uid" != "$(id -u coder)" ]; then
+    # -o permits a uid/gid another image user already holds (base image: node=1000).
+    groupmod -o -g "$gid" coder 2>/dev/null || true
+    usermod -o -u "$uid" -g "$gid" coder
+    log "Adopted workspace ownership: coder is now ${uid}:${gid}"
+  fi
+
+  su -p coder -c "touch '$dir/.ai-implement-write-probe' && rm -f '$dir/.ai-implement-write-probe'" \
+    || fail "coder cannot write the mounted workspace at $dir (owned ${uid}:${gid}). Run the harness as the owner of that directory, or check your Docker file-sharing settings."
+}

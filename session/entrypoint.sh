@@ -18,6 +18,10 @@ else
 fi
 log "Execution mode: $AI_IMPLEMENT_MODE"
 export AI_IMPLEMENT_MODE
+# The dev harness bind-mounts a live checkout at /workspace.
+# Neither the clone nor the recursive chown below may run against it.
+MOUNTED_WORKSPACE=0
+if [ "${AI_IMPLEMENT_WORKSPACE_MODE:-}" = "mounted" ]; then MOUNTED_WORKSPACE=1; fi
 
 # ── 2. Env validation ────────────────────────────────────────────────────────
 PROVIDER="${PROVIDER:-anthropic}"
@@ -70,12 +74,17 @@ git config --global user.name "ai-implement-bot"
 git config --global user.email "ai-implement-bot@users.noreply.github.com"
 git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"
 
-REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
-log "Cloning ${GITHUB_OWNER}/${GITHUB_REPO}..."
-git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" /workspace
+if [ "$MOUNTED_WORKSPACE" = "1" ]; then
+  log "Mounted workspace: skipping clone; /workspace is supplied by the dev harness"
+else
+  REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
+  log "Cloning ${GITHUB_OWNER}/${GITHUB_REPO}..."
+  git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH" "$REPO_URL" /workspace
+fi
 git config --global --add safe.directory /workspace
 cd /workspace
-if [ -n "$PR_NUMBER" ]; then
+# gh pr checkout would move the developer's own working tree onto the PR branch.
+if [ -n "$PR_NUMBER" ] && [ "$MOUNTED_WORKSPACE" = "0" ]; then
   log "Gap-fill: checking out PR #$PR_NUMBER"
   # --depth + --branch narrows origin's fetch refspec to the cloned base branch.
   # gh pr checkout needs the PR head to count as a trackable remote branch.
@@ -86,7 +95,11 @@ if [ -n "$PR_NUMBER" ]; then
 fi
 
 # ── 5. Workspace ownership for non-root Claude ───────────────────────────────
-chown -R coder:coder /workspace
+if [ "$MOUNTED_WORKSPACE" = "1" ]; then
+  adopt_workspace_ownership /workspace
+else
+  chown -R coder:coder /workspace
+fi
 cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 

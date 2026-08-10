@@ -9,9 +9,24 @@ describe("session/entrypoint.sh", () => {
     expect(r.status).toBe(0);
   });
 
-  it("is under 115 lines (bootstrap, not monolith)", () => {
+  it("is under 135 lines (bootstrap, not monolith)", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content.split("\n").length).toBeLessThan(115);
+    expect(content.split("\n").length).toBeLessThan(135);
+  });
+
+  it("skips the clone and the recursive chown for a mounted workspace", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    // The dev harness bind-mounts a live checkout. Cloning into it fails outright,
+    // and `chown -R` would rewrite the developer's files on the host.
+    expect(content).toContain('if [ "${AI_IMPLEMENT_WORKSPACE_MODE:-}" = "mounted" ]; then MOUNTED_WORKSPACE=1; fi');
+    expect(content).toMatch(/if \[ "\$MOUNTED_WORKSPACE" = "1" \][\s\S]*git clone --depth=1/);
+    expect(content).toMatch(/if \[ "\$MOUNTED_WORKSPACE" = "1" \][\s\S]*adopt_workspace_ownership \/workspace[\s\S]*chown -R coder:coder \/workspace/);
+  });
+
+  it("does not run gh pr checkout against a mounted workspace", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    // gh pr checkout would move the developer's own working tree onto the PR branch.
+    expect(content).toContain('if [ -n "$PR_NUMBER" ] && [ "$MOUNTED_WORKSPACE" = "0" ]; then');
   });
 
   it("exec's the phase-selected TS runner as the final step", () => {

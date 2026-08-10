@@ -110,6 +110,18 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     }
 
     const packageManager = config.packageManager ?? detectPackageManager(workspaceDir);
+
+    // The workspace is the developer's live checkout. `npm ci` deletes node_modules and rebuilds native modules for linux-x64, breaking their host toolchain.
+    if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
+      return {
+        packageManager,
+        installMethod: "skipped: mounted workspace",
+        durationMs: 0,
+        repoModels: config.models ?? {},
+        reviewProviders: config.reviewProviders,
+      };
+    }
+
     const installMethod = buildInstallCommand(packageManager);
 
     const start = Date.now();
