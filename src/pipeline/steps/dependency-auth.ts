@@ -14,7 +14,7 @@ interface DependencyAuthInputs extends Record<string, unknown> {
   /** Test-only injectable spawnSync implementation. */
   spawnSyncImpl?: typeof spawnSync;
   /** Test-only injectable fs.writeFileSync implementation. */
-  writeFileSyncImpl?: (path: string, data: string) => void;
+  writeFileSyncImpl?: (path: string, data: string, options?: { mode?: number }) => void;
   /** Override credential helper executable path (test environments only). */
   credentialHelperPath?: string;
 }
@@ -40,7 +40,7 @@ export async function fetchDependencyToken(params: {
   fetchImpl?: typeof fetch;
 }): Promise<DependencyTokenResponse> {
   const { callbackBase, progressToken, fetchImpl: fetchFn = fetch } = params;
-  const url = `${callbackBase.replace(/\/$/, "")}/api/runner/dependency-token`;
+  const url = `${callbackBase.replace(/\/+$/, "")}/api/runner/dependency-token`;
   const res = await fetchFn(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${progressToken}` },
@@ -111,9 +111,11 @@ export const dependencyAuthStep: StepModule<DependencyAuthInputs, DependencyAuth
       // Write a token cache file that the credential helper reads on each git
       // invocation.  The helper overwrites this file when it refreshes.
       const tokenFilePath = join("/tmp", `ai-implement-dep-token-${process.pid}.json`);
-      writeFn(tokenFilePath, JSON.stringify({ token: result.token, expires_at: result.expires_at }));
+      writeFn(tokenFilePath, JSON.stringify({ token: result.token, expires_at: result.expires_at }), {
+        mode: 0o600,
+      });
       process.env.GIT_DEPENDENCY_TOKEN_FILE = tokenFilePath;
-      process.env.GIT_DEPENDENCY_CALLBACK_URL = callbackUrl;
+      process.env.GIT_DEPENDENCY_CALLBACK_URL = callbackUrl.replace(/\/+$/, "");
 
       // Register credential helper for https://github.com so git-based composer
       // installs can reach private sibling repos.

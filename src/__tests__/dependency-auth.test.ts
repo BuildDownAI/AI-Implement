@@ -461,9 +461,9 @@ describe("dependencyAuthStep credential helper registration", () => {
   });
 
   it("writes token cache file and sets GIT_DEPENDENCY_TOKEN_FILE + GIT_DEPENDENCY_CALLBACK_URL", async () => {
-    const writeCalls: Array<{ path: string; data: string }> = [];
-    const mockWrite = vi.fn().mockImplementation((path: string, data: string) => {
-      writeCalls.push({ path, data });
+    const writeCalls: Array<{ path: string; data: string; options?: { mode?: number } }> = [];
+    const mockWrite = vi.fn().mockImplementation((path: string, data: string, options?: { mode?: number }) => {
+      writeCalls.push({ path, data, options });
     });
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -471,7 +471,7 @@ describe("dependencyAuthStep credential helper registration", () => {
       ctx(),
       {
         dependencyTokenScope: "installation",
-        callbackUrl: "https://orch.example",
+        callbackUrl: "https://orch.example///",
         fetchImpl: mockFetch(200, { token: "dep-tok-file", expires_at: "2030-06-01T12:00:00Z" }),
         spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
         writeFileSyncImpl: mockWrite,
@@ -484,6 +484,7 @@ describe("dependencyAuthStep credential helper registration", () => {
     const written = JSON.parse(writeCalls[0].data) as { token: string; expires_at: string };
     expect(written.token).toBe("dep-tok-file");
     expect(written.expires_at).toBe("2030-06-01T12:00:00Z");
+    expect(writeCalls[0].options).toEqual({ mode: 0o600 });
     expect(process.env.GIT_DEPENDENCY_TOKEN_FILE).toBe(writeCalls[0].path);
     expect(process.env.GIT_DEPENDENCY_CALLBACK_URL).toBe("https://orch.example");
   });
