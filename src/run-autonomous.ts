@@ -131,6 +131,15 @@ export function isLocalDevHarness(env: NodeJS.ProcessEnv = process.env): boolean
   return env.AI_IMPLEMENT_MODE === "local" && env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted";
 }
 
+export function waitForContainerRemoval(
+  schedule: (callback: () => void, delayMs: number) => unknown = (callback, delayMs) =>
+    setInterval(callback, delayMs),
+): Promise<never> {
+  return new Promise<never>(() => {
+    schedule(() => undefined, 60_000);
+  });
+}
+
 /** Single-quote a shell value, escaping embedded single-quotes. */
 function shellQuote(val: string): string {
   return "'" + val.replace(/'/g, "'\\''") + "'";
@@ -600,8 +609,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         // a bash session via `docker exec -it` and remove the container when
         // the user exits. The exit code is embedded so the CLI can preserve it.
         process.stdout.write(`[dev:run] shell-ready exit=${r.exitCode}\n`);
-        // Keep the container alive until the Docker daemon kills the process.
-        await new Promise<never>(() => {});
+        // A pending Promise alone does not keep Node's event loop alive. The
+        // referenced interval keeps the runner process alive until docker rm.
+        await waitForContainerRemoval();
       }
       process.exit(r.exitCode);
     })

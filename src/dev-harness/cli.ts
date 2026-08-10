@@ -14,7 +14,7 @@ export interface DevHarnessCliDependencies {
   streamLogsUntilShellReady: typeof streamLogsUntilShellReady;
   getRunStatus: typeof getRunStatus;
   collectRunArtifacts: typeof collectRunArtifacts;
-  spawnDocker: (args: string[], stdio: "inherit" | "ignore") => void;
+  spawnDocker: (args: string[], stdio: "inherit" | "ignore") => number;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
   now: () => number;
@@ -26,7 +26,7 @@ const DEFAULT_DEPENDENCIES: DevHarnessCliDependencies = {
   streamLogsUntilShellReady,
   getRunStatus,
   collectRunArtifacts,
-  spawnDocker: (args, stdio) => { spawnSync("docker", args, { stdio }); },
+  spawnDocker: (args, stdio) => spawnSync("docker", args, { stdio }).status ?? 1,
   writeStdout: (text) => process.stdout.write(text),
   writeStderr: (text) => process.stderr.write(text),
   now: () => Date.now(),
@@ -88,10 +88,11 @@ export async function runDevHarnessCli(
         `[dev:run] hook env exports sourced from /tmp/dev-run-env.sh\n` +
         `[dev:run] attaching shell at /workspace — type "exit" when done\n`,
       );
-      deps.spawnDocker(
+      const shellExitCode = deps.spawnDocker(
         ["exec", "-it", "--workdir", "/workspace", handle.containerName, "bash", "--init-file", "/tmp/dev-run-env.sh"],
         "inherit",
       );
+      if (shellExitCode !== 0) finalExitCode = shellExitCode;
 
       try {
         await deps.collectRunArtifacts(handle, finalExitCode);
