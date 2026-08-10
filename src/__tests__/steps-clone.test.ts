@@ -196,6 +196,37 @@ describe("cloneStep", () => {
     }
   });
 
+  it("keeps the boot token when credential vending rejects the refresh", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+    } as Response));
+    mockSpawn([
+      { status: 0 },
+      { status: 0, stdout: "sha1\n" },
+      { status: 0 },
+    ]);
+
+    try {
+      const outputs = await cloneStep.run(makeContext(), {
+        ...PR_INPUTS,
+        orchestratorUrl: "https://orchestrator.example",
+        machineNonce: "machine-nonce",
+        baseBranch: undefined,
+      }, new NoopStepReporter());
+
+      expect(outputs.githubToken).toBe("secret-token");
+      expect(spawnSync).toHaveBeenLastCalledWith(
+        "git",
+        ["remote", "set-url", "origin", "https://x-access-token:secret-token@github.com/acme/app.git"],
+        expect.objectContaining({ cwd: "/tmp/workspace" }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   describe("PR-targeted (gap-fill) runs: base branch fetch", () => {
     it("fetches base branch after clone and verifies merge-base on a fresh clone", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);

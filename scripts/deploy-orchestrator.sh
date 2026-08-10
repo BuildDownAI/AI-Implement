@@ -12,12 +12,17 @@
 #      prefix doesn't affect same-line expansion and passes an empty secret.
 #
 # Usage:
-#   ./scripts/deploy-orchestrator.sh [app-name]     # default: ai-implement-testing-orchestrator
+#   ./scripts/deploy-orchestrator.sh <app-name>
 #
 # Requires: fly (authed), gh (authed with read access to the private KG repo).
 set -euo pipefail
 
-APP="${1:-ai-implement-testing-orchestrator}"
+if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+    echo "Usage: $0 <app-name>" >&2
+    echo "An explicit Fly app is required to prevent deploying a fork to the upstream app." >&2
+    exit 64
+fi
+APP="$1"
 
 export GH_TOKEN="${GH_TOKEN:-$(gh auth token)}"
 if [ -z "$GH_TOKEN" ]; then
@@ -33,6 +38,7 @@ fly deploy --remote-only --no-cache --build-secret kg_token="$GH_TOKEN" --app "$
 # without the sidecar — the exact failure this script exists to prevent.
 echo "==> verifying /mcp on https://$APP.fly.dev"
 for i in $(seq 1 12); do
+    echo "==> MCP readiness attempt $i/12"
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST "https://$APP.fly.dev/mcp" -d '{}' || echo 000)
     [ "$code" = "401" ] && break
     sleep 5

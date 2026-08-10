@@ -42,6 +42,7 @@ import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js"
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
+import { withRequestErrorBoundary } from "./http-server.js";
 import {
   initMcpOAuthTables,
   handleMcpProtectedResourceMetadata,
@@ -2546,8 +2547,9 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
-  const server = http.createServer((req, res) => {
+  const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
+    const pathname = url.split("?")[0];
 
     // Health check
     if (url === "/" && req.method === "GET") {
@@ -2770,19 +2772,19 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
     }
 
     // MCP well-known metadata endpoints (public — no auth required)
-    if (url.split("?")[0] === "/.well-known/oauth-protected-resource" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl) {
+    if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
         return;
       }
       handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
       return;
     }
-    if (url.split("?")[0] === "/.well-known/oauth-authorization-server" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl) {
+    if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
         return;
       }
       handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
@@ -2790,11 +2792,10 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
     }
 
     // MCP OAuth routes — dynamic client registration, authorization, token exchange
-    if (url.startsWith("/mcp/") || url === "/mcp/register" || url === "/mcp/authorize" || url === "/mcp/token") {
-      const pathname = url.split("?")[0];
-      if (!config.oauthRedirectBaseUrl) {
+    if (pathname.startsWith("/mcp/")) {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
         return;
       }
       if (pathname === "/mcp/register" && req.method === "POST") {
@@ -2842,7 +2843,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
     }
 
     // MCP endpoint — OAuth bearer token authenticated
-    if (url === "/mcp") {
+    if (pathname === "/mcp") {
       handleMcpRequest(req, res, config.kgSidecarUrl, config.oauthRedirectBaseUrl).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
@@ -2856,7 +2857,6 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
     // OAuth / SSO — its own auth model (public providers endpoint + the OAuth flow);
     // mounted before the admin 503-gate so it works when ADMIN_ACCESS_CODE is unset.
     if (url.startsWith("/api/auth/")) {
-      const pathname = url.split("?")[0];
       // `secure` reflects the real scheme from Fly's proxy-set x-forwarded-proto.
       // The app is only reachable through that proxy, so the header is trusted; don't copy this to a directly-exposed server.
       const secure = String(req.headers["x-forwarded-proto"] ?? "").includes("https");
@@ -2916,7 +2916,8 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
 
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
-  });
+  };
+  const server = http.createServer(withRequestErrorBoundary(handleRequest));
 
   server.listen(config.healthPort, () => {
     console.log(`[server] Listening on port ${config.healthPort}`);

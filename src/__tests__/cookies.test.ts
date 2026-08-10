@@ -35,6 +35,14 @@ describe("parseCookies", () => {
     expect(parseCookies("k=a%20b")).toEqual({ k: "a b" });
   });
 
+  it("preserves malformed percent-encoding instead of throwing", () => {
+    expect(parseCookies("k=%; other=%zz; truncated=%E0%A4%A")).toEqual({
+      k: "%",
+      other: "%zz",
+      truncated: "%E0%A4%A",
+    });
+  });
+
   it("skips malformed parts with no '=' and parts with an empty name", () => {
     expect(parseCookies("a=1; garbage; =novalue; b=2")).toEqual({ a: "1", b: "2" });
   });

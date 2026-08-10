@@ -43,6 +43,7 @@ describe("refreshRunnerGithubCredentialsFromEnvironment", () => {
       owner: "BuildDownAI",
       repo: "AI-Implement",
       workspaceDir: "/workspace",
+      strict: true,
     });
   });
 });

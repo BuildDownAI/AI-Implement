@@ -46,6 +46,7 @@ export async function refreshRunnerGithubCredentialsFromEnvironment(
     owner,
     repo,
     workspaceDir,
+    strict: true,
   });
 }
 

@@ -198,6 +198,7 @@ describe("handleMcpRequest", () => {
       );
       const hdrs = capturedOpts.value!.headers as Record<string, string>;
       expect(hdrs.authorization).toBeUndefined();
+      expect(hdrs.cookie).toBeUndefined();
       expect(hdrs["content-type"]).toBe("application/json");
     });
 

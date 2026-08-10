@@ -139,6 +139,42 @@ describe("pushStep", () => {
     }
   });
 
+  it("completes the push with the boot token when credential vending returns 403", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        orchestratorUrl: "https://orchestrator.example",
+        machineNonce: "machine-nonce",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prNumber).toBe(7);
+    const remoteCalls = vi.mocked(spawnSync).mock.calls.filter(([, args]) =>
+      ["ls-remote", "push"].includes((args as string[])[0]),
+    );
+    expect(remoteCalls).toHaveLength(2);
+    for (const [, args] of remoteCalls) {
+      expect((args as string[]).join(" ")).toContain("gh-token");
+    }
+    const prRequest = vi.mocked(fetch).mock.calls[1];
+    expect(prRequest[1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer gh-token" }));
+  });
+
   it("uses the context branch as the PR base when baseBranch input is omitted", async () => {
     mockGitSuccess("abc123");
     vi.mocked(fetch).mockResolvedValueOnce({

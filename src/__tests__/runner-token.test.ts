@@ -84,7 +84,7 @@ describe("refreshRunnerGithubToken", () => {
     );
   });
 
-  it("rejects nonce and owner validation failures instead of masking them", async () => {
+  it("keeps the boot token when vending rejects an automated refresh", async () => {
     const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 403 } as Response);
 
     await expect(refreshRunnerGithubToken({
@@ -93,7 +93,32 @@ describe("refreshRunnerGithubToken", () => {
       machineNonce: "invalid-nonce",
       owner: "BuildDownAI",
       fetchImpl,
+    })).resolves.toBe("boot-token");
+  });
+
+  it("rejects vending failures in strict mode", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 403 } as Response);
+
+    await expect(refreshRunnerGithubToken({
+      currentToken: "boot-token",
+      orchestratorUrl: "https://orchestrator.example",
+      machineNonce: "invalid-nonce",
+      owner: "BuildDownAI",
+      fetchImpl,
+      strict: true,
     })).rejects.toThrow(/rejected with HTTP 403/);
+  });
+
+  it("still rejects unexpected client errors in automated mode", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 400 } as Response);
+
+    await expect(refreshRunnerGithubToken({
+      currentToken: "boot-token",
+      orchestratorUrl: "https://orchestrator.example",
+      machineNonce: "machine-nonce",
+      owner: "BuildDownAI",
+      fetchImpl,
+    })).rejects.toThrow(/rejected with HTTP 400/);
   });
 
   it("does not call the orchestrator without both URL and nonce", async () => {

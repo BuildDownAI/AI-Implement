@@ -200,9 +200,13 @@ export function appendLog(entry: {
     entry.groupingParent ? 1 : 0,
   );
 
-  // Keep only the most recent MAX_LOG_ENTRIES rows
+  // Keep only the most recent MAX_LOG_ENTRIES rows, but never evict a row while
+  // its machine nonce is active. Token vending and callbacks depend on that row
+  // for the run lifetime; invalidateNonce() makes it prunable when terminal.
   db.prepare(
-    "DELETE FROM dispatch_log WHERE id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)",
+    `DELETE FROM dispatch_log
+     WHERE machine_nonce IS NULL
+       AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)`,
   ).run(MAX_LOG_ENTRIES);
 
   return Number(result.lastInsertRowid);
@@ -263,13 +267,17 @@ export function updateJobStatus(
   // must not wipe the link on completion.
   getDb()
     .prepare(
-      "UPDATE dispatch_log SET status = ?, conclusion = ?, pr_url = COALESCE(?, pr_url), completed_at = ? WHERE id = ?",
+      `UPDATE dispatch_log
+       SET status = ?, conclusion = ?, pr_url = COALESCE(?, pr_url), completed_at = ?,
+           machine_nonce = CASE WHEN ? = 1 THEN NULL ELSE machine_nonce END
+       WHERE id = ?`,
     )
     .run(
       status,
       conclusion ?? null,
       prUrl ?? null,
       isTerminal ? Date.now() : null,
+      isTerminal ? 1 : 0,
       jobId,
     );
 }

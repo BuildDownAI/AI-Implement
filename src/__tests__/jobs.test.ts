@@ -232,6 +232,28 @@ describe("jobs table", () => {
     const all = log.listLog({ limit: 600 });
     expect(all.length).toBeLessThanOrEqual(500);
   });
+
+  it("retains rows with active machine nonces beyond the log window", () => {
+    log.appendLog({ issueId: "active-run", machineNonce: "active-nonce" });
+
+    for (let i = 0; i < 501; i++) {
+      log.appendLog({ issueId: `later-${i}` });
+    }
+
+    expect(log.getJobByNonce("active-nonce")?.issueId).toBe("active-run");
+  });
+
+  it("clears terminal nonces and allows their rows to be pruned", () => {
+    const terminalId = log.appendLog({ issueId: "terminal-run", machineNonce: "terminal-nonce" });
+    log.updateJobStatus(terminalId, "failed", "failure");
+    dedup.getDb().prepare("UPDATE dispatch_log SET dispatched_at = 0 WHERE id = ?").run(terminalId);
+
+    expect(log.getJobByNonce("terminal-nonce")).toBeNull();
+    for (let i = 0; i < 501; i++) {
+      log.appendLog({ issueId: `later-terminal-${i}` });
+    }
+    expect(log.getJobById(terminalId)).toBeNull();
+  });
 });
 
 describe("listLog time filtering", () => {
