@@ -104,6 +104,8 @@ Admin UI: `http://localhost:8080/admin` (requires an OAuth provider configured *
 
 ```bash
 npm run dev:run -- --workspace ../target-repo --task task.md
+npm run dev:run -- --workspace ../target-repo --task task.md --until setup
+npm run dev:run -- --workspace ../target-repo --task task.md --until setup --shell
 ```
 
 **Task file format** (`task.md`):
@@ -122,6 +124,8 @@ Issue description / implementation instructions go here.
 
 **How it works:**
 - `--workspace <dir>` bind-mounts the local checkout at `/workspace` inside the container.
+- `--until <step>` stops after that pipeline step, including when the step is skipped. Unknown step names fail before execution instead of falling through to a full implementation run. `--until setup` is the token-free setup-hook loop.
+- `--shell` keeps the local container alive after the selected boundary and attaches an interactive shell in `/workspace`; setup-hook `$GITHUB_ENV` exports are loaded into that shell. Exiting collects artifacts and then removes the container.
 - The clone step detects `AI_IMPLEMENT_WORKSPACE_MODE=mounted` and skips `git fetch/reset` entirely, so uncommitted edits to `WORKFLOW.md` and hook scripts take effect immediately.
 - Mounted mode **never pushes** — the push step is a no-op whenever `AI_IMPLEMENT_WORKSPACE_MODE=mounted`. The mount is your live checkout, dirty by design (the uncommitted `WORKFLOW.md`/hook edits under test), so a push would sweep in-progress work into the commit. The mutated working tree is left in the mount for inspection with `git diff`; commit/push the parts you want to keep yourself.
 - Logs are streamed to the terminal in real time. Per-run artifacts (log, diff, telemetry) are saved to `.dev-runs/<timestamp>/` (gitignored).
