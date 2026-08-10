@@ -103,9 +103,9 @@ describe("session/git-credential-helper.sh", () => {
     const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
     const tokenFile = join(dir, "token.json");
 
-    let serverCalled = false;
-    const server = http.createServer((_req, res) => {
-      serverCalled = true;
+    let requestedUrl: string | undefined;
+    const server = http.createServer((req, res) => {
+      requestedUrl = req.url;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -131,7 +131,7 @@ describe("session/git-credential-helper.sh", () => {
           env: {
             ...process.env,
             GIT_DEPENDENCY_TOKEN_FILE: tokenFile,
-            GIT_DEPENDENCY_CALLBACK_URL: `http://127.0.0.1:${port}`,
+            GIT_DEPENDENCY_CALLBACK_URL: `http://127.0.0.1:${port}///`,
             RUN_PROGRESS_TOKEN: "progress-tok",
           },
         });
@@ -147,7 +147,7 @@ describe("session/git-credential-helper.sh", () => {
         setTimeout(() => reject(new Error("helper timed out")), 15000);
       });
 
-      expect(serverCalled).toBe(true);
+      expect(requestedUrl).toBe("/api/runner/dependency-token");
       expect(stdout).toContain("password=refreshed-tok");
       // Helper must update the cache file with the refreshed token.
       const cached = JSON.parse(readFileSync(tokenFile, "utf-8")) as { token: string };

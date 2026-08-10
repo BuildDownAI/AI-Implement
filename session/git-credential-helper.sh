@@ -49,6 +49,11 @@ EXPIRES_AT=$(jq -r '.expires_at // empty' "$TOKEN_FILE" 2>/dev/null) || true
 # estimate could lie; see AII-294 notes on widening getScopedInstallationToken
 # to surface the real expiry.
 CALLBACK_URL="${GIT_DEPENDENCY_CALLBACK_URL:-}"
+# Treat this environment value as untrusted input. Normalize all trailing
+# slashes so appending the exact route can never produce a double-slash path.
+while [ "${CALLBACK_URL%/}" != "$CALLBACK_URL" ]; do
+    CALLBACK_URL="${CALLBACK_URL%/}"
+done
 PROGRESS_TOKEN="${RUN_PROGRESS_TOKEN:-}"
 
 if [ -n "$EXPIRES_AT" ] && [ -n "$CALLBACK_URL" ] && [ -n "$PROGRESS_TOKEN" ]; then
