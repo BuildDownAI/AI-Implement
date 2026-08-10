@@ -24,6 +24,15 @@ const googleProvider: OidcProviderConfig = {
   scopes: ["openid", "email", "profile"],
 };
 
+const microsoftProvider: OidcProviderConfig = {
+  id: "microsoft",
+  label: "Microsoft",
+  issuer: "https://login.microsoftonline.com/common/v2.0",
+  clientId: "mid",
+  clientSecret: "msecret",
+  scopes: ["openid", "email", "profile"],
+};
+
 const identity = (over: Partial<VerifiedIdentity> = {}): VerifiedIdentity => ({
   provider: "google",
   sub: "google|1",
@@ -98,6 +107,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   dedup.closeDb();
   try {
     fs.unlinkSync(dbPath);
@@ -118,7 +128,7 @@ function pkceChallenge(verifier: string): string {
 }
 
 // Register a client and return its client_id
-async function registerClient(redirectUris: string[] = ["http://localhost:8080/callback"]): Promise<string> {
+async function registerClient(redirectUris: string[] = ["http://127.0.0.1:8080/callback"]): Promise<string> {
   const body = JSON.stringify({ redirect_uris: redirectUris, client_name: "test-client" });
   const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
   const res = new MockResponse();
@@ -128,7 +138,7 @@ async function registerClient(redirectUris: string[] = ["http://localhost:8080/c
 }
 
 // Full authorize flow — starts auth, returns the captured OIDC state
-async function startAuthorize(clientId: string, redirectUri = "http://localhost:8080/callback"): Promise<{ res: MockResponse; codeVerifier: string; codeChallenge: string }> {
+async function startAuthorize(clientId: string, redirectUri = "http://127.0.0.1:8080/callback"): Promise<{ res: MockResponse; codeVerifier: string; codeChallenge: string }> {
   const codeVerifier = "test-verifier-0123456789abcdefghij";
   const codeChallenge = pkceChallenge(codeVerifier);
   const req = mkReq(
@@ -156,7 +166,7 @@ async function doCallback(id: VerifiedIdentity = identity()): Promise<{ res: Moc
 }
 
 // Exchange a code for an MCP token
-async function exchangeToken(code: string, codeVerifier: string, redirectUri = "http://localhost:8080/callback"): Promise<{ res: MockResponse; token?: string }> {
+async function exchangeToken(code: string, codeVerifier: string, redirectUri = "http://127.0.0.1:8080/callback"): Promise<{ res: MockResponse; token?: string }> {
   const clientId = await registerClient([redirectUri]);
   // Re-use the authorize flow to ensure the code row has the right client_id
   // (In real usage the client_id comes from the registration before authorize)
@@ -208,17 +218,67 @@ describe("handleMcpAuthorizationServerMetadata", () => {
 
 describe("handleMcpClientRegistration", () => {
   it("registers a client and returns a client_id", async () => {
-    const body = JSON.stringify({ redirect_uris: ["http://localhost/cb"], client_name: "My Client" });
+    const body = JSON.stringify({ redirect_uris: ["http://127.0.0.1/cb"], client_name: "My Client" });
     const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
     const res = new MockResponse();
     await mcpOauth.handleMcpClientRegistration(req, asRes(res));
     expect(res.statusCode).toBe(201);
     const data = JSON.parse(res.body);
     expect(typeof data.client_id).toBe("string");
-    expect(data.redirect_uris).toEqual(["http://localhost/cb"]);
+    expect(data.redirect_uris).toEqual(["http://127.0.0.1/cb"]);
     expect(data.client_name).toBe("My Client");
     expect(data.grant_types).toContain("authorization_code");
     expect(data.grant_types).toContain("refresh_token");
+  });
+
+  it("accepts IPv4 and IPv6 loopback IP redirect URIs", async () => {
+    const body = JSON.stringify({
+      redirect_uris: [
+        "http://127.0.0.1:8080/callback",
+        "http://127.0.0.2:3000/callback",
+        "http://[::1]:4000/callback",
+      ],
+    });
+    const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpClientRegistration(req, asRes(res));
+    expect(res.statusCode).toBe(201);
+  });
+
+  it("rejects localhost hostname redirects in favor of loopback IP literals", async () => {
+    const body = JSON.stringify({ redirect_uris: ["http://localhost:8080/callback"] });
+    const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpClientRegistration(req, asRes(res));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("invalid_redirect_uri");
+  });
+
+  it("rejects an arbitrary HTTPS redirect origin by default", async () => {
+    const body = JSON.stringify({ redirect_uris: ["https://attacker.example/callback"] });
+    const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpClientRegistration(req, asRes(res));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("invalid_redirect_uri");
+  });
+
+  it("accepts HTTPS callbacks only from an explicitly allowed origin", async () => {
+    vi.stubEnv("MCP_ALLOWED_REDIRECT_ORIGINS", "https://client.example.com");
+    const body = JSON.stringify({ redirect_uris: ["https://client.example.com/callback"] });
+    const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpClientRegistration(req, asRes(res));
+    expect(res.statusCode).toBe(201);
+  });
+
+  it("rejects private-use scheme redirect URIs", async () => {
+    const body = JSON.stringify({ redirect_uris: ["com.example.app:/oauth2redirect"] });
+    const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpClientRegistration(req, asRes(res));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("invalid_redirect_uri");
   });
 
   it("rejects missing redirect_uris", async () => {
@@ -245,6 +305,55 @@ describe("handleMcpClientRegistration", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe("invalid_request");
   });
+
+  it("rejects oversized registration bodies without buffering them", async () => {
+    const req = mkReq(
+      "/mcp/register",
+      "POST",
+      { "content-type": "application/json" },
+      JSON.stringify({ redirect_uris: ["https://client.example/cb"], padding: "x".repeat(70_000) }),
+    );
+    const res = new MockResponse();
+    await mcpOauth.handleMcpClientRegistration(req, asRes(res));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe("invalid_request");
+  });
+
+  it("rate-limits anonymous registrations within the durable hourly window", async () => {
+    const insert = dedup.getDb().prepare(
+      "INSERT INTO mcp_clients (client_id, redirect_uris, client_name, created_at) VALUES (?, ?, NULL, ?)",
+    );
+    const now = Date.now();
+    for (let i = 0; i < 100; i++) {
+      insert.run(`existing-${i}`, '["https://client.example/cb"]', now);
+    }
+
+    const req = mkReq(
+      "/mcp/register",
+      "POST",
+      { "content-type": "application/json" },
+      JSON.stringify({ redirect_uris: ["http://127.0.0.1/cb"] }),
+    );
+    const res = new MockResponse();
+    await mcpOauth.handleMcpClientRegistration(req, asRes(res));
+    expect(res.statusCode).toBe(429);
+    expect(res.headers["Retry-After"]).toBe("3600");
+  });
+
+  it("sweeps abandoned registrations but retains clients that completed authorization", () => {
+    const stale = Date.now() - 25 * 60 * 60 * 1000;
+    dedup.getDb().prepare(
+      "INSERT INTO mcp_clients (client_id, redirect_uris, client_name, created_at, used_at) VALUES (?, ?, NULL, ?, ?)",
+    ).run("abandoned", '["https://client.example/cb"]', stale, null);
+    dedup.getDb().prepare(
+      "INSERT INTO mcp_clients (client_id, redirect_uris, client_name, created_at, used_at) VALUES (?, ?, NULL, ?, ?)",
+    ).run("used", '["https://client.example/cb"]', stale, stale);
+
+    mcpOauth.initMcpOAuthTables();
+
+    const rows = dedup.getDb().prepare("SELECT client_id FROM mcp_clients ORDER BY client_id").all() as Array<{ client_id: string }>;
+    expect(rows.map((row) => row.client_id)).toEqual(["used"]);
+  });
 });
 
 // ---------- Unit: authorize endpoint ----------
@@ -257,10 +366,35 @@ describe("handleMcpAuthorize", () => {
     expect(res.headers["Location"]).toContain("accounts.google.com");
   });
 
+  it("honors an explicit provider choice when multiple providers are configured", async () => {
+    providers.configureOAuthProviders([googleProvider, microsoftProvider]);
+    const clientId = await registerClient();
+    const codeChallenge = pkceChallenge("verifier");
+    const req = mkReq(
+      `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://127.0.0.1:8080/callback")}&state=s&code_challenge=${codeChallenge}&code_challenge_method=S256&provider=microsoft`,
+    );
+    const res = new MockResponse();
+    await mcpOauth.handleMcpAuthorize(req, asRes(res), BASE_URL);
+    expect(res.statusCode).toBe(302);
+    expect(oidc.buildAuthUrl).toHaveBeenCalledWith(expect.objectContaining({ id: "microsoft" }), expect.any(String));
+  });
+
+  it("rejects an unknown explicit provider", async () => {
+    const clientId = await registerClient();
+    const codeChallenge = pkceChallenge("verifier");
+    const req = mkReq(
+      `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://127.0.0.1:8080/callback")}&state=s&code_challenge=${codeChallenge}&code_challenge_method=S256&provider=unknown`,
+    );
+    const res = new MockResponse();
+    await mcpOauth.handleMcpAuthorize(req, asRes(res), BASE_URL);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error_description).toBe("Unknown provider");
+  });
+
   it("rejects unknown client_id", async () => {
     const codeChallenge = pkceChallenge("verifier");
     const req = mkReq(
-      `/mcp/authorize?response_type=code&client_id=unknown&redirect_uri=${encodeURIComponent("http://localhost/cb")}&state=s&code_challenge=${codeChallenge}&code_challenge_method=S256`,
+      `/mcp/authorize?response_type=code&client_id=unknown&redirect_uri=${encodeURIComponent("http://127.0.0.1/cb")}&state=s&code_challenge=${codeChallenge}&code_challenge_method=S256`,
     );
     const res = new MockResponse();
     await mcpOauth.handleMcpAuthorize(req, asRes(res), BASE_URL);
@@ -269,7 +403,7 @@ describe("handleMcpAuthorize", () => {
   });
 
   it("rejects unregistered redirect_uri", async () => {
-    const clientId = await registerClient(["http://localhost/cb"]);
+    const clientId = await registerClient(["http://127.0.0.1/cb"]);
     const codeChallenge = pkceChallenge("verifier");
     const req = mkReq(
       `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://evil.com/cb")}&state=s&code_challenge=${codeChallenge}&code_challenge_method=S256`,
@@ -283,7 +417,7 @@ describe("handleMcpAuthorize", () => {
   it("rejects missing code_challenge", async () => {
     const clientId = await registerClient();
     const req = mkReq(
-      `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://localhost:8080/callback")}&state=s`,
+      `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://127.0.0.1:8080/callback")}&state=s`,
     );
     const res = new MockResponse();
     await mcpOauth.handleMcpAuthorize(req, asRes(res), BASE_URL);
@@ -294,7 +428,7 @@ describe("handleMcpAuthorize", () => {
   it("rejects unsupported response_type", async () => {
     const clientId = await registerClient();
     const req = mkReq(
-      `/mcp/authorize?response_type=token&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://localhost:8080/callback")}&state=s&code_challenge=x&code_challenge_method=S256`,
+      `/mcp/authorize?response_type=token&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://127.0.0.1:8080/callback")}&state=s&code_challenge=x&code_challenge_method=S256`,
     );
     const res = new MockResponse();
     await mcpOauth.handleMcpAuthorize(req, asRes(res), BASE_URL);
@@ -305,7 +439,7 @@ describe("handleMcpAuthorize", () => {
   it("rejects non-S256 code_challenge_method", async () => {
     const clientId = await registerClient();
     const req = mkReq(
-      `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://localhost:8080/callback")}&state=s&code_challenge=x&code_challenge_method=plain`,
+      `/mcp/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("http://127.0.0.1:8080/callback")}&state=s&code_challenge=x&code_challenge_method=plain`,
     );
     const res = new MockResponse();
     await mcpOauth.handleMcpAuthorize(req, asRes(res), BASE_URL);
@@ -323,7 +457,7 @@ describe("handleMcpOidcCallback", () => {
     expect(res.statusCode).toBe(302);
     expect(code).toBeTruthy();
     const location = res.headers["Location"] as string;
-    expect(location).toContain("localhost:8080");
+    expect(location).toContain("127.0.0.1:8080");
     expect(new URL(location).searchParams.get("state")).toBe("clientstate");
   });
 
@@ -394,7 +528,7 @@ async function exchangeCode(code: string, codeVerifier: string, clientId: string
   const body = new URLSearchParams({
     grant_type: "authorization_code",
     code,
-    redirect_uri: "http://localhost:8080/callback",
+    redirect_uri: "http://127.0.0.1:8080/callback",
     client_id: clientId,
     code_verifier: codeVerifier,
   }).toString();
@@ -413,7 +547,7 @@ describe("handleMcpTokenRequest", () => {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       code,
-      redirect_uri: "http://localhost:8080/callback",
+      redirect_uri: "http://127.0.0.1:8080/callback",
       client_id: clientId,
       code_verifier: codeVerifier,
     }).toString();
@@ -433,7 +567,7 @@ describe("handleMcpTokenRequest", () => {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       code,
-      redirect_uri: "http://localhost:8080/callback",
+      redirect_uri: "http://127.0.0.1:8080/callback",
       client_id: clientId,
       code_verifier: "wrong-verifier",
     }).toString();
@@ -449,7 +583,7 @@ describe("handleMcpTokenRequest", () => {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       code: "nonexistentcode",
-      redirect_uri: "http://localhost:8080/callback",
+      redirect_uri: "http://127.0.0.1:8080/callback",
       client_id: clientId,
       code_verifier: codeVerifier,
     }).toString();
@@ -465,7 +599,7 @@ describe("handleMcpTokenRequest", () => {
     const params = new URLSearchParams({
       grant_type: "authorization_code",
       code,
-      redirect_uri: "http://localhost:8080/callback",
+      redirect_uri: "http://127.0.0.1:8080/callback",
       client_id: clientId,
       code_verifier: codeVerifier,
     }).toString();
@@ -494,7 +628,7 @@ describe("handleMcpTokenRequest", () => {
     const body = JSON.stringify({
       grant_type: "authorization_code",
       code,
-      redirect_uri: "http://localhost:8080/callback",
+      redirect_uri: "http://127.0.0.1:8080/callback",
       client_id: clientId,
       code_verifier: codeVerifier,
     });
@@ -630,7 +764,7 @@ describe("verifyMcpToken", () => {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       code: code!,
-      redirect_uri: "http://localhost:8080/callback",
+      redirect_uri: "http://127.0.0.1:8080/callback",
       client_id: clientId,
       code_verifier: codeVerifier,
     }).toString();

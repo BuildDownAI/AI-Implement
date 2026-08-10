@@ -36,6 +36,7 @@ export async function handleMcpRequest(
   const forwardHeaders = { ...req.headers };
   delete forwardHeaders.authorization;
   delete forwardHeaders.host;
+  delete forwardHeaders.cookie;
 
   const options: http.RequestOptions = {
     hostname: target.hostname,

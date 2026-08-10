@@ -18,6 +18,7 @@
 
 import crypto from "node:crypto";
 import type http from "node:http";
+import { isIP } from "node:net";
 import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
@@ -31,6 +32,10 @@ export const MCP_TOKEN_TTL_MS: number = (() => {
 const MCP_REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;                  // 10 minutes
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000;                     // 5 minutes
+const UNUSED_CLIENT_TTL_MS = 24 * 60 * 60 * 1000;            // 24 hours to complete first auth
+const REGISTRATION_WINDOW_MS = 60 * 60 * 1000;                // 1 hour
+const MAX_REGISTRATIONS_PER_WINDOW = 100;
+const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -46,9 +51,17 @@ export function initMcpOAuthTables(): void {
       client_id     TEXT PRIMARY KEY,
       redirect_uris TEXT NOT NULL,
       client_name   TEXT,
-      created_at    INTEGER NOT NULL
+      created_at    INTEGER NOT NULL,
+      used_at       INTEGER
     )
   `);
+  const clientColumns = db.prepare("PRAGMA table_info(mcp_clients)").all() as Array<{ name: string }>;
+  if (!clientColumns.some((column) => column.name === "used_at")) {
+    db.exec("ALTER TABLE mcp_clients ADD COLUMN used_at INTEGER");
+    // Existing registrations predate usage tracking and must remain valid.
+    db.exec("UPDATE mcp_clients SET used_at = created_at");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_mcp_clients_created_at ON mcp_clients(created_at)");
   db.exec(`
     CREATE TABLE IF NOT EXISTS mcp_oauth_states (
       oidc_state            TEXT PRIMARY KEY,
@@ -104,10 +117,48 @@ export function initMcpOAuthTables(): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_mcp_refresh_tokens_family ON mcp_refresh_tokens(family_id)`);
   // Sweep stale rows on startup
   const now = Date.now();
+  db.prepare("DELETE FROM mcp_clients WHERE used_at IS NULL AND created_at < ?").run(now - UNUSED_CLIENT_TTL_MS);
   db.prepare("DELETE FROM mcp_oauth_states WHERE expires_at < ?").run(now);
   db.prepare("DELETE FROM mcp_auth_codes WHERE expires_at < ?").run(now);
   db.prepare("DELETE FROM mcp_tokens WHERE expires_at < ?").run(now);
   db.prepare("DELETE FROM mcp_refresh_tokens WHERE expires_at < ?").run(now);
+}
+
+function isAllowedRedirectUri(redirectUri: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(redirectUri);
+  } catch {
+    return false;
+  }
+
+  if (parsed.username || parsed.password) {
+    return false;
+  }
+
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (parsed.protocol === "http:") {
+    const ipVersion = isIP(host);
+    return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
+  }
+
+  if (parsed.protocol !== "https:") {
+    return false;
+  }
+
+  const allowedOrigins = (process.env.MCP_ALLOWED_REDIRECT_ORIGINS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .flatMap((value) => {
+      try {
+        const url = new URL(value);
+        return url.protocol === "https:" && !url.username && !url.password ? [url.origin] : [];
+      } catch {
+        return [];
+      }
+    });
+  return allowedOrigins.includes(parsed.origin);
 }
 
 // ---------- Token verification ----------
@@ -188,19 +239,33 @@ export async function handleMcpClientRegistration(
   if (
     !Array.isArray(redirectUris) ||
     redirectUris.length === 0 ||
-    redirectUris.some((u) => typeof u !== "string")
+    redirectUris.some((u) => typeof u !== "string" || !isAllowedRedirectUri(u))
   ) {
     return json(res, 400, {
       error: "invalid_redirect_uri",
-      error_description: "redirect_uris must be a non-empty array of strings",
+      error_description: "redirect_uris must use a loopback IP literal over HTTP or an explicitly allowed HTTPS origin",
     });
   }
 
   const clientName = typeof payload.client_name === "string" ? payload.client_name : null;
-  const clientId = crypto.randomBytes(16).toString("hex");
   const now = Date.now();
+  const db = getDb();
+  // Startup cleanup is not enough for a long-running orchestrator. Reap
+  // registrations that never completed an authorized flow before enforcing the
+  // durable write budget so anonymous rows stay bounded between deploys too.
+  db.prepare("DELETE FROM mcp_clients WHERE used_at IS NULL AND created_at < ?").run(now - UNUSED_CLIENT_TTL_MS);
+  const recentRegistrations = db
+    .prepare("SELECT COUNT(*) AS count FROM mcp_clients WHERE created_at >= ?")
+    .get(now - REGISTRATION_WINDOW_MS) as { count: number };
+  if (recentRegistrations.count >= MAX_REGISTRATIONS_PER_WINDOW) {
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "3600" });
+    res.end(JSON.stringify({ error: "temporarily_unavailable", error_description: "Registration limit exceeded" }));
+    return;
+  }
 
-  getDb()
+  const clientId = crypto.randomBytes(16).toString("hex");
+
+  db
     .prepare("INSERT INTO mcp_clients (client_id, redirect_uris, client_name, created_at) VALUES (?, ?, ?, ?)")
     .run(clientId, JSON.stringify(redirectUris), clientName, now);
 
@@ -261,15 +326,14 @@ export async function handleMcpAuthorize(
     return json(res, 400, { error: "invalid_redirect_uri", error_description: "redirect_uri not registered" });
   }
 
-  // Pick the first configured provider (SSO provider selection happens at the OIDC level)
   const providers = listConfiguredProviders();
   if (providers.length === 0) {
     return json(res, 503, { error: "server_error", error_description: "No OAuth providers configured" });
   }
-  const providerId = providers[0].id;
+  const providerId = url.searchParams.get("provider") ?? providers[0].id;
   const provider = getProvider(providerId);
   if (!provider) {
-    return json(res, 503, { error: "server_error", error_description: "Provider not found" });
+    return json(res, 400, { error: "invalid_request", error_description: "Unknown provider" });
   }
 
   const oidcRedirectUri = `${baseUrl}/mcp/callback/${providerId}`;
@@ -354,6 +418,8 @@ export async function handleMcpOidcCallback(
     console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
   }
+
+  db.prepare("UPDATE mcp_clients SET used_at = ? WHERE client_id = ?").run(Date.now(), stateRow.client_id);
 
   // Mint a short-lived authorization code
   const code = crypto.randomBytes(32).toString("hex");
@@ -567,9 +633,24 @@ function hashToken(token: string): string {
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    let size = 0;
+    let rejected = false;
+    req.on("data", (chunk: Buffer) => {
+      if (rejected) return;
+      size += chunk.length;
+      if (size > MAX_REQUEST_BODY_BYTES) {
+        rejected = true;
+        reject(new Error("Request body too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (!rejected) resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", (error) => {
+      if (!rejected) reject(error);
+    });
   });
 }
 

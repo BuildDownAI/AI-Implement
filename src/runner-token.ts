@@ -9,6 +9,8 @@ interface RefreshRunnerGithubTokenInputs {
   owner: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** Fail instead of retaining the current token. Intended for the explicit refresh CLI. */
+  strict?: boolean;
 }
 
 interface RefreshRunnerGithubCredentialsInputs extends RefreshRunnerGithubTokenInputs {
@@ -43,23 +45,46 @@ export async function refreshRunnerGithubToken(
     });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
+    if (inputs.strict) {
+      throw new Error(`[runner-token] Token refresh unavailable (${reason})`);
+    }
     console.warn(`[runner-token] Token refresh unavailable (${reason}); using the previous token.`);
     return inputs.currentToken;
   }
 
   if (!response.ok) {
-    if (response.status >= 500) {
-      console.warn(
-        `[runner-token] Token refresh failed with HTTP ${response.status}; using the previous token.`,
-      );
+    const message = `[runner-token] Token refresh rejected with HTTP ${response.status}`;
+    if (inputs.strict) {
+      throw new Error(message);
+    }
+    const canRetainBootToken = response.status === 403
+      || response.status === 404
+      || response.status === 429
+      || response.status >= 500;
+    if (canRetainBootToken) {
+      console.warn(`${message}; using the previous token.`);
       return inputs.currentToken;
     }
-    throw new Error(`[runner-token] Token refresh rejected with HTTP ${response.status}`);
+    throw new Error(message);
   }
 
-  const body = (await response.json()) as { token?: unknown };
+  let body: { token?: unknown };
+  try {
+    body = (await response.json()) as { token?: unknown };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    if (inputs.strict) {
+      throw new Error(`[runner-token] Token refresh returned invalid JSON (${reason})`);
+    }
+    console.warn(`[runner-token] Token refresh returned invalid JSON (${reason}); using the previous token.`);
+    return inputs.currentToken;
+  }
   if (typeof body.token !== "string" || body.token.length === 0) {
-    throw new Error("[runner-token] Token refresh returned no token");
+    if (inputs.strict) {
+      throw new Error("[runner-token] Token refresh returned no token");
+    }
+    console.warn("[runner-token] Token refresh returned no token; using the previous token.");
+    return inputs.currentToken;
   }
 
   console.log("[runner-token] Obtained a current GitHub token from the orchestrator.");

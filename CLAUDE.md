@@ -236,8 +236,8 @@ docker build --secret id=kg_token,env=GH_TOKEN .
 
 # Fly deploy — ALWAYS use the wrapper script (it encodes the required flags and
 # verifies the deployed sidecar actually serves):
-./scripts/deploy-orchestrator.sh                      # testing orchestrator (default)
-./scripts/deploy-orchestrator.sh <other-app-name>     # any other orchestrator app
+./scripts/deploy-orchestrator.sh ai-implement-testing-orchestrator  # testing orchestrator
+./scripts/deploy-orchestrator.sh <other-app-name>                    # any other orchestrator app
 ```
 
 > **Never deploy with a plain `fly deploy`** — it silently produces a sidecar-less

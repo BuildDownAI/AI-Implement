@@ -46,7 +46,7 @@ else
   require_env GITHUB_TOKEN GITHUB_OWNER GITHUB_REPO
 fi
 export GITHUB_OWNER GITHUB_REPO
-[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && PR_NUMBER="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(c.prNumber||'')}catch{}")"
+[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && PR_NUMBER="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(String(c.prNumber||''))}catch{}" 2>/dev/null||true)"
 export PR_NUMBER="${PR_NUMBER:-}"
 
 # ── 3. Token acquisition ─────────────────────────────────────────────────────

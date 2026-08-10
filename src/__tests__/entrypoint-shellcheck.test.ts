@@ -17,10 +17,23 @@ function writeShim(binDir: string, name: string, body: string): void {
 }
 
 describe("session/entrypoint.sh", () => {
-  it("passes shellcheck cleanly", () => {
-    const r = spawnSync("shellcheck", ["session/entrypoint.sh"], { stdio: ["ignore", "pipe", "pipe"] });
+  it("passes shellcheck for every deploy-critical entrypoint", () => {
+    const r = spawnSync(
+      "shellcheck",
+      ["session/entrypoint.sh", "docker-entrypoint.sh", "scripts/deploy-orchestrator.sh"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
     if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
-    expect(r.status).toBe(0);
+    expect(r.status, r.stderr?.toString()).toBe(0);
+  });
+
+  it("requires an explicit Fly app before deploy tooling runs", () => {
+    const r = spawnSync("/bin/bash", ["scripts/deploy-orchestrator.sh"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: "" },
+    });
+    expect(r.status).toBe(64);
+    expect(r.stderr).toContain("explicit Fly app is required");
   });
 
   it("is under 115 lines (bootstrap, not monolith)", () => {
@@ -97,6 +110,8 @@ describe("session/entrypoint.sh", () => {
     const checkoutIdx = content.indexOf("gh pr checkout");
     expect(decodeIdx).toBeGreaterThan(-1);
     expect(decodeIdx).toBeLessThan(checkoutIdx);
+    expect(content).toContain("String(c.prNumber||'')");
+    expect(content).toMatch(/c\.prNumber[^\n]+2>\/dev\/null\|\|true/);
   });
 
   it("does not pass duplicate preserve-environment flags to su", () => {
