@@ -1,87 +1,49 @@
 ---
-# Claude model used for implementation. Passed through verbatim to
-# `claude-code --model`, so any ID your configured provider accepts is fine.
-# Examples:
-#   Anthropic API / OAuth: claude-sonnet-4-6, claude-opus-4-7, claude-haiku-4-5-20251001
-#   AWS Bedrock:           anthropic.claude-sonnet-4-6-20250805-v1:0
-#                          or an inference-profile ARN (arn:aws:bedrock:...)
-# The default below works for the Anthropic provider. If this repo's mapping
-# is switched to provider=bedrock in the orchestrator admin UI, replace this
-# with a Bedrock model ID — the workflow will hard-fail otherwise, since
-# Bedrock IDs are account- and region-specific and have no safe default.
+# Model for implementation and review passes. Passed to `claude --model`
+# verbatim, so any ID this repo's provider accepts works. This repo's mapping
+# runs on the Anthropic provider; replace with a Bedrock model ID if that changes.
 model: claude-sonnet-4-6
-
-# Optional: model used for the post-PR gap-analysis step. Pass through as above.
-# Default (if omitted): claude-haiku-4-5-20251001 for anthropic, same as `model`
-# above for bedrock (override if you want a cheaper model for gap analysis).
-# gap_analysis_model: claude-haiku-4-5-20251001
 ---
 
 <!--
-  WORKFLOW.md — Claude AI Implementation prompt template
-  =======================================================
-  This file is seeded into your repo by the ai-implement sync workflow.
-  It is YOURS to customise — future syncs will never overwrite it.
+  AI-Implement's OWN implementation prompt, used when the orchestrator dispatches a runner at this repository. The template distributed to target repos is a separate file — workflows/WORKFLOW.md — and edits here do not propagate to it.
 
-  When claude-implement.yml runs, it renders this file as the prompt sent to
-  Claude Code. The YAML front matter block (between the --- lines) is stripped
-  before Claude sees it. The rest of the file is passed through envsubst, which
-  substitutes the following variables:
-
-    ${ISSUE_IDENTIFIER}   Linear identifier, e.g. ENG-42
-    ${ISSUE_TITLE}        Issue title
-    ${ISSUE_DESCRIPTION}  Full issue description (Markdown)
-    ${ISSUE_ID}           Linear UUID (useful if you want Claude to call the Linear API)
-    ${PR_NUMBER}          Set on gap-fill re-runs; empty on first run
-
-  FRONT MATTER (the --- block at the top)
-  ----------------------------------------
-  Stripped before sending to Claude. Supported keys:
-
-    model                Model ID for implementation (see above).
-    gap_analysis_model   Model ID for the post-PR gap-analysis step (see above).
-
-  NEW IMPLEMENTATION vs GAP-FILL RUNS
-  -------------------------------------
-  When ${PR_NUMBER} is empty  → Claude creates a new branch and PR.
-  When ${PR_NUMBER} is set    → Claude pushes gap-fill commits to the existing PR.
-  Both scenarios use this same file. The conditional sections below handle both.
-
-  HOW TO CUSTOMISE THIS FILE
-  ---------------------------
-  1. Fill in the "Repo context" section with your stack, test commands, conventions.
-  2. Adjust the quality checklist to match your standards.
-  3. Add any repo-specific constraints (e.g. "never modify migration files directly").
-  4. Change the model in the front matter if this repo needs more (opus) or less (haiku).
-  5. Remove these HTML comments once you're done — Claude won't see them anyway.
+  The runner strips this front matter and these comments, substitutes ${ISSUE_ID}, ${ISSUE_IDENTIFIER}, ${ISSUE_TITLE}, ${ISSUE_DESCRIPTION} and ${PR_NUMBER}, then sends the rest as the prompt. Any other ${UPPER_SNAKE} token is replaced with an empty string, so don't write shell examples containing one. CLAUDE.md is also loaded automatically on every invocation, so the pointer below is deliberate redundancy: that behaviour is documented but implicit, and an instruction resting on it fails silently if it ever changes. Repo conventions belong in CLAUDE.md, not here.
 -->
 
-Read CLAUDE.md if it exists for repo-specific context and conventions.
+Read `CLAUDE.md` before you begin. It carries this repository's architecture, the conventions that differ from tool defaults, and the pitfalls worth knowing before you touch the pipeline.
 
----
-
-If `${PR_NUMBER}` is set (value: "${PR_NUMBER}"), skip to the **Gap-fill instructions**
-section below and ignore New implementation.
+This run is a **gap-fill** if a pull-request number appears between these quotes: "${PR_NUMBER}". If it is empty, this is a **new implementation**. Follow only the matching section below.
 
 ---
 
 ## New implementation
 
-Create a branch named `${ISSUE_IDENTIFIER}/short-description`, implement the
-feature described in the issue below, then open a pull request with:
+Implement the issue in the current checkout. Do not create or switch branches, and do not commit, push, or open a pull request — leave your changes unstaged and uncommitted. The pipeline makes the commit, pushes an issue-scoped branch, and opens the pull request once the review pass approves the work.
 
-- **Title:** `${ISSUE_IDENTIFIER}: ${ISSUE_TITLE}`
-- **Body:** must include `Fixes ${ISSUE_IDENTIFIER}` so Linear automatically
-  closes the issue when the PR is merged.
+Then write an implementation summary to `ai-output/comments/01-summary.md`. The orchestrator posts that file to the ticket verbatim, and it is the only account of your reasoning the issue ever receives — without it the ticket gets a bare pull-request link and nothing else. Cover what you changed and why, the judgement calls you made and what you rejected, and how you satisfied each acceptance criterion. Do not post to Linear yourself; the orchestrator owns every ticket write.
+
+Anything under `ai-output/` is excluded from commits, so writing there never affects the pull request.
 
 ---
 
-## Gap-fill instructions _(only when PR_NUMBER is set)_
+## Gap-fill instructions
 
-You are adding missing work to existing PR #${PR_NUMBER}.
-**Do NOT create a new branch or PR.** Commit your changes to the current
-branch and push. Review the gap analysis comment on the PR to understand
-what is still missing.
+You are adding missing work to existing pull request #${PR_NUMBER}. Do not create a new branch or pull request. Commit to the branch already checked out and push it yourself — this is the one path where the pipeline does not handle git for you. Read the review feedback on the pull request to see what is outstanding.
+
+Write what you addressed to `ai-output/comments/01-gap-fill-summary.md`.
+
+---
+
+## Working efficiently
+
+Each pass has a turn cap, and exploration is where caps are usually spent.
+
+**Batch independent tool calls into a single message.** Reading three files and grepping for a symbol do not depend on each other — issue them together rather than one per turn. Surveying a change here typically means reading two to four source files plus their tests: one turn batched, five or more sequentially. Only sequence when one call's input genuinely depends on another's output.
+
+**Prefer `Read`, `Grep`, and `Glob` over their shell equivalents.** A `Bash` pipeline ending in `head` or `tail` silently truncates its own output, and absence of a match in truncated output is not evidence of absence — that is how a confident wrong conclusion gets reached. Use `Grep` to locate and `Read` to read the surrounding context.
+
+If you approach the cap before finishing, say what remains rather than quietly narrowing scope.
 
 ---
 
@@ -89,28 +51,36 @@ what is still missing.
 
 **Identifier:** ${ISSUE_IDENTIFIER}
 **Title:** ${ISSUE_TITLE}
-**Description:**
+
 ${ISSUE_DESCRIPTION}
 
 ---
 
-## Repo context
+## Verifying your work
 
-<!-- Customise this section for your repo -->
+Run both before you consider the work finished:
 
-- **Stack:** _e.g. Node.js 20, TypeScript, PostgreSQL, Vitest_
-- **Run tests:** _e.g. `npm test`_
-- **Run linting / formatting:** _e.g. `npm run lint`_
-- **Key conventions:** _e.g. follow patterns in existing files; no new dependencies without good reason_
+```bash
+npm run typecheck   # tsc --noEmit
+npm test            # vitest run
+```
+
+The pipeline runs these again after the review pass, but **only records the result — it does not block the pull request on it.** A failure you don't catch ships anyway, so treat these as yours to pass, not as a safety net.
+
+There is no lint script in this repository. Do not invent one or add a linter.
+
+Two things make a green pair misleading:
+
+- `tsconfig.json` excludes `src/__tests__`, so type errors in a test file are caught by neither command. Type-check any new test file explicitly.
+- `noUnusedLocals` and `noUnusedParameters` are enabled, so a leftover import or an unused parameter fails `typecheck` even when the logic is correct.
 
 ---
 
-## Quality checklist
+## Before you finish
 
-Before opening or updating the PR, verify:
-
-- [ ] Tests pass
-- [ ] No lint errors. Build completes successfully
-- [ ] No debug output, `console.log`, or commented-out code left in
-- [ ] PR description explains the approach, not just the what
+- [ ] `npm run typecheck` and `npm test` both pass
+- [ ] Any new test file type-checks despite being outside `typecheck`'s scope
+- [ ] Every acceptance criterion is met, or the summary says why it is not
+- [ ] No debug output, `console.log`, or commented-out code left behind
 - [ ] No unrelated files changed
+- [ ] `ai-output/comments/01-summary.md` written (or the gap-fill equivalent)
