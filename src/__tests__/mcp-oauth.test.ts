@@ -245,8 +245,16 @@ describe("handleMcpClientRegistration", () => {
     expect(res.statusCode).toBe(201);
   });
 
-  it("rejects localhost hostname redirects in favor of loopback IP literals", async () => {
+  it("accepts localhost hostname redirects (what MCP clients actually register)", async () => {
     const body = JSON.stringify({ redirect_uris: ["http://localhost:8080/callback"] });
+    const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
+    const res = new MockResponse();
+    await mcpOauth.handleMcpClientRegistration(req, asRes(res));
+    expect(res.statusCode).toBe(201);
+  });
+
+  it("rejects non-loopback HTTP hostname redirects", async () => {
+    const body = JSON.stringify({ redirect_uris: ["http://evil.example:8080/callback"] });
     const req = mkReq("/mcp/register", "POST", { "content-type": "application/json" }, body);
     const res = new MockResponse();
     await mcpOauth.handleMcpClientRegistration(req, asRes(res));
