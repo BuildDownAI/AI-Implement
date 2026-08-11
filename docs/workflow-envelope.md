@@ -50,6 +50,7 @@ interface RunConfigV1 {
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   profiles?: string[];
   planningContext?: { parent?: string; siblings?: string; dependencies?: string };
+  dependencyTokenScope?: "installation";
 }
 ```
 
@@ -65,6 +66,7 @@ Field notes:
 | `sensitiveFiles.allow` | Glob patterns that override the blocklist; allow wins over both built-in and add patterns |
 | `profiles` | Jira AI-Implement Profiles field values (comma-split strings) |
 | `planningContext` | Populated for child issues in a feature tree; carries parent and sibling summaries |
+| `dependencyTokenScope` | `"installation"` enables the dependency token step in the runner; absent or null disables it. The runner fetches a read-only token covering all App-installation repos and injects it as a git credential helper and `COMPOSER_AUTH`. Requires a publicly reachable orchestrator (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`). |
 
 ---
 

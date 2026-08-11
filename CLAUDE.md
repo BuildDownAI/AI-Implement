@@ -340,6 +340,36 @@ Each project's mapping carries two optional glob-list fields, editable in the `/
 
 These globs are delivered **exclusively via the `run_config` envelope** (`sensitiveFiles.add` / `sensitiveFiles.allow`). They are not sent as legacy dispatch inputs. A project using sensitive file globs must therefore have re-synced `claude-implement.yml` to envelope generation before setting these fields.
 
+### Dependency repo access (admin UI)
+
+Each project's mapping carries an optional **Dependency Token Scope** field, editable in the `/admin` Projects edit dialog. When set to **All repos the App can access**, the runner fetches a second, read-only token before the dependency-install phase — allowing it to clone or install from private sibling repositories that the GitHub App installation covers (e.g. private Composer packages, npm packages from a private org, core-service checkouts).
+
+#### Two-token model
+
+| Token | Scope | Permissions | Source |
+|-------|-------|-------------|--------|
+| **Primary** | Target repo only | Full App grants (contents write, PRs, …) | GHA `create-github-app-token` / Fly-mode `/api/token` endpoint |
+| **Dependency** | All repos the App installation can see | `contents: read` | Runner step via `POST /api/runner/dependency-token` |
+
+The runner never broadens the primary token — the implementer's write access stays scoped to the target repo at all times. The dependency token is injected as:
+- A git HTTPS credential helper (`git config credential.https://github.com.helper …`) covering all `github.com` HTTPS clones.
+- `COMPOSER_AUTH` environment variable for PHP Composer installs.
+
+The credential helper auto-refreshes the token when fewer than 10 minutes remain on its expiry, so long dependency installs do not fail mid-build.
+
+#### Prerequisites
+
+- A **publicly reachable orchestrator** (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`). This is the same requirement as planning auto-advance and the feature-branch cascade. Runs dispatched without progress tokens skip the dependency token fetch gracefully and proceed without private-dependency access.
+- An **App installation** that already covers the sibling repos. The dependency token grants access to exactly the repositories the App installation can already see — no additional GitHub permissions are required.
+
+#### Security trade-off
+
+`installation` scope is all-or-nothing: the token can read every repository the GitHub App installation covers, not just an explicit subset. This is the v1 behavior; per-project explicit repo lists are a planned v2 addition (`dependencyTokenScope` is stored as text so a JSON array slots in with no schema migration). The token is strictly read-only (`contents: read`) and separate from the write-capable primary token, so the implementer can never push to sibling repos.
+
+#### Fly/local primary-token narrowing (behaviour change)
+
+Previously, the Fly-mode `/api/token` endpoint minted a full-installation token (every repository the App can see, with all App permissions). It now narrows the primary token to the **target repository only** — consistent with the GHA primary token minted by `create-github-app-token`. **Existing Fly deployments that incidentally relied on org-wide primary-token access to read private sibling repos must enable "All repos the App can access" in the project's Dependency Token Scope field to restore that access.**
+
 `workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
 - **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
 
