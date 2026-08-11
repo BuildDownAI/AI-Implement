@@ -23,13 +23,13 @@ Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, e
 
 ## Knowledge graph
 
-Bindings for the KG skills (kg_search, kg_hybrid_search, etc.):
+Bindings for the KG skills (bd-kg-search, kg recon — format: skills `docs/kg-binding.md`):
 
-- kg.present: true
-- kg.orchestrator: orch-ai-implement-testing
-- kg.mcp_server: `orch-ai-implement-testing` (project `.mcp.json`; pre-approved in `.claude/settings.json`)
-- kg.search_tool: kg_hybrid_search
-- kg.source_repo: BuildDownAI/knowledge-graph-ai-implement
+- kg.present:      true
+- kg.orchestrator: https://ai-implement-testing-orchestrator.fly.dev
+- kg.mcp_server:   orch-ai-implement-testing
+- kg.search_tool:  mcp__orch-ai-implement-testing__kg_hybrid_search
+- kg.source_repo:  BuildDownAI/knowledge-graph-ai-implement
 
 ## Architecture
 
