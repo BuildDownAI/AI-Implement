@@ -89,13 +89,13 @@ describe("token-vending", () => {
       repo: "acme/my-repo",
       machineNonce: "valid-nonce-123",
     });
-    mockGetScopedInstallationToken.mockResolvedValueOnce("ghs_test_token");
+    mockGetScopedInstallationToken.mockResolvedValueOnce({ token: "ghs_test_token", expiresAt: "2030-01-01T00:00:00Z" });
 
     const res = await callTokenEndpoint({ nonce: "valid-nonce-123", owner: "acme" });
     expect(res.statusCode).toBe(200);
     const data = JSON.parse(res.body);
     expect(data.token).toBe("ghs_test_token");
-    expect(data.expires_at).toBeTruthy();
+    expect(data.expires_at).toBe("2030-01-01T00:00:00Z");
     expect(mockGetScopedInstallationToken).toHaveBeenCalledWith(
       "app-id", "fake-private-key", "acme", { repositories: ["my-repo"], forceRefresh: true }
     );

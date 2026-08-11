@@ -9,8 +9,8 @@ export interface InstallationDetails {
 
 // Cache: owner → { token, expiresAt }
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
-// Cache: scopedCacheKey(owner, options) → { token, expiresAt }
-const scopedTokenCache = new Map<string, { token: string; expiresAt: number }>();
+// Cache: scopedCacheKey(owner, options) → { token, real expiresAt (ISO), staleAt (cache cutoff, ms) }
+const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number }>();
 let cachedAppSlug: string | null = null;
 const TOKEN_CACHE_TTL_MS = 50 * 60 * 1000;
 
@@ -178,6 +178,12 @@ export interface ScopedTokenOptions {
   forceRefresh?: boolean;
 }
 
+export interface ScopedInstallationToken {
+  token: string;
+  /** GitHub's actual expiry for this token (ISO 8601), passed through verbatim. */
+  expiresAt: string;
+}
+
 function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
   const perms = options?.permissions
     ? Object.entries(options.permissions)
@@ -194,7 +200,10 @@ function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
  * Passes `permissions` and/or `repositories` in the request body when supplied; sends no body
  * when neither is given (GitHub then grants the App's full installation permissions).
  *
- * TTL is derived from the response `expires_at` minus a 5-minute safety margin, so the
+ * Returns the token together with GitHub's real `expires_at`, so callers that advertise an
+ * expiry downstream never have to synthesize one.
+ *
+ * Cache TTL is derived from `expires_at` minus a 5-minute safety margin, so the
  * cache stays accurate regardless of the actual token lifetime.
  * Cached per (owner, permissions, repositories) tuple — distinct option sets never collide.
  */
@@ -203,11 +212,11 @@ export async function getScopedInstallationToken(
   privateKey: string,
   owner: string,
   options?: ScopedTokenOptions,
-): Promise<string> {
+): Promise<ScopedInstallationToken> {
   const cacheKey = scopedCacheKey(owner, options);
   const cached = scopedTokenCache.get(cacheKey);
-  if (!options?.forceRefresh && cached && Date.now() < cached.expiresAt) {
-    return cached.token;
+  if (!options?.forceRefresh && cached && Date.now() < cached.staleAt) {
+    return { token: cached.token, expiresAt: cached.expiresAt };
   }
 
   const normalizedKey = privateKey.replace(/\\n/g, "\n");
@@ -240,11 +249,14 @@ export async function getScopedInstallationToken(
 
   const tokenData = (await tokenRes.json()) as { token: string; expires_at: string };
   const expMs = new Date(tokenData.expires_at).getTime();
+  // Fallbacks cover GitHub omitting or sending an unparseable expires_at: assume the
+  // standard ~60-minute lifetime, advertised conservatively at 55.
   const expiresAt = Number.isFinite(expMs)
-    ? expMs - 5 * 60 * 1000
-    : Date.now() + 50 * 60 * 1000; // fallback when GitHub omits or sends an unparseable expires_at
-  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt });
-  return tokenData.token;
+    ? tokenData.expires_at
+    : new Date(Date.now() + 55 * 60 * 1000).toISOString();
+  const staleAt = Number.isFinite(expMs) ? expMs - 5 * 60 * 1000 : Date.now() + 50 * 60 * 1000;
+  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt, staleAt });
+  return { token: tokenData.token, expiresAt };
 }
 
 /**

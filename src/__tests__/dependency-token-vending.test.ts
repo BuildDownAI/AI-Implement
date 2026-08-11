@@ -100,21 +100,21 @@ async function callHandler(opts: {
 }
 
 describe("handleDependencyTokenRequest", () => {
-  it("returns 200 with token and expires_at for valid progress token + enabled scope", async () => {
+  it("returns 200 with token and GitHub's real expires_at for valid progress token + enabled scope", async () => {
     const token = mintProgressToken();
-    mockGetScopedToken.mockResolvedValueOnce("ghs_installation_token");
+    const realExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_installation_token", expiresAt: realExpiry });
 
     const result = await callHandler({ authorization: `Bearer ${token}` });
 
     expect(result.status).toBe(200);
     expect(result.body.token).toBe("ghs_installation_token");
-    expect(typeof result.body.expires_at).toBe("string");
-    expect(new Date(result.body.expires_at as string).getTime()).toBeGreaterThan(Date.now());
+    expect(result.body.expires_at).toBe(realExpiry);
   });
 
-  it("mints token with { contents: 'read' } permissions and no repositories field", async () => {
+  it("force-mints with { contents: 'read' } permissions and no repositories field", async () => {
     const token = mintProgressToken();
-    mockGetScopedToken.mockResolvedValueOnce("ghs_token");
+    mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_token", expiresAt: "2030-01-01T00:00:00Z" });
 
     await callHandler({ authorization: `Bearer ${token}` });
 
@@ -122,7 +122,7 @@ describe("handleDependencyTokenRequest", () => {
       "app-id",
       "fake-key",
       "acme",
-      { permissions: { contents: "read" } },
+      { permissions: { contents: "read" }, forceRefresh: true },
     );
     const opts = mockGetScopedToken.mock.calls[0][3] as Record<string, unknown>;
     expect(opts).not.toHaveProperty("repositories");
@@ -130,7 +130,7 @@ describe("handleDependencyTokenRequest", () => {
 
   it("uses owner from the mapping, not anything from the request", async () => {
     const token = mintProgressToken();
-    mockGetScopedToken.mockResolvedValueOnce("ghs_token");
+    mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_token", expiresAt: "2030-01-01T00:00:00Z" });
 
     await callHandler({
       authorization: `Bearer ${token}`,
@@ -144,7 +144,7 @@ describe("handleDependencyTokenRequest", () => {
 
   it("progress token can be used more than once (multi-use)", async () => {
     const token = mintProgressToken();
-    mockGetScopedToken.mockResolvedValue("ghs_token");
+    mockGetScopedToken.mockResolvedValue({ token: "ghs_token", expiresAt: "2030-01-01T00:00:00Z" });
 
     const first = await callHandler({ authorization: `Bearer ${token}` });
     const second = await callHandler({ authorization: `Bearer ${token}` });

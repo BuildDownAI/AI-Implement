@@ -136,8 +136,8 @@ export const dependencyAuthStep: StepModule<DependencyAuthInputs, DependencyAuth
       }
 
       // Export COMPOSER_AUTH for composer's API-based (dist) downloads.
-      // This is a snapshot of the token at fetch time; valid for approximately
-      // one hour (matching the 55-min synthetic expires_at from the endpoint).
+      // This is a snapshot of the token at fetch time; valid until the endpoint's
+      // expires_at (GitHub's real token expiry, ~1 hour on a fresh mint).
       // Dependency installs run early in the pipeline, so this is acceptable
       // in practice — adding refresh machinery for COMPOSER_AUTH is not needed.
       process.env.COMPOSER_AUTH = JSON.stringify({ "github-oauth": { "github.com": result.token } });
