@@ -138,6 +138,11 @@ function isAllowedRedirectUri(redirectUri: string): boolean {
 
   const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (parsed.protocol === "http:") {
+    // RFC 8252 §7.3 prefers loopback IP literals, but real MCP clients
+    // (Claude Code included) register http://localhost:<port> — accept both.
+    if (host === "localhost") {
+      return true;
+    }
     const ipVersion = isIP(host);
     return ipVersion === 6 ? host === "::1" : ipVersion === 4 && host.startsWith("127.");
   }
@@ -243,7 +248,7 @@ export async function handleMcpClientRegistration(
   ) {
     return json(res, 400, {
       error: "invalid_redirect_uri",
-      error_description: "redirect_uris must use a loopback IP literal over HTTP or an explicitly allowed HTTPS origin",
+      error_description: "redirect_uris must use localhost or a loopback IP over HTTP, or an explicitly allowed HTTPS origin",
     });
   }
 
