@@ -7,8 +7,8 @@
 #                          or an inference-profile ARN (arn:aws:bedrock:...)
 # The default below works for the Anthropic provider. If this repo's mapping
 # is switched to provider=bedrock in the orchestrator admin UI, replace this
-# with a Bedrock model ID — the workflow will hard-fail otherwise, since
-# Bedrock IDs are account- and region-specific and have no safe default.
+# with a Bedrock model ID: nothing validates the pairing, so an Anthropic-style
+# ID reaches Bedrock verbatim and fails at invocation time rather than early.
 model: claude-sonnet-4-6
 ---
 
@@ -18,28 +18,38 @@ model: claude-sonnet-4-6
   This file is seeded into your repo by the ai-implement sync workflow.
   It is YOURS to customise — future syncs will never overwrite it.
 
-  When claude-plan.yml runs, it renders this file as the prompt sent to Claude.
-  The YAML front matter block (between the --- lines) is stripped before Claude
-  sees it. The rest of the file is passed through envsubst, which substitutes:
+  When a planning run executes this repo, it renders this file as the prompt sent
+  to Claude. The YAML front matter block (between the --- lines) is stripped before
+  Claude sees it, as are these HTML comments. The runner then substitutes the
+  variables below using a regular expression — not envsubst. Any OTHER
+  ${UPPER_SNAKE} token is replaced with an empty string, so a shell example
+  containing one is silently blanked; a plain $VAR without braces survives.
 
-    ${ISSUE_IDENTIFIER}   Linear identifier, e.g. ENG-42
+    ${ISSUE_IDENTIFIER}   Ticket identifier, e.g. ENG-42
     ${ISSUE_TITLE}        Issue title
     ${ISSUE_DESCRIPTION}  Full issue description (Markdown)
-    ${ISSUE_ID}           Linear UUID (used in curl commands to post comments)
+    ${ISSUE_ID}           Ticket UUID; rarely useful, as the runner holds no ticketing credential
     ${PARENT}             Parent issue as "- IDENTIFIER: Title" (or "None")
     ${SIBLINGS}           Sibling stories (other children of the parent), newline-separated
     ${DEPENDENCIES}       Related issues as "- [type] IDENTIFIER: Title", newline-separated
+
+  This body REPLACES the runner's built-in planning prompt rather than adding to
+  it, so anything the built-in prompt would have said must be stated here.
 
   FRONT MATTER (the --- block at the top)
   ----------------------------------------
   Stripped before sending to Claude. Supported keys:
 
-    model      Model ID for planning (see above). Required; no default for bedrock.
+    model      Model ID for planning (see above). Optional; falls back to the
+               runner's built-in default. Nothing validates it against the
+               configured provider, so a Bedrock mapping with an Anthropic-style
+               ID fails at invocation time rather than at dispatch.
 
   COMMENT FORMAT
   ---------------
-  Claude posts up to 4 structured comments to Linear. Headers are parseable
-  so the implementation workflow can locate them later:
+  Claude writes up to 4 structured comment files, which the orchestrator posts to
+  the ticket after the run. Headers are parseable so the implementation workflow
+  can locate them later:
 
     ## 🏗️ AI Planning: Architecture Analysis
     ## 🧪 AI Planning: Test Plan
@@ -55,7 +65,7 @@ model: claude-sonnet-4-6
   5. Remove these HTML comments once you're done — Claude won't see them anyway.
 -->
 
-You are a senior software architect performing a read-only planning analysis. Do NOT create any branches, files, or pull requests. Do NOT write any code. Explore the codebase and post structured planning comments to Linear.
+You are a senior software architect performing a read-only planning analysis. Do NOT create branches or pull requests, and do NOT write or modify any source code. Explore the codebase and record your analysis as the comment files described under Instructions below.
 
 **Issue:** ${ISSUE_IDENTIFIER} — ${ISSUE_TITLE}
 

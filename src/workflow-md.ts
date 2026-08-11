@@ -3,7 +3,6 @@ export interface WorkflowFrontMatter {
   setup?: string;
   verify?: string;
   teardown?: string;
-  gap_analysis_model?: string;
 }
 
 export interface ParsedWorkflowMd {
@@ -11,7 +10,7 @@ export interface ParsedWorkflowMd {
   body: string;
 }
 
-const KEYS: (keyof WorkflowFrontMatter)[] = ["model", "setup", "verify", "teardown", "gap_analysis_model"];
+const KEYS: (keyof WorkflowFrontMatter)[] = ["model", "setup", "verify", "teardown"];
 
 export function parseWorkflowMd(raw: string, envSubs: Record<string, string>): ParsedWorkflowMd {
   const lines = raw.split("\n");

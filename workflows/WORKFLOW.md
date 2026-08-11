@@ -7,14 +7,14 @@
 #                          or an inference-profile ARN (arn:aws:bedrock:...)
 # The default below works for the Anthropic provider. If this repo's mapping
 # is switched to provider=bedrock in the orchestrator admin UI, replace this
-# with a Bedrock model ID — the workflow will hard-fail otherwise, since
-# Bedrock IDs are account- and region-specific and have no safe default.
+# with a Bedrock model ID: nothing validates the pairing, so an Anthropic-style
+# ID reaches Bedrock verbatim and fails at invocation time rather than early.
 model: claude-sonnet-4-6
 
-# Optional: model used for the post-PR gap-analysis step. Pass through as above.
-# Default (if omitted): claude-haiku-4-5-20251001 for anthropic, same as `model`
-# above for bedrock (override if you want a cheaper model for gap analysis).
-# gap_analysis_model: claude-haiku-4-5-20251001
+# To run a cheaper model for the automated review pass than for implementation,
+# set models.implement / models.review in .ai-implement/config.yml. Those take
+# precedence over the model: above, and are the only supported way to split the
+# two — there is no per-phase model key in this front matter.
 ---
 
 <!--
@@ -23,24 +23,28 @@ model: claude-sonnet-4-6
   This file is seeded into your repo by the ai-implement sync workflow.
   It is YOURS to customise — future syncs will never overwrite it.
 
-  When claude-implement.yml runs, it renders this file as the prompt sent to
+  When the runner executes this repo, it renders this file as the prompt sent to
   Claude Code. The YAML front matter block (between the --- lines) is stripped
-  before Claude sees it. The rest of the file is passed through envsubst, which
-  substitutes the following variables:
+  before Claude sees it, as are these HTML comments. The runner then substitutes
+  the variables below using a regular expression — not envsubst. Any OTHER
+  ${UPPER_SNAKE} token is replaced with an empty string, so a shell example
+  containing one is silently blanked; a plain $VAR without braces survives.
 
-    ${ISSUE_IDENTIFIER}   Linear identifier, e.g. ENG-42
+    ${ISSUE_IDENTIFIER}   Ticket identifier, e.g. ENG-42
     ${ISSUE_TITLE}        Issue title
     ${ISSUE_DESCRIPTION}  Full issue description (Markdown)
-    ${ISSUE_ID}           Linear UUID (useful if you want Claude to call the Linear API)
+    ${ISSUE_ID}           Ticket UUID; rarely useful, as the runner holds no ticketing credential
     ${PR_NUMBER}          Set on gap-fill re-runs; empty on first run
-    ${PLANNING_CONTEXT}   Rendered planning comments (empty if none); expands to a full "## Planning Context" block or nothing
+
+  Planning context is appended automatically when a planning run produced it.
+  Do NOT put a ${PLANNING_CONTEXT} token in the body: the runner substitutes it
+  AND the pipeline appends the same block, so the token emits it twice.
 
   FRONT MATTER (the --- block at the top)
   ----------------------------------------
   Stripped before sending to Claude. Supported keys:
 
     model                Model ID for implementation (see above).
-    gap_analysis_model   Model ID for the post-PR gap-analysis step (see above).
     setup      Path (relative to repo root) to a shell script that runs BEFORE Claude.
                Use this to start services, install dependencies, and run migrations.
                Export env vars via `echo "VAR=value" >> "$GITHUB_ENV"` — they persist
@@ -52,9 +56,10 @@ model: claude-sonnet-4-6
     teardown   Path to a shell script that runs AFTER Claude, even on failure.
                Use this to stop containers or clean up resources.
 
-    NOTE: Hooks run only in GitHub Actions execution mode. On Fly/local modes the
-    workspace is empty when WORKFLOW.md is read (the repo is cloned later), so
-    setup/verify/teardown are silently skipped.
+    Hooks run in every execution mode — GitHub Actions, Fly Machines, and local
+    Docker. All three start from the same container entrypoint, which prepares
+    the workspace before the runner process starts, so WORKFLOW.md and the hook
+    scripts are already on disk when they are read.
 
   SETUP AND TEARDOWN HOOKS
   ------------------------
@@ -92,8 +97,9 @@ model: claude-sonnet-4-6
 
   NEW IMPLEMENTATION vs GAP-FILL RUNS
   -------------------------------------
-  When ${PR_NUMBER} is empty  → Claude creates a new branch and PR.
-  When ${PR_NUMBER} is set    → Claude pushes gap-fill commits to the existing PR.
+  When ${PR_NUMBER} is empty  → Claude edits the checkout and leaves the changes uncommitted; the pipeline commits, pushes the branch, and opens the PR.
+  When ${PR_NUMBER} is set    → Claude commits and pushes to the existing PR branch itself; the pipeline skips its push step.
+
   Both scenarios use this same file. The conditional sections below handle both.
 
   HOW TO CUSTOMISE THIS FILE
@@ -168,8 +174,6 @@ AI-Implement ingests GitHub review events and dispatches its own gap-fill run.
 **Description:**
 ${ISSUE_DESCRIPTION}
 
-${PLANNING_CONTEXT}
-
 ---
 
 ## Repo context
@@ -185,7 +189,7 @@ ${PLANNING_CONTEXT}
 
 ## Quality checklist
 
-Before opening or updating the PR, verify:
+Before you finish, verify:
 
 - [ ] Tests pass
 - [ ] No lint errors. Build completes successfully
