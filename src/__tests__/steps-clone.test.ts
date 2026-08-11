@@ -58,6 +58,13 @@ const BASE_INPUTS = {
   workspaceDir: "/tmp/workspace",
 };
 
+const PR_INPUTS = {
+  ...BASE_INPUTS,
+  branch: "ai-implement/ENG-1-test",
+  prNumber: "42",
+  baseBranch: "main",
+};
+
 describe("cloneStep", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -151,6 +158,208 @@ describe("cloneStep", () => {
 
     expect(outputs.githubToken).toBe("secret-token");
     expect(outputs.workspaceDir).toBe("/tmp/workspace");
+  });
+
+  it("refreshes credentials after clone so gap-fill runs inherit a current token", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.stubEnv("GITHUB_TOKEN", "secret-token");
+    vi.stubEnv("GH_TOKEN", "secret-token");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token" }),
+    } as Response));
+    mockSpawn([
+      { status: 0 },
+      { status: 0, stdout: "sha1\n" },
+      { status: 0 },
+    ]);
+
+    try {
+      const outputs = await cloneStep.run(makeContext(), {
+        ...PR_INPUTS,
+        orchestratorUrl: "https://orchestrator.example",
+        machineNonce: "machine-nonce",
+        baseBranch: undefined,
+      }, new NoopStepReporter());
+
+      expect(outputs.githubToken).toBe("fresh-token");
+      expect(process.env.GH_TOKEN).toBe("fresh-token");
+      expect(spawnSync).toHaveBeenLastCalledWith(
+        "git",
+        ["remote", "set-url", "origin", "https://x-access-token:fresh-token@github.com/acme/app.git"],
+        expect.objectContaining({ cwd: "/tmp/workspace" }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("keeps the boot token when credential vending rejects the refresh", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+    } as Response));
+    mockSpawn([
+      { status: 0 },
+      { status: 0, stdout: "sha1\n" },
+      { status: 0 },
+    ]);
+
+    try {
+      const outputs = await cloneStep.run(makeContext(), {
+        ...PR_INPUTS,
+        orchestratorUrl: "https://orchestrator.example",
+        machineNonce: "machine-nonce",
+        baseBranch: undefined,
+      }, new NoopStepReporter());
+
+      expect(outputs.githubToken).toBe("secret-token");
+      expect(spawnSync).toHaveBeenLastCalledWith(
+        "git",
+        ["remote", "set-url", "origin", "https://x-access-token:secret-token@github.com/acme/app.git"],
+        expect.objectContaining({ cwd: "/tmp/workspace" }),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  describe("PR-targeted (gap-fill) runs: base branch fetch", () => {
+    it("fetches base branch after clone and verifies merge-base on a fresh clone", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, fetch-base, merge-base (ok), rev-parse
+      mockSpawn([
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "deadbeef\n" },
+        { status: 0, stdout: "abc123\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(outputs.clonedRef).toBe("abc123");
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[1][1]).toEqual(["fetch", "--depth", "1", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+      expect(calls[2][1]).toEqual(["merge-base", "origin/main", "HEAD"]);
+    });
+
+    it("fetches base branch after incremental fetch and verifies merge-base", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // fetch-branch, reset, fetch-base, merge-base (ok), rev-parse
+      mockSpawn([
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "deadbeef\n" },
+        { status: 0, stdout: "def456\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("incremental");
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[2][1]).toEqual(["fetch", "--depth", "1", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+      expect(calls[3][1]).toEqual(["merge-base", "origin/main", "HEAD"]);
+    });
+
+    it("runs git fetch --unshallow when merge-base finds no common ancestor", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, fetch-base, merge-base (fail), unshallow, rev-parse
+      mockSpawn([
+        { status: 0 },
+        { status: 0 },
+        { status: 1, stderr: "fatal: Not a valid commit name" },
+        { status: 0 },
+        { status: 0, stdout: "abc123\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedRef).toBe("abc123");
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[3][1]).toEqual(["fetch", "--unshallow", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+    });
+
+    it("logs and continues when base-branch fetch fails (fail soft)", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, fetch-base (fail), rev-parse — merge-base and unshallow are NOT called
+      mockSpawn([
+        { status: 0 },
+        { status: 128, stderr: "fatal: secret-token could not read Username" },
+        { status: 0, stdout: "abc123\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedRef).toBe("abc123");
+      const calls = vi.mocked(spawnSync).mock.calls;
+      // Only 3 calls total: clone, fetch-base, rev-parse (no merge-base or unshallow)
+      expect(calls.length).toBe(3);
+    });
+
+    it("logs and continues when unshallow also fails (fail soft)", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, fetch-base, merge-base (fail), unshallow (fail), rev-parse
+      mockSpawn([
+        { status: 0 },
+        { status: 0 },
+        { status: 1 },
+        { status: 1, stderr: "fatal: server does not support shallow requests" },
+        { status: 0, stdout: "abc123\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedRef).toBe("abc123");
+    });
+
+    it("does not fetch base branch when prNumber is absent", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, rev-parse only
+      mockSpawn([
+        { status: 0 },
+        { status: 0, stdout: "abc123\n" },
+      ]);
+
+      await cloneStep.run(makeContext(), { ...BASE_INPUTS, baseBranch: "main" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls.length).toBe(2);
+      expect(calls[1][1]).toEqual(["rev-parse", "HEAD"]);
+    });
+
+    it("does not fetch base branch when baseBranch is absent", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([
+        { status: 0 },
+        { status: 0, stdout: "abc123\n" },
+      ]);
+
+      await cloneStep.run(makeContext(), { ...BASE_INPUTS, prNumber: "42" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls.length).toBe(2);
+    });
+
+    it("redacts token in base-branch fetch error message", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([
+        { status: 0 },
+        { status: 128, stderr: "fatal: secret-token auth failed" },
+        { status: 0, stdout: "abc123\n" },
+      ]);
+
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+      const errorMsg = consoleSpy.mock.calls[0]?.[0] as string;
+      expect(errorMsg).toContain("[clone] base-branch fetch failed");
+      expect(errorMsg).not.toContain("secret-token");
+      consoleSpy.mockRestore();
+    });
   });
 
   describe("mounted workspace mode (AI_IMPLEMENT_WORKSPACE_MODE=mounted)", () => {

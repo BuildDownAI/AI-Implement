@@ -29,3 +29,19 @@ require_one_of() {
   done
   fail "At least one of $* must be set"
 }
+
+# Match the non-root runner account to the owner of a host bind mount without
+# recursively changing ownership of the host checkout.
+prepare_coder_identity() {
+  local host_uid="$1" host_gid="$2" host_group
+  [[ "$host_uid" =~ ^[1-9][0-9]*$ ]] || fail "AI_IMPLEMENT_HOST_UID must be a positive integer"
+  [[ "$host_gid" =~ ^[1-9][0-9]*$ ]] || fail "AI_IMPLEMENT_HOST_GID must be a positive integer"
+  host_group="$(getent group "$host_gid" | cut -d: -f1 || true)"
+  if [ -n "$host_group" ]; then
+    usermod -g "$host_group" coder
+  else
+    groupmod -o -g "$host_gid" coder
+  fi
+  usermod -o -u "$host_uid" coder
+  chown -R coder:"$(id -gn coder)" /home/coder
+}

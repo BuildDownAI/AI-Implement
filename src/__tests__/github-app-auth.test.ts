@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { getInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt, getScopedInstallationToken } from "../github-app-auth.js";
+import { getInstallationToken, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt, getScopedInstallationToken } from "../github-app-auth.js";
 
 // Generate a real RSA key pair for tests so JWT signing works correctly
 const { privateKey } = generateKeyPairSync("rsa", {
@@ -96,6 +96,20 @@ describe("getInstallationToken", () => {
     expect(t1).toBe("ghs_cached");
     expect(t2).toBe("ghs_cached");
     expect(fetch).toHaveBeenCalledTimes(2); // only called once per token, not twice per call
+  });
+
+  it("force-refreshes and replaces a still-valid cached token", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 42 } },
+      { ok: true, json: { token: "ghs_boot", expires_at: "" } },
+      { ok: true, json: { id: 42 } },
+      { ok: true, json: { token: "ghs_fresh", expires_at: "" } },
+    ]));
+
+    expect(await getInstallationToken(APP_ID, privateKey, "my-org")).toBe("ghs_boot");
+    expect(await refreshInstallationToken(APP_ID, privateKey, "my-org")).toBe("ghs_fresh");
+    expect(await getInstallationToken(APP_ID, privateKey, "my-org")).toBe("ghs_fresh");
+    expect(fetch).toHaveBeenCalledTimes(4);
   });
 
   it("maintains separate caches per owner", async () => {
@@ -413,6 +427,23 @@ describe("getScopedInstallationToken", () => {
     expect(t1).toBe("ghs_hit");
     expect(t2).toBe("ghs_hit");
     expect(fetch).toHaveBeenCalledTimes(2); // install + token, then served from cache
+  });
+
+  it("forceRefresh skips the cache read but still updates the cache", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_first", expires_at: futureExpiresAt() } },
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_fresh", expires_at: futureExpiresAt() } },
+    ]));
+
+    const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
+    const t2 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"], forceRefresh: true });
+    const t3 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
+    expect(t1).toBe("ghs_first");
+    expect(t2).toBe("ghs_fresh");
+    expect(t3).toBe("ghs_fresh"); // the forced mint replaced the cached entry
+    expect(fetch).toHaveBeenCalledTimes(4);
   });
 
   it("re-fetches on differing options for the same owner (cache miss)", async () => {

@@ -99,6 +99,16 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
     const config = readAiImplementConfig(workspaceDir);
     const hasPackageJson = fs.existsSync(path.join(workspaceDir, "package.json"));
 
+    if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
+      return {
+        packageManager: config.packageManager ?? (hasPackageJson ? detectPackageManager(workspaceDir) : "none"),
+        installMethod: "skipped: mounted workspace",
+        durationMs: 0,
+        repoModels: config.models ?? {},
+        reviewProviders: config.reviewProviders,
+      };
+    }
+
     if (!hasPackageJson) {
       return {
         packageManager: config.packageManager ?? "none",

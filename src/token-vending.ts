@@ -46,8 +46,11 @@ export async function handleTokenRequest(
       return;
     }
 
+    // forceRefresh mirrors the refreshInstallationToken semantics this endpoint had on
+    // testing: the advertised 55-minute expiry is only honest on a freshly minted token,
+    // never a cache hit.
     const repoName = job.repo!.split("/")[1];
-    const token = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, body.owner, { repositories: [repoName] });
+    const token = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, body.owner, { repositories: [repoName], forceRefresh: true });
     const expiresAt = new Date(Date.now() + 55 * 60 * 1000).toISOString();
 
     json(res, 200, { token, expires_at: expiresAt });

@@ -15,6 +15,12 @@ import { FakeProvider } from "./providers/fake.js";
 import type { TicketIssue } from "../providers/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 
+const notifyTextMock = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../notify.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../notify.js")>()),
+  notifyText: notifyTextMock,
+}));
+
 vi.mock("../workflow-sync.js", () => ({
   syncWorkflowTemplates: vi.fn(),
   classifySyncError: (err: unknown) => ({
@@ -1071,6 +1077,54 @@ describe("admin runner-mode", () => {
     // Confirm it survives a fresh GET
     const get = await request("/api/runner-mode", "GET", "secret", undefined, token);
     expect(JSON.parse(get.body).mode).toBe("shadow");
+  });
+
+  it("GET /api/runner-mode lists ineligible mappings when a force is active (AII-306)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", { teamKey: "BED", owner: "o", repo: "r", provider: "bedrock", awsRegion: "us-west-2" }, token);
+    expect(create.statusCode, create.body).toBeLessThan(300);
+    await request("/api/runner-mode", "POST", "secret", { mode: "fly" }, token);
+    const res = await request("/api/runner-mode", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.mode).toBe("fly");
+    expect(Array.isArray(body.ineligible)).toBe(true);
+    const bed = body.ineligible.find((m: { teamKey: string }) => m.teamKey === "BED");
+    expect(bed).toBeDefined();
+    expect(bed.reason).toMatch(/bedrock/i);
+  });
+
+  it("GET /api/runner-mode has no ineligible list under non-forcing modes (AII-306)", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "BED", owner: "o", repo: "r", provider: "bedrock", awsRegion: "us-west-2" }, token);
+    const res = await request("/api/runner-mode", "GET", "secret", undefined, token);
+    const body = JSON.parse(res.body);
+    expect(body.mode).toBe("default");
+    expect(body.ineligible ?? []).toEqual([]);
+  });
+
+  it("POST /api/runner-mode fires the notify hook with old→new when a webhook is configured (AII-306)", async () => {
+    notifyTextMock.mockClear();
+    const token = await login("secret");
+    const cfg = { ...adminConfig("secret"), notifyWebhookUrl: "https://hooks.example/x" };
+    const req = new MockRequest("/api/runner-mode", "POST", { authorization: `Bearer ${token}` }, JSON.stringify({ mode: "fly" }));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, cfg as never, makeFakeRegistry(provider));
+    await res.done;
+    expect(res.statusCode).toBe(200);
+    expect(notifyTextMock).toHaveBeenCalledTimes(1);
+    const [url, message] = notifyTextMock.mock.calls[0] as unknown as [string, string];
+    expect(url).toBe("https://hooks.example/x");
+    expect(message).toMatch(/default/);
+    expect(message).toMatch(/fly/);
+  });
+
+  it("POST /api/runner-mode does not notify when no webhook is configured (AII-306)", async () => {
+    notifyTextMock.mockClear();
+    const token = await login("secret");
+    const res = await request("/api/runner-mode", "POST", "secret", { mode: "fly" }, token);
+    expect(res.statusCode).toBe(200);
+    expect(notifyTextMock).not.toHaveBeenCalled();
   });
 
   it("POST /api/runner-mode rejects an invalid mode with 400", async () => {

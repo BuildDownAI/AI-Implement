@@ -1,10 +1,22 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function writeShim(binDir: string, name: string, body: string): void {
+  const shim = join(binDir, name);
+  writeFileSync(shim, `#!/usr/bin/env bash\n${body}\n`);
+  chmodSync(shim, 0o755);
+}
 
 // ─── session/git-credential-helper.sh ────────────────────────────────────────
 
@@ -202,10 +214,23 @@ describe("session/git-credential-helper.sh", () => {
 // ─── session/entrypoint.sh ───────────────────────────────────────────────────
 
 describe("session/entrypoint.sh", () => {
-  it("passes shellcheck cleanly", () => {
-    const r = spawnSync("shellcheck", ["session/entrypoint.sh"], { stdio: ["ignore", "pipe", "pipe"] });
+  it("passes shellcheck for every deploy-critical entrypoint", () => {
+    const r = spawnSync(
+      "shellcheck",
+      ["session/entrypoint.sh", "docker-entrypoint.sh", "scripts/deploy-orchestrator.sh"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
     if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
-    expect(r.status).toBe(0);
+    expect(r.status, r.stderr?.toString()).toBe(0);
+  });
+
+  it("requires an explicit Fly app before deploy tooling runs", () => {
+    const r = spawnSync("/bin/bash", ["scripts/deploy-orchestrator.sh"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: "" },
+    });
+    expect(r.status).toBe(64);
+    expect(r.stderr).toContain("explicit Fly app is required");
   });
 
   it("is under 115 lines (bootstrap, not monolith)", () => {
@@ -251,6 +276,41 @@ describe("session/entrypoint.sh", () => {
     expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(git branch --show-current\)"/);
   });
 
+  it("marks the cloned workspace safe before the gap-fill PR checkout", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    const cloneIdx = content.indexOf('git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH"');
+    const safeDirectoryIdx = content.indexOf('git config --global --add safe.directory "$WORKSPACE_DIR"', cloneIdx);
+    const checkoutIdx = content.indexOf('gh pr checkout "$PR_NUMBER"');
+
+    expect(cloneIdx).toBeGreaterThan(-1);
+    expect(safeDirectoryIdx).toBeGreaterThan(cloneIdx);
+    expect(safeDirectoryIdx).toBeLessThan(checkoutIdx);
+  });
+
+  it("expands the shallow clone refspec before tracking a gap-fill PR branch", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    const refspecIdx = content.indexOf(
+      "git config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'",
+    );
+    const checkoutIdx = content.indexOf('gh pr checkout "$PR_NUMBER"');
+
+    expect(refspecIdx).toBeGreaterThan(-1);
+    expect(refspecIdx).toBeLessThan(checkoutIdx);
+  });
+
+  it("decodes prNumber from the envelope before the gap-fill checkout when PR_NUMBER is empty", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    // Decode line must extract prNumber from the envelope JSON
+    expect(content).toMatch(/node -e.*c\.prNumber/);
+    // Decode must precede the gh pr checkout guard
+    const decodeIdx = content.indexOf("c.prNumber");
+    const checkoutIdx = content.indexOf("gh pr checkout");
+    expect(decodeIdx).toBeGreaterThan(-1);
+    expect(decodeIdx).toBeLessThan(checkoutIdx);
+    expect(content).toContain("String(c.prNumber||'')");
+    expect(content).toMatch(/c\.prNumber[^\n]+2>\/dev\/null\|\|true/);
+  });
+
   it("does not pass duplicate preserve-environment flags to su", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toContain("su -p coder");
@@ -274,5 +334,51 @@ describe("session/entrypoint.sh", () => {
     expect(content).toMatch(/if \[ -n "\$\{AI_IMPLEMENT_RUN_CONFIG:-\}" \]; then/);
     expect(content).toContain('require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION');
     expect(content).toContain("export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION");
+  });
+
+  it("consumes mounted workspace mode before clone and never changes bind-mount ownership", () => {
+    const root = mkdtempSync(join(tmpdir(), "entrypoint-mounted-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    const workspace = join(root, "workspace");
+    const commandLog = join(root, "commands.log");
+    spawnSync("mkdir", ["-p", binDir, workspace]);
+
+    for (const name of ["git", "usermod", "groupmod", "chown", "cp", "dbus-run-session"]) {
+      writeShim(binDir, name, `printf '%s %s\\n' '${name}' \"$*\" >> \"$COMMAND_LOG\"`);
+    }
+    writeShim(binDir, "getent", "printf 'hostgroup:x:2345:\\n'");
+    writeShim(binDir, "id", "[ \"${1:-}\" = '-gn' ] && printf 'hostgroup\\n'");
+
+    const result = spawnSync("bash", ["session/entrypoint.sh"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        COMMAND_LOG: commandLog,
+        WORKSPACE_DIR: workspace,
+        AI_IMPLEMENT_MODE: "local",
+        AI_IMPLEMENT_WORKSPACE_MODE: "mounted",
+        AI_IMPLEMENT_HOST_UID: "1234",
+        AI_IMPLEMENT_HOST_GID: "2345",
+        ANTHROPIC_API_KEY: "test-key",
+        GITHUB_TOKEN: "test-token",
+        GITHUB_OWNER: "BuildDownAI",
+        GITHUB_REPO: "fixture",
+        GITHUB_DEFAULT_BRANCH: "testing",
+        ISSUE_ID: "issue-id",
+        ISSUE_IDENTIFIER: "DEV-1",
+        ISSUE_TITLE: "Test",
+        ISSUE_DESCRIPTION: "Test mounted mode",
+      },
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    const commands = readFileSync(commandLog, "utf8");
+    expect(commands).not.toMatch(/git clone/);
+    expect(commands).not.toContain(`chown -R coder:coder ${workspace}`);
+    expect(commands).toContain(`git config --global --add safe.directory ${workspace}`);
+    expect(commands).toContain("usermod -o -u 1234 coder");
+    expect(commands).toContain("dbus-run-session -- su -p coder");
   });
 });

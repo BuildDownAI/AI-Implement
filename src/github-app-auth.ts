@@ -12,6 +12,7 @@ const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 // Cache: scopedCacheKey(owner, options) → { token, expiresAt }
 const scopedTokenCache = new Map<string, { token: string; expiresAt: number }>();
 let cachedAppSlug: string | null = null;
+const TOKEN_CACHE_TTL_MS = 50 * 60 * 1000;
 
 /**
  * Wraps raw bytes in an ASN.1 TLV (tag-length-value) structure.
@@ -170,6 +171,11 @@ export interface ScopedTokenOptions {
   permissions?: Record<string, string>;
   /** Repo names (not owner/repo) to scope to. Omit for all installation repos. */
   repositories?: string[];
+  /**
+   * Skip the cache read and always mint a fresh token (the cache is still updated).
+   * For vending endpoints that advertise a full lifetime on the returned token.
+   */
+  forceRefresh?: boolean;
 }
 
 function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
@@ -200,7 +206,7 @@ export async function getScopedInstallationToken(
 ): Promise<string> {
   const cacheKey = scopedCacheKey(owner, options);
   const cached = scopedTokenCache.get(cacheKey);
-  if (cached && Date.now() < cached.expiresAt) {
+  if (!options?.forceRefresh && cached && Date.now() < cached.expiresAt) {
     return cached.token;
   }
 
@@ -316,8 +322,21 @@ export async function getInstallationToken(
   if (cached && Date.now() < cached.expiresAt) {
     return cached.token;
   }
+  return refreshInstallationToken(appId, privateKey, owner);
+}
+
+/**
+ * Mint and cache a new installation token even when an older cached token is
+ * still within the dispatch cache window. Runner vending uses this path so a
+ * refresh request cannot receive the same near-expiry token it booted with.
+ */
+export async function refreshInstallationToken(
+  appId: string,
+  privateKey: string,
+  owner: string,
+): Promise<string> {
   const { token } = await getInstallation(appId, privateKey, owner);
-  tokenCache.set(owner, { token, expiresAt: Date.now() + 50 * 60 * 1000 });
+  tokenCache.set(owner, { token, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS });
   return token;
 }
 

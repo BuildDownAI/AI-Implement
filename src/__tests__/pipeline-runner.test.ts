@@ -196,6 +196,119 @@ describe("PipelineRunner", () => {
       expect(installMod.run).not.toHaveBeenCalled();
     });
 
+    it("stopAfterStep: stops after the named step and does not run subsequent steps", async () => {
+      const afterSetupMod = makeModule({});
+
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "clone", type: "clone" },
+          { id: "install", type: "install" },
+          { id: "setup", type: "custom", moduleId: "setup" },
+          { id: "after-setup", type: "custom", moduleId: "after-setup" },
+        ],
+      };
+
+      const runner = new PipelineRunner()
+        .register("clone", makeModule({}))
+        .register("install", makeModule({}))
+        .register("setup", makeModule({}))
+        .register("after-setup", afterSetupMod);
+
+      const ctx = makeContext();
+      await runner.run(pipeline, ctx, new NoopStepReporter(), { stopAfterStep: "setup" });
+
+      expect(afterSetupMod.run).not.toHaveBeenCalled();
+    });
+
+    it("stopAfterStep: step before the boundary still runs and its outputs are available", async () => {
+      let installRan = false;
+
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "clone", type: "clone" },
+          { id: "install", type: "install" },
+          { id: "setup", type: "custom", moduleId: "setup" },
+        ],
+      };
+
+      const runner = new PipelineRunner()
+        .register("clone", makeModule({ workspaceDir: "/w" }))
+        .register("install", {
+          run: vi.fn(async () => { installRan = true; return { packageManager: "npm" }; }),
+        })
+        .register("setup", makeModule({}));
+
+      const ctx = makeContext();
+      await runner.run(pipeline, ctx, new NoopStepReporter(), { stopAfterStep: "install" });
+
+      expect(installRan).toBe(true);
+      expect(ctx.getOutputs("clone")).toEqual({ workspaceDir: "/w" });
+      expect(ctx.getOutputs("install")).toEqual({ packageManager: "npm" });
+    });
+
+    it("stopAfterStep: error in the boundary step still propagates", async () => {
+      const afterMod = makeModule({});
+
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "setup", type: "custom", moduleId: "setup" },
+          { id: "after", type: "custom", moduleId: "after" },
+        ],
+      };
+
+      const runner = new PipelineRunner()
+        .register("setup", { run: vi.fn().mockRejectedValue(new Error("hook failed")) })
+        .register("after", afterMod);
+
+      await expect(
+        runner.run(pipeline, makeContext(), new NoopStepReporter(), { stopAfterStep: "setup" }),
+      ).rejects.toThrow("hook failed");
+
+      expect(afterMod.run).not.toHaveBeenCalled();
+    });
+
+    it("stopAfterStep: stops when the named boundary step is skipped", async () => {
+      const afterSetupMod = makeModule({});
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "setup", type: "custom", moduleId: "setup", skip: () => true },
+          { id: "after-setup", type: "custom", moduleId: "after-setup" },
+        ],
+      };
+      const runner = new PipelineRunner().register("after-setup", afterSetupMod);
+
+      await runner.run(pipeline, makeContext(), new NoopStepReporter(), { stopAfterStep: "setup" });
+
+      expect(afterSetupMod.run).not.toHaveBeenCalled();
+    });
+
+    it("stopAfterStep: rejects an unknown boundary instead of running the full pipeline", async () => {
+      const allMods = [makeModule({}), makeModule({}), makeModule({})];
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "clone", type: "clone" },
+          { id: "install", type: "install" },
+          { id: "setup", type: "custom", moduleId: "setup" },
+        ],
+      };
+
+      const runner = new PipelineRunner()
+        .register("clone", allMods[0])
+        .register("install", allMods[1])
+        .register("setup", allMods[2]);
+
+      await expect(
+        runner.run(pipeline, makeContext(), new NoopStepReporter(), { stopAfterStep: "nonexistent" }),
+      ).rejects.toThrow('Unknown stopAfterStep "nonexistent"');
+
+      for (const mod of allMods) expect(mod.run).not.toHaveBeenCalled();
+    });
+
     it("throws when no module is registered for the step type", async () => {
       const pipeline: PipelineDefinition = {
         id: "test",

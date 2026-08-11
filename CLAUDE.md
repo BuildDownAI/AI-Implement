@@ -50,6 +50,9 @@ src/
   admin.ts          — admin HTTP API (auth + CRUD)
   admin-html.ts     — re-exports the assembled admin HTML from admin-ui/index.ts
   admin-ui/         — string-composed admin SPA (see "admin-ui" section below)
+  mcp.ts            — OAuth-authenticated MCP proxy to KG sidecar
+  mcp-oauth.ts      — RFC 6749 authorization server for /mcp (client reg, PKCE, token exchange)
+  oauth/            — OIDC engine + shared admin-UI and MCP login routes
   __tests__/        — Vitest unit tests
 
 workflows/          — templates synced to target repos
@@ -77,6 +80,10 @@ docs/
   solutions/  — documented solutions to past problems (bugs, best practices, workflow
                 patterns), by category with YAML frontmatter (module, tags, problem_type);
                 relevant when implementing or debugging in documented areas
+
+docker-entrypoint.sh  — container entrypoint: starts KG sidecar on loopback before Node
+kg/                   — KG sidecar artifacts (manually populated pre-build; see "KG sidecar")
+  .gitkeep            — placeholder; replaced with actual server code + snapshot artifacts
 ```
 
 ## Running locally
@@ -97,6 +104,8 @@ Admin UI: `http://localhost:8080/admin` (requires an OAuth provider configured *
 
 ```bash
 npm run dev:run -- --workspace ../target-repo --task task.md
+npm run dev:run -- --workspace ../target-repo --task task.md --until setup
+npm run dev:run -- --workspace ../target-repo --task task.md --until setup --shell
 ```
 
 **Task file format** (`task.md`):
@@ -115,6 +124,8 @@ Issue description / implementation instructions go here.
 
 **How it works:**
 - `--workspace <dir>` bind-mounts the local checkout at `/workspace` inside the container.
+- `--until <step>` stops after that pipeline step, including when the step is skipped. Unknown step names fail before execution instead of falling through to a full implementation run. `--until setup` is the token-free setup-hook loop.
+- `--shell` keeps the local container alive after the selected boundary and attaches an interactive shell in `/workspace`; setup-hook `$GITHUB_ENV` exports are loaded into that shell. Exiting collects artifacts and then removes the container.
 - The clone step detects `AI_IMPLEMENT_WORKSPACE_MODE=mounted` and skips `git fetch/reset` entirely, so uncommitted edits to `WORKFLOW.md` and hook scripts take effect immediately.
 - Mounted mode **never pushes** — the push step is a no-op whenever `AI_IMPLEMENT_WORKSPACE_MODE=mounted`. The mount is your live checkout, dirty by design (the uncommitted `WORKFLOW.md`/hook edits under test), so a push would sweep in-progress work into the commit. The mutated working tree is left in the mount for inspection with `git diff`; commit/push the parts you want to keep yourself.
 - Logs are streamed to the terminal in real time. Per-run artifacts (log, diff, telemetry) are saved to `.dev-runs/<timestamp>/` (gitignored).
@@ -152,6 +163,10 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `mappings` | Team key → GitHub repo config |
 | `dispatch_log` | Audit log, last 500 dispatches |
 | `settings` | Key-value store — runner mode, Fly session config, deploy-notification state |
+| `mcp_clients` | MCP OAuth — registered clients (RFC 7591 dynamic registration) |
+| `mcp_oauth_states` | MCP OAuth — in-flight OIDC transactions (10-minute TTL) |
+| `mcp_auth_codes` | MCP OAuth — short-lived authorization codes (5-minute TTL) |
+| `mcp_tokens` | MCP OAuth — issued Bearer access tokens (1-hour TTL) |
 
 `dedup.ts` owns the DB singleton (`getDb()`). All other modules import `getDb` from `dedup.ts`.
 
@@ -170,10 +185,109 @@ All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup
 | `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | No | Google OIDC credentials — enables the Google SSO button |
 | `MICROSOFT_OAUTH_CLIENT_ID` / `MICROSOFT_OAUTH_CLIENT_SECRET` / `MICROSOFT_OAUTH_TENANT` | No | Microsoft (Entra) OIDC credentials; `_TENANT` is the directory (tenant) ID |
 | `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` | No | Comma-separated allowlist; a verified identity must match a domain or email (fail-closed) |
+| `KG_SIDECAR_URL` | No | URL of the private KG sidecar (streamable-HTTP MCP transport), e.g. `http://127.0.0.1:8765/mcp`. Unset → 503 on `/mcp`. The sidecar should be reachable only from loopback; the orchestrator proxies auth-verified requests verbatim and strips the `Authorization` header before forwarding. |
 | `DEDUP_DB_PATH` | No | SQLite path (default `/data/dedup.sqlite`) |
 | `POLL_INTERVAL_MS` | No | Poll interval ms (default `60000`) |
 | `PORT` | No | HTTP port (default `8080`) |
 | `AI_IMPLEMENT_LOG_LEVEL` | No | Runner log verbosity: `summary` (default) or `stream`. `stream` tees per-turn tool activity to the log. Telemetry (turns/cost/tokens/outcome) is captured at both levels. |
+
+## KG sidecar and MCP endpoint
+
+The orchestrator bundles a Python-based KG (knowledge-graph) sidecar that serves `kg_*` tools. MCP clients (e.g. Claude Code) reach those tools via the orchestrator's `/mcp` endpoint — an OAuth-authenticated proxy implemented in `src/mcp.ts`. The sidecar is started by `docker-entrypoint.sh` on `127.0.0.1:8765` before Node, then `KG_SIDECAR_URL` is exported so `src/index.ts` picks it up automatically. Sidecar failure (crash, timeout, absent artifacts) is **non-fatal**: the orchestrator boots normally and `/mcp` returns 503; all other routes are unaffected.
+
+### Single-machine deploy shape
+
+The sidecar runs **inside** the orchestrator container on loopback — no separate service, no public port. `docker-entrypoint.sh` starts the sidecar, polls `http://127.0.0.1:8765/mcp` for up to 30 s, and exports `KG_SIDECAR_URL=http://127.0.0.1:8765/mcp` if it becomes ready. Node then starts with that variable already set. For local dev (`npm run dev`), start the sidecar manually and set `KG_SIDECAR_URL` in `.env`; or leave it blank (no `/mcp`).
+
+### MCP OAuth flow
+
+The `/mcp` endpoint returns 401 with `WWW-Authenticate` pointing to `/.well-known/oauth-protected-resource`. A compliant MCP client discovers the authorization server from there and completes the RFC 6749 authorization code + PKCE flow implemented in `src/mcp-oauth.ts`:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /mcp/register` | RFC 7591 dynamic client registration — returns `client_id` |
+| `GET /mcp/authorize` | Start PKCE auth flow → delegates to configured OIDC provider |
+| `GET /mcp/callback/{provider}` | OIDC callback — applies allowlist, mints 5-min auth code |
+| `POST /mcp/token` | Exchange auth code + PKCE verifier for a 1-hour Bearer token |
+| `GET /.well-known/oauth-protected-resource` | RFC resource metadata — points clients to the AS |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 AS metadata |
+
+Authorization is **fail-closed**: a verified identity must pass the same `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` allowlist as the admin UI. Tokens live 1 hour; the client re-authenticates after expiry.
+
+**Configuring MCP OAuth** — register two additional redirect URIs in the OIDC provider consoles (alongside the admin-UI redirect URIs):
+- `${OAUTH_REDIRECT_BASE_URL}/mcp/callback/google`
+- `${OAUTH_REDIRECT_BASE_URL}/mcp/callback/microsoft`
+
+`OAUTH_REDIRECT_BASE_URL` and at least one OIDC provider must be configured; `/mcp/authorize` returns 503 when neither is set.
+
+### Decision (a) — base image
+
+`Dockerfile` uses `node:24-slim` (Debian bookworm) instead of `node:24-alpine`. fastembed and onnxruntime ship pre-built glibc wheels; Alpine's musl libc makes those wheels fail to install without a full from-source build. Slim costs ~30 MB more but makes the sidecar viable without cross-compilation.
+
+### Decision (b) — KG artifact acquisition via BuildKit build secret (fail-soft)
+
+The KG repository is private. A **BuildKit `--build-secret` mount** clones it at build time. The token is only readable inside the mounted `RUN` layer and is never written to `ARG`, `ENV`, or image history.
+
+**Build with the KG sidecar enabled** (requires a GitHub token with read access to `BuildDownAI/knowledge-graph-ai-implement`):
+
+```bash
+# Local Docker build:
+docker build --secret id=kg_token,env=GH_TOKEN .
+
+# Fly deploy — ALWAYS use the wrapper script (it encodes the required flags and
+# verifies the deployed sidecar actually serves):
+./scripts/deploy-orchestrator.sh ai-implement-testing-orchestrator  # testing orchestrator
+./scripts/deploy-orchestrator.sh <other-app-name>                    # any other orchestrator app
+```
+
+> **Never deploy with a plain `fly deploy`** — it silently produces a sidecar-less
+> image (`/mcp` → 503). The script exists because this has happened three times:
+> the KG clone needs the build secret, `--no-cache` is required (a build secret is
+> not part of the layer cache key, so repeat deploys silently reuse stale layers),
+> and `GH_TOKEN` must be exported (an inline prefix passes an empty secret). The
+> script ends by asserting `/mcp` answers 401 — a deploy that ships without a
+> working sidecar fails loudly instead of being discovered days later.
+
+The sidecar clone copies the KG's `sources.yml` (which pins the IRI `namespace:`)
+alongside the code — without it the server falls back to the placeholder
+namespace and every type-filtered `kg_*` tool silently returns empty (the graph
+loads, but queries match nothing). Verify a deploy with a real query
+(`kg_search` returns non-empty), not just that `/mcp` answers.
+
+**Build without the KG sidecar** (sidecar-less / degraded — `/mcp` returns 503, all other routes remain healthy):
+
+```bash
+docker build .
+fly deploy --remote-only
+```
+
+When the `kg_token` secret is absent or empty the build succeeds and logs `[kg] sidecar-less build`. The entrypoint skips sidecar startup and the orchestrator boots normally.
+
+**When testing moves to Fly native auto-deploy (AII-256):** the build secret must be configured in that deploy path (e.g. as a Fly build secret or CI secret) so automated deployments continue to produce sidecar-enabled images.
+
+`kg/` is excluded from workflow sync and never copied to target repos. The `kg/.gitkeep` placeholder remains in git; the actual KG code and snapshot are cloned at build time and never committed. After the venv install, the Dockerfile performs three distinct build steps:
+
+1. **Model bake** — warms the fastembed model (`BAAI/bge-small-en-v1.5`) into a baked cache at `FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache`. This eliminates network fetches at runtime: the query-embedding path reads the baked cache from the image. If this step fails, the build prints `[kg] WARNING: EMBEDDINGS BUILD FAILED` and continues graph-only; the sidecar starts in lexical-only mode.
+2. **Graph materialize** — runs `kg_ingest.materialize --no-embed` to produce `out/graph.trig`. This step is a hard failure: a broken graph is not usable.
+3. **Embed** — runs `kg_ingest.materialize` (full) using the same `FASTEMBED_CACHE_PATH`. If this step fails, the build prints `[kg] WARNING: EMBEDDINGS BUILD FAILED` and continues graph-only. A successful embed step produces `out/graph.trig` with semantic vectors; lexical-only search is the fallback if the embed step fails.
+
+The `start.sh` script generated at build time exports `FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache` so the running sidecar also reads the baked cache rather than downloading the model on first query. `kg_hybrid_search` returns results immediately on boot without a separate data-load step. Verify a sidecar-enabled deploy by asserting `degraded:false` in a `kg_hybrid_search` response (not just that `/mcp` answers).
+
+### Memory sizing
+
+Fastembed embedding models load into process memory at startup. A typical small model (e.g. BAAI/bge-small-en-v1.5, ~130 MB on disk) expands to ~300–400 MB resident once loaded. Combined with the orchestrator's Node.js footprint (~100–150 MB), **256 MB Fly machines are too small** and will OOM-kill the sidecar or the orchestrator.
+
+**Recommended minimum: 512 MB.** For comfortable headroom (larger models, concurrent requests): **1 GB.**
+
+Update `fly.toml` before deploying a sidecar-enabled image:
+
+```toml
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"   # minimum with KG sidecar; 1024mb recommended
+```
+
+The `fly.toml` in this repository shows `512mb` as the base default (sufficient for sidecar-enabled deployments; sidecar-less deployments could use 256mb but 512mb is harmless). Adjust per-client in `clients/<slug>.toml`.
 
 ## Adding a new target repo
 
@@ -218,6 +332,14 @@ Page conventions: each `<name>.ts` exports two strings. The HTML uses `data-page
 When adding a new page: create the page module, append both strings to the lists in `src/admin-ui/index.ts`, and add the route to `sidebar.ts`. When adding a new design token: extend `tokens.ts` and the `tokens.test.ts` spot-check. When adding a new icon: drop the SVG inner markup into `iconRegistry`.
 
 Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still stubbed in `src/admin-ui/pages/stubs.ts` with "Coming soon" placeholders (badged "Not implemented yet" or "Partially implemented") that explain what exists today and link to the related built pages.
+
+## Backend outage playbook (runner-mode failover)
+
+When GitHub Actions (or Fly) is degraded, the global **runner mode** is the failover lever: `/admin#runners` (or `POST /api/runner-mode`) with `fly` forces every new dispatch onto Fly Machines; `gha` forces GitHub Actions; `default` restores per-project modes. In-flight runs keep their monitors — only new dispatches reroute.
+
+- **Prerequisite for `fly`:** the orchestrator must have a Fly session backend (`FLY_SESSIONS_APP` + Fly API token) and the mapping must be Fly-capable. **Ineligible mappings are skipped at dispatch** (provider=`bedrock` is GHA-only; no sessions app configured) — they stay queued, dedup untouched, with one log line per poll, and are listed in the Runners-page override banner and the `GET /api/runner-mode` response (`ineligible`).
+- Every mode change is logged (`old → new`) and fires a plain-text notification when `NOTIFY_WEBHOOK_URL` is set.
+- Flip back to `default` after the outage; skipped issues dispatch normally on the next poll.
 
 ## Notification adapter
 

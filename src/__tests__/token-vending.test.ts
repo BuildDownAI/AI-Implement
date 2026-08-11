@@ -97,7 +97,7 @@ describe("token-vending", () => {
     expect(data.token).toBe("ghs_test_token");
     expect(data.expires_at).toBeTruthy();
     expect(mockGetScopedInstallationToken).toHaveBeenCalledWith(
-      "app-id", "fake-private-key", "acme", { repositories: ["my-repo"] }
+      "app-id", "fake-private-key", "acme", { repositories: ["my-repo"], forceRefresh: true }
     );
   });
 

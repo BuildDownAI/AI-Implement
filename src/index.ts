@@ -14,7 +14,7 @@ import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
-import { remediateStuckJob } from "./stuck-watchdog.js";
+import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
@@ -31,7 +31,7 @@ import { postStatusComment } from "./status-events.js";
 import { classifyCompletion, renderClassification } from "./completion-classification.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
-import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl } from "./runner-mode.js";
+import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
@@ -42,6 +42,17 @@ import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult }
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
+import { handleMcpRequest } from "./mcp.js";
+import { withRequestErrorBoundary } from "./http-server.js";
+import {
+  initMcpOAuthTables,
+  handleMcpProtectedResourceMetadata,
+  handleMcpAuthorizationServerMetadata,
+  handleMcpClientRegistration,
+  handleMcpAuthorize,
+  handleMcpOidcCallback,
+  handleMcpTokenRequest,
+} from "./mcp-oauth.js";
 import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import {
@@ -97,6 +108,7 @@ interface AppConfig {
   gapFillTriggerSecret: string | null;
   localRunnerImage: string;
   localRunnerOrchestratorUrl: string | null;
+  kgSidecarUrl: string | null;
 }
 
 function loadConfig(): AppConfig {
@@ -215,6 +227,7 @@ function loadConfig(): AppConfig {
     gapFillTriggerSecret,
     localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
+    kgSidecarUrl: process.env.KG_SIDECAR_URL || null,
   };
 }
 
@@ -439,6 +452,18 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
           const { mode: runnerMode } = getRunnerMode();
           const execPath = resolveExecutionPath(runnerMode, mapping.executionMode);
+
+          // AII-306: a forced global mode can point at a backend this mapping
+          // cannot run on (bedrock is GHA-only; Fly needs a sessions app).
+          // Skip — issue stays queued, dedup untouched — instead of
+          // dispatching a run that cannot work.
+          const eligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
+          if (!eligibility.eligible) {
+            console.log(
+              `[poll] Skipping ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${eligibility.reason}`,
+            );
+            continue;
+          }
 
           // Resolve the base branch once per issue (feature-branch grouping). Doing it
           // here — before the exec-path switch — guarantees the "both" shadow path's two
@@ -745,6 +770,15 @@ async function dispatchPlanning(
   // Shadow collapses to GHA-only: planning posts user-visible Linear comments,
   // so a shadow second backend would double-post.
   const execPath = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
+
+  // AII-306: same forced-mode eligibility guard as implementation dispatch.
+  const planningEligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
+  if (!planningEligibility.eligible) {
+    console.log(
+      `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}`,
+    );
+    return;
+  }
 
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) for all execution paths.
   const planningContextInputs = await buildPlanningContextInputs({
@@ -1700,6 +1734,11 @@ async function monitorGitHubActionsJob(
       const provider = await providerForJob(registry, job);
       await finalizeNoOpGroupingParent(provider, job);
     }
+
+    if (jobStatus === "failed") {
+      const provider = await providerForJob(registry, job);
+      await remediateFailedJob(watchdogConfig, provider, job, runStatus.conclusion ?? "failure");
+    }
   }
   // If status is queued or in_progress, ensure job is marked running
   else if (job.status === "dispatched") {
@@ -1757,19 +1796,7 @@ async function monitorFlyMachineJob(
       await postSessionLogs(config, provider, job, "machine_timeout");
     }
 
-    try {
-      await destroyMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
-      console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
-    } catch (err) {
-      // Machine may already be gone — that's fine
-      if (!(err instanceof Error && err.message.includes("404"))) {
-        console.error(`[monitor] Failed to destroy timed-out machine ${job.machineId}:`, err);
-      }
-    }
-    updateJobStatus(job.id, "timed_out", "machine_timeout");
-    invalidateNonce(job.id);
     const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
-    console.warn(`[monitor] Fly machine job ${job.id} (${job.issueIdentifier}) timed out after ${elapsedMin}m`);
 
     // Post timeout status comment to Linear (best-effort, skip shadow jobs)
     if (job.runnerMode !== "shadow" && job.issueId) {
@@ -1782,7 +1809,27 @@ async function monitorFlyMachineJob(
       });
     }
 
-    await resetTicket(provider, job);
+    const watchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+
+    const stopRunner = async () => {
+      try {
+        await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
+      } catch (err) {
+        // Machine may already be gone — that's fine
+        if (!(err instanceof Error && err.message.includes("404"))) {
+          console.error(`[monitor] Failed to destroy timed-out machine ${job.machineId}:`, err);
+        }
+      }
+      invalidateNonce(job.id);
+    };
+
+    await remediateStuckJob(watchdogConfig, provider, job, "machine_timeout", stopRunner);
     return;
   }
 
@@ -1910,8 +1957,13 @@ async function monitorFlyMachineJob(
         await markReadyForReview(provider, job, prUrl);
       }
     } else if (jobStatus === "failed") {
-      // On failure/timeout, reset the Linear issue so it can be re-dispatched
-      await resetTicket(provider, job);
+      const flyWatchdogConfig: StuckWatchdogConfig = {
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+        notifyType: config.notifyType,
+        notifyWebhookUrl: config.notifyWebhookUrl,
+      };
+      await remediateFailedJob(flyWatchdogConfig, provider, job, machineConclusion);
     }
   }
 }
@@ -1925,17 +1977,8 @@ async function monitorLocalDockerJob(
 
   if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
     await postLocalContainerLogs(provider, job, "container_timeout");
-    try {
-      await removeLocalContainer(job.machineId);
-      console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
-    } catch (err) {
-      console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
-    }
 
-    updateJobStatus(job.id, "timed_out", "container_timeout");
-    invalidateNonce(job.id);
     const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
-    console.warn(`[monitor] Local Docker job ${job.id} (${job.issueIdentifier}) timed out after ${elapsedMin}m`);
 
     if (job.issueId) {
       postStatusComment(provider, job.issueId, {
@@ -1946,7 +1989,24 @@ async function monitorLocalDockerJob(
       });
     }
 
-    await resetTicket(provider, job);
+    const watchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+
+    const stopRunner = async () => {
+      try {
+        await removeLocalContainer(job.machineId!);
+        console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
+      } catch (err) {
+        console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
+      }
+      invalidateNonce(job.id);
+    };
+
+    await remediateStuckJob(watchdogConfig, provider, job, "container_timeout", stopRunner);
     return;
   }
 
@@ -2024,7 +2084,13 @@ async function monitorLocalDockerJob(
       await markReadyForReview(provider, job, prUrl);
     }
   } else {
-    await resetTicket(provider, job);
+    const localWatchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+    await remediateFailedJob(localWatchdogConfig, provider, job, `exit_${state.exitCode}`);
   }
 }
 
@@ -2484,8 +2550,9 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
-  const server = http.createServer((req, res) => {
+  const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
+    const pathname = url.split("?")[0];
 
     // Health check
     if (url === "/" && req.method === "GET") {
@@ -2600,6 +2667,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
             const mapping = getMappings()[mappingTeamKey];
             if (!mapping) return null;
             return await registry.forMapping(mapping);
+          },
+          watchdogConfig: {
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            notifyType: config.notifyType,
+            notifyWebhookUrl: config.notifyWebhookUrl,
           },
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
@@ -2728,10 +2801,92 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
       return;
     }
 
+    // MCP well-known metadata endpoints (public — no auth required)
+    if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        return;
+      }
+      handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
+      return;
+    }
+    if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        return;
+      }
+      handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
+      return;
+    }
+
+    // MCP OAuth routes — dynamic client registration, authorization, token exchange
+    if (pathname.startsWith("/mcp/")) {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        return;
+      }
+      if (pathname === "/mcp/register" && req.method === "POST") {
+        handleMcpClientRegistration(req, res).catch((err) => {
+          console.error("[mcp-oauth] register error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      if (pathname === "/mcp/authorize" && req.method === "GET") {
+        handleMcpAuthorize(req, res, config.oauthRedirectBaseUrl).catch((err) => {
+          console.error("[mcp-oauth] authorize error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
+      if (callbackMatch && req.method === "GET") {
+        const [, providerId] = callbackMatch;
+        handleMcpOidcCallback(req, res, providerId, config.oauthRedirectBaseUrl).catch((err) => {
+          console.error("[mcp-oauth] callback error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      if (pathname === "/mcp/token" && req.method === "POST") {
+        handleMcpTokenRequest(req, res).catch((err) => {
+          console.error("[mcp-oauth] token error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+    }
+
+    // MCP endpoint — OAuth bearer token authenticated
+    if (pathname === "/mcp") {
+      handleMcpRequest(req, res, config.kgSidecarUrl, config.oauthRedirectBaseUrl).catch((err) => {
+        console.error("[mcp] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
     // OAuth / SSO — its own auth model (public providers endpoint + the OAuth flow);
     // mounted before the admin 503-gate so it works when ADMIN_ACCESS_CODE is unset.
     if (url.startsWith("/api/auth/")) {
-      const pathname = url.split("?")[0];
       // `secure` reflects the real scheme from Fly's proxy-set x-forwarded-proto.
       // The app is only reachable through that proxy, so the header is trusted; don't copy this to a directly-exposed server.
       const secure = String(req.headers["x-forwarded-proto"] ?? "").includes("https");
@@ -2785,12 +2940,14 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         flySessionsRegion: config.flySessionsRegion,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
+        notifyWebhookUrl: config.notifyWebhookUrl,
       }, registry)) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
-  });
+  };
+  const server = http.createServer(withRequestErrorBoundary(handleRequest));
 
   server.listen(config.healthPort, () => {
     console.log(`[server] Listening on port ${config.healthPort}`);
@@ -2812,6 +2969,7 @@ async function main(): Promise<void> {
   initSettingsTable();
   initReconciliationTable();
   initStepLogTable();
+  initMcpOAuthTables();
 
   const config = loadConfig();
 

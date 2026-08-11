@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { installStep } from "../pipeline/steps/install.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -49,6 +49,26 @@ describe("installStep", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockSpawnSuccess();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("does not mutate dependencies in a mounted host workspace", async () => {
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+    mockRootPackageJson((p) => p.endsWith("package-lock.json"));
+
+    const outputs = await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.packageManager).toBe("npm");
+    expect(outputs.installMethod).toBe("skipped: mounted workspace");
+    expect(outputs.durationMs).toBe(0);
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it("detects npm when no lock files exist", async () => {

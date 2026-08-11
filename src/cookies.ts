@@ -14,7 +14,15 @@ export function parseCookies(header: string | undefined): Record<string, string>
     const eq = part.indexOf("=");
     if (eq === -1) continue;
     const name = part.slice(0, eq).trim();
-    if (name) out[name] = decodeURIComponent(part.slice(eq + 1).trim());
+    if (!name) continue;
+    const raw = part.slice(eq + 1).trim();
+    try {
+      out[name] = decodeURIComponent(raw);
+    } catch {
+      // Cookie parsing runs before authentication on every admin request. A
+      // malformed percent escape is untrusted input, not a process-level error.
+      out[name] = raw;
+    }
   }
   return out;
 }

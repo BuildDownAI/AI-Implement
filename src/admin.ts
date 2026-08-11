@@ -23,9 +23,11 @@ import {
   VALID_RUNNER_MODES,
   isRunnerMode,
   setFlySecretsMinVersion,
+  checkForcedPathEligibility,
 } from "./runner-mode.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
+import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
@@ -172,6 +174,8 @@ export interface AdminConfig {
   flySessionsRegion: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
+  /** AII-306: runner-mode swaps fire a plain-text notification when set. */
+  notifyWebhookUrl?: string | null;
 }
 
 export function handleAdminRequest(
@@ -331,12 +335,19 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/runner-mode" && method === "GET") {
-      json(res, 200, getRunnerMode());
+      const status = getRunnerMode();
+      // AII-306: under a forcing mode, surface which mappings the force cannot
+      // apply to (they are skipped at dispatch, staying queued).
+      const ineligible = Object.entries(getMappings())
+        .map(([teamKey, m]) => ({ teamKey, ...checkForcedPathEligibility(status.mode, m, Boolean(config.flySessionsApp)) }))
+        .filter((e) => !e.eligible)
+        .map((e) => ({ teamKey: e.teamKey, reason: e.reason }));
+      json(res, 200, { ...status, ineligible });
       return true;
     }
 
     if (url === "/api/runner-mode" && method === "POST") {
-      handleSetRunnerMode(req, res);
+      handleSetRunnerMode(req, res, config);
       return true;
     }
 
@@ -525,6 +536,7 @@ async function handleListIssues(
 async function handleSetRunnerMode(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  config: AdminConfig,
 ): Promise<void> {
   try {
     const body = JSON.parse(await readBody(req)) as { mode?: string };
@@ -532,8 +544,20 @@ async function handleSetRunnerMode(
       json(res, 400, { error: `mode must be one of: ${VALID_RUNNER_MODES.join(", ")}` });
       return;
     }
+    const previous = getRunnerMode();
     setRunnerMode(body.mode);
     const status = getRunnerMode();
+    // AII-306: swap observability — an execution-mode change is an operational
+    // event, not a quiet preference. Log it and fire the notify hook best-effort.
+    if (previous.mode !== status.mode) {
+      console.log(`[admin] Runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`);
+      if (config.notifyWebhookUrl) {
+        notifyText(
+          config.notifyWebhookUrl,
+          `⚙️ AI-Implement runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`,
+        ).catch((err) => console.error("[admin] runner-mode notify failed:", err));
+      }
+    }
     // The DB write succeeded but the RUNNER_MODE env var still wins at
     // runtime. Return 409 so direct API callers (not the UI, which already
     // disables the buttons) can tell their write was overridden.

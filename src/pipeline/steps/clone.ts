@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { prepareScratchExclusion } from "../scratch-exclude.js";
+import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 
 interface CloneInputs extends Record<string, unknown> {
   repoOwner: string;
@@ -10,6 +11,10 @@ interface CloneInputs extends Record<string, unknown> {
   branch: string;
   githubToken: string;
   workspaceDir: string;
+  baseBranch?: string;
+  prNumber?: string;
+  orchestratorUrl?: string;
+  machineNonce?: string;
 }
 
 interface CloneOutputs extends Record<string, unknown> {
@@ -85,6 +90,46 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       cloneMethod = "fresh";
     }
 
+    // On PR-targeted (gap-fill) runs, fetch the base branch so the agent can
+    // create true merge commits. Fail soft — if the fetch fails the run degrades
+    // to single-branch behavior rather than aborting.
+    if (inputs.prNumber && inputs.baseBranch) {
+      const gitAuthEnv = {
+        ...process.env,
+        GIT_ASKPASS: "echo",
+        GIT_USERNAME: "x-access-token",
+        GIT_PASSWORD: githubToken,
+      };
+      const baseBranchRefspec = `+refs/heads/${inputs.baseBranch}:refs/remotes/origin/${inputs.baseBranch}`;
+      const fetchBase = spawnSync(
+        "git",
+        ["fetch", "--depth", "1", "origin", baseBranchRefspec],
+        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitAuthEnv },
+      );
+      if (fetchBase.status !== 0) {
+        const stderr = (fetchBase.stderr?.toString() ?? "").replace(githubToken, "***");
+        console.error(`[clone] base-branch fetch failed (non-fatal): ${stderr}`);
+      } else {
+        // Verify a common ancestor exists; if not, deepen to establish one.
+        const mergeBase = spawnSync(
+          "git",
+          ["merge-base", `origin/${inputs.baseBranch}`, "HEAD"],
+          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+        );
+        if (mergeBase.status !== 0) {
+          const unshallow = spawnSync(
+            "git",
+            ["fetch", "--unshallow", "origin", baseBranchRefspec],
+            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitAuthEnv },
+          );
+          if (unshallow.status !== 0) {
+            const stderr = (unshallow.stderr?.toString() ?? "").replace(githubToken, "***");
+            console.error(`[clone] base-branch unshallow failed (non-fatal): ${stderr}`);
+          }
+        }
+      }
+    }
+
     // Working tree now exists (fresh or incremental). Make orchestrator scratch
     // paths (e.g. ai-output/) uncommittable before any downstream `git add`.
     prepareScratchExclusion(workspaceDir);
@@ -99,6 +144,18 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     }
     const clonedRef = revResult.stdout.toString().trim();
 
-    return { workspaceDir, clonedRef, cloneMethod, repoOwner, repoRepo, branch, githubToken };
+    // Give long-running and gap-fill sessions a newly minted token immediately
+    // after clone. Push refreshes again at its own write boundary; gap-fill
+    // prompts refresh the origin again immediately before Claude-owned pushes.
+    const activeGithubToken = await refreshRunnerGithubCredentials({
+      currentToken: githubToken,
+      orchestratorUrl: inputs.orchestratorUrl,
+      machineNonce: inputs.machineNonce,
+      owner: repoOwner,
+      repo: repoRepo,
+      workspaceDir,
+    });
+
+    return { workspaceDir, clonedRef, cloneMethod, repoOwner, repoRepo, branch, githubToken: activeGithubToken };
   },
 };

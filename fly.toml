@@ -15,7 +15,7 @@ kill_timeout = 15
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  memory = "512mb"
 
 [mounts]
   source = "dedup_data"

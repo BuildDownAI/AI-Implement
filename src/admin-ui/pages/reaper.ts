@@ -6,29 +6,13 @@ export const reaperHtml = `
       <div class="page-subtitle">Reconciliation sweep &#x2014; destroys orphaned machines and stale jobs</div>
     </div>
     <div class="page-header-actions">
-      <button class="btn btn-sm" onclick="window.loadRunnerMode(); window.loadReaper();">&#8635; Refresh</button>
+      <button class="btn btn-sm" onclick="window.loadReaper();">&#8635; Refresh</button>
     </div>
   </header>
   <div class="page-body">
     <div id="reaper-mode-banner" class="alert" hidden></div>
 
-    <div class="card">
-      <div class="card-header"><h2 class="card-title">Runner mode</h2></div>
-      <div class="card-body">
-        <div id="runner-mode-env-warning" class="warning hidden">&#x26A0; RUNNER_MODE env var is set &#x2014; UI toggle has no effect until it is unset.</div>
-        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
-          <span class="text-secondary" style="text-transform:uppercase;font-size:11px;font-weight:500">Current</span>
-          <span id="runner-mode-badge" class="badge"></span>
-          <span id="runner-mode-source" class="text-tertiary" style="font-size:11px"></span>
-          <span class="seg" id="runner-mode-controls">
-            <button class="btn btn-sm" id="btn-mode-default" data-mode="default" onclick="window.setRunnerMode('default')">Default</button>
-            <button class="btn btn-sm" id="btn-mode-gha" data-mode="gha" onclick="window.setRunnerMode('gha')">GHA</button>
-            <button class="btn btn-sm" id="btn-mode-fly" data-mode="fly" onclick="window.setRunnerMode('fly')">Fly</button>
-            <button class="btn btn-sm" id="btn-mode-shadow" data-mode="shadow" onclick="window.setRunnerMode('shadow')">Shadow</button>
-          </span>
-        </div>
-      </div>
-    </div>
+    <p class="text-secondary" style="font-size:13px">Runner mode controls have moved to the <a href="#runners" class="text-accent">Runners page</a>.</p>
 
     <div class="card">
       <div class="card-header">
@@ -68,49 +52,6 @@ export const reaperScript = `
     if (m < 60) return m + 'm ago';
     const h = Math.floor(m / 60);
     return h + 'h ago';
-  }
-
-  async function loadRunnerMode() {
-    try {
-      const res = await window.api('/api/runner-mode');
-      const data = await res.json();
-      renderRunnerMode(data);
-    } catch (err) {
-      console.error('loadRunnerMode failed:', err);
-    }
-  }
-
-  function renderRunnerMode(data) {
-    const badge = document.getElementById('runner-mode-badge');
-    const sourceEl = document.getElementById('runner-mode-source');
-    const warning = document.getElementById('runner-mode-env-warning');
-    const modeKinds = { default: '', gha: 'info', fly: 'success', shadow: 'warn' };
-    const kind = modeKinds[data.mode] || '';
-    badge.className = 'badge' + (kind ? ' ' + kind : '');
-    badge.textContent = data.mode;
-    const sourceLabels = { env: 'env var (locked)', db: 'db', default: 'default' };
-    sourceEl.textContent = '(' + (sourceLabels[data.source] || data.source) + ')';
-    if (data.source === 'env') {
-      warning.classList.remove('hidden');
-    } else {
-      warning.classList.add('hidden');
-    }
-    const btns = document.querySelectorAll('#runner-mode-controls .btn');
-    btns.forEach(function (b) {
-      b.classList.toggle('btn-primary', b.dataset.mode === data.mode);
-      b.disabled = data.source === 'env';
-    });
-    setLastUpdated('lu-runner');
-  }
-
-  async function setRunnerMode(mode) {
-    try {
-      const res = await window.api('/api/runner-mode', { method: 'POST', body: JSON.stringify({ mode }) });
-      const data = await res.json();
-      renderRunnerMode(data);
-    } catch (err) {
-      console.error('setRunnerMode failed:', err);
-    }
   }
 
   async function loadReaper() {
@@ -197,12 +138,9 @@ export const reaperScript = `
     setLastUpdated('lu-reaper');
   }
 
-  window.loadRunnerMode = loadRunnerMode;
-  window.setRunnerMode = setRunnerMode;
   window.loadReaper = loadReaper;
 
   window.registerPage('reaper', function () {
-    loadRunnerMode();
     loadReaper();
   });
 })();
