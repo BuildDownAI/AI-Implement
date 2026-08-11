@@ -158,3 +158,22 @@ The helper masks the token in GHA logs (`::add-mask::`) when running under Actio
 - CLAUDE.md: new "Dependency repo access (admin UI)" subsection; note the Fly narrowing.
 - `docs/workflow-envelope.md`: `dependencyTokenScope` field.
 - Release notes: Fly primary-token narrowing as a behaviour change.
+
+## As-built deviations (2026-08-11)
+
+The AII-287 tree implemented this spec with three deltas, recorded here so the doc
+stays truthful as a decision artifact:
+
+- **Credential-helper refresh threshold is 10 minutes**, not 5
+  (`session/git-credential-helper.sh`).
+- **Scoped-token cache TTL is derived from GitHub's `expires_at` minus a 5-minute
+  safety margin**, not a fixed 50 minutes (`getScopedInstallationToken` in
+  `src/github-app-auth.ts`).
+- **`/api/token` mints with `forceRefresh`**: the roll-up merge reconciled this spec's
+  repo-narrowing with testing's fresh-mint requirement (AII-207 lineage) by adding a
+  `forceRefresh` option to `getScopedInstallationToken` — the endpoint's advertised
+  55-minute expiry is only honest on a freshly minted token, never a cache hit.
+
+The release-note requirement in **Documentation** was satisfied by the
+"Fly/local primary-token narrowing (behaviour change)" subsection in CLAUDE.md —
+the repo has no separate changelog convention.
