@@ -41,13 +41,10 @@ EXPIRES_AT=$(jq -r '.expires_at // empty' "$TOKEN_FILE" 2>/dev/null) || true
 
 # Refresh when fewer than 10 minutes remain on the cached token.
 #
-# NOTE: expires_at is a synthetic 55-minute estimate produced by the vending
-# endpoint (getScopedInstallationToken discards GitHub's real expiry).  A
-# 10-minute safety margin is conservative — we refresh at ~45 min elapsed,
-# well before the estimate lapses.  This is safe today because installation
-# tokens last ~60 minutes, but if GitHub ever issues shorter tokens the
-# estimate could lie; see AII-294 notes on widening getScopedInstallationToken
-# to surface the real expiry.
+# expires_at is GitHub's real token expiry, passed through verbatim by the
+# vending endpoint, which also force-mints on every vend — so a fresh token
+# always arrives with its full (~60-minute) lifetime and the 10-minute margin
+# holds even if GitHub ever shortens token lifetimes.
 CALLBACK_URL="${GIT_DEPENDENCY_CALLBACK_URL:-}"
 # Treat this environment value as untrusted input. Normalize all trailing
 # slashes so appending the exact route can never produce a double-slash path.
@@ -72,9 +69,21 @@ if [ -n "$EXPIRES_AT" ] && [ -n "$CALLBACK_URL" ] && [ -n "$PROGRESS_TOKEN" ]; t
             NEW_EXPIRES=$(echo "$RESPONSE" | jq -r '.expires_at // empty' 2>/dev/null) || true
 
             if [ -n "$NEW_TOKEN" ] && [ -n "$NEW_EXPIRES" ]; then
-                # Overwrite cache atomically enough for a single-container runner.
-                printf '{"token":"%s","expires_at":"%s"}' "$NEW_TOKEN" "$NEW_EXPIRES" > "$TOKEN_FILE"
-                TOKEN="$NEW_TOKEN"
+                # git spawns one helper process per credential request, so parallel
+                # fetches can read this file while we replace it — write to a temp
+                # file in the same directory and rename so a reader never sees a
+                # truncated cache.  jq builds the JSON so a value containing quotes
+                # or backslashes cannot wedge the cache with unparseable content.
+                TMP_FILE=$(mktemp "${TOKEN_FILE}.XXXXXX" 2>/dev/null) || TMP_FILE=""
+                if [ -n "$TMP_FILE" ]; then
+                    if jq -n --arg token "$NEW_TOKEN" --arg expires_at "$NEW_EXPIRES" \
+                        '{token: $token, expires_at: $expires_at}' > "$TMP_FILE" 2>/dev/null; then
+                        mv -f "$TMP_FILE" "$TOKEN_FILE"
+                        TOKEN="$NEW_TOKEN"
+                    else
+                        rm -f "$TMP_FILE"
+                    fi
+                fi
             fi
         fi
     fi

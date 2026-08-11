@@ -57,14 +57,16 @@ export async function handleDependencyTokenRequest(
   }
 
   try {
-    const token = await getScopedInstallationToken(
+    // forceRefresh: the credential helper refreshes purely on expires_at — never on 401 —
+    // so a vend must return a full-lifetime token. A cache hit could be minutes from
+    // expiry, and once it lapses every sibling clone fails for the rest of the run.
+    const { token, expiresAt } = await getScopedInstallationToken(
       input.githubAppId,
       input.githubAppPrivateKey,
       mapping.owner,
-      { permissions: { contents: "read" } },
+      { permissions: { contents: "read" }, forceRefresh: true },
     );
-    const expires_at = new Date(Date.now() + 55 * 60 * 1000).toISOString();
-    return { status: 200, body: { token, expires_at } };
+    return { status: 200, body: { token, expires_at: expiresAt } };
   } catch (err) {
     console.error("[dependency-token] Failed to mint installation token:", err);
     return { status: 500, body: { error: "Failed to mint token" } };

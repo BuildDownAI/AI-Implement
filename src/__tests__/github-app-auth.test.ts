@@ -322,10 +322,10 @@ describe("getScopedInstallationToken", () => {
       { ok: true, json: { token: "ghs_perms", expires_at: futureExpiresAt() } },
     ]));
 
-    const token = await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
+    const result = await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
       permissions: { contents: "read" },
     });
-    expect(token).toBe("ghs_perms");
+    expect(result.token).toBe("ghs_perms");
 
     const [, opts] = vi.mocked(fetch).mock.calls[1];
     const body = JSON.parse((opts as RequestInit).body as string);
@@ -424,8 +424,9 @@ describe("getScopedInstallationToken", () => {
 
     const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
     const t2 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
-    expect(t1).toBe("ghs_hit");
-    expect(t2).toBe("ghs_hit");
+    expect(t1.token).toBe("ghs_hit");
+    expect(t2.token).toBe("ghs_hit");
+    expect(t2.expiresAt).toBe(t1.expiresAt); // cache hit carries the real expiry through
     expect(fetch).toHaveBeenCalledTimes(2); // install + token, then served from cache
   });
 
@@ -440,9 +441,9 @@ describe("getScopedInstallationToken", () => {
     const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
     const t2 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"], forceRefresh: true });
     const t3 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
-    expect(t1).toBe("ghs_first");
-    expect(t2).toBe("ghs_fresh");
-    expect(t3).toBe("ghs_fresh"); // the forced mint replaced the cached entry
+    expect(t1.token).toBe("ghs_first");
+    expect(t2.token).toBe("ghs_fresh");
+    expect(t3.token).toBe("ghs_fresh"); // the forced mint replaced the cached entry
     expect(fetch).toHaveBeenCalledTimes(4);
   });
 
@@ -456,8 +457,8 @@ describe("getScopedInstallationToken", () => {
 
     const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
     const t2 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "write" } });
-    expect(t1).toBe("ghs_read");
-    expect(t2).toBe("ghs_write");
+    expect(t1.token).toBe("ghs_read");
+    expect(t2.token).toBe("ghs_write");
     expect(fetch).toHaveBeenCalledTimes(4);
   });
 
@@ -465,21 +466,24 @@ describe("getScopedInstallationToken", () => {
     const baseMs = 1_700_000_000_000;
     const oneHourMs = 60 * 60 * 1000;
     const fiveMinMs = 5 * 60 * 1000;
+    const realExpiry = new Date(baseMs + oneHourMs).toISOString();
 
     vi.spyOn(Date, "now").mockReturnValue(baseMs);
 
     vi.mocked(fetch).mockImplementation(mockFetch([
       { ok: true, json: { id: 1 } },
-      { ok: true, json: { token: "ghs_ttl", expires_at: new Date(baseMs + oneHourMs).toISOString() } },
+      { ok: true, json: { token: "ghs_ttl", expires_at: realExpiry } },
     ]));
 
-    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    const minted = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    expect(minted.expiresAt).toBe(realExpiry); // GitHub's expiry surfaces verbatim, no synthetic estimate
 
     // Just before TTL boundary: cache still valid
     vi.spyOn(Date, "now").mockReturnValue(baseMs + oneHourMs - fiveMinMs - 1);
     vi.mocked(fetch).mockClear();
     const cached = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
-    expect(cached).toBe("ghs_ttl");
+    expect(cached.token).toBe("ghs_ttl");
+    expect(cached.expiresAt).toBe(realExpiry);
     expect(fetch).not.toHaveBeenCalled();
 
     // Just past TTL boundary: cache expired → re-fetch
@@ -490,7 +494,7 @@ describe("getScopedInstallationToken", () => {
     ]));
 
     const fresh = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
-    expect(fresh).toBe("ghs_ttl2");
+    expect(fresh.token).toBe("ghs_ttl2");
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
@@ -510,8 +514,8 @@ describe("getScopedInstallationToken", () => {
       { ok: true, json: { token: "ghs_after", expires_at: futureExpiresAt() } },
     ]));
 
-    const token = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
-    expect(token).toBe("ghs_after");
+    const result = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    expect(result.token).toBe("ghs_after");
     expect(fetch).toHaveBeenCalledTimes(2); // re-fetched after cache was cleared
   });
 
@@ -547,10 +551,10 @@ describe("getScopedInstallationToken", () => {
       { ok: true, json: { token: "ghs_user_scoped", expires_at: futureExpiresAt() } },
     ]));
 
-    const token = await getScopedInstallationToken(APP_ID, privateKey, "my-user", {
+    const result = await getScopedInstallationToken(APP_ID, privateKey, "my-user", {
       repositories: ["my-repo"],
     });
-    expect(token).toBe("ghs_user_scoped");
+    expect(result.token).toBe("ghs_user_scoped");
 
     const [userInstallUrl] = vi.mocked(fetch).mock.calls[1];
     expect(userInstallUrl).toBe("https://api.github.com/users/my-user/installation");
