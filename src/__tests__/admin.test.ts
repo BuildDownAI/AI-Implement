@@ -978,6 +978,74 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(202);
     expect(JSON.parse(res.body).sensitiveAllowPatterns).toEqual(["**/secrets.env", ".env.*"]);
   });
+
+  it("persists dependencyTokenScope='installation' and returns it", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS1", owner: "org", repo: "app",
+      dependencyTokenScope: "installation",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).dependencyTokenScope).toBe("installation");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).DTS1.dependencyTokenScope).toBe("installation");
+  });
+
+  it("treats null dependencyTokenScope as null", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS2", owner: "org", repo: "app",
+      dependencyTokenScope: null,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).dependencyTokenScope).toBeNull();
+  });
+
+  it("treats empty string dependencyTokenScope as null", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS3", owner: "org", repo: "app",
+      dependencyTokenScope: "",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).dependencyTokenScope).toBeNull();
+  });
+
+  it("treats absent dependencyTokenScope as null on new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS4", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).dependencyTokenScope).toBeNull();
+  });
+
+  it("preserves existing dependencyTokenScope when omitted from update", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS5", owner: "org", repo: "app",
+      dependencyTokenScope: "installation",
+    }, token);
+
+    const update = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS5", owner: "org", repo: "app-updated",
+    }, token);
+    expect(update.statusCode).toBe(202);
+    expect(JSON.parse(update.body).dependencyTokenScope).toBe("installation");
+  });
+
+  it("rejects invalid dependencyTokenScope values with 400", async () => {
+    const token = await login("secret");
+    for (const invalid of ["all", "true", "repo", "INSTALLATION"]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "DTSBAD", owner: "org", repo: "app",
+        dependencyTokenScope: invalid,
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("dependencyTokenScope");
+    }
+  });
 });
 
 describe("admin runner-mode", () => {

@@ -23,6 +23,8 @@ export interface RunConfigV1 {
   /** True when this dispatch is a grouping parent's own closing-work run. The runner uses
    *  this to finalize cleanly when the agent produces no changes (Case B). */
   groupingParent?: boolean;
+  /** Per-project dependency-repo read access. Absent = feature off. */
+  dependencyTokenScope?: "installation";
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -56,7 +58,7 @@ export function decodeRunConfig(encoded: string): RunConfigV1 {
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
-    profiles, planningContext, groupingParent } = cfg;
+    profiles, planningContext, groupingParent, dependencyTokenScope } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -71,5 +73,6 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (profiles !== undefined) out.profiles = profiles;
   if (planningContext !== undefined) out.planningContext = planningContext;
   if (groupingParent !== undefined) out.groupingParent = groupingParent;
+  if (dependencyTokenScope !== undefined) out.dependencyTokenScope = dependencyTokenScope;
   return out;
 }

@@ -192,6 +192,7 @@ export interface ResolvedRunnerInputs {
   branchPrefix: string | undefined;
   skillsRepo: string | undefined;
   sensitiveFiles: { add?: string[]; allow?: string[] } | undefined;
+  dependencyTokenScope: "installation" | undefined;
   baseBranch: string | undefined;
   profiles: string[];
   githubOwner: string;
@@ -255,6 +256,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     branchPrefix: safeBranchPrefix(cfg.branchPrefix),
     skillsRepo: cfg.skillsRepo,
     sensitiveFiles: cfg.sensitiveFiles,
+    dependencyTokenScope: cfg.dependencyTokenScope,
     baseBranch: cfg.baseBranch,
     profiles: cfg.profiles
       ? cfg.profiles
@@ -310,6 +312,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     }
   })();
   const skillsRepo = env.AI_IMPLEMENT_SKILLS_REPO?.trim() || undefined;
+  const dependencyTokenScope = undefined;
   const profiles = (env.AI_IMPLEMENT_PROFILES ?? "")
     .split(",")
     .map((p) => p.trim())
@@ -329,6 +332,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     branchPrefix,
     skillsRepo,
     sensitiveFiles: undefined,
+    dependencyTokenScope,
     baseBranch: undefined,
     profiles,
     githubOwner,
@@ -361,6 +365,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     branchPrefix,
     skillsRepo,
     sensitiveFiles,
+    dependencyTokenScope,
     baseBranch,
     profiles,
     logLevel,
@@ -459,8 +464,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       branchPrefix,
       skillsRepo,
       sensitiveFiles,
+      dependencyTokenScope,
       profiles,
       groupingParent,
+      callbackUrl: callbackUrl ?? undefined,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,

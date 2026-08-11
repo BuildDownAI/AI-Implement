@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { getInstallationToken, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt } from "../github-app-auth.js";
+import { getInstallationToken, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt, getScopedInstallationToken } from "../github-app-auth.js";
 
 // Generate a real RSA key pair for tests so JWT signing works correctly
 const { privateKey } = generateKeyPairSync("rsa", {
@@ -310,6 +310,250 @@ describe("installationIncludesRepo", () => {
 
     await expect(installationIncludesRepo("ghs_x", "backend"))
       .rejects.toThrow("Failed to list installation repositories");
+  });
+});
+
+describe("getScopedInstallationToken", () => {
+  const futureExpiresAt = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+  it("sends permissions only in the request body", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_perms", expires_at: futureExpiresAt() } },
+    ]));
+
+    const token = await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
+      permissions: { contents: "read" },
+    });
+    expect(token).toBe("ghs_perms");
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    const body = JSON.parse((opts as RequestInit).body as string);
+    expect(body).toEqual({ permissions: { contents: "read" } });
+    expect(body.repositories).toBeUndefined();
+  });
+
+  it("sends repositories only in the request body", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_repos", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
+      repositories: ["my-repo"],
+    });
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    const body = JSON.parse((opts as RequestInit).body as string);
+    expect(body).toEqual({ repositories: ["my-repo"] });
+    expect(body.permissions).toBeUndefined();
+  });
+
+  it("sends both permissions and repositories in the request body", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_both", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", {
+      permissions: { contents: "read", issues: "write" },
+      repositories: ["repo-a", "repo-b"],
+    });
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    const body = JSON.parse((opts as RequestInit).body as string);
+    expect(body).toEqual({
+      permissions: { contents: "read", issues: "write" },
+      repositories: ["repo-a", "repo-b"],
+    });
+  });
+
+  it("sends no body when neither option is supplied", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_bare", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org");
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
+  it("treats an empty permissions object as absent (no body sent)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_empty_perms", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: {} });
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
+  it("treats an empty repositories array as absent (no body sent)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_empty_repos", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: [] });
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
+  it("treats both empty permissions and empty repositories as absent (no body sent)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_empty_both", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: {}, repositories: [] });
+
+    const [, opts] = vi.mocked(fetch).mock.calls[1];
+    expect((opts as RequestInit).body).toBeUndefined();
+  });
+
+  it("returns a cached token on identical options (cache hit)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_hit", expires_at: futureExpiresAt() } },
+    ]));
+
+    const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    const t2 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    expect(t1).toBe("ghs_hit");
+    expect(t2).toBe("ghs_hit");
+    expect(fetch).toHaveBeenCalledTimes(2); // install + token, then served from cache
+  });
+
+  it("forceRefresh skips the cache read but still updates the cache", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_first", expires_at: futureExpiresAt() } },
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_fresh", expires_at: futureExpiresAt() } },
+    ]));
+
+    const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
+    const t2 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"], forceRefresh: true });
+    const t3 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { repositories: ["repo-a"] });
+    expect(t1).toBe("ghs_first");
+    expect(t2).toBe("ghs_fresh");
+    expect(t3).toBe("ghs_fresh"); // the forced mint replaced the cached entry
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("re-fetches on differing options for the same owner (cache miss)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_read", expires_at: futureExpiresAt() } },
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_write", expires_at: futureExpiresAt() } },
+    ]));
+
+    const t1 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    const t2 = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "write" } });
+    expect(t1).toBe("ghs_read");
+    expect(t2).toBe("ghs_write");
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("derives cache TTL from expires_at with a 5-minute safety margin", async () => {
+    const baseMs = 1_700_000_000_000;
+    const oneHourMs = 60 * 60 * 1000;
+    const fiveMinMs = 5 * 60 * 1000;
+
+    vi.spyOn(Date, "now").mockReturnValue(baseMs);
+
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_ttl", expires_at: new Date(baseMs + oneHourMs).toISOString() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+
+    // Just before TTL boundary: cache still valid
+    vi.spyOn(Date, "now").mockReturnValue(baseMs + oneHourMs - fiveMinMs - 1);
+    vi.mocked(fetch).mockClear();
+    const cached = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    expect(cached).toBe("ghs_ttl");
+    expect(fetch).not.toHaveBeenCalled();
+
+    // Just past TTL boundary: cache expired → re-fetch
+    vi.spyOn(Date, "now").mockReturnValue(baseMs + oneHourMs - fiveMinMs + 1);
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_ttl2", expires_at: new Date(baseMs + 2 * oneHourMs).toISOString() } },
+    ]));
+
+    const fresh = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    expect(fresh).toBe("ghs_ttl2");
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("clearTokenCache() clears the scoped cache", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_before", expires_at: futureExpiresAt() } },
+    ]));
+
+    await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+
+    clearTokenCache();
+    vi.mocked(fetch).mockClear();
+
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_after", expires_at: futureExpiresAt() } },
+    ]));
+
+    const token = await getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } });
+    expect(token).toBe("ghs_after");
+    expect(fetch).toHaveBeenCalledTimes(2); // re-fetched after cache was cleared
+  });
+
+  it("throws GitHubApiError with status and path on token-mint failure", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: false, status: 422, text: "Unprocessable Entity" },
+    ]));
+
+    await expect(
+      getScopedInstallationToken(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } }),
+    ).rejects.toMatchObject({
+      status: 422,
+      path: "/app/installations/1/access_tokens",
+    });
+  });
+
+  it("throws GitHubApiError when the installation is not found", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: false, status: 404, text: "Not Found" },
+      { ok: false, status: 404, text: "Not Found" },
+    ]));
+
+    await expect(
+      getScopedInstallationToken(APP_ID, privateKey, "unknown-org", { permissions: { contents: "read" } }),
+    ).rejects.toThrow('GitHub App not installed for owner "unknown-org"');
+  });
+
+  it("falls back to the user installation endpoint for non-org owners", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: false, status: 404, text: "Not Found" },
+      { ok: true, json: { id: 5 } },
+      { ok: true, json: { token: "ghs_user_scoped", expires_at: futureExpiresAt() } },
+    ]));
+
+    const token = await getScopedInstallationToken(APP_ID, privateKey, "my-user", {
+      repositories: ["my-repo"],
+    });
+    expect(token).toBe("ghs_user_scoped");
+
+    const [userInstallUrl] = vi.mocked(fetch).mock.calls[1];
+    expect(userInstallUrl).toBe("https://api.github.com/users/my-user/installation");
   });
 });
 

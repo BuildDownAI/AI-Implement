@@ -5,6 +5,9 @@ steps:
   - id: install-skills
     type: custom
     moduleId: install-skills
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
   - id: install
     type: install
   - id: setup

@@ -1,6 +1,7 @@
 import { PipelineRunner } from "./runner.js";
 import type { PipelineDefinition, StepModule } from "./types.js";
 import { cloneStep } from "./steps/clone.js";
+import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { installSkillsStep } from "./steps/install-skills.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { installStep } from "./steps/install.js";
@@ -23,6 +24,7 @@ export const DEFAULT_PIPELINE: PipelineDefinition = loadPipelineDefinition(
 const BUILTIN_STEPS: Array<[string, StepModule]> = [
   ["clone", cloneStep],
   ["install-skills", installSkillsStep],
+  ["dependency-auth", dependencyAuthStep],
   ["install", installStep],
   ["setup", setupStep],
   ["feedback-loop", feedbackLoopStep],

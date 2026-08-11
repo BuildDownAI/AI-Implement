@@ -38,6 +38,7 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     skillsRepo: null,
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
+    dependencyTokenScope: null,
     ...overrides,
   };
 }
@@ -620,6 +621,40 @@ describe("config", () => {
     reopened.close();
     expect(info.map((c) => c.name)).toContain("sensitive_add_patterns");
     expect(info.map((c) => c.name)).toContain("sensitive_allow_patterns");
+  });
+
+  it("round-trips dependencyTokenScope (including null)", () => {
+    config.initMappingsTable();
+    config.upsertMapping("DTS", mapping({ owner: "org", repo: "repo", dependencyTokenScope: "installation" }));
+    config.upsertMapping("DTSNULL", mapping({ owner: "org", repo: "repo", dependencyTokenScope: null }));
+
+    const all = config.getMappings();
+    expect(all.DTS.dependencyTokenScope).toBe("installation");
+    expect(all.DTSNULL.dependencyTokenScope).toBeNull();
+  });
+
+  it("migrates a pre-existing mappings table to include the dependency_token_scope column (default null)", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG3", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    expect(config.getMappings().LEG3.dependencyTokenScope).toBeNull();
+
+    const reopened = new Database(dbPath);
+    const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
+    reopened.close();
+    expect(info.map((c) => c.name)).toContain("dependency_token_scope");
   });
 
   it("getMappings falls back to {} when extra_env contains invalid JSON", () => {
