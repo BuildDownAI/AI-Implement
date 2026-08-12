@@ -270,6 +270,113 @@ describe("handleMcpRequest", () => {
       expect(names).toContain("kg_search");
     });
 
+    it("merges kg_* tools from an SSE-framed sidecar response (streamable-HTTP)", async () => {
+      const mockProxyReq = new PassThrough();
+      const mockProxyRes = new PassThrough();
+      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
+      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
+        process.nextTick(() => {
+          cb(mockProxyRes);
+          mockProxyRes.push(": ping\n\n");
+          mockProxyRes.push(
+            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "kg_hybrid_search", description: "hybrid" }] } })}\n\n`,
+          );
+          mockProxyRes.push(null);
+        });
+        return mockProxyReq;
+      });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        SIDECAR_URL,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      expect(result.statusCode).toBe(200);
+      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
+      expect(names).toContain("get_tenant_health");
+      expect(names).toContain("kg_hybrid_search");
+    });
+
+    it("joins multi-line SSE data fields before parsing", async () => {
+      const payload = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "kg_search" }] } });
+      const mid = Math.floor(payload.length / 2);
+      const mockProxyReq = new PassThrough();
+      const mockProxyRes = new PassThrough();
+      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
+      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
+        process.nextTick(() => {
+          cb(mockProxyRes);
+          mockProxyRes.push(`event: message\ndata: ${payload.slice(0, mid)}\ndata:${payload.slice(mid)}\n\n`);
+          mockProxyRes.push(null);
+        });
+        return mockProxyReq;
+      });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        SIDECAR_URL,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
+      expect(names).toContain("kg_search");
+    });
+
+    it("returns only diagnostic tools when the sidecar replies with a JSON-RPC error over SSE", async () => {
+      const mockProxyReq = new PassThrough();
+      const mockProxyRes = new PassThrough();
+      Object.assign(mockProxyRes, { statusCode: 400, headers: { "content-type": "text/event-stream" } });
+      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
+        process.nextTick(() => {
+          cb(mockProxyRes);
+          mockProxyRes.push(
+            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: "server-error", error: { code: -32600, message: "Bad Request: Missing session ID" } })}\n\n`,
+          );
+          mockProxyRes.push(null);
+        });
+        return mockProxyReq;
+      });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        SIDECAR_URL,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.tools.some((t: { name: string }) => t.name === "get_tenant_health")).toBe(true);
+      expect(parsed.result.tools.some((t: { name: string }) => t.name.startsWith("kg_"))).toBe(false);
+    });
+
+    it("returns only diagnostic tools when the SSE stream carries only pings", async () => {
+      const mockProxyReq = new PassThrough();
+      const mockProxyRes = new PassThrough();
+      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
+      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
+        process.nextTick(() => {
+          cb(mockProxyRes);
+          mockProxyRes.push(": ping\n\n: ping\n\n");
+          mockProxyRes.push(null);
+        });
+        return mockProxyReq;
+      });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        SIDECAR_URL,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.tools.some((t: { name: string }) => t.name === "get_tenant_health")).toBe(true);
+      expect(parsed.result.tools.some((t: { name: string }) => t.name.startsWith("kg_"))).toBe(false);
+    });
+
     it("returns only diagnostic tools when sidecar returns invalid JSON", async () => {
       const mockProxyReq = new PassThrough();
       const mockProxyRes = new PassThrough();

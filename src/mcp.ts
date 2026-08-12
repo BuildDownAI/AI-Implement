@@ -164,6 +164,48 @@ function callDiagnosticTool(name: string, args: Record<string, unknown>): unknow
 
 // ---- Sidecar proxy helpers ----
 
+interface SidecarRpcResponse {
+  result?: { tools?: unknown[] };
+  error?: unknown;
+}
+
+/**
+ * Extract the JSON-RPC response from a sidecar reply. The Python MCP SDK's
+ * streamable-HTTP transport frames responses as SSE (`event:`/`data:` lines)
+ * rather than a bare JSON body, so both encodings must be handled. Returns
+ * the first event carrying a `result` (falling back to one carrying an
+ * `error`), or null if nothing in the reply is a JSON-RPC response.
+ */
+function parseSidecarRpcResponse(raw: string, contentType: string | undefined): SidecarRpcResponse | null {
+  if (contentType?.includes("text/event-stream")) {
+    let errorReply: SidecarRpcResponse | null = null;
+    // Events are separated by blank lines; one event's data may span several
+    // data: lines, joined with newlines before parsing.
+    for (const event of raw.split(/\r?\n\r?\n/)) {
+      const data = event
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).replace(/^ /, ""))
+        .join("\n");
+      if (!data) continue;
+      try {
+        const parsed = JSON.parse(data) as SidecarRpcResponse;
+        if (!parsed || typeof parsed !== "object") continue;
+        if ("result" in parsed) return parsed;
+        if ("error" in parsed) errorReply ??= parsed;
+      } catch {
+        // keep scanning; other events (pings, notifications) may share the stream
+      }
+    }
+    return errorReply;
+  }
+  try {
+    return JSON.parse(raw) as SidecarRpcResponse;
+  } catch {
+    return null;
+  }
+}
+
 function fetchSidecarToolsList(
   kgSidecarUrl: string,
   body: Buffer,
@@ -187,14 +229,18 @@ function fetchSidecarToolsList(
       const chunks: Buffer[] = [];
       proxyRes.on("data", (chunk: Buffer) => chunks.push(chunk));
       proxyRes.on("end", () => {
-        try {
-          const parsed = JSON.parse(Buffer.concat(chunks).toString()) as {
-            result?: { tools?: unknown[] };
-          };
-          resolve(parsed.result?.tools ?? []);
-        } catch {
-          resolve([]);
+        const raw = Buffer.concat(chunks).toString();
+        const parsed = parseSidecarRpcResponse(raw, proxyRes.headers["content-type"]);
+        if (!parsed) {
+          console.error(
+            `[mcp] KG sidecar tools/list unparseable (status ${proxyRes.statusCode}, content-type ${proxyRes.headers["content-type"]}): ${raw.slice(0, 200)}`,
+          );
+        } else if (!parsed.result) {
+          console.error(
+            `[mcp] KG sidecar tools/list returned no result (status ${proxyRes.statusCode}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
+          );
         }
+        resolve(parsed?.result?.tools ?? []);
       });
       proxyRes.on("error", () => resolve([]));
     });
