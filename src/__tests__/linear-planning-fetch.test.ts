@@ -138,4 +138,79 @@ describe("fetchPlanningContext", () => {
     expect(ctx).toContain("<planning_context>");
     expect(ctx).toContain("</planning_context>");
   });
+
+  it("returns context for old-format comments alone", async () => {
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            comments: {
+              nodes: [
+                { body: "## 🏗️ AI Planning: Architecture Analysis\n\nOld arch", createdAt: "2026-05-01T00:00:00Z" },
+                { body: "## 🧪 AI Planning: Test Plan\n\nOld tests", createdAt: "2026-05-01T00:00:00Z" },
+                { body: "## 🔗 AI Planning: Cross-Story Context\n\nOld cross", createdAt: "2026-05-01T00:00:00Z" },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    });
+    const ctx = await fetchPlanningContext({ issueId: "x", fetchImpl: mockFetch });
+    expect(ctx).toContain("Old arch");
+    expect(ctx).toContain("Old tests");
+    expect(ctx).toContain("Old cross");
+    expect(ctx).toContain("<planning_context>");
+  });
+
+  it("returns context for new-format comments alone", async () => {
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            comments: {
+              nodes: [
+                { body: "## 🗺 AI Planning: Implementation Map\n\nNew map", createdAt: "2026-06-01T00:00:00Z" },
+                { body: "## ✅ AI Planning: Acceptance Bar\n\nNew bar", createdAt: "2026-06-01T00:00:00Z" },
+                { body: "## ⚠️ AI Planning: Risks & Open Questions\n\nNew risks", createdAt: "2026-06-01T00:00:00Z" },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    });
+    const ctx = await fetchPlanningContext({ issueId: "x", fetchImpl: mockFetch });
+    expect(ctx).toContain("New map");
+    expect(ctx).toContain("New bar");
+    expect(ctx).toContain("New risks");
+    expect(ctx).toContain("<planning_context>");
+  });
+
+  it("returns context for mixed old-format and new-format comments", async () => {
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        data: {
+          issue: {
+            comments: {
+              nodes: [
+                { body: "## 🏗️ AI Planning: Architecture Analysis\n\nOld arch", createdAt: "2026-05-01T00:00:00Z" },
+                { body: "## 🗺 AI Planning: Implementation Map\n\nNew map", createdAt: "2026-06-01T00:00:00Z" },
+                { body: "## ✅ AI Planning: Acceptance Bar\n\nNew bar", createdAt: "2026-06-01T00:00:00Z" },
+              ],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    });
+    const ctx = await fetchPlanningContext({ issueId: "x", fetchImpl: mockFetch });
+    expect(ctx).toContain("Old arch");
+    expect(ctx).toContain("New map");
+    expect(ctx).toContain("New bar");
+    expect(ctx).toContain("<planning_context>");
+  });
 });
