@@ -43,10 +43,9 @@ ${s.ISSUE_DESCRIPTION}
 **Dependencies:** ${s.DEPENDENCIES}
 
 Use Read, Glob, and Grep to explore the codebase, then write structured planning comments as separate Markdown files under ai-output/comments/, prefixed with a two-digit sequence number:
-  ai-output/comments/01-architecture-analysis.md  → "## 🏗️ AI Planning: Architecture Analysis"
-  ai-output/comments/02-test-plan.md               → "## 🧪 AI Planning: Test Plan"
-  ai-output/comments/03-work-units.md              → "## 🔧 AI Planning: Work Units"
-  ai-output/comments/04-cross-story-context.md     → "## 🔗 AI Planning: Cross-Story Context" (only if parent/siblings/dependencies are not "None")
+  ai-output/comments/01-implementation-map.md  → "## 🗺 AI Planning: Implementation Map"
+  ai-output/comments/02-acceptance-bar.md       → "## ✅ AI Planning: Acceptance Bar"
+  ai-output/comments/03-risks.md                → "## ⚠️ AI Planning: Risks & Open Questions"
 Do NOT post to the ticketing system; the orchestrator posts the files you write.`;
 }
 
