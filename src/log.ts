@@ -401,6 +401,25 @@ export function getLatestDispatchForPr(owner: string, repo: string, prNumber: nu
   return mapRows([row])[0];
 }
 
+/**
+ * Returns GitHub Actions run URLs for the most recent failed/timed-out jobs for
+ * an issue+phase. Fly Machines and local-Docker jobs are excluded (no stable URL).
+ * Used by the dispatch-breaker trip comment.
+ */
+export function getRecentFailedRunUrls(issueId: string, phase: string, limit = 3): string[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT repo, run_id FROM dispatch_log
+       WHERE issue_id = ? AND phase = ?
+         AND status IN ('failed', 'timed_out')
+         AND execution_mode = 'github-actions'
+         AND run_id IS NOT NULL AND repo IS NOT NULL
+       ORDER BY dispatched_at DESC LIMIT ?`,
+    )
+    .all(issueId, phase, limit) as Array<{ repo: string; run_id: number }>;
+  return rows.map((r) => `https://github.com/${r.repo}/actions/runs/${r.run_id}`);
+}
+
 interface RawRow {
   id: number;
   issue_id: string;
