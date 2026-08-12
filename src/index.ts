@@ -20,7 +20,7 @@ import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { configureAuthorizationPolicy } from "./oauth/authorize.js";
@@ -2382,14 +2382,23 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
 /**
  * Thin wrapper: adapts registry + mappings to runReconciliations.
  */
-async function processReconciliations(_config: AppConfig, registry: ProviderRegistry): Promise<void> {
+async function processReconciliations(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const teamRepoMap = getMappings();
+  let appBotLogin: string | undefined;
+  try {
+    const slug = await getAppSlug(config.githubAppId, config.githubAppPrivateKey);
+    appBotLogin = `${slug}[bot]`;
+  } catch {
+    // Non-fatal; runner commits won't be bucketed separately
+  }
   await runReconciliations({
     mappingForRepo: (repo) => {
       const entry = Object.entries(teamRepoMap).find(([, m]) => `${m.owner}/${m.repo}` === repo);
       return entry ? { scopeKey: entry[0], mapping: entry[1] } : undefined;
     },
     resolveProvider: (mapping) => registry.forMapping(mapping),
+    tokenForOwner: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+    appBotLogin,
   });
 }
 
