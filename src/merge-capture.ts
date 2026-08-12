@@ -60,26 +60,46 @@ function bucketCommit(
   return "human";
 }
 
-function bucketFinding(login: string): "claude-review" | "codex" | "human" {
-  const lower = login.toLowerCase();
-  if (lower.includes("claude")) return "claude-review";
-  if (lower.includes("codex")) return "codex";
+function bucketFinding(
+  login: string,
+  body?: string,
+): "claude-review" | "codex" | "human" {
+  // External Claude review posts as github-actions[bot] with a body starting with "Claude finished"
+  if (login === "github-actions[bot]" && body?.includes("Claude finished"))
+    return "claude-review";
+  if (login.toLowerCase().includes("codex")) return "codex";
   return "human";
 }
 
+type GhPullRequest = {
+  merged_at: string | null;
+};
+
 type GhCommit = {
+  sha: string;
   author: { login: string } | null;
   commit: { author: { date: string }; committer?: { date: string } };
+};
+
+type GhSingleCommit = {
   stats?: { additions?: number; deletions?: number };
 };
 
 type GhReview = {
   user: { login: string } | null;
   state: string;
+  submitted_at: string;
 };
 
 type GhComment = {
   user: { login: string } | null;
+  created_at: string;
+};
+
+type GhIssueComment = {
+  user: { login: string } | null;
+  body: string;
+  created_at: string;
 };
 
 export async function capturePrMerge(opts: {
@@ -96,27 +116,39 @@ export async function capturePrMerge(opts: {
 
   const approvalTs = issueId ? queryApprovalTs(issueId) : null;
 
-  const base = `https://api.github.com/repos/${repo}/pulls/${prNumber}`;
+  const base = `https://api.github.com/repos/${repo}`;
   const headers = ghHeaders(token);
 
-  const [commitsRes, reviewsRes, commentsRes] = await Promise.all([
-    fetchImpl(`${base}/commits?per_page=100`, { headers }),
-    fetchImpl(`${base}/reviews?per_page=100`, { headers }),
-    fetchImpl(`${base}/comments?per_page=100`, { headers }),
+  const [prRes, commitsRes, reviewsRes, prCommentsRes, issueCommentsRes] = await Promise.all([
+    fetchImpl(`${base}/pulls/${prNumber}`, { headers }),
+    fetchImpl(`${base}/pulls/${prNumber}/commits?per_page=100`, { headers }),
+    fetchImpl(`${base}/pulls/${prNumber}/reviews?per_page=100`, { headers }),
+    fetchImpl(`${base}/pulls/${prNumber}/comments?per_page=100`, { headers }),
+    fetchImpl(`${base}/issues/${prNumber}/comments?per_page=100`, { headers }),
   ]);
 
+  if (!prRes.ok) throw new Error(`PR fetch failed: HTTP ${prRes.status}`);
   if (!commitsRes.ok) throw new Error(`commits fetch failed: HTTP ${commitsRes.status}`);
   if (!reviewsRes.ok) throw new Error(`reviews fetch failed: HTTP ${reviewsRes.status}`);
-  if (!commentsRes.ok) throw new Error(`comments fetch failed: HTTP ${commentsRes.status}`);
+  if (!prCommentsRes.ok) throw new Error(`PR comments fetch failed: HTTP ${prCommentsRes.status}`);
+  if (!issueCommentsRes.ok)
+    throw new Error(`issue comments fetch failed: HTTP ${issueCommentsRes.status}`);
 
+  const pr = (await prRes.json()) as GhPullRequest;
   const commits = (await commitsRes.json()) as GhCommit[];
   const reviews = (await reviewsRes.json()) as GhReview[];
-  const comments = (await commentsRes.json()) as GhComment[];
+  const prComments = (await prCommentsRes.json()) as GhComment[];
+  const issueComments = (await issueCommentsRes.json()) as GhIssueComment[];
+
+  const mergedAtMs = pr.merged_at ? new Date(pr.merged_at).getTime() : null;
+  const mergedAt = mergedAtMs !== null && !isNaN(mergedAtMs) ? mergedAtMs : null;
 
   let commitsRunner = 0;
   let commitsBot = 0;
   let commitsHuman = 0;
   let postApprovalLines = 0;
+
+  const postApprovalShas: string[] = [];
 
   for (const c of commits) {
     const login = c.author?.login ?? "";
@@ -125,28 +157,57 @@ export async function capturePrMerge(opts: {
 
     if (approvalTs !== null && commitTs <= approvalTs) continue;
 
+    // Only collect SHAs for line-count fetches when an approval timestamp exists,
+    // since "post_approval_lines" is undefined without an approval.
+    if (approvalTs !== null) {
+      postApprovalShas.push(c.sha);
+    }
+
     const bucket = login ? bucketCommit(login, appBotLogin) : "human";
     if (bucket === "runner") commitsRunner++;
     else if (bucket === "bot") commitsBot++;
     else commitsHuman++;
+  }
 
-    postApprovalLines += (c.stats?.additions ?? 0) + (c.stats?.deletions ?? 0);
+  // Fetch per-commit stats from the single-commit endpoint; the list endpoint omits stats.
+  for (const sha of postApprovalShas) {
+    const res = await fetchImpl(`${base}/commits/${sha}`, { headers });
+    if (res.ok) {
+      const data = (await res.json()) as GhSingleCommit;
+      postApprovalLines += (data.stats?.additions ?? 0) + (data.stats?.deletions ?? 0);
+    }
   }
 
   const findings: Record<string, number> = { "claude-review": 0, codex: 0, human: 0 };
 
-  for (const comment of comments) {
+  for (const comment of prComments) {
     const login = comment.user?.login ?? "";
+    if (appBotLogin && login === appBotLogin) continue;
+    const commentTs = new Date(comment.created_at).getTime();
+    if (approvalTs !== null && commentTs <= approvalTs) continue;
     findings[bucketFinding(login)]!++;
+  }
+
+  for (const comment of issueComments) {
+    const login = comment.user?.login ?? "";
+    if (appBotLogin && login === appBotLogin) continue;
+    const commentTs = new Date(comment.created_at).getTime();
+    if (approvalTs !== null && commentTs <= approvalTs) continue;
+    findings[bucketFinding(login, comment.body)]!++;
   }
 
   for (const review of reviews) {
     if (review.state !== "CHANGES_REQUESTED" && review.state !== "COMMENTED") continue;
     const login = review.user?.login ?? "";
+    if (appBotLogin && login === appBotLogin) continue;
+    const reviewTs = new Date(review.submitted_at).getTime();
+    if (approvalTs !== null && reviewTs <= approvalTs) continue;
     findings[bucketFinding(login)]!++;
   }
 
-  const externalFindings = (findings["codex"] ?? 0) + (findings["human"] ?? 0);
+  const externalFindings =
+    (findings["claude-review"] ?? 0) + (findings["codex"] ?? 0) + (findings["human"] ?? 0);
+
   const reviewEscape =
     approvalTs !== null && (commitsHuman + commitsBot > 0 || externalFindings > 0) ? 1 : 0;
 
@@ -155,12 +216,13 @@ export async function capturePrMerge(opts: {
       `INSERT OR REPLACE INTO pr_merge_capture
          (repo, pr_number, issue_id, merged_at, approval_ts, commits_runner, commits_bot, commits_human,
           post_approval_lines, findings_json, review_escape, captured_at)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       repo,
       prNumber,
       issueId ?? null,
+      mergedAt,
       approvalTs,
       commitsRunner,
       commitsBot,
