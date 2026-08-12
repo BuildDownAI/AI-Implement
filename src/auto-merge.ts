@@ -48,6 +48,30 @@ export async function runAutoMerges(mappings: RepoMapping[], deps: AutoMergeDeps
   }
 }
 
+/**
+ * Merge approved child PRs into grouping branches (feature/multi-issue) for all non-paused
+ * mappings, regardless of the mapping's `autoMerge` setting. The top-of-tree feature→base PR
+ * still requires human review.
+ *
+ * Unlike `runAutoMerges` this is unconditional — it runs every poll for cascade self-healing
+ * so that a reopened parent's approved children merge without requiring per-project opt-in.
+ * (AII-349 reopen re-arm.)
+ */
+export async function runGroupingBranchAutoMerge(mappings: RepoMapping[], deps: AutoMergeDeps): Promise<void> {
+  const seen = new Set<string>();
+  for (const mapping of mappings) {
+    if (mapping.paused) continue;
+    const repoKey = `${mapping.owner}/${mapping.repo}`;
+    if (seen.has(repoKey)) continue;
+    seen.add(repoKey);
+    try {
+      await autoMergeRepo(mapping, deps);
+    } catch (err) {
+      console.error(`[auto-merge] Failed for ${repoKey}:`, err);
+    }
+  }
+}
+
 async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise<void> {
   const { owner, repo, defaultBranch } = mapping;
   const token = await getInstallationToken(deps.githubAppId, deps.githubAppPrivateKey, owner);

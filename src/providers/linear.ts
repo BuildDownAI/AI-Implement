@@ -325,6 +325,19 @@ export class LinearProvider implements TicketingProvider {
           console.log(`[linear] Skipping ${issue.identifier}: ${mode} grouping parent waiting on in-flight AI-Implement children`);
           continue;
         }
+        // AII-349 race guard: if any child without the AI-Implement label is still active, the
+        // operator may be mid-way through labeling children. Wait until they are designated or
+        // reach a terminal state — same guard the no-AI-children path already applies.
+        const anyUndesignatedActive = children.some(
+          (c) =>
+            !(c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL) &&
+            c.state?.type !== "completed" &&
+            c.state?.type !== "canceled",
+        );
+        if (anyUndesignatedActive) {
+          console.log(`[linear] Skipping ${issue.identifier}: ${mode} grouping parent has undesignated non-terminal children`);
+          continue;
+        }
         // All AI-Implement children done. If the spec is empty, finalize instead of dispatching.
         const isBlankSpec = !parsed.description || parsed.description.trim() === "";
         if (isBlankSpec) {
