@@ -8,6 +8,28 @@ import { capDiff } from "./review.js";
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 
+const ACCEPTANCE_BAR_HEADER = "## ✅ AI Planning: Acceptance Bar";
+const MAP_HEADER = "## 🗺 AI Planning: Implementation Map";
+
+function extractSection(text: string, header: string): string | undefined {
+  const startIdx = text.indexOf(header);
+  if (startIdx === -1) return undefined;
+  const afterStart = startIdx + header.length;
+  const nextHeaderIdx = text.indexOf("\n## ", afterStart);
+  const sectionEnd = nextHeaderIdx !== -1 ? nextHeaderIdx : text.length;
+  return text.slice(startIdx, sectionEnd).trim();
+}
+
+export function splitPlanningContext(planningContext: string): {
+  acceptanceBar: string | undefined;
+  mapSection: string | undefined;
+} {
+  return {
+    acceptanceBar: extractSection(planningContext, ACCEPTANCE_BAR_HEADER),
+    mapSection: extractSection(planningContext, MAP_HEADER),
+  };
+}
+
 interface FeedbackLoopInputs extends Record<string, unknown> {
   workspaceDir: string;
   issueTitle: string;
@@ -228,8 +250,16 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     const passes: PassStat[] = [];
     let postMortem: string | undefined;
 
+    const rawPlanningContext =
+      inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined;
+    const { acceptanceBar, mapSection } = splitPlanningContext(rawPlanningContext ?? "");
+    const isNewFormatContext = acceptanceBar !== undefined || mapSection !== undefined;
+
     while (iteration < effectiveMaxIterations && !approved) {
       iteration++;
+
+      const implementPlanningContext =
+        isNewFormatContext && iteration > 1 ? mapSection : rawPlanningContext;
 
       const implementPrompt = buildImplementPrompt(
         String(inputs.issueTitle),
@@ -252,7 +282,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           prompt: implementPrompt,
           model: resolvedImplementModel,
           maxTurns: effectiveMaxTurns,
-          planningContext: inputs.planningContext,
+          planningContext: implementPlanningContext,
         },
         outputs: {},
         logs_url: null,
@@ -268,8 +298,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             prompt: implementPrompt,
             model: resolvedImplementModel,
             maxTurns: effectiveMaxTurns,
-            planningContext:
-              inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined,
+            planningContext: implementPlanningContext,
           },
           reporter,
         );
@@ -335,6 +364,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           iteration,
           issueTitle: inputs.issueTitle,
           issueDescription: inputs.issueDescription,
+          acceptanceBar,
         },
         outputs: {},
         logs_url: null,
@@ -351,6 +381,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             issueTitle: inputs.issueTitle !== undefined ? String(inputs.issueTitle) : undefined,
             issueDescription:
               inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
+            acceptanceBar,
           },
           reporter,
         );
