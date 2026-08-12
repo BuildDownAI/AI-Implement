@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { runAutoMerges, isGroupingBranch, classifyStalledChild, MAX_CONFLICT_RESOLUTION_ATTEMPTS } from "../auto-merge.js";
+import { runAutoMerges, runGroupingBranchAutoMerge, isGroupingBranch, classifyStalledChild, MAX_CONFLICT_RESOLUTION_ATTEMPTS } from "../auto-merge.js";
 import type { RepoMapping } from "../config.js";
 
 vi.mock("../github-app-auth.js", () => ({
@@ -158,6 +158,33 @@ describe("runAutoMerges", () => {
     vi.mocked(listOpenPullRequests).mockResolvedValue([]);
     await runAutoMerges([mapping(), mapping()], deps());
     expect(vi.mocked(listOpenPullRequests)).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("runGroupingBranchAutoMerge (AII-349 cascade self-healing)", () => {
+  it("merges into grouping branches even when mapping.autoMerge is false", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+    await runGroupingBranchAutoMerge([mapping({ autoMerge: false })], deps());
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith(
+      "tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge",
+    );
+  });
+
+  it("still skips paused mappings", async () => {
+    await runGroupingBranchAutoMerge([mapping({ paused: true })], deps());
+    expect(vi.mocked(listOpenPullRequests)).not.toHaveBeenCalled();
+  });
+
+  it("deduplicates by owner/repo — calls listOpenPullRequests once per repo", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([]);
+    await runGroupingBranchAutoMerge([mapping(), mapping()], deps());
+    expect(vi.mocked(listOpenPullRequests)).toHaveBeenCalledTimes(1);
+  });
+
+  it("still only merges into grouping branches, never the default branch", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr({ base: "main" })]);
+    await runGroupingBranchAutoMerge([mapping({ autoMerge: false, defaultBranch: "main" })], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
   });
 });
 

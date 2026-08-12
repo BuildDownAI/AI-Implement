@@ -67,8 +67,8 @@ import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
-import { runMergeUps } from "./merge-up.js";
-import { runAutoMerges } from "./auto-merge.js";
+import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
+import { runGroupingBranchAutoMerge } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
@@ -307,6 +307,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     for (let i = 0; i < providers.length; i++) {
       for (const entry of snapshots[i].parentsToFinalize) {
         console.log(`[${providers[i].id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
+        // AII-349 reopen re-arm: clear any stale handled markers so merge-up re-runs and opens
+        // a new roll-up PR when the parent was previously finalized and then reopened.
+        const m = getMappings()[entry.scopeKey];
+        if (m) clearRollUpHandledMarkersByIdentifier(m.owner, m.repo, entry.identifier);
         await providers[i].markMerged(entry.issueId, entry.scopeKey).catch((err) => {
           console.error(`[${providers[i].id}] Failed to finalize empty grouping parent ${entry.identifier}:`, err);
         });
@@ -364,12 +368,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       }
     }
 
-    // Auto-merge child PRs into their grouping branch once checks pass (opt-in per project;
-    // never merges into defaultBranch — the top-of-tree PR stays human-reviewed). Best-effort.
+    // Merge approved child PRs into grouping branches (cascade self-healing). Runs for all
+    // non-paused projects — the top-of-tree feature→base PR still requires human review.
+    // (AII-349: always-on so a reopened parent's approved children merge without per-project opt-in.)
     try {
-      const autoMergeMappings = Object.values(teamRepoMap).filter((m) => m.autoMerge);
-      if (autoMergeMappings.length > 0) {
-        await runAutoMerges(autoMergeMappings, {
+      const nonPausedMappings = Object.values(teamRepoMap);
+      if (nonPausedMappings.length > 0) {
+        await runGroupingBranchAutoMerge(nonPausedMappings, {
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
           notify: config.notifyWebhookUrl

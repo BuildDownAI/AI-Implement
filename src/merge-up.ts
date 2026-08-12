@@ -69,6 +69,21 @@ export function resetRollUpHandledMarkers(): void {
   getDb().prepare("DELETE FROM settings WHERE key LIKE ?").run(`${HANDLED_KEY_PREFIX}%`);
 }
 
+/**
+ * Clear the handled markers for a feature node by identifier (tries both "feature" and
+ * "multi-issue" branch modes). Call when a previously-finalized parent is re-queued for
+ * finalization after being reopened — this allows the merge-up to re-run and open a new
+ * roll-up PR if the feature branch has new commits. (AII-349 reopen re-arm.)
+ */
+export function clearRollUpHandledMarkersByIdentifier(owner: string, repo: string, identifier: string): void {
+  ensureSettingsTable();
+  const lowerId = identifier.toLowerCase();
+  const stmt = getDb().prepare("DELETE FROM settings WHERE key = ?");
+  for (const mode of ["feature", "multi-issue"]) {
+    stmt.run(handledKey(owner, repo, `ai-implement/${mode}/${lowerId}`));
+  }
+}
+
 // Log-once guard for closed-without-merging (vetoed) roll-up PRs — the skip itself must
 // repeat every poll (that's the veto being respected), but the log line should not.
 const closedVetoLogged = new Set<string>();

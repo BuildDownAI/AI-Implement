@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, runMergeUps } from "../merge-up.js";
+import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, isRollUpHandled, markRollUpHandled, clearRollUpHandledMarkersByIdentifier, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
 
@@ -278,5 +278,41 @@ describe("runMergeUps", () => {
     await runMergeUps([rollUp({ identifier: "OOL-107" }), rollUp({ identifier: "OOL-108" })], deps(() => mapping()));
     expect(err).toHaveBeenCalled();
     expect(vi.mocked(mergeBranch)).toHaveBeenCalledTimes(1); // second roll-up still processed
+  });
+});
+
+describe("clearRollUpHandledMarkersByIdentifier (AII-349 reopen re-arm)", () => {
+  beforeEach(() => {
+    resetRollUpHandledMarkers();
+  });
+
+  it("clears a feature-mode marker so isRollUpHandled returns false", () => {
+    markRollUpHandled("owner", "repo", "ai-implement/feature/ool-78");
+    expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-78")).toBe(true);
+
+    clearRollUpHandledMarkersByIdentifier("owner", "repo", "OOL-78");
+    expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-78")).toBe(false);
+  });
+
+  it("clears a multi-issue-mode marker so isRollUpHandled returns false", () => {
+    markRollUpHandled("owner", "repo", "ai-implement/multi-issue/ool-78");
+    expect(isRollUpHandled("owner", "repo", "ai-implement/multi-issue/ool-78")).toBe(true);
+
+    clearRollUpHandledMarkersByIdentifier("owner", "repo", "OOL-78");
+    expect(isRollUpHandled("owner", "repo", "ai-implement/multi-issue/ool-78")).toBe(false);
+  });
+
+  it("is a no-op when no marker exists (does not throw)", () => {
+    expect(() => clearRollUpHandledMarkersByIdentifier("owner", "repo", "OOL-99")).not.toThrow();
+  });
+
+  it("does not clear markers for other identifiers in the same repo", () => {
+    markRollUpHandled("owner", "repo", "ai-implement/feature/ool-78");
+    markRollUpHandled("owner", "repo", "ai-implement/feature/ool-79");
+
+    clearRollUpHandledMarkersByIdentifier("owner", "repo", "OOL-78");
+
+    expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-78")).toBe(false);
+    expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-79")).toBe(true);
   });
 });
