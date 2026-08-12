@@ -14,6 +14,7 @@ import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
+import { refreshAvailability, readStampedTarget, type SelfDeployTarget } from "./deploy-availability.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -109,6 +110,7 @@ interface AppConfig {
   localRunnerImage: string;
   localRunnerOrchestratorUrl: string | null;
   kgSidecarUrl: string | null;
+  selfDeployTarget: SelfDeployTarget | null; // build-stamped; null when the image carries no stamps
 }
 
 function loadConfig(): AppConfig {
@@ -228,6 +230,7 @@ function loadConfig(): AppConfig {
     localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
     kgSidecarUrl: process.env.KG_SIDECAR_URL || null,
+    selfDeployTarget: readStampedTarget(process.env),
   };
 }
 
@@ -259,6 +262,20 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   pollInProgress = true;
   try {
   console.log(`[poll] Starting poll cycle #${++pollCount}`);
+
+  // Independent of tracker providers so self-deploy still works on an orchestrator with none configured.
+  // Best-effort — never blocks the poll.
+  if (config.selfDeployTarget) {
+    try {
+      await refreshAvailability({
+        appId: config.githubAppId,
+        privateKey: config.githubAppPrivateKey,
+        ...config.selfDeployTarget,
+      });
+    } catch (err) {
+      console.error("[deploy] availability check failed:", err);
+    }
+  }
 
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
@@ -2630,7 +2647,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         res.end(JSON.stringify({ error: "Webhook endpoint not configured: GITHUB_WEBHOOK_SECRET is not set" }));
         return;
       }
-      handleGitHubWebhook(req, res, config.githubWebhookSecret, config.githubAppId, config.githubAppPrivateKey).catch((err) => {
+      handleGitHubWebhook(req, res, config.githubWebhookSecret, config.githubAppId, config.githubAppPrivateKey, config.selfDeployTarget ?? undefined).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

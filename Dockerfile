@@ -118,6 +118,14 @@ RUN mkdir -p /data
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# Commit/repo/branch this image was built from. Last in the stage — a changing ARG busts every layer below it.
+ARG SOURCE_COMMIT=unknown
+ARG SOURCE_REPO=unknown
+ARG SOURCE_BRANCH=unknown
+ENV AI_IMPLEMENT_SOURCE_COMMIT=$SOURCE_COMMIT \
+    AI_IMPLEMENT_SOURCE_REPO=$SOURCE_REPO \
+    AI_IMPLEMENT_SOURCE_BRANCH=$SOURCE_BRANCH
+
 USER node
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
