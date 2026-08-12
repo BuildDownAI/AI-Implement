@@ -6,7 +6,7 @@ import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
-import type { LLMExecutor, LogLevel, PipelineDefinition, StepReporter } from "./pipeline/types.js";
+import type { LLMExecutor, LogLevel, PipelineDefinition, Step, StepReporter } from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } from "./pipeline/timing.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
@@ -491,6 +491,33 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     }
 
     const fbOutputs = context.getOutputs("feedback-loop");
+
+    // Re-emit the feedback-loop terminal report so the step log always has the
+    // outcome fields, even if the runner's own HTTP report failed (e.g. transient
+    // network error as the machine winds down). finalFeedback is capped to 4096
+    // chars for callback payload hygiene; the full text still reaches the autopsy
+    // via writeRunAutopsy below.
+    if (typeof fbOutputs.terminationReason === "string") {
+      const now = new Date().toISOString();
+      const fbStep: Step = {
+        id: "feedback-loop",
+        type: "custom",
+        status: "passed",
+        started_at: now,
+        ended_at: now,
+        parent_step_id: null,
+        inputs: {},
+        outputs: {
+          ...fbOutputs,
+          finalFeedback: typeof fbOutputs.finalFeedback === "string"
+            ? fbOutputs.finalFeedback.slice(0, 4096)
+            : "",
+        },
+        logs_url: null,
+      };
+      await reporter.report(fbStep);
+    }
+
     const pushOutputs = context.getOutputs("push");
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
     const approved = fbOutputs.approved === true;

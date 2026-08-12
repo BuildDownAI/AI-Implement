@@ -9,7 +9,7 @@ import { runAutonomous, resolveLogLevel, waitForContainerRemoval } from "../run-
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { encodeRunConfig } from "../run-config.js";
-import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
+import type { LLMExecutor, PipelineDefinition, StepModule, StepReporter } from "../pipeline/types.js";
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -1457,6 +1457,64 @@ describe("runAutonomous", () => {
       expect(feedbackMod.run).toHaveBeenCalledOnce();
       expect(pushMod.run).toHaveBeenCalledOnce();
     });
+  });
+
+  it("reporter's terminal feedback-loop report carries approved, iterations, terminationReason, passes, and caps finalFeedback at 4096 chars", async () => {
+    const captured: Array<{ id: string; status: string; outputs: Record<string, unknown> }> = [];
+    const capturingReporter: StepReporter = {
+      async report(step) {
+        captured.push({ id: step.id, status: step.status, outputs: { ...step.outputs } });
+      },
+    };
+
+    const longFeedback = "x".repeat(10_000);
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 2,
+            terminationReason: "iterations_exhausted",
+            passes: [{ iteration: 1, implementTurns: 5, implementOutcome: "complete", costUsd: 0.1, reviewApproved: false }],
+            finalFeedback: longFeedback,
+          }),
+        },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: null,
+            prNumber: null,
+            branchPushed: false,
+            draft: true,
+          }),
+        },
+      ],
+    ]);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: capturingReporter,
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    // run-autonomous.ts re-emits the feedback-loop terminal report after all pipeline
+    // steps complete, capping finalFeedback. This is the last terminal report.
+    const terminalReports = captured.filter(
+      (r) => r.id === "feedback-loop" && r.status !== "running",
+    );
+    expect(terminalReports.length).toBeGreaterThan(0);
+    const last = terminalReports[terminalReports.length - 1];
+    expect(last.outputs.approved).toBe(false);
+    expect(last.outputs.iterations).toBe(2);
+    expect(last.outputs.terminationReason).toBe("iterations_exhausted");
+    expect(Array.isArray(last.outputs.passes)).toBe(true);
+    expect(typeof last.outputs.finalFeedback).toBe("string");
+    expect((last.outputs.finalFeedback as string).length).toBeLessThanOrEqual(4096);
   });
 });
 
