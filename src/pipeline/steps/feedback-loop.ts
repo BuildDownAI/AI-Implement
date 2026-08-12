@@ -4,6 +4,7 @@ import { implementStep } from "./implement.js";
 import { reviewStep } from "./review.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
+import { wrapWithPlanningGuard } from "../../linear-planning-fetch.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -17,7 +18,8 @@ function extractSection(text: string, header: string): string | undefined {
   const afterStart = startIdx + header.length;
   const nextHeaderIdx = text.indexOf("\n## ", afterStart);
   const sectionEnd = nextHeaderIdx !== -1 ? nextHeaderIdx : text.length;
-  return text.slice(startIdx, sectionEnd).trim();
+  // Strip trailing "---" separator left by the "\n\n---\n\n" join format used by fetchPlanningContext
+  return text.slice(startIdx, sectionEnd).trim().replace(/\n\n---\s*$/, "").trim();
 }
 
 export function splitPlanningContext(planningContext: string): {
@@ -258,8 +260,16 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     while (iteration < effectiveMaxIterations && !approved) {
       iteration++;
 
+      // On retries with new-format context, send only the map section — but
+      // re-wrap it with the untrusted-data guard so the security preamble is
+      // never dropped. Fall back to the full rawPlanningContext when mapSection
+      // is absent (partial planning output) rather than sending undefined.
       const implementPlanningContext =
-        isNewFormatContext && iteration > 1 ? mapSection : rawPlanningContext;
+        isNewFormatContext && iteration > 1
+          ? mapSection !== undefined
+            ? wrapWithPlanningGuard(mapSection)
+            : rawPlanningContext
+          : rawPlanningContext;
 
       const implementPrompt = buildImplementPrompt(
         String(inputs.issueTitle),

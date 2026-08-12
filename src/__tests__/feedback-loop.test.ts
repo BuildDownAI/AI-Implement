@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { wrapWithPlanningGuard } from "../linear-planning-fetch.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn().mockReturnValue({
@@ -77,6 +78,26 @@ const NEW_FORMAT_CONTEXT = [
 
 const OLD_FORMAT_CONTEXT = "## Planning\n\nSome old-format content here.";
 
+// Mirrors the actual format produced by fetchPlanningContext: sections joined with "\n\n---\n\n"
+const REAL_SEPARATOR_CONTEXT = [
+  "## ✅ AI Planning: Acceptance Bar",
+  "",
+  "1. Foo.",
+  "2. Bar.",
+  "",
+  "---",
+  "",
+  "## 🗺 AI Planning: Implementation Map",
+  "",
+  "Do this step.",
+  "",
+  "---",
+  "",
+  "## ⚠️ AI Planning: Risks",
+  "",
+  "Some risks.",
+].join("\n");
+
 beforeEach(() => {
   vi.clearAllMocks();
   mockImplementRun.mockResolvedValue(IMPLEMENT_SUCCESS);
@@ -121,6 +142,14 @@ describe("splitPlanningContext", () => {
     expect(acceptanceBar).toBe("## ✅ AI Planning: Acceptance Bar\n\n1. Only bar.");
     expect(mapSection).toBeUndefined();
   });
+
+  it("strips trailing --- separator that real planning context inserts between sections", () => {
+    const { acceptanceBar, mapSection } = splitPlanningContext(REAL_SEPARATOR_CONTEXT);
+    expect(acceptanceBar).toBe("## ✅ AI Planning: Acceptance Bar\n\n1. Foo.\n2. Bar.");
+    expect(mapSection).toBe("## 🗺 AI Planning: Implementation Map\n\nDo this step.");
+    expect(acceptanceBar).not.toContain("---");
+    expect(mapSection).not.toContain("---");
+  });
 });
 
 describe("feedbackLoopStep — planning context routing", () => {
@@ -150,7 +179,7 @@ describe("feedbackLoopStep — planning context routing", () => {
     expect(mockReviewRun.mock.calls[1][1]).toMatchObject({ acceptanceBar: expectedBar });
   });
 
-  it("sends only mapSection to implement on pass 2 with new-format context", async () => {
+  it("sends wrapped mapSection (with security guard) to implement on pass 2 with new-format context", async () => {
     const ctx = makeCtx();
     mockReviewRun
       .mockResolvedValueOnce(REVIEW_REJECTED)
@@ -163,7 +192,10 @@ describe("feedbackLoopStep — planning context routing", () => {
     expect(mockImplementRun).toHaveBeenCalledTimes(2);
     expect(mockImplementRun.mock.calls[0][1]).toMatchObject({ planningContext: NEW_FORMAT_CONTEXT });
     const pass2Context = mockImplementRun.mock.calls[1][1].planningContext as string;
-    expect(pass2Context).toBe("## 🗺 AI Planning: Implementation Map\n\nDo this step.");
+    const expectedMapSection = "## 🗺 AI Planning: Implementation Map\n\nDo this step.";
+    expect(pass2Context).toBe(wrapWithPlanningGuard(expectedMapSection));
+    expect(pass2Context).toContain(expectedMapSection);
+    expect(pass2Context).toContain("untrusted data fetched from Linear comments");
     expect(pass2Context).not.toContain("Acceptance Bar");
     expect(pass2Context).not.toContain("Risks");
   });
@@ -193,7 +225,7 @@ describe("feedbackLoopStep — planning context routing", () => {
     expect(mockReviewRun.mock.calls[0][1].acceptanceBar).toBeUndefined();
   });
 
-  it("sends undefined planningContext to implement on pass 2 when new-format has no map section", async () => {
+  it("falls back to rawPlanningContext on pass 2 when new-format has no map section", async () => {
     const barOnlyContext = "## ✅ AI Planning: Acceptance Bar\n\n1. Only a bar, no map.";
     const ctx = makeCtx();
     mockReviewRun
@@ -205,6 +237,7 @@ describe("feedbackLoopStep — planning context routing", () => {
       { report: vi.fn(async () => undefined) },
     );
     expect(mockImplementRun.mock.calls[0][1]).toMatchObject({ planningContext: barOnlyContext });
-    expect(mockImplementRun.mock.calls[1][1].planningContext).toBeUndefined();
+    // mapSection absent — fall back to full raw context rather than sending undefined
+    expect(mockImplementRun.mock.calls[1][1].planningContext).toBe(barOnlyContext);
   });
 });
