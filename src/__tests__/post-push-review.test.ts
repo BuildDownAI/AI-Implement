@@ -1461,6 +1461,110 @@ describe("postPushReviewStep", () => {
     expect(fixComment).toContain("Notes:\nNo behavior changes.");
   });
 
+  it("approves with no fix cycle and lists minor external findings when the verdict has only minor[] entries", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "lgtm", score: 9, progress_delta: 0 });
+    const ghComments: string[] = [];
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([{
+            user: { login: "github-actions[bot]", type: "Bot" },
+            body: '<!-- claude-review-verdict {"blocking":[],"minor":[{"body":"Consider extracting this to a helper function"},{"body":"Rename variable for clarity","path":"src/app.ts","line":7}]} -->',
+            html_url: "https://example.com/verdict",
+          }]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    const approvalComment = ghComments.find((c) => c.includes("✅"));
+    expect(approvalComment).toContain("Unaddressed external review findings (non-blocking):");
+    expect(approvalComment).toContain("Consider extracting this to a helper function");
+    expect(approvalComment).toContain("Rename variable for clarity");
+    expect(approvalComment).toContain("**Merge readiness:** Ready to merge.");
+  });
+
+  it("withholds approval and initiates a fix pass when the verdict has blocking[] entries", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([{
+            user: { login: "github-actions[bot]", type: "Bot" },
+            body: '<!-- claude-review-verdict {"blocking":[{"body":"Missing null guard on path param","path":"src/routes.ts","line":88}],"minor":[]} -->',
+            html_url: "https://example.com/verdict",
+          }]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const fixPrompt = (invoke.mock.calls as any[][])[1][0].prompt as string;
+    expect(fixPrompt).toContain("Required external review findings");
+    expect(fixPrompt).toContain("Missing null guard on path param");
+    const reviewComment = ghComments.find((c) => c.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("External review findings are blocking this PR.");
+  });
+
+  it("does not include minor external findings in the approval comment when there are none", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "lgtm", score: 9, progress_delta: 0 });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    const approvalComment = ghComments.find((c) => c.includes("✅"));
+    expect(approvalComment).not.toContain("non-blocking");
+  });
+
   it("waits for the external review check to complete before approving and ingests its late findings", async () => {
     const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
