@@ -17,6 +17,13 @@ export const componentsCss = `
   position: sticky;
   top: 0;
   height: 100vh;
+  overflow: hidden;
+}
+
+/* Absorbs the overflow so the brand and footer stay pinned. */
+.sidebar-nav {
+  flex: 1;
+  overflow-y: auto;
 }
 
 .sidebar-brand {
@@ -99,7 +106,6 @@ export const componentsCss = `
 [data-theme="dark"] .theme-icon-moon { display: none; }
 
 .sidebar-footer {
-  margin-top: auto;
   padding: var(--sp-2) var(--sp-2) 0;
   border-top: 1px solid var(--border-subtle);
 }
