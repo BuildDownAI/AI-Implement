@@ -270,6 +270,35 @@ describe("handleMcpRequest", () => {
       expect(names).toContain("kg_search");
     });
 
+    it("merges kg_* tools from an SSE-framed sidecar response (streamable-HTTP)", async () => {
+      const mockProxyReq = new PassThrough();
+      const mockProxyRes = new PassThrough();
+      Object.assign(mockProxyRes, { statusCode: 200, headers: { "content-type": "text/event-stream" } });
+      mockHttpRequest.mockImplementationOnce((_o: unknown, cb: (r: unknown) => void) => {
+        process.nextTick(() => {
+          cb(mockProxyRes);
+          mockProxyRes.push(": ping\n\n");
+          mockProxyRes.push(
+            `event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "kg_hybrid_search", description: "hybrid" }] } })}\n\n`,
+          );
+          mockProxyRes.push(null);
+        });
+        return mockProxyReq;
+      });
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        SIDECAR_URL,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      expect(result.statusCode).toBe(200);
+      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
+      expect(names).toContain("get_tenant_health");
+      expect(names).toContain("kg_hybrid_search");
+    });
+
     it("returns only diagnostic tools when sidecar returns invalid JSON", async () => {
       const mockProxyReq = new PassThrough();
       const mockProxyRes = new PassThrough();
