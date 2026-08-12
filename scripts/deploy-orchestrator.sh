@@ -30,8 +30,20 @@ if [ -z "$GH_TOKEN" ]; then
     exit 1
 fi
 
+# Stamp the image with its own provenance. Without these the build defaults to
+# "unknown" and self-deploy stays inert — it cannot tell which commit it is running.
+SOURCE_COMMIT=$(git rev-parse HEAD)
+SOURCE_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+SOURCE_REPO=$(git remote get-url origin | sed -E 's#(\.git)?$##; s#^.*[:/]([^/]+/[^/]+)$#\1#')
+
 echo "==> deploying $APP (KG sidecar build, --no-cache)"
-fly deploy --remote-only --no-cache --build-secret kg_token="$GH_TOKEN" --app "$APP"
+echo "==> stamping $SOURCE_REPO@$SOURCE_BRANCH ${SOURCE_COMMIT:0:7}"
+fly deploy --remote-only --no-cache \
+    --build-secret kg_token="$GH_TOKEN" \
+    --build-arg SOURCE_COMMIT="$SOURCE_COMMIT" \
+    --build-arg SOURCE_REPO="$SOURCE_REPO" \
+    --build-arg SOURCE_BRANCH="$SOURCE_BRANCH" \
+    --app "$APP"
 
 # ---- post-deploy serve check (boots != serves) ------------------------------
 # /mcp must answer 401 (alive, OAuth-gated). 503 means the image shipped

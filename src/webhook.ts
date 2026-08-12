@@ -11,6 +11,7 @@ import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
 import { addCommentReaction } from "./github.js";
+import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -106,6 +107,10 @@ interface IssueCommentPayload {
   };
 }
 
+interface PushPayload {
+  ref?: string;
+}
+
 const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
   "ai-implement",
   "ai-implement[bot]",
@@ -153,6 +158,7 @@ export async function handleGitHubWebhook(
   webhookSecret: string,
   appId?: string,
   privateKey?: string,
+  selfDeploy?: SelfDeployTarget,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -186,6 +192,11 @@ export async function handleGitHubWebhook(
 
   if (event === "issue_comment") {
     await handleIssueCommentWebhook(payload as IssueCommentPayload, res, appId, privateKey);
+    return;
+  }
+
+  if (event === "push") {
+    await handlePushWebhook(payload as unknown as PushPayload, res, appId, privateKey, selfDeploy);
     return;
   }
 
@@ -384,6 +395,33 @@ function handlePullRequestSynchronize(payload: PullRequestPayload, res: http.Ser
 
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ acknowledged: true, reason: "awaiting_gap_analysis_result" }));
+}
+
+async function handlePushWebhook(
+  payload: PushPayload,
+  res: http.ServerResponse,
+  appId: string | undefined,
+  privateKey: string | undefined,
+  selfDeploy: SelfDeployTarget | undefined,
+): Promise<void> {
+  const branch = payload.ref?.replace(/^refs\/heads\//, "");
+  if (!selfDeploy || !appId || !privateKey || branch !== selfDeploy.branch) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true }));
+    return;
+  }
+
+  let refreshed = true;
+  try {
+    await refreshAvailability({ appId, privateKey, ...selfDeploy });
+  } catch (err) {
+    // The poll recomputes on its own cycle, so a failed refresh costs latency,
+    // not correctness — 200 keeps GitHub from retrying work that will redo itself.
+    refreshed = false;
+    console.error("[deploy] webhook availability refresh failed:", err);
+  }
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ refreshed }));
 }
 
 const AI_IMPLEMENT_COMMENT_RE = /^\/ai-implement(?:\s+([\s\S]*))?$/;
