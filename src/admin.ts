@@ -26,6 +26,7 @@ import {
   checkForcedPathEligibility,
 } from "./runner-mode.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
@@ -443,6 +444,18 @@ export function handleAdminRequest(
         console.error("[admin] template-status failed:", err);
         if (!res.headersSent) json(res, 500, { error: "internal_error" });
       });
+      return true;
+    }
+
+    if (url === "/api/dispatch-breaker" && method === "GET") {
+      json(res, 200, { parked: listParked() });
+      return true;
+    }
+
+    const unparkMatch = url.match(/^\/api\/dispatch-breaker\/([^/]+)\/unpark$/);
+    if (unparkMatch && method === "POST") {
+      const issueId = decodeURIComponent(unparkMatch[1]);
+      handleUnparkIssue(req, res, issueId);
       return true;
     }
 
@@ -1410,6 +1423,25 @@ async function handleGithubInstallState(
     console.error(`[admin] install-state probe failed for ${owner}/${repo}:`, err);
     json(res, 500, { error: err instanceof Error ? err.message : String(err) });
   }
+}
+
+async function handleUnparkIssue(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  issueId: string,
+): Promise<void> {
+  let phase: string | undefined;
+  try {
+    const raw = await readBody(req);
+    if (raw.trim()) {
+      const body = JSON.parse(raw) as { phase?: string };
+      phase = typeof body.phase === "string" && body.phase ? body.phase : undefined;
+    }
+  } catch {
+    // body is optional — proceed without phase
+  }
+  const cleared = unpark(issueId, phase);
+  json(res, cleared ? 200 : 404, { unparked: cleared, issueId, phase: phase ?? null });
 }
 
 interface TemplateStatusEntry {

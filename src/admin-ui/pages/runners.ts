@@ -18,6 +18,7 @@ export const runnersHtml = `
       <div class="kpi"><div class="kpi-label">Live Fly sessions</div><div class="kpi-value" id="kpi-live-sessions">0</div></div>
       <div class="kpi"><div class="kpi-label">Capacity used</div><div class="kpi-value"><span id="kpi-capacity-used">0</span><span class="kpi-unit"> / <span id="kpi-capacity-max">0</span></span></div></div>
       <div class="kpi"><div class="kpi-label">Reaper (24h)</div><div class="kpi-value" id="kpi-reaped">0</div><div class="kpi-trend" id="kpi-reaper-sweep"></div></div>
+      <div class="kpi"><div class="kpi-label">Parked issues</div><div class="kpi-value" id="kpi-parked">0</div></div>
     </div>
 
     <div class="card">
@@ -60,6 +61,20 @@ export const runnersHtml = `
           <tbody id="runners-projects-body"></tbody>
         </table>
         <div id="runners-projects-empty" class="hidden text-tertiary" style="padding:12px">No projects configured.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Parked issues</h2>
+        <div class="card-subtitle">Issues blocked after consecutive dispatch failures. Unpark to allow re-dispatch.</div>
+      </div>
+      <div class="card-body tight">
+        <table class="tbl">
+          <thead><tr><th>Issue</th><th>Phase</th><th>Failures</th><th>Last conclusion</th><th>Parked</th><th></th></tr></thead>
+          <tbody id="parked-body"></tbody>
+        </table>
+        <div id="parked-empty" class="hidden text-tertiary" style="padding:12px">No parked issues.</div>
       </div>
     </div>
   </div>
@@ -105,11 +120,12 @@ export const runnersScript = `
     errEl.hidden = true;
     bannerEl.hidden = true;
 
-    const [runnerModeRes, mappingsRes, sessions, reaper] = await Promise.all([
+    const [runnerModeRes, mappingsRes, sessions, reaper, breakerRes] = await Promise.all([
       window.api('/api/runner-mode'),
       window.api('/api/mappings'),
       fetchOk('/api/sessions', null),
       fetchOk('/api/reaper/summary', null),
+      fetchOk('/api/dispatch-breaker', null),
     ]);
 
     if (!runnerModeRes.ok || !mappingsRes.ok) {
@@ -189,6 +205,28 @@ export const runnersScript = `
     document.getElementById('kpi-reaped').textContent = String(reaper ? (reaper.total24h ?? 0) : 0);
     document.getElementById('kpi-reaper-sweep').textContent = reaper && reaper.lastSweepAt ? ('last sweep ' + fmtAgo(reaper.lastSweepAt)) : 'no sweep yet';
 
+    // Parked issues KPI and table
+    const parkedList = breakerRes && Array.isArray(breakerRes.parked) ? breakerRes.parked : [];
+    document.getElementById('kpi-parked').textContent = String(parkedList.length);
+    const parkedBody = document.getElementById('parked-body');
+    const parkedEmpty = document.getElementById('parked-empty');
+    parkedBody.innerHTML = '';
+    if (parkedList.length === 0) {
+      parkedEmpty.classList.remove('hidden');
+    } else {
+      parkedEmpty.classList.add('hidden');
+      for (const p of parkedList) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td class="mono">' + window.esc(p.issueId || '—') + '</td>'
+          + '<td class="mono">' + window.esc(p.phase || '—') + '</td>'
+          + '<td class="mono">' + window.esc(String(p.failures ?? 0)) + '</td>'
+          + '<td class="mono">' + window.esc(p.lastConclusion || '—') + '</td>'
+          + '<td class="text-secondary">' + (p.parkedAt ? fmtAgo(p.parkedAt) : '—') + '</td>'
+          + '<td style="text-align:right"><button class="btn btn-sm btn-danger" onclick="window.unparkIssue(' + JSON.stringify(p.issueId) + ',' + JSON.stringify(p.phase) + ')">Unpark</button></td>';
+        parkedBody.appendChild(tr);
+      }
+    }
+
     // Sessions table
     const sessionsBody = document.getElementById('runners-sessions-body');
     const sessionsEmpty = document.getElementById('runners-sessions-empty');
@@ -265,8 +303,19 @@ export const runnersScript = `
     }
   }
 
+  async function unparkIssue(issueId, phase) {
+    try {
+      const body = phase ? JSON.stringify({ phase }) : '{}';
+      await window.api('/api/dispatch-breaker/' + encodeURIComponent(issueId) + '/unpark', { method: 'POST', body });
+      loadRunners();
+    } catch (err) {
+      console.error('unparkIssue failed:', err);
+    }
+  }
+
   window.loadRunners = loadRunners;
   window.setRunnerMode = setRunnerMode;
+  window.unparkIssue = unparkIssue;
   window.registerPage('runners', function () { loadRunners(); setInterval(loadRunners, 30000); });
 })();
 `;
