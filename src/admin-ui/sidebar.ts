@@ -52,7 +52,9 @@ export function sidebarHtml(): string {
         <div class="brand-meta">orchestrator</div>
       </div>
     </div>
-    ${sections}
+    <div class="sidebar-nav">
+      ${sections}
+    </div>
     <div class="sidebar-footer">
       <div class="sidebar-user">
         <div class="avatar">·</div>
