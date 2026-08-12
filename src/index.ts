@@ -2304,7 +2304,7 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
         const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
         if (job.status === "completed") {
           recordDispatchSuccess(job.issueId, breakerPhase);
-        } else if (job.status === "failed" || job.status === "timed_out") {
+        } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
           const breakerConclusion = job.conclusion ?? job.status;
           // Don't fire the trip notification for stuck conclusions — stuck_giveup already
           // fires notifyStuckGiveUp; we still record the failure so the counter advances.

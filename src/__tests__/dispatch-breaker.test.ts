@@ -247,6 +247,47 @@ describe("listParked", () => {
   });
 });
 
+describe("review_failed conclusion behavior", () => {
+  it("three review_failed conclusions park the issue", () => {
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    const r3 = breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    expect(r3.tripped).toBe(true);
+    expect(r3.failures).toBe(3);
+    expect(breaker.isParked("issue-1", "implementation")).toBe(true);
+  });
+
+  it("completed after two review_failed conclusions resets counter to zero", () => {
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    breaker.recordDispatchSuccess("issue-1", "implementation");
+
+    const r1 = breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    expect(r1.failures).toBe(1);
+    expect(r1.tripped).toBe(false);
+  });
+
+  it("stores conclusion verbatim — REVIEW_UNAPPROVED when conclusion is present", () => {
+    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED");
+    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED");
+    breaker.recordDispatchFailure("issue-1", "implementation", "REVIEW_UNAPPROVED");
+
+    const parked = breaker.listParked();
+    expect(parked).toHaveLength(1);
+    expect(parked[0].lastConclusion).toBe("REVIEW_UNAPPROVED");
+  });
+
+  it("stores review_failed as conclusion when no conclusion string is present", () => {
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+    breaker.recordDispatchFailure("issue-1", "implementation", "review_failed");
+
+    const parked = breaker.listParked();
+    expect(parked).toHaveLength(1);
+    expect(parked[0].lastConclusion).toBe("review_failed");
+  });
+});
+
 describe("initDispatchBreakerTable idempotency", () => {
   it("can be called multiple times without error", () => {
     expect(() => breaker.initDispatchBreakerTable()).not.toThrow();
