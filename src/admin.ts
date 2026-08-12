@@ -25,7 +25,8 @@ import {
   setFlySecretsMinVersion,
   checkForcedPathEligibility,
 } from "./runner-mode.js";
-import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { unpark } from "./dispatch-breaker.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
@@ -334,6 +335,53 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/parked" && method === "GET") {
+      const rows = getDb()
+        .prepare(
+          `SELECT db.issue_id, db.phase, db.consecutive_failures AS failures,
+                  db.last_conclusion, db.parked_at,
+                  dl.issue_identifier, dl.issue_title, dl.repo
+           FROM dispatch_breaker db
+           LEFT JOIN (
+             SELECT issue_id, issue_identifier, issue_title, repo
+             FROM dispatch_log
+             WHERE id IN (SELECT MAX(id) FROM dispatch_log GROUP BY issue_id)
+           ) dl ON db.issue_id = dl.issue_id
+           WHERE db.parked_at IS NOT NULL
+           ORDER BY db.parked_at DESC`,
+        )
+        .all() as Array<{
+          issue_id: string;
+          phase: string;
+          failures: number;
+          last_conclusion: string | null;
+          parked_at: number;
+          issue_identifier: string | null;
+          issue_title: string | null;
+          repo: string | null;
+        }>;
+      json(
+        res,
+        200,
+        rows.map((r) => ({
+          issueId: r.issue_id,
+          phase: r.phase,
+          failures: r.failures,
+          lastConclusion: r.last_conclusion,
+          parkedAt: r.parked_at,
+          issueIdentifier: r.issue_identifier,
+          issueTitle: r.issue_title,
+          repo: r.repo,
+        })),
+      );
+      return true;
+    }
+
+    if (url === "/api/parked/unpark" && method === "POST") {
+      handleUnparkIssue(req, res);
+      return true;
+    }
+
     if (url === "/api/runner-mode" && method === "GET") {
       const status = getRunnerMode();
       // AII-306: under a forcing mode, surface which mappings the force cannot
@@ -451,6 +499,20 @@ export function handleAdminRequest(
   }
 
   return false;
+}
+
+async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as { issueId?: string };
+    if (typeof body.issueId !== "string" || !body.issueId) {
+      json(res, 400, { error: "issueId is required" });
+      return;
+    }
+    const unparked = unpark(body.issueId);
+    json(res, 200, { unparked });
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+  }
 }
 
 async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplementSnapshot> {

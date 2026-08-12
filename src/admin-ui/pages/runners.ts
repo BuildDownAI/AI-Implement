@@ -13,6 +13,21 @@ export const runnersHtml = `
     <div id="runners-error" class="alert fail" hidden></div>
     <div id="runners-mode-banner" class="alert warn" hidden></div>
 
+    <div id="runners-parked-section" hidden>
+      <div class="card" style="border-color:var(--st-warn-dot)">
+        <div class="card-header">
+          <h2 class="card-title">Parked issues</h2>
+          <div class="card-subtitle">Parked by the circuit breaker after repeated dispatch failures. Unpark to allow re-dispatch.</div>
+        </div>
+        <div class="card-body tight">
+          <table class="tbl">
+            <thead><tr><th>Issue</th><th>Repo</th><th>Failures</th><th>Last conclusion</th><th>Parked</th><th></th></tr></thead>
+            <tbody id="runners-parked-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <div class="kpi-grid">
       <div class="kpi"><div class="kpi-label">Runner mode</div><div class="kpi-value" id="kpi-runner-mode">—</div><div class="kpi-trend" id="kpi-runner-source"></div></div>
       <div class="kpi"><div class="kpi-label">Live Fly sessions</div><div class="kpi-value" id="kpi-live-sessions">0</div></div>
@@ -105,11 +120,12 @@ export const runnersScript = `
     errEl.hidden = true;
     bannerEl.hidden = true;
 
-    const [runnerModeRes, mappingsRes, sessions, reaper] = await Promise.all([
+    const [runnerModeRes, mappingsRes, sessions, reaper, parked] = await Promise.all([
       window.api('/api/runner-mode'),
       window.api('/api/mappings'),
       fetchOk('/api/sessions', null),
       fetchOk('/api/reaper/summary', null),
+      fetchOk('/api/parked', []),
     ]);
 
     if (!runnerModeRes.ok || !mappingsRes.ok) {
@@ -176,6 +192,23 @@ export const runnersScript = `
       bannerEl.className = 'alert ' + bannerKind;
       bannerEl.innerHTML = '<div style="flex:1"><div class="alert-title">Runner mode override active: ' + window.esc(runnerMode.mode) + '</div><div class="alert-desc">All projects route through ' + window.esc(runnerMode.mode) + ' regardless of their per-project mode.</div>' + ineligibleHtml + '</div>';
       bannerEl.hidden = false;
+    }
+
+    // Parked issues section
+    const parkedRows = Array.isArray(parked) ? parked : [];
+    const parkedSection = document.getElementById('runners-parked-section');
+    const parkedBody = document.getElementById('runners-parked-body');
+    parkedSection.hidden = parkedRows.length === 0;
+    parkedBody.innerHTML = '';
+    for (const p of parkedRows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td class="mono">' + window.esc(p.issueIdentifier || p.issueId || '—') + '</td>'
+        + '<td class="mono">' + window.esc(p.repo || '—') + '</td>'
+        + '<td class="mono">' + window.esc(String(p.failures)) + '</td>'
+        + '<td class="mono">' + window.esc(p.lastConclusion || '—') + '</td>'
+        + '<td class="mono">' + window.esc(fmtAgo(p.parkedAt)) + '</td>'
+        + '<td><button class="btn btn-sm" data-id="' + window.esc(p.issueId) + '" onclick="window.unparkIssue(this.dataset.id)">Unpark</button></td>';
+      parkedBody.appendChild(tr);
     }
 
     // Live sessions KPI
@@ -265,8 +298,18 @@ export const runnersScript = `
     }
   }
 
+  async function unparkIssue(issueId) {
+    try {
+      const res = await window.api('/api/parked/unpark', { method: 'POST', body: JSON.stringify({ issueId }) });
+      if (res.ok) loadRunners();
+    } catch (err) {
+      console.error('unparkIssue failed:', err);
+    }
+  }
+
   window.loadRunners = loadRunners;
   window.setRunnerMode = setRunnerMode;
+  window.unparkIssue = unparkIssue;
   window.registerPage('runners', function () { loadRunners(); setInterval(loadRunners, 30000); });
 })();
 `;
