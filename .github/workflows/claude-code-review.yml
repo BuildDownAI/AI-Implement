@@ -11,7 +11,7 @@ on:
     #   - "src/**/*.jsx"
 
 jobs:
-  claude-review:
+  code-review-plugin:
     if: contains(fromJSON('["OWNER","MEMBER"]'), github.event.pull_request.author_association)
 
     runs-on: ubuntu-latest

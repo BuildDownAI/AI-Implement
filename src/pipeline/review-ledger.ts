@@ -76,7 +76,7 @@ export function extractVerdictMarkerFindings(body: string, url?: string): Review
   const startIdx = body.indexOf(markerPrefix);
   if (startIdx === -1) return null;
   const jsonStart = startIdx + markerPrefix.length;
-  const endIdx = body.indexOf(markerSuffix, jsonStart);
+  const endIdx = body.lastIndexOf(markerSuffix);
   if (endIdx === -1) return null;
   const jsonStr = body.slice(jsonStart, endIdx).trim();
   let parsed: unknown;

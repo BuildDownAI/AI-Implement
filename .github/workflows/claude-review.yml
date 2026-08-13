@@ -102,5 +102,7 @@ jobs:
             - Shorthand: bare strings also accepted, e.g. {"blocking":["full description"]}
             - If nothing blocking or minor, use empty arrays: {"blocking":[],"minor":[]}
             - Do NOT omit the verdict block even if you have nothing to report.
+            - NEVER use the sequence --> inside a finding body — it terminates the HTML
+              comment in rendered Markdown and will corrupt the verdict block.
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
