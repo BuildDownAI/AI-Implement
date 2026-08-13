@@ -328,6 +328,23 @@ export async function getBranchSha(
 }
 
 /**
+ * Downloads a repository tree at `ref` as a gzipped tarball.
+ */
+export async function fetchRepoTarball(
+  token: string,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<Buffer> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/tarball/${ref}`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) {
+    throw new Error(`fetchRepoTarball failed: HTTP ${res.status}`);
+  }
+  return Buffer.from(await res.arrayBuffer());
+}
+
+/**
  * Ensures `branch` exists on the remote, creating it from `fromBranch`'s current
  * head if missing. Idempotent: a no-op when the branch already exists, and tolerant
  * of a 422 race (another caller created it between the check and the create).

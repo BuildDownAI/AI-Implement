@@ -2,7 +2,7 @@
 
 The orchestrator bundles a Python knowledge-graph sidecar that serves `kg_*` tools, and exposes them to MCP clients through an OAuth-authenticated proxy at `/mcp`. This covers the deploy shape, how the image is built, the OAuth flow, and the ways a deploy can ship without a working sidecar.
 
-Reference for `docker-entrypoint.sh`, the KG stages of `Dockerfile`, `src/mcp.ts`, `src/mcp-oauth.ts`, and `scripts/deploy-orchestrator.sh`. `CLAUDE.md` carries the summary and points here.
+Reference for `docker-entrypoint.sh`, the KG stages of `Dockerfile`, `src/mcp.ts`, `src/mcp-oauth.ts`, and `src/deploy.ts`. `CLAUDE.md` carries the summary and points here.
 
 ## Deploy shape
 
@@ -53,20 +53,17 @@ The container runs as the unprivileged `node` user.
 
 ## Deploying
 
-**Always use the wrapper script.** A plain `fly deploy` silently produces a sidecar-less image:
+**A plain `fly deploy` silently produces a sidecar-less image.** Deploy through the orchestrator itself, or with the manual command in [deployment.md](deployment.md#deploy-paths) when there is no orchestrator to ask.
 
-```bash
-./scripts/deploy-orchestrator.sh ai-implement-testing-orchestrator
-./scripts/deploy-orchestrator.sh <other-app-name>
-```
-
-The script exists because three separate mistakes each produce a silently degraded deploy, and this has happened repeatedly:
+Three separate mistakes each produce a silently degraded deploy, and each has happened repeatedly:
 
 - **The build secret is required for the clone.** Without it the build fail-softs to a sidecar-less image rather than failing.
 - **`--no-cache` is required.** A build secret is not part of the layer cache key, so a repeat deploy otherwise reuses a stale — possibly sidecar-less — clone layer even when the secret is present.
-- **`GH_TOKEN` must be exported.** An inline `GH_TOKEN=... fly deploy ... "$GH_TOKEN"` prefix does not affect same-line expansion and passes an empty secret.
+- **The token must be exported, not inlined.** An inline `GH_TOKEN=... fly deploy ... "$GH_TOKEN"` prefix does not affect same-line expansion and passes an empty secret.
 
-The script ends by polling `/mcp` until it answers **401**, and exits non-zero otherwise. A deploy that ships without a working sidecar fails loudly instead of being discovered days later.
+Self-deploy carries all three by construction: they are assembled in one place and a test asserts each is present, so they cannot be dropped the way a hand-typed command can. The exported-token trap disappears entirely there, because the secret is passed as an argument rather than through a shell.
+
+Verify any deploy by polling `/mcp` until it answers **401** — a release that boots is not necessarily a release that serves, and the difference is invisible from the Fly dashboard.
 
 ### Verifying more than "it answers"
 

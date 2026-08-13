@@ -16,6 +16,7 @@ import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, type SelfDeployTarget } from "./deploy-availability.js";
 import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
+import { makeStartDeploy } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -95,6 +96,7 @@ interface AppConfig {
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
   flyOrchestratorApp: string | null;
+  flyDeployToken: string | null;
   tenantId: string | null;
   sessionImage: string;
   /** Deprecation state of SESSION_IMAGE, used for the startup warning. */
@@ -217,6 +219,7 @@ function loadConfig(): AppConfig {
       return getOrchestratorSettings().flySessionsRegion;
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
+    flyDeployToken: process.env.FLY_DEPLOY_TOKEN || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
     sessionImage: defaultRunner.image,
     sessionImageStatus: defaultRunner.sessionImageStatus,
@@ -2723,6 +2726,8 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
+  const startDeploy = makeStartDeploy(config);
+
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
     const pathname = url.split("?")[0];
@@ -3114,7 +3119,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry)) return;
+      }, registry, { startDeploy })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });

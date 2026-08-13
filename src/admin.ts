@@ -27,6 +27,7 @@ import {
 } from "./runner-mode.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
+import type { DeployStart } from "./deploy.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls } from "./log.js";
@@ -178,11 +179,17 @@ export interface AdminConfig {
   notifyWebhookUrl?: string | null;
 }
 
+export interface AdminDeps {
+  /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
+  startDeploy?: () => Promise<DeployStart>;
+}
+
 export function handleAdminRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   config: AdminConfig,
   registry: ProviderRegistry,
+  deps: AdminDeps = {},
 ): boolean {
   const url = req.url || "/";
   const method = req.method || "GET";
@@ -214,6 +221,11 @@ export function handleAdminRequest(
 
     if (url === "/api/mappings" && method === "POST") {
       handleUpsertMapping(req, res, config, registry);
+      return true;
+    }
+
+    if (url === "/api/deploy" && method === "POST") {
+      handleDeployTrigger(res, deps);
       return true;
     }
 
@@ -745,6 +757,27 @@ function handleSyncWorkflows(
     console.error(`[admin] workflow sync failed for ${teamKey}:`, err)
   );
   json(res, 202, { teamKey, syncJobId: id });
+}
+
+async function handleDeployTrigger(
+  res: http.ServerResponse,
+  deps: AdminDeps,
+): Promise<void> {
+  if (!deps.startDeploy) {
+    json(res, 501, { error: "Self-deploy is not configured" });
+    return;
+  }
+  try {
+    const result = await deps.startDeploy();
+    if (!result.started) {
+      json(res, result.reason === "deploy-in-progress" ? 409 : 503, { error: result.reason });
+      return;
+    }
+    json(res, 202, { deploying: result.commit });
+  } catch (err) {
+    console.error("[admin] deploy trigger failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
 }
 
 async function handleListSecrets(

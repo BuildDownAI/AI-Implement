@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -645,5 +645,45 @@ describe("getCombinedChecksState", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ state: "success", total_count: 0 }) }),
     );
     expect(await getCombinedChecksState("tok", "owner", "repo", "abc")).toBe("failure");
+  });
+});
+
+describe("fetchRepoTarball", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const tarball = (bytes: number[]) =>
+    ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array(bytes).buffer }) as Response;
+
+  it("requests the tarball endpoint at the exact ref", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(tarball([1, 2, 3]));
+    await fetchRepoTarball("tok", "Owner", "Repo", "abc123");
+
+    // A wrong path here surfaces only as a 404 at deploy time, when the orchestrator
+    // is mid-deploy and least able to explain itself.
+    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
+      "https://api.github.com/repos/Owner/Repo/tarball/abc123",
+    );
+  });
+
+  it("sends the bearer token — the source repository may be private", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(tarball([1]));
+    await fetchRepoTarball("tok", "Owner", "Repo", "abc123");
+
+    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer tok");
+  });
+
+  it("returns the bytes as a Buffer", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(tarball([31, 139, 8]));
+    const out = await fetchRepoTarball("tok", "Owner", "Repo", "abc123");
+    expect(Buffer.isBuffer(out)).toBe(true);
+    expect([...out]).toEqual([31, 139, 8]);
+  });
+
+  it("throws on a non-ok response rather than returning an empty context", async () => {
+    // Returning empty bytes would extract to an empty build context and fail much later.
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+    await expect(fetchRepoTarball("tok", "Owner", "Repo", "nope")).rejects.toThrow(/HTTP 404/);
   });
 });
