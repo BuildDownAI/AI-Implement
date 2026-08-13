@@ -190,6 +190,37 @@ describe("extractVerdictMarkerFindings", () => {
       { source: "claude-review-summary", severity: "blocking", body: "Valid finding" },
     ]);
   });
+
+  it("parses a marker whose finding body contains --> by trying subsequent terminator candidates", () => {
+    const body = '<!-- claude-review-verdict {"blocking":[{"body":"Fix --> here","path":"src/app.ts","line":42}],"minor":[]} -->';
+    expect(extractVerdictMarkerFindings(body, "https://example.com/review")).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Fix --> here",
+        path: "src/app.ts",
+        line: 42,
+        url: "https://example.com/review",
+      },
+    ]);
+  });
+
+  it("parses a marker followed by a later HTML comment without voiding the verdict", () => {
+    const body = '<!-- claude-review-verdict {"blocking":["Missing validation"],"minor":[]} -->\n\n<!-- tracking: abc -->';
+    expect(extractVerdictMarkerFindings(body)).toEqual([
+      { source: "claude-review-summary", severity: "blocking", body: "Missing validation" },
+    ]);
+  });
+
+  it("returns null without throwing when a stray --> appears before an unterminated marker", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const body = 'Some text --> <!-- claude-review-verdict {"blocking":["Never reached"]';
+      expect(extractVerdictMarkerFindings(body)).toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 describe("formatReviewLedgerForPrompt", () => {

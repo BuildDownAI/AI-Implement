@@ -76,13 +76,18 @@ export function extractVerdictMarkerFindings(body: string, url?: string): Review
   const startIdx = body.indexOf(markerPrefix);
   if (startIdx === -1) return null;
   const jsonStart = startIdx + markerPrefix.length;
-  const endIdx = body.lastIndexOf(markerSuffix);
-  if (endIdx === -1) return null;
-  const jsonStr = body.slice(jsonStart, endIdx).trim();
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonStr);
-  } catch {
+  let endIdx = body.indexOf(markerSuffix, jsonStart);
+  while (endIdx !== -1) {
+    const candidate = body.slice(jsonStart, endIdx).trim();
+    try {
+      parsed = JSON.parse(candidate);
+      break;
+    } catch {
+      endIdx = body.indexOf(markerSuffix, endIdx + markerSuffix.length);
+    }
+  }
+  if (endIdx === -1) {
     console.warn("[review-ledger] Malformed JSON in claude-review-verdict marker; treating comment as no verdict");
     return null;
   }
