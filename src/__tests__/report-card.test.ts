@@ -290,18 +290,36 @@ describe("getIssueReportCard", () => {
   });
 
   describe("merged flag", () => {
-    it("is true when reconciliation_queue has a row for the issue", () => {
+    it("is true when reconciliation_queue has a dispatched row for the issue", () => {
       insertDispatch({ issueId: "issue-mg", issueIdentifier: "AII-MG", repo: "org/repo" });
       dedup.getDb()
         .prepare(
-          `INSERT INTO reconciliation_queue (issue_id, issue_identifier, pr_number, repo, merge_commit_sha, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO reconciliation_queue (issue_id, issue_identifier, pr_number, repo, merge_commit_sha, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run("issue-mg", "AII-MG", 42, "org/repo", "abc123", Date.now());
+        .run("issue-mg", "AII-MG", 42, "org/repo", "abc123", "dispatched", Date.now());
 
       const card = rc.getIssueReportCard("AII-MG");
       expect(card!.merged).toBe(true);
     });
+
+    it.each([["pending", 200], ["skipped", 201], ["failed", 202]] as const)(
+      "is false when reconciliation_queue row has status=%s",
+      (status, prNumber) => {
+        const id = `issue-mg-${status}`;
+        const key = `AII-MG-${status.toUpperCase()}`;
+        insertDispatch({ issueId: id, issueIdentifier: key, repo: "org/repo" });
+        dedup.getDb()
+          .prepare(
+            `INSERT INTO reconciliation_queue (issue_id, issue_identifier, pr_number, repo, merge_commit_sha, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(id, key, prNumber, "org/repo", "", status, Date.now());
+
+        const card = rc.getIssueReportCard(key);
+        expect(card!.merged).toBe(false);
+      },
+    );
   });
 
   describe("escape field", () => {

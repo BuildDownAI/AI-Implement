@@ -217,7 +217,7 @@ export function getIssueReportCard(identifier: string): IssueReportCard | null {
   const planned = dispatches.some((d) => d.phase === "planning");
 
   const mergedRow = db
-    .prepare(`SELECT 1 FROM reconciliation_queue WHERE issue_identifier = ? LIMIT 1`)
+    .prepare(`SELECT 1 FROM reconciliation_queue WHERE issue_identifier = ? AND status = 'dispatched' LIMIT 1`)
     .get(identifier);
   const merged = mergedRow !== undefined;
 
@@ -447,6 +447,7 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
            AND dl.dispatched_at >= ?
            AND dl.repo IS NOT NULL AND dl.repo NOT LIKE 'test-org/%'
          WHERE rq.repo IS NOT NULL AND rq.repo NOT LIKE 'test-org/%'
+           AND rq.status = 'dispatched'
          GROUP BY rq.repo`,
       )
       .all(since) as typeof mergedByRepoRows;
@@ -560,7 +561,7 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
     for (const key of cohortIssues) {
       try {
         const row = db
-          .prepare(`SELECT 1 FROM reconciliation_queue WHERE issue_identifier = ? LIMIT 1`)
+          .prepare(`SELECT 1 FROM reconciliation_queue WHERE issue_identifier = ? AND status = 'dispatched' LIMIT 1`)
           .get(key);
         if (row !== undefined) mergedC++;
       } catch { /* absent */ }
