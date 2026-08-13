@@ -5,6 +5,7 @@ import { getRunnerMode } from "./runner-mode.js";
 import { getMappings } from "./config.js";
 import { getInFlightJobs } from "./log.js";
 import { getDb } from "./dedup.js";
+import { getIssueReportCard, getFleetReport } from "./report-card.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -64,6 +65,29 @@ const DIAG_TOOLS = [
         identifier: { type: "string", description: "Issue identifier, e.g. 'AII-123'" },
       },
       required: ["identifier"],
+    },
+  },
+  {
+    name: "get_issue_report_card",
+    description:
+      "Returns a full report card for a specific issue: all dispatch runs with per-pass telemetry, totals (dispatches, passes, cost), approval/merge/escape status, gap-fill rounds, and review-fix rounds. Use this to understand the full history and outcome of an issue.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issue: { type: "string", description: "Issue identifier, e.g. 'AII-123'" },
+      },
+      required: ["issue"],
+    },
+  },
+  {
+    name: "get_fleet_report",
+    description:
+      "Returns an aggregated fleet report: per-repo job/issue/cost/pass counts, one-shot and eventual approval rates, planning A/B cohort comparison, review escape rate, and a ranked list of runaway issues. Optional `days` parameter (default 30) controls the look-back window.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        days: { type: "number", description: "Look-back window in days (default 30)" },
+      },
     },
   },
 ];
@@ -172,6 +196,21 @@ function callDiagnosticTool(name: string, args: Record<string, unknown>): unknow
           conclusion: j.conclusion,
         })),
       };
+    }
+
+    case "get_issue_report_card": {
+      const issue = args.issue;
+      if (typeof issue !== "string" || !issue) {
+        return { error: "issue is required and must be a non-empty string" };
+      }
+      const card = getIssueReportCard(issue);
+      if (!card) return { error: `No dispatch records found for issue: ${issue}` };
+      return card;
+    }
+
+    case "get_fleet_report": {
+      const days = typeof args.days === "number" ? args.days : undefined;
+      return getFleetReport({ days });
     }
 
     default:
