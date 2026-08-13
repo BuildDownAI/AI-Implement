@@ -278,7 +278,8 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       console.error("[deploy] availability check failed:", err);
     }
   }
-  // One read per tick so all three dispatch surfaces agree, even if the hold is set part-way through a poll.
+  // Read once for the surfaces this poll owns, so they agree even if the hold is set part-way through a tick.
+  // runWorkflowSync reads it independently — the admin fire-immediately path has no tick to share.
   const deployHeld = isDeployHeld();
 
   const allMappings = Object.values(getMappings());
@@ -595,7 +596,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Both of these launch runner jobs, so they pause with issue dispatch —
   // otherwise the hold would block on work it is itself still creating.
-  if (!deployHeld) {
+  if (deployHeld) {
+    console.log("[deploy] Review-fix and gap-fill drains paused. self-deployment in progress");
+  } else {
     // Process pending late review feedback that arrived after the original run.
     await processReviewFixQueue(config);
 

@@ -241,6 +241,26 @@ describe("runWorkflowSync executor", () => {
     expect(queue.countRunningWorkflowSyncs()).toBe(0);
   });
 
+  it("reclaims a stale running row to pending even while a deploy holds work back", async () => {
+    seedMapping("ENG");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "running");
+    // Age it past the stale window — an orchestrator that crashed mid-sync.
+    dedup
+      .getDb()
+      .prepare("UPDATE workflow_sync_queue SET updated_at = ? WHERE id = ?")
+      .run(Date.now() - queue.STALE_RUNNING_MS - 1000, id);
+    deployHold.setDeployHold();
+
+    await queue.runWorkflowSync(id, CREDS);
+
+    expect(workflowSync.syncWorkflowTemplates).not.toHaveBeenCalled();
+    // Left 'running' the row would count as in-flight work for the whole hold, and a deploy
+    // gated on that count reaching zero could never clear the hold that freezes it.
+    expect(queue.getWorkflowSyncById(id)?.status).toBe("pending");
+    expect(queue.countRunningWorkflowSyncs()).toBe(0);
+  });
+
   it("runs the deferred sync once the hold clears", async () => {
     seedMapping("ENG");
     const { id } = queue.enqueueWorkflowSync("ENG");

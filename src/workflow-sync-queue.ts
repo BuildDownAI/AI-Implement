@@ -114,11 +114,14 @@ export async function runWorkflowSync(jobId: number, creds: WorkflowSyncCreds): 
   const job = getWorkflowSyncById(jobId);
   if (!job) return; // row vanished — nothing to run
   // A fresh `running` row means a live runner already owns this job. Bail rather than double-fire the sync.
-  // A `running` row past the stale window is fair game (the safety net reclaims a crashed run).
-  if (job.status === "running" && Date.now() - job.updatedAt < STALE_RUNNING_MS) return;
+  if (job.status === "running") {
+    if (Date.now() - job.updatedAt < STALE_RUNNING_MS) return;
+    // A stale `running` row is a crashed run, reclaim it before the hold check.
+    updateWorkflowSyncStatus(jobId, "pending");
+  }
 
   // A deploy is waiting for work to drain; starting one here would block it on work it just created.
-  // The row stays 'pending', so the poll-loop safety net runs it once the hold clears.
+  // The row is left 'pending', so the poll-loop safety net runs it once the hold clears.
   if (isDeployHeld()) {
     console.log(`[workflow-sync] Deferred sync #${jobId} — deploy in progress`);
     return;
