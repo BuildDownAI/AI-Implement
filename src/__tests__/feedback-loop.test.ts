@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { wrapWithPlanningGuard } from "../linear-planning-fetch.js";
+import { wrapWithPlanningGuard, assemblePlanningContext } from "../planning-context-assembly.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn().mockReturnValue({
@@ -71,14 +71,15 @@ const NEW_FORMAT_CONTEXT = [
   "",
   "Do this step.",
   "",
-  "## ⚠️ AI Planning: Risks",
+  "## ⚠️ AI Planning: Risks & Open Questions",
   "",
   "Some risks.",
 ].join("\n");
 
 const OLD_FORMAT_CONTEXT = "## Planning\n\nSome old-format content here.";
 
-// Mirrors the actual format produced by fetchPlanningContext: sections joined with "\n\n---\n\n"
+// Uses the "\n\n---\n\n" join separator between sections (the actual fetchPlanningContext
+// output also wraps everything in <planning_context> tags and prepends a preamble).
 const REAL_SEPARATOR_CONTEXT = [
   "## ✅ AI Planning: Acceptance Bar",
   "",
@@ -93,7 +94,7 @@ const REAL_SEPARATOR_CONTEXT = [
   "",
   "---",
   "",
-  "## ⚠️ AI Planning: Risks",
+  "## ⚠️ AI Planning: Risks & Open Questions",
   "",
   "Some risks.",
 ].join("\n");
@@ -149,6 +150,75 @@ describe("splitPlanningContext", () => {
     expect(mapSection).toBe("## 🗺 AI Planning: Implementation Map\n\nDo this step.");
     expect(acceptanceBar).not.toContain("---");
     expect(mapSection).not.toContain("---");
+  });
+});
+
+const ASSEMBLY_PREFIXES = [
+  "## 🏗️ AI Planning: Architecture Analysis",
+  "## 🧪 AI Planning: Test Plan",
+  "## 🔗 AI Planning: Cross-Story Context",
+  "## 🗺 AI Planning: Implementation Map",
+  "## ✅ AI Planning: Acceptance Bar",
+  "## ⚠️ AI Planning: Risks & Open Questions",
+];
+
+const MAP_WITH_FILES_AND_MACHINE_BLOCK = [
+  "## 🗺 AI Planning: Implementation Map",
+  "",
+  "Do the thing.",
+  "",
+  "## Files",
+  "- Modify: `src/foo.ts`",
+  "- Test: `src/__tests__/foo.test.ts`",
+  "",
+  "<!-- ai-implement-planning",
+  "v: 1",
+  'files: ["src/foo.ts"]',
+  "risk: low",
+  "-->",
+].join("\n");
+
+const ASSEMBLY_COMMENTS = [
+  {
+    body: "## ✅ AI Planning: Acceptance Bar\n\n1. Foo must work.\n2. Bar must pass.",
+    createdAt: "2026-01-01T00:00:00Z",
+  },
+  { body: MAP_WITH_FILES_AND_MACHINE_BLOCK, createdAt: "2026-01-01T00:01:00Z" },
+  {
+    body: "## ⚠️ AI Planning: Risks & Open Questions\n\nSome risks.",
+    createdAt: "2026-01-01T00:02:00Z",
+  },
+];
+
+describe("splitPlanningContext with real assemblePlanningContext output", () => {
+  it("extracted Map contains ## Files bullets and machine block", () => {
+    const assembled = assemblePlanningContext(ASSEMBLY_COMMENTS, ASSEMBLY_PREFIXES);
+    const { mapSection } = splitPlanningContext(assembled);
+    expect(mapSection).toBeDefined();
+    expect(mapSection).toContain("## Files");
+    expect(mapSection).toContain("src/foo.ts");
+    expect(mapSection).toContain("<!-- ai-implement-planning");
+  });
+
+  it("extracted Bar contains no planning_context tag", () => {
+    const assembled = assemblePlanningContext(ASSEMBLY_COMMENTS, ASSEMBLY_PREFIXES);
+    const { acceptanceBar } = splitPlanningContext(assembled);
+    expect(acceptanceBar).toBeDefined();
+    expect(acceptanceBar).not.toMatch(/<\s*\/?\s*planning_context\s*>/i);
+  });
+
+  it("extracted Bar does not contain wrapper tags when it is the last section", () => {
+    const barLastComments = [
+      { body: MAP_WITH_FILES_AND_MACHINE_BLOCK, createdAt: "2026-01-01T00:00:00Z" },
+      {
+        body: "## ✅ AI Planning: Acceptance Bar\n\n1. Bar is last.",
+        createdAt: "2026-01-01T00:01:00Z",
+      },
+    ];
+    const assembled = assemblePlanningContext(barLastComments, ASSEMBLY_PREFIXES);
+    const { acceptanceBar } = splitPlanningContext(assembled);
+    expect(acceptanceBar).toBeDefined();
+    expect(acceptanceBar).not.toContain("planning_context");
   });
 });
 

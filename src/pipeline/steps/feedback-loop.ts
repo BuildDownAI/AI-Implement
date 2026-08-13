@@ -4,7 +4,7 @@ import { implementStep } from "./implement.js";
 import { reviewStep } from "./review.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
-import { wrapWithPlanningGuard } from "../../linear-planning-fetch.js";
+import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -12,14 +12,36 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 const ACCEPTANCE_BAR_HEADER = "## ✅ AI Planning: Acceptance Bar";
 const MAP_HEADER = "## 🗺 AI Planning: Implementation Map";
 
+// All recognised planning-section headers. A section ends only when one of
+// these appears, so internal subheadings (e.g. "## Files" inside the Map) do
+// not split the section prematurely.
+const PLANNING_HEADERS = [
+  "## 🏗️ AI Planning: Architecture Analysis",
+  "## 🧪 AI Planning: Test Plan",
+  "## 🔗 AI Planning: Cross-Story Context",
+  "## 🗺 AI Planning: Implementation Map",
+  "## ✅ AI Planning: Acceptance Bar",
+  "## ⚠️ AI Planning: Risks & Open Questions",
+];
+
 function extractSection(text: string, header: string): string | undefined {
   const startIdx = text.indexOf(header);
   if (startIdx === -1) return undefined;
   const afterStart = startIdx + header.length;
-  const nextHeaderIdx = text.indexOf("\n## ", afterStart);
-  const sectionEnd = nextHeaderIdx !== -1 ? nextHeaderIdx : text.length;
-  // Strip trailing "---" separator left by the "\n\n---\n\n" join format used by fetchPlanningContext
-  return text.slice(startIdx, sectionEnd).trim().replace(/\n\n---\s*$/, "").trim();
+  let sectionEnd = text.length;
+  for (const h of PLANNING_HEADERS) {
+    if (h === header) continue;
+    const idx = text.indexOf(h, afterStart);
+    if (idx !== -1 && idx < sectionEnd) sectionEnd = idx;
+  }
+  // Strip planning_context wrapper tags that appear when this is the last section,
+  // then strip the trailing "---" separator from the "\n\n---\n\n" join format.
+  return text
+    .slice(startIdx, sectionEnd)
+    .replace(/<\s*\/?\s*planning_context\s*>/gi, "")
+    .trim()
+    .replace(/\n\n---\s*$/, "")
+    .trim();
 }
 
 export function splitPlanningContext(planningContext: string): {

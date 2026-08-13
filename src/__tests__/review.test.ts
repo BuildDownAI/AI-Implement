@@ -82,4 +82,28 @@ describe("reviewStep", () => {
     const barStart = capturedPrompt.indexOf(bar);
     expect(barStart).toBeGreaterThan(framingEnd);
   });
+
+  it("acceptance bar is enclosed in a delimited planning_context block with a closing tag", async () => {
+    const bar = "## ✅ AI Planning: Acceptance Bar\n\n1. Foo is done.\n2. Bar is tested.";
+    let capturedPrompt = "";
+    const ctx = makeCtx(vi.fn(async ({ prompt }: { prompt: string }) => {
+      capturedPrompt = prompt;
+      return { stdout: REVIEW_JSON, exitCode: 0, tokensUsed: 100 };
+    }));
+    await reviewStep.run(
+      ctx,
+      { diff: "diff", issueTitle: "T", issueDescription: "D", iteration: 1, acceptanceBar: bar },
+      { report: vi.fn() },
+    );
+    const openIdx = capturedPrompt.indexOf("<planning_context>");
+    const closeIdx = capturedPrompt.indexOf("</planning_context>");
+    expect(openIdx).toBeGreaterThan(-1);
+    expect(closeIdx).toBeGreaterThan(openIdx);
+    // Bar content must appear inside the delimited block
+    const taggedContent = capturedPrompt.slice(openIdx + "<planning_context>".length, closeIdx);
+    expect(taggedContent).toContain("Foo is done");
+    // The closing tag must precede the diff so the bar cannot bleed into prompt structure
+    const diffIdx = capturedPrompt.indexOf("## Implementation Diff");
+    expect(closeIdx).toBeLessThan(diffIdx);
+  });
 });
