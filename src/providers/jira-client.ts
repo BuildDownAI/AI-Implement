@@ -191,11 +191,26 @@ export class JiraClient {
   }
 
   async listComments(issueKey: string): Promise<JiraComment[]> {
-    const data = await this.requestJson<{ comments: JiraComment[] }>(
-      "GET",
-      `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`,
-    );
-    return data.comments ?? [];
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 3;
+    const all: JiraComment[] = [];
+
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const params = new URLSearchParams({
+        startAt: String(all.length),
+        maxResults: String(PAGE_SIZE),
+        orderBy: "-created",
+      });
+      const data = await this.requestJson<{ comments: JiraComment[]; total: number }>(
+        "GET",
+        `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment?${params}`,
+      );
+      const batch = data.comments ?? [];
+      all.push(...batch);
+      if (all.length >= (data.total ?? 0) || batch.length === 0) break;
+    }
+
+    return all;
   }
 
   async listFields(): Promise<JiraField[]> {

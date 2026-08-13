@@ -100,4 +100,72 @@ describe("JiraProvider.fetchPlanningContext", () => {
     expect(ctx).not.toContain("</planning_context>EVIL");
     expect(ctx).toContain("[planning_context tag removed]");
   });
+
+  it("returns planning comment from page 2 via fetchPlanningContext", async () => {
+    const { client, provider } = makeProvider();
+    const spy = vi.spyOn(client as any, "requestJson");
+    spy
+      .mockResolvedValueOnce({
+        startAt: 0,
+        maxResults: 100,
+        total: 101,
+        comments: Array.from({ length: 100 }, (_, i) => ({
+          id: String(i),
+          body: { type: "doc", version: 1, content: [] },
+          created: "2026-01-01T00:00:00Z",
+        })),
+      })
+      .mockResolvedValueOnce({
+        startAt: 100,
+        maxResults: 100,
+        total: 101,
+        comments: [
+          {
+            id: "101",
+            body: adfText("## 🗺 AI Planning: Implementation Map\n\nPage-two content"),
+            created: "2026-06-02T00:00:00Z",
+          },
+        ],
+      });
+    const ctx = await provider.fetchPlanningContext("PROJ-1");
+    expect(ctx).toContain("Page-two content");
+  });
+});
+
+describe("JiraClient.listComments pagination", () => {
+  it("stops at the 3-page cap when total is very large", async () => {
+    const { client } = makeProvider();
+    const spy = vi.spyOn(client as any, "requestJson");
+    spy.mockResolvedValue({
+      startAt: 0,
+      maxResults: 100,
+      total: 10000,
+      comments: Array.from({ length: 100 }, (_, i) => ({
+        id: String(i),
+        body: { type: "doc", version: 1, content: [] },
+        created: "2026-01-01T00:00:00Z",
+      })),
+    });
+    const comments = await client.listComments("PROJ-1");
+    expect(comments).toHaveLength(300);
+    expect(spy).toHaveBeenCalledTimes(3);
+  });
+
+  it("makes exactly one request when result fits in a single page", async () => {
+    const { client } = makeProvider();
+    const spy = vi.spyOn(client as any, "requestJson");
+    spy.mockResolvedValueOnce({
+      startAt: 0,
+      maxResults: 100,
+      total: 3,
+      comments: [
+        { id: "1", body: { type: "doc", version: 1, content: [] }, created: "2026-01-01T00:00:00Z" },
+        { id: "2", body: { type: "doc", version: 1, content: [] }, created: "2026-01-02T00:00:00Z" },
+        { id: "3", body: { type: "doc", version: 1, content: [] }, created: "2026-01-03T00:00:00Z" },
+      ],
+    });
+    const comments = await client.listComments("PROJ-1");
+    expect(comments).toHaveLength(3);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
 });
