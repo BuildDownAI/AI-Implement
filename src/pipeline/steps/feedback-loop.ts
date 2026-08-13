@@ -4,9 +4,55 @@ import { implementStep } from "./implement.js";
 import { reviewStep } from "./review.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
+import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
+
+const ACCEPTANCE_BAR_HEADER = "## ✅ AI Planning: Acceptance Bar";
+const MAP_HEADER = "## 🗺 AI Planning: Implementation Map";
+
+// All recognised planning-section headers. A section ends only when one of
+// these appears, so internal subheadings (e.g. "## Files" inside the Map) do
+// not split the section prematurely.
+const PLANNING_HEADERS = [
+  "## 🏗️ AI Planning: Architecture Analysis",
+  "## 🧪 AI Planning: Test Plan",
+  "## 🔗 AI Planning: Cross-Story Context",
+  "## 🗺 AI Planning: Implementation Map",
+  "## ✅ AI Planning: Acceptance Bar",
+  "## ⚠️ AI Planning: Risks & Open Questions",
+];
+
+function extractSection(text: string, header: string): string | undefined {
+  const startIdx = text.indexOf(header);
+  if (startIdx === -1) return undefined;
+  const afterStart = startIdx + header.length;
+  let sectionEnd = text.length;
+  for (const h of PLANNING_HEADERS) {
+    if (h === header) continue;
+    const idx = text.indexOf(h, afterStart);
+    if (idx !== -1 && idx < sectionEnd) sectionEnd = idx;
+  }
+  // Strip planning_context wrapper tags that appear when this is the last section,
+  // then strip the trailing "---" separator from the "\n\n---\n\n" join format.
+  return text
+    .slice(startIdx, sectionEnd)
+    .replace(/<\s*\/?\s*planning_context\s*>/gi, "")
+    .trim()
+    .replace(/\n\n---\s*$/, "")
+    .trim();
+}
+
+export function splitPlanningContext(planningContext: string): {
+  acceptanceBar: string | undefined;
+  mapSection: string | undefined;
+} {
+  return {
+    acceptanceBar: extractSection(planningContext, ACCEPTANCE_BAR_HEADER),
+    mapSection: extractSection(planningContext, MAP_HEADER),
+  };
+}
 
 interface FeedbackLoopInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -228,8 +274,24 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     const passes: PassStat[] = [];
     let postMortem: string | undefined;
 
+    const rawPlanningContext =
+      inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined;
+    const { acceptanceBar, mapSection } = splitPlanningContext(rawPlanningContext ?? "");
+    const isNewFormatContext = acceptanceBar !== undefined || mapSection !== undefined;
+
     while (iteration < effectiveMaxIterations && !approved) {
       iteration++;
+
+      // On retries with new-format context, send only the map section — but
+      // re-wrap it with the untrusted-data guard so the security preamble is
+      // never dropped. Fall back to the full rawPlanningContext when mapSection
+      // is absent (partial planning output) rather than sending undefined.
+      const implementPlanningContext =
+        isNewFormatContext && iteration > 1
+          ? mapSection !== undefined
+            ? wrapWithPlanningGuard(mapSection)
+            : rawPlanningContext
+          : rawPlanningContext;
 
       const implementPrompt = buildImplementPrompt(
         String(inputs.issueTitle),
@@ -252,7 +314,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           prompt: implementPrompt,
           model: resolvedImplementModel,
           maxTurns: effectiveMaxTurns,
-          planningContext: inputs.planningContext,
+          planningContext: implementPlanningContext,
         },
         outputs: {},
         logs_url: null,
@@ -268,8 +330,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             prompt: implementPrompt,
             model: resolvedImplementModel,
             maxTurns: effectiveMaxTurns,
-            planningContext:
-              inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined,
+            planningContext: implementPlanningContext,
           },
           reporter,
         );
@@ -335,6 +396,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           iteration,
           issueTitle: inputs.issueTitle,
           issueDescription: inputs.issueDescription,
+          acceptanceBar,
         },
         outputs: {},
         logs_url: null,
@@ -351,6 +413,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             issueTitle: inputs.issueTitle !== undefined ? String(inputs.issueTitle) : undefined,
             issueDescription:
               inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
+            acceptanceBar,
           },
           reporter,
         );
