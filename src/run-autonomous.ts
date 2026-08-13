@@ -536,7 +536,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       writeRunStats(workspaceDir, {
         issueIdentifier,
         passes: statPasses,
-        plannedFiles: planningBlock?.files ?? [],
+        plannedFiles: prUrl ? (planningBlock?.files ?? []) : [],
         filesChanged,
       });
       const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?";
