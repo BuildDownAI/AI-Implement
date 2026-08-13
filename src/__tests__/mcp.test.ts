@@ -457,7 +457,7 @@ describe("handleMcpRequest", () => {
       expect(data).toEqual({ mode: "fly", source: "env" });
     });
 
-    it("handles list_projects", async () => {
+    it("handles list_projects — existing seven fields preserved", async () => {
       (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
         "AII": {
           owner: "BuildDownAI",
@@ -467,6 +467,24 @@ describe("handleMcpRequest", () => {
           paused: false,
           planningEnabled: true,
           maxInProgressAiIssues: 3,
+          defaultBranch: "main",
+          workflowFile: "claude-implement.yml",
+          sessionMode: "autonomous",
+          autoMerge: false,
+          maxTurns: null,
+          maxIterations: null,
+          maxJobMinutes: null,
+          branchPrefix: null,
+          skillsRepo: null,
+          dependencyTokenScope: null,
+          sensitiveAddPatterns: null,
+          sensitiveAllowPatterns: null,
+          machineCpus: 2,
+          machineMemoryMb: 4096,
+          awsRegion: null,
+          planningWorkflowFile: "claude-plan.yml",
+          autoApprovePlans: true,
+          extraEnv: { SECRET_KEY: "secret-value" },
         },
       });
 
@@ -485,6 +503,175 @@ describe("handleMcpRequest", () => {
       expect(data[0].teamKey).toBe("AII");
       expect(data[0].repo).toBe("BuildDownAI/AI-Implement");
       expect(data[0].paused).toBe(false);
+      expect(data[0].executionMode).toBe("github-actions");
+      expect(data[0].provider).toBe("anthropic");
+      expect(data[0].planningEnabled).toBe(true);
+      expect(data[0].maxInProgressAiIssues).toBe(3);
+    });
+
+    it("handles list_projects — extended per-project settings", async () => {
+      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+        "AII": {
+          owner: "BuildDownAI",
+          repo: "AI-Implement",
+          executionMode: "fly-machines",
+          provider: "bedrock",
+          paused: true,
+          planningEnabled: false,
+          maxInProgressAiIssues: 5,
+          defaultBranch: "develop",
+          workflowFile: "custom-implement.yml",
+          sessionMode: "hybrid",
+          autoMerge: true,
+          maxTurns: 40,
+          maxIterations: 2,
+          maxJobMinutes: 60,
+          branchPrefix: "feat",
+          skillsRepo: "org/skills",
+          dependencyTokenScope: "installation",
+          sensitiveAddPatterns: ["*.pem", "secrets/**"],
+          sensitiveAllowPatterns: ["public/**"],
+          machineCpus: 4,
+          machineMemoryMb: 8192,
+          awsRegion: "us-east-1",
+          planningWorkflowFile: "claude-plan.yml",
+          autoApprovePlans: false,
+          extraEnv: { SHOULD_NOT_APPEAR: "hidden" },
+        },
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_projects", arguments: {} } }),
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data).toHaveLength(1);
+      const p = data[0];
+      expect(p.defaultBranch).toBe("develop");
+      expect(p.workflowFile).toBe("custom-implement.yml");
+      expect(p.sessionMode).toBe("hybrid");
+      expect(p.autoMerge).toBe(true);
+      expect(p.maxTurns).toBe(40);
+      expect(p.maxIterations).toBe(2);
+      expect(p.maxJobMinutes).toBe(60);
+      expect(p.branchPrefix).toBe("feat");
+      expect(p.skillsRepo).toBe("org/skills");
+      expect(p.dependencyTokenScope).toBe("installation");
+      expect(p.sensitiveAddPatterns).toEqual(["*.pem", "secrets/**"]);
+      expect(p.sensitiveAllowPatterns).toEqual(["public/**"]);
+      expect(p.machineCpus).toBe(4);
+      expect(p.machineMemoryMb).toBe(8192);
+      expect(p.awsRegion).toBe("us-east-1");
+      expect(p.planningWorkflowFile).toBe("claude-plan.yml");
+      expect(p.autoApprovePlans).toBe(false);
+    });
+
+    it("handles list_projects — null-able caps return null, not fabricated defaults", async () => {
+      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+        "AII": {
+          owner: "BuildDownAI",
+          repo: "AI-Implement",
+          executionMode: "github-actions",
+          provider: "anthropic",
+          paused: false,
+          planningEnabled: true,
+          maxInProgressAiIssues: 3,
+          defaultBranch: "main",
+          workflowFile: "claude-implement.yml",
+          sessionMode: "autonomous",
+          autoMerge: false,
+          maxTurns: null,
+          maxIterations: null,
+          maxJobMinutes: null,
+          branchPrefix: null,
+          skillsRepo: null,
+          dependencyTokenScope: null,
+          sensitiveAddPatterns: null,
+          sensitiveAllowPatterns: null,
+          machineCpus: 2,
+          machineMemoryMb: 4096,
+          awsRegion: null,
+          planningWorkflowFile: "claude-plan.yml",
+          autoApprovePlans: true,
+          extraEnv: {},
+        },
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_projects", arguments: {} } }),
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      const p = data[0];
+      expect(p.maxTurns).toBeNull();
+      expect(p.maxIterations).toBeNull();
+      expect(p.maxJobMinutes).toBeNull();
+      expect(p.branchPrefix).toBeNull();
+      expect(p.skillsRepo).toBeNull();
+      expect(p.dependencyTokenScope).toBeNull();
+      expect(p.awsRegion).toBeNull();
+      expect(p.sensitiveAddPatterns).toBeNull();
+      expect(p.sensitiveAllowPatterns).toBeNull();
+    });
+
+    it("handles list_projects — extraEnv is absent from output", async () => {
+      (configMock.getMappings as ReturnType<typeof vi.fn>).mockReturnValue({
+        "AII": {
+          owner: "BuildDownAI",
+          repo: "AI-Implement",
+          executionMode: "github-actions",
+          provider: "anthropic",
+          paused: false,
+          planningEnabled: true,
+          maxInProgressAiIssues: 3,
+          defaultBranch: "main",
+          workflowFile: "claude-implement.yml",
+          sessionMode: "autonomous",
+          autoMerge: false,
+          maxTurns: null,
+          maxIterations: null,
+          maxJobMinutes: null,
+          branchPrefix: null,
+          skillsRepo: null,
+          dependencyTokenScope: null,
+          sensitiveAddPatterns: null,
+          sensitiveAllowPatterns: null,
+          machineCpus: 2,
+          machineMemoryMb: 4096,
+          awsRegion: null,
+          planningWorkflowFile: "claude-plan.yml",
+          autoApprovePlans: true,
+          extraEnv: { API_KEY: "do-not-expose", DB_PASS: "also-secret" },
+        },
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_projects", arguments: {} } }),
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data[0]).not.toHaveProperty("extraEnv");
+      // Also verify key names are not exposed
+      expect(JSON.stringify(data)).not.toContain("API_KEY");
+      expect(JSON.stringify(data)).not.toContain("DB_PASS");
     });
 
     it("handles list_in_flight_jobs", async () => {

@@ -41,7 +41,11 @@ Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, e
 
 ## Knowledge graph
 
-Bindings for the KG skills (bd-kg-search, kg recon — format: skills `docs/kg-binding.md`):
+Bindings for the KG skills (bd-kg-search, kg recon — format: skills `plugin/skills/bd-shared/kg-binding.md`):
+
+> **Path note (skills PR #49):** the skills repo moved its shared docs from `docs/` into
+> `plugin/skills/bd-shared/`. Stubs remain at the old `docs/` paths, so old citations still
+> resolve. Use the `bd-shared/` path in new references.
 
 - kg.present:      true
 - kg.orchestrator: https://ai-implement-testing-orchestrator.fly.dev

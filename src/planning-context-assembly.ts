@@ -43,6 +43,7 @@ export function assemblePlanningContext(
   return full;
 }
 
+/** Slice a UTF-8 buffer at or before maxBytes without splitting a codepoint. */
 function sliceUtf8(buf: Buffer, maxBytes: number): string {
   let end = Math.min(maxBytes, buf.length);
   // Back off while the first excluded byte is a continuation byte (0b10xxxxxx),

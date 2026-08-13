@@ -98,6 +98,23 @@ function callDiagnosticTool(name: string, args: Record<string, unknown>): unknow
         paused: m.paused,
         planningEnabled: m.planningEnabled,
         maxInProgressAiIssues: m.maxInProgressAiIssues,
+        defaultBranch: m.defaultBranch,
+        workflowFile: m.workflowFile,
+        sessionMode: m.sessionMode,
+        autoMerge: m.autoMerge,
+        maxTurns: m.maxTurns,
+        maxIterations: m.maxIterations,
+        maxJobMinutes: m.maxJobMinutes,
+        branchPrefix: m.branchPrefix,
+        skillsRepo: m.skillsRepo,
+        dependencyTokenScope: m.dependencyTokenScope,
+        sensitiveAddPatterns: m.sensitiveAddPatterns,
+        sensitiveAllowPatterns: m.sensitiveAllowPatterns,
+        machineCpus: m.machineCpus,
+        machineMemoryMb: m.machineMemoryMb,
+        awsRegion: m.awsRegion,
+        planningWorkflowFile: m.planningWorkflowFile,
+        autoApprovePlans: m.autoApprovePlans,
       }));
     }
 

@@ -362,6 +362,18 @@ function externalBlockingCommentBlock(hasExternalBlockers: boolean): string {
   return hasExternalBlockers ? "\n\nExternal review findings are blocking this PR." : "";
 }
 
+function minorExternalFindingsBlock(findings: ReviewLedgerFinding[]): string {
+  const minorFindings = findings.filter((f) => f.severity === "minor");
+  if (minorFindings.length === 0) return "";
+  const issues = minorFindings.map((finding) => {
+    const location = finding.path
+      ? `${finding.path}${typeof finding.line === "number" ? `:${finding.line}` : ""}: `
+      : "";
+    return issueFromString(`${location}${finding.body}`);
+  });
+  return `\n\nUnaddressed external review findings (non-blocking):\n${formatIssueList(issues)}`;
+}
+
 function shouldCollectExternalReviewFindings(reviewProviders: string[] | undefined): boolean {
   return reviewProviders === undefined || reviewProviders.includes(GITHUB_CLAUDE_CODE_REVIEW_PROVIDER);
 }
@@ -888,7 +900,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}\n\n**Merge readiness:** Ready to merge.`,
+          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}${minorExternalFindingsBlock(externalFindings)}\n\n**Merge readiness:** Ready to merge.`,
           marker,
         );
         break;

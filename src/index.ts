@@ -15,12 +15,14 @@ import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, se
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, type SelfDeployTarget } from "./deploy-availability.js";
+import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { configureAuthorizationPolicy } from "./oauth/authorize.js";
@@ -276,6 +278,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       console.error("[deploy] availability check failed:", err);
     }
   }
+  // Read once for the surfaces this poll owns, so they agree even if the hold is set part-way through a tick.
+  // runWorkflowSync reads it independently — the admin fire-immediately path has no tick to share.
+  const deployHeld = isDeployHeld();
 
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
@@ -307,6 +312,14 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           deleteDispatched(id);
           const reason = observedTerminal ? "terminal" : "not found";
           console.log(`[reconcile] Cleared dedup for ${id} (state: ${reason})`);
+          // observedTerminal means the tracker issue reached completed/cancelled —
+          // a success signal, not a dispatch failure. Only count failures for not-found entries.
+          if (!observedTerminal) {
+            const _brReconcile = recordDispatchFailure(id, "implementation", `reconcile_${reason}`);
+            if (_brReconcile.tripped) {
+              await fireBreakerTrip(config, null, id, null, "implementation", _brReconcile.failures, `reconcile_${reason}`);
+            }
+          }
         }
       }
     } catch (err) {
@@ -409,15 +422,26 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const needsPlanningIds = new Set(needsPlanning.map((i) => i.id));
 
     const inFlightIssueIds = getInFlightIssueIds();
-    const isDispatchBlocked = (issueId: string) =>
-      isAlreadyDispatched(issueId) || inFlightIssueIds.has(issueId);
+    const isDispatchBlocked = (issueId: string) => {
+      const phase = needsPlanningIds.has(issueId) ? "planning" : "implementation";
+      return isAlreadyDispatched(issueId) || inFlightIssueIds.has(issueId) || isParked(issueId, phase);
+    };
 
-    const toProcess = selectIssuesToDispatch(
-      allCandidates,
-      teamRepoMap,
-      inProgressCountsByTeam,
-      isDispatchBlocked,
-    );
+    // A deploy is holding new work back. Skipping selection cannot lose work:
+    // selectIssuesToDispatch is pure, and markDispatched runs only after a
+    // successful dispatch — so every candidate stays queued with dedup untouched.
+    if (deployHeld && allCandidates.length > 0) {
+      console.log(`[deploy] Dispatch paused — ${allCandidates.length} candidate(s) stay queued`);
+    }
+
+    const toProcess = deployHeld
+      ? []
+      : selectIssuesToDispatch(
+          allCandidates,
+          teamRepoMap,
+          inProgressCountsByTeam,
+          isDispatchBlocked,
+        );
 
     // AII-278 Finding 3: in-flight issues carry AI-Working and drop OUT of the
     // candidate snapshot, so filtering allCandidates made the in-flight set
@@ -570,32 +594,38 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // Process any pending reconciliation jobs triggered by merged PRs
   await processReconciliations(config, registry);
 
-  // Process pending late review feedback that arrived after the original run.
-  await processReviewFixQueue(config);
+  // Both of these launch runner jobs, so they pause with issue dispatch —
+  // otherwise the hold would block on work it is itself still creating.
+  if (deployHeld) {
+    console.log("[deploy] Review-fix and gap-fill drains paused. self-deployment in progress");
+  } else {
+    // Process pending late review feedback that arrived after the original run.
+    await processReviewFixQueue(config);
 
-  // Drain orchestrator-mediated /ai-implement comment gap-fills.
-  await drainCommentGapfillQueue({
-    getMappings,
-    runnerMode: getRunnerMode().mode,
-    notifyType: config.notifyType,
-    notifyWebhookUrl: config.notifyWebhookUrl,
-    runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
-    runnerTokenSecret: config.runnerTokenSecret,
-    getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
-    resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
-    checkContract: (params) => resolveWorkflowContract(params),
-    dispatch: dispatchWorkflow,
-    postComment: postPrComment,
-    onDispatchFailure: surfaceDispatchFailure,
-    flySessionsToken: config.flySessionsToken,
-    flySessionsApp: config.flySessionsApp,
-    flySessionsRegion: config.flySessionsRegion,
-    flyOrchestratorApp: config.flyOrchestratorApp,
-    tenantId: config.tenantId,
-    anthropicApiKey: config.anthropicApiKey,
-    claudeOAuthToken: config.claudeOAuthToken,
-    sessionImage: config.sessionImage,
-  });
+    // Drain orchestrator-mediated /ai-implement comment gap-fills.
+    await drainCommentGapfillQueue({
+      getMappings,
+      runnerMode: getRunnerMode().mode,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+      runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+      runnerTokenSecret: config.runnerTokenSecret,
+      getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
+      checkContract: (params) => resolveWorkflowContract(params),
+      dispatch: dispatchWorkflow,
+      postComment: postPrComment,
+      onDispatchFailure: surfaceDispatchFailure,
+      flySessionsToken: config.flySessionsToken,
+      flySessionsApp: config.flySessionsApp,
+      flySessionsRegion: config.flySessionsRegion,
+      flyOrchestratorApp: config.flyOrchestratorApp,
+      tenantId: config.tenantId,
+      anthropicApiKey: config.anthropicApiKey,
+      claudeOAuthToken: config.claudeOAuthToken,
+      sessionImage: config.sessionImage,
+    });
+  }
 
   // Crash-recovery safety net for workflow syncs. (NOT the primary trigger. the admin handlers fire runWorkflowSync immediately on save) 
   // this only re-runs jobs that lost their runner to a restart or a wedge.
@@ -603,6 +633,61 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   } finally {
     pollInProgress = false;
+  }
+}
+
+// ---------- Dispatch breaker ----------
+
+/**
+ * Fires after recordDispatchFailure returns tripped=true. Posts a tracker
+ * comment and a webhook notification, both best-effort. Never throws.
+ */
+async function fireBreakerTrip(
+  config: AppConfig,
+  provider: TicketingProvider | null,
+  issueId: string,
+  issueIdentifier: string | null,
+  phase: string,
+  failures: number,
+  conclusion: string,
+): Promise<void> {
+  console.warn(
+    `[breaker] Parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, conclusion: ${conclusion})`,
+  );
+
+  const runUrls = getRecentFailedRunUrls(issueId, phase, 3);
+  const commentLines = [
+    `**⛔ AI-Implement parked this issue**`,
+    ``,
+    `This issue has been parked after ${failures} consecutive failed dispatches.`,
+    ``,
+    `- Phase: \`${phase}\``,
+    `- Failures: ${failures}`,
+    `- Last conclusion: \`${conclusion}\``,
+    ...(runUrls.length > 0
+      ? [`- Failed runs:`, ...runUrls.map((u) => `  - ${u}`)]
+      : []),
+    ``,
+    `Unpark: admin → Runners → Unpark, or ask the operator.`,
+  ];
+
+  if (provider) {
+    try {
+      await provider.postComment(issueId, commentLines.join("\n"));
+    } catch (err) {
+      console.error(`[breaker] Failed to post park comment for ${issueIdentifier ?? issueId}:`, err);
+    }
+  }
+
+  if (config.notifyWebhookUrl) {
+    try {
+      await notifyText(
+        config.notifyWebhookUrl,
+        `⛔ AI-Implement parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, last: ${conclusion}). Unpark: admin → Runners → Unpark.`,
+      );
+    } catch (err) {
+      console.error(`[breaker] Failed to send park notification for ${issueIdentifier ?? issueId}:`, err);
+    }
   }
 }
 
@@ -734,6 +819,11 @@ async function dispatchGitHubActions(
         phase: "implementation",
       },
     );
+    // No dedup row was written at this point (markDispatched is called only on success below).
+    const _brImpl = recordDispatchFailure(issue.id, "implementation", "workflow_dispatch_failed");
+    if (_brImpl.tripped) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", _brImpl.failures, "workflow_dispatch_failed");
+    }
     return;
   }
 
@@ -1076,6 +1166,11 @@ async function dispatchPlanning(
         phase: "planning",
       },
     );
+    // Planning never writes a dedup row (intentional), but we still count the failure.
+    const _brPlan = recordDispatchFailure(issue.id, "planning", "workflow_dispatch_failed");
+    if (_brPlan.tripped) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", _brPlan.failures, "workflow_dispatch_failed");
+    }
     return;
   }
 
@@ -1183,45 +1278,58 @@ async function dispatchSession(
     markDispatched(issue.id, issue.identifier, issue.title);
   }
 
-  const jobId = appendLog({
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
-    teamKey: issue.scopeKey,
-    repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: issue.nativeStatus,
-    dispatchId,
-    dispatchNumber: prior.count + 1,
-    executionMode: result.executionMode,
-    machineNonce,
-    machineId: result.machineId,
-    runnerMode,
-    sessionImage: result.sessionImage,
-    phase: opts.phase,
-    groupingParent: opts.phase === "implementation" && isGroupingParentDispatch(issue),
-  });
+  // AII-194: if anything after markDispatched throws, clean up the orphaned dedup row
+  // so the issue can be re-dispatched and the failure is counted.
+  try {
+    const jobId = appendLog({
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      issueTitle: issue.title,
+      teamKey: issue.scopeKey,
+      repo: `${mapping.owner}/${mapping.repo}`,
+      issueState: issue.nativeStatus,
+      dispatchId,
+      dispatchNumber: prior.count + 1,
+      executionMode: result.executionMode,
+      machineNonce,
+      machineId: result.machineId,
+      runnerMode,
+      sessionImage: result.sessionImage,
+      phase: opts.phase,
+      groupingParent: opts.phase === "implementation" && isGroupingParentDispatch(issue),
+    });
 
-  if (!opts.shadow) {
-    const suppressed = suppressStaleNotifications(issue.id, jobId);
-    if (suppressed > 0) {
-      console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
+    if (!opts.shadow) {
+      const suppressed = suppressStaleNotifications(issue.id, jobId);
+      if (suppressed > 0) {
+        console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
+      }
+
+      const doPostDispatch = opts.onPostDispatch ?? postDispatch;
+      await doPostDispatch(config, provider, issue, mapping, result.ghToken, jobId, result.executionMode);
+
+      if (result.statusComment) {
+        postStatusComment(provider, issue.id, {
+          type: "machine_created",
+          machineName: result.statusComment.machineName,
+        }, result.statusComment.logsUrl).catch((err) => {
+          console.error(`[poll] Failed to post machine_created status for ${issue.identifier}:`, err);
+        });
+      }
     }
 
-    const doPostDispatch = opts.onPostDispatch ?? postDispatch;
-    await doPostDispatch(config, provider, issue, mapping, result.ghToken, jobId, result.executionMode);
-
-    if (result.statusComment) {
-      postStatusComment(provider, issue.id, {
-        type: "machine_created",
-        machineName: result.statusComment.machineName,
-      }, result.statusComment.logsUrl).catch((err) => {
-        console.error(`[poll] Failed to post machine_created status for ${issue.identifier}:`, err);
-      });
+    if (result.dispatchedLogLine) {
+      console.log(result.dispatchedLogLine);
     }
-  }
-
-  if (result.dispatchedLogLine) {
-    console.log(result.dispatchedLogLine);
+  } catch (err) {
+    if (opts.doMarkDispatched) {
+      deleteDispatched(issue.id);
+    }
+    const _brSession = recordDispatchFailure(issue.id, opts.phase, "dispatch_error");
+    if (_brSession.tripped) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, _brSession.failures, "dispatch_error");
+    }
+    throw err;
   }
 }
 
@@ -2206,6 +2314,27 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
   const mappings = getMappings();
   for (const job of terminalJobs) {
     try {
+      // Record dispatch breaker state for ALL terminal jobs before any early-continue.
+      // Uses reportJobCompletion as the single integration point because it sees every
+      // terminal job regardless of which backend or path produced it (GHA callback,
+      // GHA monitor, Fly, local-docker).
+      let pendingBreakerTrip: { phase: string; failures: number; conclusion: string } | null = null;
+      if (job.issueId) {
+        const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
+        if (job.status === "completed") {
+          recordDispatchSuccess(job.issueId, breakerPhase);
+        } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
+          const breakerConclusion = job.conclusion ?? job.status;
+          // Don't fire the trip notification for stuck conclusions — stuck_giveup already
+          // fires notifyStuckGiveUp; we still record the failure so the counter advances.
+          const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
+          const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+          if (br.tripped && !isStuck) {
+            pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+          }
+        }
+      }
+
       // Suppress ordinary completion notice for stuck conclusions — stuck_giveup
       // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
       // requeue that will produce its own dispatch notice on the next cycle.
@@ -2249,6 +2378,19 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
         } catch (err) {
           console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
         }
+      }
+
+      // Fire breaker trip notification now that provider is resolved.
+      if (pendingBreakerTrip && job.issueId) {
+        await fireBreakerTrip(
+          config,
+          provider,
+          job.issueId,
+          job.issueIdentifier,
+          pendingBreakerTrip.phase,
+          pendingBreakerTrip.failures,
+          pendingBreakerTrip.conclusion,
+        );
       }
 
       // Tracker comment — ALWAYS, independent of the Slack/Teams webhook (failures only)
@@ -2382,14 +2524,23 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
 /**
  * Thin wrapper: adapts registry + mappings to runReconciliations.
  */
-async function processReconciliations(_config: AppConfig, registry: ProviderRegistry): Promise<void> {
+async function processReconciliations(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const teamRepoMap = getMappings();
+  let appBotLogin: string | undefined;
+  try {
+    const slug = await getAppSlug(config.githubAppId, config.githubAppPrivateKey);
+    appBotLogin = `${slug}[bot]`;
+  } catch {
+    // Non-fatal; runner commits won't be bucketed separately
+  }
   await runReconciliations({
     mappingForRepo: (repo) => {
       const entry = Object.entries(teamRepoMap).find(([, m]) => `${m.owner}/${m.repo}` === repo);
       return entry ? { scopeKey: entry[0], mapping: entry[1] } : undefined;
     },
     resolveProvider: (mapping) => registry.forMapping(mapping),
+    tokenForOwner: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+    appBotLogin,
   });
 }
 
@@ -2987,11 +3138,17 @@ async function main(): Promise<void> {
   // Initialize DB tables before loadConfig() so DB-backed settings are readable on first boot
   initMappingsTable();
   initLogTable();
+  initDispatchBreakerTable();
   sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
   initReconciliationTable();
   initStepLogTable();
   initMcpOAuthTables();
+
+  // A process that died mid-deploy must not leave dispatch paused forever.
+  if (clearDeployHold()) {
+    console.warn("[main] Cleared a hold left by the previous deployment process, resuming paused dispatches...");
+  }
 
   const config = loadConfig();
 

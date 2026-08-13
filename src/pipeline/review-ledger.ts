@@ -51,6 +51,79 @@ function normalizeReviewerLogin(login: string): string {
   return login.trim().toLowerCase().replace(/\[bot\]$/, "");
 }
 
+function parseVerdictItem(item: unknown): { body: string; path?: string; line?: number } | null {
+  if (typeof item === "string") {
+    const body = item.trim();
+    return body ? { body } : null;
+  }
+  if (!isRecord(item)) return null;
+  const body = typeof item.body === "string" ? item.body.trim() : "";
+  if (!body) return null;
+  const path = typeof item.path === "string" && item.path ? item.path : undefined;
+  const line = typeof item.line === "number" ? item.line : undefined;
+  return { body, ...(path ? { path } : {}), ...(line !== undefined ? { line } : {}) };
+}
+
+/**
+ * Extracts findings from a `<!-- claude-review-verdict {...} -->` marker embedded in a
+ * comment body. Returns null when the marker is absent or the JSON is malformed (caller
+ * should fall back to heading-based extraction). Returns an empty array when the marker
+ * is present and valid but both blocking[] and minor[] are empty.
+ */
+export function extractVerdictMarkerFindings(body: string, url?: string): ReviewLedgerFinding[] | null {
+  const markerPrefix = "<!-- claude-review-verdict ";
+  const markerSuffix = " -->";
+  const startIdx = body.indexOf(markerPrefix);
+  if (startIdx === -1) return null;
+  const jsonStart = startIdx + markerPrefix.length;
+  let parsed: unknown;
+  let endIdx = body.indexOf(markerSuffix, jsonStart);
+  while (endIdx !== -1) {
+    const candidate = body.slice(jsonStart, endIdx).trim();
+    try {
+      parsed = JSON.parse(candidate);
+      break;
+    } catch {
+      endIdx = body.indexOf(markerSuffix, endIdx + markerSuffix.length);
+    }
+  }
+  if (endIdx === -1) {
+    console.warn("[review-ledger] Malformed JSON in claude-review-verdict marker; treating comment as no verdict");
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const findings: ReviewLedgerFinding[] = [];
+  if (Array.isArray(parsed.blocking)) {
+    for (const item of parsed.blocking) {
+      const v = parseVerdictItem(item);
+      if (!v) continue;
+      findings.push({
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: v.body,
+        ...(v.path ? { path: v.path } : {}),
+        ...(typeof v.line === "number" ? { line: v.line } : {}),
+        ...(url ? { url } : {}),
+      });
+    }
+  }
+  if (Array.isArray(parsed.minor)) {
+    for (const item of parsed.minor) {
+      const v = parseVerdictItem(item);
+      if (!v) continue;
+      findings.push({
+        source: "claude-review-summary",
+        severity: "minor",
+        body: v.body,
+        ...(v.path ? { path: v.path } : {}),
+        ...(typeof v.line === "number" ? { line: v.line } : {}),
+        ...(url ? { url } : {}),
+      });
+    }
+  }
+  return findings;
+}
+
 export function extractClaudeSummaryFindings(body: string, url?: string): ReviewLedgerFinding[] {
   const items: string[] = [];
   let inBlockingSection = false;
@@ -194,14 +267,26 @@ function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings
   const comments = parseReviewPages(result.stdout);
 
   for (const comment of comments) {
-    if (!isRecord(comment) || !isLikelyClaudeReviewComment(comment)) continue;
+    if (!isRecord(comment) || typeof comment.body !== "string" || isAiImplementComment(comment.body)) continue;
 
-    findings.push(
-      ...extractClaudeSummaryFindings(
-        comment.body,
-        typeof comment.html_url === "string" ? comment.html_url : undefined,
-      ),
-    );
+    const url = typeof comment.html_url === "string" ? comment.html_url : undefined;
+
+    // Verdict marker path: accept from bot accounts (user.type === "Bot") and
+    // already-trusted authors. A human commenter cannot post as a Bot-type account,
+    // so the marker is not forgeable by an arbitrary PR participant.
+    if (isVerdictEligibleAuthor(comment)) {
+      const verdictFindings = extractVerdictMarkerFindings(comment.body, url);
+      if (verdictFindings !== null) {
+        findings.push(...verdictFindings);
+        continue;
+      }
+    }
+
+    // Heading-based extraction (backward compat with target repos using trusted-author
+    // Claude App identity that posts without a verdict marker).
+    if (isLikelyClaudeReviewComment(comment)) {
+      findings.push(...extractClaudeSummaryFindings(comment.body, url));
+    }
   }
 }
 
@@ -369,6 +454,16 @@ function isClaudeAuthor(comment: Record<string, unknown>): boolean {
   const user = comment.user;
   if (!isRecord(user) || typeof user.login !== "string") return false;
   return TRUSTED_REVIEW_COMMENT_AUTHORS.has(user.login.toLowerCase());
+}
+
+function isBotAuthor(comment: Record<string, unknown>): boolean {
+  const user = comment.user;
+  if (!isRecord(user)) return false;
+  return user.type === "Bot";
+}
+
+function isVerdictEligibleAuthor(comment: Record<string, unknown>): boolean {
+  return isBotAuthor(comment) || isClaudeAuthor(comment);
 }
 
 function hasClaudeReviewHeading(body: string): boolean {
