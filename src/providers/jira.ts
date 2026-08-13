@@ -590,6 +590,8 @@ export class JiraProvider implements TicketingProvider {
       const jiraComments = await this.client.listComments(issueId);
       const comments = jiraComments.map((c) => ({
         body: adfToPlainText(c.body),
+        // When `created` is absent all entries map to "" and first-encountered
+        // wins; listComments requests orderBy=-created so first-encountered = newest.
         createdAt: c.created ?? "",
       }));
       return assemblePlanningContext(comments, JIRA_V2_PREFIXES);
