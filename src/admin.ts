@@ -25,12 +25,12 @@ import {
   setFlySecretsMinVersion,
   checkForcedPathEligibility,
 } from "./runner-mode.js";
-import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
-import { unpark } from "./dispatch-breaker.js";
+import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls } from "./log.js";
+import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
@@ -336,43 +336,23 @@ export function handleAdminRequest(
     }
 
     if (url === "/api/parked" && method === "GET") {
-      const rows = getDb()
-        .prepare(
-          `SELECT db.issue_id, db.phase, db.consecutive_failures AS failures,
-                  db.last_conclusion, db.parked_at,
-                  dl.issue_identifier, dl.issue_title, dl.repo
-           FROM dispatch_breaker db
-           LEFT JOIN (
-             SELECT issue_id, issue_identifier, issue_title, repo
-             FROM dispatch_log
-             WHERE id IN (SELECT MAX(id) FROM dispatch_log GROUP BY issue_id)
-           ) dl ON db.issue_id = dl.issue_id
-           WHERE db.parked_at IS NOT NULL
-           ORDER BY db.parked_at DESC`,
-        )
-        .all() as Array<{
-          issue_id: string;
-          phase: string;
-          failures: number;
-          last_conclusion: string | null;
-          parked_at: number;
-          issue_identifier: string | null;
-          issue_title: string | null;
-          repo: string | null;
-        }>;
+      const parkedRows = listParked();
       json(
         res,
         200,
-        rows.map((r) => ({
-          issueId: r.issue_id,
-          phase: r.phase,
-          failures: r.failures,
-          lastConclusion: r.last_conclusion,
-          parkedAt: r.parked_at,
-          issueIdentifier: r.issue_identifier,
-          issueTitle: r.issue_title,
-          repo: r.repo,
-        })),
+        parkedRows.map((r) => {
+          const enrichment = getIssueEnrichment(r.issueId, r.phase);
+          return {
+            issueId: r.issueId,
+            phase: r.phase,
+            failures: r.failures,
+            lastConclusion: r.lastConclusion,
+            parkedAt: r.parkedAt,
+            issueIdentifier: enrichment.issueIdentifier,
+            issueTitle: enrichment.issueTitle,
+            repo: enrichment.repo,
+          };
+        }),
       );
       return true;
     }

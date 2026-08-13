@@ -21,7 +21,7 @@ export const runnersHtml = `
         </div>
         <div class="card-body tight">
           <table class="tbl">
-            <thead><tr><th>Issue</th><th>Repo</th><th>Failures</th><th>Last conclusion</th><th>Parked</th><th></th></tr></thead>
+            <thead><tr><th>Issue</th><th>Repo</th><th>Phase</th><th>Failures</th><th>Last conclusion</th><th>Parked</th><th></th></tr></thead>
             <tbody id="runners-parked-body"></tbody>
           </table>
         </div>
@@ -204,6 +204,7 @@ export const runnersScript = `
       const tr = document.createElement('tr');
       tr.innerHTML = '<td class="mono">' + window.esc(p.issueIdentifier || p.issueId || '—') + '</td>'
         + '<td class="mono">' + window.esc(p.repo || '—') + '</td>'
+        + '<td class="mono">' + window.esc(p.phase || '—') + '</td>'
         + '<td class="mono">' + window.esc(String(p.failures)) + '</td>'
         + '<td class="mono">' + window.esc(p.lastConclusion || '—') + '</td>'
         + '<td class="mono">' + window.esc(fmtAgo(p.parkedAt)) + '</td>'
@@ -299,11 +300,20 @@ export const runnersScript = `
   }
 
   async function unparkIssue(issueId) {
+    const errEl = document.getElementById('runners-error');
     try {
       const res = await window.api('/api/parked/unpark', { method: 'POST', body: JSON.stringify({ issueId }) });
-      if (res.ok) loadRunners();
+      if (res.ok) {
+        loadRunners();
+      } else if (res.status !== 401) {
+        let message = 'Unpark failed';
+        try { const body = await res.json(); message = body.error || message; } catch (e) { /* ignore */ }
+        errEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to unpark issue</div><div class="alert-desc">' + window.esc(message) + '</div></div>';
+        errEl.hidden = false;
+      }
     } catch (err) {
-      console.error('unparkIssue failed:', err);
+      errEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to unpark issue</div><div class="alert-desc">' + window.esc(String(err)) + '</div></div>';
+      errEl.hidden = false;
     }
   }
 
