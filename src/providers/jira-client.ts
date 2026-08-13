@@ -24,6 +24,7 @@ export interface JiraIssue {
 export interface JiraComment {
   id: string;
   body: unknown; // ADF JSON
+  created?: string; // ISO 8601 timestamp
 }
 
 export interface JiraField {

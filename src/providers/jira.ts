@@ -19,6 +19,7 @@ import type { RepoMapping } from "../config.js";
 import { classifyByChildren, ancestorChain, type ChildState } from "./jira-hierarchy.js";
 import { parseIssueConfig } from "../issue-config.js";
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
+import { assemblePlanningContext } from "../planning-context-assembly.js";
 
 function adfToPlainText(adf: unknown): string {
   const out: string[] = [];
@@ -160,6 +161,12 @@ export interface JiraProviderConstructor {
   /** Optional callback invoked when an issue's repo field doesn't match its mapping's expected value. */
   onRepoFieldMismatch?: (mappingId: string, issueKey: string, actual: string) => void;
 }
+
+const JIRA_V2_PREFIXES = [
+  "## 🗺 AI Planning: Implementation Map",
+  "## ✅ AI Planning: Acceptance Bar",
+  "## ⚠️ AI Planning: Risks & Open Questions",
+];
 
 export class JiraProvider implements TicketingProvider {
   readonly id = "jira";
@@ -578,10 +585,18 @@ export class JiraProvider implements TicketingProvider {
     await this.client.addComment(issueId, adfParagraph(body));
   }
 
-  async fetchPlanningContext(_issueId: string): Promise<string> {
-    // Jira planning-context extraction is not implemented yet; the
-    // implementation run proceeds without it (best-effort context).
-    return "";
+  async fetchPlanningContext(issueId: string): Promise<string> {
+    try {
+      const jiraComments = await this.client.listComments(issueId);
+      const comments = jiraComments.map((c) => ({
+        body: adfToPlainText(c.body),
+        createdAt: c.created ?? "",
+      }));
+      return assemblePlanningContext(comments, JIRA_V2_PREFIXES);
+    } catch (err) {
+      console.warn(`Failed to fetch Jira planning context for ${issueId}: ${err}`);
+      return "";
+    }
   }
 
   issueUrl(issue: TicketIssue): string {
