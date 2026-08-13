@@ -80,6 +80,17 @@ describe("JiraProvider.fetchPlanningContext", () => {
     expect(ctx).not.toContain("Old map");
   });
 
+  it("deduplicates by prefix keeping the most recent comment when newest arrives first (orderBy=-created order)", async () => {
+    const { client, provider } = makeProvider();
+    vi.spyOn(client, "listComments").mockResolvedValue([
+      { id: "2", body: adfText("## 🗺 AI Planning: Implementation Map\n\nNew map"), created: "2026-06-02T00:00:00Z" },
+      { id: "1", body: adfText("## 🗺 AI Planning: Implementation Map\n\nOld map"), created: "2026-06-01T00:00:00Z" },
+    ]);
+    const ctx = await provider.fetchPlanningContext("PROJ-1");
+    expect(ctx).toContain("New map");
+    expect(ctx).not.toContain("Old map");
+  });
+
   it("applies 40KB cap (shared code)", async () => {
     const { client, provider } = makeProvider();
     const bigContent = "x".repeat(50_000);
@@ -109,21 +120,23 @@ describe("JiraProvider.fetchPlanningContext", () => {
         startAt: 0,
         maxResults: 100,
         total: 101,
+        // Page 1 is newest-first (orderBy=-created), so these have the newer dates.
         comments: Array.from({ length: 100 }, (_, i) => ({
           id: String(i),
           body: { type: "doc", version: 1, content: [] },
-          created: "2026-01-01T00:00:00Z",
+          created: "2026-06-02T00:00:00Z",
         })),
       })
       .mockResolvedValueOnce({
         startAt: 100,
         maxResults: 100,
         total: 101,
+        // Page 2 has the older comment (it was pushed off page 1 by newer ones).
         comments: [
           {
             id: "101",
             body: adfText("## 🗺 AI Planning: Implementation Map\n\nPage-two content"),
-            created: "2026-06-02T00:00:00Z",
+            created: "2026-01-01T00:00:00Z",
           },
         ],
       });
@@ -149,6 +162,12 @@ describe("JiraClient.listComments pagination", () => {
     const comments = await client.listComments("PROJ-1");
     expect(comments).toHaveLength(300);
     expect(spy).toHaveBeenCalledTimes(3);
+    // Each request must carry orderBy=-created so the client's first-encountered = newest.
+    expect(spy.mock.calls[0][1]).toContain("orderBy=-created");
+    // startAt must advance by the accumulated count, not by a fixed page size.
+    expect(spy.mock.calls[0][1]).toContain("startAt=0");
+    expect(spy.mock.calls[1][1]).toContain("startAt=100");
+    expect(spy.mock.calls[2][1]).toContain("startAt=200");
   });
 
   it("makes exactly one request when result fits in a single page", async () => {
@@ -167,5 +186,40 @@ describe("JiraClient.listComments pagination", () => {
     const comments = await client.listComments("PROJ-1");
     expect(comments).toHaveLength(3);
     expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][1]).toContain("orderBy=-created");
+    expect(spy.mock.calls[0][1]).toContain("startAt=0");
+    expect(spy.mock.calls[0][1]).toContain("maxResults=100");
+  });
+
+  it("advances startAt by actual comments returned when server caps maxResults", async () => {
+    const { client } = makeProvider();
+    const spy = vi.spyOn(client as any, "requestJson");
+    // Server honours orderBy=-created but caps maxResults at 50 despite 100 being requested.
+    spy
+      .mockResolvedValueOnce({
+        startAt: 0,
+        maxResults: 50,
+        total: 75,
+        comments: Array.from({ length: 50 }, (_, i) => ({
+          id: String(i),
+          body: { type: "doc", version: 1, content: [] },
+          created: "2026-06-02T00:00:00Z",
+        })),
+      })
+      .mockResolvedValueOnce({
+        startAt: 50,
+        maxResults: 50,
+        total: 75,
+        comments: Array.from({ length: 25 }, (_, i) => ({
+          id: String(50 + i),
+          body: { type: "doc", version: 1, content: [] },
+          created: "2026-01-01T00:00:00Z",
+        })),
+      });
+    const comments = await client.listComments("PROJ-1");
+    expect(comments).toHaveLength(75);
+    expect(spy).toHaveBeenCalledTimes(2);
+    // Second request must use 50 (actual count) as startAt, not 100 (requested page size).
+    expect(spy.mock.calls[1][1]).toContain("startAt=50");
   });
 });
