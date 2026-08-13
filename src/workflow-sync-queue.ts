@@ -1,6 +1,7 @@
 import { getDb } from "./dedup.js";
 import { getMappings } from "./config.js";
 import { syncWorkflowTemplates, classifySyncError, type WorkflowSyncResult, type ClassifiedSyncError } from "./workflow-sync.js";
+import { isDeployHeld } from "./deploy-hold.js";
 
 export type WorkflowSyncStatus = "pending" | "running" | "completed" | "failed";
 
@@ -82,6 +83,14 @@ export function getStaleRunningWorkflowSyncs(olderThanMs = STALE_RUNNING_MS, lim
   return rows.map(mapRow);
 }
 
+/** Rows the sync worker is actively processing. Queued ('pending') rows are durable and resume. */
+export function countRunningWorkflowSyncs(): number {
+  const row = getDb()
+    .prepare("SELECT COUNT(*) AS n FROM workflow_sync_queue WHERE status = 'running'")
+    .get() as { n: number };
+  return row.n;
+}
+
 export function updateWorkflowSyncStatus(
   id: number,
   status: WorkflowSyncStatus,
@@ -108,7 +117,13 @@ export async function runWorkflowSync(jobId: number, creds: WorkflowSyncCreds): 
   // A `running` row past the stale window is fair game (the safety net reclaims a crashed run).
   if (job.status === "running" && Date.now() - job.updatedAt < STALE_RUNNING_MS) return;
 
-  
+  // A deploy is waiting for work to drain; starting one here would block it on work it just created.
+  // The row stays 'pending', so the poll-loop safety net runs it once the hold clears.
+  if (isDeployHeld()) {
+    console.log(`[workflow-sync] Deferred sync #${jobId} — deploy in progress`);
+    return;
+  }
+
   updateWorkflowSyncStatus(jobId, "running");
 
   // Re-read the mapping at RUN time, not enqueue time: 
