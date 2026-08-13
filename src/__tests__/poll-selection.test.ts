@@ -376,6 +376,41 @@ describe("parseDeclaredFiles — inline Files: convention (planning template sha
   });
 });
 
+// AII-375: planning block fallback in the file-overlap guard.
+describe("selectFileOverlapDeferrals — planning block fallback", () => {
+  const PARENT = "FEAT-1";
+  const planningBlock = (files: string[]) =>
+    `<!-- ai-implement-planning\nv: 1\nfiles: ${JSON.stringify(files)}\nrisk: low\n-->`;
+
+  it("defers a prose-only candidate when its planning block overlaps an in-flight sibling", () => {
+    const candidate = makeFeatureIssue(
+      "c1", "AII-2", "AII", PARENT,
+      `Fix the widget.\n\n${planningBlock(["src/a.ts"])}`,
+    );
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].reason).toBe("file-overlap");
+    expect(blockers[0].issueId).toBe("c1");
+  });
+
+  it("fails open when the candidate has no declared files and no planning block", () => {
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "Prose only.");
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    expect(selectFileOverlapDeferrals([candidate], [sibling])).toHaveLength(0);
+  });
+
+  it("defers when the sibling uses only a planning block and files overlap", () => {
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
+    const sibling = makeFeatureIssue(
+      "s1", "AII-3", "AII", PARENT,
+      `Fix stuff.\n\n${planningBlock(["src/a.ts"])}`,
+    );
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling]);
+    expect(blockers).toHaveLength(1);
+  });
+});
+
 // PR #202 review finding #1 (admin-side remnant): the shared cache resolves in-flight
 // siblings identically for the poll loop and the admin blockers preview.
 describe("shared seen-candidates cache (rememberCandidates / resolveInFlightSiblings)", () => {

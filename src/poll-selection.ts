@@ -1,5 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue } from "./providers/types.js";
+import { parsePlanningBlock } from "./planning-block.js";
 
 export interface Blocker {
   issueId: string;
@@ -67,6 +68,16 @@ export function resetSeenCandidates(): void {
 const groupingBranchOf = (i: TicketIssue) =>
   i.featureBranchChain?.length ? i.featureBranchChain[i.featureBranchChain.length - 1] : null;
 
+// When the issue body has no parseable file bullets, fall back to the planning
+// block that planning runs stamp into the body. Keeps fail-open when both are empty.
+function resolveIssueFiles(description: string | null): Set<string> {
+  const declared = parseDeclaredFiles(description);
+  if (declared.size > 0 || !description) return declared;
+  const block = parsePlanningBlock(description);
+  if (block && block.files.length > 0) return new Set(block.files);
+  return declared;
+}
+
 /** Fail-open guard: defer candidates whose declared files intersect an in-flight sibling's
  *  (same last grouping-branch entry). Candidates with no declared files never defer. */
 /** Fail-open guard: defer candidates whose declared files intersect an IN-FLIGHT
@@ -87,7 +98,7 @@ export function selectFileOverlapDeferrals(
   const claim = (issue: TicketIssue) => {
     const b = groupingBranchOf(issue);
     if (!b) return;
-    const files = parseDeclaredFiles(issue.description);
+    const files = resolveIssueFiles(issue.description);
     if (files.size === 0) return;
     const m = claims.get(branchKey(b)) ?? new Map<string, string>();
     for (const f of files) if (!m.has(f)) m.set(f, issue.identifier);
@@ -99,7 +110,7 @@ export function selectFileOverlapDeferrals(
   for (const c of ordered) {
     const branch = groupingBranchOf(c);
     if (!branch) continue;
-    const mine = parseDeclaredFiles(c.description);
+    const mine = resolveIssueFiles(c.description);
     if (mine.size === 0) continue;
     const m = claims.get(branchKey(branch));
     const shared = m ? [...mine].filter((f) => m.has(f)) : [];

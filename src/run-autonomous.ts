@@ -15,7 +15,8 @@ import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
-import { writeRunAutopsy } from "./run-autopsy.js";
+import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
+import { parsePlanningBlock } from "./planning-block.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -51,6 +52,15 @@ function currentGitBranch(workspaceDir: string): string | null {
   if (result.status !== 0) return null;
   const branch = result.stdout.toString().trim();
   return branch || null;
+}
+
+function getCommittedFiles(workspaceDir: string, baseBranch: string): string[] {
+  const result = spawnSync("git", ["diff", "--name-only", baseBranch, "HEAD"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0) return [];
+  return result.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
 }
 
 function resolveBranch(workspaceDir: string, baseBranch?: string, prNumber?: string): string {
@@ -517,6 +527,18 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // push because Claude commits and pushes to the existing PR branch itself. An
     // approved gap-fill without a prUrl is therefore a success, not REVIEW_UNAPPROVED.
     if (approved && (prUrl || prNumber)) {
+      const statPasses = Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [];
+      const planningBlock = parsePlanningBlock(planningContext);
+      // For new runs prUrl is set and branch is the base — compare committed diff.
+      // For gap-fill runs (prNumber only) branch equals the PR branch, so the diff
+      // is empty; we skip the comparison rather than produce misleading output.
+      const filesChanged = prUrl ? getCommittedFiles(workspaceDir, branch) : [];
+      writeRunStats(workspaceDir, {
+        issueIdentifier,
+        passes: statPasses,
+        plannedFiles: planningBlock?.files ?? [],
+        filesChanged,
+      });
       const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?";
       disposition = prUrl
         ? `PR ${prUrl} (approved after ${iterations} iteration(s))`
