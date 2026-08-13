@@ -218,6 +218,29 @@ describe("GET /api/parked", () => {
     expect(rows[0].repo).toBeNull();
   });
 
+  it("returns two rows for an issue parked in both planning and implementation phases", async () => {
+    const token = await login();
+
+    log.appendLog({ issueId: "issue-multi", issueIdentifier: "AII-200", repo: "org/repo", phase: "planning" });
+    log.appendLog({ issueId: "issue-multi", issueIdentifier: "AII-200", repo: "org/repo", phase: "implementation" });
+
+    // Park in planning phase
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "planning", "DISPATCH_FAILED");
+    // Park in implementation phase
+    for (let i = 0; i < 3; i++) breaker.recordDispatchFailure("issue-multi", "implementation", "MAX_TURNS_EXHAUSTED");
+
+    const res = await makeRequest("/api/parked", "GET", token);
+    expect(res.statusCode).toBe(200);
+    const rows = JSON.parse(res.body) as Array<{ issueId: string; phase: string; lastConclusion: string | null }>;
+    expect(rows).toHaveLength(2);
+    const phases = rows.map((r) => r.phase).sort();
+    expect(phases).toEqual(["implementation", "planning"]);
+    const planningRow = rows.find((r) => r.phase === "planning");
+    const implRow = rows.find((r) => r.phase === "implementation");
+    expect(planningRow?.lastConclusion).toBe("DISPATCH_FAILED");
+    expect(implRow?.lastConclusion).toBe("MAX_TURNS_EXHAUSTED");
+  });
+
   it("returns all parked issues and excludes unparked ones", async () => {
     const token = await login();
     parkIssue("issue-still-parked");

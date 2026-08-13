@@ -402,6 +402,32 @@ export function getLatestDispatchForPr(owner: string, repo: string, prNumber: nu
 }
 
 /**
+ * Returns the latest identifier, title, and repo recorded in dispatch_log for a
+ * given issue+phase, or null fields when no log entry exists. Used to enrich
+ * parked-issue rows whose metadata lives only in dispatch_log.
+ */
+export function getIssueEnrichment(
+  issueId: string,
+  phase: string,
+): { issueIdentifier: string | null; issueTitle: string | null; repo: string | null } {
+  const row = getDb()
+    .prepare(
+      `SELECT issue_identifier, issue_title, repo
+       FROM dispatch_log
+       WHERE issue_id = ? AND phase = ?
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(issueId, phase) as
+    | { issue_identifier: string | null; issue_title: string | null; repo: string | null }
+    | undefined;
+  return {
+    issueIdentifier: row?.issue_identifier ?? null,
+    issueTitle: row?.issue_title ?? null,
+    repo: row?.repo ?? null,
+  };
+}
+
+/**
  * Returns GitHub Actions run URLs for the most recent failed/timed-out jobs for
  * an issue+phase. Fly Machines and local-Docker jobs are excluded (no stable URL).
  * Used by the dispatch-breaker trip comment.
