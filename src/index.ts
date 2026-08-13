@@ -15,6 +15,7 @@ import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, se
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, type SelfDeployTarget } from "./deploy-availability.js";
+import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -277,6 +278,9 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       console.error("[deploy] availability check failed:", err);
     }
   }
+  // Read once for the surfaces this poll owns, so they agree even if the hold is set part-way through a tick.
+  // runWorkflowSync reads it independently — the admin fire-immediately path has no tick to share.
+  const deployHeld = isDeployHeld();
 
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
@@ -423,12 +427,21 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       return isAlreadyDispatched(issueId) || inFlightIssueIds.has(issueId) || isParked(issueId, phase);
     };
 
-    const toProcess = selectIssuesToDispatch(
-      allCandidates,
-      teamRepoMap,
-      inProgressCountsByTeam,
-      isDispatchBlocked,
-    );
+    // A deploy is holding new work back. Skipping selection cannot lose work:
+    // selectIssuesToDispatch is pure, and markDispatched runs only after a
+    // successful dispatch — so every candidate stays queued with dedup untouched.
+    if (deployHeld && allCandidates.length > 0) {
+      console.log(`[deploy] Dispatch paused — ${allCandidates.length} candidate(s) stay queued`);
+    }
+
+    const toProcess = deployHeld
+      ? []
+      : selectIssuesToDispatch(
+          allCandidates,
+          teamRepoMap,
+          inProgressCountsByTeam,
+          isDispatchBlocked,
+        );
 
     // AII-278 Finding 3: in-flight issues carry AI-Working and drop OUT of the
     // candidate snapshot, so filtering allCandidates made the in-flight set
@@ -581,32 +594,38 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // Process any pending reconciliation jobs triggered by merged PRs
   await processReconciliations(config, registry);
 
-  // Process pending late review feedback that arrived after the original run.
-  await processReviewFixQueue(config);
+  // Both of these launch runner jobs, so they pause with issue dispatch —
+  // otherwise the hold would block on work it is itself still creating.
+  if (deployHeld) {
+    console.log("[deploy] Review-fix and gap-fill drains paused. self-deployment in progress");
+  } else {
+    // Process pending late review feedback that arrived after the original run.
+    await processReviewFixQueue(config);
 
-  // Drain orchestrator-mediated /ai-implement comment gap-fills.
-  await drainCommentGapfillQueue({
-    getMappings,
-    runnerMode: getRunnerMode().mode,
-    notifyType: config.notifyType,
-    notifyWebhookUrl: config.notifyWebhookUrl,
-    runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
-    runnerTokenSecret: config.runnerTokenSecret,
-    getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
-    resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
-    checkContract: (params) => resolveWorkflowContract(params),
-    dispatch: dispatchWorkflow,
-    postComment: postPrComment,
-    onDispatchFailure: surfaceDispatchFailure,
-    flySessionsToken: config.flySessionsToken,
-    flySessionsApp: config.flySessionsApp,
-    flySessionsRegion: config.flySessionsRegion,
-    flyOrchestratorApp: config.flyOrchestratorApp,
-    tenantId: config.tenantId,
-    anthropicApiKey: config.anthropicApiKey,
-    claudeOAuthToken: config.claudeOAuthToken,
-    sessionImage: config.sessionImage,
-  });
+    // Drain orchestrator-mediated /ai-implement comment gap-fills.
+    await drainCommentGapfillQueue({
+      getMappings,
+      runnerMode: getRunnerMode().mode,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+      runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+      runnerTokenSecret: config.runnerTokenSecret,
+      getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
+      checkContract: (params) => resolveWorkflowContract(params),
+      dispatch: dispatchWorkflow,
+      postComment: postPrComment,
+      onDispatchFailure: surfaceDispatchFailure,
+      flySessionsToken: config.flySessionsToken,
+      flySessionsApp: config.flySessionsApp,
+      flySessionsRegion: config.flySessionsRegion,
+      flyOrchestratorApp: config.flyOrchestratorApp,
+      tenantId: config.tenantId,
+      anthropicApiKey: config.anthropicApiKey,
+      claudeOAuthToken: config.claudeOAuthToken,
+      sessionImage: config.sessionImage,
+    });
+  }
 
   // Crash-recovery safety net for workflow syncs. (NOT the primary trigger. the admin handlers fire runWorkflowSync immediately on save) 
   // this only re-runs jobs that lost their runner to a restart or a wedge.
@@ -3125,6 +3144,11 @@ async function main(): Promise<void> {
   initReconciliationTable();
   initStepLogTable();
   initMcpOAuthTables();
+
+  // A process that died mid-deploy must not leave dispatch paused forever.
+  if (clearDeployHold()) {
+    console.warn("[main] Cleared a hold left by the previous deployment process, resuming paused dispatches...");
+  }
 
   const config = loadConfig();
 
