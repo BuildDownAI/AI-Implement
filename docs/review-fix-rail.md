@@ -23,7 +23,7 @@ The post-run half is **entirely webhook-driven**. Three GitHub event subscriptio
 |-------|------|-------------|
 | `pull_request_review` | `action=submitted` **and** `state=CHANGES_REQUESTED` | `github-review`, severity `blocking` |
 | `pull_request_review_comment` | `action=created` | `github-review-thread`, severity `medium` |
-| `issue_comment` | author is a trusted reviewer bot **and** the body has extractable blocking findings | `claude-review-summary`, severity `blocking` |
+| `issue_comment` | author's `user.type == "Bot"` **and** the body contains a `<!-- claude-review-verdict {...} -->` marker | `claude-review-summary`, severity `blocking` or `minor` |
 
 `GITHUB_WEBHOOK_SECRET` must be set, and deliveries are rejected 401 on an invalid signature. Note that `pull_request` and `issue_comment` are already needed for merge reconciliation and `/ai-implement` handling respectively — the two review events are the ones easily missed.
 
