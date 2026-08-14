@@ -13,14 +13,6 @@ on:
   issue_comment:
     types: [created]
 
-# Collapse rapid push bursts: cancel the superseded run and review the settled head.
-# Group covers both PR events (pull_request.number) and comment-triggered re-runs
-# (issue.number). The fallback keeps the expression valid for neither-event contexts,
-# though in practice one of the two is always set.
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
   pull-requests: write
@@ -29,11 +21,10 @@ permissions:
 
 jobs:
   claude-review:
-    # Auto-run on same-repo PRs (opened/ready_for_review/synchronize). The top-level
-    # concurrency group cancels superseded runs on rapid pushes, so cost stays roughly
-    # "one review per quiet period". For fork PRs and re-runs, a maintainer must post
-    # `/claude-review` as a comment — forks must not auto-run on synchronize because
-    # pull_request_target has repository-secret access and that would be a priv-esc vector.
+    # Auto-run on same-repo PRs (opened/ready_for_review/synchronize). For fork PRs and
+    # re-runs, a maintainer must post `/claude-review` as a comment — forks must not
+    # auto-run on synchronize because pull_request_target has repository-secret access
+    # and that would be a priv-esc vector.
     if: |
       (github.event_name == 'pull_request_target' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
@@ -44,6 +35,17 @@ jobs:
        (github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'COLLABORATOR'))
+    # Collapse rapid push bursts: cancel the superseded run and review the settled head.
+    # This MUST stay at job level, not workflow level. A workflow-level group is claimed
+    # the moment a run is created — before `if:` is evaluated — so any issue_comment (not
+    # just `/claude-review`), or a synchronize push to a draft PR, would cancel an
+    # in-flight legitimate review and then skip its own job. The killed review leaves no
+    # verdict, which the post-push gate correctly refuses, which resolves to
+    # review_failed and counts toward the dispatch breaker. At job level the group is
+    # only claimed once `if:` passes, so a skipped job cancels nothing.
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - name: Resolve PR head SHA
