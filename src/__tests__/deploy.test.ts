@@ -139,6 +139,29 @@ describe("makeStartDeploy", () => {
       expect(deploy.makeStartDeploy({ ...configured, [field]: null })).toBeUndefined();
     },
   );
+
+  it("refuses while a deploy already holds, before reaching the network", async () => {
+    const { initSettingsTable } = await import("../runner-mode.js");
+    const { setDeployHold } = await import("../deploy-hold.js");
+    const { closeDb } = await import("../dedup.js");
+    initSettingsTable();
+    setDeployHold();
+
+    // Asserting that nothing is fetched is the point: it is the only observable
+    // difference between claiming the hold before the awaits and after them, and the
+    // "after" ordering is the one that lets two triggers both start a deploy.
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    try {
+      const start = deploy.makeStartDeploy(configured)!;
+      await expect(start()).resolves.toEqual({ started: false, reason: "deploy-in-progress" });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      closeDb();
+    }
+  });
 });
 
 describe("resolveFlyctl", () => {

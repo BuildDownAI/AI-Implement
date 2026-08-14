@@ -72,7 +72,7 @@ const DRAIN_TIMEOUT_MS = 75 * 60 * 1000;
  * Builds and releases a new version of this orchestrator.
 *
 * On success this never returns: the release replaces the machine, so the process is
-* SIGTERMed inside the flyctl await and no catch or finally runs. The hold is
+* SIGINTed inside the flyctl await and no catch or finally runs. The hold is
 * therefore released at boot, not here. Only a failure — which happens before the
 * machine is touched — comes back to this function.
 */
@@ -120,6 +120,12 @@ export async function runDeploy(input: RunDeployInput): Promise<void> {
         timeoutMs: DEPLOY_TIMEOUT_MS,
       },
     );
+    
+    // Reached only when the release did not replace its own process: a different app, or a local run.
+    // A self-deploy is SIGINTed inside the await above and relies on the
+    // boot clear instead — which is why this cannot be a finally.
+    console.log(`[deploy] ${app} released; this process was not replaced`);
+    clearDeployHold();
   } catch (err) {
     clearDeployHold();
     throw err;
@@ -327,16 +333,21 @@ export function makeStartDeploy(
   const flyDeployToken = config.flyDeployToken;
 
   return async () => {
+    // Claim before any await: the check and the set have to be atomic. With the awaits
+    // below sitting between them, two triggers arriving together would both pass the
+    // check, and the loser's cleanup would clear the hold out from under the winner.
+    if (isDeployHeld()) return { started: false, reason: "deploy-in-progress" };
+    setDeployHold();
+
     const source = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, target.owner, {
       permissions: { contents: "read" },
       repositories: [target.repo],
     });
     const head = await getBranchSha(source.token, target.owner, target.repo, target.branch);
-    if (!head) return { started: false, reason: "head-unknown" };
-
-    // No await between this check and the call below: runDeploy sets the hold
-    // synchronously before its first await, so a second request cannot slip past.
-    if (isDeployHeld()) return { started: false, reason: "deploy-in-progress" };
+    if (!head) {
+      clearDeployHold();
+      return { started: false, reason: "head-unknown" };
+    }
 
     void runDeploy({
       app,

@@ -30,6 +30,17 @@ The endpoint requires **both** `KG_SIDECAR_URL` and `OAUTH_REDIRECT_BASE_URL`. M
 
 The knowledge-graph repository is private. A **BuildKit build secret** mounts a GitHub token for exactly one `RUN` layer to clone it; the token is never written to `ARG`, `ENV`, or image history.
 
+**Where that token comes from is an operational prerequisite, not a detail.** A self-deploy mints it from the GitHub App installation, scoped to the knowledge-graph repository alone with `contents: read` — which only works if that repository is part of the installation. The installation grants selected repositories rather than the whole organisation, so it has to be added deliberately. Without it the mint fails with a 422 naming an inaccessible repository, before any build starts; the deploy reports a failure rather than shipping a sidecar-less image, which is the one good thing about failing this early. A manual deploy sidesteps the question entirely by passing an operator's own token.
+
+That requirement is a consequence of automating the deploy, and it is worth understanding rather than working around. The operator script that preceded self-deploy cloned the repository with `gh auth token` — a *human's* credential, which reached the repository because that human could. An orchestrator has no human behind it; its only GitHub identity is the App installation, so access that used to be ambient has to be granted explicitly. The gap was always there, and borrowing a person's credentials merely hid it.
+
+**Changing this is a deliberate decision, not a configuration tweak.** Two alternatives exist, and both cost something the current shape does not:
+
+- **A read-only deploy key** on the knowledge-graph repository. The narrowest option — nothing else gains access — but it adds a secret to store and rotate, needs one per fork, and the clone would have to move from HTTPS to SSH.
+- **A personal access token.** Works immediately and widens nothing at the installation, but reintroduces a person-shaped credential that leaves when they do, which is the property automating the script was meant to remove.
+
+The App installation was chosen because it adds no new secret and keeps the per-deploy token scoped to a single repository. Its cost is that installation-*wide* tokens — the dependency-token vending path mints one — now reach the knowledge-graph repository too. That is bounded: the setting defaults to off per project, and a per-project repository list is already planned to replace the all-or-nothing scope. Revisit this if that plan changes.
+
 The mount is declared `required=false`, so a build with no secret still succeeds — it logs `[kg] sidecar-less build` and produces a working orchestrator without `/mcp`. That fail-soft behaviour is deliberate, and it is also the trap described below.
 
 ### The four build stages
