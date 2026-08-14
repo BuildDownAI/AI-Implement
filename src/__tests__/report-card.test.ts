@@ -561,10 +561,12 @@ describe("getFleetReport", () => {
       insertDispatch({ issueId: "fa", issueIdentifier: "AII-FA", repo: "org/rfail", status: "failed" });
       insertDispatch({ issueId: "fb", issueIdentifier: "AII-FB", repo: "org/rfail", status: "review_failed" });
       insertDispatch({ issueId: "fc", issueIdentifier: "AII-FC", repo: "org/rfail", status: "timed_out" });
+      insertDispatch({ issueId: "fd", issueIdentifier: "AII-FD", repo: "org/rfail", status: "review_failed" });
 
       const report = rc.getFleetReport({ days: 365 });
       const r = report.byRepo.find((x) => x.repo === "org/rfail");
-      expect(r!.failed).toBe(2);
+      // failed(1) + review_failed(2) = 3; timed_out must not be counted
+      expect(r!.failed).toBe(3);
     });
   });
 

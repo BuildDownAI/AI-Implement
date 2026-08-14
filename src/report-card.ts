@@ -149,14 +149,14 @@ function statsFromSubSteps(db: Db, jobId: number): DerivedRunStats {
   let maxTurnsHits = 0;
   for (const row of rows) {
     try {
-      if (row.step_type === "review") {
+      if (row.step_type === "implement") {
         iterations++;
-        approved = (JSON.parse(row.outputs_json) as ReviewOutputs).approved ?? false;
-      } else {
         const out = JSON.parse(row.outputs_json) as ImplementOutputs;
         const c = out.telemetry?.costUsd;
         if (c != null) costUsd = (costUsd ?? 0) + c;
         if (out.telemetry?.outcome === "max_turns") maxTurnsHits++;
+      } else {
+        approved = (JSON.parse(row.outputs_json) as ReviewOutputs).approved ?? false;
       }
     } catch { /* malformed JSON */ }
   }
@@ -169,7 +169,10 @@ function derivedStatsForJob(db: Db, jobId: number): DerivedRunStats {
     flRow = db
       .prepare(
         `SELECT outputs_json FROM step_log
-         WHERE job_id = ? AND step_id = 'feedback-loop' LIMIT 1`,
+         WHERE job_id = ? AND step_id = 'feedback-loop'
+           AND outputs_json != '{}'
+           AND json_extract(outputs_json, '$.iterations') IS NOT NULL
+         LIMIT 1`,
       )
       .get(jobId) as typeof flRow;
   } catch { /* step_log may not exist */ }
@@ -364,12 +367,12 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
   let costUsd: number | null = null;
   for (const row of rows) {
     try {
-      if (row.step_type === "review") {
+      if (row.step_type === "implement") {
         iterations++;
-        lastApproved = (JSON.parse(row.outputs_json) as ReviewOutputs).approved ?? false;
-      } else {
         const c = (JSON.parse(row.outputs_json) as ImplementOutputs).telemetry?.costUsd;
         if (c != null) costUsd = (costUsd ?? 0) + c;
+      } else {
+        lastApproved = (JSON.parse(row.outputs_json) as ReviewOutputs).approved ?? false;
       }
     } catch { /* skip */ }
   }
@@ -451,6 +454,7 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
          WHERE dl.dispatched_at >= ?
            AND dl.repo IS NOT NULL AND dl.repo NOT LIKE 'test-org/%'
            AND dl.issue_identifier IS NOT NULL
+           AND dl.phase != 'planning'
            AND EXISTS (
              SELECT 1 FROM reconciliation_queue rq
              WHERE rq.issue_identifier = dl.issue_identifier
