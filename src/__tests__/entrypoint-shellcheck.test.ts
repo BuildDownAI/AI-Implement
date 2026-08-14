@@ -217,20 +217,11 @@ describe("session/entrypoint.sh", () => {
   it("passes shellcheck for every deploy-critical entrypoint", () => {
     const r = spawnSync(
       "shellcheck",
-      ["session/entrypoint.sh", "docker-entrypoint.sh", "scripts/deploy-orchestrator.sh"],
+      ["session/entrypoint.sh", "docker-entrypoint.sh"],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
     expect(r.status, r.stderr?.toString()).toBe(0);
-  });
-
-  it("requires an explicit Fly app before deploy tooling runs", () => {
-    const r = spawnSync("/bin/bash", ["scripts/deploy-orchestrator.sh"], {
-      encoding: "utf8",
-      env: { ...process.env, PATH: "" },
-    });
-    expect(r.status).toBe(64);
-    expect(r.stderr).toContain("explicit Fly app is required");
   });
 
   it("is under 115 lines (bootstrap, not monolith)", () => {

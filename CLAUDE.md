@@ -87,7 +87,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
-| Deploying, clients, Bedrock | `scripts/deploy-orchestrator.sh` | [docs/deployment.md](docs/deployment.md) |
+| Deploying, clients, Bedrock | `src/deploy.ts` | [docs/deployment.md](docs/deployment.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
 | Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | |
@@ -160,6 +160,7 @@ Only the non-obvious ones are worth restating:
 - `KG_SIDECAR_URL` — unset gives `/mcp` a 503, **and so does an unset `OAUTH_REDIRECT_BASE_URL`**. The two failures look identical from outside.
 - `AI_IMPLEMENT_LOG_LEVEL`, `AI_IMPLEMENT_RUNNER_LABEL`, `AI_IMPLEMENT_PROVIDER` — repo/org **Actions variables**, not orchestrator env, and effective only after the target repo re-syncs `claude-implement.yml`. `LOG_LEVEL` is `summary` (one result line per invocation — outcome, turns, duration, cost, tokens) or `stream` (additionally tees each tool call, not its output); telemetry is captured at both. `RUNNER_LABEL` overrides `runs-on`, default `ubuntu-latest` — pointing it at a larger runner roughly halves the CPU-bound implement job, but **write access to that variable lets the holder retarget the job to an arbitrary self-hosted runner that would then see the job's secrets.**
 - `AI_IMPLEMENT_SOURCE_COMMIT` / `_REPO` / `_BRANCH` — **stamped by the image build, not set by an operator** (`Dockerfile` build args). Self-deploy compares the stamp against the branch head, so an image built without all three goes inert and reports availability as *unknown*, never as up to date — a hand-run `fly deploy` that omits them silently disables the feature. No webhook or inbound reachability is needed; those only cut detection latency from one poll cycle to seconds.
+- `FLY_DEPLOY_TOKEN` — the orchestrator's own deploy credential, distinct from `FLY_SESSIONS_TOKEN`, which is scoped to the sessions app and cannot deploy the orchestrator. Scope it to the single app it deploys. The app name needs no variable: Fly injects `FLY_APP_NAME` into every machine, so an orchestrator can only ever deploy itself.
 
 Adding or renaming a variable means updating `.env.example` in the same change; it is the operator's only discovery surface.
 

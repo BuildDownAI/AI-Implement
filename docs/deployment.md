@@ -2,22 +2,75 @@
 
 How an orchestrator instance gets deployed, how a new client instance is stood up, and how to point a target repo at AWS Bedrock.
 
-Reference for `scripts/deploy-orchestrator.sh`, `scripts/provision-client.sh`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
+Reference for `src/deploy.ts`, `scripts/provision-client.sh`, `clients/`, `.github/workflows/deploy-clients.yml`, and the Bedrock path in the synced workflows. `CLAUDE.md` carries the summary and points here.
 
 ## Deploy paths
 
 Three ways an orchestrator gets deployed, in descending order of how often they are actually used.
 
-### The wrapper script — the standard command
+### Self-deploy — the standard path
+
+The orchestrator builds and releases its own next version. Trigger one from an authenticated admin session:
 
 ```bash
-./scripts/deploy-orchestrator.sh ai-implement-testing-orchestrator
-./scripts/deploy-orchestrator.sh <other-app-name>
+# A session token comes from POST /api/auth with the access code, or from the
+# session cookie an SSO sign-in already set in the browser.
+curl -X POST https://<app-name>.fly.dev/api/deploy -H "Authorization: Bearer <session-token>"
 ```
 
-This is the correct command for any orchestrator carrying the KG sidecar, which is all of them. It encodes the build secret, `--no-cache`, and an exported `GH_TOKEN`, then asserts the deployed `/mcp` answers 401 before exiting.
+| Response | Meaning |
+|---|---|
+| `202 {"deploying":"<sha>"}` | Accepted. The deploy has started, not finished. |
+| `409 deploy-in-progress` | A deploy is already running. |
+| `503 head-unknown` | The watched branch's HEAD could not be read. |
+| `501` | This orchestrator is not configured to deploy itself. |
 
-**The app name is required** — the script exits 64 with a usage message when it is missing, rather than falling back to a default. That is deliberate: a default would let a fork deploy itself over the upstream app. **A plain `fly deploy` silently ships a sidecar-less image** — see [kg-sidecar.md](kg-sidecar.md) for why each flag is load-bearing.
+It pauses dispatch, waits for in-flight work to drain, fetches the source at the branch HEAD, builds with the sidecar secret and the source stamps, then releases. **The release replaces the machine running the deploy**, so the process is killed partway through and the 202 is the last thing it can tell you. Nothing checks the result afterwards — confirm it yourself with the `/mcp` probe below.
+
+Four things must be true, and they are not all reported the same way:
+
+- **`FLY_DEPLOY_TOKEN`** is set, scoped to this app. `FLY_SESSIONS_TOKEN` is a different credential and cannot deploy the orchestrator.
+- **The running image carries its source stamps.** `AI_IMPLEMENT_SOURCE_REPO` (as `owner/repo`) and `AI_IMPLEMENT_SOURCE_BRANCH` are both required; an image built without them cannot self-deploy at all. `AI_IMPLEMENT_SOURCE_COMMIT` is not required — without it a deploy still runs, but availability reports *unknown* rather than telling you a new version exists.
+- **An admin auth method is configured** — SSO providers or `ADMIN_ACCESS_CODE`. Every `/api/` route answers 503 otherwise, this one included.
+- **The GitHub App installation can read this repository and the KG repository.** Both tokens are minted from it, each scoped to one repo with `contents: read`.
+
+The first two and the app name collapse into a single `501`, which says the orchestrator cannot deploy itself without saying which piece is missing. The third is a different 503, raised at the `/api/` gate before this route is reached. The fourth is **not checked up front** — a token that cannot read a repository surfaces as a failed build, after the hold has already been taken and released.
+
+The app it deploys is never configured: Fly injects `FLY_APP_NAME` into every machine, so an orchestrator can only ever deploy itself.
+
+### Manual deploy — cold start and recovery
+
+Needed whenever there is no working orchestrator to ask: a brand-new app, an image that will not boot, or a release that broke the deploy path itself. This is the path that has to keep working when everything else does not.
+
+```bash
+# Exported, not inlined — an inline `GH_TOKEN=... fly deploy ... "$GH_TOKEN"` prefix
+# does not affect same-line expansion and passes an empty secret.
+export GH_TOKEN="$(gh auth token)"
+
+fly deploy --remote-only --no-cache \
+    --build-secret kg_token="$GH_TOKEN" \
+    --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg SOURCE_REPO=BuildDownAI/AI-Implement \
+    --build-arg SOURCE_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+    --app <app-name>
+```
+
+Then confirm the release actually serves, because booting is not serving:
+
+```bash
+curl -s -w '\n%{http_code}\n' -X POST https://<app-name>.fly.dev/mcp -d '{}'
+```
+
+**401 is success** — alive and OAuth-gated. **503 means it is not serving**, from either a sidecar-less image or an unset `OAUTH_REDIRECT_BASE_URL`. The two are indistinguishable by status, which is why the body is worth printing: it names the one that fired.
+
+Every flag above is load-bearing, and each was learned from a silently degraded deploy:
+
+- **`--build-secret`** — the KG is cloned at build time through it. Without it the build fail-softs to a sidecar-less image and reports success.
+- **`--no-cache`** — a build secret is not part of the layer cache key, so a repeat deploy otherwise reuses a stale, possibly sidecar-less clone layer even when the secret is present.
+- **`--build-arg SOURCE_*`** — the stamps. Omit `SOURCE_REPO` or `SOURCE_BRANCH` and the image you just deployed cannot deploy itself, which is how a manual recovery quietly disables the automatic path.
+- **`--app`** — always explicit. A default would let a fork deploy itself over the upstream app.
+
+Substitute your own `SOURCE_REPO` when deploying a fork; it must be `owner/repo`, and a malformed value logs a warning and disables self-deploy on the resulting image.
 
 ### Fly's native GitHub integration
 
@@ -28,15 +81,7 @@ A Fly app can watch a branch and deploy on push, with no workflow involved. Fly 
 - **Attaching does not itself deploy.** The first deploy happens on the next push to the watched branch.
 - **The release `USER` field shows the connecting account even for integration deploys**, so it cannot distinguish an automated deploy from a manual one. Correlate by timestamp instead.
 
-Note the interaction with the sidecar: an integration deploy does not pass the KG build secret, so it produces a sidecar-less image unless the secret is configured in that build path.
-
-### Manual fallback
-
-```bash
-flyctl deploy --remote-only --app <app-name>
-```
-
-Works from any logged-in checkout. Same sidecar caveat as above.
+**This path cannot carry the sidecar, and that is why self-deploy exists.** An integration deploy has no hook for a BuildKit build secret — no pre-deploy command, nowhere to pass `--build-secret`, no `fly.toml` key for one — so every push-triggered release ships a sidecar-less image whose `/mcp` answers 503, silently overwriting a good manual deploy. Leaving auto-deploy enabled on an app that serves `/mcp` will undo a working deploy on the next merge.
 
 ## Client instances
 

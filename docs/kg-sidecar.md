@@ -2,7 +2,7 @@
 
 The orchestrator bundles a Python knowledge-graph sidecar that serves `kg_*` tools, and exposes them to MCP clients through an OAuth-authenticated proxy at `/mcp`. This covers the deploy shape, how the image is built, the OAuth flow, and the ways a deploy can ship without a working sidecar.
 
-Reference for `docker-entrypoint.sh`, the KG stages of `Dockerfile`, `src/mcp.ts`, `src/mcp-oauth.ts`, and `scripts/deploy-orchestrator.sh`. `CLAUDE.md` carries the summary and points here.
+Reference for `docker-entrypoint.sh`, the KG stages of `Dockerfile`, `src/mcp.ts`, `src/mcp-oauth.ts`, and `src/deploy.ts`. `CLAUDE.md` carries the summary and points here.
 
 ## Deploy shape
 
@@ -30,6 +30,17 @@ The endpoint requires **both** `KG_SIDECAR_URL` and `OAUTH_REDIRECT_BASE_URL`. M
 
 The knowledge-graph repository is private. A **BuildKit build secret** mounts a GitHub token for exactly one `RUN` layer to clone it; the token is never written to `ARG`, `ENV`, or image history.
 
+**Where that token comes from is an operational prerequisite, not a detail.** A self-deploy mints it from the GitHub App installation, scoped to the knowledge-graph repository alone with `contents: read` — which only works if that repository is part of the installation. The installation grants selected repositories rather than the whole organisation, so it has to be added deliberately. Without it the mint fails with a 422 naming an inaccessible repository, before any build starts; the deploy reports a failure rather than shipping a sidecar-less image, which is the one good thing about failing this early. A manual deploy sidesteps the question entirely by passing an operator's own token.
+
+That requirement is a consequence of automating the deploy, and it is worth understanding rather than working around. The operator script that preceded self-deploy cloned the repository with `gh auth token` — a *human's* credential, which reached the repository because that human could. An orchestrator has no human behind it; its only GitHub identity is the App installation, so access that used to be ambient has to be granted explicitly. The gap was always there, and borrowing a person's credentials merely hid it.
+
+**Changing this is a deliberate decision, not a configuration tweak.** Two alternatives exist, and both cost something the current shape does not:
+
+- **A read-only deploy key** on the knowledge-graph repository. The narrowest option — nothing else gains access — but it adds a secret to store and rotate, needs one per fork, and the clone would have to move from HTTPS to SSH.
+- **A personal access token.** Works immediately and widens nothing at the installation, but reintroduces a person-shaped credential that leaves when they do, which is the property automating the script was meant to remove.
+
+The App installation was chosen because it adds no new secret and keeps the per-deploy token scoped to a single repository. Its cost is that installation-*wide* tokens — the dependency-token vending path mints one — now reach the knowledge-graph repository too. That is bounded: the setting defaults to off per project, and a per-project repository list is already planned to replace the all-or-nothing scope. Revisit this if that plan changes.
+
 The mount is declared `required=false`, so a build with no secret still succeeds — it logs `[kg] sidecar-less build` and produces a working orchestrator without `/mcp`. That fail-soft behaviour is deliberate, and it is also the trap described below.
 
 ### The four build stages
@@ -53,20 +64,17 @@ The container runs as the unprivileged `node` user.
 
 ## Deploying
 
-**Always use the wrapper script.** A plain `fly deploy` silently produces a sidecar-less image:
+**A plain `fly deploy` silently produces a sidecar-less image.** Deploy through the orchestrator itself, or with the manual command in [deployment.md](deployment.md#deploy-paths) when there is no orchestrator to ask.
 
-```bash
-./scripts/deploy-orchestrator.sh ai-implement-testing-orchestrator
-./scripts/deploy-orchestrator.sh <other-app-name>
-```
-
-The script exists because three separate mistakes each produce a silently degraded deploy, and this has happened repeatedly:
+Three separate mistakes each produce a silently degraded deploy, and each has happened repeatedly:
 
 - **The build secret is required for the clone.** Without it the build fail-softs to a sidecar-less image rather than failing.
 - **`--no-cache` is required.** A build secret is not part of the layer cache key, so a repeat deploy otherwise reuses a stale — possibly sidecar-less — clone layer even when the secret is present.
-- **`GH_TOKEN` must be exported.** An inline `GH_TOKEN=... fly deploy ... "$GH_TOKEN"` prefix does not affect same-line expansion and passes an empty secret.
+- **The token must be exported, not inlined.** An inline `GH_TOKEN=... fly deploy ... "$GH_TOKEN"` prefix does not affect same-line expansion and passes an empty secret.
 
-The script ends by polling `/mcp` until it answers **401**, and exits non-zero otherwise. A deploy that ships without a working sidecar fails loudly instead of being discovered days later.
+Self-deploy carries all three by construction: they are assembled in one place and a test asserts each is present, so they cannot be dropped the way a hand-typed command can. The exported-token trap disappears entirely there, because the secret is passed as an argument rather than through a shell.
+
+Verify any deploy by polling `/mcp` until it answers **401** — a release that boots is not necessarily a release that serves, and the difference is invisible from the Fly dashboard.
 
 ### Verifying more than "it answers"
 
