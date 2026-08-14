@@ -381,9 +381,10 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
 
 // ---- getFleetReport ----
 
-export function getFleetReport(opts: { days?: number } = {}): FleetReport {
+export function getFleetReport(opts: { days?: number; repo?: string } = {}): FleetReport {
   const days = opts.days ?? 30;
   const since = Date.now() - days * 24 * 60 * 60 * 1000;
+  const repoFilter = opts.repo ?? null;
   const db = getDb();
 
   const dispatches = db
@@ -393,9 +394,10 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
        WHERE dispatched_at >= ?
          AND repo IS NOT NULL
          AND repo NOT LIKE 'test-org/%'
+         AND (? IS NULL OR repo = ?)
        ORDER BY dispatched_at ASC`,
     )
-    .all(since) as FleetDispatchRow[];
+    .all(since, repoFilter, repoFilter) as FleetDispatchRow[];
 
   // --- Per-repo aggregates ---
 
@@ -453,6 +455,7 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
          FROM dispatch_log dl
          WHERE dl.dispatched_at >= ?
            AND dl.repo IS NOT NULL AND dl.repo NOT LIKE 'test-org/%'
+           AND (? IS NULL OR dl.repo = ?)
            AND dl.issue_identifier IS NOT NULL
            AND dl.phase != 'planning'
            AND EXISTS (
@@ -462,7 +465,7 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
            )
          GROUP BY dl.repo`,
       )
-      .all(since) as typeof mergedByRepoRows;
+      .all(since, repoFilter, repoFilter) as typeof mergedByRepoRows;
   } catch { /* table absent */ }
 
   const mergedByRepo = new Map<string, number>();
@@ -597,12 +600,13 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
         `SELECT COUNT(*) as total, SUM(review_escape) as escaped
          FROM pr_merge_capture pmc
          WHERE pmc.repo IS NOT NULL AND pmc.repo NOT LIKE 'test-org/%'
+           AND (? IS NULL OR pmc.repo = ?)
            AND EXISTS (
              SELECT 1 FROM dispatch_log dl
              WHERE dl.issue_id = pmc.issue_id AND dl.dispatched_at >= ?
            )`,
       )
-      .get(since) as { total: number; escaped: number | null } | undefined;
+      .get(repoFilter, repoFilter, since) as { total: number; escaped: number | null } | undefined;
     if (escRow && escRow.total > 0) {
       escapeRate = (escRow.escaped ?? 0) / escRow.total;
     }
@@ -627,6 +631,7 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
          WHERE dl.dispatched_at >= ?
            AND dl.issue_identifier IS NOT NULL
            AND dl.repo IS NOT NULL AND dl.repo NOT LIKE 'test-org/%'
+           AND (? IS NULL OR dl.repo = ?)
            AND NOT EXISTS (
              SELECT 1 FROM reconciliation_queue rq
              WHERE rq.issue_identifier = dl.issue_identifier
@@ -634,7 +639,7 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
          GROUP BY dl.issue_identifier
          ORDER BY COUNT(*) DESC`,
       )
-      .all(since) as RunawaySummary[];
+      .all(since, repoFilter, repoFilter) as RunawaySummary[];
   } catch { /* reconciliation_queue absent */ }
 
   const runaways: FleetReport["runaways"] = [];

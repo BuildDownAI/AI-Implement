@@ -41,6 +41,7 @@ import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-
 import { getInstallationToken } from "./github-app-auth.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
+import { getFleetReport } from "./report-card.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
@@ -454,6 +455,18 @@ export function handleAdminRequest(
         runnerCallback: !!(process.env.RUNNER_CALLBACK_BASE_URL && process.env.RUNNER_TOKEN_SECRET),
         gapFillTrigger: !!process.env.GAP_FILL_TRIGGER_SECRET,
       });
+      return true;
+    }
+
+    if ((url === "/api/report" || url.startsWith("/api/report?")) && method === "GET") {
+      const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+      const p = new URLSearchParams(qs);
+      const daysRaw = p.get("days");
+      const projectParam = p.get("project") || undefined;
+      const daysNum = daysRaw ? parseInt(daysRaw, 10) : NaN;
+      const days = Number.isFinite(daysNum) && daysNum > 0 ? daysNum : undefined;
+      const report = getFleetReport({ days, repo: projectParam });
+      json(res, 200, report);
       return true;
     }
 
