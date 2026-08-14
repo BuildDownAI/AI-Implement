@@ -513,66 +513,41 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
 
   // --- Fleet-level one-shot / eventual ---
 
-  // Group impl dispatches by issue key
-  const issueToJobIds = new Map<string, number[]>();
-  for (const d of implDispatches) {
-    const key = d.issue_identifier ?? d.issue_id;
-    if (!issueToJobIds.has(key)) issueToJobIds.set(key, []);
-    issueToJobIds.get(key)!.push(d.id);
-  }
+  // Count distinct issues for eventualPct denominator
+  const issueKeys = new Set<string>();
+  for (const d of implDispatches) issueKeys.add(d.issue_identifier ?? d.issue_id);
+  const totalIssues = issueKeys.size;
 
+  // oneShotPct: one row per implement dispatch, matching SQL §2 (FROM impl_jobs WHERE iterations IS NOT NULL).
+  // Every dispatch with a determinable review.1 outcome counts — including re-dispatches of the same issue.
   let oneShotCount = 0;
   let oneShotEligible = 0;
-  let eventualCount = 0;
-  const totalIssues = issueToJobIds.size;
+  const approvedIssues = new Set<string>();
 
-  for (const [, jobIds] of issueToJobIds) {
-    let firstJobOneShot: boolean | null = null;
-    let anyApproved = false;
-
-    for (let i = 0; i < jobIds.length; i++) {
-      const stats = jobPassStats(db, jobIds[i]!);
-      if (!stats) continue;
-      if (i === 0) firstJobOneShot = stats.oneShot;
-      if (stats.approved) anyApproved = true;
-    }
-
-    // Only count in denominator when first-pass approval is determinable (non-null).
-    // Matches SQL AVG(first_pass_approved = 1) which skips NULL rows.
-    if (firstJobOneShot !== null) {
+  for (const d of implDispatches) {
+    const stats = jobPassStats(db, d.id);
+    if (stats === null) continue;
+    if (stats.oneShot !== null) {
       oneShotEligible++;
-      if (firstJobOneShot) oneShotCount++;
+      if (stats.oneShot) oneShotCount++;
     }
-    if (anyApproved) eventualCount++;
+    if (stats.approved) approvedIssues.add(d.issue_identifier ?? d.issue_id);
   }
 
+  const eventualCount = approvedIssues.size;
   const oneShotPct = oneShotEligible > 0 ? oneShotCount / oneShotEligible : null;
   const eventualPct = totalIssues > 0 ? eventualCount / totalIssues : null;
 
   // --- Planning cohort ---
 
-  // Track earliest planning dispatch per issue
+  // Track earliest planning dispatch per issue.
+  // Each impl dispatch is classified individually: planned = planning preceded *this* dispatch (SQL §3).
   const planningByIssue = new Map<string, number>();
   for (const d of dispatches) {
     if (d.phase !== "planning") continue;
     const key = d.issue_identifier ?? d.issue_id;
     const prev = planningByIssue.get(key);
     if (prev === undefined || d.dispatched_at < prev) planningByIssue.set(key, d.dispatched_at);
-  }
-
-  // Track earliest impl dispatch per issue
-  const firstImplAt = new Map<string, number>();
-  for (const d of implDispatches) {
-    const key = d.issue_identifier ?? d.issue_id;
-    const prev = firstImplAt.get(key);
-    if (prev === undefined || d.dispatched_at < prev) firstImplAt.set(key, d.dispatched_at);
-  }
-
-  // An issue is "planned" if its planning dispatch ≤ its first impl dispatch
-  const plannedIssueSet = new Set<string>();
-  for (const [key, implAt] of firstImplAt) {
-    const planAt = planningByIssue.get(key);
-    if (planAt !== undefined && planAt <= implAt) plannedIssueSet.add(key);
   }
 
   function cohortFor(planned: boolean): PlanningCohort {
@@ -586,7 +561,8 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
 
     for (const d of implDispatches) {
       const key = d.issue_identifier ?? d.issue_id;
-      if (plannedIssueSet.has(key) !== planned) continue;
+      const planAt = planningByIssue.get(key);
+      if ((planAt !== undefined && planAt <= d.dispatched_at) !== planned) continue;
       jobs++;
       cohortIssues.add(key);
 

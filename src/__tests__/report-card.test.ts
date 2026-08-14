@@ -556,6 +556,29 @@ describe("getFleetReport", () => {
       // j1 has no review.1 → excluded from denominator; j2 → denominator=1, numerator=1 → 100%
       expect(report.oneShotPct).toBeCloseTo(1.0);
     });
+
+    it("counts re-dispatches of the same issue as separate jobs", () => {
+      // Two dispatches for the same issue: first not one-shot, second one-shot.
+      // Per-job (correct): 2 eligible, 1 one-shot → 50%.
+      // Per-issue-first-job (old bug): 1 eligible (first), 0 one-shot → 0%.
+      const j1 = insertDispatch({ issueId: "multi-i", issueIdentifier: "AII-MULTI", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j1, {
+        approved: true, iterations: 2, terminationReason: "approved",
+        passes: [
+          { iteration: 1, costUsd: 0.05, implementOutcome: "success", reviewApproved: false },
+          { iteration: 2, costUsd: 0.05, implementOutcome: "success", reviewApproved: true },
+        ],
+      });
+      const j2 = insertDispatch({ issueId: "multi-i", issueIdentifier: "AII-MULTI", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j2, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+      });
+
+      const report = rc.getFleetReport({ days: 365 });
+      // 2 eligible jobs, 1 one-shot → 50%; would be 0% if only the first job counted
+      expect(report.oneShotPct).toBeCloseTo(0.5);
+    });
   });
 
   describe("planning cohort", () => {
@@ -584,6 +607,38 @@ describe("getFleetReport", () => {
       expect(report.planning.planned.oneShotPct).toBeCloseTo(1.0);
       expect(report.planning.unplanned.jobs).toBe(1);
       expect(report.planning.unplanned.oneShotPct).toBeCloseTo(0.0);
+    });
+
+    it("assigns each dispatch to its cohort based on whether planning preceded that dispatch", () => {
+      // Issue "PL-LATE": impl dispatch 1 at base (before planning), planning at base+1000,
+      // impl dispatch 2 at base+2000 (after planning).
+      // Per-dispatch (correct): dispatch 1 → unplanned, dispatch 2 → planned.
+      // Per-issue (old bug): firstImplAt=base, planAt=base+1000 > base → whole issue unplanned;
+      //   both dispatches would land in unplanned, leaving planned.jobs=0.
+      const base = Date.now() - 20000;
+      const j1 = insertDispatch({ issueId: "pllate", issueIdentifier: "AII-PLLATE", repo: "org/r",
+        phase: "implementation", dispatchedAt: base, status: "completed" });
+      insertFeedbackLoopStep(j1, {
+        approved: true, iterations: 2, terminationReason: "approved",
+        passes: [
+          { iteration: 1, costUsd: 0.05, implementOutcome: "success", reviewApproved: false },
+          { iteration: 2, costUsd: 0.05, implementOutcome: "success", reviewApproved: true },
+        ],
+      });
+      insertDispatch({ issueId: "pllate", issueIdentifier: "AII-PLLATE", repo: "org/r",
+        phase: "planning", dispatchedAt: base + 1000 });
+      const j2 = insertDispatch({ issueId: "pllate", issueIdentifier: "AII-PLLATE", repo: "org/r",
+        phase: "implementation", dispatchedAt: base + 2000, status: "completed" });
+      insertFeedbackLoopStep(j2, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+      });
+
+      const report = rc.getFleetReport({ days: 365 });
+      expect(report.planning.planned.jobs).toBe(1);   // j2 only
+      expect(report.planning.unplanned.jobs).toBe(1); // j1 only
+      expect(report.planning.planned.oneShotPct).toBeCloseTo(1.0);   // j2 was one-shot
+      expect(report.planning.unplanned.oneShotPct).toBeCloseTo(0.0); // j1 was not one-shot
     });
   });
 
