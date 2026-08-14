@@ -93,6 +93,17 @@ describe("formatRunStats — planned-vs-actual delta", () => {
     });
     expect(md).not.toContain("Planned vs actual");
   });
+
+  it("omits planned-vs-actual section when filesChanged is null (diff unavailable)", () => {
+    const md = formatRunStats({
+      issueIdentifier: "AII-1",
+      passes: STAT_PASSES,
+      plannedFiles: ["src/a.ts", "src/b.ts"],
+      filesChanged: null,
+    });
+    expect(md).not.toContain("Planned vs actual");
+    expect(md).not.toContain("Planned files not touched");
+  });
 });
 
 describe("writeRunAutopsy", () => {

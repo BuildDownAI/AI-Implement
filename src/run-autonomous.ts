@@ -54,12 +54,12 @@ function currentGitBranch(workspaceDir: string): string | null {
   return branch || null;
 }
 
-function getCommittedFiles(workspaceDir: string, baseBranch: string): string[] {
+function getCommittedFiles(workspaceDir: string, baseBranch: string): string[] | null {
   const result = spawnSync("git", ["diff", "--name-only", baseBranch, "HEAD"], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "ignore"],
   });
-  if (result.status !== 0) return [];
+  if (result.status !== 0) return null;
   return result.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
 }
 

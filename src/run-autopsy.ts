@@ -70,7 +70,7 @@ export interface RunStats {
     reviewApproved: boolean | null;
   }>;
   plannedFiles: string[];
-  filesChanged: string[];
+  filesChanged: string[] | null;
 }
 
 /** Markdown stats posted to the ticket for approved runs via the ai-output/comments plumbing. */
@@ -94,7 +94,7 @@ export function formatRunStats(s: RunStats): string {
     `**Total cost:** $${totalCost.toFixed(2)}`,
   ];
 
-  if (s.plannedFiles.length > 0) {
+  if (s.plannedFiles.length > 0 && s.filesChanged !== null) {
     const plannedSet = new Set(s.plannedFiles);
     const changedSet = new Set(s.filesChanged);
     const unplannedTouched = s.filesChanged.filter((f) => !plannedSet.has(f));
