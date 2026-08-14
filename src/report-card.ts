@@ -146,6 +146,7 @@ function statsFromSubSteps(db: Db, jobId: number): DerivedRunStats {
   let iterations = 0;
   let approved = false;
   let costUsd: number | null = null;
+  let maxTurnsHits = 0;
   for (const row of rows) {
     try {
       if (row.step_type === "review") {
@@ -155,10 +156,11 @@ function statsFromSubSteps(db: Db, jobId: number): DerivedRunStats {
         const out = JSON.parse(row.outputs_json) as ImplementOutputs;
         const c = out.telemetry?.costUsd;
         if (c != null) costUsd = (costUsd ?? 0) + c;
+        if (out.telemetry?.outcome === "max_turns") maxTurnsHits++;
       }
     } catch { /* malformed JSON */ }
   }
-  return { iterations, approved, terminationReason: null, costUsd, maxTurnsHits: 0 };
+  return { iterations, approved, terminationReason: null, costUsd, maxTurnsHits };
 }
 
 function derivedStatsForJob(db: Db, jobId: number): DerivedRunStats {
@@ -167,7 +169,7 @@ function derivedStatsForJob(db: Db, jobId: number): DerivedRunStats {
     flRow = db
       .prepare(
         `SELECT outputs_json FROM step_log
-         WHERE job_id = ? AND step_type = 'feedback-loop' LIMIT 1`,
+         WHERE job_id = ? AND step_id = 'feedback-loop' LIMIT 1`,
       )
       .get(jobId) as typeof flRow;
   } catch { /* step_log may not exist */ }
@@ -321,7 +323,10 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
     flRow = db
       .prepare(
         `SELECT outputs_json FROM step_log
-         WHERE job_id = ? AND step_type = 'feedback-loop' LIMIT 1`,
+         WHERE job_id = ? AND step_id = 'feedback-loop'
+           AND outputs_json != '{}'
+           AND json_extract(outputs_json, '$.iterations') IS NOT NULL
+         LIMIT 1`,
       )
       .get(jobId) as typeof flRow;
   } catch { /* step_log absent */ }
@@ -422,7 +427,7 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
     agg.jobs++;
     agg.issueSet.add(d.issue_identifier ?? d.issue_id);
     if (d.status === "completed") agg.completed++;
-    if (d.status === "failed" || d.status === "timed_out") agg.failed++;
+    if (d.status === "failed" || d.status === "review_failed") agg.failed++;
   }
 
   for (const d of implDispatches) {
@@ -441,14 +446,17 @@ export function getFleetReport(opts: { days?: number } = {}): FleetReport {
   try {
     mergedByRepoRows = db
       .prepare(
-        `SELECT rq.repo, COUNT(DISTINCT rq.issue_identifier) as cnt
-         FROM reconciliation_queue rq
-         INNER JOIN dispatch_log dl ON dl.issue_identifier = rq.issue_identifier
-           AND dl.dispatched_at >= ?
+        `SELECT dl.repo, COUNT(*) as cnt
+         FROM dispatch_log dl
+         WHERE dl.dispatched_at >= ?
            AND dl.repo IS NOT NULL AND dl.repo NOT LIKE 'test-org/%'
-         WHERE rq.repo IS NOT NULL AND rq.repo NOT LIKE 'test-org/%'
-           AND rq.status = 'dispatched'
-         GROUP BY rq.repo`,
+           AND dl.issue_identifier IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM reconciliation_queue rq
+             WHERE rq.issue_identifier = dl.issue_identifier
+               AND rq.status = 'dispatched'
+           )
+         GROUP BY dl.repo`,
       )
       .all(since) as typeof mergedByRepoRows;
   } catch { /* table absent */ }

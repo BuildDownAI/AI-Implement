@@ -103,7 +103,7 @@ function insertFeedbackLoopStep(
   dedup.getDb()
     .prepare(
       `INSERT INTO step_log (job_id, step_id, step_type, status, started_at, inputs_json, outputs_json)
-       VALUES (?, 'feedback-loop', 'feedback-loop', 'passed', '2024-01-01T00:00:00Z', '{}', ?)`,
+       VALUES (?, 'feedback-loop', 'custom', 'passed', '2024-01-01T00:00:00Z', '{}', ?)`,
     )
     .run(jobId, JSON.stringify(outputs));
 }
@@ -192,6 +192,21 @@ describe("getIssueReportCard", () => {
       const card = rc.getIssueReportCard("AII-2B");
       expect(card!.runs[0]!.costUsd).toBeNull();
       expect(card!.runs[0]!.iterations).toBe(1);
+    });
+
+    it("counts maxTurnsHits from implement sub-steps with outcome=max_turns", () => {
+      const jobId = insertDispatch({ issueId: "issue-2mx", issueIdentifier: "AII-2MX", repo: "org/repo" });
+      insertSubStep(jobId, "implement.1", "implement", {
+        telemetry: { costUsd: 0.10, numTurns: 50, outcome: "max_turns" },
+      });
+      insertSubStep(jobId, "review.1", "review", { approved: false });
+      insertSubStep(jobId, "implement.2", "implement", {
+        telemetry: { costUsd: 0.05, numTurns: 50, outcome: "max_turns" },
+      });
+      insertSubStep(jobId, "review.2", "review", { approved: false });
+
+      const card = rc.getIssueReportCard("AII-2MX");
+      expect(card!.runs[0]!.maxTurnsHits).toBe(2);
     });
   });
 
@@ -538,6 +553,55 @@ describe("getFleetReport", () => {
 
       const report = rc.getFleetReport({ days: 365 });
       expect(report.escapeRate).toBeCloseTo(0.5);
+    });
+  });
+
+  describe("failed count semantics", () => {
+    it("counts review_failed as failed and excludes timed_out", () => {
+      insertDispatch({ issueId: "fa", issueIdentifier: "AII-FA", repo: "org/rfail", status: "failed" });
+      insertDispatch({ issueId: "fb", issueIdentifier: "AII-FB", repo: "org/rfail", status: "review_failed" });
+      insertDispatch({ issueId: "fc", issueIdentifier: "AII-FC", repo: "org/rfail", status: "timed_out" });
+
+      const report = rc.getFleetReport({ days: 365 });
+      const r = report.byRepo.find((x) => x.repo === "org/rfail");
+      expect(r!.failed).toBe(2);
+    });
+  });
+
+  describe("merged count semantics", () => {
+    it("counts dispatch jobs (not distinct issues) for merged", () => {
+      insertDispatch({ issueId: "mg-a", issueIdentifier: "AII-MGA", repo: "org/rmg", status: "failed" });
+      insertDispatch({ issueId: "mg-a", issueIdentifier: "AII-MGA", repo: "org/rmg", status: "completed" });
+      dedup.getDb()
+        .prepare(
+          `INSERT INTO reconciliation_queue (issue_id, issue_identifier, pr_number, repo, merge_commit_sha, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("mg-a", "AII-MGA", 55, "org/rmg", "sha55", "dispatched", Date.now());
+
+      const report = rc.getFleetReport({ days: 365 });
+      const r = report.byRepo.find((x) => x.repo === "org/rmg");
+      expect(r!.merged).toBe(2);
+    });
+  });
+
+  describe("feedback-loop row filters", () => {
+    it("excludes feedback-loop rows with empty outputs_json and falls back to sub-steps", () => {
+      const j = insertDispatch({
+        issueId: "fe", issueIdentifier: "AII-FE", repo: "org/rfe", status: "completed",
+      });
+      dedup.getDb()
+        .prepare(
+          `INSERT INTO step_log (job_id, step_id, step_type, status, started_at, inputs_json, outputs_json)
+           VALUES (?, 'feedback-loop', 'custom', 'passed', '2024-01-01T00:00:00Z', '{}', '{}')`,
+        )
+        .run(j);
+      insertSubStep(j, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+      insertSubStep(j, "review.1", "review", { approved: true });
+
+      const report = rc.getFleetReport({ days: 365 });
+      const r = report.byRepo.find((x) => x.repo === "org/rfe");
+      expect(r!.avgPasses).toBeCloseTo(1.0);
     });
   });
 });
