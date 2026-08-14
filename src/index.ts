@@ -11,7 +11,7 @@ import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals } from "./poll-selection.js";
+import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, parseDeclaredFiles } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, type SelfDeployTarget } from "./deploy-availability.js";
@@ -450,7 +450,30 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     // blockers preview via poll-selection.ts).
     rememberCandidates(allCandidates);
     const inFlightSiblings = resolveInFlightSiblings(inFlightIssueIds);
-    const fileOverlapDeferrals = selectFileOverlapDeferrals(toProcess, inFlightSiblings);
+
+    // AII-388: fetch planning contexts for candidates and in-flight siblings whose
+    // description carries no file bullets — the planning block lives in the planning
+    // *comment*, not the description, so the guard needs the assembled comment text.
+    const planningContexts = new Map<string, string>();
+    {
+      const issuesNeedingContext = [...toProcess, ...inFlightSiblings].filter(
+        (i) => i.description !== null && parseDeclaredFiles(i.description).size === 0,
+      );
+      await Promise.all(
+        issuesNeedingContext.map(async (issue) => {
+          const mapping = teamRepoMap[issue.scopeKey];
+          if (!mapping) return;
+          try {
+            const p = await registry.forMapping(mapping);
+            const ctx = await p.fetchPlanningContext(issue.id);
+            if (ctx) planningContexts.set(issue.id, ctx);
+          } catch {
+            // fail-open: missing context does not block dispatch
+          }
+        }),
+      );
+    }
+    const fileOverlapDeferrals = selectFileOverlapDeferrals(toProcess, inFlightSiblings, planningContexts);
     const deferredIds = new Set(fileOverlapDeferrals.map((b) => b.issueId));
     for (const b of fileOverlapDeferrals) {
       console.log(`[poll] Deferring ${b.issueIdentifier}: ${b.detail}`);
