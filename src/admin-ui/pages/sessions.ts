@@ -75,15 +75,20 @@ export const sessionsScript = `
           ? (s.issueTitle ? s.issueIdentifier + ': ' + s.issueTitle : s.issueIdentifier)
           : '—';
         const issueHtml = s.issueIdentifier
-          ? '<a href="https://linear.app/issue/' + window.esc(s.issueIdentifier) + '" target="_blank">' + window.esc(issueLabel) + '</a>'
+          ? '<a href="https://linear.app/issue/' + window.escAttr(s.issueIdentifier) + '" target="_blank">' + window.esc(issueLabel) + '</a>'
           : '<span class="mono">—</span>';
         tr.innerHTML = '<td>' + issueHtml + '</td>'
           + '<td class="mono">' + window.esc(s.teamKey || '—') + '</td>'
           + '<td class="mono">' + window.esc(s.repo || '—') + '</td>'
-          + '<td class="mono" title="' + window.esc(s.machineId) + '">' + window.esc(s.machineName || s.machineId.slice(0, 10)) + '</td>'
+          + '<td class="mono" title="' + window.escAttr(s.machineId) + '">' + window.esc(s.machineName || s.machineId.slice(0, 10)) + '</td>'
           + '<td>' + window.esc(s.state) + '</td>'
           + '<td>' + duration + '</td>'
-          + '<td><button class="sm danger" data-mid="' + window.esc(s.machineId) + '" onclick="destroySession(this.dataset.mid)">Destroy</button></td>';
+          + '<td></td>';
+        const destroyBtn = document.createElement('button');
+        destroyBtn.className = 'sm danger';
+        destroyBtn.textContent = 'Destroy';
+        destroyBtn.addEventListener('click', function() { destroySession(s.machineId); });
+        tr.lastElementChild.appendChild(destroyBtn);
         tbody.appendChild(tr);
       }
       setLastUpdated('lu-sessions');

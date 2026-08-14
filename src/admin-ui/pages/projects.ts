@@ -249,9 +249,7 @@ export const projectsScript = `
       const tr = document.createElement('tr');
       const ek = window.esc(key);
       const recent = recentSync[key];
-      const syncCell = (recent && recent.prUrl)
-        ? '<a class="btn btn-sm btn-ghost" href="' + window.esc(recent.prUrl) + '" target="_blank" rel="noopener noreferrer" title="Workflow sync PR (just created)">Workflows synced — PR opened &#8599;</a> '
-        : '<button class="btn btn-sm btn-ghost" data-sync-btn data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> ';
+      // syncCell built via DOM below (avoids data-* + inline onclick pattern)
       const execBadge = m.executionMode === 'fly-machines'
         ? '<span class="badge info">fly</span>'
         : '<span class="badge neutral">gha</span>';
@@ -273,13 +271,51 @@ export const projectsScript = `
         + '<td>' + planBadge + '</td>'
         + '<td>' + providerBadge + '</td>'
         + '<td>' + statusBadge + '</td>'
-        + '<td style="white-space:nowrap">'
-          + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
-          + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
-          + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
-          + syncCell
-          + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
-        + '</td>';
+        + '<td style="white-space:nowrap"></td>';
+      const actionCell = tr.lastElementChild;
+      const pauseBtn = document.createElement('button');
+      pauseBtn.className = 'btn btn-sm';
+      pauseBtn.textContent = pauseLabel;
+      pauseBtn.addEventListener('click', function() { togglePause(key, m.paused); });
+      actionCell.appendChild(pauseBtn);
+      actionCell.appendChild(document.createTextNode(' '));
+      const editBtn = document.createElement('button');
+      editBtn.className = 'btn btn-sm';
+      editBtn.textContent = 'Edit';
+      editBtn.addEventListener('click', function() { openMappingDialog(key); });
+      actionCell.appendChild(editBtn);
+      actionCell.appendChild(document.createTextNode(' '));
+      const delMappingBtn = document.createElement('button');
+      delMappingBtn.className = 'btn btn-sm btn-danger';
+      delMappingBtn.textContent = 'Del';
+      delMappingBtn.addEventListener('click', function() { delMapping(key); });
+      actionCell.appendChild(delMappingBtn);
+      actionCell.appendChild(document.createTextNode(' '));
+      if (recent && recent.prUrl) {
+        const syncLink = document.createElement('a');
+        syncLink.className = 'btn btn-sm btn-ghost';
+        syncLink.href = window.safeUrl(recent.prUrl);
+        syncLink.target = '_blank';
+        syncLink.rel = 'noopener noreferrer';
+        syncLink.title = 'Workflow sync PR (just created)';
+        syncLink.textContent = 'Workflows synced \u2014 PR opened \u2197';
+        actionCell.appendChild(syncLink);
+        actionCell.appendChild(document.createTextNode(' '));
+      } else {
+        const syncBtn = document.createElement('button');
+        syncBtn.className = 'btn btn-sm btn-ghost';
+        syncBtn.dataset.syncBtn = '';
+        syncBtn.dataset.key = key;
+        syncBtn.textContent = 'Sync workflows';
+        syncBtn.addEventListener('click', function() { syncWorkflows(syncBtn); });
+        actionCell.appendChild(syncBtn);
+        actionCell.appendChild(document.createTextNode(' '));
+      }
+      const secretsBtn = document.createElement('button');
+      secretsBtn.className = 'btn btn-sm btn-ghost';
+      secretsBtn.textContent = 'Secrets';
+      secretsBtn.addEventListener('click', function() { showSecrets(key); });
+      actionCell.appendChild(secretsBtn);
       tbody.appendChild(tr);
     }
   }
@@ -868,7 +904,12 @@ export const projectsScript = `
         const tr = document.createElement('tr');
         tr.innerHTML = '<td class="mono">' + window.esc(s.name) + '</td>'
           + '<td><span class="badge success">Set</span></td>'
-          + '<td><button class="btn btn-sm btn-danger" data-name="' + window.esc(s.name) + '" onclick="delSecret(this.dataset.name)">Delete</button></td>';
+          + '<td></td>';
+        const delSecBtn = document.createElement('button');
+        delSecBtn.className = 'btn btn-sm btn-danger';
+        delSecBtn.textContent = 'Delete';
+        delSecBtn.addEventListener('click', function() { delSecret(s.name); });
+        tr.lastElementChild.appendChild(delSecBtn);
         tbody.appendChild(tr);
       }
     } catch (err) {

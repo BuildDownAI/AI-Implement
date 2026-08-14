@@ -207,7 +207,7 @@ export const drawerScript = `
       else badgeKind = 'neutral';
 
       const logsLink = step.logsUrl
-        ? '<a class="btn btn-sm" href="' + window.esc(step.logsUrl) + '" target="_blank" style="font-size:11px">Logs ↗</a>'
+        ? '<a class="btn btn-sm" href="' + window.safeUrl(step.logsUrl) + '" target="_blank" style="font-size:11px">Logs ↗</a>'
         : '';
 
       html += '<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border-subtle);font-size:12.5px">'
@@ -234,12 +234,12 @@ export const drawerScript = `
       const jiraSiteUrl = (window.jiraSiteUrl || '');
       let valueHtml;
       if (ticketingProvider === 'jira' && jiraSiteUrl) {
-        valueHtml = '<a class="text-accent" href="' + window.esc(jiraSiteUrl) + '/browse/' + window.esc(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
+        valueHtml = '<a class="text-accent" href="' + window.safeUrl(jiraSiteUrl) + '/browse/' + window.escAttr(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
       } else if (ticketingProvider === 'jira') {
         // Jira but we don't know the site URL — show plain text.
         valueHtml = window.esc(job.issueIdentifier);
       } else {
-        valueHtml = '<a class="text-accent" href="https://linear.app/issue/' + window.esc(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
+        valueHtml = '<a class="text-accent" href="https://linear.app/issue/' + window.escAttr(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
       }
       fields.push({ label: 'Issue', value: valueHtml });
     }
@@ -269,7 +269,7 @@ export const drawerScript = `
       const prNum = job.prUrl.split('/').pop() || '';
       fields.push({
         label: 'Pull request',
-        value: '<a class="text-accent" href="' + window.esc(job.prUrl) + '" target="_blank">#' + window.esc(prNum) + ' &#8599;</a>'
+        value: '<a class="text-accent" href="' + window.safeUrl(job.prUrl) + '" target="_blank">#' + window.esc(prNum) + ' &#8599;</a>'
       });
     }
 

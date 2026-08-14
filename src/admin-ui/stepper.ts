@@ -592,11 +592,11 @@ export const stepperScript = `
     }
     if (state === 'app-not-installed') {
       return '<span class="badge warn">Action needed</span> The App is not installed on this owner. '
-        + '<a class="text-accent" href="' + window.esc(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Install the App &#8599;</a> then Re-check.';
+        + '<a class="text-accent" href="' + window.safeUrl(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Install the App &#8599;</a> then Re-check.';
     }
     if (state === 'repo-not-selected') {
       return '<span class="badge warn">Action needed</span> The App is installed, but this repo is not in its selected repositories. '
-      + '<a class="text-accent" href="' + window.esc(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Add this repo &#8599;</a> then Re-check.';
+      + '<a class="text-accent" href="' + window.safeUrl(data.installUrl) + '" target="_blank" rel="noopener noreferrer">Add this repo &#8599;</a> then Re-check.';
     }
     return '';
   }

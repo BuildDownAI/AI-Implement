@@ -128,7 +128,7 @@ export const reaperScript = `
         : '<span class="badge" style="background:#e74c3c;color:#fff">destroyed</span>';
       tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
         + '<td class="mono">' + window.esc(r.ruleMatched) + '</td>'
-        + '<td class="mono" title="' + window.esc(r.machineId) + '">' + window.esc(r.machineId.slice(0, 12)) + '</td>'
+        + '<td class="mono" title="' + window.escAttr(r.machineId) + '">' + window.esc(r.machineId.slice(0, 12)) + '</td>'
         + '<td class="mono">' + window.esc(r.tenantId || '—') + '</td>'
         + '<td class="mono">' + window.esc(r.issueIdentifier || '—') + '</td>'
         + '<td>' + (r.ageSeconds != null ? r.ageSeconds : '—') + '</td>'

@@ -75,10 +75,10 @@ export const pullsScript = `
     for (const pull of pulls) {
       const { prUrl, prNumber, issueIdentifier, issueTitle, repo, jobStatus, dispatchNumber, lastDispatchedAt } = pull;
       const kind = statusBadgeKind(jobStatus);
-      const prCell = '<a class="text-accent mono" href="' + window.esc(prUrl) + '" target="_blank">#' + (prNumber != null ? prNumber : '?') + '</a>';
+      const prCell = '<a class="text-accent mono" href="' + window.safeUrl(prUrl) + '" target="_blank">#' + (prNumber != null ? prNumber : '?') + '</a>';
       let issueCell;
       if (issueIdentifier) {
-        issueCell = '<a class="text-accent" href="https://linear.app/issue/' + window.esc(issueIdentifier) + '" target="_blank"><span class="mono text-secondary">' + window.esc(issueIdentifier) + '</span> <span>' + window.esc(issueTitle || '') + '</span></a>';
+        issueCell = '<a class="text-accent" href="https://linear.app/issue/' + window.escAttr(issueIdentifier) + '" target="_blank"><span class="mono text-secondary">' + window.esc(issueIdentifier) + '</span> <span>' + window.esc(issueTitle || '') + '</span></a>';
       } else {
         issueCell = '<span class="text-tertiary">&mdash;</span>';
       }
@@ -87,7 +87,7 @@ export const pullsScript = `
       const statusCell = '<span class="badge ' + kind + '"><span class="dot"></span>' + window.esc(statusLabel) + '</span>';
       const iterCell = '<span class="mono' + (dispatchNumber > 1 ? ' text-secondary' : '') + '">' + dispatchNumber + '</span>';
       const lastCell = '<td style="text-align:right" class="mono text-tertiary">' + fmtAgo(lastDispatchedAt) + '</td>';
-      const actionCell = '<a class="text-accent" href="' + window.esc(prUrl) + '" target="_blank">Open &#8599;</a>';
+      const actionCell = '<a class="text-accent" href="' + window.safeUrl(prUrl) + '" target="_blank">Open &#8599;</a>';
       const tr = document.createElement('tr');
       tr.innerHTML = '<td>' + prCell + '</td>'
         + '<td>' + issueCell + '</td>'
