@@ -1764,4 +1764,146 @@ describe("postPushReviewStep", () => {
     expect(checkRunsQueried).toBe(true);
     expect(sleep).not.toHaveBeenCalled();
   });
+
+  it("does not satisfy the gate when the only matching check concluded 'skipped' (fails closed immediately)", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        // code-review-plugin is completed but skipped — bot-authored PR, author_association gate
+        return {
+          stdout: JSON.stringify({
+            check_runs: [{ name: "code-review-plugin", status: "completed", conclusion: "skipped" }],
+          }),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewWaitTimeoutMs: 1000, reviewWaitPollMs: 100 },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    // A skipped check is not a completed review — the gate must fail closed, not auto-approve.
+    expect(out.approved).toBe(false);
+    // Must fail closed immediately (all-skipped path), not after polling to timeout.
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("recognizes 'claude-code-review' as the external review gate by default", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    let checkProbes = 0;
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        checkProbes++;
+        const done = checkProbes >= 2;
+        return {
+          stdout: JSON.stringify({
+            check_runs: [{ name: "claude-code-review", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null }],
+          }),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    // Must be recognised as the external review gate, causing the step to wait.
+    expect(sleep).toHaveBeenCalled();
+    expect(checkProbes).toBeGreaterThanOrEqual(2);
+    expect(out.approved).toBe(true);
+  });
+
+  it("warns with the head SHA when no check runs are present at all", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "sha1234abc" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/sha1234abc/check-runs"))) {
+        return { stdout: JSON.stringify({ check_runs: [] }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    let warnings = "";
+
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn },
+        { report: vi.fn(async () => undefined) },
+      );
+      warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(warnings).toContain("sha1234abc");
+  });
+
+  it("uses configured reviewCheckNames for exact matching, overriding defaults", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    let checkProbes = 0;
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        checkProbes++;
+        const done = checkProbes >= 2;
+        return {
+          stdout: JSON.stringify({
+            check_runs: [
+              // "review" matches by default but must be ignored when reviewCheckNames is configured.
+              { name: "review", status: "completed", conclusion: "success" },
+              { name: "my-custom-review", status: done ? "completed" : "in_progress", conclusion: done ? "success" : null },
+            ],
+          }),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep, reviewCheckNames: ["my-custom-review"] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    // "review" must NOT satisfy the gate — only "my-custom-review" is configured.
+    // The step must wait for "my-custom-review" to complete.
+    expect(sleep).toHaveBeenCalled();
+    expect(checkProbes).toBeGreaterThanOrEqual(2);
+    expect(out.approved).toBe(true);
+  });
 });

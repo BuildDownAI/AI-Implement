@@ -44,7 +44,7 @@ function parseModelsConfig(value: unknown): RepoModels {
   return result;
 }
 
-function parseReviewCheckNamesConfig(value: unknown): string[] | undefined {
+export function parseReviewCheckNamesConfig(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const names = value
     .filter((name): name is string => typeof name === "string" && name.trim().length > 0)

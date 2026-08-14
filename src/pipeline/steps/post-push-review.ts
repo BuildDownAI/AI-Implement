@@ -55,10 +55,11 @@ const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
 const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
 const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 300000;
 // Check-run names produced by the review workflows in this repository.
-// "review" comes from claude-review.yml (pull_request_target, resolves from the base branch).
+// "review" comes from claude-review.yml (pull_request_target, resolves from the default branch).
 // "code-review-plugin" comes from claude-code-review.yml (pull_request, resolves from the PR head).
-// "claude-review" and "claude code review" cover repos still running the pre-AII-276 workflow names.
-const DEFAULT_REVIEW_CHECK_NAMES = ["review", "code-review-plugin", "claude-review", "claude code review"];
+// "claude-review", "claude code review", and "claude-code-review" cover repos running earlier
+// workflow versions. The heuristic fallback in isExternalReviewCheckName catches other variants.
+const DEFAULT_REVIEW_CHECK_NAMES = ["review", "code-review-plugin", "claude-review", "claude code review", "claude-code-review"];
 
 async function refreshCredentialsBeforePush(
   context: PipelineContext,
@@ -386,8 +387,14 @@ function shouldCollectExternalReviewFindings(reviewProviders: string[] | undefin
 function isExternalReviewCheckName(name: string, configured: string[] | undefined): boolean {
   const normalized = name.trim().toLowerCase();
   if (!normalized) return false;
-  const candidates = (configured && configured.length > 0) ? configured : DEFAULT_REVIEW_CHECK_NAMES;
-  return candidates.some((candidate) => candidate.trim().toLowerCase() === normalized);
+  if (configured && configured.length > 0) {
+    // Configured path: exact match only — the operator pinned exact names.
+    return configured.some((candidate) => candidate.trim().toLowerCase() === normalized);
+  }
+  // Default path: exact match against the known list, then heuristic fallback for names like
+  // "claude-code-review" that don't appear in an explicit enumeration.
+  return DEFAULT_REVIEW_CHECK_NAMES.some((candidate) => candidate.trim().toLowerCase() === normalized)
+    || (normalized.includes("claude") && normalized.includes("review"));
 }
 
 function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): string {
@@ -401,7 +408,7 @@ function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
   }
 }
 
-function parseCheckRuns(stdout: string): { name: string; status: string }[] {
+function parseCheckRuns(stdout: string): { name: string; status: string; conclusion: string }[] {
   let payload: unknown;
   try {
     payload = JSON.parse(stdout);
@@ -410,7 +417,7 @@ function parseCheckRuns(stdout: string): { name: string; status: string }[] {
   }
   // `gh api` returns { check_runs: [...] }; with --slurp/--paginate it can be an array of pages.
   const pages = Array.isArray(payload) ? payload : [payload];
-  const runs: { name: string; status: string }[] = [];
+  const runs: { name: string; status: string; conclusion: string }[] = [];
   for (const page of pages) {
     const record = asRecord(page);
     const checkRuns = record?.check_runs;
@@ -419,7 +426,8 @@ function parseCheckRuns(stdout: string): { name: string; status: string }[] {
       const r = asRecord(run);
       const name = stringProp(r, "name");
       const status = stringProp(r, "status");
-      if (name) runs.push({ name, status });
+      const conclusion = stringProp(r, "conclusion");
+      if (name) runs.push({ name, status, conclusion });
     }
   }
   return runs;
@@ -429,21 +437,34 @@ function probeExternalReviewCheck(
   ghSpawn: (args: string[]) => SpawnResult,
   headSha: string,
   configuredCheckNames: string[] | undefined,
-): "absent" | "running" | "completed" {
+): "absent" | "running" | "completed" | "all-skipped" {
   const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
   // If we cannot read check state, fail open rather than stall the loop indefinitely.
   if (res.exitCode !== 0) return "absent";
   const allRuns = parseCheckRuns(res.stdout);
   const matching = allRuns.filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
   if (matching.length === 0) {
-    if (allRuns.length > 0) {
+    // Warn unconditionally: "no runs at all" and "runs present but none matched" are both worth
+    // surfacing, since they are the two most common causes of silent fail-open.
+    if (allRuns.length === 0) {
+      console.warn(`[post-push-review] No check runs present at ${headSha}`);
+    } else {
       const presentNames = allRuns.map((r) => r.name).join(", ");
       const expected = (configuredCheckNames && configuredCheckNames.length > 0) ? configuredCheckNames : DEFAULT_REVIEW_CHECK_NAMES;
       console.warn(`[post-push-review] No external review check matched; present: ${presentNames}; expected one of: ${expected.join(", ")}`);
     }
     return "absent";
   }
-  return matching.every((run) => run.status === "completed") ? "completed" : "running";
+  if (matching.some((run) => run.status !== "completed")) return "running";
+  // A check whose conclusion is "skipped" or "neutral" is not a real review — it means the
+  // workflow decided not to run (e.g. bot-authored PRs gated on author_association).
+  const hasRealReview = matching.some(
+    (run) => run.conclusion !== "skipped" && run.conclusion !== "neutral",
+  );
+  if (hasRealReview) return "completed";
+  // Every matching run is completed but none produced a real verdict. Return "all-skipped" so
+  // the caller can fail closed immediately rather than approving as if no check existed.
+  return "all-skipped";
 }
 
 /**
@@ -471,6 +492,9 @@ async function waitForExternalReviewCompletion(
   let elapsed = 0;
   for (;;) {
     const state = probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames);
+    // "all-skipped": every matching check concluded skipped or neutral — no real review ran for
+    // this SHA. Fail closed immediately rather than failing open the way "absent" does.
+    if (state === "all-skipped") return "running";
     if (state !== "running") return state;
     if (elapsed >= opts.timeoutMs) return "running";
     await opts.sleep(opts.pollMs);
