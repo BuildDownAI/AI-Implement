@@ -339,28 +339,35 @@ export function makeStartDeploy(
     if (isDeployHeld()) return { started: false, reason: "deploy-in-progress" };
     setDeployHold();
 
-    const source = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, target.owner, {
-      permissions: { contents: "read" },
-      repositories: [target.repo],
-    });
-    const head = await getBranchSha(source.token, target.owner, target.repo, target.branch);
-    if (!head) {
+    try {
+      const source = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, target.owner, {
+        permissions: { contents: "read" },
+        repositories: [target.repo],
+      });
+      const head = await getBranchSha(source.token, target.owner, target.repo, target.branch);
+      if (!head) {
+        clearDeployHold();
+        return { started: false, reason: "head-unknown" };
+      }
+
+      void runDeploy({
+        app,
+        flyDeployToken,
+        owner: target.owner,
+        repo: target.repo,
+        branch: target.branch,
+        commit: head,
+        pollIntervalMs: config.pollIntervalMs,
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+      }).catch((err) => console.error("[deploy] failed:", err));
+
+      return { started: true, commit: head };
+    } catch (err) {
+      // Only a 404 is soft here,
+      // both calls throw on any other non-OK response, and a hold claimed above would otherwise outlive the request that took it.
       clearDeployHold();
-      return { started: false, reason: "head-unknown" };
+      throw err;
     }
-
-    void runDeploy({
-      app,
-      flyDeployToken,
-      owner: target.owner,
-      repo: target.repo,
-      branch: target.branch,
-      commit: head,
-      pollIntervalMs: config.pollIntervalMs,
-      githubAppId: config.githubAppId,
-      githubAppPrivateKey: config.githubAppPrivateKey,
-    }).catch((err) => console.error("[deploy] failed:", err));
-
-    return { started: true, commit: head };
   };
 }

@@ -140,6 +140,24 @@ describe("makeStartDeploy", () => {
     },
   );
 
+  it("clears the hold when resolving HEAD throws, rather than pausing dispatch forever", async () => {
+    const { initSettingsTable } = await import("../runner-mode.js");
+    const { isDeployHeld } = await import("../deploy-hold.js");
+    const { closeDb } = await import("../dedup.js");
+    initSettingsTable();
+
+    try {
+      // Only a 404 is soft on these calls; anything else throws. `configured` carries a
+      // stub private key so the App-token mint throws before any request, standing in
+      // for the 5xx or 422 this has to survive — the hold is claimed by then.
+      const start = deploy.makeStartDeploy(configured)!;
+      await expect(start()).rejects.toThrow();
+      expect(isDeployHeld()).toBe(false);
+    } finally {
+      closeDb();
+    }
+  });
+
   it("refuses while a deploy already holds, before reaching the network", async () => {
     const { initSettingsTable } = await import("../runner-mode.js");
     const { setDeployHold } = await import("../deploy-hold.js");

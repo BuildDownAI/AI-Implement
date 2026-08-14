@@ -2052,3 +2052,69 @@ describe("github-install-state endpoint", () => {
     expect(res.statusCode).toBe(500);
   });
 });
+
+describe("POST /api/deploy", () => {
+  // The shared harness never passes deps, which is itself the 501 case; the rest need
+  // a stubbed starter, so the route is exercised without touching Fly or GitHub.
+  async function deployRequest(
+    token: string,
+    deps: AdminModule.AdminDeps,
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest("/api/deploy", "POST", { authorization: `Bearer ${token}` }, undefined);
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  it("rejects an unauthenticated request before consulting the starter", async () => {
+    let called = false;
+    const res = await deployRequest("not-a-session", {
+      startDeploy: async () => { called = true; return { started: true, commit: "abc1234" }; },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(called).toBe(false);
+  });
+
+  it("answers 501 when the orchestrator is not configured to deploy itself", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {});
+    expect(res.statusCode).toBe(501);
+  });
+
+  it("answers 202 with the commit when a deploy starts", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {
+      startDeploy: async () => ({ started: true, commit: "abc1234" }),
+    });
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).deploying).toBe("abc1234");
+  });
+
+  it("answers 409 when a deploy is already running", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {
+      startDeploy: async () => ({ started: false, reason: "deploy-in-progress" }),
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("answers 503 when HEAD cannot be resolved", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {
+      startDeploy: async () => ({ started: false, reason: "head-unknown" }),
+    });
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("answers 500 without echoing the error text", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {
+      startDeploy: async () => { throw new Error("kg_token=super-secret"); },
+    });
+    expect(res.statusCode).toBe(500);
+    // Admin 5xx bodies leaking raw error text is a known defect elsewhere; this route
+    // must not add to it, and the thrown message here would carry a build secret.
+    expect(res.body).not.toContain("super-secret");
+  });
+});
