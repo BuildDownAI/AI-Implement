@@ -505,6 +505,57 @@ describe("getFleetReport", () => {
       const report = rc.getFleetReport({ days: 365 });
       expect(report.oneShotPct).toBeCloseTo(0.0);
     });
+
+    it("excludes from denominator when first-pass approval is unknowable (null reviewApproved, no review.1 sub-step)", () => {
+      // Job with loop data but no first-pass approval info — oneShot must be null, excluded from denominator
+      const j1 = insertDispatch({ issueId: "unk1", issueIdentifier: "AII-UNK1", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j1, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.01, implementOutcome: "success", reviewApproved: null }],
+      });
+
+      // Job with known first-pass approval
+      const j2 = insertDispatch({ issueId: "unk2", issueIdentifier: "AII-UNK2", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j2, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.01, implementOutcome: "success", reviewApproved: true }],
+      });
+
+      const report = rc.getFleetReport({ days: 365 });
+      // j1 excluded from denominator (first-pass approval unknown); j2 included → 1/1 = 100%
+      // If j1 were counted as a failure: 1/2 = 50%
+      expect(report.oneShotPct).toBeCloseTo(1.0);
+    });
+
+    it("uses review.1 sub-step as fallback when passes[0].reviewApproved is absent", () => {
+      // Feedback-loop step without reviewApproved but review.1 sub-step is present
+      const j1 = insertDispatch({ issueId: "r1fb", issueIdentifier: "AII-R1FB", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j1, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.01, implementOutcome: "success", reviewApproved: null }],
+      });
+      insertSubStep(j1, "review.1", "review", { approved: true });
+
+      const report = rc.getFleetReport({ days: 365 });
+      // review.1 sub-step settles first-pass approval → included in denominator as one-shot
+      expect(report.oneShotPct).toBeCloseTo(1.0);
+    });
+
+    it("excludes from denominator when sub-step path has no review.1", () => {
+      // Sub-step job where the only review step is not review.1
+      const j1 = insertDispatch({ issueId: "nor1", issueIdentifier: "AII-NOR1", repo: "org/r", status: "completed" });
+      insertSubStep(j1, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+      insertSubStep(j1, "review.2", "review", { approved: true }); // review.2, not review.1
+
+      // Job with review.1
+      const j2 = insertDispatch({ issueId: "hasr1", issueIdentifier: "AII-HASR1", repo: "org/r", status: "completed" });
+      insertSubStep(j2, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+      insertSubStep(j2, "review.1", "review", { approved: true });
+
+      const report = rc.getFleetReport({ days: 365 });
+      // j1 has no review.1 → excluded from denominator; j2 → denominator=1, numerator=1 → 100%
+      expect(report.oneShotPct).toBeCloseTo(1.0);
+    });
   });
 
   describe("planning cohort", () => {
