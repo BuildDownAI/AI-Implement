@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { formatRunAutopsy, writeRunAutopsy, type RunAutopsy } from "../run-autopsy.js";
+import { formatRunAutopsy, writeRunAutopsy, formatRunStats, type RunAutopsy } from "../run-autopsy.js";
 
 const AUTOPSY: RunAutopsy = {
   issueIdentifier: "DF-6",
@@ -29,6 +29,80 @@ describe("formatRunAutopsy", () => {
   it("notes when no PR could be opened", () => {
     const md = formatRunAutopsy({ ...AUTOPSY, prUrl: undefined });
     expect(md).toContain("No PR could be opened");
+  });
+});
+
+const STAT_PASSES = [{ iteration: 1, implementTurns: 42, implementOutcome: "success", costUsd: 1.5, reviewApproved: true }];
+
+describe("formatRunStats — planned-vs-actual delta", () => {
+  it("shows all-touched message when planned and changed sets are identical", () => {
+    const md = formatRunStats({
+      issueIdentifier: "AII-1",
+      passes: STAT_PASSES,
+      plannedFiles: ["src/a.ts", "src/b.ts"],
+      filesChanged: ["src/a.ts", "src/b.ts"],
+    });
+    expect(md).toContain("All planned files were touched");
+    expect(md).not.toContain("Unplanned files touched");
+    expect(md).not.toContain("Planned files not touched");
+  });
+
+  it("lists unplanned files touched when filesChanged has extras", () => {
+    const md = formatRunStats({
+      issueIdentifier: "AII-1",
+      passes: STAT_PASSES,
+      plannedFiles: ["src/a.ts"],
+      filesChanged: ["src/a.ts", "src/extra.ts"],
+    });
+    expect(md).toContain("Unplanned files touched");
+    expect(md).toContain("`src/extra.ts`");
+    expect(md).not.toContain("Planned files not touched");
+  });
+
+  it("lists planned files not touched when filesChanged is missing entries", () => {
+    const md = formatRunStats({
+      issueIdentifier: "AII-1",
+      passes: STAT_PASSES,
+      plannedFiles: ["src/a.ts", "src/b.ts"],
+      filesChanged: ["src/a.ts"],
+    });
+    expect(md).toContain("Planned files not touched");
+    expect(md).toContain("`src/b.ts`");
+    expect(md).not.toContain("Unplanned files touched");
+  });
+
+  it("lists both sections when sets partially overlap", () => {
+    const md = formatRunStats({
+      issueIdentifier: "AII-1",
+      passes: STAT_PASSES,
+      plannedFiles: ["src/a.ts", "src/b.ts"],
+      filesChanged: ["src/a.ts", "src/extra.ts"],
+    });
+    expect(md).toContain("Unplanned files touched");
+    expect(md).toContain("`src/extra.ts`");
+    expect(md).toContain("Planned files not touched");
+    expect(md).toContain("`src/b.ts`");
+  });
+
+  it("omits planned-vs-actual section entirely when plannedFiles is empty", () => {
+    const md = formatRunStats({
+      issueIdentifier: "AII-1",
+      passes: STAT_PASSES,
+      plannedFiles: [],
+      filesChanged: ["src/a.ts"],
+    });
+    expect(md).not.toContain("Planned vs actual");
+  });
+
+  it("omits planned-vs-actual section when filesChanged is null (diff unavailable)", () => {
+    const md = formatRunStats({
+      issueIdentifier: "AII-1",
+      passes: STAT_PASSES,
+      plannedFiles: ["src/a.ts", "src/b.ts"],
+      filesChanged: null,
+    });
+    expect(md).not.toContain("Planned vs actual");
+    expect(md).not.toContain("Planned files not touched");
   });
 });
 

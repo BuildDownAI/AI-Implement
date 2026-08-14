@@ -694,7 +694,8 @@ describe("runAutonomous", () => {
       outcome: "success",
       prUrl: "https://github.com/acme/app/pull/1",
     });
-    expect(body.comments).toEqual([{ body: "first" }, { body: "second" }]);
+    expect(body.comments).toEqual(expect.arrayContaining([{ body: "first" }, { body: "second" }]));
+    expect(body.comments.some((c: { body: string }) => c.body.includes("Run stats"))).toBe(true);
   });
 
   it("posts the implementation callback using the AI_IMPLEMENT_RUN_CONFIG envelope's runnerCallbackUrl (GHA mode, RUNNER_CALLBACK_URL unset)", async () => {
