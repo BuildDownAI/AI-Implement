@@ -9,9 +9,17 @@ name: Claude PR review
 
 on:
   pull_request_target:
-    types: [opened, ready_for_review]
+    types: [opened, ready_for_review, synchronize]
   issue_comment:
     types: [created]
+
+# Collapse rapid push bursts: cancel the superseded run and review the settled head.
+# Group covers both PR events (pull_request.number) and comment-triggered re-runs
+# (issue.number). The fallback keeps the expression valid for neither-event contexts,
+# though in practice one of the two is always set.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -21,9 +29,11 @@ permissions:
 
 jobs:
   claude-review:
-    # Auto-run on same-repo PRs (opened/ready_for_review only — not synchronize,
-    # to control cost during iterative pushes). For fork PRs and re-runs, a
-    # maintainer must post `/claude-review` as a comment.
+    # Auto-run on same-repo PRs (opened/ready_for_review/synchronize). The top-level
+    # concurrency group cancels superseded runs on rapid pushes, so cost stays roughly
+    # "one review per quiet period". For fork PRs and re-runs, a maintainer must post
+    # `/claude-review` as a comment — forks must not auto-run on synchronize because
+    # pull_request_target has repository-secret access and that would be a priv-esc vector.
     if: |
       (github.event_name == 'pull_request_target' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
