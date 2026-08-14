@@ -43,14 +43,22 @@ export const authJs = `
   window.raw = raw;
 
   // Tagged template that escapes every interpolation with escAttr() by default.
+  // For href/src attributes, also validates the URL scheme via safeUrl().
   // Wrap a value with raw() to inject pre-built markup without escaping.
+  // Residual: does not detect URL context when the attribute is split across
+  // multiple interpolations or the URL is built in a variable before the template.
   function html(strings, ...values) {
     let result = '';
     for (let i = 0; i < strings.length; i++) {
       result += strings[i];
       if (i < values.length) {
         const v = values[i];
-        result += (v && typeof v === 'object' && v.__raw) ? v.value : escAttr(v);
+        if (v && typeof v === 'object' && v.__raw) {
+          result += v.value;
+        } else {
+          const inUrlAttr = /(?:href|src)\s*=\s*["']?$/i.test(strings[i]);
+          result += escAttr(inUrlAttr ? safeUrl(v) : v);
+        }
       }
     }
     return result;

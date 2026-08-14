@@ -274,7 +274,7 @@ The SPA at `/admin` is composed from string-exporting modules under `src/admin-u
 | Quoted attribute value (`title=`, `data-*`, path in `href=`) | `window.escAttr()` | Also escapes `"` and `'` |
 | Full URL in `href=`/`src=` (scheme from data) | `window.safeUrl()` | Validates scheme; `javascript:` returns `'#'` |
 
-`window.html` is a tagged template that calls `escAttr()` on every interpolation by default; use `window.raw(markup)` to opt out for pre-built HTML. Use `html` for all new markup-building code. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents.
+`window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first. Use `window.raw(markup)` to opt out for pre-built HTML. Use `html` for all new markup-building code. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. Note: when a URL is assembled in a variable and then placed in `html`, the template cannot detect the URL context — call `safeUrl()` explicitly in that case.
 
 Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
 

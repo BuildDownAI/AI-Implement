@@ -42,7 +42,9 @@ Validates the scheme before allowing a value into an `href` or `src` where the w
 
 ### `html` tagged template
 
-A tagged template function that calls `escAttr()` on every interpolation by default. An explicit `raw(markup)` wrapper passes pre-built HTML through unescaped (the equivalent of `dangerouslySetInnerHTML` in React). The default-safe path inverts the discipline required: new code that uses the template is safe without author thought; only intentionally injecting markup requires an explicit opt-out.
+A tagged template function that calls `escAttr()` on every interpolation by default. When the preceding static chunk ends with `href=`, `href="`, `src=`, or `src="` (case-insensitive), it additionally routes the value through `safeUrl()` before `escAttr()`, blocking `javascript:` and other dangerous schemes. An explicit `raw(markup)` wrapper passes pre-built HTML through unescaped (the equivalent of `dangerouslySetInnerHTML` in React).
+
+**Residual case:** the detection inspects only the static chunk immediately before the interpolation. It does not detect URL context when the attribute name and the URL are spread across multiple interpolations, or when the URL is assembled in a variable before entering the template. In those cases, call `safeUrl()` explicitly before passing the value to `html`.
 
 ### Removal of `data-*` + inline `onclick`
 
@@ -54,13 +56,14 @@ Where a value was serialised into a `data-*` attribute and then read back by an 
 
 **Positive:**
 - Every HTML generation path now has a named helper that matches its security context: `esc()` for text, `escAttr()` for attributes, `safeUrl()` for full URLs.
-- The `html` tagged template makes the safe path the lazy path for new code — no attribute/text context distinction to remember.
+- The `html` tagged template makes the safe path the lazy path for new code: `href` and `src` interpolations are scheme-validated automatically; other attribute and text interpolations are HTML-escaped; only pre-built markup requires an explicit `raw()` opt-out.
 - Removing the `data-*` + inline handler pattern eliminates a class of issues rather than mitigating them.
 - The ADR documents the three-way distinction once; `CLAUDE.md` propagates it to every future session.
 
 **Negative / trade-offs:**
 - 154 existing call sites still use `esc()` for text-node content, which is correct but looks identical to the wrong usage. The tagged template is the long-term answer; bulk conversion would be churn without safety benefit today.
-- `safeUrl()` validates scheme but does not HTML-encode the URL contents (e.g., an `&` in a query string). This is acceptable because all Tier 2a URLs originate from GitHub API responses, orchestrator records, and operator-configured Jira site URLs — none of which contain raw quotes or injection-relevant characters.
+- `safeUrl()` validates scheme but does not HTML-encode the URL contents (e.g., an `&` in a query string). When used inside `html`, `escAttr()` encodes the result, so `&` in a query string becomes `&amp;`; this is correct per the HTML spec for attribute values. Manual call sites that use `safeUrl()` directly (outside `html`) do not encode, which is acceptable because all Tier 2a URLs originate from trusted sources — none of which contain raw quotes or injection-relevant characters.
+- The `html` template does not detect URL context when the attribute name and the URL span multiple interpolations, or when the URL is built in a variable before the template call. Those cases require an explicit `safeUrl()` before the value enters the template.
 
 ---
 

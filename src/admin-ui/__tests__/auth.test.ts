@@ -153,4 +153,69 @@ describe("html tagged template", () => {
     expect(result).toContain("&lt;script&gt;");
     expect(result).not.toContain("<script>");
   });
+
+  describe("URL context detection (href/src)", () => {
+    it("blocks javascript: in href interpolation", () => {
+      const win = mountAuth();
+      const result: string = win.html`<a href="${"javascript:alert(document.cookie)"}">x</a>`;
+      expect(result).not.toContain("javascript:");
+      expect(result).toContain('href="#"');
+    });
+
+    it("blocks javascript: in src interpolation", () => {
+      const win = mountAuth();
+      const result: string = win.html`<img src="${"javascript:alert(1)"}">`;
+      expect(result).not.toContain("javascript:");
+      expect(result).toContain('src="#"');
+    });
+
+    it("passes https: URL through href unchanged", () => {
+      const win = mountAuth();
+      const url = "https://example.com/path";
+      const result: string = win.html`<a href="${url}">link</a>`;
+      expect(result).toContain(`href="${url}"`);
+    });
+
+    it("passes https: URL with query string through href (& encoded per HTML spec)", () => {
+      const win = mountAuth();
+      const url = "https://example.com/?a=1&b=2";
+      const result: string = win.html`<a href="${url}">link</a>`;
+      expect(result).toContain("href=");
+      expect(result).not.toContain("javascript:");
+      expect(result).toContain("https://example.com/?a=1");
+    });
+
+    it("detects href with double-quote delimiter", () => {
+      const win = mountAuth();
+      const result: string = win.html`<a href="${"javascript:x"}">x</a>`;
+      expect(result).toContain('href="#"');
+    });
+
+    it("detects href without quote delimiter", () => {
+      const win = mountAuth();
+      // href= with no opening quote before the interpolation
+      const tmpl = (win as { html: (s: TemplateStringsArray, ...v: unknown[]) => string }).html;
+      // Manually exercise via tagged template with no quote
+      const strings = Object.assign(["<a href=", ">x</a>"], { raw: ["<a href=", ">x</a>"] }) as unknown as TemplateStringsArray;
+      const result: string = tmpl(strings, "javascript:alert(1)");
+      expect(result).not.toContain("javascript:");
+    });
+
+    it("does not apply safeUrl to non-URL attributes", () => {
+      const win = mountAuth();
+      // title= should still just escAttr, not safeUrl (so javascript: string is escaped, not replaced with #)
+      const result: string = win.html`<span title="${"javascript:alert(1)"}">x</span>`;
+      // escAttr encodes the colon only if needed; javascript: has no chars to escape
+      // but it should NOT become '#' — that is safeUrl behaviour, not escAttr behaviour
+      expect(result).toContain("javascript:");
+      expect(result).not.toContain('title="#"');
+    });
+
+    it("raw() still opts out in URL context", () => {
+      const win = mountAuth();
+      const markup = win.raw("javascript:alert(1)");
+      const result: string = win.html`<a href="${markup}">x</a>`;
+      expect(result).toContain("javascript:alert(1)");
+    });
+  });
 });
