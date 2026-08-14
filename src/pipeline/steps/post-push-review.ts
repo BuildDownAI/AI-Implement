@@ -60,6 +60,10 @@ const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 300000;
 // "claude-review", "claude code review", and "claude-code-review" cover repos running earlier
 // workflow versions. The heuristic fallback in isExternalReviewCheckName catches other variants.
 const DEFAULT_REVIEW_CHECK_NAMES = ["review", "code-review-plugin", "claude-review", "claude code review", "claude-code-review"];
+// Allowlist of check-run conclusions that represent a reviewer actually producing findings.
+// Anything outside this set — skipped, neutral, cancelled, timed_out, action_required, and any
+// future conclusion GitHub adds — routes to "no-real-verdict" and fails closed.
+const REAL_REVIEW_CONCLUSIONS = new Set(["success", "failure", "stale"]);
 
 async function refreshCredentialsBeforePush(
   context: PipelineContext,
@@ -437,7 +441,7 @@ function probeExternalReviewCheck(
   ghSpawn: (args: string[]) => SpawnResult,
   headSha: string,
   configuredCheckNames: string[] | undefined,
-): "absent" | "running" | "completed" | "all-skipped" {
+): "absent" | "running" | "completed" | "no-real-verdict" {
   const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
   // If we cannot read check state, fail open rather than stall the loop indefinitely.
   if (res.exitCode !== 0) return "absent";
@@ -456,15 +460,14 @@ function probeExternalReviewCheck(
     return "absent";
   }
   if (matching.some((run) => run.status !== "completed")) return "running";
-  // A check whose conclusion is "skipped" or "neutral" is not a real review — it means the
-  // workflow decided not to run (e.g. bot-authored PRs gated on author_association).
-  const hasRealReview = matching.some(
-    (run) => run.conclusion !== "skipped" && run.conclusion !== "neutral",
-  );
+  // Only conclusions a reviewer actually produces count as a real review. Cancelled, skipped,
+  // neutral, timed_out, action_required, and any future conclusion GitHub adds all fail closed —
+  // an unknown conclusion should never silently approve.
+  const hasRealReview = matching.some((run) => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
   if (hasRealReview) return "completed";
-  // Every matching run is completed but none produced a real verdict. Return "all-skipped" so
+  // Every matching run is completed but none produced a real verdict. Return "no-real-verdict" so
   // the caller can fail closed immediately rather than approving as if no check existed.
-  return "all-skipped";
+  return "no-real-verdict";
 }
 
 /**
@@ -472,9 +475,10 @@ function probeExternalReviewCheck(
  * reaches a terminal state, so the merge-readiness decision is made against a real
  * external verdict instead of the empty snapshot that exists when both reviews start.
  *
- * - "completed": the external check finished — read its findings and gate normally.
+ * - "completed": the external check finished with a real verdict — read findings and gate normally.
  * - "absent": no external review check exists for this SHA — fail open (repo has none).
- * - "running": the check exists but did not finish within the budget — fail closed.
+ * - "running": the check is still in flight or concluded without a real verdict (cancelled, skipped,
+ *   etc.) — both cases fail closed; "no-real-verdict" is mapped to "running" immediately.
  */
 async function waitForExternalReviewCompletion(
   ghSpawn: (args: string[]) => SpawnResult,
@@ -492,9 +496,9 @@ async function waitForExternalReviewCompletion(
   let elapsed = 0;
   for (;;) {
     const state = probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames);
-    // "all-skipped": every matching check concluded skipped or neutral — no real review ran for
-    // this SHA. Fail closed immediately rather than failing open the way "absent" does.
-    if (state === "all-skipped") return "running";
+    // "no-real-verdict": every matching check is completed but none produced a reviewer verdict
+    // (e.g. cancelled, skipped, timed_out). Fail closed immediately — a cancelled run is not a review.
+    if (state === "no-real-verdict") return "running";
     if (state !== "running") return state;
     if (elapsed >= opts.timeoutMs) return "running";
     await opts.sleep(opts.pollMs);
