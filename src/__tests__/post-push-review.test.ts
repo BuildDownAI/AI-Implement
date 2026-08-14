@@ -1655,6 +1655,86 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("did not complete") && c.includes("Manual review required"))).toBe(true);
   });
 
+  it("recognizes 'review' and 'code-review-plugin' check names as the external review gate by default", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const sleep = vi.fn(async () => undefined);
+    let checkProbes = 0;
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        checkProbes++;
+        const done = checkProbes >= 2;
+        return {
+          stdout: JSON.stringify({
+            check_runs: [
+              { name: "review", status: done ? "completed" : "in_progress" },
+              { name: "code-review-plugin", status: done ? "completed" : "in_progress" },
+            ],
+          }),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, sleep },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    // Both names must be recognised as the external review gate (not absent), causing the step to wait.
+    expect(sleep).toHaveBeenCalled();
+    expect(checkProbes).toBeGreaterThanOrEqual(2);
+    expect(out.approved).toBe(true);
+  });
+
+  it("logs a warning when check runs are present but none match the external review gate", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: [
+              { name: "ci", status: "completed" },
+              { name: "lint", status: "completed" },
+            ],
+          }),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    let warnings = "";
+
+    try {
+      await postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn },
+        { report: vi.fn(async () => undefined) },
+      );
+      warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(warnings).toContain("No external review check matched");
+    expect(warnings).toContain("ci");
+    expect(warnings).toContain("lint");
+  });
+
   it("fails open and approves when no external review check exists for the head SHA", async () => {
     const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);

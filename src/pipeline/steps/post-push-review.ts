@@ -54,6 +54,11 @@ const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
 const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
 const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 300000;
+// Check-run names produced by the review workflows in this repository.
+// "review" comes from claude-review.yml (pull_request_target, resolves from the base branch).
+// "code-review-plugin" comes from claude-code-review.yml (pull_request, resolves from the PR head).
+// "claude-review" and "claude code review" cover repos still running the pre-AII-276 workflow names.
+const DEFAULT_REVIEW_CHECK_NAMES = ["review", "code-review-plugin", "claude-review", "claude code review"];
 
 async function refreshCredentialsBeforePush(
   context: PipelineContext,
@@ -381,11 +386,8 @@ function shouldCollectExternalReviewFindings(reviewProviders: string[] | undefin
 function isExternalReviewCheckName(name: string, configured: string[] | undefined): boolean {
   const normalized = name.trim().toLowerCase();
   if (!normalized) return false;
-  if (configured && configured.length > 0) {
-    return configured.some((candidate) => candidate.trim().toLowerCase() === normalized);
-  }
-  if (normalized === "claude-review" || normalized === "claude code review") return true;
-  return /claude/.test(normalized) && /review/.test(normalized);
+  const candidates = (configured && configured.length > 0) ? configured : DEFAULT_REVIEW_CHECK_NAMES;
+  return candidates.some((candidate) => candidate.trim().toLowerCase() === normalized);
 }
 
 function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): string {
@@ -431,8 +433,16 @@ function probeExternalReviewCheck(
   const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
   // If we cannot read check state, fail open rather than stall the loop indefinitely.
   if (res.exitCode !== 0) return "absent";
-  const matching = parseCheckRuns(res.stdout).filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
-  if (matching.length === 0) return "absent";
+  const allRuns = parseCheckRuns(res.stdout);
+  const matching = allRuns.filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
+  if (matching.length === 0) {
+    if (allRuns.length > 0) {
+      const presentNames = allRuns.map((r) => r.name).join(", ");
+      const expected = (configuredCheckNames && configuredCheckNames.length > 0) ? configuredCheckNames : DEFAULT_REVIEW_CHECK_NAMES;
+      console.warn(`[post-push-review] No external review check matched; present: ${presentNames}; expected one of: ${expected.join(", ")}`);
+    }
+    return "absent";
+  }
   return matching.every((run) => run.status === "completed") ? "completed" : "running";
 }
 
