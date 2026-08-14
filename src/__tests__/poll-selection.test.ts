@@ -460,6 +460,26 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
     const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
     expect(selectFileOverlapDeferrals([candidate], [sibling], planningContexts)).toHaveLength(0);
   });
+
+  it("defers a null-description candidate when its planning context block overlaps a sibling (Gap 1 fix)", () => {
+    // Pre-fix: || !description short-circuited before the planning-context loop, returning
+    // empty — the very case this feature exists for.
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, null);
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].issueId).toBe("c1");
+  });
+
+  it("defers an empty-description candidate when its planning context block overlaps a sibling (Gap 1 fix)", () => {
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "");
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].issueId).toBe("c1");
+  });
 });
 
 // PR #202 review finding #1 (admin-side remnant): the shared cache resolves in-flight

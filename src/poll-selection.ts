@@ -74,7 +74,7 @@ const groupingBranchOf = (i: TicketIssue) =>
 // body for completeness. Keeps fail-open when all sources are empty.
 function resolveIssueFiles(description: string | null, planningContext?: string): Set<string> {
   const declared = parseDeclaredFiles(description);
-  if (declared.size > 0 || !description) return declared;
+  if (declared.size > 0) return declared;
   for (const src of [planningContext, description]) {
     if (!src) continue;
     const block = parsePlanningBlock(src);

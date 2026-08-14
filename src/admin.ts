@@ -35,7 +35,7 @@ import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, parseDeclaredFiles } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
@@ -537,7 +537,26 @@ async function handleListBlockers(
     const fileOverlapCandidates = allIssues.filter(
       (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && teamRepoMap[i.scopeKey],
     );
-    const fileOverlapBlockers = selectFileOverlapDeferrals(fileOverlapCandidates, inFlightSiblings);
+    const planningContexts = new Map<string, string>();
+    {
+      const issuesNeedingContext = [...fileOverlapCandidates, ...inFlightSiblings].filter(
+        (i) => i.description !== null && parseDeclaredFiles(i.description).size === 0,
+      );
+      await Promise.all(
+        issuesNeedingContext.map(async (issue) => {
+          const mapping = teamRepoMap[issue.scopeKey];
+          if (!mapping) return;
+          try {
+            const p = await registry.forMapping(mapping);
+            const ctx = await p.fetchPlanningContext(issue.id);
+            if (ctx) planningContexts.set(issue.id, ctx);
+          } catch {
+            // fail-open: missing context does not block the admin preview
+          }
+        }),
+      );
+    }
+    const fileOverlapBlockers = selectFileOverlapDeferrals(fileOverlapCandidates, inFlightSiblings, planningContexts);
     const blockers = [...baseBlockers, ...fileOverlapBlockers].sort(
       (a, b) =>
         a.reason.localeCompare(b.reason) ||
