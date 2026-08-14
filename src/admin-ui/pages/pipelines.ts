@@ -197,7 +197,7 @@ export const pipelinesScript = `
             : '' + dn2;
           const runnerCell = phaseBadge(plan.phase) + ' ' + execBadge(plan.executionMode, null) + ' <span style="color:#aaa">→</span> ' + phaseBadge(impl.phase) + ' ' + execBadge(impl.executionMode, impl.runnerMode);
           const imageCell = impl.sessionImage
-            ? '<td class="mono" title="' + window.esc(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
+            ? '<td class="mono" title="' + window.escAttr(impl.sessionImage) + '">' + window.esc(impl.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
           // A grouped row exists only when an implement dispatch followed this plan,
           // which requires plan approval — so a plan row stranded in a non-terminal
@@ -205,7 +205,7 @@ export const pipelinesScript = `
           const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
             ? 'completed' : plan.status;
           const combinedStatus = statusBadge(planStatus) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status);
-          const prLink = impl.prUrl ? '<a href="' + window.esc(impl.prUrl) + '" target="_blank">View</a>' : '—';
+          const prLink = impl.prUrl ? '<a href="' + window.safeUrl(impl.prUrl) + '" target="_blank">View</a>' : '—';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
             + '<td class="mono">' + issueLabel + '</td>'
@@ -228,7 +228,7 @@ export const pipelinesScript = `
             : '' + dn3;
           const runnerCell = phaseBadge(entry.phase) + ' ' + execBadge(entry.executionMode, entry.runnerMode);
           const imageCell = entry.sessionImage
-            ? '<td class="mono" title="' + window.esc(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
+            ? '<td class="mono" title="' + window.escAttr(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
@@ -239,7 +239,7 @@ export const pipelinesScript = `
             + '<td>' + runnerCell + '</td>'
             + imageCell
             + '<td>' + statusBadge(entry.status) + '</td>'
-            + '<td>' + (entry.prUrl ? '<a href="' + window.esc(entry.prUrl) + '" target="_blank">View</a>' : '—') + '</td>';
+            + '<td>' + (entry.prUrl ? '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">View</a>' : '—') + '</td>';
         }
         tbody.appendChild(tr);
       }

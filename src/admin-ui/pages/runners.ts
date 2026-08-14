@@ -208,7 +208,12 @@ export const runnersScript = `
         + '<td class="mono">' + window.esc(String(p.failures)) + '</td>'
         + '<td class="mono">' + window.esc(p.lastConclusion || '—') + '</td>'
         + '<td class="mono">' + window.esc(fmtAgo(p.parkedAt)) + '</td>'
-        + '<td><button class="btn btn-sm" data-id="' + window.esc(p.issueId) + '" onclick="window.unparkIssue(this.dataset.id)">Unpark</button></td>';
+        + '<td></td>';
+      const unparkBtn = document.createElement('button');
+      unparkBtn.className = 'btn btn-sm';
+      unparkBtn.textContent = 'Unpark';
+      unparkBtn.addEventListener('click', function() { window.unparkIssue(p.issueId); });
+      tr.lastElementChild.appendChild(unparkBtn);
       parkedBody.appendChild(tr);
     }
 
@@ -237,10 +242,10 @@ export const runnersScript = `
         const machineId = s.machineId || '';
         const machineTrunc = machineId.length > 12 ? machineId.slice(0, 12) : machineId;
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td class="mono" title="' + window.esc(s.issueTitle || '') + '">' + window.esc(s.issueIdentifier || '—') + '</td>'
+        tr.innerHTML = '<td class="mono" title="' + window.escAttr(s.issueTitle || '') + '">' + window.esc(s.issueIdentifier || '—') + '</td>'
           + '<td class="mono">' + window.esc(s.teamKey || '—') + '</td>'
           + '<td class="mono">' + window.esc(s.repo || '—') + '</td>'
-          + '<td class="mono" title="' + window.esc(machineId) + '">' + window.esc(machineTrunc) + '</td>'
+          + '<td class="mono" title="' + window.escAttr(machineId) + '">' + window.esc(machineTrunc) + '</td>'
           + '<td><span class="badge ' + stateBadgeKind + '">' + window.esc(s.state || '—') + '</span></td>';
         sessionsBody.appendChild(tr);
       }

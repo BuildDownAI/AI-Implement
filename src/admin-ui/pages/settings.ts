@@ -138,7 +138,12 @@ export const settingsScript = `
           const dt = s.createdAt ? new Date(s.createdAt).toLocaleString() : '—';
           tr.innerHTML = '<td class="mono">' + window.esc(s.name) + '</td>'
             + '<td style="color:#888;font-size:0.85em">' + dt + '</td>'
-            + '<td><button class="sm danger" data-name="' + window.esc(s.name) + '" onclick="deleteGlobalSecret(this.dataset.name)">Delete</button></td>';
+            + '<td></td>';
+          const delSecretBtn = document.createElement('button');
+          delSecretBtn.className = 'sm danger';
+          delSecretBtn.textContent = 'Delete';
+          delSecretBtn.addEventListener('click', function() { deleteGlobalSecret(s.name); });
+          tr.lastElementChild.appendChild(delSecretBtn);
           tbody.appendChild(tr);
         }
       }

@@ -69,7 +69,7 @@ export const blockersScript = `
         + '<td><span class="mono">' + window.esc(b.teamKey) + '</span></td>'
         + '<td>' + reasonBadge(b.reason) + '</td>'
         + '<td class="col-grow"><span class="text-secondary">' + window.esc(b.detail) + '</span></td>'
-        + '<td><a class="text-accent" href="https://linear.app/issue/' + window.esc(b.issueIdentifier) + '" target="_blank">Open ↗</a></td>';
+        + '<td><a class="text-accent" href="https://linear.app/issue/' + window.escAttr(b.issueIdentifier) + '" target="_blank">Open ↗</a></td>';
       tbody.appendChild(tr);
     }
   }

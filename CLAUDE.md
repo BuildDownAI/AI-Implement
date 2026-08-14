@@ -264,7 +264,17 @@ Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll dete
 
 SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. **Authorization and session identity key on different claims, and it is easy to state this backwards:** authorization is a fail-closed allowlist matched against the verified *email*, while the session stores the provider's stable `sub`, because email is mutable.
 
-The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — all client JS is concatenated into one inline `<script>` at module load. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` / `window.esc()` rather than bare globals. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts`.
+The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — all client JS is concatenated into one inline `<script>` at module load. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the HTML-escaping helpers (below) rather than bare globals. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts`.
+
+**HTML escaping — three-way rule** (full rationale: [docs/adr/002-admin-ui-html-escaping.md](docs/adr/002-admin-ui-html-escaping.md)):
+
+| Context | Helper | Why |
+|---|---|---|
+| Text content (`innerHTML`, `textContent`) | `window.esc()` | Escapes `&`, `<`, `>` via DOM round-trip |
+| Quoted attribute value (`title=`, `data-*`, path in `href=`) | `window.escAttr()` | Also escapes `"` and `'` |
+| Full URL in `href=`/`src=` (scheme from data) | `window.safeUrl()` | Validates scheme; `javascript:` returns `'#'` |
+
+`window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first. Use `window.raw(markup)` to opt out for pre-built HTML. Use `html` for all new markup-building code. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. Note: when a URL is assembled in a variable and then placed in `html`, the template cannot detect the URL context — call `safeUrl()` explicitly in that case.
 
 Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
 

@@ -405,7 +405,7 @@ export const overviewScript = `
       const tint = p.on ? 'var(--st-ok-fg, #2a8)' : 'var(--text-tertiary, #888)';
       const dot = p.on ? '●' : '○';
       const text = p.label + ' ' + (p.on ? 'ON' : 'off');
-      return '<span title="' + window.esc(p.hint) + '" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border, #2a2a2a);border-radius:999px;font-size:0.85em;color:' + tint + '"><span style="font-size:0.7em">' + dot + '</span>' + window.esc(text) + '</span>';
+      return '<span title="' + window.escAttr(p.hint) + '" style="display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border, #2a2a2a);border-radius:999px;font-size:0.85em;color:' + tint + '"><span style="font-size:0.7em">' + dot + '</span>' + window.esc(text) + '</span>';
     }).join('');
   }
 

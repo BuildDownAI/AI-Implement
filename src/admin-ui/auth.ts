@@ -11,6 +11,60 @@ export const authJs = `
     return d.innerHTML;
   }
   window.esc = esc;
+
+  function escAttr(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#x27;');
+  }
+  window.escAttr = escAttr;
+
+  // Validates URL scheme; returns '#' for javascript:, data:, etc.
+  // Relative URLs (/path, ./path, #fragment) and http/https/mailto pass through.
+  function safeUrl(s) {
+    if (s == null) return '#';
+    const str = String(s);
+    if (!str) return '';
+    if (str[0] === '#' || str[0] === '/' || str[0] === '.' || !str.includes(':')) return str;
+    try {
+      const url = new URL(str);
+      if (url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'mailto:') return str;
+    } catch (_) { /* malformed URL with colon — block it */ }
+    return '#';
+  }
+  window.safeUrl = safeUrl;
+
+  function raw(s) {
+    return { __raw: true, value: String(s == null ? '' : s) };
+  }
+  window.raw = raw;
+
+  // Tagged template that escapes every interpolation with escAttr() by default.
+  // For href/src attributes, also validates the URL scheme via safeUrl().
+  // Wrap a value with raw() to inject pre-built markup without escaping.
+  // Residual: does not detect URL context when the attribute is split across
+  // multiple interpolations or the URL is built in a variable before the template.
+  function html(strings, ...values) {
+    let result = '';
+    for (let i = 0; i < strings.length; i++) {
+      result += strings[i];
+      if (i < values.length) {
+        const v = values[i];
+        if (v && typeof v === 'object' && v.__raw) {
+          result += v.value;
+        } else {
+          const inUrlAttr = /(?:href|src)\s*=\s*["']?$/i.test(strings[i]);
+          result += escAttr(inUrlAttr ? safeUrl(v) : v);
+        }
+      }
+    }
+    return result;
+  }
+  window.html = html;
+
   // Brand marks for the provider tiles; unknown providers render label-only.
   var PROVIDER_ICONS = {
     google: '<svg viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.28-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>',

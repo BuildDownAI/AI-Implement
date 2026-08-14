@@ -72,7 +72,7 @@ export const issuesScript = `
         + '<td><span class="mono">' + window.esc(issue.teamKey) + '</span></td>'
         + '<td><span class="badge ' + stateKind + '"><span class="dot"></span>' + window.esc(issue.stateName) + '</span></td>'
         + '<td>' + planBadge + '</td>'
-        + '<td><a class="text-accent" href="https://linear.app/issue/' + window.esc(issue.identifier) + '" target="_blank">Open ↗</a></td>';
+        + '<td><a class="text-accent" href="https://linear.app/issue/' + window.escAttr(issue.identifier) + '" target="_blank">Open ↗</a></td>';
       tbody.appendChild(tr);
     }
   }
