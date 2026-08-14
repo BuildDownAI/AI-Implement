@@ -35,7 +35,7 @@ import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, parseDeclaredFiles } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, parseDeclaredFiles, getCachedPlanningContext, setCachedPlanningContext } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
@@ -553,16 +553,24 @@ async function handleListBlockers(
     const planningContexts = new Map<string, string>();
     {
       const issuesNeedingContext = [...fileOverlapCandidates, ...inFlightSiblings].filter(
-        (i) => parseDeclaredFiles(i.description).size === 0,
+        (i) => parseDeclaredFiles(i.description).size === 0 && Boolean(i.featureBranchChain?.length),
       );
       await Promise.all(
         issuesNeedingContext.map(async (issue) => {
+          const cached = getCachedPlanningContext(issue.id);
+          if (cached !== undefined) {
+            planningContexts.set(issue.id, cached);
+            return;
+          }
           const mapping = teamRepoMap[issue.scopeKey];
           if (!mapping) return;
           try {
             const p = await registry.forMapping(mapping);
             const ctx = await p.fetchPlanningContext(issue.id);
-            if (ctx) planningContexts.set(issue.id, ctx);
+            if (ctx) {
+              setCachedPlanningContext(issue.id, ctx);
+              planningContexts.set(issue.id, ctx);
+            }
           } catch {
             // fail-open: missing context does not block the admin preview
           }

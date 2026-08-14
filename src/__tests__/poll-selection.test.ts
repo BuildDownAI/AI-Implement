@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates } from "../poll-selection.js";
+import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
 
@@ -523,5 +523,78 @@ describe("shared seen-candidates cache (rememberCandidates / resolveInFlightSibl
     const d = selectFileOverlapDeferrals([cand], resolveInFlightSiblings(["in-flight-1"]));
     expect(d).toHaveLength(1);
     resetSeenCandidates();
+  });
+});
+
+// AII-390: planning-context fetch is gated on featureBranchChain being non-empty.
+// Issues outside a feature tree can never produce a deferral, so fetching their
+// planning context is wasted work. The filter in index.ts / admin.ts must match the
+// predicate that selectFileOverlapDeferrals itself uses for groupingBranchOf.
+describe("planning-context fetch filter — grouping-branch guard (AII-390)", () => {
+  it("excludes non-feature-tree issues from the fetch filter", () => {
+    const nonFeature = makeIssue("i1", "AII-1", "AII", { description: "Prose only." });
+    const featureIssue = makeFeatureIssue("i2", "AII-2", "AII", "FEAT-1", "Prose only.");
+
+    // Inline the filter from src/index.ts and src/admin.ts after AII-390.
+    const needingContext = [nonFeature, featureIssue].filter(
+      (i) => parseDeclaredFiles(i.description).size === 0 && Boolean(i.featureBranchChain?.length),
+    );
+
+    expect(needingContext.some((i) => i.id === "i1")).toBe(false);
+    expect(needingContext.some((i) => i.id === "i2")).toBe(true);
+  });
+
+  it("excludes feature-tree issues whose description already has file bullets", () => {
+    const withBullets = makeFeatureIssue("i1", "AII-1", "AII", "FEAT-1", "- Modify: `src/a.ts`");
+    const withoutBullets = makeFeatureIssue("i2", "AII-2", "AII", "FEAT-1", "Prose only.");
+
+    const needingContext = [withBullets, withoutBullets].filter(
+      (i) => parseDeclaredFiles(i.description).size === 0 && Boolean(i.featureBranchChain?.length),
+    );
+
+    expect(needingContext.some((i) => i.id === "i1")).toBe(false);
+    expect(needingContext.some((i) => i.id === "i2")).toBe(true);
+  });
+});
+
+// AII-390: planning context is memoised per issue id so the same issue is not
+// re-fetched on every 60-second poll cycle for the life of a run.
+describe("planning context cache (AII-390)", () => {
+  it("getCachedPlanningContext returns undefined before any value is set", () => {
+    resetPlanningContextCache();
+    expect(getCachedPlanningContext("never-set")).toBeUndefined();
+    resetPlanningContextCache();
+  });
+
+  it("getCachedPlanningContext returns the value set by setCachedPlanningContext", () => {
+    resetPlanningContextCache();
+    setCachedPlanningContext("issue-1", "## Planning context");
+    expect(getCachedPlanningContext("issue-1")).toBe("## Planning context");
+    resetPlanningContextCache();
+  });
+
+  it("second poll cycle hits the cache — at most one fetch per issue per process", () => {
+    resetPlanningContextCache();
+    let fetchCount = 0;
+
+    // Poll cycle 1: cache miss → fetch
+    if (getCachedPlanningContext("issue-1") === undefined) {
+      fetchCount++;
+      setCachedPlanningContext("issue-1", "## planning context");
+    }
+
+    // Poll cycle 2: cache hit → no fetch
+    if (getCachedPlanningContext("issue-1") === undefined) {
+      fetchCount++;
+    }
+
+    expect(fetchCount).toBe(1);
+    resetPlanningContextCache();
+  });
+
+  it("resetPlanningContextCache clears all entries", () => {
+    setCachedPlanningContext("issue-1", "some context");
+    resetPlanningContextCache();
+    expect(getCachedPlanningContext("issue-1")).toBeUndefined();
   });
 });

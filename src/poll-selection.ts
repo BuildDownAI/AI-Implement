@@ -65,6 +65,23 @@ export function resetSeenCandidates(): void {
   seenCandidatesById.clear();
 }
 
+// Per-process cache for planning contexts. Planning comments are immutable once the
+// planning run completes, so caching by issue id avoids re-fetching on every poll cycle.
+const planningContextCache = new Map<string, string>();
+
+export function getCachedPlanningContext(issueId: string): string | undefined {
+  return planningContextCache.get(issueId);
+}
+
+export function setCachedPlanningContext(issueId: string, ctx: string): void {
+  planningContextCache.set(issueId, ctx);
+}
+
+/** Test hook: clear the planning context cache. */
+export function resetPlanningContextCache(): void {
+  planningContextCache.clear();
+}
+
 const groupingBranchOf = (i: TicketIssue) =>
   i.featureBranchChain?.length ? i.featureBranchChain[i.featureBranchChain.length - 1] : null;
 
@@ -78,7 +95,7 @@ function resolveIssueFiles(description: string | null, planningContext?: string)
   for (const src of [planningContext, description]) {
     if (!src) continue;
     const block = parsePlanningBlock(src);
-    if (block && block.files.length > 0) return new Set(block.files.slice(0, 200));
+    if (block && block.files.length > 0) return new Set(block.files);
   }
   return declared;
 }
