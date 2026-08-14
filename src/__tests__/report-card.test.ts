@@ -505,6 +505,80 @@ describe("getFleetReport", () => {
       const report = rc.getFleetReport({ days: 365 });
       expect(report.oneShotPct).toBeCloseTo(0.0);
     });
+
+    it("excludes from denominator when first-pass approval is unknowable (null reviewApproved, no review.1 sub-step)", () => {
+      // Job with loop data but no first-pass approval info — oneShot must be null, excluded from denominator
+      const j1 = insertDispatch({ issueId: "unk1", issueIdentifier: "AII-UNK1", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j1, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.01, implementOutcome: "success", reviewApproved: null }],
+      });
+
+      // Job with known first-pass approval
+      const j2 = insertDispatch({ issueId: "unk2", issueIdentifier: "AII-UNK2", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j2, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.01, implementOutcome: "success", reviewApproved: true }],
+      });
+
+      const report = rc.getFleetReport({ days: 365 });
+      // j1 excluded from denominator (first-pass approval unknown); j2 included → 1/1 = 100%
+      // If j1 were counted as a failure: 1/2 = 50%
+      expect(report.oneShotPct).toBeCloseTo(1.0);
+    });
+
+    it("uses review.1 sub-step as fallback when passes[0].reviewApproved is absent", () => {
+      // Feedback-loop step without reviewApproved but review.1 sub-step is present
+      const j1 = insertDispatch({ issueId: "r1fb", issueIdentifier: "AII-R1FB", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j1, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.01, implementOutcome: "success", reviewApproved: null }],
+      });
+      insertSubStep(j1, "review.1", "review", { approved: true });
+
+      const report = rc.getFleetReport({ days: 365 });
+      // review.1 sub-step settles first-pass approval → included in denominator as one-shot
+      expect(report.oneShotPct).toBeCloseTo(1.0);
+    });
+
+    it("excludes from denominator when sub-step path has no review.1", () => {
+      // Sub-step job where the only review step is not review.1
+      const j1 = insertDispatch({ issueId: "nor1", issueIdentifier: "AII-NOR1", repo: "org/r", status: "completed" });
+      insertSubStep(j1, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+      insertSubStep(j1, "review.2", "review", { approved: true }); // review.2, not review.1
+
+      // Job with review.1
+      const j2 = insertDispatch({ issueId: "hasr1", issueIdentifier: "AII-HASR1", repo: "org/r", status: "completed" });
+      insertSubStep(j2, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+      insertSubStep(j2, "review.1", "review", { approved: true });
+
+      const report = rc.getFleetReport({ days: 365 });
+      // j1 has no review.1 → excluded from denominator; j2 → denominator=1, numerator=1 → 100%
+      expect(report.oneShotPct).toBeCloseTo(1.0);
+    });
+
+    it("counts re-dispatches of the same issue as separate jobs", () => {
+      // Two dispatches for the same issue: first not one-shot, second one-shot.
+      // Per-job (correct): 2 eligible, 1 one-shot → 50%.
+      // Per-issue-first-job (old bug): 1 eligible (first), 0 one-shot → 0%.
+      const j1 = insertDispatch({ issueId: "multi-i", issueIdentifier: "AII-MULTI", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j1, {
+        approved: true, iterations: 2, terminationReason: "approved",
+        passes: [
+          { iteration: 1, costUsd: 0.05, implementOutcome: "success", reviewApproved: false },
+          { iteration: 2, costUsd: 0.05, implementOutcome: "success", reviewApproved: true },
+        ],
+      });
+      const j2 = insertDispatch({ issueId: "multi-i", issueIdentifier: "AII-MULTI", repo: "org/r", status: "completed" });
+      insertFeedbackLoopStep(j2, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+      });
+
+      const report = rc.getFleetReport({ days: 365 });
+      // 2 eligible jobs, 1 one-shot → 50%; would be 0% if only the first job counted
+      expect(report.oneShotPct).toBeCloseTo(0.5);
+    });
   });
 
   describe("planning cohort", () => {
@@ -533,6 +607,38 @@ describe("getFleetReport", () => {
       expect(report.planning.planned.oneShotPct).toBeCloseTo(1.0);
       expect(report.planning.unplanned.jobs).toBe(1);
       expect(report.planning.unplanned.oneShotPct).toBeCloseTo(0.0);
+    });
+
+    it("assigns each dispatch to its cohort based on whether planning preceded that dispatch", () => {
+      // Issue "PL-LATE": impl dispatch 1 at base (before planning), planning at base+1000,
+      // impl dispatch 2 at base+2000 (after planning).
+      // Per-dispatch (correct): dispatch 1 → unplanned, dispatch 2 → planned.
+      // Per-issue (old bug): firstImplAt=base, planAt=base+1000 > base → whole issue unplanned;
+      //   both dispatches would land in unplanned, leaving planned.jobs=0.
+      const base = Date.now() - 20000;
+      const j1 = insertDispatch({ issueId: "pllate", issueIdentifier: "AII-PLLATE", repo: "org/r",
+        phase: "implementation", dispatchedAt: base, status: "completed" });
+      insertFeedbackLoopStep(j1, {
+        approved: true, iterations: 2, terminationReason: "approved",
+        passes: [
+          { iteration: 1, costUsd: 0.05, implementOutcome: "success", reviewApproved: false },
+          { iteration: 2, costUsd: 0.05, implementOutcome: "success", reviewApproved: true },
+        ],
+      });
+      insertDispatch({ issueId: "pllate", issueIdentifier: "AII-PLLATE", repo: "org/r",
+        phase: "planning", dispatchedAt: base + 1000 });
+      const j2 = insertDispatch({ issueId: "pllate", issueIdentifier: "AII-PLLATE", repo: "org/r",
+        phase: "implementation", dispatchedAt: base + 2000, status: "completed" });
+      insertFeedbackLoopStep(j2, {
+        approved: true, iterations: 1, terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+      });
+
+      const report = rc.getFleetReport({ days: 365 });
+      expect(report.planning.planned.jobs).toBe(1);   // j2 only
+      expect(report.planning.unplanned.jobs).toBe(1); // j1 only
+      expect(report.planning.planned.oneShotPct).toBeCloseTo(1.0);   // j2 was one-shot
+      expect(report.planning.unplanned.oneShotPct).toBeCloseTo(0.0); // j1 was not one-shot
     });
   });
 

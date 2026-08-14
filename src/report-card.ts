@@ -89,6 +89,7 @@ interface FeedbackLoopOutputs {
   passes?: Array<{
     costUsd?: number | null;
     implementOutcome?: string;
+    reviewApproved?: boolean | null;
   }>;
 }
 
@@ -315,7 +316,7 @@ interface FleetDispatchRow {
 
 interface JobPassStats {
   passes: number;
-  oneShot: boolean;
+  oneShot: boolean | null;
   costUsd: number | null;
   approved: boolean;
 }
@@ -344,16 +345,36 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
       }
       const iterations = out.iterations ?? passes.length;
       const approved = out.approved ?? false;
-      return { passes: iterations, oneShot: iterations === 1 && approved, costUsd, approved };
+
+      // Use passes[0].reviewApproved if present; fall back to review.1 sub-step.
+      // Return null when neither source is available — first-pass approval is unknowable.
+      const firstPassFromPasses = passes[0]?.reviewApproved ?? null;
+      let oneShot: boolean | null;
+      if (firstPassFromPasses != null) {
+        oneShot = firstPassFromPasses;
+      } else {
+        let review1Approved: boolean | null = null;
+        try {
+          const r1Row = db
+            .prepare(`SELECT outputs_json FROM step_log WHERE job_id = ? AND step_id = 'review.1' LIMIT 1`)
+            .get(jobId) as { outputs_json: string } | undefined;
+          if (r1Row) {
+            review1Approved = (JSON.parse(r1Row.outputs_json) as ReviewOutputs).approved ?? null;
+          }
+        } catch { /* step_log absent */ }
+        oneShot = review1Approved;
+      }
+
+      return { passes: iterations, oneShot, costUsd, approved };
     } catch { /* fallthrough */ }
   }
 
   // Sub-step fallback
-  let rows: Array<{ step_type: string; outputs_json: string }> = [];
+  let rows: Array<{ step_id: string; step_type: string; outputs_json: string }> = [];
   try {
     rows = db
       .prepare(
-        `SELECT step_type, outputs_json FROM step_log
+        `SELECT step_id, step_type, outputs_json FROM step_log
          WHERE job_id = ? AND step_type IN ('implement', 'review')
          ORDER BY id ASC`,
       )
@@ -364,6 +385,7 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
 
   let iterations = 0;
   let lastApproved = false;
+  let firstPassApproved: boolean | null = null;
   let costUsd: number | null = null;
   for (const row of rows) {
     try {
@@ -372,11 +394,15 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
         const c = (JSON.parse(row.outputs_json) as ImplementOutputs).telemetry?.costUsd;
         if (c != null) costUsd = (costUsd ?? 0) + c;
       } else {
-        lastApproved = (JSON.parse(row.outputs_json) as ReviewOutputs).approved ?? false;
+        const reviewOut = JSON.parse(row.outputs_json) as ReviewOutputs;
+        lastApproved = reviewOut.approved ?? false;
+        if (row.step_id === "review.1") {
+          firstPassApproved = reviewOut.approved ?? null;
+        }
       }
     } catch { /* skip */ }
   }
-  return { passes: iterations, oneShot: iterations === 1 && lastApproved, costUsd, approved: lastApproved };
+  return { passes: iterations, oneShot: firstPassApproved, costUsd, approved: lastApproved };
 }
 
 // ---- getFleetReport ----
@@ -487,45 +513,35 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
 
   // --- Fleet-level one-shot / eventual ---
 
-  // Group impl dispatches by issue key
-  const issueToJobIds = new Map<string, number[]>();
-  for (const d of implDispatches) {
-    const key = d.issue_identifier ?? d.issue_id;
-    if (!issueToJobIds.has(key)) issueToJobIds.set(key, []);
-    issueToJobIds.get(key)!.push(d.id);
-  }
+  // Count distinct issues for eventualPct denominator
+  const issueKeys = new Set<string>();
+  for (const d of implDispatches) issueKeys.add(d.issue_identifier ?? d.issue_id);
+  const totalIssues = issueKeys.size;
 
+  // oneShotPct: one row per implement dispatch, matching SQL §2 (FROM impl_jobs WHERE iterations IS NOT NULL).
+  // Every dispatch with a determinable review.1 outcome counts — including re-dispatches of the same issue.
   let oneShotCount = 0;
   let oneShotEligible = 0;
-  let eventualCount = 0;
-  const totalIssues = issueToJobIds.size;
+  const approvedIssues = new Set<string>();
 
-  for (const [, jobIds] of issueToJobIds) {
-    let hasLoopData = false;
-    let firstJobOneShot = false;
-    let anyApproved = false;
-
-    for (let i = 0; i < jobIds.length; i++) {
-      const stats = jobPassStats(db, jobIds[i]!);
-      if (!stats) continue;
-      hasLoopData = true;
-      if (i === 0 && stats.oneShot) firstJobOneShot = true;
-      if (stats.approved) anyApproved = true;
-    }
-
-    if (hasLoopData) {
+  for (const d of implDispatches) {
+    const stats = jobPassStats(db, d.id);
+    if (stats === null) continue;
+    if (stats.oneShot !== null) {
       oneShotEligible++;
-      if (firstJobOneShot) oneShotCount++;
+      if (stats.oneShot) oneShotCount++;
     }
-    if (anyApproved) eventualCount++;
+    if (stats.approved) approvedIssues.add(d.issue_identifier ?? d.issue_id);
   }
 
+  const eventualCount = approvedIssues.size;
   const oneShotPct = oneShotEligible > 0 ? oneShotCount / oneShotEligible : null;
   const eventualPct = totalIssues > 0 ? eventualCount / totalIssues : null;
 
   // --- Planning cohort ---
 
-  // Track earliest planning dispatch per issue
+  // Track earliest planning dispatch per issue.
+  // Each impl dispatch is classified individually: planned = planning preceded *this* dispatch (SQL §3).
   const planningByIssue = new Map<string, number>();
   for (const d of dispatches) {
     if (d.phase !== "planning") continue;
@@ -534,24 +550,10 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
     if (prev === undefined || d.dispatched_at < prev) planningByIssue.set(key, d.dispatched_at);
   }
 
-  // Track earliest impl dispatch per issue
-  const firstImplAt = new Map<string, number>();
-  for (const d of implDispatches) {
-    const key = d.issue_identifier ?? d.issue_id;
-    const prev = firstImplAt.get(key);
-    if (prev === undefined || d.dispatched_at < prev) firstImplAt.set(key, d.dispatched_at);
-  }
-
-  // An issue is "planned" if its planning dispatch ≤ its first impl dispatch
-  const plannedIssueSet = new Set<string>();
-  for (const [key, implAt] of firstImplAt) {
-    const planAt = planningByIssue.get(key);
-    if (planAt !== undefined && planAt <= implAt) plannedIssueSet.add(key);
-  }
-
   function cohortFor(planned: boolean): PlanningCohort {
     let jobs = 0;
     let eligibleJobs = 0;
+    let oneShotEligibleJobs = 0;
     let oneShotC = 0;
     let totalPassesC = 0;
     let totalCostC: number | null = null;
@@ -559,7 +561,8 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
 
     for (const d of implDispatches) {
       const key = d.issue_identifier ?? d.issue_id;
-      if (plannedIssueSet.has(key) !== planned) continue;
+      const planAt = planningByIssue.get(key);
+      if ((planAt !== undefined && planAt <= d.dispatched_at) !== planned) continue;
       jobs++;
       cohortIssues.add(key);
 
@@ -568,7 +571,11 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
         eligibleJobs++;
         totalPassesC += stats.passes;
         if (stats.costUsd != null) totalCostC = (totalCostC ?? 0) + stats.costUsd;
-        if (stats.oneShot) oneShotC++;
+        // Only count in one-shot denominator when first-pass approval is determinable.
+        if (stats.oneShot !== null) {
+          oneShotEligibleJobs++;
+          if (stats.oneShot) oneShotC++;
+        }
       }
     }
 
@@ -584,7 +591,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
 
     return {
       jobs,
-      oneShotPct: eligibleJobs > 0 ? oneShotC / eligibleJobs : null,
+      oneShotPct: oneShotEligibleJobs > 0 ? oneShotC / oneShotEligibleJobs : null,
       avgPasses: eligibleJobs > 0 ? totalPassesC / eligibleJobs : null,
       avgCostUsd: eligibleJobs > 0 && totalCostC != null ? totalCostC / eligibleJobs : null,
       mergedPct: cohortIssues.size > 0 ? mergedC / cohortIssues.size : null,
