@@ -6,7 +6,7 @@ import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
-const DEFAULT_MODEL = "claude-sonnet-4-6";
+const DEFAULT_MODEL = "claude-sonnet-5";
 
 interface FeedbackLoopInputs extends Record<string, unknown> {
   workspaceDir: string;

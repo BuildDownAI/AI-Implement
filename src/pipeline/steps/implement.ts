@@ -67,7 +67,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
 
     const result = await context.llmExecutor.invoke({
       prompt: fullPrompt,
-      model: model ?? "claude-sonnet-4-6",
+      model: model ?? "claude-sonnet-5",
       maxTurns,
     });
 

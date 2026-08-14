@@ -50,7 +50,7 @@ describe("implementStep", () => {
     );
   });
 
-  it("defaults model to claude-sonnet-4-6 when not specified", async () => {
+  it("defaults model to claude-sonnet-5 when not specified", async () => {
     const executor = makeExecutor();
     const ctx = makeContext(executor);
 
@@ -61,7 +61,7 @@ describe("implementStep", () => {
     );
 
     expect(executor.invoke).toHaveBeenCalledWith(
-      expect.objectContaining({ model: "claude-sonnet-4-6" }),
+      expect.objectContaining({ model: "claude-sonnet-5" }),
     );
   });
 
