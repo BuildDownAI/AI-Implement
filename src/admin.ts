@@ -29,6 +29,9 @@ import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, 
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import type { DeployStart } from "./deploy.js";
+import { getAvailability } from "./deploy-availability.js";
+import { isDeployHeld } from "./deploy-hold.js";
+import { getInFlightWork } from "./in-flight-work.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls, getIssueEnrichment } from "./log.js";
@@ -228,6 +231,18 @@ export function handleAdminRequest(
 
     if (url === "/api/deploy" && method === "POST") {
       handleDeployTrigger(res, deps);
+      return true;
+    }
+
+    if (url === "/api/deployment-status" && method === "GET") {
+      const availability = getAvailability();
+      json(res, 200, {
+        configured: !!deps.startDeploy,
+        available: availability?.available ?? null,
+        held: isDeployHeld(),
+        inFlight: getInFlightWork(),
+        checkedAt: availability?.checkedAt ?? null,
+      });
       return true;
     }
 

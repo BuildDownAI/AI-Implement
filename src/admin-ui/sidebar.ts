@@ -20,11 +20,12 @@ const groups: NavGroup[] = [
     { key: "policies",  label: "Policies & risk",     icon: "shield" },
   ]},
   { label: "Platform", items: [
-    { key: "runners",  label: "Runners",  icon: "cpu" },
-    { key: "sessions", label: "Sessions", icon: "server" },
-    { key: "reaper",   label: "Reaper",   icon: "broom" },
-    { key: "secrets",  label: "Secrets",  icon: "key" },
-    { key: "settings", label: "Settings", icon: "settings" },
+    { key: "runners",     label: "Runners",     icon: "cpu" },
+    { key: "sessions",    label: "Sessions",    icon: "server" },
+    { key: "deployments", label: "Deployments", icon: "rocket", count: "deploy-available" },
+    { key: "reaper",      label: "Reaper",      icon: "broom" },
+    { key: "secrets",     label: "Secrets",     icon: "key" },
+    { key: "settings",    label: "Settings",    icon: "settings" },
   ]},
   { label: "Developer", items: [
     { key: "mcp",            label: "MCP server",     icon: "plug" },
