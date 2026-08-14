@@ -10,6 +10,7 @@ const groups: NavGroup[] = [
     { key: "jobs",     label: "Pipelines",     icon: "queue",   count: "running" },
     { key: "pulls",    label: "Pull requests", icon: "git",     count: "pulls" },
     { key: "blockers", label: "Blockers",      icon: "alert",   count: "blockers" },
+    { key: "reports",  label: "Reports",       icon: "layers" },
   ]},
   { label: "Configure", items: [
     { key: "projects",  label: "Projects",            icon: "folder" },
