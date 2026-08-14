@@ -462,7 +462,7 @@ export function handleAdminRequest(
       const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
       const p = new URLSearchParams(qs);
       const daysRaw = p.get("days");
-      const projectParam = p.get("project") ?? undefined;
+      const projectParam = p.get("project") || undefined;
       const daysNum = daysRaw ? parseInt(daysRaw, 10) : NaN;
       const days = Number.isFinite(daysNum) && daysNum > 0 ? daysNum : undefined;
       const report = getFleetReport({ days, repo: projectParam });
