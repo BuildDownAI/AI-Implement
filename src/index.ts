@@ -11,7 +11,7 @@ import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, parseDeclaredFiles } from "./poll-selection.js";
+import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, parseDeclaredFiles, getCachedPlanningContext, setCachedPlanningContext } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, type SelfDeployTarget } from "./deploy-availability.js";
@@ -457,16 +457,24 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const planningContexts = new Map<string, string>();
     {
       const issuesNeedingContext = [...toProcess, ...inFlightSiblings].filter(
-        (i) => parseDeclaredFiles(i.description).size === 0,
+        (i) => parseDeclaredFiles(i.description).size === 0 && Boolean(i.featureBranchChain?.length),
       );
       await Promise.all(
         issuesNeedingContext.map(async (issue) => {
+          const cached = getCachedPlanningContext(issue.id);
+          if (cached !== undefined) {
+            planningContexts.set(issue.id, cached);
+            return;
+          }
           const mapping = teamRepoMap[issue.scopeKey];
           if (!mapping) return;
           try {
             const p = await registry.forMapping(mapping);
             const ctx = await p.fetchPlanningContext(issue.id);
-            if (ctx) planningContexts.set(issue.id, ctx);
+            if (ctx) {
+              setCachedPlanningContext(issue.id, ctx);
+              planningContexts.set(issue.id, ctx);
+            }
           } catch {
             // fail-open: missing context does not block dispatch
           }

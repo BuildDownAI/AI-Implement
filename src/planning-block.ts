@@ -37,7 +37,9 @@ export function parsePlanningBlock(
     const riskLine = /^\s*risk:\s*(\S+)\s*$/m.exec(body);
     const risk = riskLine ? riskLine[1] : undefined;
 
-    return { v, files: parsed as string[], ...(risk !== undefined ? { risk } : {}) };
+    // Cap at 200: positional truncation means a path past index 200 fails open —
+    // correct direction for an advisory guard but makes outcome order-dependent.
+    return { v, files: (parsed as string[]).slice(0, 200), ...(risk !== undefined ? { risk } : {}) };
   } catch {
     return null;
   }
