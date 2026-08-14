@@ -1,5 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue } from "./providers/types.js";
+import type { ProviderRegistry } from "./providers/registry.js";
 import { parsePlanningBlock } from "./planning-block.js";
 
 export interface Blocker {
@@ -65,21 +66,81 @@ export function resetSeenCandidates(): void {
   seenCandidatesById.clear();
 }
 
-// Per-process cache for planning contexts. Planning comments are immutable once the
+// Per-process LRU cache for planning contexts. Planning comments are immutable once the
 // planning run completes, so caching by issue id avoids re-fetching on every poll cycle.
+// Bounded to prevent unbounded growth on long-lived Fly machines (contexts are up to 40 KB each).
+export const PLANNING_CONTEXT_CACHE_MAX = 256;
 const planningContextCache = new Map<string, string>();
 
 export function getCachedPlanningContext(issueId: string): string | undefined {
-  return planningContextCache.get(issueId);
+  if (!planningContextCache.has(issueId)) return undefined;
+  // LRU: move to end on access so the oldest entry is always first.
+  const val = planningContextCache.get(issueId)!;
+  planningContextCache.delete(issueId);
+  planningContextCache.set(issueId, val);
+  return val;
 }
 
 export function setCachedPlanningContext(issueId: string, ctx: string): void {
+  if (planningContextCache.has(issueId)) {
+    planningContextCache.delete(issueId);
+  } else if (planningContextCache.size >= PLANNING_CONTEXT_CACHE_MAX) {
+    planningContextCache.delete(planningContextCache.keys().next().value!);
+  }
   planningContextCache.set(issueId, ctx);
+}
+
+/** Test hook: returns the number of entries currently in the planning context cache. */
+export function getPlanningContextCacheSize(): number {
+  return planningContextCache.size;
 }
 
 /** Test hook: clear the planning context cache. */
 export function resetPlanningContextCache(): void {
   planningContextCache.clear();
+}
+
+/** True when an issue needs its planning context fetched for the file-overlap guard.
+ *  Issues outside a feature tree can never produce a deferral, so fetching is wasted work.
+ *  Issues with declared file bullets already have what the guard needs. */
+export function needsPlanningContextFetch(issue: TicketIssue): boolean {
+  return parseDeclaredFiles(issue.description).size === 0 && Boolean(issue.featureBranchChain?.length);
+}
+
+/** Fetch planning contexts for all issues that pass needsPlanningContextFetch, reading
+ *  from the per-process cache first. Returns a Map from issue id to assembled context text.
+ *  Fail-open: fetch errors are swallowed and the issue is absent from the result. */
+export async function getOrFetchPlanningContexts(
+  issues: TicketIssue[],
+  teamRepoMap: Record<string, RepoMapping>,
+  registry: ProviderRegistry,
+): Promise<Map<string, string>> {
+  const planningContexts = new Map<string, string>();
+  await Promise.all(
+    issues.filter(needsPlanningContextFetch).map(async (issue) => {
+      const cached = getCachedPlanningContext(issue.id);
+      if (cached !== undefined) {
+        planningContexts.set(issue.id, cached);
+        return;
+      }
+      const mapping = teamRepoMap[issue.scopeKey];
+      if (!mapping) return;
+      try {
+        const p = await registry.forMapping(mapping);
+        const ctx = await p.fetchPlanningContext(issue.id);
+        // Empty results are intentionally not cached: a later successful fetch (once the
+        // planning run completes) must not be suppressed. The cost is re-fetching every
+        // poll cycle for issues whose planning run has not yet completed.
+        if (ctx) {
+          setCachedPlanningContext(issue.id, ctx);
+          planningContexts.set(issue.id, ctx);
+        }
+      } catch {
+        // fail-open: missing context does not block dispatch
+      }
+    }),
+  );
+  return planningContexts;
 }
 
 const groupingBranchOf = (i: TicketIssue) =>

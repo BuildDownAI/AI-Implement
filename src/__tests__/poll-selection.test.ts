@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache } from "../poll-selection.js";
+import { selectIssuesToDispatch, selectBlockers, parseDeclaredFiles, selectFileOverlapDeferrals, rememberCandidates, resolveInFlightSiblings, resetSeenCandidates, getCachedPlanningContext, setCachedPlanningContext, resetPlanningContextCache, needsPlanningContextFetch, getPlanningContextCacheSize, PLANNING_CONTEXT_CACHE_MAX } from "../poll-selection.js";
 import type { RepoMapping } from "../config.js";
 import type { TicketIssue } from "../providers/types.js";
 
@@ -490,10 +490,8 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
     const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, null);
     const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
 
-    // Exact filter from src/index.ts and src/admin.ts after the fix.
-    const issuesNeedingContext = [candidate, sibling].filter(
-      (i) => parseDeclaredFiles(i.description).size === 0,
-    );
+    // The shared predicate from poll-selection.ts — drift at either call site fails this test.
+    const issuesNeedingContext = [candidate, sibling].filter(needsPlanningContextFetch);
     // A null-description issue must be included — this is what was broken before.
     expect(issuesNeedingContext.some((i) => i.id === "c1")).toBe(true);
 
@@ -535,10 +533,7 @@ describe("planning-context fetch filter — grouping-branch guard (AII-390)", ()
     const nonFeature = makeIssue("i1", "AII-1", "AII", { description: "Prose only." });
     const featureIssue = makeFeatureIssue("i2", "AII-2", "AII", "FEAT-1", "Prose only.");
 
-    // Inline the filter from src/index.ts and src/admin.ts after AII-390.
-    const needingContext = [nonFeature, featureIssue].filter(
-      (i) => parseDeclaredFiles(i.description).size === 0 && Boolean(i.featureBranchChain?.length),
-    );
+    const needingContext = [nonFeature, featureIssue].filter(needsPlanningContextFetch);
 
     expect(needingContext.some((i) => i.id === "i1")).toBe(false);
     expect(needingContext.some((i) => i.id === "i2")).toBe(true);
@@ -548,9 +543,7 @@ describe("planning-context fetch filter — grouping-branch guard (AII-390)", ()
     const withBullets = makeFeatureIssue("i1", "AII-1", "AII", "FEAT-1", "- Modify: `src/a.ts`");
     const withoutBullets = makeFeatureIssue("i2", "AII-2", "AII", "FEAT-1", "Prose only.");
 
-    const needingContext = [withBullets, withoutBullets].filter(
-      (i) => parseDeclaredFiles(i.description).size === 0 && Boolean(i.featureBranchChain?.length),
-    );
+    const needingContext = [withBullets, withoutBullets].filter(needsPlanningContextFetch);
 
     expect(needingContext.some((i) => i.id === "i1")).toBe(false);
     expect(needingContext.some((i) => i.id === "i2")).toBe(true);
@@ -596,5 +589,18 @@ describe("planning context cache (AII-390)", () => {
     setCachedPlanningContext("issue-1", "some context");
     resetPlanningContextCache();
     expect(getCachedPlanningContext("issue-1")).toBeUndefined();
+  });
+
+  it("cache does not grow past PLANNING_CONTEXT_CACHE_MAX — oldest entry is evicted", () => {
+    resetPlanningContextCache();
+    for (let i = 0; i < PLANNING_CONTEXT_CACHE_MAX + 1; i++) {
+      setCachedPlanningContext(`issue-${i}`, `ctx-${i}`);
+    }
+    expect(getPlanningContextCacheSize()).toBe(PLANNING_CONTEXT_CACHE_MAX);
+    // The first entry (issue-0) should have been evicted as the oldest.
+    expect(getCachedPlanningContext("issue-0")).toBeUndefined();
+    // The last entry (issue-PLANNING_CONTEXT_CACHE_MAX) should still be present.
+    expect(getCachedPlanningContext(`issue-${PLANNING_CONTEXT_CACHE_MAX}`)).toBe(`ctx-${PLANNING_CONTEXT_CACHE_MAX}`);
+    resetPlanningContextCache();
   });
 });
