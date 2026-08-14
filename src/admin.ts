@@ -540,7 +540,7 @@ async function handleListBlockers(
     const planningContexts = new Map<string, string>();
     {
       const issuesNeedingContext = [...fileOverlapCandidates, ...inFlightSiblings].filter(
-        (i) => i.description !== null && parseDeclaredFiles(i.description).size === 0,
+        (i) => parseDeclaredFiles(i.description).size === 0,
       );
       await Promise.all(
         issuesNeedingContext.map(async (issue) => {

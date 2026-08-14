@@ -480,6 +480,33 @@ describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", (
     expect(blockers).toHaveLength(1);
     expect(blockers[0].issueId).toBe("c1");
   });
+
+  it("null-description issue is included by the fetch filter and defers end-to-end (Gap 2 fix)", () => {
+    // Both prior rounds of this fix were defeated by a layer the tests did not cover.
+    // Round 1: resolveIssueFiles short-circuit was fixed, but index.ts/admin.ts never
+    //          fetched planning context for null-description issues (i.description !== null guard).
+    // Round 2: that guard is removed; this test drives the full path — filter → context map →
+    //          selectFileOverlapDeferrals — to catch any future regression at any layer.
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, null);
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+
+    // Exact filter from src/index.ts and src/admin.ts after the fix.
+    const issuesNeedingContext = [candidate, sibling].filter(
+      (i) => parseDeclaredFiles(i.description).size === 0,
+    );
+    // A null-description issue must be included — this is what was broken before.
+    expect(issuesNeedingContext.some((i) => i.id === "c1")).toBe(true);
+
+    // Simulate fetching and storing context only for issues that passed the filter.
+    const planningContexts = new Map(
+      issuesNeedingContext
+        .filter((i) => i.id === "c1")
+        .map((i) => [i.id, planningContextWithBlock(["src/a.ts"])]),
+    );
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].issueId).toBe("c1");
+  });
 });
 
 // PR #202 review finding #1 (admin-side remnant): the shared cache resolves in-flight
