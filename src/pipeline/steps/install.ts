@@ -13,6 +13,7 @@ interface AiImplementConfig {
   packageManager?: string;
   models?: RepoModels;
   reviewProviders?: string[];
+  reviewCheckNames?: string[];
 }
 
 interface InstallInputs extends Record<string, unknown> {
@@ -25,6 +26,7 @@ interface InstallOutputs extends Record<string, unknown> {
   durationMs: number;
   repoModels: RepoModels;
   reviewProviders?: string[];
+  reviewCheckNames?: string[];
 }
 
 const KNOWN_REVIEW_PROVIDERS = new Set(["github-claude-code-review"]);
@@ -40,6 +42,14 @@ function parseModelsConfig(value: unknown): RepoModels {
     result.review = models.review.trim();
   }
   return result;
+}
+
+export function parseReviewCheckNamesConfig(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const names = value
+    .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+    .map((name) => name.trim());
+  return names.length > 0 ? names : undefined;
 }
 
 function parseReviewProvidersConfig(value: unknown): string[] | undefined {
@@ -61,12 +71,14 @@ function readAiImplementConfig(workspaceDir: string): AiImplementConfig {
     const doc = parsed as Record<string, unknown>;
     const models = parseModelsConfig(doc.models);
     const reviewProviders = parseReviewProvidersConfig(doc.reviewProviders);
+    const reviewCheckNames = parseReviewCheckNamesConfig(doc.reviewCheckNames);
     const config: AiImplementConfig = {};
     if (typeof doc.packageManager === "string" && doc.packageManager.trim()) {
       config.packageManager = doc.packageManager.trim();
     }
     if (models.implement || models.review) config.models = models;
     if (reviewProviders !== undefined) config.reviewProviders = reviewProviders;
+    if (reviewCheckNames !== undefined) config.reviewCheckNames = reviewCheckNames;
     return config;
   } catch {
     return {};
@@ -106,6 +118,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         durationMs: 0,
         repoModels: config.models ?? {},
         reviewProviders: config.reviewProviders,
+        reviewCheckNames: config.reviewCheckNames,
       };
     }
 
@@ -116,6 +129,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
         durationMs: 0,
         repoModels: config.models ?? {},
         reviewProviders: config.reviewProviders,
+        reviewCheckNames: config.reviewCheckNames,
       };
     }
 
@@ -144,6 +158,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
       durationMs,
       repoModels: config.models ?? {},
       reviewProviders: config.reviewProviders,
+      reviewCheckNames: config.reviewCheckNames,
     };
   },
 };

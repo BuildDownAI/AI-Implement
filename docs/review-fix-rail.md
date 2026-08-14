@@ -80,6 +80,13 @@ It runs its own LLM review, then **waits for the external review check** on the 
 
 Internal issues are deduplicated against external findings so the same problem is not reported twice, and fix passes iterate up to the configured maximum. PR comments carry `<!-- ai-implement post-push iter=N ... -->` markers so repeated passes update rather than duplicate.
 
+**External check name matching** uses an explicit name list, not a heuristic. The defaults are `review`, `code-review-plugin`, `claude-review`, and `claude code review`. When no check with one of those names exists for the head SHA, the gate logs a warning listing the names that *were* present and then fails open (so repos without an external review check are not blocked). Configure the exact name for a specific repo with `reviewCheckNames` in `.ai-implement/config.yml`:
+
+```yaml
+reviewCheckNames:
+  - my-custom-review-check
+```
+
 External collection can be disabled per repo via `reviewProviders` in `.ai-implement/config.yml`; when it is, the step skips the wait entirely.
 
 ## Post-run: the drain loop
@@ -115,3 +122,5 @@ The snapshot is the important case. A finding that arrives *while* a fix run is 
 - **The queue holds one row per PR**, so a burst of feedback produces one run. Read `review_fix_events` to see everything that contributed.
 - **Findings from a review on a PR the orchestrator did not dispatch are ignored**, since every path requires a matching dispatch record.
 - **`review_findings` has no retention policy.** Rows persist for merged and closed PRs alike.
+- **`pull_request_target` resolves the workflow file from the repository's default branch (`main`), not from the PR base branch or the PR head.** A rename of a job in a workflow triggered by `pull_request_target` (such as `claude-review.yml`) is not in force until it lands on the default branch — regardless of which branch the PR targets. For example, a PR targeting `testing` will still use the workflow as declared on `main`, so a rename committed only to `testing` does not change the check-run name the gate sees. When the gate logs "No external review check matched", compare the present names against what the **default branch** workflow file declares.
+- **Renaming a review job name is a silent gate change.** If no check matches the configured or default names, the gate fails open (logs a warning, then approves). Use `reviewCheckNames` in `.ai-implement/config.yml` to pin the expected name and make mismatches visible rather than silently bypassed.

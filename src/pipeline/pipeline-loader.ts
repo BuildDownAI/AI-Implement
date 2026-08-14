@@ -227,6 +227,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           prNumber: String(ctx.getOutputs("push").prNumber ?? ""),
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
           reviewProviders: ctx.getOutputs("install").reviewProviders,
+          reviewCheckNames: ctx.getOutputs("install").reviewCheckNames,
         }),
         skip: (ctx: PipelineContext) => {
           // Never run further review/force-push cycles against an unapproved
