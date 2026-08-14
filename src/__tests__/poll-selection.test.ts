@@ -411,6 +411,104 @@ describe("selectFileOverlapDeferrals — planning block fallback", () => {
   });
 });
 
+// AII-388: the planning block lives in the planning *comment*, not the description.
+// The guard must read it from the assembled planning context (as returned by
+// fetchPlanningContext), NOT from a hand-built description string.
+describe("selectFileOverlapDeferrals — planning context sourcing (AII-388)", () => {
+  const PARENT = "FEAT-1";
+  // Simulates the text returned by fetchPlanningContext / assemblePlanningContext —
+  // the full comment body including headers and the machine block appended last.
+  const planningContextWithBlock = (files: string[]) =>
+    `## 🗺 AI Planning: Implementation Map\n\n(analysis)\n\n<!-- ai-implement-planning\nv: 1\nfiles: ${JSON.stringify(files)}\nrisk: low\n-->`;
+
+  it("defers a prose-only candidate whose planning context (not description) contains a block overlapping a sibling", () => {
+    // The candidate description has NO planning block and NO file bullets — exactly
+    // as it arrives from the tracker in production after a planning run.
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "Prose only. No files.");
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].reason).toBe("file-overlap");
+    expect(blockers[0].issueId).toBe("c1");
+    expect(blockers[0].detail).toContain("AII-3");
+    expect(blockers[0].detail).toContain("src/a.ts");
+  });
+
+  it("defers when an in-flight sibling's planning context declares the overlapping file", () => {
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/a.ts`");
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "Prose only.");
+    const planningContexts = new Map([["s1", planningContextWithBlock(["src/a.ts"])]]);
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].issueId).toBe("c1");
+    expect(blockers[0].detail).toContain("AII-3");
+  });
+
+  it("fails open when the planning context has no block (no deferral, no throw)", () => {
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "Prose only.");
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const planningContexts = new Map([["c1", "## 🗺 AI Planning: Implementation Map\n\n(no machine block)"]]);
+    expect(selectFileOverlapDeferrals([candidate], [sibling], planningContexts)).toHaveLength(0);
+  });
+
+  it("description verb bullets take precedence over planning context block", () => {
+    // Candidate has description bullets for src/b.ts only; planning block says src/a.ts.
+    // Sibling touches src/a.ts. Candidate should NOT defer — the description bullets win.
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "- Modify: `src/b.ts`");
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
+    expect(selectFileOverlapDeferrals([candidate], [sibling], planningContexts)).toHaveLength(0);
+  });
+
+  it("defers a null-description candidate when its planning context block overlaps a sibling (Gap 1 fix)", () => {
+    // Pre-fix: || !description short-circuited before the planning-context loop, returning
+    // empty — the very case this feature exists for.
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, null);
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].issueId).toBe("c1");
+  });
+
+  it("defers an empty-description candidate when its planning context block overlaps a sibling (Gap 1 fix)", () => {
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, "");
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+    const planningContexts = new Map([["c1", planningContextWithBlock(["src/a.ts"])]]);
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].issueId).toBe("c1");
+  });
+
+  it("null-description issue is included by the fetch filter and defers end-to-end (Gap 2 fix)", () => {
+    // Both prior rounds of this fix were defeated by a layer the tests did not cover.
+    // Round 1: resolveIssueFiles short-circuit was fixed, but index.ts/admin.ts never
+    //          fetched planning context for null-description issues (i.description !== null guard).
+    // Round 2: that guard is removed; this test drives the full path — filter → context map →
+    //          selectFileOverlapDeferrals — to catch any future regression at any layer.
+    const candidate = makeFeatureIssue("c1", "AII-2", "AII", PARENT, null);
+    const sibling = makeFeatureIssue("s1", "AII-3", "AII", PARENT, "- Modify: `src/a.ts`");
+
+    // Exact filter from src/index.ts and src/admin.ts after the fix.
+    const issuesNeedingContext = [candidate, sibling].filter(
+      (i) => parseDeclaredFiles(i.description).size === 0,
+    );
+    // A null-description issue must be included — this is what was broken before.
+    expect(issuesNeedingContext.some((i) => i.id === "c1")).toBe(true);
+
+    // Simulate fetching and storing context only for issues that passed the filter.
+    const planningContexts = new Map(
+      issuesNeedingContext
+        .filter((i) => i.id === "c1")
+        .map((i) => [i.id, planningContextWithBlock(["src/a.ts"])]),
+    );
+    const blockers = selectFileOverlapDeferrals([candidate], [sibling], planningContexts);
+    expect(blockers).toHaveLength(1);
+    expect(blockers[0].issueId).toBe("c1");
+  });
+});
+
 // PR #202 review finding #1 (admin-side remnant): the shared cache resolves in-flight
 // siblings identically for the poll loop and the admin blockers preview.
 describe("shared seen-candidates cache (rememberCandidates / resolveInFlightSiblings)", () => {
