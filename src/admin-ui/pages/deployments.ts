@@ -3,15 +3,34 @@ export const deploymentsHtml = `
   <header class="page-header">
     <div class="page-header-left">
       <h1 class="page-title">Deployments</h1>
-      <div class="page-subtitle" id="deployments-subtitle">—</div>
+      <div class="page-subtitle">Release a new version of this orchestrator — dispatch pauses until in-flight work drains</div>
     </div>
     <div class="page-header-actions">
       <button class="btn btn-sm" onclick="loadDeployments()">↻ Refresh</button>
-      <button class="btn btn-primary btn-sm" id="deployments-deploy-btn" onclick="window.triggerDeploy()" hidden>Deploy now</button>
     </div>
   </header>
   <div class="page-body">
-    <div id="deployments-error" class="alert fail" hidden></div>
+    <div id="deployments-error" hidden></div>
+
+    <div class="kpi-grid" id="deployments-kpis" style="grid-template-columns: 1fr">
+      <div class="kpi">
+        <div class="kpi-label">Availability <span class="badge neutral" id="kpi-deploy-badge">—</span></div>
+        <div class="kpi-value"><span id="kpi-deploy-commit">—</span><span class="kpi-unit" id="kpi-deploy-checked"></span></div>
+        <div class="kpi-trend" id="kpi-deploy-source"></div>
+      </div>
+      <div class="kpi" id="deployments-status-kpi" hidden>
+        <div class="kpi-label">Deploy status <span class="badge neutral" id="kpi-deploy-status-badge">—</span></div>
+        <div class="kpi-value"><span id="kpi-deploy-status">—</span><span class="kpi-unit" id="kpi-deploy-status-unit"></span></div>
+        <div class="kpi-trend" id="kpi-deploy-dispatch"></div>
+      </div>
+    </div>
+
+    <div id="deployments-cta" hidden style="text-align: center">
+      <div style="display: inline-flex; flex-direction: column; align-items: center; gap: 8px">
+        <button class="btn btn-accent btn-lg" id="deployments-deploy-btn" onclick="window.triggerDeploy()">Deploy now</button>
+        <div class="kpi-trend text-secondary" style="justify-content: center; max-width: 46ch">New dispatches pause immediately, and in-flight work drains before the build starts.</div>
+      </div>
+    </div>
 
     <div id="deployments-not-configured" class="alert warn" hidden>
       <div style="flex:1">
@@ -19,29 +38,6 @@ export const deploymentsHtml = `
         <div class="alert-desc">This orchestrator cannot deploy itself. Set <span class="mono">FLY_DEPLOY_TOKEN</span> and ensure the image was built with the <span class="mono">AI_IMPLEMENT_SOURCE_*</span> build args stamped in.</div>
       </div>
     </div>
-
-    <div id="deployments-held-section" hidden>
-      <div class="alert info">
-        <div style="flex:1">
-          <div class="alert-title" id="deployments-held-title">Deploy in progress</div>
-          <div class="alert-desc" id="deployments-held-desc"></div>
-        </div>
-      </div>
-    </div>
-
-    <div class="kpi-grid" style="grid-template-columns: repeat(2, 1fr)">
-      <div class="kpi">
-        <div class="kpi-label">Availability</div>
-        <div class="kpi-value" id="kpi-deploy-available">—</div>
-        <div class="kpi-trend" id="kpi-deploy-checked"></div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label">Deploy status</div>
-        <div class="kpi-value" id="kpi-deploy-status">—</div>
-      </div>
-    </div>
-
-    <div id="deployments-uptodate" class="empty" hidden>You are up to date. No deployment is available.</div>
   </div>
 </section>
 `;
@@ -57,9 +53,45 @@ export const deploymentsScript = `
     return h + 'h ago';
   }
 
+  function short(sha) { return sha ? sha.slice(0, 7) : ''; }
+
+  function plural(count, noun) {
+    return count + '\u00a0' + noun + (count === 1 ? '' : 's');
+  }
+
+  // Every badge in the app carries a .dot child: .badge .dot sizes it, .badge.<kind> .dot
+  // colours it, and .badge.running .dot is where the pulse animation lives. The class
+  // alone renders a dotless pill, so the span is opt-in markup that is easy to drop.
+  // Routing every badge through here is what stops that recurring on this page.
+  function setBadge(el, kind, label) {
+    el.className = 'badge ' + kind;
+    el.innerHTML = '<span class="dot"></span>' + window.esc(label);
+  }
+
+  // a static https:// prefix with escAttr on the path segments
+  function commitLink(repo, sha) {
+    if (!repo || !sha) return '';
+    // .mono sets font-size: 11.5px as well as the family, and wins the cascade against
+    // .kpi-value — so the family is set here directly to keep the SHAs at value size.
+    return '<a class="text-accent" style="font-family: var(--font-mono)" href="https://github.com/' + window.escAttr(repo)
+      + '/commit/' + window.escAttr(sha) + '" target="_blank">' + window.esc(short(sha)) + '</a>';
+  }
+
+  // One box, two severities: reading status can fail transiently while the page stays
+  // usable, but a refused deploy is a real failure. .warning/.error are the house pair.
+  function showMessage(kind, text) {
+    const el = document.getElementById('deployments-error');
+    el.className = kind;
+    el.textContent = text;
+    el.hidden = false;
+  }
+
+  function clearMessage() {
+    document.getElementById('deployments-error').hidden = true;
+  }
+
   async function loadDeployments() {
-    const errEl = document.getElementById('deployments-error');
-    errEl.hidden = true;
+    clearMessage();
 
     let data;
     try {
@@ -67,14 +99,12 @@ export const deploymentsScript = `
       if (!res.ok) {
         let message = 'Unknown error';
         try { const body = await res.json(); message = body.error || message; } catch (e) { /* ignore */ }
-        errEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load deployment status</div><div class="alert-desc">' + window.esc(message) + '</div></div>';
-        errEl.hidden = false;
+        showMessage('warning', 'Could not read deployment status — ' + message);
         return;
       }
       data = await res.json();
     } catch (err) {
-      errEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to load deployment status</div><div class="alert-desc">' + window.esc(String(err)) + '</div></div>';
-      errEl.hidden = false;
+      showMessage('warning', 'Could not read deployment status — ' + String(err));
       return;
     }
 
@@ -83,63 +113,62 @@ export const deploymentsScript = `
     const held = !!data.held;
     const inFlight = Array.isArray(data.inFlight) ? data.inFlight : [];
 
-    // Not-configured banner
+    // With self-deploy off the banner is the whole page — availability and status
+    // describe an action this orchestrator cannot take.
     document.getElementById('deployments-not-configured').hidden = configured;
+    document.getElementById('deployments-kpis').hidden = !configured;
 
-    // Deploy button — only when configured, not held, and a deployment is available
-    const deployBtn = document.getElementById('deployments-deploy-btn');
-    deployBtn.hidden = !configured || held || available !== true;
+    document.getElementById('deployments-cta').hidden = !configured || held || available !== true;
 
-    // Held section — names what's still executing
-    const heldSection = document.getElementById('deployments-held-section');
-    const heldTitle = document.getElementById('deployments-held-title');
-    const heldDesc = document.getElementById('deployments-held-desc');
-    if (held) {
-      heldSection.hidden = false;
-      if (inFlight.length > 0) {
-        heldTitle.textContent = 'Draining — waiting for in-flight work to complete';
-        const summary = inFlight.map(function (w) {
-          return window.esc(String(w.count)) + '\u00a0' + window.esc(w.kind);
-        }).join(', ');
-        heldDesc.innerHTML = 'Still executing: ' + summary + '. New dispatches are paused until these finish.';
-      } else {
-        heldTitle.textContent = 'Building';
-        heldDesc.textContent = 'Work has drained. The new image is being built and released.';
-      }
-    } else {
-      heldSection.hidden = true;
-    }
-
-    // Availability KPI — three states; null is always unknown, never up to date
-    const availEl = document.getElementById('kpi-deploy-available');
-    const checkedEl = document.getElementById('kpi-deploy-checked');
-    if (available === true) {
-      availEl.innerHTML = '<span class="badge warn"><span class="dot"></span>Available</span>';
-    } else if (available === false) {
-      availEl.innerHTML = '<span class="badge success"><span class="dot"></span>Up to date</span>';
-    } else {
-      availEl.innerHTML = '<span class="badge neutral"><span class="dot"></span>Unknown</span>';
-    }
-    checkedEl.textContent = data.checkedAt ? 'checked ' + fmtAgo(data.checkedAt) : 'not yet checked';
-
-    // Deploy status KPI
+    // Deploy status is only meaningful once a deploy is under way, so the whole tile appears with the hold 
+    const statusKpi = document.getElementById('deployments-status-kpi');
+    const statusBadge = document.getElementById('kpi-deploy-status-badge');
     const statusEl = document.getElementById('kpi-deploy-status');
-    if (held && inFlight.length > 0) {
-      statusEl.innerHTML = '<span class="badge warn"><span class="dot"></span>Draining</span>';
-    } else if (held) {
-      statusEl.innerHTML = '<span class="badge running"><span class="dot"></span>Building</span>';
-    } else {
-      statusEl.innerHTML = '<span class="badge neutral">Idle</span>';
+    const statusUnit = document.getElementById('kpi-deploy-status-unit');
+    const dispatchEl = document.getElementById('kpi-deploy-dispatch');
+    statusKpi.hidden = !held;
+    if (held) {
+      if (inFlight.length > 0) {
+        setBadge(statusBadge, 'warn', 'Draining');
+        statusEl.textContent = inFlight.map(function (w) { return plural(w.count, w.kind); }).join(', ');
+        statusUnit.textContent = 'waiting for in-flight work to finish';
+      } else {
+        setBadge(statusBadge, 'running', 'Building');
+        statusEl.textContent = 'All in-flight work drained';
+        statusUnit.textContent = 'building and releasing the new image';
+      }
+      // Identical in both phases deliberately: the pause is a property of deploying,
+      // not of a phase, so varying the wording would imply it varies with the phase.
+      dispatchEl.textContent = 'New dispatches are paused until the deploy completes.';
     }
 
-    // Subtitle
+    // Availability is the least of the three signals here, so it rides in the label as
+    // a tag. The commits it was derived from are the value.
+    const badgeEl = document.getElementById('kpi-deploy-badge');
     if (available === true) {
-      document.getElementById('deployments-subtitle').textContent = 'deployment available';
+      setBadge(badgeEl, 'warn', 'Available');
     } else if (available === false) {
-      document.getElementById('deployments-subtitle').textContent = 'up to date';
+      setBadge(badgeEl, 'success', 'Up to date');
     } else {
-      document.getElementById('deployments-subtitle').textContent = 'availability unknown';
+      setBadge(badgeEl, 'neutral', 'Unknown');
     }
+
+    // Built from whichever commits resolved rather than branching on the verdict:
+    // two differing commits render as a comparison, equal ones collapse to one, and
+    // an unstamped running commit leaves just the head — no case needs special text.
+    const links = [];
+    if (data.runningCommit) links.push(commitLink(data.repo, data.runningCommit));
+    if (data.headCommit && data.headCommit !== data.runningCommit) {
+      links.push(commitLink(data.repo, data.headCommit));
+    }
+    document.getElementById('kpi-deploy-commit').innerHTML = links.length ? links.join(' → ') : '—';
+    document.getElementById('kpi-deploy-checked').textContent =
+      data.checkedAt ? 'checked ' + fmtAgo(data.checkedAt) : 'not yet checked';
+
+    const source = [];
+    if (data.repo) source.push(data.repo);
+    if (data.branch) source.push(data.branch);
+    document.getElementById('kpi-deploy-source').textContent = source.join(' · ');
 
     // Nav indicator — shown only when a deployment is confirmed available
     const navCount = document.querySelector('[data-count="deploy-available"]');
@@ -151,33 +180,31 @@ export const deploymentsScript = `
         navCount.hidden = true;
       }
     }
-
-    // Up-to-date empty state
-    document.getElementById('deployments-uptodate').hidden = available !== false || held;
   }
 
   async function triggerDeploy() {
-    const errEl = document.getElementById('deployments-error');
-    errEl.hidden = true;
+    // Native confirm is this codebase's gate for consequential actions — destroying a
+    // machine and deleting a secret both use it. A .modal would read better but its
+    // only current user is the stepper, with its own open/close wiring.
+    if (!confirm('Deploy now? New dispatches pause immediately and in-flight work drains before the build starts.')) return;
+    clearMessage();
     const btn = document.getElementById('deployments-deploy-btn');
     btn.disabled = true;
     try {
       const res = await window.api('/api/deploy', { method: 'POST' });
-      if (res.ok || res.status === 202) {
-        loadDeployments();
-        return;
-      }
-      if (res.status !== 401) {
+      if (!res.ok && res.status !== 401) {
         let message = 'Deploy failed to start';
         try { const body = await res.json(); message = body.error || message; } catch (e) { /* ignore */ }
-        errEl.innerHTML = '<div style="flex:1"><div class="alert-title">Deploy failed to start</div><div class="alert-desc">' + window.esc(message) + '</div></div>';
-        errEl.hidden = false;
+        showMessage('error', 'Deploy failed to start — ' + message);
       }
     } catch (err) {
-      errEl.innerHTML = '<div style="flex:1"><div class="alert-title">Deploy failed to start</div><div class="alert-desc">' + window.esc(String(err)) + '</div></div>';
-      errEl.hidden = false;
+      showMessage('error', 'Deploy failed to start — ' + String(err));
+    } finally {
+      // finally, not the success path: returning early there left the button dead
+      // whenever a fast failure cleared the hold before the next poll could hide it.
+      btn.disabled = false;
+      loadDeployments();
     }
-    btn.disabled = false;
   }
 
   window.loadDeployments = loadDeployments;

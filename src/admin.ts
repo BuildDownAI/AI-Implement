@@ -29,7 +29,7 @@ import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, 
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import type { DeployStart } from "./deploy.js";
-import { getAvailability } from "./deploy-availability.js";
+import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { notifyText } from "./notify.js";
@@ -187,6 +187,7 @@ export interface AdminConfig {
 export interface AdminDeps {
   /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
   startDeploy?: () => Promise<DeployStart>;
+  selfDeployTarget?: SelfDeployTarget | null;
 }
 
 export function handleAdminRequest(
@@ -236,12 +237,17 @@ export function handleAdminRequest(
 
     if (url === "/api/deployment-status" && method === "GET") {
       const availability = getAvailability();
+      const target = deps.selfDeployTarget ?? null;
       json(res, 200, {
         configured: !!deps.startDeploy,
         available: availability?.available ?? null,
         held: isDeployHeld(),
         inFlight: getInFlightWork(),
         checkedAt: availability?.checkedAt ?? null,
+        runningCommit: availability?.runningCommit ?? null,
+        headCommit: availability?.headCommit ?? null,
+        repo: target ? `${target.owner}/${target.repo}` : null,
+        branch: target?.branch ?? null,
       });
       return true;
     }

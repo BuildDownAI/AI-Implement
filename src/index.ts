@@ -3128,7 +3128,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy })) return;
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
