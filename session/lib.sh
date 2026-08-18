@@ -63,7 +63,7 @@ verify_workspace_writable() {
   # shellcheck disable=SC2016
   if su coder -s /bin/bash -c '
     probe="$(mktemp "$1/.ai-implement-probe.XXXXXX")" || exit 1
-    trap "rm -f \"$probe\"" EXIT
+    trap '\''rm -f -- "$probe"'\'' EXIT
   ' -- _ "$workspace_dir" 2>/dev/null; then
     return 0
   fi
