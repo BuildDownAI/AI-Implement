@@ -6,6 +6,7 @@ import {
   symlinkSync,
   readFileSync,
   existsSync,
+  realpathSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
@@ -48,7 +49,7 @@ afterEach(() => {
 describe("resolveRepository", () => {
   it("resolves a valid clean repository", async () => {
     const repo = await resolveRepository(repoDir);
-    expect(repo.topLevel).toBe(repoDir);
+    expect(repo.topLevel).toBe(realpathSync(repoDir));
     expect(repo.branch).toBe("main");
     expect(repo.headSha).toMatch(/^[0-9a-f]{40}$/);
     expect(repo.isDirty).toBe(false);
@@ -210,18 +211,20 @@ describe("createIsolatedWorkspace", () => {
   });
 
   it("source git index is unchanged after isolation of a dirty repo", async () => {
+    writeFileSync(join(repoDir, "file.txt"), "staged modification\n");
     git(["add", "file.txt"]);
     writeFileSync(join(repoDir, "unstaged.txt"), "unstaged\n");
     const repo = await resolveRepository(repoDir);
     const ws = await createIsolatedWorkspace(repo, { includeDirty: true });
     await ws.cleanup();
 
-    // Staged changes still appear in the source index
+    // Both the staged modification and the untracked file must survive in the source
     const statusResult = spawnSync("git", ["status", "--porcelain"], {
       cwd: repoDir,
       stdio: ["ignore", "pipe", "pipe"],
     });
     const status = (statusResult.stdout as Buffer).toString();
+    expect(status).toMatch(/^M  file\.txt/m);
     expect(status).toContain("unstaged.txt");
   });
 
