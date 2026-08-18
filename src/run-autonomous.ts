@@ -17,6 +17,7 @@ import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
+import type { LocalRunTokenSummary } from "./local/run-result.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -696,6 +697,23 @@ export interface RunLocalAutonomousResult {
     reviewApproved: boolean | null;
   }>;
   finalFeedback: string;
+  effectiveMaxTurns: number;
+  effectiveMaxIterations: number;
+  tokenSummary: LocalRunTokenSummary | null;
+}
+
+function buildTokenSummary(
+  passes: RunLocalAutonomousResult["passes"],
+): LocalRunTokenSummary | null {
+  if (passes.length === 0) return null;
+  const totalCost = passes.reduce((sum, p) => sum + (p.costUsd ?? 0), 0);
+  return {
+    costUsd: totalCost > 0 ? totalCost : null,
+    tokensIn: null,
+    tokensOut: null,
+    cacheReadTokens: null,
+    cacheCreationTokens: null,
+  };
 }
 
 export async function runAutonomousLocally(
@@ -703,6 +721,8 @@ export async function runAutonomousLocally(
 ): Promise<RunLocalAutonomousResult> {
   const workspaceDir = opts.workspaceDir;
   const planningContext = opts.planningContext ?? "";
+  const effectiveMaxTurns = opts.maxTurns ?? 50;
+  const effectiveMaxIterations = opts.maxIterations ?? 3;
 
   let implementationPrompt = buildDefaultImplementationPrompt({
     issueIdentifier: opts.issueIdentifier,
@@ -712,6 +732,8 @@ export async function runAutonomousLocally(
   });
 
   let workflowModel: string | undefined;
+  let setupHook: string | undefined;
+  let verifyHook: string | undefined;
   let teardownHook: string | undefined;
   const wfPath = join(workspaceDir, "WORKFLOW.md");
   if (existsSync(wfPath)) {
@@ -724,6 +746,8 @@ export async function runAutonomousLocally(
       PLANNING_CONTEXT: planningContext,
     });
     workflowModel = parsed.frontMatter.model;
+    setupHook = parsed.frontMatter.setup;
+    verifyHook = parsed.frontMatter.verify;
     teardownHook = parsed.frontMatter.teardown;
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
@@ -763,20 +787,96 @@ export async function runAutonomousLocally(
   const pipeline = opts.pipeline ?? LOCAL_FEEDBACK_PIPELINE;
   const runner = opts.runner ?? (await createDefaultRunner());
 
+  // Teardown runs only when setup ran successfully (or no setup was configured).
+  // If setup is configured but fails, setupRan stays false and teardown is skipped.
+  let setupRan = !setupHook;
+
   try {
+    if (setupHook) {
+      try {
+        const setupResult = runHookScript("setup", setupHook, workspaceDir);
+        if (setupResult.exitCode !== 0) {
+          return {
+            exitCode: 1,
+            approved: false,
+            terminationReason: "setup_failed",
+            iterations: 0,
+            passes: [],
+            finalFeedback: `Setup hook exited with code ${setupResult.exitCode}`,
+            effectiveMaxTurns,
+            effectiveMaxIterations,
+            tokenSummary: null,
+          };
+        }
+      } catch (err) {
+        return {
+          exitCode: 1,
+          approved: false,
+          terminationReason: "setup_failed",
+          iterations: 0,
+          passes: [],
+          finalFeedback: `Setup hook error: ${String(err)}`,
+          effectiveMaxTurns,
+          effectiveMaxIterations,
+          tokenSummary: null,
+        };
+      }
+      setupRan = true;
+    }
+
     await runner.run(pipeline, context, reporter);
 
     const fb = context.getOutputs("feedback-loop");
+    const approved = fb.approved === true;
+    const terminationReason =
+      typeof fb.terminationReason === "string" ? fb.terminationReason : "unknown";
+    const iterations = typeof fb.iterations === "number" ? fb.iterations : 0;
+    const passes = Array.isArray(fb.passes)
+      ? (fb.passes as RunLocalAutonomousResult["passes"])
+      : [];
+    const finalFeedback = typeof fb.finalFeedback === "string" ? fb.finalFeedback : "";
+
+    if (approved && verifyHook) {
+      try {
+        const verifyResult = runHookScript("verify", verifyHook, workspaceDir);
+        if (verifyResult.exitCode !== 0) {
+          return {
+            exitCode: 1,
+            approved: false,
+            terminationReason: "verify_failed",
+            iterations,
+            passes,
+            finalFeedback: `Verify hook exited with code ${verifyResult.exitCode}`,
+            effectiveMaxTurns,
+            effectiveMaxIterations,
+            tokenSummary: buildTokenSummary(passes),
+          };
+        }
+      } catch (err) {
+        return {
+          exitCode: 1,
+          approved: false,
+          terminationReason: "verify_failed",
+          iterations,
+          passes,
+          finalFeedback: `Verify hook error: ${String(err)}`,
+          effectiveMaxTurns,
+          effectiveMaxIterations,
+          tokenSummary: buildTokenSummary(passes),
+        };
+      }
+    }
+
     return {
       exitCode: 0,
-      approved: fb.approved === true,
-      terminationReason:
-        typeof fb.terminationReason === "string" ? fb.terminationReason : "unknown",
-      iterations: typeof fb.iterations === "number" ? fb.iterations : 0,
-      passes: Array.isArray(fb.passes)
-        ? (fb.passes as RunLocalAutonomousResult["passes"])
-        : [],
-      finalFeedback: typeof fb.finalFeedback === "string" ? fb.finalFeedback : "",
+      approved,
+      terminationReason,
+      iterations,
+      passes,
+      finalFeedback,
+      effectiveMaxTurns,
+      effectiveMaxIterations,
+      tokenSummary: buildTokenSummary(passes),
     };
   } catch (err) {
     return {
@@ -786,9 +886,12 @@ export async function runAutonomousLocally(
       iterations: 0,
       passes: [],
       finalFeedback: err instanceof Error ? err.message : String(err),
+      effectiveMaxTurns,
+      effectiveMaxIterations,
+      tokenSummary: null,
     };
   } finally {
-    if (teardownHook) {
+    if (setupRan && teardownHook) {
       try {
         const result = runHookScript("teardown", teardownHook, workspaceDir);
         if (result.exitCode !== 0) {

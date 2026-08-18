@@ -184,6 +184,8 @@ describe("runPlanningLocally", () => {
     let invoked: { prompt: string; args: string[] } | null = null;
     const fakeExecutor = (prompt: string, args: string[]) => {
       invoked = { prompt, args };
+      mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+      writeFileSync(join(ws, "ai-output", "comments", "01-plan.md"), "# Plan\nContent");
       return { status: 0, stdout: "", stderr: "" };
     };
 
@@ -196,6 +198,7 @@ describe("runPlanningLocally", () => {
     });
 
     expect(result.exitCode).toBe(0);
+    expect(result.planFound).toBe(true);
     expect(invoked!.prompt).toContain("LOCAL-1");
     expect(invoked!.prompt).toContain("Local task");
     expect(invoked!.args).toContain("--dangerously-skip-permissions");
@@ -211,7 +214,9 @@ describe("runPlanningLocally", () => {
     });
 
     expect(result.exitCode).toBe(1);
+    expect(result.planFound).toBe(false);
     expect(result.planningContext).toBe("");
+    expect(result.diagnostics).toContain("boom");
   });
 
   it("collects planning context from ai-output/comments/*.md files", async () => {
@@ -248,7 +253,7 @@ describe("runPlanningLocally", () => {
     expect(result.planningContext).toBe("First\n\nSecond");
   });
 
-  it("returns empty planningContext when ai-output/comments directory is absent", async () => {
+  it("returns exitCode 1 and planFound false when executor exits 0 but no plan files written", async () => {
     const result = await runPlanningLocally({
       workspaceDir: ws,
       issueIdentifier: "LOCAL-1",
@@ -257,8 +262,10 @@ describe("runPlanningLocally", () => {
       executor: () => ({ status: 0, stdout: "", stderr: "" }),
     });
 
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode).toBe(1);
+    expect(result.planFound).toBe(false);
     expect(result.planningContext).toBe("");
+    expect(result.diagnostics).toContain("no readable Markdown plan");
   });
 
   it("uses PLANNING.md body and substitutes issue fields when present", async () => {
@@ -275,6 +282,8 @@ describe("runPlanningLocally", () => {
       issueDescription: "Desc",
       executor: (prompt) => {
         capturedPrompt = prompt;
+        mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+        writeFileSync(join(ws, "ai-output", "comments", "01-plan.md"), "# Plan\nContent");
         return { status: 0, stdout: "", stderr: "" };
       },
     });
@@ -295,6 +304,8 @@ describe("runPlanningLocally", () => {
       model: "claude-override",
       executor: (_prompt, args) => {
         capturedArgs = args;
+        mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+        writeFileSync(join(ws, "ai-output", "comments", "01-plan.md"), "# Plan\nContent");
         return { status: 0, stdout: "", stderr: "" };
       },
     });

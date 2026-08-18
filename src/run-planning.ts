@@ -95,6 +95,10 @@ export interface RunPlanningLocalOptions {
 export interface RunPlanningLocalResult {
   exitCode: number;
   planningContext: string;
+  /** True when at least one readable Markdown plan file was produced. */
+  planFound: boolean;
+  /** Human-readable diagnostics for plan_failed outcomes. */
+  diagnostics: string;
 }
 
 export async function runPlanningLocally(
@@ -133,9 +137,23 @@ export async function runPlanningLocally(
   const executor = opts.executor ?? defaultExecutor;
   const result = executor(prompt, args, opts.workspaceDir);
   if (result.status !== 0) {
-    return { exitCode: 1, planningContext: "" };
+    return {
+      exitCode: 1,
+      planningContext: "",
+      planFound: false,
+      diagnostics: (result.stderr || result.stdout || "planning executor exited with non-zero status").slice(0, 2000),
+    };
   }
-  return { exitCode: 0, planningContext: collectLocalPlanningContext(opts.workspaceDir) };
+  const planningContext = collectLocalPlanningContext(opts.workspaceDir);
+  if (!planningContext.trim()) {
+    return {
+      exitCode: 1,
+      planningContext: "",
+      planFound: false,
+      diagnostics: "Planning process exited successfully but produced no readable Markdown plan in ai-output/comments/",
+    };
+  }
+  return { exitCode: 0, planningContext, planFound: true, diagnostics: "" };
 }
 
 export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number }> {
