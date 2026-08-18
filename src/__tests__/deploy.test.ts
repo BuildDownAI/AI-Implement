@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import type * as DeployModule from "../deploy.js";
@@ -233,5 +233,63 @@ describe("canSelfDeploy", () => {
     expect(deploy.canSelfDeploy(configured)).toBe(deploy.makeStartDeploy(configured) !== undefined);
     const unconfigured = { ...configured, flyDeployToken: null };
     expect(deploy.canSelfDeploy(unconfigured)).toBe(deploy.makeStartDeploy(unconfigured) !== undefined);
+  });
+});
+
+describe("makeStartDeploy onBuildFailure callback", () => {
+  // Needs real SQLite (deploy-hold.ts writes to it), but mocks the two GitHub helpers
+  // so we can control what commit is returned and skip the App-token mint.
+  let localDeploy: typeof DeployModule;
+  let closeDb: () => void;
+
+  beforeEach(async () => {
+    // Re-reset so the mocks below are visible when deploy.js is imported.
+    vi.resetModules();
+    process.env.DEDUP_DB_PATH = path.join(os.tmpdir(), `deploy-onbf-${Date.now()}.sqlite`);
+
+    vi.doMock("../github-app-auth.js", () => ({
+      getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "tok", expiresAt: "" }),
+    }));
+    vi.doMock("../github.js", () => ({
+      fetchRepoTarball: vi.fn(),
+      getBranchSha: vi.fn().mockResolvedValue("def5678"),
+    }));
+
+    localDeploy = await import("../deploy.js");
+    const { initSettingsTable } = await import("../runner-mode.js");
+    initSettingsTable();
+    const dedup = await import("../dedup.js");
+    closeDb = dedup.closeDb;
+  });
+
+  afterEach(() => {
+    closeDb?.();
+    vi.doUnmock("../github-app-auth.js");
+    vi.doUnmock("../github.js");
+    vi.unstubAllGlobals();
+  });
+
+  it("calls onBuildFailure when runDeploy rejects", async () => {
+    // resolveFlyctl uses global fetch; a 404 makes it reject before any subprocess.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("nope", { status: 404 })));
+
+    const onBuildFailure = vi.fn();
+    const start = localDeploy.makeStartDeploy({
+      flyDeployToken: "fly-token",
+      flyOrchestratorApp: "orchestrator",
+      selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
+      pollIntervalMs: 60_000,
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      onBuildFailure,
+    })!;
+
+    const result = await start();
+    expect(result).toMatchObject({ started: true, commit: "def5678" });
+
+    // runDeploy is fire-and-forget; wait for the .catch to execute
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(onBuildFailure).toHaveBeenCalledWith("def5678", expect.any(Error));
   });
 });

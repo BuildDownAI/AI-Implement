@@ -21,7 +21,8 @@ export interface DeployNotifyConfig {
 
 export interface DeployOutcome {
   kind: "deployed-ok" | "deployed-not-serving" | "build-failed";
-  commit: string;
+  /** null when the image was not stamped with AI_IMPLEMENT_SOURCE_COMMIT at build time */
+  commit: string | null;
   timestamp: number;
   detail?: string;
 }
@@ -147,7 +148,7 @@ export async function postBootNotice(
   // Probe /mcp to confirm the sidecar is reachable, then record the outcome durably —
   // independent of whether a webhook is configured.
   if (opts.holdWasSet && prevImageRef !== null && prevImageRef !== imageRef) {
-    const commit = process.env.AI_IMPLEMENT_SOURCE_COMMIT || imageRef;
+    const commit = process.env.AI_IMPLEMENT_SOURCE_COMMIT || null;
     const { serving, detail } = await probeMcp(opts.fetchImpl ?? fetch);
     recordDeployOutcome(
       serving

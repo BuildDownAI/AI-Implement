@@ -326,6 +326,16 @@ describe("postBootNotice", () => {
     expect(deployNotify.getDeployOutcome()?.commit).toBe("deadbeef");
   });
 
+  it("records null commit when AI_IMPLEMENT_SOURCE_COMMIT is not set", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    delete process.env.AI_IMPLEMENT_SOURCE_COMMIT;
+    vi.mocked(deployModule.interpretMcpProbe).mockReturnValue({ serving: true });
+    const fetchMock = vi.fn().mockResolvedValue({ status: 401, text: vi.fn().mockResolvedValue("") });
+    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
+    expect(deployNotify.getDeployOutcome()?.commit).toBeNull();
+  });
+
   it("sends exactly one webhook notification even when the outcome is recorded", async () => {
     writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
     onFly(IMAGE_B);

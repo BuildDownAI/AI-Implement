@@ -2270,6 +2270,16 @@ describe("GET /api/deployment-status", () => {
     setLastActedCommit("def5678");
     expect((await statusRequest(token)).body.lastActedCommit).toBe("def5678");
   });
+
+  it("reports the last deploy outcome, so the page can render deployed-ok and build-failed cards", async () => {
+    const { recordDeployOutcome } = await import("../deploy-notify.js");
+    const token = await login("secret");
+
+    expect((await statusRequest(token)).body.lastDeployOutcome).toBeNull();
+    recordDeployOutcome({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
+    const body = (await statusRequest(token)).body;
+    expect(body.lastDeployOutcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
+  });
 });
 
 describe("POST /api/deploy-policy", () => {

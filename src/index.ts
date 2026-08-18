@@ -287,12 +287,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       // A factory over config with no state of its own, so building one per tick is
       // free and behaves identically to the server's — the hold that actually
       // serializes deploys lives in SQLite, not in this closure.
-      const startDeploy = makeStartDeploy({
-        ...config,
-        onBuildFailure: (commit, err) => {
-          recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
-        },
-      });
+      const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
       const availability = getAvailability();
       const head = availability?.headCommit ?? null;
 
@@ -2786,13 +2781,12 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
+function onDeployBuildFailure(commit: string, err: unknown): void {
+  recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
+}
+
 function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
-  const startDeploy = makeStartDeploy({
-    ...config,
-    onBuildFailure: (commit, err) => {
-      recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
-    },
-  });
+  const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
