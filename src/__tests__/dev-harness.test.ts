@@ -2,34 +2,41 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { splitLocalRunnerEnv } from "../local-docker.js";
 import { decodeRunConfig } from "../run-config.js";
 
-// Mock node:child_process to prevent real docker/git invocations.
+// Prevent real git invocations for branch and origin detection.
 vi.mock("node:child_process", () => ({
   execFile: vi.fn(),
   spawn: vi.fn(),
   spawnSync: vi.fn(),
 }));
 
-// Mock node:fs so existsSync returns true for the workspace.
+// Make existsSync return true for the workspace path.
 vi.mock("node:fs", () => ({
   default: { existsSync: vi.fn().mockReturnValue(true) },
   existsSync: vi.fn().mockReturnValue(true),
 }));
 
-// Mock node:fs/promises so mkdir/writeFile/chmod/unlink are no-ops.
+// Prevent real filesystem writes for the artifacts directory.
 vi.mock("node:fs/promises", () => ({
   mkdir: vi.fn().mockResolvedValue(undefined),
   writeFile: vi.fn().mockResolvedValue(undefined),
-  chmod: vi.fn().mockResolvedValue(undefined),
-  unlink: vi.fn().mockResolvedValue(undefined),
-  readFileSync: vi.fn(),
 }));
 
-import { execFile as rawExecFile, spawnSync } from "node:child_process";
+// Stub the session layer so startDevRun is tested in isolation.
+vi.mock("../local/session.js", () => ({
+  launchLocalSession: vi.fn(),
+  getSessionStatus: vi.fn(),
+  streamSessionLogs: vi.fn(),
+  streamSessionLogsUntilShellReady: vi.fn(),
+  awaitSessionResult: vi.fn(),
+  stopLocalSession: vi.fn(),
+}));
+
+import { spawnSync } from "node:child_process";
+import { launchLocalSession } from "../local/session.js";
 import { startDevRun } from "../dev-harness/index.js";
 
 const TASK_CONTENT = `---\nidentifier: DEV-1\ntitle: Add feature\nmaxTurns: 15\n---\n\nImplement the feature.`;
 
-// parseTaskFileFromPath reads the file — mock readFileSync on node:fs module.
 vi.mock("../dev-harness/task-file.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../dev-harness/task-file.js")>();
   return {
@@ -40,21 +47,11 @@ vi.mock("../dev-harness/task-file.js", async (importOriginal) => {
   };
 });
 
-function makeExecFileMock(containerId = "abc123def456789") {
-  // execFile is promisified inside index.ts, but the underlying call is to
-  // node:child_process.execFile with a callback. Vitest's mock intercepts the
-  // raw module export. We need to simulate the callback-based API used by
-  // util.promisify.
-  vi.mocked(rawExecFile).mockImplementation(
-    (_cmd: unknown, _args: unknown, cb: unknown) => {
-      (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
-        stdout: `${containerId}\n`,
-        stderr: "",
-      });
-      return {} as ReturnType<typeof rawExecFile>;
-    },
-  );
-}
+const DEFAULT_SESSION_HANDLE = {
+  containerId: "abc123def456789",
+  containerName: "ai-implement-dev-dev-1-xyz",
+  startedAt: new Date(),
+};
 
 function makeSpawnSyncMock(stdout = "") {
   vi.mocked(spawnSync).mockReturnValue({
@@ -71,8 +68,8 @@ function makeSpawnSyncMock(stdout = "") {
 describe("startDevRun", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    makeSpawnSyncMock("main");  // detectCurrentBranch + detectRepoFromOrigin
-    makeExecFileMock();
+    makeSpawnSyncMock("main");
+    vi.mocked(launchLocalSession).mockResolvedValue(DEFAULT_SESSION_HANDLE);
   });
 
   afterEach(() => {
@@ -91,8 +88,8 @@ describe("startDevRun", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
 
-    makeSpawnSyncMock("");  // no git remote → dev-local/workspace
-    makeExecFileMock("cid1");
+    makeSpawnSyncMock("");
+    vi.mocked(launchLocalSession).mockResolvedValue({ ...DEFAULT_SESSION_HANDLE, containerId: "cid1" });
 
     const handle = await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
     expect(handle.containerId).toBe("cid1");
@@ -103,7 +100,7 @@ describe("startDevRun", () => {
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
 
     makeSpawnSyncMock("");
-    makeExecFileMock("deadbeef");
+    vi.mocked(launchLocalSession).mockResolvedValue({ ...DEFAULT_SESSION_HANDLE, containerId: "deadbeef" });
 
     const handle = await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
 
@@ -114,27 +111,15 @@ describe("startDevRun", () => {
     expect(handle.artifactsDir).toMatch(/\.dev-runs/);
   });
 
-  it("sets AI_IMPLEMENT_WORKSPACE_MODE=mounted in the container env", async () => {
+  it("passes AI_IMPLEMENT_WORKSPACE_MODE=mounted to the session via publicEnv", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
-
     makeSpawnSyncMock("");
-
-    const capturedArgs: string[] = [];
-    vi.mocked(rawExecFile).mockImplementation(
-      (_cmd: unknown, args: unknown, cb: unknown) => {
-        capturedArgs.push(...(args as string[]));
-        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
-          stdout: "cid\n",
-          stderr: "",
-        });
-        return {} as ReturnType<typeof rawExecFile>;
-      },
-    );
 
     await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
 
-    expect(capturedArgs).toContain("AI_IMPLEMENT_WORKSPACE_MODE=mounted");
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.publicEnv["AI_IMPLEMENT_WORKSPACE_MODE"]).toBe("mounted");
   });
 
   it("passes the host uid and gid so the container user can write without chowning the mount", async () => {
@@ -142,103 +127,56 @@ describe("startDevRun", () => {
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
     makeSpawnSyncMock("");
 
-    const capturedArgs: string[] = [];
-    vi.mocked(rawExecFile).mockImplementation(
-      (_cmd: unknown, args: unknown, cb: unknown) => {
-        capturedArgs.push(...(args as string[]));
-        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
-          stdout: "cid\n",
-          stderr: "",
-        });
-        return {} as ReturnType<typeof rawExecFile>;
-      },
-    );
-
     await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
 
-    expect(capturedArgs).toContain(`AI_IMPLEMENT_HOST_UID=${process.getuid!()}`);
-    expect(capturedArgs).toContain(`AI_IMPLEMENT_HOST_GID=${process.getgid!()}`);
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.publicEnv["AI_IMPLEMENT_HOST_UID"]).toBe(String(process.getuid!()));
+    expect(opts.publicEnv["AI_IMPLEMENT_HOST_GID"]).toBe(String(process.getgid!()));
   });
 
-  it("includes workspace bind-mount arg in docker run command", async () => {
+  it("passes the workspace path for bind-mounting at /workspace", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
-
     makeSpawnSyncMock("");
 
-    const capturedArgs: string[] = [];
-    vi.mocked(rawExecFile).mockImplementation(
-      (_cmd: unknown, args: unknown, cb: unknown) => {
-        capturedArgs.push(...(args as string[]));
-        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
-          stdout: "cid\n",
-          stderr: "",
-        });
-        return {} as ReturnType<typeof rawExecFile>;
-      },
-    );
-
     await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
-    expect(capturedArgs).toContain("-v");
-    expect(capturedArgs.some((a) => a.startsWith("/tmp/repo:/workspace"))).toBe(true);
+
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.workspace).toBe("/tmp/repo");
   });
 
-  it("embeds RunConfigV1 envelope in the env and it decodes correctly", async () => {
+  it("embeds RunConfigV1 envelope in publicEnv and it decodes correctly", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
-
     makeSpawnSyncMock("");
-
-    const publicArgs: string[] = [];
-    vi.mocked(rawExecFile).mockImplementation(
-      (_cmd: unknown, args: unknown, cb: unknown) => {
-        publicArgs.push(...(args as string[]));
-        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
-          stdout: "cid\n",
-          stderr: "",
-        });
-        return {} as ReturnType<typeof rawExecFile>;
-      },
-    );
 
     await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
 
-    const runConfigArg = publicArgs.find((a) => a.startsWith("AI_IMPLEMENT_RUN_CONFIG="));
-    expect(runConfigArg).toBeDefined();
-    const encoded = runConfigArg!.slice("AI_IMPLEMENT_RUN_CONFIG=".length);
-    const cfg = decodeRunConfig(encoded);
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    const encoded = opts.publicEnv["AI_IMPLEMENT_RUN_CONFIG"];
+    expect(encoded).toBeDefined();
+    const cfg = decodeRunConfig(encoded!);
     expect(cfg.issue.identifier).toBe("DEV-1");
     expect(cfg.issue.title).toBe("Add feature");
     expect(cfg.maxTurns).toBe(15);
     expect(cfg.runnerPhase).toBe("implementation");
   });
 
-  it("ANTHROPIC_API_KEY is in the secret (env-file) bucket, not the public -e args", async () => {
+  it("ANTHROPIC_API_KEY is in the secret (secretEnv) bucket, not publicEnv", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-secret");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
-
     makeSpawnSyncMock("");
-
-    const capturedArgs: string[] = [];
-    vi.mocked(rawExecFile).mockImplementation(
-      (_cmd: unknown, args: unknown, cb: unknown) => {
-        capturedArgs.push(...(args as string[]));
-        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, {
-          stdout: "cid\n",
-          stderr: "",
-        });
-        return {} as ReturnType<typeof rawExecFile>;
-      },
-    );
 
     await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
 
-    // The API key must not appear as a -e arg (it goes into the secret env file).
-    expect(capturedArgs).not.toContain("ANTHROPIC_API_KEY=sk-ant-secret");
-    // But the public env is correctly split.
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.secretEnv["ANTHROPIC_API_KEY"]).toBe("sk-ant-secret");
+    expect(opts.publicEnv["ANTHROPIC_API_KEY"]).toBeUndefined();
+
+    // Verify the split is consistent with the shared util.
     const allEnv = { ANTHROPIC_API_KEY: "sk-ant-secret", ISSUE_ID: "x" };
     const { secretEnv, publicEnv } = splitLocalRunnerEnv(allEnv);
-    expect(secretEnv.ANTHROPIC_API_KEY).toBe("sk-ant-secret");
-    expect(publicEnv.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(secretEnv["ANTHROPIC_API_KEY"]).toBe("sk-ant-secret");
+    expect(publicEnv["ANTHROPIC_API_KEY"]).toBeUndefined();
   });
 });
