@@ -97,3 +97,62 @@ describe("parseTaskFile", () => {
     expect(result.description).toBe("");
   });
 });
+
+describe("parseTaskFile — compatibility adapter (new field names)", () => {
+  it("accepts the new 'id' field as the identifier", () => {
+    const content = `---\ntitle: T\nid: PROJ-7\n---\n\nBody.`;
+    const result = parseTaskFile(content);
+    expect(result.identifier).toBe("PROJ-7");
+  });
+
+  it("accepts the new 'base' field as the branch", () => {
+    const content = `---\ntitle: T\nbase: feature/abc\n---\n\nBody.`;
+    const result = parseTaskFile(content);
+    expect(result.branch).toBe("feature/abc");
+  });
+
+  it("accepts the new 'limits' block for maxTurns", () => {
+    const content = `---\ntitle: T\nlimits:\n  maxTurns: 30\n---\n\nBody.`;
+    const result = parseTaskFile(content);
+    expect(result.maxTurns).toBe(30);
+  });
+
+  it("accepts the new 'limits' block for maxIterations", () => {
+    const content = `---\ntitle: T\nlimits:\n  maxIterations: 4\n---\n\nBody.`;
+    const result = parseTaskFile(content);
+    expect(result.maxIterations).toBe(4);
+  });
+
+  it("new 'id' field wins over legacy 'identifier' when both are present", () => {
+    const content = `---\ntitle: T\nid: NEW-1\nidentifier: OLD-1\n---\n\nBody.`;
+    const result = parseTaskFile(content);
+    expect(result.identifier).toBe("NEW-1");
+  });
+
+  it("new 'base' field wins over legacy 'branch' when both are present", () => {
+    const content = `---\ntitle: T\nbase: new-branch\nbranch: old-branch\n---\n\nBody.`;
+    const result = parseTaskFile(content);
+    expect(result.branch).toBe("new-branch");
+  });
+
+  it("new 'limits' block wins over legacy top-level maxTurns when both are present", () => {
+    const content = `---\ntitle: T\nlimits:\n  maxTurns: 99\nmaxTurns: 5\n---\n\nBody.`;
+    const result = parseTaskFile(content);
+    expect(result.maxTurns).toBe(99);
+  });
+
+  it("accepts 'profiles' field (new schema) without error", () => {
+    const content = `---\ntitle: T\nprofiles:\n  - backend\n  - webapp\n---\n\nBody.`;
+    expect(() => parseTaskFile(content)).not.toThrow();
+  });
+
+  it("rejects unknown fields not in the legacy or new schema", () => {
+    const content = `---\ntitle: T\nfooBar: x\n---\n\nBody.`;
+    expect(() => parseTaskFile(content)).toThrow(/fooBar/);
+  });
+
+  it("rejects credential fields even through the compatibility adapter", () => {
+    const content = `---\ntitle: T\nanthropicApiKey: secret\n---\n\nBody.`;
+    expect(() => parseTaskFile(content)).toThrow(/credential/i);
+  });
+});
