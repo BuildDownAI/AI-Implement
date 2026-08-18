@@ -1,6 +1,5 @@
 import { execFile as nodeExecFile, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
 import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,6 +11,7 @@ import {
 } from "../local-docker.js";
 import type { LocalContainerState } from "../local-docker.js";
 import { encodeRunConfig } from "../run-config.js";
+import { resolveRepository, createIsolatedWorkspace } from "../local/workspace.js";
 import { parseTaskFileFromPath } from "./task-file.js";
 import type { ParsedTaskFile } from "./task-file.js";
 
@@ -59,7 +59,10 @@ export interface DevRunHandle {
   artifactsDir: string;
   startedAt: Date;
   task: ParsedTaskFile;
+  /** Absolute path of the isolated workspace copy mounted at /workspace. */
   workspace: string;
+  /** Removes the isolated workspace directory created for this run. */
+  cleanup: () => Promise<void>;
 }
 
 export interface DevRunResult {
@@ -117,10 +120,9 @@ async function writeDevSecretEnvFile(secretEnv: Record<string, string>): Promise
  * effect immediately.
  */
 export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
-  const workspace = resolve(opts.workspace);
-  if (!existsSync(workspace)) {
-    throw new Error(`Workspace directory does not exist: ${workspace}`);
-  }
+  const repo = await resolveRepository(resolve(opts.workspace));
+  const isolated = await createIsolatedWorkspace(repo, { includeDirty: true });
+  const workspace = isolated.workspacePath;
 
   const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const artifactsDir = opts.artifactsDir ?? join(process.cwd(), ".dev-runs", ts);
@@ -210,6 +212,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     const { stdout } = await execFile("docker", args);
     containerId = stdout.trim();
   } catch (err) {
+    await isolated.cleanup().catch(() => undefined);
     const msg =
       (err as { stderr?: string }).stderr?.trim() ||
       (err instanceof Error ? err.message : String(err));
@@ -218,7 +221,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     await unlink(envFilePath).catch(() => undefined);
   }
 
-  return { runId, containerId, containerName, artifactsDir, startedAt: new Date(), task, workspace };
+  return { runId, containerId, containerName, artifactsDir, startedAt: new Date(), task, workspace, cleanup: isolated.cleanup };
 }
 
 /**

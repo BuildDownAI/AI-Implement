@@ -107,11 +107,12 @@ export async function runDevHarnessCli(
     }
 
     if (!artifactsCollected) await deps.collectRunArtifacts(handle, finalExitCode);
+    await handle.cleanup().catch(() => undefined);
     const durationSec = ((deps.now() - handle.startedAt.getTime()) / 1000).toFixed(1);
     deps.writeStderr(
       `[dev:run] done: exit=${finalExitCode ?? "unknown"} duration=${durationSec}s\n` +
       `[dev:run] artifacts saved to ${handle.artifactsDir}/\n` +
-      `[dev:run] inspect changes: cd ${handle.workspace} && git diff\n`,
+      `[dev:run] inspect changes: see ${handle.artifactsDir}/changes.diff\n`,
     );
     return finalExitCode ?? 1;
   }
@@ -121,10 +122,11 @@ export async function runDevHarnessCli(
   const exitCode = state.exitCode;
   const durationSec = ((deps.now() - handle.startedAt.getTime()) / 1000).toFixed(1);
   await deps.collectRunArtifacts(handle, exitCode);
+  await handle.cleanup().catch(() => undefined);
   deps.writeStderr(
     `[dev:run] done: exit=${exitCode ?? "unknown"} duration=${durationSec}s\n` +
     `[dev:run] artifacts saved to ${handle.artifactsDir}/\n` +
-    `[dev:run] inspect changes: cd ${handle.workspace} && git diff\n`,
+    `[dev:run] inspect changes: see ${handle.artifactsDir}/changes.diff\n`,
   );
   return exitCode ?? 1;
 }

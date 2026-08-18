@@ -9,12 +9,6 @@ vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
 }));
 
-// Mock node:fs so existsSync returns true for the workspace.
-vi.mock("node:fs", () => ({
-  default: { existsSync: vi.fn().mockReturnValue(true) },
-  existsSync: vi.fn().mockReturnValue(true),
-}));
-
 // Mock node:fs/promises so mkdir/writeFile/chmod/unlink are no-ops.
 vi.mock("node:fs/promises", () => ({
   mkdir: vi.fn().mockResolvedValue(undefined),
@@ -22,6 +16,25 @@ vi.mock("node:fs/promises", () => ({
   chmod: vi.fn().mockResolvedValue(undefined),
   unlink: vi.fn().mockResolvedValue(undefined),
   readFileSync: vi.fn(),
+}));
+
+// vi.mock factories are hoisted before variable initialisation, so the
+// constant must be defined via vi.hoisted to be accessible inside the factory.
+const ISOLATED_PATH = vi.hoisted(() => "/tmp/ai-implement-isolated");
+
+// Mock the workspace module so tests don't hit the real filesystem.
+vi.mock("../local/workspace.js", () => ({
+  resolveRepository: vi.fn().mockResolvedValue({
+    topLevel: "/tmp/repo",
+    branch: "main",
+    headSha: "abc123def456",
+    isDirty: false,
+    dirtyFiles: [],
+  }),
+  createIsolatedWorkspace: vi.fn().mockResolvedValue({
+    workspacePath: ISOLATED_PATH,
+    cleanup: vi.fn().mockResolvedValue(undefined),
+  }),
 }));
 
 import { execFile as rawExecFile, spawnSync } from "node:child_process";
@@ -110,8 +123,9 @@ describe("startDevRun", () => {
     expect(handle.task.identifier).toBe("DEV-1");
     expect(handle.task.title).toBe("Add feature");
     expect(handle.containerId).toBe("deadbeef");
-    expect(handle.workspace).toBe("/tmp/repo");
+    expect(handle.workspace).toBe(ISOLATED_PATH);
     expect(handle.artifactsDir).toMatch(/\.dev-runs/);
+    expect(typeof handle.cleanup).toBe("function");
   });
 
   it("sets AI_IMPLEMENT_WORKSPACE_MODE=mounted in the container env", async () => {
@@ -160,7 +174,7 @@ describe("startDevRun", () => {
     expect(capturedArgs).toContain(`AI_IMPLEMENT_HOST_GID=${process.getgid!()}`);
   });
 
-  it("includes workspace bind-mount arg in docker run command", async () => {
+  it("mounts the isolated workspace copy (not the original checkout) into the container", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
 
@@ -180,7 +194,9 @@ describe("startDevRun", () => {
 
     await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
     expect(capturedArgs).toContain("-v");
-    expect(capturedArgs.some((a) => a.startsWith("/tmp/repo:/workspace"))).toBe(true);
+    expect(capturedArgs.some((a) => a.startsWith(`${ISOLATED_PATH}:/workspace`))).toBe(true);
+    // The original checkout path must NOT be mounted.
+    expect(capturedArgs.some((a) => a.startsWith("/tmp/repo:/workspace"))).toBe(false);
   });
 
   it("embeds RunConfigV1 envelope in the env and it decodes correctly", async () => {

@@ -9,16 +9,19 @@ function makeHandle(): DevRunHandle {
     containerName: "dev-container",
     artifactsDir: "/tmp/artifacts",
     startedAt: new Date(),
-    task: { identifier: "DEV-1", title: "Test", description: "Test" },
-    workspace: "/tmp/workspace",
+    task: { identifier: "DEV-1", title: "Test", description: "Test", maxTurns: undefined, maxIterations: undefined, repo: undefined, branch: undefined },
+    workspace: "/tmp/isolated-workspace",
+    cleanup: vi.fn().mockResolvedValue(undefined),
   };
 }
 
 describe("runDevHarnessCli", () => {
-  it("collects shell-mode artifacts before removing the container", async () => {
+  it("collects shell-mode artifacts before removing the container, then cleans up isolated workspace", async () => {
     const events: string[] = [];
+    const handle = makeHandle();
+    (handle.cleanup as ReturnType<typeof vi.fn>).mockImplementation(async () => { events.push("cleanup"); });
     const deps: DevHarnessCliDependencies = {
-      startDevRun: vi.fn().mockResolvedValue(makeHandle()),
+      startDevRun: vi.fn().mockResolvedValue(handle),
       streamLogs: vi.fn().mockResolvedValue(undefined),
       streamLogsUntilShellReady: vi.fn().mockResolvedValue({ ready: true, exitCode: 0 }),
       getRunStatus: vi.fn(),
@@ -38,13 +41,15 @@ describe("runDevHarnessCli", () => {
     );
 
     expect(exitCode).toBe(0);
-    expect(events).toEqual(["shell", "artifacts", "remove"]);
+    expect(events).toEqual(["shell", "artifacts", "remove", "cleanup"]);
   });
 
   it("returns the docker exec failure after collecting artifacts and removing the container", async () => {
     const events: string[] = [];
+    const handle = makeHandle();
+    (handle.cleanup as ReturnType<typeof vi.fn>).mockImplementation(async () => { events.push("cleanup"); });
     const deps: DevHarnessCliDependencies = {
-      startDevRun: vi.fn().mockResolvedValue(makeHandle()),
+      startDevRun: vi.fn().mockResolvedValue(handle),
       streamLogs: vi.fn().mockResolvedValue(undefined),
       streamLogsUntilShellReady: vi.fn().mockResolvedValue({ ready: true, exitCode: 0 }),
       getRunStatus: vi.fn(),
@@ -64,6 +69,6 @@ describe("runDevHarnessCli", () => {
     );
 
     expect(exitCode).toBe(125);
-    expect(events).toEqual(["shell", "artifacts", "remove"]);
+    expect(events).toEqual(["shell", "artifacts", "remove", "cleanup"]);
   });
 });

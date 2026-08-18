@@ -5,11 +5,11 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 
 export class WorkspaceError extends Error {
-  readonly kind: "inaccessible" | "not-git" | "traversal" | "symlink-escape" | "dirty";
+  readonly kind: "inaccessible" | "not-git" | "traversal" | "symlink-escape" | "dirty" | "copy-failed";
 
   constructor(
     message: string,
-    kind: "inaccessible" | "not-git" | "traversal" | "symlink-escape" | "dirty",
+    kind: "inaccessible" | "not-git" | "traversal" | "symlink-escape" | "dirty" | "copy-failed",
   ) {
     super(message);
     this.name = "WorkspaceError";
@@ -136,7 +136,7 @@ export async function createIsolatedWorkspace(
   if (r.status !== 0) {
     await rm(workspacePath, { recursive: true, force: true });
     const stderr = r.stderr instanceof Buffer ? r.stderr.toString().trim() : String(r.stderr ?? "");
-    throw new Error(`Failed to copy repository to isolated workspace: ${stderr}`);
+    throw new WorkspaceError(`Failed to copy repository to isolated workspace: ${stderr}`, "copy-failed");
   }
 
   return {
