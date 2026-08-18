@@ -85,11 +85,26 @@ describe.skipIf(isWindows)("verify_workspace_writable", () => {
   it("succeeds and leaves no probe file when coder can write the workspace", () => {
     const { binDir, workspace } = makeEnv();
     writeShim(binDir, "id", `case "\${1:-}" in -u) echo 1234 ;; -g) echo 2345 ;; esac`);
-    // su shim that forwards the -c command to the current shell (no user switching needed in tests)
+    // su shim: extract the -c script and positional args after --, run as current user.
+    // Real su strips -- before calling bash, so bash sees: bash -c '<script>' _ /workspace
+    // ($0=_, $1=/workspace).  We replicate that by collecting args after -- and calling
+    // bash without --.
     writeShim(
       binDir,
       "su",
-      `while [[ $# -gt 0 ]]; do [ "$1" = "-c" ] && { shift; bash -c "$1"; exit $?; }; shift; done`,
+      [
+        "cmd=''",
+        "pos_args=()",
+        "while (( $# )); do",
+        '  case "$1" in',
+        '    -c) cmd="$2"; shift 2 ;;',
+        "    -s) shift 2 ;;",
+        '    --) shift; pos_args=("$@"); break ;;',
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        'exec bash -c "$cmd" "${pos_args[@]}"',
+      ].join("\n"),
     );
 
     const result = runVerify(binDir, workspace);

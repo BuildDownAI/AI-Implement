@@ -51,13 +51,20 @@ prepare_coder_identity() {
 # Stops the run on failure and reports the path, detected ownership, and adopted identity.
 verify_workspace_writable() {
   local workspace_dir="$1"
-  local coder_uid coder_gid ws_uid ws_gid probe
+  local coder_uid coder_gid ws_uid ws_gid
   coder_uid="$(id -u coder)"
   coder_gid="$(id -g coder)"
   ws_uid="$(stat -c '%u' "$workspace_dir" 2>/dev/null || stat -f '%u' "$workspace_dir" 2>/dev/null || echo '?')"
   ws_gid="$(stat -c '%g' "$workspace_dir" 2>/dev/null || stat -f '%g' "$workspace_dir" 2>/dev/null || echo '?')"
-  probe="$workspace_dir/.ai-implement-probe-$$"
-  if su coder -c "touch '$probe' && rm -f '$probe'" 2>/dev/null; then
+  # workspace_dir is passed as $1 to the child shell — never interpolated into the
+  # -c program text — so shell-significant characters in the path cannot become
+  # executable code.  mktemp generates a collision-safe name; the EXIT trap removes
+  # the probe on both success and failure.
+  # shellcheck disable=SC2016
+  if su coder -s /bin/bash -c '
+    probe="$(mktemp "$1/.ai-implement-probe.XXXXXX")" || exit 1
+    trap "rm -f \"$probe\"" EXIT
+  ' -- _ "$workspace_dir" 2>/dev/null; then
     return 0
   fi
   fail "Cannot write to bind-mounted workspace $workspace_dir (owner $ws_uid:$ws_gid, coder UID $coder_uid GID $coder_gid). Verify AI_IMPLEMENT_HOST_UID/AI_IMPLEMENT_HOST_GID match the host directory owner. On macOS Docker Desktop, confirm file sharing is enabled — the mount may be read-only."
