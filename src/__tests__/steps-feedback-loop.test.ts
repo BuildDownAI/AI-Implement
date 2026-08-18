@@ -526,7 +526,7 @@ describe("feedbackLoopStep termination reasons", () => {
 
     expect(outputs.terminationReason).toBe("approved");
     expect(outputs.passes).toEqual([
-      { iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true },
+      { iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true, tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null },
     ]);
   });
 

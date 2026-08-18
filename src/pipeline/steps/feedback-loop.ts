@@ -87,6 +87,10 @@ export interface PassStat extends Record<string, unknown> {
   implementOutcome: string;   // RunTelemetry outcome or "unknown"
   costUsd: number | null;
   reviewApproved: boolean | null; // null when review never ran on this pass
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
 }
 
 interface FeedbackLoopOutputs extends Record<string, unknown> {
@@ -417,6 +421,10 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         implementOutcome: implementTelemetry?.outcome ?? "unknown",
         costUsd: implementTelemetry?.costUsd ?? null,
         reviewApproved: null,
+        tokensIn: implementTelemetry?.tokensIn ?? null,
+        tokensOut: implementTelemetry?.tokensOut ?? null,
+        cacheReadTokens: implementTelemetry?.cacheReadTokens ?? null,
+        cacheCreationTokens: implementTelemetry?.cacheCreationTokens ?? null,
       };
       passes.push(pass);
 
