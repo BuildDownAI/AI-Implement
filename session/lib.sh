@@ -45,3 +45,20 @@ prepare_coder_identity() {
   usermod -o -u "$host_uid" coder
   chown -R coder:"$(id -gn coder)" /home/coder
 }
+
+# Verify that coder can create and remove a file in the bind-mounted workspace.
+# Call this after prepare_coder_identity has adopted the host UID/GID.
+# Stops the run on failure and reports the path, detected ownership, and adopted identity.
+verify_workspace_writable() {
+  local workspace_dir="$1"
+  local coder_uid coder_gid ws_uid ws_gid probe
+  coder_uid="$(id -u coder)"
+  coder_gid="$(id -g coder)"
+  ws_uid="$(stat -c '%u' "$workspace_dir" 2>/dev/null || stat -f '%u' "$workspace_dir" 2>/dev/null || echo '?')"
+  ws_gid="$(stat -c '%g' "$workspace_dir" 2>/dev/null || stat -f '%g' "$workspace_dir" 2>/dev/null || echo '?')"
+  probe="$workspace_dir/.ai-implement-probe-$$"
+  if su coder -c "touch '$probe' && rm -f '$probe'" 2>/dev/null; then
+    return 0
+  fi
+  fail "Cannot write to bind-mounted workspace $workspace_dir (owner $ws_uid:$ws_gid, coder UID $coder_uid GID $coder_gid). Verify AI_IMPLEMENT_HOST_UID/AI_IMPLEMENT_HOST_GID match the host directory owner. On macOS Docker Desktop, confirm file sharing is enabled — the mount may be read-only."
+}
