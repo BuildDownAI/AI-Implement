@@ -58,12 +58,14 @@ verify_workspace_writable() {
   ws_gid="$(stat -c '%g' "$workspace_dir" 2>/dev/null || stat -f '%g' "$workspace_dir" 2>/dev/null || echo '?')"
   # workspace_dir is passed as $1 to the child shell — never interpolated into the
   # -c program text — so shell-significant characters in the path cannot become
-  # executable code.  mktemp generates a collision-safe name; the EXIT trap removes
-  # the probe on both success and failure.
+  # executable code.  mktemp generates a collision-safe name; _cleanup_probe removes
+  # the probe by variable reference rather than embedding the path in an evaluated
+  # trap string, so shell-significant characters in the probe path remain data.
   # shellcheck disable=SC2016
   if su coder -s /bin/bash -c '
     probe="$(mktemp "$1/.ai-implement-probe.XXXXXX")" || exit 1
-    trap '\''rm -f -- "$probe"'\'' EXIT
+    _cleanup_probe() { rm -f -- "$probe"; }
+    trap _cleanup_probe EXIT
   ' -- _ "$workspace_dir" 2>/dev/null; then
     return 0
   fi
