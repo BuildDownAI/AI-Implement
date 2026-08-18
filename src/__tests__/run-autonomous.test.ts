@@ -1073,6 +1073,7 @@ describe("runAutonomous", () => {
     vi.stubEnv("RUN_TOKEN", "run-token");
 
     const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const postPushReviewRun = vi.fn().mockRejectedValue(new Error("skipped step must not run"));
     const { pipeline, runner } = makeStepsPipeline([
       [
         "feedback-loop",
@@ -1097,7 +1098,9 @@ describe("runAutonomous", () => {
           }),
         },
       ],
+      ["post-push-review", { run: postPushReviewRun }],
     ]);
+    pipeline.steps[2].skip = () => true;
 
     const result = await runAutonomous({
       workspaceDir,
@@ -1109,8 +1112,13 @@ describe("runAutonomous", () => {
     });
 
     expect(result.exitCode).toBe(0);
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as { failureCode: string };
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      failureCode: string;
+      failureReason: string;
+    };
+    expect(postPushReviewRun).not.toHaveBeenCalled();
     expect(body.failureCode).toBe("MAX_TURNS_EXHAUSTED");
+    expect(body.failureReason).toContain("ran out of turns");
   });
 
   it("writes the autopsy comment file on unapproved runs", async () => {

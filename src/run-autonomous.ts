@@ -505,7 +505,13 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const pushOutputs = context.getOutputs("push");
     const postPushReviewOutputs = context.getOutputs("post-push-review");
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
-    const postPushReviewRequired = Boolean(prUrl)
+    // Mirror the post-push-review skip contract: a statically registered step is
+    // authoritative only when the internal review approved and push produced the
+    // branch/PR inputs that cause the step to run. Otherwise its outputs are empty.
+    const postPushReviewRequired = fbOutputs.approved === true
+      && pushOutputs.branchPushed === true
+      && Boolean(pushOutputs.prNumber)
+      && Boolean(prUrl)
       && pipeline.steps.some((step) => step.id === "post-push-review");
     const approved = fbOutputs.approved === true
       && (!postPushReviewRequired || postPushReviewOutputs.approved === true);
