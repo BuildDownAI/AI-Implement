@@ -33,6 +33,8 @@ const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
   "claude-code[bot]",
 ]);
 
+const GITHUB_ACTIONS_REVIEW_AUTHOR = "github-actions";
+
 export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): ReviewLedgerFinding[] {
   const findings: ReviewLedgerFinding[] = [];
 
@@ -190,6 +192,110 @@ export function extractClaudeSummaryFindings(body: string, url?: string): Review
   }));
 }
 
+function classifyClaudeFindingHeading(value: string): ReviewLedgerSeverity | null {
+  const normalized = normalizeText(value).replace(/:$/, "");
+  if (/\b(?:blocking|changes requested|must fix|required fixes?)\b/i.test(normalized)) return "blocking";
+  if (/\b(?:minor|non-blocking|notes?)\b/i.test(normalized)) return "minor";
+  if (/\b(?:findings?|issues?|concerns?|problems?)\b/i.test(normalized)) return "medium";
+  return null;
+}
+
+function stripClaudeActionNoise(lines: string[]): string {
+  return lines
+    .filter((line) => !/^\s*[-*]\s+\[[ xX]\]\s+/.test(line))
+    .filter((line) => !/^\s*[·•]\s+Branch\s*:/i.test(line))
+    .join("\n")
+    .trim();
+}
+
+function hasExplicitCleanVerdict(body: string): boolean {
+  return /\bno\s+(?:correctness(?:,\s*security,?\s*or\s*style)?)?\s*(?:issues?|findings?|concerns?|changes)\s+(?:were\s+)?(?:found|required)\b/i.test(body);
+}
+
+function hasFindingSignal(body: string): boolean {
+  return /\b(?:one|two|three|\d+)\s+(?:minor\s+)?(?:issues?|findings?|concerns?|notes?)\b/i.test(body)
+    || /\b(?:issue|finding|concern)\s+(?:undercuts|remains|requires|needs|must)\b/i.test(body)
+    || /\bminor\s+(?:issue|finding|concern|note)\b/i.test(body)
+    || /\bminor\s*\(\s*non-blocking\s*\)/i.test(body);
+}
+
+function isExplicitlyEmptyFindingSection(body: string): boolean {
+  const normalized = normalizeText(body).replace(/^[*_`\s-]+|[*_`.\s-]+$/g, "");
+  return /^(?:none|nothing|n\/a|no\s+(?:(?:blocking|minor|non-blocking|material|actionable)\s+)?(?:issues?|findings?|concerns?|changes)(?:\s+(?:were\s+)?(?:found|required))?)$/i.test(normalized);
+}
+
+/**
+ * Parses the live comment shape emitted by anthropics/claude-code-action when it runs
+ * under GitHub Actions. The action has repeatedly omitted the requested verdict marker,
+ * so a completed external review must not be treated as clean merely because the marker
+ * is absent. Recognized finding sections are preserved; ambiguous output fails closed.
+ */
+export function extractGithubActionsClaudeReviewFindings(body: string, url?: string): ReviewLedgerFinding[] {
+  const findings: ReviewLedgerFinding[] = [];
+  const lines = body.split(/\r?\n/);
+  let severity: ReviewLedgerSeverity | null = null;
+  let sectionLines: string[] = [];
+  let recognizedSections = 0;
+  let explicitlyEmptySections = 0;
+
+  const flush = () => {
+    if (!severity) {
+      sectionLines = [];
+      return;
+    }
+    const findingBody = normalizeText(stripClaudeActionNoise(sectionLines));
+    if (findingBody) {
+      if (isExplicitlyEmptyFindingSection(findingBody)) {
+        explicitlyEmptySections += 1;
+      } else {
+        findings.push({
+          source: "claude-review-summary",
+          severity,
+          body: findingBody,
+          ...(url ? { url } : {}),
+        });
+      }
+    }
+    sectionLines = [];
+  };
+
+  for (const line of lines) {
+    const markdownHeading = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/);
+    const boldHeading = line.match(/^\s*\*\*(.+?)\*\*\s*(.*)$/);
+    if (markdownHeading) {
+      flush();
+      severity = classifyClaudeFindingHeading(markdownHeading[1]);
+      if (severity) recognizedSections += 1;
+      continue;
+    }
+    if (boldHeading) {
+      const boldSeverity = classifyClaudeFindingHeading(boldHeading[1]);
+      if (boldSeverity) {
+        flush();
+        severity = boldSeverity;
+        recognizedSections += 1;
+        const trailingText = boldHeading[2].trim();
+        if (trailingText) sectionLines.push(trailingText);
+        continue;
+      }
+    }
+    if (severity) sectionLines.push(line);
+  }
+  flush();
+
+  if (findings.length > 0) return findings;
+  if (recognizedSections > 0 && explicitlyEmptySections === recognizedSections) return [];
+  if (hasExplicitCleanVerdict(body) && !hasFindingSignal(body)) return [];
+
+  const reviewBody = normalizeText(stripClaudeActionNoise(lines));
+  return [{
+    source: "claude-review-summary",
+    severity: "medium",
+    body: reviewBody || "External Claude review did not provide an explicit clean verdict.",
+    ...(url ? { url } : {}),
+  }];
+}
+
 export function formatReviewLedgerForPrompt(findings: ReviewLedgerFinding[]): string {
   if (findings.length === 0) {
     return "No unresolved external review findings.";
@@ -264,21 +370,28 @@ function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings
   ]);
   if (!result || result.exitCode !== 0) return;
 
-  const comments = parseReviewPages(result.stdout);
+  const comments = parseReviewPages(result.stdout)
+    .map((comment, index) => ({ comment, index, timestamp: reviewCommentTimestamp(comment) }))
+    .sort((a, b) => b.timestamp - a.timestamp || b.index - a.index)
+    .map(({ comment }) => comment);
 
+  // Top-level Claude review comments are revision verdicts, not an append-only ledger.
+  // The live action currently posts a new comment for each head instead of updating a
+  // sticky comment, so the newest recognized verdict supersedes older review summaries.
+  // Formal CHANGES_REQUESTED reviews and unresolved threads remain independently collected.
   for (const comment of comments) {
     if (!isRecord(comment) || typeof comment.body !== "string" || isAiImplementComment(comment.body)) continue;
 
     const url = typeof comment.html_url === "string" ? comment.html_url : undefined;
 
-    // Verdict marker path: accept from bot accounts (user.type === "Bot") and
-    // already-trusted authors. A human commenter cannot post as a Bot-type account,
-    // so the marker is not forgeable by an arbitrary PR participant.
+    // Verdict marker path: accept only from the GitHub Actions bot or an
+    // already-trusted Claude author. Other integrations must not be able to
+    // supersede the latest Claude review by emitting a lookalike marker.
     if (isVerdictEligibleAuthor(comment)) {
       const verdictFindings = extractVerdictMarkerFindings(comment.body, url);
       if (verdictFindings !== null) {
         findings.push(...verdictFindings);
-        continue;
+        return;
       }
     }
 
@@ -286,8 +399,25 @@ function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings
     // Claude App identity that posts without a verdict marker).
     if (isLikelyClaudeReviewComment(comment)) {
       findings.push(...extractClaudeSummaryFindings(comment.body, url));
+      return;
+    }
+
+    if (isGithubActionsClaudeReviewComment(comment)) {
+      findings.push(...extractGithubActionsClaudeReviewFindings(comment.body, url));
+      return;
     }
   }
+}
+
+function reviewCommentTimestamp(comment: unknown): number {
+  if (!isRecord(comment)) return 0;
+  const value = typeof comment.updated_at === "string"
+    ? comment.updated_at
+    : typeof comment.created_at === "string"
+      ? comment.created_at
+      : "";
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function collectUnresolvedReviewThreads(
@@ -446,6 +576,13 @@ function isLikelyClaudeReviewComment(comment: Record<string, unknown>): comment 
   return isClaudeAuthor(comment) && hasClaudeReviewHeading(comment.body);
 }
 
+function isGithubActionsClaudeReviewComment(comment: Record<string, unknown>): comment is Record<string, unknown> & { body: string } {
+  if (typeof comment.body !== "string" || isAiImplementComment(comment.body)) return false;
+  return isGithubActionsBotAuthor(comment)
+    && /\*\*Claude finished\b/i.test(comment.body)
+    && hasClaudeReviewHeading(comment.body);
+}
+
 function isAiImplementComment(body: string): boolean {
   return body.includes("<!-- ai-implement");
 }
@@ -456,18 +593,19 @@ function isClaudeAuthor(comment: Record<string, unknown>): boolean {
   return TRUSTED_REVIEW_COMMENT_AUTHORS.has(user.login.toLowerCase());
 }
 
-function isBotAuthor(comment: Record<string, unknown>): boolean {
+function isGithubActionsBotAuthor(comment: Record<string, unknown>): boolean {
   const user = comment.user;
-  if (!isRecord(user)) return false;
-  return user.type === "Bot";
+  if (!isRecord(user) || typeof user.login !== "string") return false;
+  return user.type === "Bot"
+    && normalizeReviewerLogin(user.login) === GITHUB_ACTIONS_REVIEW_AUTHOR;
 }
 
 function isVerdictEligibleAuthor(comment: Record<string, unknown>): boolean {
-  return isBotAuthor(comment) || isClaudeAuthor(comment);
+  return isGithubActionsBotAuthor(comment) || isClaudeAuthor(comment);
 }
 
 function hasClaudeReviewHeading(body: string): boolean {
-  return /(?:^|\n)\s{0,3}#{1,6}\s+(?:PR Review|Code Review|Follow-up Review|Code Review Complete|Changes Requested)\b/i.test(body);
+  return /(?:^|\n)\s{0,3}#{1,6}\s+(?:PR Review|Code Review|Claude Review|Follow-up Review|Code Review Complete|Review(?=\s*:|\s+complete\b|\s*$)|Changes Requested)\b/im.test(body);
 }
 
 function isClaudeBlockingHeading(value: string): boolean {

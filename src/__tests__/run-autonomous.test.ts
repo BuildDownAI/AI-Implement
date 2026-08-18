@@ -1174,6 +1174,37 @@ describe("runAutonomous", () => {
     expect(body.failureCode).toBeUndefined();
   });
 
+  it("does not report success when the post-push review rejects an internally approved PR", async () => {
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const { pipeline, runner } = makeStepsPipeline([
+      ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved" }) }],
+      ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/12", prNumber: 12, branchPushed: true, draft: false }) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({ approved: false, iterations: 2, finalFeedback: "External Claude finding remains." }) }],
+    ]);
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      outcome: string;
+      failureCode?: string;
+      prUrl?: string;
+    };
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
+    expect(body.prUrl).toBe("https://github.com/o/r/pull/12");
+  });
+
   it("approved mounted run exits 0, posts success with no prUrl, writes no autopsy", async () => {
     vi.stubEnv("AI_IMPLEMENT_MODE", "local");
     vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");

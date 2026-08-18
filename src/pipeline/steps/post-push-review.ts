@@ -215,7 +215,9 @@ function parseReviewIssues(parsed: Record<string, unknown>): ReviewIssue[] {
       ? parsed.blockingIssues
       : Array.isArray(parsed.issues)
         ? parsed.issues
-        : [];
+        : Array.isArray(parsed.findings)
+          ? parsed.findings
+          : [];
 
   return source
     .map(parseReviewIssue)
@@ -370,18 +372,6 @@ function suppressDuplicateExternalFeedback(feedback: string, externalFindings: R
 
 function externalBlockingCommentBlock(hasExternalBlockers: boolean): string {
   return hasExternalBlockers ? "\n\nExternal review findings are blocking this PR." : "";
-}
-
-function minorExternalFindingsBlock(findings: ReviewLedgerFinding[]): string {
-  const minorFindings = findings.filter((f) => f.severity === "minor");
-  if (minorFindings.length === 0) return "";
-  const issues = minorFindings.map((finding) => {
-    const location = finding.path
-      ? `${finding.path}${typeof finding.line === "number" ? `:${finding.line}` : ""}: `
-      : "";
-    return issueFromString(`${location}${finding.body}`);
-  });
-  return `\n\nUnaddressed external review findings (non-blocking):\n${formatIssueList(issues)}`;
 }
 
 function shouldCollectExternalReviewFindings(reviewProviders: string[] | undefined): boolean {
@@ -831,7 +821,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       const parsed = extractFirstJsonObject(reviewResult.stdout) as
-        | { approved?: boolean; feedback?: string; issues?: unknown[]; blocking_issues?: unknown[]; blockingIssues?: unknown[] }
+        | { approved?: boolean; feedback?: string; issues?: unknown[]; findings?: unknown[]; blocking_issues?: unknown[]; blockingIssues?: unknown[] }
         | null;
       if (!parsed) {
         feedback = compactErrorMessage(`Reviewer returned non-JSON output: ${reviewResult.stdout || "(empty stdout)"}`);
@@ -879,12 +869,14 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const externalFindings: ReviewLedgerFinding[] = externalReviewState === "skipped"
         ? []
         : collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
-      const hasExternalBlockers = externalFindings.some((finding) => finding.severity === "blocking");
+      // Approval is a zero-findings invariant. Severity controls presentation and
+      // prioritisation, not whether a reported Claude finding may be silently escaped.
+      const hasExternalFindings = externalFindings.length > 0;
 
       feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
       let issues = parseReviewIssues(parsed);
       issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
-      if (issues.length === 0 && parsed.approved === false && !hasExternalBlockers) {
+      if (issues.length === 0 && parsed.approved === false && !hasExternalFindings) {
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
@@ -893,7 +885,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
       // external review check did not finish within the wait budget. Do not auto-approve
       // against a reviewer that is still in flight — defer to a human.
-      const internalApprovable = parsed.approved === true && issues.length === 0 && !hasExternalBlockers;
+      const internalApprovable = parsed.approved === true && issues.length === 0 && !hasExternalFindings;
       if (internalApprovable && externalReviewPending) {
         feedback = "External review did not complete within the wait budget; not auto-approving.";
         await reporter.report({
@@ -938,7 +930,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}${minorExternalFindingsBlock(externalFindings)}\n\n**Merge readiness:** Ready to merge.`,
+          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}\n\n**Merge readiness:** Ready to merge.`,
           marker,
         );
         break;
@@ -954,7 +946,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalBlockers)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalFindings)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
@@ -964,7 +956,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       postPrComment(
         ghSpawn,
         prNumber,
-        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalBlockers)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalFindings)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
         feedbackMarker,
       );
 

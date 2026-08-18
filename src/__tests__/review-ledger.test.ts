@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   collectExternalReviewFindingsFromGh,
   extractClaudeSummaryFindings,
+  extractGithubActionsClaudeReviewFindings,
   extractVerdictMarkerFindings,
   formatReviewLedgerForPrompt,
   type GhSpawn,
@@ -122,6 +123,97 @@ Late reviews are not persisted.
         body: "Callback lifecycle can drop feedback Late reviews are not persisted.",
         url: "https://example.com/claude-review",
       },
+    ]);
+  });
+});
+
+describe("extractGithubActionsClaudeReviewFindings", () => {
+  it("extracts prose under the live Claude Actions blocking heading", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review: PR #302",
+      "",
+      "### Blocking",
+      "",
+      "**Missing regression test for the actual vulnerability that was fixed.**",
+      "The existing test would pass under the vulnerable implementation.",
+      "",
+      "### Everything else",
+      "",
+      "No other changes are required.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body, "https://example.com/review")).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Missing regression test for the actual vulnerability that was fixed. The existing test would pass under the vulnerable implementation.",
+        url: "https://example.com/review",
+      },
+    ]);
+  });
+
+  it("accepts an explicit clean verdict when no finding signal is present", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review complete ✅",
+      "",
+      "No correctness, security, or style issues found.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual([]);
+  });
+
+  it("accepts recognized finding sections that explicitly report no findings", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review complete ✅",
+      "",
+      "### Blocking",
+      "No blocking issues found.",
+      "",
+      "### Minor",
+      "No minor issues found.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual([]);
+  });
+
+  it("does not treat no-blockers prose as clean when a minor finding follows", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review complete",
+      "",
+      "No blocking issues found. Minor issue: rename this variable for clarity.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual([
+      expect.objectContaining({
+        source: "claude-review-summary",
+        severity: "medium",
+        body: expect.stringContaining("Minor issue"),
+      }),
+    ]);
+  });
+
+  it("fails closed when a completed review has neither findings nor an explicit clean verdict", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review",
+      "",
+      "The implementation follows the surrounding patterns.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual([
+      expect.objectContaining({
+        source: "claude-review-summary",
+        severity: "medium",
+      }),
     ]);
   });
 });
@@ -940,6 +1032,75 @@ describe("collectExternalReviewFindingsFromGh", () => {
         severity: "minor",
         body: "Consider extracting a helper",
         url: "https://example.com/verdict-comment",
+      },
+    ]);
+  });
+
+  it("uses the latest Claude Actions review comment so fixed findings do not remain forever", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) return { exitCode: 0, stdout: "[]" };
+      if (isIssueCommentsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            {
+              user: { login: "github-actions[bot]", type: "Bot" },
+              body: "**Claude finished the review**\n\n### Review: first pass\n\n### Blocking\n\nMissing regression coverage.",
+              html_url: "https://example.com/old-review",
+              created_at: "2026-08-18T18:00:00Z",
+            },
+            {
+              user: { login: "github-actions[bot]", type: "Bot" },
+              body: "**Claude finished the review**\n\n### Review complete ✅\n\nNo correctness, security, or style issues found.",
+              html_url: "https://example.com/latest-review",
+              created_at: "2026-08-18T18:05:00Z",
+            },
+          ]),
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+  });
+
+  it("does not let an unrelated bot verdict supersede the latest Claude review", () => {
+    const ghSpawn: GhSpawn = (args) => {
+      if (isPullReviewsRequest(args)) return { exitCode: 0, stdout: "[]" };
+      if (isIssueCommentsRequest(args)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            {
+              user: { login: "github-actions[bot]", type: "Bot" },
+              body: "**Claude finished the review**\n\n### Review: current head\n\n### Blocking\n\nMissing regression coverage.",
+              html_url: "https://example.com/claude-review",
+              created_at: "2026-08-18T18:00:00Z",
+            },
+            {
+              user: { login: "unrelated-check[bot]", type: "Bot" },
+              body: '<!-- claude-review-verdict {"blocking":[],"minor":[]} -->',
+              html_url: "https://example.com/unrelated-bot",
+              created_at: "2026-08-18T18:05:00Z",
+            },
+          ]),
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+      };
+    };
+
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
+      {
+        source: "claude-review-summary",
+        severity: "blocking",
+        body: "Missing regression coverage.",
+        url: "https://example.com/claude-review",
       },
     ]);
   });

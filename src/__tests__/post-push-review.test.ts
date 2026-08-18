@@ -280,6 +280,36 @@ describe("postPushReviewStep", () => {
     expect(invoke.mock.calls[1][0].prompt).toContain("1. Escape quoted user input");
   });
 
+  it("runs a fix pass when reviewer uses the findings alias", async () => {
+    const approvedWithFindings = JSON.stringify({
+      approved: true,
+      findings: [{ title: "Missing guard", problem: "Null input reaches the write path.", required_fix: "Reject null input." }],
+      feedback: "One finding remains.",
+      score: 7,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: approvedWithFindings, exitCode: 0, tokensUsed: 100 }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls[1][0].prompt).toContain("Missing guard");
+    expect(invoke.mock.calls[1][0].prompt).toContain("Reject null input.");
+  });
+
   it("runs a fix pass when an external changes-requested review blocks internal approval", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,
@@ -384,6 +414,62 @@ describe("postPushReviewStep", () => {
     ]);
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
     expect(reviewComment).toContain("External review findings are blocking this PR.");
+  });
+
+  it("does not approve when the GitHub Actions Claude review reports a prose blocking finding", async () => {
+    const reviewerJson = JSON.stringify({
+      approved: true,
+      issues: [],
+      feedback: "Internal reviewer approves.",
+      score: 9,
+      progress_delta: 0,
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([{
+            user: { login: "github-actions[bot]", type: "Bot" },
+            body: [
+              "**Claude finished the review**",
+              "",
+              "### Review: PR #42",
+              "",
+              "### Blocking",
+              "",
+              "**Missing regression test for the actual vulnerability that was fixed.**",
+              "The existing test would pass under the vulnerable implementation.",
+              "",
+              "### Everything else",
+              "",
+              "No other changes are required.",
+            ].join("\n"),
+            html_url: "https://example.com/claude-review",
+          }]),
+          exitCode: 0,
+        };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls[1][0].prompt).toContain("Missing regression test for the actual vulnerability that was fixed.");
   });
 
   it("preserves opportunistic external collection when reviewProviders is undefined", async () => {
@@ -1461,7 +1547,7 @@ describe("postPushReviewStep", () => {
     expect(fixComment).toContain("Notes:\nNo behavior changes.");
   });
 
-  it("approves with no fix cycle and lists minor external findings when the verdict has only minor[] entries", async () => {
+  it("withholds approval and initiates a fix pass when the verdict has only minor[] entries", async () => {
     const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "lgtm", score: 9, progress_delta: 0 });
     const ghComments: string[] = [];
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
@@ -1491,13 +1577,15 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(true);
-    expect(invoke).toHaveBeenCalledTimes(1);
-    const approvalComment = ghComments.find((c) => c.includes("✅"));
-    expect(approvalComment).toContain("Unaddressed external review findings (non-blocking):");
-    expect(approvalComment).toContain("Consider extracting this to a helper function");
-    expect(approvalComment).toContain("Rename variable for clarity");
-    expect(approvalComment).toContain("**Merge readiness:** Ready to merge.");
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const fixPrompt = invoke.mock.calls[1][0].prompt;
+    expect(fixPrompt).toContain("Required external review findings");
+    expect(fixPrompt).toContain("Consider extracting this to a helper function");
+    expect(fixPrompt).toContain("Rename variable for clarity");
+    const reviewComment = ghComments.find((c) => c.includes("Reviewer found issues"));
+    expect(reviewComment).toContain("External review findings are blocking this PR.");
+    expect(ghComments.some((c) => c.includes("**Merge readiness:** Ready to merge."))).toBe(false);
   });
 
   it("withholds approval and initiates a fix pass when the verdict has blocking[] entries", async () => {
