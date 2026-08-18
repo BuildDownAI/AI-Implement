@@ -573,16 +573,14 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // This is NOT a success: report a coded failure
     // so the ticket is updated and notifications fire, leave a run autopsy for
     // the ticket, and flag the GHA run — but keep the job green (warning only).
-    const authoritativeReviewOutputs = postPushReviewRequired && postPushReviewOutputs.approved !== true
+    const postPushReviewRejected = postPushReviewRequired && postPushReviewOutputs.approved !== true;
+    const authoritativeReviewOutputs = postPushReviewRejected
       ? postPushReviewOutputs
       : fbOutputs;
-    const postPushTerminationReason = typeof postPushReviewOutputs.terminationReason === "string"
-      ? postPushReviewOutputs.terminationReason
-      : "post_push_review_unapproved";
-    const terminationReason = postPushReviewRequired && postPushReviewOutputs.approved !== true
-      ? postPushTerminationReason
-      : typeof authoritativeReviewOutputs.terminationReason === "string"
-        ? authoritativeReviewOutputs.terminationReason
+    const terminationReason = typeof authoritativeReviewOutputs.terminationReason === "string"
+      ? authoritativeReviewOutputs.terminationReason
+      : postPushReviewRejected
+        ? "post_push_review_unapproved"
         : "unknown";
     const iterations = typeof authoritativeReviewOutputs.iterations === "number"
       ? authoritativeReviewOutputs.iterations
@@ -595,8 +593,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
       finalFeedback.slice(0, 500);
 
+    const prKind = pushOutputs.draft === true ? "draft PR" : "PR";
     const prDisposition = prUrl
-      ? `${fbOutputs.approved === true ? "PR" : "draft PR"} ${prUrl}`
+      ? `${prKind} ${prUrl}`
       : "no PR";
     disposition = `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
 
@@ -611,7 +610,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     });
     console.warn(
       `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
-        (prUrl ? `draft PR opened: ${prUrl}` : "no PR opened"),
+        (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
     );
     await postRunnerResult({
       workspaceDir,

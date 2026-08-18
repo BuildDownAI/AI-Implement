@@ -961,6 +961,55 @@ describe("runAutonomous", () => {
     expect(body.prUrl).toBe("https://github.com/o/r/pull/9");
   });
 
+  it("reports the push step's actual non-draft PR state when an unapproved run reuses a real PR", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { pipeline, runner } = makeStepsPipeline([
+      [
+        "feedback-loop",
+        {
+          run: vi.fn().mockResolvedValue({
+            approved: false,
+            iterations: 1,
+            finalFeedback: "not approved",
+            terminationReason: "iterations_exhausted",
+            passes: [],
+          }),
+        },
+      ],
+      [
+        "push",
+        {
+          run: vi.fn().mockResolvedValue({
+            prUrl: "https://github.com/o/r/pull/9",
+            prNumber: 9,
+            branchPushed: true,
+            draft: false,
+          }),
+        },
+      ],
+    ]);
+
+    try {
+      await runAutonomous({
+        workspaceDir,
+        pipeline,
+        runner,
+        reporter: new NoopStepReporter(),
+        llmExecutor: makeMockExecutor(0),
+      });
+    } finally {
+      const summary = error.mock.calls.map((call) => call.join(" ")).join("\n");
+      const warnings = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+      error.mockRestore();
+      warn.mockRestore();
+      expect(summary).toContain("outcome: PR https://github.com/o/r/pull/9");
+      expect(summary).not.toContain("outcome: draft PR https://github.com/o/r/pull/9");
+      expect(warnings).toContain("PR opened: https://github.com/o/r/pull/9");
+      expect(warnings).not.toContain("draft PR opened: https://github.com/o/r/pull/9");
+    }
+  });
+
   it("gap-fill run (prNumber set, unapproved) skips push — outcome derivation still reports a coded failure with no prUrl", async () => {
     // Mirrors pipeline-loader.ts's push skip condition for gap-fill runs: Claude owns git on
     // the existing PR branch there, so a gap-fill run must not run push against an
