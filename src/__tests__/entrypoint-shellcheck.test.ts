@@ -1,6 +1,6 @@
 import { afterEach, describe, it, expect } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -372,5 +372,133 @@ describe("session/entrypoint.sh", () => {
     expect(commands).toContain(`git config --global --add safe.directory ${workspace}`);
     expect(commands).toContain("usermod -o -u 1234 coder");
     expect(commands).toContain("dbus-run-session -- su -p coder");
+  });
+});
+
+// ─── session/lib.sh ───────────────────────────────────────────────────────────
+
+describe("session/lib.sh", () => {
+  it("passes shellcheck", () => {
+    const r = spawnSync("shellcheck", ["session/lib.sh"], { stdio: ["ignore", "pipe", "pipe"] });
+    if (r.error?.code === "ENOENT") return;
+    expect(r.status, r.stderr?.toString()).toBe(0);
+  });
+});
+
+// ─── session/lib.sh verify_workspace_writable ─────────────────────────────────
+
+describe("session/lib.sh verify_workspace_writable", () => {
+  // A su shim that executes the -c script under the current user with the
+  // correct positional arguments, so mktemp / trap / EXIT behaviour is exercised.
+  // Real su strips the -- before invoking bash, so bash sees:
+  //   bash -c '<script>' _ /workspace   ($0=_, $1=/workspace)
+  // We replicate that by collecting args after -- and calling bash without --.
+  const SU_EXEC_SHIM = [
+    "cmd=''",
+    "pos_args=()",
+    "while (( $# )); do",
+    "  case \"$1\" in",
+    "    -c) cmd=\"$2\"; shift 2 ;;",
+    "    -s) shift 2 ;;",
+    "    --) shift; pos_args=(\"$@\"); break ;;",
+    "    *) shift ;;",
+    "  esac",
+    "done",
+    'exec bash -c "$cmd" "${pos_args[@]}"',
+  ].join("\n");
+
+  function makeShims(binDir: string, suBody: string): void {
+    writeShim(binDir, "su", suBody);
+    writeShim(binDir, "id", `case "$*" in *-u*) echo 1000 ;; *-g*) echo 1000 ;; esac`);
+    writeShim(binDir, "stat", "echo 1000");
+  }
+
+  function runVerify(
+    workspace: string,
+    binDir: string,
+  ): { status: number | null; stderr: string } {
+    const r = spawnSync(
+      "bash",
+      ["-c", 'source session/lib.sh; verify_workspace_writable "$1"', "--", workspace],
+      { encoding: "utf8", env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+    );
+    return { status: r.status, stderr: r.stderr };
+  }
+
+  it("leaves pre-existing probe-like files byte-for-byte unchanged on success", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    spawnSync("mkdir", [binDir]);
+    makeShims(binDir, SU_EXEC_SHIM);
+
+    const existingProbe = join(root, ".ai-implement-probe-1");
+    writeFileSync(existingProbe, "original content");
+
+    const { status } = runVerify(root, binDir);
+    expect(status).toBe(0);
+    expect(readFileSync(existingProbe, "utf8")).toBe("original content");
+  });
+
+  it("leaves no generated probe files after a successful check", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    spawnSync("mkdir", [binDir]);
+    makeShims(binDir, SU_EXEC_SHIM);
+
+    const { status } = runVerify(root, binDir);
+    expect(status).toBe(0);
+    const probes = readdirSync(root).filter((f) => f.startsWith(".ai-implement-probe"));
+    expect(probes).toHaveLength(0);
+  });
+
+  it("succeeds for a workspace path containing a single quote", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const workspace = join(root, "work's-dir");
+    spawnSync("mkdir", [workspace]);
+    const binDir = join(root, "bin");
+    spawnSync("mkdir", [binDir]);
+    makeShims(binDir, SU_EXEC_SHIM);
+
+    const { status } = runVerify(workspace, binDir);
+    expect(status).toBe(0);
+    const probes = readdirSync(workspace).filter((f) => f.startsWith(".ai-implement-probe"));
+    expect(probes).toHaveLength(0);
+  });
+
+  it("fails before the pipeline and reports path and identity on write failure", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    spawnSync("mkdir", [binDir]);
+    makeShims(binDir, "exit 1");
+
+    const { status, stderr } = runVerify(root, binDir);
+    expect(status).not.toBe(0);
+    expect(stderr).toContain(root);
+    expect(stderr).toContain("coder UID");
+  });
+
+  it("passes workspace dir as a positional argument, not embedded in the -c program text", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    const cmdLog = join(root, "cmd.log");
+    spawnSync("mkdir", [binDir]);
+    writeShim(binDir, "su", `printf '%s\\0' "$@" > "${cmdLog}"`);
+    writeShim(binDir, "id", `case "$*" in *-u*) echo 1000 ;; *-g*) echo 1000 ;; esac`);
+    writeShim(binDir, "stat", "echo 1000");
+
+    runVerify(root, binDir);
+
+    const rawArgs = readFileSync(cmdLog, "utf8").split("\0");
+    const cIdx = rawArgs.indexOf("-c");
+    expect(cIdx).toBeGreaterThan(-1);
+    // The -c program text must not contain the workspace path
+    expect(rawArgs[cIdx + 1]).not.toContain(root);
+    // The workspace path must appear as a standalone argument
+    expect(rawArgs).toContain(root);
   });
 });
