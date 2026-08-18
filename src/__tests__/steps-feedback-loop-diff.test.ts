@@ -172,3 +172,80 @@ describe("getDiff untracked-file inclusion", () => {
     expect(diff).not.toContain("settings.local.json");
   });
 });
+
+describe("getDiff index state preservation", () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "diff-index-test-"));
+    git(repo, ["init", "-q"]);
+    git(repo, ["config", "user.email", "t@t.com"]);
+    git(repo, ["config", "user.name", "t"]);
+    writeFileSync(join(repo, "initial.ts"), "export const x = 1;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "seed"]);
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(repo, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  it("leaves untracked files out of the index after return — no intent-to-add markers", () => {
+    writeFileSync(join(repo, "new-file.ts"), "export const y = 2;\n");
+
+    getDiff(repo);
+
+    const staged = spawnSync("git", ["diff", "--cached", "--name-only"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(staged.stdout.toString().trim()).toBe("");
+
+    const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(untracked.stdout.toString()).toContain("new-file.ts");
+  });
+
+  it("preserves already-staged changes across the getDiff call", () => {
+    writeFileSync(join(repo, "initial.ts"), "export const x = 2;\n");
+    spawnSync("git", ["add", "initial.ts"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+
+    writeFileSync(join(repo, "new-file.ts"), "export const y = 3;\n");
+
+    getDiff(repo);
+
+    const staged = spawnSync("git", ["diff", "--cached", "--name-only"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(staged.stdout.toString()).toContain("initial.ts");
+
+    const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(untracked.stdout.toString()).toContain("new-file.ts");
+  });
+
+  it("returns the correct diff while leaving the index unchanged", () => {
+    writeFileSync(join(repo, "new-file.ts"), "export const y = 2;\n");
+    writeFileSync(join(repo, "initial.ts"), "export const x = 99;\n");
+
+    const diff = getDiff(repo);
+
+    expect(diff).toContain("new-file.ts");
+    expect(diff).toContain("initial.ts");
+
+    const staged = spawnSync("git", ["diff", "--cached", "--name-only"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(staged.stdout.toString().trim()).toBe("");
+  });
+});
