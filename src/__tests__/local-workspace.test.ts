@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   mkdtempSync,
+  mkdirSync,
   realpathSync,
   writeFileSync,
   rmSync,
@@ -119,6 +120,32 @@ describe("resolveRepository", () => {
       expect(err.message).toMatch(/symlink/i);
     } finally {
       rmSync(linkBase, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a repository whose path contains an intermediate symlink (e.g. macOS /var)", async () => {
+    // Simulates macOS /var → /private/var: an intermediate path component is a
+    // symlink but the final directory (the repo itself) is real.
+    const realBase = mkdtempSync(join(tmpdir(), "real-base-"));
+    const linkBase = mkdtempSync(join(tmpdir(), "link-base-"));
+    const intermediateLink = join(linkBase, "alias");
+    symlinkSync(realBase, intermediateLink);
+    const repoPath = join(realBase, "myrepo");
+    mkdirSync(repoPath);
+    spawnSync("git", ["init", "-b", "main"], { cwd: repoPath, stdio: "ignore" });
+    spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: repoPath, stdio: "ignore" });
+    spawnSync("git", ["config", "user.name", "T"], { cwd: repoPath, stdio: "ignore" });
+    writeFileSync(join(repoPath, "f.txt"), "x");
+    spawnSync("git", ["add", "."], { cwd: repoPath, stdio: "ignore" });
+    spawnSync("git", ["commit", "-m", "init"], { cwd: repoPath, stdio: "ignore" });
+    const viaAlias = join(intermediateLink, "myrepo");
+    try {
+      const repo = await resolveRepository(viaAlias);
+      expect(repo.topLevel).toBe(realpathSync(viaAlias));
+      expect(repo.branch).toBe("main");
+    } finally {
+      rmSync(linkBase, { recursive: true, force: true });
+      rmSync(realBase, { recursive: true, force: true });
     }
   });
 
