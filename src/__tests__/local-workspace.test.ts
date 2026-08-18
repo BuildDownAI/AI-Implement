@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   mkdtempSync,
+  realpathSync,
   writeFileSync,
   rmSync,
   symlinkSync,
@@ -47,8 +48,12 @@ afterEach(() => {
 
 describe("resolveRepository", () => {
   it("resolves a valid clean repository", async () => {
+    // Use the canonical real path as the expected topLevel: on macOS the
+    // tmpdir path goes through /var→/private/var, so realpathSync gives the
+    // path that git rev-parse --show-toplevel reports.
+    const realRepoDir = realpathSync(repoDir);
     const repo = await resolveRepository(repoDir);
-    expect(repo.topLevel).toBe(repoDir);
+    expect(repo.topLevel).toBe(realRepoDir);
     expect(repo.branch).toBe("main");
     expect(repo.headSha).toMatch(/^[0-9a-f]{40}$/);
     expect(repo.isDirty).toBe(false);

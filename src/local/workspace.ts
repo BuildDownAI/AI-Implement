@@ -1,4 +1,4 @@
-import { access, realpath, mkdtemp, rm } from "node:fs/promises";
+import { access, realpath, lstat, mkdtemp, rm } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve as resolvePath, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -78,14 +78,18 @@ export async function resolveRepository(inputPath: string): Promise<ResolvedRepo
     throw new WorkspaceError(`Path is not accessible: ${inputPath}`, "inaccessible");
   }
 
-  // Reject paths that resolve through symlinks to a different location.
-  const realPath = await realpath(absPath);
-  if (realPath !== absPath) {
+  // Reject paths where the selected entry itself is a symlink. lstat checks
+  // the final component without following it, so macOS /var→/private/var
+  // canonical aliases (which affect only intermediate components) are not
+  // flagged here.
+  const absStat = await lstat(absPath);
+  if (absStat.isSymbolicLink()) {
     throw new WorkspaceError(
-      `Path escapes repository root via symlink: ${inputPath} resolves to ${realPath}`,
+      `Path escapes repository root via symlink: ${inputPath}`,
       "symlink-escape",
     );
   }
+  const realPath = await realpath(absPath);
 
   const toplevelResult = gitRun(["rev-parse", "--show-toplevel"], realPath);
   if (!toplevelResult.ok) {
