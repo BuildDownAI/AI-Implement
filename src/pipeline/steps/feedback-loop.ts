@@ -1,4 +1,7 @@
 import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { implementStep } from "./implement.js";
 import { reviewStep } from "./review.js";
@@ -129,55 +132,72 @@ const REVIEW_DIFF_EXCLUDES = [
 ];
 
 export function getDiff(workspaceDir: string): string {
-  // Snapshot which files are currently untracked so we can undo the intent-to-add
-  // markers after the diff. On mounted runs there is no push step to clean them up.
-  const untrackedResult = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], {
-    cwd: workspaceDir,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const untrackedFiles =
-    untrackedResult.status === 0
-      ? untrackedResult.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean)
-      : [];
-
-  // Mark all untracked files as "intent to add" so git diff HEAD includes them
-  // as new-file additions. Without this, untracked files (e.g. newly created
-  // .mcp.json, .claude/settings.json) are invisible to the diff and the reviewer
-  // falsely rejects the implementation as "uncommitted".
-  spawnSync("git", ["add", "-N", "."], {
+  // Locate the real git index so we can seed the disposable index from it.
+  const gitDirResult = spawnSync("git", ["rev-parse", "--git-dir"], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const result = spawnSync(
-    "git",
-    ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
-    {
-      cwd: workspaceDir,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-
-  // Remove the intent-to-add markers we just added. Preserves the developer's
-  // Git index on mounted runs (no push step); the push step re-stages everything
-  // on normal runs so this is safe in both cases.
-  if (untrackedFiles.length > 0) {
-    spawnSync("git", ["rm", "-r", "--cached", "--force", "--", ...untrackedFiles], {
-      cwd: workspaceDir,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  }
-
-  if (result.status !== 0) {
-    // A non-zero exit means the reviewer sees an empty diff and may spuriously
-    // approve. Behaviour is unchanged (still return ""), but surface it so the
-    // failure is observable in the runner logs rather than silent.
+  if (gitDirResult.status !== 0) {
     console.warn(
-      `[getDiff] git diff failed (exit ${result.status ?? "null"}): ${result.stderr?.toString().trim() ?? ""}`,
+      `[getDiff] git rev-parse --git-dir failed (exit ${gitDirResult.status ?? "null"})`,
     );
     return "";
   }
-  return result.stdout.toString();
+
+  const gitDir = resolve(workspaceDir, gitDirResult.stdout.toString().trim());
+  const realIndexPath = join(gitDir, "index");
+  // Unique temp path per call; unlinking in finally guarantees no leftover.
+  const tmpIndexPath = join(
+    tmpdir(),
+    `git-review-index-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  );
+
+  try {
+    // Seed the disposable index from the real one so existing staged changes
+    // remain visible in the diff. Skip the copy only when the real index file
+    // does not exist (fresh repo, nothing staged), in which case git initialises
+    // the disposable index automatically on first write.
+    if (existsSync(realIndexPath)) {
+      copyFileSync(realIndexPath, tmpIndexPath);
+    }
+
+    const env = { ...process.env, GIT_INDEX_FILE: tmpIndexPath };
+
+    // Apply intent-to-add to the disposable index only — the real index is
+    // never mutated. This makes the operation interruption-safe: no cleanup
+    // step is needed, and pre-existing intent-to-add entries in the real index
+    // are byte-for-byte unchanged after this function returns.
+    spawnSync("git", ["add", "-N", "."], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+    });
+
+    const result = spawnSync(
+      "git",
+      ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
+      {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+      },
+    );
+
+    if (result.status !== 0) {
+      console.warn(
+        `[getDiff] git diff failed (exit ${result.status ?? "null"}): ${result.stderr?.toString().trim() ?? ""}`,
+      );
+      return "";
+    }
+    return result.stdout.toString();
+  } finally {
+    try {
+      unlinkSync(tmpIndexPath);
+    } catch {
+      // File may not exist if setup failed before it was created.
+    }
+  }
 }
 
 const POST_MORTEM_MAX_TURNS = 15;
