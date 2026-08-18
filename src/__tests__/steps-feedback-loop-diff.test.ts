@@ -248,4 +248,55 @@ describe("getDiff index state preservation", () => {
     });
     expect(staged.stdout.toString().trim()).toBe("");
   });
+
+  it("preserves a pre-existing intent-to-add entry byte-for-byte after getDiff", () => {
+    // Developer staged a new file via `git add -N` before the review diff runs.
+    writeFileSync(join(repo, "pending.ts"), "export const z = 0;\n");
+    spawnSync("git", ["add", "-N", "pending.ts"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    // Confirm the entry is intent-to-add before the call:
+    // `ls-files` (tracked) should contain it; `ls-files --others` (untracked) should not.
+    const beforeTracked = spawnSync("git", ["ls-files", "pending.ts"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(beforeTracked.stdout.toString()).toContain("pending.ts");
+
+    const beforeOthers = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(beforeOthers.stdout.toString()).not.toContain("pending.ts");
+
+    getDiff(repo);
+
+    // After getDiff, the real index must be unchanged: pending.ts stays
+    // intent-to-add (tracked) and is still not listed as truly untracked.
+    const afterTracked = spawnSync("git", ["ls-files", "pending.ts"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(afterTracked.stdout.toString()).toContain("pending.ts");
+
+    const afterOthers = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(afterOthers.stdout.toString()).not.toContain("pending.ts");
+  });
+
+  it("includes a pre-existing intent-to-add file in the review diff", () => {
+    writeFileSync(join(repo, "pending.ts"), "export const z = 0;\n");
+    spawnSync("git", ["add", "-N", "pending.ts"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const diff = getDiff(repo);
+
+    expect(diff).toContain("pending.ts");
+  });
 });
