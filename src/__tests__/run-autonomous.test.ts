@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { runAutonomous, resolveLogLevel, waitForContainerRemoval } from "../run-autonomous.js";
+import { runAutonomous, resolveLogLevel, waitForContainerRemoval, runAutonomousLocally } from "../run-autonomous.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { encodeRunConfig } from "../run-config.js";
@@ -1564,5 +1564,271 @@ describe("resolveLogLevel", () => {
   });
   it("defaults to summary for an unrecognized value", () => {
     expect(resolveLogLevel("loud")).toBe("summary");
+  });
+});
+
+describe("runAutonomousLocally", () => {
+  let workspaceDir: string;
+
+  function makeFeedbackLoopPipeline(mod: StepModule): {
+    pipeline: PipelineDefinition;
+    runner: PipelineRunner;
+  } {
+    const pipeline: PipelineDefinition = {
+      id: "test-local",
+      steps: [
+        {
+          id: "feedback-loop",
+          type: "custom",
+          moduleId: "feedback-loop",
+          inputs: (ctx) => ({
+            workspaceDir: ctx.data.workspaceDir,
+            issueTitle: ctx.data.issueTitle,
+            issueDescription: ctx.data.issueDescription,
+            implementationPrompt: ctx.data.implementationPrompt,
+            planningContext: ctx.data.planningContext,
+            provider: ctx.data.provider,
+            maxTurns: ctx.data.maxTurns,
+            maxIterations: ctx.data.maxIterations,
+          }),
+        },
+      ],
+    };
+    const runner = new PipelineRunner().register("feedback-loop", mod);
+    return { pipeline, runner };
+  }
+
+  beforeEach(() => {
+    workspaceDir = mkdtempSync(join(tmpdir(), "local-auto-test-"));
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+  });
+
+  it("returns exitCode 0 and approved=true when feedback-loop approves", async () => {
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 2,
+        terminationReason: "approved",
+        passes: [],
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test issue",
+      issueDescription: "Test description",
+      pipeline,
+      runner,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.approved).toBe(true);
+    expect(result.terminationReason).toBe("approved");
+    expect(result.iterations).toBe(2);
+  });
+
+  it("returns exitCode 1 and approved=false when pipeline throws", async () => {
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockRejectedValue(new Error("implementation failed")),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test issue",
+      issueDescription: "Test description",
+      pipeline,
+      runner,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.approved).toBe(false);
+    expect(result.terminationReason).toBe("error");
+  });
+
+  it("passes planningContext to the feedback-loop via context data", async () => {
+    let capturedPlanningContext: unknown;
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockImplementation(async (ctx) => {
+        capturedPlanningContext = ctx.data.planningContext;
+        return {
+          approved: true,
+          iterations: 1,
+          terminationReason: "approved",
+          passes: [],
+          finalFeedback: "",
+        };
+      }),
+    });
+
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      planningContext: "## Planning\nSome context",
+      pipeline,
+      runner,
+    });
+
+    expect(capturedPlanningContext).toBe("## Planning\nSome context");
+  });
+
+  it("defaults planningContext to empty string when not provided", async () => {
+    let capturedPlanningContext: unknown;
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockImplementation(async (ctx) => {
+        capturedPlanningContext = ctx.data.planningContext;
+        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+      }),
+    });
+
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(capturedPlanningContext).toBe("");
+  });
+
+  it("passes maxTurns and maxIterations to feedback-loop inputs", async () => {
+    let capturedInputs: Record<string, unknown> | undefined;
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockImplementation(async (_ctx, inputs: Record<string, unknown>) => {
+        capturedInputs = inputs;
+        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+      }),
+    });
+
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      maxTurns: 30,
+      maxIterations: 4,
+      pipeline,
+      runner,
+    });
+
+    expect(capturedInputs?.maxTurns).toBe(30);
+    expect(capturedInputs?.maxIterations).toBe(4);
+  });
+
+  it("reads model from WORKFLOW.md front matter", async () => {
+    writeFileSync(
+      join(workspaceDir, "WORKFLOW.md"),
+      "---\nmodel: claude-opus-4-7\n---\nDo the thing\n",
+    );
+
+    let capturedModel: unknown;
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockImplementation(async (ctx) => {
+        capturedModel = ctx.data.model;
+        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+      }),
+    });
+
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(capturedModel).toBe("claude-opus-4-7");
+  });
+
+  it("model option overrides WORKFLOW.md model", async () => {
+    writeFileSync(
+      join(workspaceDir, "WORKFLOW.md"),
+      "---\nmodel: claude-opus-4-7\n---\nDo the thing\n",
+    );
+
+    let capturedModel: unknown;
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockImplementation(async (ctx) => {
+        capturedModel = ctx.data.model;
+        return { approved: true, iterations: 1, terminationReason: "approved", passes: [], finalFeedback: "" };
+      }),
+    });
+
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      model: "claude-override",
+      pipeline,
+      runner,
+    });
+
+    expect(capturedModel).toBe("claude-override");
+  });
+
+  it("returns approved=false and passes from feedback-loop outputs", async () => {
+    const passes = [
+      { iteration: 1, implementTurns: 10, implementOutcome: "partial", costUsd: 0.05, reviewApproved: false },
+    ];
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 1,
+        terminationReason: "iterations_exhausted",
+        passes,
+        finalFeedback: "needs more tests",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.approved).toBe(false);
+    expect(result.terminationReason).toBe("iterations_exhausted");
+    expect(result.finalFeedback).toBe("needs more tests");
+    expect(result.passes).toEqual(passes);
+  });
+
+  it.skipIf(isWindows)("runs teardown hook even when pipeline throws", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nteardown: teardown.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'printf "" > teardown-ran.marker\n');
+
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockRejectedValue(new Error("step exploded")),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
   });
 });

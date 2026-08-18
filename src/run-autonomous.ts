@@ -6,7 +6,7 @@ import { ClaudeCliExecutor } from "./pipeline/executor.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
-import type { LLMExecutor, LogLevel, PipelineDefinition, StepReporter } from "./pipeline/types.js";
+import type { LLMExecutor, LogLevel, PipelineContext, PipelineDefinition, StepReporter } from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } from "./pipeline/timing.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
@@ -644,6 +644,161 @@ function resolveRunnerPhase(rawPhase: string | undefined, prNumber: string): "im
   if (!rawPhase) return prNumber ? "gap-analysis" : "implementation";
   if (rawPhase === "implementation" || rawPhase === "gap-analysis") return rawPhase;
   throw new Error(`Invalid RUNNER_PHASE: ${rawPhase}`);
+}
+
+const LOCAL_FEEDBACK_PIPELINE: PipelineDefinition = {
+  id: "local-feedback",
+  steps: [
+    {
+      id: "feedback-loop",
+      type: "custom",
+      moduleId: "feedback-loop",
+      inputs: (ctx: PipelineContext) => ({
+        workspaceDir: ctx.data.workspaceDir,
+        issueTitle: ctx.data.issueTitle,
+        issueDescription: ctx.data.issueDescription,
+        implementationPrompt: ctx.data.implementationPrompt,
+        planningContext: ctx.data.planningContext,
+        provider: ctx.data.provider,
+        maxTurns: ctx.data.maxTurns,
+        maxIterations: ctx.data.maxIterations,
+      }),
+    },
+  ],
+};
+
+export interface RunLocalAutonomousOptions {
+  workspaceDir: string;
+  issueIdentifier: string;
+  issueTitle: string;
+  issueDescription: string;
+  issueId?: string;
+  maxTurns?: number;
+  maxIterations?: number;
+  model?: string;
+  planningContext?: string;
+  reporter?: StepReporter;
+  llmExecutor?: LLMExecutor;
+  pipeline?: PipelineDefinition;
+  runner?: PipelineRunner;
+}
+
+export interface RunLocalAutonomousResult {
+  exitCode: number;
+  approved: boolean;
+  terminationReason: string;
+  iterations: number;
+  passes: Array<{
+    iteration: number;
+    implementTurns: number | null;
+    implementOutcome: string;
+    costUsd: number | null;
+    reviewApproved: boolean | null;
+  }>;
+  finalFeedback: string;
+}
+
+export async function runAutonomousLocally(
+  opts: RunLocalAutonomousOptions,
+): Promise<RunLocalAutonomousResult> {
+  const workspaceDir = opts.workspaceDir;
+  const planningContext = opts.planningContext ?? "";
+
+  let implementationPrompt = buildDefaultImplementationPrompt({
+    issueIdentifier: opts.issueIdentifier,
+    issueTitle: opts.issueTitle,
+    issueDescription: opts.issueDescription,
+    prNumber: "",
+  });
+
+  let workflowModel: string | undefined;
+  let teardownHook: string | undefined;
+  const wfPath = join(workspaceDir, "WORKFLOW.md");
+  if (existsSync(wfPath)) {
+    const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {
+      ISSUE_ID: opts.issueId ?? "",
+      ISSUE_IDENTIFIER: opts.issueIdentifier,
+      ISSUE_TITLE: opts.issueTitle,
+      ISSUE_DESCRIPTION: opts.issueDescription,
+      PR_NUMBER: "",
+      PLANNING_CONTEXT: planningContext,
+    });
+    workflowModel = parsed.frontMatter.model;
+    teardownHook = parsed.frontMatter.teardown;
+    if (parsed.body.trim()) implementationPrompt = parsed.body;
+  }
+
+  implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, "");
+  const model = opts.model ?? workflowModel ?? "claude-sonnet-4-6";
+  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary");
+  const reporter = opts.reporter ?? new NoopStepReporter();
+
+  const context = new DefaultPipelineContext(
+    {
+      jobId: 0,
+      issueId: opts.issueId ?? "",
+      issueIdentifier: opts.issueIdentifier,
+      issueTitle: opts.issueTitle,
+      issueDescription: opts.issueDescription,
+      nonce: "",
+      orchestratorUrl: "",
+      model,
+      workspaceDir,
+      planningContext,
+      implementationPrompt,
+      prNumber: "",
+      githubOwner: "",
+      githubRepo: "",
+      githubToken: "",
+      branch: "",
+      provider: "anthropic",
+      maxTurns: opts.maxTurns,
+      maxIterations: opts.maxIterations,
+      profiles: [],
+      groupingParent: false,
+    },
+    llmExecutor,
+  );
+
+  const pipeline = opts.pipeline ?? LOCAL_FEEDBACK_PIPELINE;
+  const runner = opts.runner ?? (await createDefaultRunner());
+
+  try {
+    await runner.run(pipeline, context, reporter);
+
+    const fb = context.getOutputs("feedback-loop");
+    return {
+      exitCode: 0,
+      approved: fb.approved === true,
+      terminationReason:
+        typeof fb.terminationReason === "string" ? fb.terminationReason : "unknown",
+      iterations: typeof fb.iterations === "number" ? fb.iterations : 0,
+      passes: Array.isArray(fb.passes)
+        ? (fb.passes as RunLocalAutonomousResult["passes"])
+        : [],
+      finalFeedback: typeof fb.finalFeedback === "string" ? fb.finalFeedback : "",
+    };
+  } catch (err) {
+    return {
+      exitCode: 1,
+      approved: false,
+      terminationReason: "error",
+      iterations: 0,
+      passes: [],
+      finalFeedback: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    if (teardownHook) {
+      try {
+        const result = runHookScript("teardown", teardownHook, workspaceDir);
+        if (result.exitCode !== 0) {
+          console.error(`teardown hook exited with code ${result.exitCode}`);
+        }
+      } catch (teardownErr) {
+        console.error(`teardown hook error: ${teardownErr}`);
+      }
+    }
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
