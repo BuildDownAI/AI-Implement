@@ -10,6 +10,7 @@ import {
   awaitSessionResult,
   getSessionStatus,
   launchLocalSession,
+  stopLocalSession,
   streamSessionLogs,
   streamSessionLogsUntilShellReady,
 } from "../local/session.js";
@@ -236,6 +237,13 @@ export async function streamLogsUntilShellReady(
  */
 export async function getRunResult(handle: DevRunHandle): Promise<DevRunResult> {
   return awaitSessionResult(handle);
+}
+
+/**
+ * Force-remove the dev runner container. Best-effort; errors are swallowed.
+ */
+export async function stopDevRun(handle: DevRunHandle): Promise<void> {
+  return stopLocalSession(handle);
 }
 
 /**
