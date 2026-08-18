@@ -190,6 +190,7 @@ describe("postPushReviewStep", () => {
     );
     expect(out.approved).toBe(false);
     expect(out.iterations).toBe(2);
+    expect(out.terminationReason).toBe("iterations_exhausted");
     expect(gitPushCalls.length).toBe(1); // only one fix-pass-and-push happens before the cap-iteration which doesn't push
     expect(gitPushCalls[0]).toEqual([
       "push",

@@ -1190,7 +1190,12 @@ describe("runAutonomous", () => {
     const { pipeline, runner } = makeStepsPipeline([
       ["feedback-loop", { run: vi.fn().mockResolvedValue({ approved: true, iterations: 1, terminationReason: "approved" }) }],
       ["push", { run: vi.fn().mockResolvedValue({ prUrl: "https://github.com/o/r/pull/12", prNumber: 12, branchPushed: true, draft: false }) }],
-      ["post-push-review", { run: vi.fn().mockResolvedValue({ approved: false, iterations: 2, finalFeedback: "External Claude finding remains." }) }],
+      ["post-push-review", { run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 2,
+        finalFeedback: "External Claude finding remains.",
+        terminationReason: "iterations_exhausted",
+      }) }],
     ]);
 
     const result = await runAutonomous({
@@ -1206,10 +1211,12 @@ describe("runAutonomous", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
       outcome: string;
       failureCode?: string;
+      failureReason?: string;
       prUrl?: string;
     };
     expect(body.outcome).toBe("failure");
     expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
+    expect(body.failureReason).toContain("iterations_exhausted");
     expect(body.prUrl).toBe("https://github.com/o/r/pull/12");
   });
 

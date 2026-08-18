@@ -30,12 +30,21 @@ interface PostPushReviewInputs extends Record<string, unknown> {
 }
 
 type ExternalReviewState = "skipped" | "absent" | "running" | "completed";
+type PostPushReviewTerminationReason =
+  | "approved"
+  | "iterations_exhausted"
+  | "review_failed"
+  | "invalid_review"
+  | "external_review_pending"
+  | "fix_failed"
+  | "no_changes";
 
 interface PostPushReviewOutputs extends Record<string, unknown> {
   approved: boolean;
   iterations: number;
   finalFeedback: string;
   forcePushedRevisions: number;
+  terminationReason: PostPushReviewTerminationReason;
 }
 
 interface SpawnResult {
@@ -737,6 +746,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let approved = false;
     let feedback = "";
     let forcePushed = 0;
+    let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     const reviewHistory: ReviewFinding[] = [];
 
     while (iteration < maxIterations && !approved) {
@@ -797,6 +807,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
 
       const reviewResult = await context.llmExecutor.invoke({ prompt: reviewPrompt, model, maxTurns: REVIEW_MAX_TURNS });
       if (reviewResult.exitCode !== 0) {
+        terminationReason = "review_failed";
         const failure = `Reviewer LLM failed (${llmResultMessage(reviewResult)})`;
         feedback = compactErrorMessage(failure);
         await reporter.report({
@@ -824,6 +835,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         | { approved?: boolean; feedback?: string; issues?: unknown[]; findings?: unknown[]; blocking_issues?: unknown[]; blockingIssues?: unknown[] }
         | null;
       if (!parsed) {
+        terminationReason = "invalid_review";
         feedback = compactErrorMessage(`Reviewer returned non-JSON output: ${reviewResult.stdout || "(empty stdout)"}`);
         await reporter.report({
           id: `post-push-review.${iteration}`,
@@ -847,6 +859,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       if (typeof parsed.approved !== "boolean") {
+        terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: expected approved:boolean.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
@@ -877,6 +890,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       let issues = parseReviewIssues(parsed);
       issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
       if (issues.length === 0 && parsed.approved === false && !hasExternalFindings) {
+        terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
@@ -887,6 +901,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // against a reviewer that is still in flight — defer to a human.
       const internalApprovable = parsed.approved === true && issues.length === 0 && !hasExternalFindings;
       if (internalApprovable && externalReviewPending) {
+        terminationReason = "external_review_pending";
         feedback = "External review did not complete within the wait budget; not auto-approving.";
         await reporter.report({
           id: `post-push-review.${iteration}`,
@@ -925,6 +940,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       });
 
       if (approved) {
+        terminationReason = "approved";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
         submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.`);
         postPrComment(
@@ -937,6 +953,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       if (iteration >= maxIterations) {
+        terminationReason = "iterations_exhausted";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
         submitPrReview(
           ghSpawn,
@@ -999,6 +1016,7 @@ ${externalReviewFindingsBlock(externalFindings)}
 
       const fixResult = await context.llmExecutor.invoke({ prompt: fixPrompt, model, maxTurns: FIX_MAX_TURNS });
       if (fixResult.exitCode !== 0) {
+        terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);
         const marker = `<!-- ai-implement post-push iter=${iteration} fix-failed -->`;
         postPrComment(
@@ -1017,6 +1035,7 @@ ${externalReviewFindingsBlock(externalFindings)}
       const status = gitSpawn(["status", "--porcelain"]);
       if (status.exitCode !== 0) throw new Error(`git status failed: ${resultMessage(status)}`);
       if (!status.stdout.trim()) {
+        terminationReason = "no_changes";
         const marker = `<!-- ai-implement post-push iter=${iteration} no-changes -->`;
         submitPrReview(
           ghSpawn,
@@ -1069,7 +1088,13 @@ ${externalReviewFindingsBlock(externalFindings)}
       );
     }
 
-    return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed };
+    return {
+      approved,
+      iterations: iteration,
+      finalFeedback: feedback,
+      forcePushedRevisions: forcePushed,
+      terminationReason,
+    };
   },
 };
 

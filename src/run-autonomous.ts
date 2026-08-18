@@ -576,8 +576,11 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const authoritativeReviewOutputs = postPushReviewRequired && postPushReviewOutputs.approved !== true
       ? postPushReviewOutputs
       : fbOutputs;
+    const postPushTerminationReason = typeof postPushReviewOutputs.terminationReason === "string"
+      ? postPushReviewOutputs.terminationReason
+      : "post_push_review_unapproved";
     const terminationReason = postPushReviewRequired && postPushReviewOutputs.approved !== true
-      ? "post_push_review_unapproved"
+      ? postPushTerminationReason
       : typeof authoritativeReviewOutputs.terminationReason === "string"
         ? authoritativeReviewOutputs.terminationReason
         : "unknown";
