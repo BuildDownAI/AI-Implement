@@ -33,6 +33,17 @@ vi.mock("../github-install-state.js", () => ({
   probeInstallState: vi.fn(),
 }));
 
+// getAvailability() is module state the poll loop populates. Mocking that one export
+// keeps the rest of the module real and lets the route's passthrough be exercised
+// without an App-token mint or a network call.
+const availabilityMock = vi.hoisted(() =>
+  vi.fn((): import("../deploy-availability.js").DeploymentAvailability | null => null),
+);
+vi.mock("../deploy-availability.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../deploy-availability.js")>()),
+  getAvailability: availabilityMock,
+}));
+
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
     forMapping: async () => provider,
@@ -2116,5 +2127,123 @@ describe("POST /api/deploy", () => {
     // Admin 5xx bodies leaking raw error text is a known defect elsewhere; this route
     // must not add to it, and the thrown message here would carry a build secret.
     expect(res.body).not.toContain("super-secret");
+  });
+});
+
+describe("GET /api/deployment-status", () => {
+  // The page reads this once per poll; every field it renders comes from here, so the
+  // route is tested for shape and passthrough rather than for the values themselves.
+  async function statusRequest(
+    token: string,
+    deps: AdminModule.AdminDeps = {},
+  ): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    const req = new MockRequest("/api/deployment-status", "GET", { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
+  }
+
+  beforeEach(() => {
+    availabilityMock.mockReturnValue(null);
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    const res = await statusRequest("not-a-session");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("reports not configured when no starter is injected", async () => {
+    // This is the only signal that separates "nothing to deploy" from "this
+    // orchestrator cannot deploy itself" — otherwise only the trigger's 501 knows.
+    const token = await login("secret");
+    const res = await statusRequest(token, {});
+    expect(res.statusCode).toBe(200);
+    expect(res.body.configured).toBe(false);
+  });
+
+  it("reports configured when a starter is injected", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token, {
+      startDeploy: async () => ({ started: true, commit: "abc1234" }),
+    });
+    expect(res.body.configured).toBe(true);
+  });
+
+  it("passes an unresolved availability through as null, never as false", async () => {
+    // null is unknown. Collapsing it to false would have the page render "up to date"
+    // for an orchestrator that has no idea whether it is behind.
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.available).toBeNull();
+    expect(res.body.runningCommit).toBeNull();
+    expect(res.body.headCommit).toBeNull();
+    expect(res.body.checkedAt).toBeNull();
+  });
+
+  it("passes a derived availability and its commits through unchanged", async () => {
+    availabilityMock.mockReturnValue({
+      available: true,
+      runningCommit: "abc1234",
+      headCommit: "def5678",
+      checkedAt: 1_700_000_000_000,
+    });
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body).toMatchObject({
+      available: true,
+      runningCommit: "abc1234",
+      headCommit: "def5678",
+      checkedAt: 1_700_000_000_000,
+    });
+  });
+
+  it("keeps a resolved false distinct from unknown", async () => {
+    availabilityMock.mockReturnValue({
+      available: false,
+      runningCommit: "abc1234",
+      headCommit: "abc1234",
+      checkedAt: 1,
+    });
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.available).toBe(false);
+  });
+
+  it("names the watched repo and branch from the injected target", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token, {
+      selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement", branch: "testing", runningCommit: "abc1234" },
+    });
+    expect(res.body.repo).toBe("BuildDownAI/AI-Implement");
+    expect(res.body.branch).toBe("testing");
+  });
+
+  it("reports no target when the image carries no build stamps", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token, {});
+    expect(res.body.repo).toBeNull();
+    expect(res.body.branch).toBeNull();
+  });
+
+  it("reports nothing held and nothing executing on an idle orchestrator", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.held).toBe(false);
+    expect(res.body.inFlight).toEqual([]);
+  });
+
+  it("reports the hold and what is still executing", async () => {
+    // Held with work executing is the draining state the page names, and the counts
+    // come from the same inventory the deploy itself waits on.
+    const { setDeployHold } = await import("../deploy-hold.js");
+    setDeployHold();
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "running");
+
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.held).toBe(true);
+    expect(res.body.inFlight).toEqual([{ kind: "workflow-sync", count: 1 }]);
   });
 });
