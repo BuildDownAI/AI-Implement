@@ -318,6 +318,13 @@ export interface StartDeployConfig {
   githubAppPrivateKey: string;
 }
 
+/** `StartDeployConfig` with the three optional fields proven present. */
+type SelfDeployReady = StartDeployConfig & {
+  flyDeployToken: string;
+  flyOrchestratorApp: string;
+  selfDeployTarget: SelfDeployTarget;
+};
+
 /**
  * Builds the trigger's entry point, or undefined when this orchestrator cannot deploy
  * itself — which is what lets the route answer 501 rather than failing partway.
@@ -325,9 +332,8 @@ export interface StartDeployConfig {
 export function makeStartDeploy(
   config: StartDeployConfig,
 ): (() => Promise<DeployStart>) | undefined {
-  if (!config.flyDeployToken || !config.selfDeployTarget || !config.flyOrchestratorApp) {
-    return undefined;
-  }
+  if (!canSelfDeploy(config)) return undefined;
+
   const target = config.selfDeployTarget;
   const app = config.flyOrchestratorApp;
   const flyDeployToken = config.flyDeployToken;
@@ -370,4 +376,12 @@ export function makeStartDeploy(
       throw err;
     }
   };
+}
+
+/**
+ * Whether this orchestrator can deploy itself: a token with deploy rights, an app to
+ * deploy, and build stamps naming what to build.
+ */
+export function canSelfDeploy(config: StartDeployConfig): config is SelfDeployReady {
+  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget);
 }

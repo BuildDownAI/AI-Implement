@@ -30,6 +30,7 @@ import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import type { DeployStart } from "./deploy.js";
 import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { notifyText } from "./notify.js";
@@ -248,7 +249,16 @@ export function handleAdminRequest(
         headCommit: availability?.headCommit ?? null,
         repo: target ? `${target.owner}/${target.repo}` : null,
         branch: target?.branch ?? null,
+        ...getDeployPolicy(),
+        // a notice with no webhook goes nowhere, and automatic deploying will not act on a commit it has already announced.
+        notifyConfigured: Boolean(config.notifyWebhookUrl),
+        lastActedCommit: getLastActedCommit(),
       });
+      return true;
+    }
+
+    if (url === "/api/deploy-policy" && method === "POST") {
+      handleSetDeployPolicy(req, res);
       return true;
     }
 
@@ -857,6 +867,31 @@ async function handleDeployTrigger(
     json(res, 202, { deploying: result.commit });
   } catch (err) {
     console.error("[admin] deploy trigger failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+async function handleSetDeployPolicy(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as Partial<Record<keyof DeployPolicy, unknown>>;
+    const patch: Partial<DeployPolicy> = {};
+    for (const key of ["autoDeploy", "notifyAvailable"] as const) {
+      if (body[key] === undefined) continue;
+      // Reject rather than coerce: a string "false" is truthy, and silently enabling
+      // automatic deploying because a caller sent the wrong type is not a small bug.
+      if (typeof body[key] !== "boolean") {
+        json(res, 400, { error: `${key} must be a boolean` });
+        return;
+      }
+      patch[key] = body[key];
+    }
+    setDeployPolicy(patch);
+    json(res, 200, getDeployPolicy());
+  } catch (err) {
+    console.error("[admin] deploy policy update failed:", err);
     json(res, 500, { error: "Internal server error" });
   }
 }

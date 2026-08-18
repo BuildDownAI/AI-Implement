@@ -46,11 +46,12 @@ export interface CompletionNotification {
 }
 
 export interface DeployNotification {
-  kind: "shutdown" | "deployed" | "restarted";
+  kind: "shutdown" | "deployed" | "restarted" | "available";
   appName: string;
   region: string | null;
   imageRef: string | null; // Full FLY_IMAGE_REF, only the deployment-<id> tag is displayed.
   downtimeMs?: number | null; // Gap between the shutdown notice and the boot that answered it, when both were observed.
+  commit?: string | null; // Only the "available" kind — there is no image to reference yet.
 }
 
 // Human label for a run phase, reused across notification kinds (dispatch, completion, …).
@@ -89,6 +90,13 @@ const DEPLOY_EVENTS: Record<DeployNotification["kind"], {
     teamsIcon: "&#x21BB;",
     title: "Orchestrator back up",
     summary: "Same version — a restart, not a new deploy.",
+    broadcast: false,
+  },
+  available: {
+    slackEmoji: ":arrow_up:",
+    teamsIcon: "&#x2B06;",
+    title: "Deployment available",
+    summary: "Deploy from /admin#deployments when you are ready.",
     broadcast: false,
   },
 };
@@ -433,6 +441,8 @@ function imageTag(imageRef: string | null): string | null {
 // The shutdown notice runs in the outgoing process, so its ref is the version being replaced:
 // printing it would be ambiguous (two differing versions for same deploy, same version twice for a restart)
 function displayedVersion(n: DeployNotification): string | null {
+  // An availability notice names the commit that is waiting; no image exists yet.
+  if (n.kind === "available") return n.commit ? n.commit.slice(0, 7) : null;
   return n.kind === "shutdown" ? null : imageTag(n.imageRef);
 }
 

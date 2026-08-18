@@ -13,10 +13,11 @@ import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "
 import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
-import { postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
-import { refreshAvailability, readStampedTarget, type SelfDeployTarget } from "./deploy-availability.js";
+import { postAvailableNotice, postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
+import { refreshAvailability, readStampedTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
-import { makeStartDeploy } from "./deploy.js";
+import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
+import { canSelfDeploy, makeStartDeploy } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -279,6 +280,52 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       });
     } catch (err) {
       console.error("[deploy] availability check failed:", err);
+    }
+    
+    // Act on what the refresh above found.
+    try {
+      // A factory over config with no state of its own, so building one per tick is
+      // free and behaves identically to the server's — the hold that actually
+      // serializes deploys lives in SQLite, not in this closure.
+      const startDeploy = makeStartDeploy(config);
+      const availability = getAvailability();
+      const head = availability?.headCommit ?? null;
+
+      const action = decideAvailabilityAction({
+        configured: canSelfDeploy(config),
+        available: availability?.available ?? null,
+        headCommit: head,
+        held: isDeployHeld(),
+        policy: getDeployPolicy(),
+        lastActedCommit: getLastActedCommit(),
+      });
+
+      if (action !== "none" && head) {
+        // Recorded before acting, not after. A successful self-deploy kills this
+        // process inside the await below, so a write afterwards would never land and
+        // every boot would retry the same commit forever.
+        setLastActedCommit(head);
+
+        if (action === "deploy") {
+          console.log(`[deploy] Auto-deploying ${head.slice(0, 7)} — dispatch pauses now`);
+          const result = await startDeploy?.();
+          if (result && !result.started) {
+            console.warn(`[deploy] Auto-deploy did not start: ${result.reason}`);
+          }
+          // The starter resolves HEAD itself, one round trip after the cached read
+          // above. A push landing in that window means the commit recorded as acted on
+          // is not the commit being deployed — so correct it to what actually went out,
+          // or a later poll would retry the commit that really failed.
+          if (result?.started && result.commit !== head) {
+            console.log(`[deploy] head moved during the trigger: deploying ${result.commit.slice(0, 7)}`);
+            setLastActedCommit(result.commit);
+          }
+        } else {
+          await postAvailableNotice(config, head);
+        }
+      }
+    } catch (err) {
+      console.error("[deploy] availability action failed:", err);
     }
   }
   // Read once for the surfaces this poll owns, so they agree even if the hold is set part-way through a tick.

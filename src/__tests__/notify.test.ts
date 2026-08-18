@@ -406,4 +406,49 @@ describe("notifyDeploy", () => {
       ).rejects.toThrow("500");
     });
   });
+
+  describe("availability notice", () => {
+    const available: DeployNotification = {
+      ...deployBase,
+      kind: "available",
+      imageRef: null,
+      downtimeMs: null,
+      commit: "def5678abcdef0123456789",
+    };
+
+    it("names the waiting commit as the version, shortened", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", available);
+      expect(slackText()).toContain("def5678");
+      expect(slackText()).not.toContain("def5678abcdef");
+    });
+
+    it("does not broadcast — an invitation, not an interruption", async () => {
+      // Only the shutdown notice earns an @channel: it is the one telling people
+      // their dispatches have stopped. This one is asking for a decision.
+      await notifyDeploy("slack", "https://webhook.example.com/slack", available);
+      expect(slackText()).not.toContain("<!channel>");
+      expect(slackText()).toContain("Deployment available");
+    });
+
+    it("carries the commit on teams as well, with no per-provider work", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", available);
+      expect(teamsFacts()).toContainEqual({ title: "Version", value: "def5678" });
+    });
+
+    it("omits the version rather than rendering an empty one without a commit", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", { ...available, commit: null });
+      expect(teamsFacts().map((f) => f.title)).not.toContain("Version");
+    });
+
+    it("never falls back to the image ref", async () => {
+      // There is no image for an available deployment. A stale ref would name the
+      // *running* version as though it were the one waiting — worse than showing none.
+      await notifyDeploy("teams", "https://webhook.example.com/teams", {
+        ...available,
+        commit: null,
+        imageRef: "registry.fly.io/ai-implement-testing-orchestrator:deployment-STALE",
+      });
+      expect(teamsFacts().map((f) => f.title)).not.toContain("Version");
+    });
+  });
 });

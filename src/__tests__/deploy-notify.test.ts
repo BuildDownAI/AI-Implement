@@ -263,3 +263,43 @@ describe("shutdown → boot cycle", () => {
     expect(kinds).toEqual(["shutdown", "restarted"]);
   });
 });
+
+describe("postAvailableNotice", () => {
+  it("names the commit and does not pretend an image exists", async () => {
+    onFly(IMAGE_A);
+    await deployNotify.postAvailableNotice(config, "def5678abcdef");
+
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    const [type, url, payload] = vi.mocked(notify.notifyDeploy).mock.calls[0];
+    expect(type).toBe("slack");
+    expect(url).toBe(config.notifyWebhookUrl);
+    expect(payload).toMatchObject({
+      kind: "available",
+      appName: "ai-implement-testing-orchestrator",
+      region: "iad",
+      imageRef: null,
+      commit: "def5678abcdef",
+    });
+  });
+
+  it("posts off Fly too, unlike the boot and shutdown notices", async () => {
+    // Those gate on FLY_IMAGE_REF because they describe this machine's own lifecycle
+    // and would fire on every local Ctrl-C. Availability is a fact about the repository
+    // against the running commit, and is meaningful wherever self-deploy is configured.
+    await deployNotify.postAvailableNotice(config, "def5678");
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+  });
+
+  it("stays silent with no webhook configured", async () => {
+    onFly(IMAGE_A);
+    await deployNotify.postAvailableNotice({ ...config, notifyWebhookUrl: null }, "def5678");
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+  });
+
+  it("swallows a webhook failure rather than failing the poll", async () => {
+    // It runs as a poll passenger; a dead webhook must not stall dispatch.
+    onFly(IMAGE_A);
+    vi.mocked(notify.notifyDeploy).mockRejectedValueOnce(new Error("Slack webhook failed: 500"));
+    await expect(deployNotify.postAvailableNotice(config, "def5678")).resolves.toBeUndefined();
+  });
+});

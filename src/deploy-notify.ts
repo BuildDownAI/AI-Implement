@@ -118,3 +118,24 @@ export async function postBootNotice(config: DeployNotifyConfig): Promise<void> 
     console.error("[deploy-notify] boot notice failed:", err);
   }
 }
+
+/**
+ * Announces a deployment the operator has to decide about. Unlike the boot and
+ * shutdown notices this does not gate on FLY_IMAGE_REF: those describe this machine's
+ * own lifecycle and would fire on every local Ctrl-C, while availability is a fact
+ * about the repository against the running commit and is meaningful on any host.
+ */
+export async function postAvailableNotice(config: DeployNotifyConfig, commit: string): Promise<void> {
+  if (!config.notifyWebhookUrl) return;
+  try {
+    await notifyDeploy(config.notifyType, config.notifyWebhookUrl, {
+      kind: "available",
+      appName: process.env.FLY_APP_NAME || "orchestrator",
+      region: process.env.FLY_REGION || null,
+      imageRef: null,
+      commit,
+    });
+  } catch (err) {
+    console.error("[deploy-notify] availability notice failed:", err);
+  }
+}

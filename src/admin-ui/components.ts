@@ -214,6 +214,7 @@ export const componentsCss = `
 .btn-primary:hover { background: #2a2a28; border-color: #2a2a28; }
 [data-theme="dark"] .btn-primary { background: var(--fg-primary); color: var(--bg-app); }
 [data-theme="dark"] .btn-primary:hover { background: #fff; }
+[data-theme="dark"] .btn-primary:disabled { background: var(--bg-active); color: var(--fg-secondary); border-color: var(--border-default); }
 
 .btn-accent {
   background: var(--accent);

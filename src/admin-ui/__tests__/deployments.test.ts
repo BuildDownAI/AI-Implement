@@ -148,6 +148,103 @@ describe("deployments page", () => {
     expect(cta).toContain("deployments-deploy-btn");
   });
 
+  it("declares the policy card ids", () => {
+    for (const id of [
+      "deployments-policy",
+      "deployments-auto",
+      "deployments-notify",
+      "deployments-auto-hint",
+      "deployments-notify-hint",
+    ]) {
+      expect(deploymentsHtml).toContain(`id="${id}"`);
+    }
+  });
+
+  it("groups both switches under one question, using the settings card pattern", () => {
+    // They are two answers to "what happens when a deployment becomes available", not
+    // independent preferences — the framing is what stops them reading as unrelated.
+    expect(deploymentsHtml).toContain('class="card" id="deployments-policy"');
+    expect(deploymentsHtml).toContain("When a deployment becomes available");
+    expect(deploymentsHtml).toContain('class="checkbox-row"');
+  });
+
+  it("hides the policy card when self-deploy is unconfigured", () => {
+    expect(deploymentsScript).toContain("getElementById('deployments-policy').hidden = !configured");
+  });
+
+  it("saves both flags through the policy endpoint", () => {
+    expect(deploymentsScript).toContain("window.api('/api/deploy-policy', { method: 'POST'");
+    expect(deploymentsScript).toContain("window.saveDeployPolicy = saveDeployPolicy");
+  });
+
+  it("re-renders from the server after saving rather than trusting the checkbox", () => {
+    // The flags interact, so an optimistic update can show a hint that is not yet true.
+    const save = deploymentsScript.slice(deploymentsScript.indexOf("async function saveDeployPolicy"));
+    expect(save.slice(0, save.indexOf("\n  }"))).toContain("loadDeployments()");
+  });
+
+  it("explains the combination that does nothing", () => {
+    // Automatic deploying makes the announcement inert. Two switches that look
+    // independent while one silences the other is the confusion worth pre-empting.
+    expect(deploymentsScript).toContain("No effect while automatic deploying is on");
+    // Names the way to enable it rather than only reporting that it is off — an
+    // unavailable capability the operator cannot discover is worse than a dead switch.
+    expect(deploymentsScript).toContain("NOTIFY_WEBHOOK_URL");
+  });
+
+  it("does not claim a deploy is deferred while that deploy is running", () => {
+    // Observed live: the status tile read "Building" while the hint said the commit
+    // "applies from the next push". Both true in isolation, contradictory side by side.
+    expect(deploymentsScript).toContain("if (held) return 'On — the deploy in progress above is the current one.';");
+    expect(deploymentsScript).toContain("autoHint(data, available, held)");
+  });
+
+  it("offers the manual path when automatic deploying cannot act on the waiting commit", () => {
+    // One attempt per commit means enabling the toggle does not reach back for a commit
+    // already announced. Saying so, and naming the button, is the whole point.
+    expect(deploymentsScript).toContain("applies from the next push");
+    expect(deploymentsScript).toContain("Deploy now to release it immediately");
+  });
+
+  it("declares every id exactly once", () => {
+    // The page is one concatenated string, so a duplicated block is easy to introduce
+    // and silent: getElementById returns the first match, leaving the copy rendered but
+    // permanently stale. A toContain assertion cannot see it — a count can.
+    const ids = [...deploymentsHtml.matchAll(/id="([a-z-]+)"/g)].map((m) => m[1]);
+    expect(ids).toHaveLength(new Set(ids).size);
+  });
+
+  it("orders the body: tiles, then the policy, then the deploy control", () => {
+    const at = (id: string) => deploymentsHtml.indexOf(`id="${id}"`);
+    expect(at("deployments-kpis")).toBeLessThan(at("deployments-policy"));
+    expect(at("deployments-policy")).toBeLessThan(at("deployments-cta"));
+  });
+
+  it("saves on submit rather than on every click", () => {
+    // Writing per click makes an accidental tick a live config change, and gives the
+    // 30s poll a window to clobber a half-made decision.
+    expect(deploymentsHtml).toContain('id="deployments-policy-save"');
+    expect(deploymentsHtml).toContain('onchange="window.refreshPolicyDirty()"');
+    expect(deploymentsHtml).not.toContain('onchange="window.saveDeployPolicy()"');
+  });
+
+  it("does not overwrite unsaved checkboxes on a poll", () => {
+    expect(deploymentsScript).toContain("if (!policyDirty()) {");
+  });
+
+  it("disables the announcement switch when no webhook exists", () => {
+    expect(deploymentsScript).toContain("notifyEl.disabled = !data.notifyConfigured");
+  });
+
+  it("keeps an unavailable announcement switch out of the form entirely", () => {
+    // Forced unchecked so a greyed-but-ticked box cannot claim something is being sent,
+    // excluded from the dirty check so Save is not lit forever against a stored true,
+    // and omitted from the patch so saving cannot overwrite the stored preference.
+    expect(deploymentsScript).toContain("if (!data.notifyConfigured) notifyEl.checked = false;");
+    expect(deploymentsScript).toContain("!notifyEl.disabled && notifyEl.checked !== savedPolicy.notifyAvailable");
+    expect(deploymentsScript).toContain("if (!notifyEl.disabled) patch.notifyAvailable = notifyEl.checked;");
+  });
+
   it("keeps the page subtitle static", () => {
     // A state-dependent subtitle duplicates the Availability tile. Dynamic subtitles
     // are this codebase's collection-count convention (issues, pulls, runners); this
