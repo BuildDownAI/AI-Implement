@@ -3265,8 +3265,10 @@ async function main(): Promise<void> {
   const server = startServer(config, registry);
 
   // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
-  // Safe because everything postBootNotice persists happens synchronously before its first await,
-  // so the stored image ref is committed by the time this returns.
+  // Boot-classification writes (LAST_IMAGE_REF_KEY, LAST_SHUTDOWN_AT_KEY) happen synchronously
+  // before postBootNotice's first await, so decideBootNotification's inputs are committed by the
+  // time this returns. DEPLOY_OUTCOME_KEY is written after await probeMcp() — intentionally, since
+  // the probe result must be known before the outcome can be recorded.
   void postBootNotice(config, { holdWasSet });
 
   // Reconcile machines from any previous run before starting the poll loop
