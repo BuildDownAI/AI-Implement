@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { parseWorkflowMd } from "./workflow-md.js";
@@ -65,6 +65,77 @@ export interface RunPlanningOptions {
   workspaceDir?: string;
   executor?: PlanningExecutor;
   fetchImpl?: typeof fetch;
+}
+
+function collectLocalPlanningContext(workspaceDir: string): string {
+  const dir = join(workspaceDir, "ai-output", "comments");
+  if (!existsSync(dir)) return "";
+  try {
+    const files = readdirSync(dir)
+      .filter((n) => n.endsWith(".md"))
+      .sort();
+    return files.map((n) => readFileSync(join(dir, n), "utf-8")).join("\n\n");
+  } catch {
+    return "";
+  }
+}
+
+export interface RunPlanningLocalOptions {
+  workspaceDir: string;
+  issueIdentifier: string;
+  issueTitle: string;
+  issueDescription: string;
+  parent?: string;
+  siblings?: string;
+  dependencies?: string;
+  model?: string;
+  executor?: PlanningExecutor;
+}
+
+export interface RunPlanningLocalResult {
+  exitCode: number;
+  planningContext: string;
+}
+
+export async function runPlanningLocally(
+  opts: RunPlanningLocalOptions,
+): Promise<RunPlanningLocalResult> {
+  const subs: Record<string, string> = {
+    ISSUE_ID: "",
+    ISSUE_IDENTIFIER: opts.issueIdentifier,
+    ISSUE_TITLE: opts.issueTitle,
+    ISSUE_DESCRIPTION: opts.issueDescription,
+    PARENT: opts.parent ?? "None",
+    SIBLINGS: opts.siblings ?? "None",
+    DEPENDENCIES: opts.dependencies ?? "None",
+  };
+  let model = opts.model ?? "claude-sonnet-4-6";
+  let prompt = buildDefaultPlanningPrompt(subs);
+  const planningMdPath = join(opts.workspaceDir, "PLANNING.md");
+  if (existsSync(planningMdPath)) {
+    const parsed = parseWorkflowMd(readFileSync(planningMdPath, "utf-8"), subs);
+    if (parsed.frontMatter.model) model = opts.model ?? parsed.frontMatter.model;
+    if (parsed.body.trim()) prompt = parsed.body;
+  }
+  const args = [
+    "--dangerously-skip-permissions",
+    "--model",
+    model,
+    "--max-turns",
+    "50",
+    "--allowedTools",
+    "Read",
+    "--allowedTools",
+    "Glob",
+    "--allowedTools",
+    "Grep",
+  ];
+  const executor = opts.executor ?? defaultExecutor;
+  const result = executor(prompt, args, opts.workspaceDir);
+  if (result.status !== 0) {
+    return { exitCode: 1, planningContext: "" };
+  }
+  return { exitCode: 0, planningContext: collectLocalPlanningContext(opts.workspaceDir) };
 }
 
 export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number }> {

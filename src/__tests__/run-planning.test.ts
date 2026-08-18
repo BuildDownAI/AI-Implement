@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runPlanning } from "../run-planning.js";
+import { runPlanning, runPlanningLocally } from "../run-planning.js";
 import { encodeRunConfig } from "../run-config.js";
 
 type RunnerResultPayload = {
@@ -165,6 +165,140 @@ describe("runPlanning", () => {
       return { status: 0, stdout: "", stderr: "" };
     };
     await runPlanning({ workspaceDir: ws, executor: fakeExecutor });
+    expect(capturedArgs.join(" ")).toContain("--model claude-override");
+  });
+});
+
+describe("runPlanningLocally", () => {
+  let ws: string;
+
+  beforeEach(() => {
+    ws = mkdtempSync(join(tmpdir(), "plan-local-"));
+  });
+
+  afterEach(() => {
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  it("runs planning with explicit options and returns exitCode 0 on success", async () => {
+    let invoked: { prompt: string; args: string[] } | null = null;
+    const fakeExecutor = (prompt: string, args: string[]) => {
+      invoked = { prompt, args };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+
+    const result = await runPlanningLocally({
+      workspaceDir: ws,
+      issueIdentifier: "LOCAL-1",
+      issueTitle: "Local task",
+      issueDescription: "Do the local thing",
+      executor: fakeExecutor,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(invoked!.prompt).toContain("LOCAL-1");
+    expect(invoked!.prompt).toContain("Local task");
+    expect(invoked!.args).toContain("--dangerously-skip-permissions");
+  });
+
+  it("returns exitCode 1 and empty planningContext when executor fails", async () => {
+    const result = await runPlanningLocally({
+      workspaceDir: ws,
+      issueIdentifier: "LOCAL-1",
+      issueTitle: "Local task",
+      issueDescription: "Do the local thing",
+      executor: () => ({ status: 1, stdout: "", stderr: "boom" }),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.planningContext).toBe("");
+  });
+
+  it("collects planning context from ai-output/comments/*.md files", async () => {
+    mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+    writeFileSync(join(ws, "ai-output", "comments", "01-plan.md"), "# Plan\nDo the thing");
+    writeFileSync(join(ws, "ai-output", "comments", "02-risks.md"), "# Risks\nBe careful");
+
+    const result = await runPlanningLocally({
+      workspaceDir: ws,
+      issueIdentifier: "LOCAL-1",
+      issueTitle: "Local task",
+      issueDescription: "Desc",
+      executor: () => ({ status: 0, stdout: "", stderr: "" }),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.planningContext).toContain("Do the thing");
+    expect(result.planningContext).toContain("Be careful");
+  });
+
+  it("concatenates comment files in lexicographic order with double-newline separator", async () => {
+    mkdirSync(join(ws, "ai-output", "comments"), { recursive: true });
+    writeFileSync(join(ws, "ai-output", "comments", "02-second.md"), "Second");
+    writeFileSync(join(ws, "ai-output", "comments", "01-first.md"), "First");
+
+    const result = await runPlanningLocally({
+      workspaceDir: ws,
+      issueIdentifier: "LOCAL-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      executor: () => ({ status: 0, stdout: "", stderr: "" }),
+    });
+
+    expect(result.planningContext).toBe("First\n\nSecond");
+  });
+
+  it("returns empty planningContext when ai-output/comments directory is absent", async () => {
+    const result = await runPlanningLocally({
+      workspaceDir: ws,
+      issueIdentifier: "LOCAL-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      executor: () => ({ status: 0, stdout: "", stderr: "" }),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.planningContext).toBe("");
+  });
+
+  it("uses PLANNING.md body and substitutes issue fields when present", async () => {
+    writeFileSync(
+      join(ws, "PLANNING.md"),
+      "---\nmodel: claude-x\n---\nPlan ${ISSUE_IDENTIFIER}: ${ISSUE_TITLE}",
+    );
+
+    let capturedPrompt = "";
+    const result = await runPlanningLocally({
+      workspaceDir: ws,
+      issueIdentifier: "LOCAL-1",
+      issueTitle: "My task",
+      issueDescription: "Desc",
+      executor: (prompt) => {
+        capturedPrompt = prompt;
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(capturedPrompt).toContain("Plan LOCAL-1: My task");
+  });
+
+  it("model option overrides PLANNING.md model", async () => {
+    writeFileSync(join(ws, "PLANNING.md"), "---\nmodel: claude-x\n---\nbody");
+
+    let capturedArgs: string[] = [];
+    await runPlanningLocally({
+      workspaceDir: ws,
+      issueIdentifier: "LOCAL-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      model: "claude-override",
+      executor: (_prompt, args) => {
+        capturedArgs = args;
+        return { status: 0, stdout: "", stderr: "" };
+      },
+    });
+
     expect(capturedArgs.join(" ")).toContain("--model claude-override");
   });
 });
