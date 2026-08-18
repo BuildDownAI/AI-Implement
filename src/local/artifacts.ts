@@ -23,9 +23,10 @@ export function validateRunId(runId: string): void {
 
 /**
  * Return the absolute artifact directory path for a given run ID.
- * Does not touch the filesystem. Call validateRunId first for user-supplied IDs.
+ * Validates runId before constructing the path. Does not touch the filesystem.
  */
 export function resolveArtifactDir(runId: string, outputRoot?: string): string {
+  validateRunId(runId);
   return resolve(join(outputRoot ?? DEFAULT_OUTPUT_ROOT, runId));
 }
 
@@ -55,6 +56,22 @@ async function assertSafeArtifactDir(dir: string, root: string): Promise<void> {
 }
 
 /**
+ * Assert that a file path is not a symbolic link before writing.
+ * If the path does not exist, proceeds silently (safe to create).
+ */
+async function assertNotSymlink(filePath: string): Promise<void> {
+  try {
+    const st = await lstat(filePath);
+    if (st.isSymbolicLink()) {
+      throw new Error(`Symlink escape rejected: "${filePath}" is a symbolic link`);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+}
+
+/**
  * Write run artifacts under outputRoot/<runId>/ and return the absolute path.
  *
  * summary.json is always written and contains no credentials or repository
@@ -64,9 +81,8 @@ async function assertSafeArtifactDir(dir: string, root: string): Promise<void> {
  * Throws on invalid run ID, path traversal, or symlink escape.
  */
 export async function writeRunArtifacts(input: LocalArtifactInput): Promise<string> {
-  validateRunId(input.runId);
   const root = input.outputRoot ?? DEFAULT_OUTPUT_ROOT;
-  const dir = resolve(join(root, input.runId));
+  const dir = resolveArtifactDir(input.runId, root);
   await assertSafeArtifactDir(dir, root);
   await mkdir(dir, { recursive: true });
 
@@ -86,32 +102,27 @@ export async function writeRunArtifacts(input: LocalArtifactInput): Promise<stri
     artifactDir: dir,
   };
 
-  const writes: Promise<void>[] = [
-    writeFile(join(dir, "summary.json"), JSON.stringify(summary, null, 2), "utf-8"),
+  const files: [string, string][] = [
+    [join(dir, "summary.json"), JSON.stringify(summary, null, 2)],
   ];
 
-  if (input.logs != null)
-    writes.push(writeFile(join(dir, "run.log"), input.logs, "utf-8"));
-  if (input.plan != null)
-    writes.push(writeFile(join(dir, "plan.md"), input.plan, "utf-8"));
-  if (input.patch != null)
-    writes.push(writeFile(join(dir, "changes.diff"), input.patch, "utf-8"));
+  if (input.logs != null) files.push([join(dir, "run.log"), input.logs]);
+  if (input.plan != null) files.push([join(dir, "plan.md"), input.plan]);
+  if (input.patch != null) files.push([join(dir, "changes.diff"), input.patch]);
   if (input.changedFiles != null)
-    writes.push(writeFile(join(dir, "changed-files.txt"), input.changedFiles.join("\n"), "utf-8"));
+    files.push([join(dir, "changed-files.txt"), input.changedFiles.join("\n")]);
   if (input.testSummary != null)
-    writes.push(writeFile(join(dir, "test-summary.txt"), input.testSummary, "utf-8"));
+    files.push([join(dir, "test-summary.txt"), input.testSummary]);
   if (input.reviewResult != null)
-    writes.push(writeFile(join(dir, "review.md"), input.reviewResult, "utf-8"));
+    files.push([join(dir, "review.md"), input.reviewResult]);
   if (input.runSummary != null)
-    writes.push(writeFile(join(dir, "run-summary.md"), input.runSummary, "utf-8"));
+    files.push([join(dir, "run-summary.md"), input.runSummary]);
   if (input.tokenSummary != null)
-    writes.push(
-      writeFile(join(dir, "tokens.json"), JSON.stringify(input.tokenSummary, null, 2), "utf-8"),
-    );
-  if (input.autopsy != null)
-    writes.push(writeFile(join(dir, "autopsy.md"), input.autopsy, "utf-8"));
+    files.push([join(dir, "tokens.json"), JSON.stringify(input.tokenSummary, null, 2)]);
+  if (input.autopsy != null) files.push([join(dir, "autopsy.md"), input.autopsy]);
 
-  await Promise.all(writes);
+  await Promise.all(files.map(([path]) => assertNotSymlink(path)));
+  await Promise.all(files.map(([path, content]) => writeFile(path, content, "utf-8")));
   return dir;
 }
 
@@ -121,9 +132,8 @@ export async function writeRunArtifacts(input: LocalArtifactInput): Promise<stri
  * Idempotent: silently succeeds when the directory does not exist.
  */
 export async function removeRunArtifacts(runId: string, outputRoot?: string): Promise<void> {
-  validateRunId(runId);
   const root = outputRoot ?? DEFAULT_OUTPUT_ROOT;
-  const dir = resolve(join(root, runId));
+  const dir = resolveArtifactDir(runId, root);
   await assertSafeArtifactDir(dir, root);
   await rm(dir, { recursive: true, force: true });
 }
