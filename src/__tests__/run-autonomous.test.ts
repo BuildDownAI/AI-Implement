@@ -1831,4 +1831,233 @@ describe("runAutonomousLocally", () => {
     expect(result.exitCode).toBe(1);
     expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
   });
+
+  it("returns effectiveMaxTurns and effectiveMaxIterations in result", async () => {
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [],
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      maxTurns: 25,
+      maxIterations: 4,
+      pipeline,
+      runner,
+    });
+
+    expect(result.effectiveMaxTurns).toBe(25);
+    expect(result.effectiveMaxIterations).toBe(4);
+  });
+
+  it("uses default effectiveMaxTurns=50 and effectiveMaxIterations=3 when not specified", async () => {
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [],
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.effectiveMaxTurns).toBe(50);
+    expect(result.effectiveMaxIterations).toBe(3);
+  });
+
+  it("returns tokenSummary with summed costUsd from passes, other fields null", async () => {
+    const passes = [
+      { iteration: 1, implementTurns: 5, implementOutcome: "ok", costUsd: 0.05, reviewApproved: true },
+    ];
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes,
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.tokenSummary).not.toBeNull();
+    expect(result.tokenSummary!.costUsd).toBeCloseTo(0.05);
+    expect(result.tokenSummary!.tokensIn).toBeNull();
+    expect(result.tokenSummary!.tokensOut).toBeNull();
+    expect(result.tokenSummary!.cacheReadTokens).toBeNull();
+    expect(result.tokenSummary!.cacheCreationTokens).toBeNull();
+  });
+
+  it("returns tokenSummary null when no passes ran", async () => {
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockRejectedValue(new Error("boom")),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.tokenSummary).toBeNull();
+  });
+
+  it.skipIf(isWindows)("setup failure returns exitCode 1 with terminationReason setup_failed", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nsetup: setup.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "setup.sh"), "exit 1\n");
+
+    const implRun = vi.fn();
+    const { pipeline, runner } = makeFeedbackLoopPipeline({ run: implRun });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.terminationReason).toBe("setup_failed");
+    expect(implRun).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(isWindows)("teardown does not run when setup fails", async () => {
+    writeFileSync(
+      join(workspaceDir, "WORKFLOW.md"),
+      "---\nsetup: setup.sh\nteardown: teardown.sh\n---\nbody\n",
+    );
+    writeFileSync(join(workspaceDir, "setup.sh"), "exit 1\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'printf "" > teardown-ran.marker\n');
+
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [],
+        finalFeedback: "",
+      }),
+    });
+
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(false);
+  });
+
+  it.skipIf(isWindows)("verify failure returns exitCode 1 with terminationReason verify_failed", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nverify: verify.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "verify.sh"), "exit 1\n");
+
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [],
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.terminationReason).toBe("verify_failed");
+    expect(result.approved).toBe(false);
+  });
+
+  it.skipIf(isWindows)("verify does not run when review did not approve", async () => {
+    writeFileSync(join(workspaceDir, "WORKFLOW.md"), "---\nverify: verify.sh\n---\nbody\n");
+    writeFileSync(join(workspaceDir, "verify.sh"), 'printf "" > verify-ran.marker\n');
+
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: false,
+        iterations: 2,
+        terminationReason: "iterations_exhausted",
+        passes: [],
+        finalFeedback: "",
+      }),
+    });
+
+    await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(existsSync(join(workspaceDir, "verify-ran.marker"))).toBe(false);
+  });
+
+  it.skipIf(isWindows)("teardown runs when setup succeeds and pipeline throws", async () => {
+    writeFileSync(
+      join(workspaceDir, "WORKFLOW.md"),
+      "---\nsetup: setup.sh\nteardown: teardown.sh\n---\nbody\n",
+    );
+    writeFileSync(join(workspaceDir, "setup.sh"), "exit 0\n");
+    writeFileSync(join(workspaceDir, "teardown.sh"), 'printf "" > teardown-ran.marker\n');
+
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockRejectedValue(new Error("step exploded")),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(existsSync(join(workspaceDir, "teardown-ran.marker"))).toBe(true);
+  });
 });
