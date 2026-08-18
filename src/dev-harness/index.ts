@@ -1,23 +1,22 @@
-import { execFile as nodeExecFile, spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
-import { promisify } from "node:util";
-import {
-  buildDockerEnvFileContent,
-  inspectLocalContainer,
-  splitLocalRunnerEnv,
-} from "../local-docker.js";
+import { splitLocalRunnerEnv } from "../local-docker.js";
 import type { LocalContainerState } from "../local-docker.js";
 import { encodeRunConfig } from "../run-config.js";
+import {
+  awaitSessionResult,
+  getSessionStatus,
+  launchLocalSession,
+  streamSessionLogs,
+  streamSessionLogsUntilShellReady,
+} from "../local/session.js";
 import { parseTaskFileFromPath } from "./task-file.js";
 import type { ParsedTaskFile } from "./task-file.js";
 
 export type { ParsedTaskFile };
-
-const execFile = promisify(nodeExecFile);
 
 export interface DevRunOptions {
   /** Absolute or relative path to the local target-repo checkout. */
@@ -94,15 +93,6 @@ function detectRepoFromOrigin(workspaceDir: string): { owner: string; repo: stri
 function sanitizeContainerName(identifier: string): string {
   const slug = identifier.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
   return `ai-implement-dev-${slug || "task"}-${Date.now().toString(36)}`;
-}
-
-async function writeDevSecretEnvFile(secretEnv: Record<string, string>): Promise<string> {
-  const dir = join(tmpdir(), "ai-implement-dev-runner");
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const filePath = join(dir, `${randomUUID()}.env`);
-  await writeFile(filePath, buildDockerEnvFileContent(secretEnv), { mode: 0o600 });
-  await chmod(filePath, 0o600);
-  return filePath;
 }
 
 /**
@@ -190,42 +180,31 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
   };
 
   const { publicEnv, secretEnv } = splitLocalRunnerEnv(allEnv);
-  const envFilePath = await writeDevSecretEnvFile(secretEnv);
 
-  const args = [
-    "run",
-    "-d",
-    "--name", containerName,
-    "--add-host", "host.docker.internal:host-gateway",
-    "-v", `${workspace}:/workspace`,
-    "--env-file", envFilePath,
-  ];
-  for (const [key, value] of Object.entries(publicEnv)) {
-    args.push("-e", `${key}=${value}`);
-  }
-  args.push(image);
+  const session = await launchLocalSession({
+    containerName,
+    image,
+    publicEnv,
+    secretEnv,
+    workspace,
+  });
 
-  let containerId: string;
-  try {
-    const { stdout } = await execFile("docker", args);
-    containerId = stdout.trim();
-  } catch (err) {
-    const msg =
-      (err as { stderr?: string }).stderr?.trim() ||
-      (err instanceof Error ? err.message : String(err));
-    throw new Error(`Failed to start dev runner container: ${msg}`);
-  } finally {
-    await unlink(envFilePath).catch(() => undefined);
-  }
-
-  return { runId, containerId, containerName, artifactsDir, startedAt: new Date(), task, workspace };
+  return {
+    runId,
+    containerId: session.containerId,
+    containerName: session.containerName,
+    artifactsDir,
+    startedAt: session.startedAt,
+    task,
+    workspace,
+  };
 }
 
 /**
  * Query the current state of the dev runner container.
  */
 export async function getRunStatus(handle: DevRunHandle): Promise<LocalContainerState> {
-  return inspectLocalContainer(handle.containerId);
+  return getSessionStatus(handle);
 }
 
 /**
@@ -236,23 +215,8 @@ export async function streamLogs(
   handle: DevRunHandle,
   onLine: (line: string) => void,
 ): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const proc = spawn("docker", ["logs", "-f", handle.containerId], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const emit = (data: Buffer) => {
-      for (const line of data.toString().split("\n")) {
-        const t = line.trimEnd();
-        if (t) onLine(t);
-      }
-    };
-    proc.stdout?.on("data", emit);
-    proc.stderr?.on("data", emit);
-    proc.on("close", () => resolve());
-  });
+  return streamSessionLogs(handle, onLine);
 }
-
-const SHELL_READY_RE = /^\[dev:run\] shell-ready exit=(\d+)$/;
 
 /**
  * Stream container logs until either the container exits or the shell-ready
@@ -264,47 +228,14 @@ export async function streamLogsUntilShellReady(
   handle: DevRunHandle,
   onLine: (line: string) => void,
 ): Promise<{ ready: boolean; exitCode: number | null }> {
-  return new Promise<{ ready: boolean; exitCode: number | null }>((resolve) => {
-    const proc = spawn("docker", ["logs", "-f", handle.containerId], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let resolved = false;
-    const finish = (result: { ready: boolean; exitCode: number | null }) => {
-      if (!resolved) {
-        resolved = true;
-        proc.kill();
-        resolve(result);
-      }
-    };
-    const emit = (data: Buffer) => {
-      for (const line of data.toString().split("\n")) {
-        const t = line.trimEnd();
-        if (!t) continue;
-        const m = t.match(SHELL_READY_RE);
-        if (m) {
-          finish({ ready: true, exitCode: parseInt(m[1], 10) });
-          return;
-        }
-        onLine(t);
-      }
-    };
-    proc.stdout?.on("data", emit);
-    proc.stderr?.on("data", emit);
-    proc.on("close", () => finish({ ready: false, exitCode: null }));
-  });
+  return streamSessionLogsUntilShellReady(handle, onLine);
 }
 
 /**
  * Poll until the container exits and return the result.
  */
 export async function getRunResult(handle: DevRunHandle): Promise<DevRunResult> {
-  while (true) {
-    const state = await inspectLocalContainer(handle.containerId);
-    if (!state.running) {
-      return { exitCode: state.exitCode, durationMs: Date.now() - handle.startedAt.getTime() };
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
+  return awaitSessionResult(handle);
 }
 
 /**
