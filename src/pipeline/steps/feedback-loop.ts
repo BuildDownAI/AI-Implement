@@ -129,11 +129,21 @@ const REVIEW_DIFF_EXCLUDES = [
 ];
 
 export function getDiff(workspaceDir: string): string {
+  // Snapshot which files are currently untracked so we can undo the intent-to-add
+  // markers after the diff. On mounted runs there is no push step to clean them up.
+  const untrackedResult = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const untrackedFiles =
+    untrackedResult.status === 0
+      ? untrackedResult.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean)
+      : [];
+
   // Mark all untracked files as "intent to add" so git diff HEAD includes them
   // as new-file additions. Without this, untracked files (e.g. newly created
   // .mcp.json, .claude/settings.json) are invisible to the diff and the reviewer
-  // falsely rejects the implementation as "uncommitted". The push step runs
-  // git add -A unconditionally, so leaving intent-to-add markers is harmless.
+  // falsely rejects the implementation as "uncommitted".
   spawnSync("git", ["add", "-N", "."], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
@@ -147,6 +157,17 @@ export function getDiff(workspaceDir: string): string {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+
+  // Remove the intent-to-add markers we just added. Preserves the developer's
+  // Git index on mounted runs (no push step); the push step re-stages everything
+  // on normal runs so this is safe in both cases.
+  if (untrackedFiles.length > 0) {
+    spawnSync("git", ["rm", "-r", "--cached", "--force", "--", ...untrackedFiles], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  }
+
   if (result.status !== 0) {
     // A non-zero exit means the reviewer sees an empty diff and may spuriously
     // approve. Behaviour is unchanged (still return ""), but surface it so the

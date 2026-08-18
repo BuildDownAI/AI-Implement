@@ -526,12 +526,13 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // A gap-fill run (prNumber set) never produces push outputs: the pipeline skips
     // push because Claude commits and pushes to the existing PR branch itself. An
     // approved gap-fill without a prUrl is therefore a success, not REVIEW_UNAPPROVED.
-    if (approved && (prUrl || prNumber)) {
+    // Similarly, an approved mounted dev-harness run has no push step and no PR URL,
+    // but is a genuine local success.
+    if (approved && (prUrl || prNumber || devHarnessMode)) {
       const statPasses = Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [];
       const planningBlock = parsePlanningBlock(planningContext);
       // For new runs prUrl is set and branch is the base — compare committed diff.
-      // For gap-fill runs (prNumber only) branch equals the PR branch, so the diff
-      // is empty; we skip the comparison rather than produce misleading output.
+      // For gap-fill and mounted runs there is no prUrl; skip the comparison.
       const filesChanged = prUrl ? getCommittedFiles(workspaceDir, branch) : [];
       writeRunStats(workspaceDir, {
         issueIdentifier,
@@ -542,7 +543,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?";
       disposition = prUrl
         ? `PR ${prUrl} (approved after ${iterations} iteration(s))`
-        : `gap-fill on PR #${prNumber} (approved after ${iterations} iteration(s))`;
+        : prNumber
+        ? `gap-fill on PR #${prNumber} (approved after ${iterations} iteration(s))`
+        : `local: approved after ${iterations} iteration(s) (mounted mode)`;
       await postRunnerResult({
         workspaceDir,
         phase: runnerPhase,
