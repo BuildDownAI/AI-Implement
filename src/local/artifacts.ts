@@ -26,7 +26,7 @@ export function validateRunId(runId: string): void {
  * Does not touch the filesystem. Call validateRunId first for user-supplied IDs.
  */
 export function resolveArtifactDir(runId: string, outputRoot?: string): string {
-  return join(outputRoot ?? DEFAULT_OUTPUT_ROOT, runId);
+  return resolve(join(outputRoot ?? DEFAULT_OUTPUT_ROOT, runId));
 }
 
 /**
@@ -66,7 +66,7 @@ async function assertSafeArtifactDir(dir: string, root: string): Promise<void> {
 export async function writeRunArtifacts(input: LocalArtifactInput): Promise<string> {
   validateRunId(input.runId);
   const root = input.outputRoot ?? DEFAULT_OUTPUT_ROOT;
-  const dir = join(root, input.runId);
+  const dir = resolve(join(root, input.runId));
   await assertSafeArtifactDir(dir, root);
   await mkdir(dir, { recursive: true });
 
@@ -123,7 +123,7 @@ export async function writeRunArtifacts(input: LocalArtifactInput): Promise<stri
 export async function removeRunArtifacts(runId: string, outputRoot?: string): Promise<void> {
   validateRunId(runId);
   const root = outputRoot ?? DEFAULT_OUTPUT_ROOT;
-  const dir = join(root, runId);
+  const dir = resolve(join(root, runId));
   await assertSafeArtifactDir(dir, root);
   await rm(dir, { recursive: true, force: true });
 }

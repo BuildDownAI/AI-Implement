@@ -110,6 +110,19 @@ describe("writeRunArtifacts", () => {
     expect(dir).toBe(join(root, VALID_ID));
   });
 
+  it("returns an absolute path even when outputRoot is relative", async () => {
+    root = mkdtempSync(join(tmpdir(), "aii-art-"));
+    const relative = `./aii-rel-${Date.now()}`;
+    let dir: string | undefined;
+    try {
+      dir = await writeRunArtifacts(baseInput({ outputRoot: relative }));
+      expect(dir.startsWith("/")).toBe(true);
+    } finally {
+      if (dir != null) rmSync(dir, { recursive: true, force: true });
+      rmSync(relative, { recursive: true, force: true });
+    }
+  });
+
   it("writes run.log when logs is provided", async () => {
     root = mkdtempSync(join(tmpdir(), "aii-art-"));
     const dir = await writeRunArtifacts(baseInput({ outputRoot: root, logs: "step 1\nstep 2\n" }));
