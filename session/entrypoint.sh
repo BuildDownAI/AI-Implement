@@ -91,6 +91,7 @@ fi
 # ── 5. Workspace ownership for non-root Claude ───────────────────────────────
 if [ "$WORKSPACE_MODE" = "mounted" ]; then
   prepare_coder_identity "${AI_IMPLEMENT_HOST_UID:-}" "${AI_IMPLEMENT_HOST_GID:-}"
+  verify_workspace_writable "$WORKSPACE_DIR"
 else
   chown -R coder:coder "$WORKSPACE_DIR"
 fi

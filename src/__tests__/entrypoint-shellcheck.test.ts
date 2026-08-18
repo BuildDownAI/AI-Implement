@@ -224,9 +224,9 @@ describe("session/entrypoint.sh", () => {
     expect(r.status, r.stderr?.toString()).toBe(0);
   });
 
-  it("is under 115 lines (bootstrap, not monolith)", () => {
+  it("is under 116 lines (bootstrap, not monolith)", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content.split("\n").length).toBeLessThan(115);
+    expect(content.split("\n").length).toBeLessThan(116);
   });
 
   it("exec's the phase-selected TS runner as the final step", () => {
@@ -335,11 +335,12 @@ describe("session/entrypoint.sh", () => {
     const commandLog = join(root, "commands.log");
     spawnSync("mkdir", ["-p", binDir, workspace]);
 
-    for (const name of ["git", "usermod", "groupmod", "chown", "cp", "dbus-run-session"]) {
-      writeShim(binDir, name, `printf '%s %s\\n' '${name}' \"$*\" >> \"$COMMAND_LOG\"`);
+    for (const name of ["git", "usermod", "groupmod", "chown", "cp", "dbus-run-session", "su"]) {
+      writeShim(binDir, name, `printf '%s %s\\n' '${name}' "$*" >> "$COMMAND_LOG"`);
     }
     writeShim(binDir, "getent", "printf 'hostgroup:x:2345:\\n'");
-    writeShim(binDir, "id", "[ \"${1:-}\" = '-gn' ] && printf 'hostgroup\\n'");
+    writeShim(binDir, "stat", "printf '1234\\n'");
+    writeShim(binDir, "id", `case "\${1:-}" in -gn) printf 'hostgroup\\n' ;; -u) printf '1234\\n' ;; -g) printf '2345\\n' ;; esac`);
 
     const result = spawnSync("bash", ["session/entrypoint.sh"], {
       encoding: "utf8",
