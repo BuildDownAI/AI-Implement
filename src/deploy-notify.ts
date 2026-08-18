@@ -1,5 +1,6 @@
 import { getDb } from "./dedup.js";
 import { notifyDeploy, type DeployNotification } from "./notify.js";
+import { interpretMcpProbe } from "./deploy.js";
 
 export interface BootStateInput {
   currentImageRef: string;
@@ -18,8 +19,16 @@ export interface DeployNotifyConfig {
   notifyWebhookUrl: string | null;
 }
 
+export interface DeployOutcome {
+  kind: "deployed-ok" | "deployed-not-serving" | "build-failed";
+  commit: string;
+  timestamp: number;
+  detail?: string;
+}
+
 const LAST_IMAGE_REF_KEY = "deploy_last_image_ref";
 const LAST_SHUTDOWN_AT_KEY = "deploy_last_shutdown_at";
+const DEPLOY_OUTCOME_KEY = "deploy_last_outcome";
 
 function readSetting(key: string): string | null {
   try {
@@ -71,6 +80,24 @@ function describe(kind: DeployNotification["kind"], imageRef: string, downtimeMs
   };
 }
 
+export function getDeployOutcome(): DeployOutcome | null {
+  const raw = readSetting(DEPLOY_OUTCOME_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as DeployOutcome;
+  } catch {
+    return null;
+  }
+}
+
+export function recordDeployOutcome(outcome: DeployOutcome): void {
+  try {
+    writeSetting(DEPLOY_OUTCOME_KEY, JSON.stringify(outcome));
+  } catch (err) {
+    console.error("[deploy-notify] failed to record deploy outcome:", err);
+  }
+}
+
 /** Records the stop so the next boot can measure downtime. Must run before closeDb(). */
 export function recordShutdown(): void {
   if (!flyImageRef()) return;
@@ -91,13 +118,18 @@ export async function postShutdownNotice(config: DeployNotifyConfig): Promise<vo
   }
 }
 
-export async function postBootNotice(config: DeployNotifyConfig): Promise<void> {
+export async function postBootNotice(
+  config: DeployNotifyConfig,
+  opts: { holdWasSet?: boolean; fetchImpl?: typeof fetch } = {},
+): Promise<void> {
   const imageRef = flyImageRef();
   if (!imageRef) return;
 
+  const prevImageRef = readSetting(LAST_IMAGE_REF_KEY);
+
   const decision = decideBootNotification({
     currentImageRef: imageRef,
-    prevImageRef: readSetting(LAST_IMAGE_REF_KEY),
+    prevImageRef,
     lastShutdownAt: Number(readSetting(LAST_SHUTDOWN_AT_KEY)) || null,
     now: Date.now(),
   });
@@ -109,6 +141,19 @@ export async function postBootNotice(config: DeployNotifyConfig): Promise<void> 
     writeSetting(LAST_SHUTDOWN_AT_KEY, null);
   } catch (err) {
     console.error("[deploy-notify] failed to persist deploy state:", err);
+  }
+
+  // A deploy hold was set and the image changed: the release replaced this process.
+  // Probe /mcp to confirm the sidecar is reachable, then record the outcome durably —
+  // independent of whether a webhook is configured.
+  if (opts.holdWasSet && prevImageRef !== null && prevImageRef !== imageRef) {
+    const commit = process.env.AI_IMPLEMENT_SOURCE_COMMIT || imageRef;
+    const { serving, detail } = await probeMcp(opts.fetchImpl ?? fetch);
+    recordDeployOutcome(
+      serving
+        ? { kind: "deployed-ok", commit, timestamp: Date.now() }
+        : { kind: "deployed-not-serving", commit, timestamp: Date.now(), detail },
+    );
   }
 
   if (!decision || !config.notifyWebhookUrl) return;
@@ -137,5 +182,21 @@ export async function postAvailableNotice(config: DeployNotifyConfig, commit: st
     });
   } catch (err) {
     console.error("[deploy-notify] availability notice failed:", err);
+  }
+}
+
+async function probeMcp(fetchImpl: typeof fetch): Promise<{ serving: boolean; detail?: string }> {
+  const appName = process.env.FLY_APP_NAME;
+  if (!appName) return { serving: false, detail: "FLY_APP_NAME not set" };
+  const url = `https://${appName}.fly.dev/mcp`;
+  try {
+    const res = await fetchImpl(url, { signal: AbortSignal.timeout(30_000) });
+    const body = res.status === 503 ? await res.text().catch(() => "") : "";
+    const probe = interpretMcpProbe(res.status, body);
+    if (probe.serving) return { serving: true };
+    if (probe.reason === "mcp-unavailable") return { serving: false, detail: probe.detail || "503" };
+    return { serving: false, detail: `status ${probe.status}` };
+  } catch (err) {
+    return { serving: false, detail: String(err) };
   }
 }

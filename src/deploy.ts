@@ -316,6 +316,8 @@ export interface StartDeployConfig {
   pollIntervalMs: number;
   githubAppId: string;
   githubAppPrivateKey: string;
+  /** Called when the build or release step fails, so the caller can record the outcome. */
+  onBuildFailure?: (commit: string, err: unknown) => void;
 }
 
 /** `StartDeployConfig` with the three optional fields proven present. */
@@ -366,7 +368,10 @@ export function makeStartDeploy(
         pollIntervalMs: config.pollIntervalMs,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-      }).catch((err) => console.error("[deploy] failed:", err));
+      }).catch((err) => {
+        console.error("[deploy] failed:", err);
+        config.onBuildFailure?.(head, err);
+      });
 
       return { started: true, commit: head };
     } catch (err) {

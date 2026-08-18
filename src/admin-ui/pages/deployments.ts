@@ -25,6 +25,17 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div class="card" id="deployments-last-outcome" hidden>
+      <div class="card-header"><h2 class="card-title">Last deploy outcome</h2></div>
+      <div class="card-body">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="badge neutral" id="kpi-deploy-outcome-badge">—</span>
+          <span id="kpi-deploy-outcome-commit"></span>
+        </div>
+        <div class="kpi-trend text-secondary" id="kpi-deploy-outcome-meta" style="margin-top:4px"></div>
+      </div>
+    </div>
+
     <div class="card" id="deployments-policy" hidden>
       <div class="card-header"><h2 class="card-title">When a deployment becomes available...</h2></div>
       <div class="card-body">
@@ -231,6 +242,29 @@ export const deploymentsScript = `
       // Identical in both phases deliberately: the pause is a property of deploying,
       // not of a phase, so varying the wording would imply it varies with the phase.
       dispatchEl.textContent = 'New dispatches are paused until the deploy completes.';
+    }
+
+    // Last deploy outcome — persists after the hold clears, survives restarts.
+    // Shown as long as one outcome is on record; independent of configured/held.
+    const outcomeCard = document.getElementById('deployments-last-outcome');
+    const outcome = data.lastDeployOutcome;
+    if (outcome) {
+      outcomeCard.hidden = false;
+      const outcomeBadge = document.getElementById('kpi-deploy-outcome-badge');
+      if (outcome.kind === 'deployed-ok') {
+        setBadge(outcomeBadge, 'success', 'Deployed OK');
+      } else if (outcome.kind === 'deployed-not-serving') {
+        setBadge(outcomeBadge, 'fail', 'Not serving');
+      } else {
+        setBadge(outcomeBadge, 'fail', 'Build failed');
+      }
+      const outcomeCommit = document.getElementById('kpi-deploy-outcome-commit');
+      outcomeCommit.innerHTML = commitLink(data.repo, outcome.commit)
+        + (outcome.detail ? ' \u2014 ' + window.esc(outcome.detail) : '');
+      document.getElementById('kpi-deploy-outcome-meta').textContent =
+        outcome.timestamp ? fmtAgo(outcome.timestamp) : '';
+    } else {
+      outcomeCard.hidden = true;
     }
 
     // Availability is the least of the three signals here, so it rides in the label as

@@ -29,6 +29,7 @@ import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, 
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
 import type { DeployStart } from "./deploy.js";
+import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
 import { isDeployHeld } from "./deploy-hold.js";
@@ -253,6 +254,7 @@ export function handleAdminRequest(
         // a notice with no webhook goes nowhere, and automatic deploying will not act on a commit it has already announced.
         notifyConfigured: Boolean(config.notifyWebhookUrl),
         lastActedCommit: getLastActedCommit(),
+        lastDeployOutcome: getDeployOutcome(),
       });
       return true;
     }

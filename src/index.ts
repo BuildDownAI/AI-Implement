@@ -13,7 +13,7 @@ import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "
 import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
-import { postAvailableNotice, postBootNotice, postShutdownNotice, recordShutdown } from "./deploy-notify.js";
+import { postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
@@ -287,7 +287,12 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       // A factory over config with no state of its own, so building one per tick is
       // free and behaves identically to the server's — the hold that actually
       // serializes deploys lives in SQLite, not in this closure.
-      const startDeploy = makeStartDeploy(config);
+      const startDeploy = makeStartDeploy({
+        ...config,
+        onBuildFailure: (commit, err) => {
+          recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
+        },
+      });
       const availability = getAvailability();
       const head = availability?.headCommit ?? null;
 
@@ -2782,7 +2787,12 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
-  const startDeploy = makeStartDeploy(config);
+  const startDeploy = makeStartDeploy({
+    ...config,
+    onBuildFailure: (commit, err) => {
+      recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
+    },
+  });
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -3207,7 +3217,8 @@ async function main(): Promise<void> {
   initMcpOAuthTables();
 
   // A process that died mid-deploy must not leave dispatch paused forever.
-  if (clearDeployHold()) {
+  const holdWasSet = clearDeployHold();
+  if (holdWasSet) {
     console.warn("[main] Cleared a hold left by the previous deployment process, resuming paused dispatches...");
   }
 
@@ -3262,7 +3273,7 @@ async function main(): Promise<void> {
   // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
   // Safe because everything postBootNotice persists happens synchronously before its first await,
   // so the stored image ref is committed by the time this returns.
-  void postBootNotice(config);
+  void postBootNotice(config, { holdWasSet });
 
   // Reconcile machines from any previous run before starting the poll loop
   await startupReconciliation(config, registry);

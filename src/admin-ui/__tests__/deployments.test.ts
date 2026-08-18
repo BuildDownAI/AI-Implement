@@ -15,6 +15,10 @@ describe("deployments page", () => {
       "kpi-deploy-status",
       "kpi-deploy-status-unit",
       "kpi-deploy-dispatch",
+      "deployments-last-outcome",
+      "kpi-deploy-outcome-badge",
+      "kpi-deploy-outcome-commit",
+      "kpi-deploy-outcome-meta",
       "deployments-cta",
       "deployments-deploy-btn",
       "deployments-not-configured",
@@ -119,6 +123,9 @@ describe("deployments page", () => {
       ["warn", "Available"],
       ["success", "Up to date"],
       ["neutral", "Unknown"],
+      ["success", "Deployed OK"],
+      ["fail", "Not serving"],
+      ["fail", "Build failed"],
     ]) {
       expect(deploymentsScript).toContain(`, '${kind}', '${label}')`);
     }
@@ -214,9 +221,10 @@ describe("deployments page", () => {
     expect(ids).toHaveLength(new Set(ids).size);
   });
 
-  it("orders the body: tiles, then the policy, then the deploy control", () => {
+  it("orders the body: tiles, then outcome, then the policy, then the deploy control", () => {
     const at = (id: string) => deploymentsHtml.indexOf(`id="${id}"`);
-    expect(at("deployments-kpis")).toBeLessThan(at("deployments-policy"));
+    expect(at("deployments-kpis")).toBeLessThan(at("deployments-last-outcome"));
+    expect(at("deployments-last-outcome")).toBeLessThan(at("deployments-policy"));
     expect(at("deployments-policy")).toBeLessThan(at("deployments-cta"));
   });
 
@@ -270,5 +278,33 @@ describe("deployments page", () => {
   it("updates the nav indicator based on availability", () => {
     expect(deploymentsScript).toContain("deploy-available");
     expect(deploymentsScript).toContain("navCount.hidden");
+  });
+
+  it("shows the outcome card when lastDeployOutcome is present", () => {
+    // The card's visibility is driven by data.lastDeployOutcome, not by held/configured,
+    // so the outcome persists after the hold clears.
+    expect(deploymentsScript).toContain("data.lastDeployOutcome");
+    expect(deploymentsScript).toContain("outcomeCard.hidden = false");
+    expect(deploymentsScript).toContain("outcomeCard.hidden = true");
+  });
+
+  it("surfaces the outcome card independently of the deploy hold", () => {
+    // The hold drives the deploy-status tile. The outcome region must not be gated on it —
+    // an outcome has to persist after the hold clears, which is the entire point.
+    const outcomeBlock = deploymentsScript.slice(
+      deploymentsScript.indexOf("deployments-last-outcome"),
+    );
+    // The block should reference outcome, not the held flag
+    expect(outcomeBlock.slice(0, outcomeBlock.indexOf("kpi-deploy-badge"))).not.toContain("held");
+  });
+
+  it("escapes the detail field in the outcome region", () => {
+    // outcome.detail comes from flyctl output and must not be placed raw into innerHTML.
+    expect(deploymentsScript).toContain("window.esc(outcome.detail)");
+  });
+
+  it("calls /api/deployment-status to retrieve lastDeployOutcome", () => {
+    // The outcome is a field on the existing endpoint — no second request needed.
+    expect(deploymentsScript).toContain("lastDeployOutcome");
   });
 });
