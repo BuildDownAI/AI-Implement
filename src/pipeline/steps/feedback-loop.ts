@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, unlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
@@ -132,47 +132,70 @@ const REVIEW_DIFF_EXCLUDES = [
 ];
 
 export function getDiff(workspaceDir: string): string {
-  // Locate the real git index so we can seed the disposable index from it.
-  const gitDirResult = spawnSync("git", ["rev-parse", "--git-dir"], {
+  // Resolve the real index via git rev-parse --git-path index, which handles
+  // worktrees correctly (each worktree has its own index, not the one in the
+  // shared .git dir).
+  const gitPathResult = spawnSync("git", ["rev-parse", "--git-path", "index"], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  if (gitDirResult.status !== 0) {
+  if (gitPathResult.status !== 0) {
     console.warn(
-      `[getDiff] git rev-parse --git-dir failed (exit ${gitDirResult.status ?? "null"})`,
+      `[getDiff] git rev-parse --git-path index failed (exit ${gitPathResult.status ?? "null"})`,
     );
     return "";
   }
 
-  const gitDir = resolve(workspaceDir, gitDirResult.stdout.toString().trim());
-  const realIndexPath = join(gitDir, "index");
-  // Unique temp path per call; unlinking in finally guarantees no leftover.
-  const tmpIndexPath = join(
-    tmpdir(),
-    `git-review-index-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-  );
+  const rawIndexPath = gitPathResult.stdout.toString().trim();
+  if (!rawIndexPath) {
+    console.warn("[getDiff] git rev-parse --git-path index returned an empty path");
+    return "";
+  }
+  const realIndexPath = resolve(workspaceDir, rawIndexPath);
+
+  // mkdtempSync guarantees exclusive creation — no collision with existing paths
+  // or symlink-following attacks. The disposable index lives inside this dir.
+  const tmpDir = mkdtempSync(join(tmpdir(), "ai-implement-review-index-"));
+  const tmpIndexPath = join(tmpDir, "index");
 
   try {
-    // Seed the disposable index from the real one so existing staged changes
-    // remain visible in the diff. Skip the copy only when the real index file
-    // does not exist (fresh repo, nothing staged), in which case git initialises
-    // the disposable index automatically on first write.
-    if (existsSync(realIndexPath)) {
-      copyFileSync(realIndexPath, tmpIndexPath);
-    }
-
     const env = { ...process.env, GIT_INDEX_FILE: tmpIndexPath };
 
+    if (existsSync(realIndexPath)) {
+      // Seed the disposable index from the real one so existing staged changes
+      // remain visible in the diff. The real index is only read here — never written.
+      copyFileSync(realIndexPath, tmpIndexPath);
+    } else {
+      // No real index (nothing staged yet): initialize the disposable index
+      // from HEAD so that git diff HEAD sees the full working-tree delta.
+      const readTreeResult = spawnSync("git", ["read-tree", "HEAD"], {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+      });
+      if (readTreeResult.status !== 0) {
+        console.warn(
+          `[getDiff] git read-tree HEAD failed (exit ${readTreeResult.status ?? "null"}): ${readTreeResult.stderr?.toString().trim() ?? ""}`,
+        );
+        return "";
+      }
+    }
+
     // Apply intent-to-add to the disposable index only — the real index is
-    // never mutated. This makes the operation interruption-safe: no cleanup
-    // step is needed, and pre-existing intent-to-add entries in the real index
-    // are byte-for-byte unchanged after this function returns.
-    spawnSync("git", ["add", "-N", "."], {
+    // never mutated. Pre-existing entries in the real index are byte-for-byte
+    // unchanged after this function returns.
+    const addResult = spawnSync("git", ["add", "-N", "."], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
       env,
     });
+    if (addResult.status !== 0) {
+      console.warn(
+        `[getDiff] git add -N failed (exit ${addResult.status ?? "null"}): ${addResult.stderr?.toString().trim() ?? ""}`,
+      );
+      return "";
+    }
 
     const result = spawnSync(
       "git",
@@ -193,9 +216,9 @@ export function getDiff(workspaceDir: string): string {
     return result.stdout.toString();
   } finally {
     try {
-      unlinkSync(tmpIndexPath);
+      rmSync(tmpDir, { recursive: true, force: true });
     } catch {
-      // File may not exist if setup failed before it was created.
+      // Ignore cleanup failures
     }
   }
 }
