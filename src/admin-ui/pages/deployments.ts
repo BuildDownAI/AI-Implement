@@ -25,6 +25,27 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div class="card" id="deployments-policy" hidden>
+      <div class="card-header"><h2 class="card-title">When a deployment becomes available...</h2></div>
+      <div class="card-body">
+        <label class="checkbox-row" id="deployments-auto-row">
+          <input type="checkbox" id="deployments-auto" onchange="window.refreshPolicyDirty()">
+          <span>Deploy it automatically</span>
+        </label>
+        <div class="kpi-trend text-secondary" id="deployments-auto-hint" style="margin-left: 24px"></div>
+
+        <label class="checkbox-row" id="deployments-notify-row">
+          <input type="checkbox" id="deployments-notify" onchange="window.refreshPolicyDirty()">
+          <span>Announce it to the notification webhook</span>
+        </label>
+        <div class="kpi-trend text-secondary" id="deployments-notify-hint" style="margin-left: 24px"></div>
+
+        <div style="margin-top: 12px">
+          <button class="btn btn-primary btn-sm" id="deployments-policy-save" onclick="window.saveDeployPolicy()" disabled>Save</button>
+        </div>
+      </div>
+    </div>
+
     <div id="deployments-cta" hidden style="text-align: center">
       <div style="display: inline-flex; flex-direction: column; align-items: center; gap: 8px">
         <button class="btn btn-accent btn-lg" id="deployments-deploy-btn" onclick="window.triggerDeploy()">Deploy now</button>
@@ -90,6 +111,46 @@ export const deploymentsScript = `
     document.getElementById('deployments-error').hidden = true;
   }
 
+  function autoHint(data, available, held) {
+    if (!data.autoDeploy) {
+      return 'Off — an available deployment is announced instead, and you decide when to release it.';
+    }
+    // A deploy in flight already has its own tile saying what is happening. Repeating
+    // "applies from the next push" beside it reads as a contradiction, because the
+    // commit being deployed is the one the per-commit guard has just consumed.
+    if (held) return 'On — the deploy in progress above is the current one.';
+    // One attempt per commit, so switching this on does not reach back for a commit
+    // already announced. Name it, and name the way out.
+    if (available === true && data.headCommit && data.headCommit === data.lastActedCommit) {
+      return short(data.headCommit) + ' is available now but was already announced, so this applies from the next push. Use Deploy now to release it immediately.';
+    }
+    return 'A push to ' + (data.branch || 'the watched branch') + ' pauses dispatch and releases without asking.';
+  }
+
+  function notifyHint(data) {
+    if (!data.notifyConfigured) return 'Unavailable — set NOTIFY_WEBHOOK_URL on the orchestrator to announce available deployments here.';
+    if (data.autoDeploy) return 'No effect while automatic deploying is on — the restart notice already announces the pause.';
+    return 'Sent once per commit, to the same webhook as run notifications.';
+  }
+
+  // What the server last told us. Kept so an edit can be detected, and so the 30s poll
+  // does not silently revert a checkbox someone has ticked but not yet saved.
+  let savedPolicy = null;
+
+  function policyDirty() {
+    if (!savedPolicy) return false;
+    // A disabled announcement switch is not part of the form: it is forced unchecked
+    // while no webhook exists, which would otherwise read as permanently dirty against
+    // a stored true and leave Save lit forever.
+    const notifyEl = document.getElementById('deployments-notify');
+    const notifyChanged = !notifyEl.disabled && notifyEl.checked !== savedPolicy.notifyAvailable;
+    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged;
+  }
+
+  function refreshPolicyDirty() {
+    document.getElementById('deployments-policy-save').disabled = !policyDirty();
+  }
+
   async function loadDeployments() {
     clearMessage();
 
@@ -119,6 +180,36 @@ export const deploymentsScript = `
     document.getElementById('deployments-kpis').hidden = !configured;
 
     document.getElementById('deployments-cta').hidden = !configured || held || available !== true;
+
+    // The policy card follows the tiles: meaningless on an orchestrator that cannot
+    // deploy itself, where the banner below is the whole story.
+    document.getElementById('deployments-policy').hidden = !configured;
+
+    const autoEl = document.getElementById('deployments-auto');
+    const notifyEl = document.getElementById('deployments-notify');
+
+    // Computed against the *previous* server state, before it is replaced below — the
+    // poll must not overwrite a checkbox that is ticked and not yet saved.
+    if (!policyDirty()) {
+      autoEl.checked = !!data.autoDeploy;
+      notifyEl.checked = !!data.notifyAvailable;
+    }
+    savedPolicy = { autoDeploy: !!data.autoDeploy, notifyAvailable: !!data.notifyAvailable };
+    refreshPolicyDirty();
+
+    // Nothing can be announced without somewhere to announce to, so the control says so
+    // by being unavailable rather than by being a switch that quietly does nothing.
+    // Unchecked as well as disabled: the stored value may be true, but nothing is being
+    // announced, and a ticked-but-greyed box claims otherwise. The stored value is never
+    // written from here, so it returns intact once a webhook exists.
+    notifyEl.disabled = !data.notifyConfigured;
+    if (!data.notifyConfigured) notifyEl.checked = false;
+    const notifyRow = document.getElementById('deployments-notify-row');
+    notifyRow.style.opacity = data.notifyConfigured ? '' : '0.5';
+    notifyRow.style.cursor = data.notifyConfigured ? '' : 'not-allowed';
+
+    document.getElementById('deployments-auto-hint').textContent = autoHint(data, available, held);
+    document.getElementById('deployments-notify-hint').textContent = notifyHint(data);
 
     // Deploy status is only meaningful once a deploy is under way, so the whole tile appears with the hold 
     const statusKpi = document.getElementById('deployments-status-kpi');
@@ -207,8 +298,32 @@ export const deploymentsScript = `
     }
   }
 
+  async function saveDeployPolicy() {
+    clearMessage();
+    // Sends only the two flags, and re-renders from the response rather than the
+    // checkbox state — the server's view is what decides whether the other flag is
+    // still meaningful, and an optimistic update would show a hint that is not true yet.
+    // Omits the announcement flag while it is unavailable, so saving cannot overwrite a
+    // stored preference with the forced-unchecked display. The endpoint takes a patch
+    // precisely so one control can stay out of a write.
+    const notifyEl = document.getElementById('deployments-notify');
+    const patch = { autoDeploy: document.getElementById('deployments-auto').checked };
+    if (!notifyEl.disabled) patch.notifyAvailable = notifyEl.checked;
+    try {
+      const res = await window.api('/api/deploy-policy', { method: 'POST', body: JSON.stringify(patch) });
+      if (!res.ok && res.status !== 401) {
+        showMessage('error', 'Could not save the deployment policy — the toggles may not reflect what is stored.');
+      }
+    } catch (err) {
+      showMessage('error', 'Could not save the deployment policy — ' + String(err));
+    }
+    loadDeployments();
+  }
+
   window.loadDeployments = loadDeployments;
   window.triggerDeploy = triggerDeploy;
+  window.saveDeployPolicy = saveDeployPolicy;
+  window.refreshPolicyDirty = refreshPolicyDirty;
   window.registerPage('deployments', function () { loadDeployments(); setInterval(loadDeployments, 30000); });
 })();
 `;

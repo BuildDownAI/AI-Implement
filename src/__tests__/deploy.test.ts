@@ -201,3 +201,37 @@ describe("resolveFlyctl", () => {
     );
   });
 });
+
+describe("canSelfDeploy", () => {
+  const configured = {
+    flyDeployToken: "fly-token",
+    flyOrchestratorApp: "orchestrator",
+    selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
+    pollIntervalMs: 60_000,
+    githubAppId: "1",
+    githubAppPrivateKey: "key",
+  };
+
+  it("is true when a token, an app and build stamps are all present", () => {
+    expect(deploy.canSelfDeploy(configured)).toBe(true);
+  });
+
+  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget"] as const)(
+    "is false without %s",
+    (field) => {
+      // The predicate is the single definition of "can this orchestrator deploy itself",
+      // asserted directly here rather than only through makeStartDeploy's return. A type
+      // predicate's body is not verified by the compiler, so this table is what holds it
+      // honest — a fourth requirement belongs in it.
+      expect(deploy.canSelfDeploy({ ...configured, [field]: null })).toBe(false);
+    },
+  );
+
+  it("agrees with whether makeStartDeploy produces a starter", () => {
+    // They must never disagree: the route answers 501 on the starter's absence while
+    // the poll passenger gates on the predicate.
+    expect(deploy.canSelfDeploy(configured)).toBe(deploy.makeStartDeploy(configured) !== undefined);
+    const unconfigured = { ...configured, flyDeployToken: null };
+    expect(deploy.canSelfDeploy(unconfigured)).toBe(deploy.makeStartDeploy(unconfigured) !== undefined);
+  });
+});

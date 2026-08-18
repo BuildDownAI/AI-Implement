@@ -2246,4 +2246,78 @@ describe("GET /api/deployment-status", () => {
     expect(res.body.held).toBe(true);
     expect(res.body.inFlight).toEqual([{ kind: "workflow-sync", count: 1 }]);
   });
+
+  it("reports whether a notification webhook exists, so the toggle can explain itself", async () => {
+    // Without this the page cannot tell an enabled announcement from an inert one, and
+    // would show "no webhook configured" forever regardless of the truth.
+    const token = await login("secret");
+    const withHook = { ...adminConfig("secret"), notifyWebhookUrl: "https://hook.example.com" };
+
+    const req = new MockRequest("/api/deployment-status", "GET", { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, withHook, makeFakeRegistry(provider), {});
+    await res.done;
+    expect(JSON.parse(res.body).notifyConfigured).toBe(true);
+
+    expect((await statusRequest(token)).body.notifyConfigured).toBe(false);
+  });
+
+  it("reports the last acted commit, so the page knows what automatic deploying already handled", async () => {
+    const { setLastActedCommit } = await import("../deploy-policy.js");
+    const token = await login("secret");
+
+    expect((await statusRequest(token)).body.lastActedCommit).toBeNull();
+    setLastActedCommit("def5678");
+    expect((await statusRequest(token)).body.lastActedCommit).toBe("def5678");
+  });
+});
+
+describe("POST /api/deploy-policy", () => {
+  async function policyRequest(token: string, body: unknown): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    const req = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${token}` }, JSON.stringify(body));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
+  }
+
+  it("rejects an unauthenticated request", async () => {
+    const res = await policyRequest("not-a-session", { autoDeploy: true });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("rejects a non-boolean rather than coercing it", async () => {
+    // "false" is a truthy string. Coercing would enable unattended deploying because
+    // a caller sent the wrong type, which is not a small bug.
+    const token = await login("secret");
+    const res = await policyRequest(token, { autoDeploy: "false" });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns the full policy so the page renders the server's view", async () => {
+    // The two flags interact — autoDeploy being on makes notifyAvailable inert — so an
+    // optimistic client-side update can disagree with what the server actually stored.
+    const token = await login("secret");
+    const res = await policyRequest(token, { autoDeploy: true });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ autoDeploy: true, notifyAvailable: true });
+  });
+
+  it("leaves the unnamed flag untouched", async () => {
+    const token = await login("secret");
+    await policyRequest(token, { notifyAvailable: false });
+    const res = await policyRequest(token, { autoDeploy: true });
+    expect(res.body).toEqual({ autoDeploy: true, notifyAvailable: false });
+  });
+
+  it("surfaces the policy on the deployment-status read the page already makes", async () => {
+    const token = await login("secret");
+    await policyRequest(token, { autoDeploy: true });
+
+    const req = new MockRequest("/api/deployment-status", "GET", { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await res.done;
+    expect(JSON.parse(res.body)).toMatchObject({ autoDeploy: true, notifyAvailable: true });
+  });
 });
