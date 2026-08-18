@@ -695,6 +695,10 @@ export interface RunLocalAutonomousResult {
     implementOutcome: string;
     costUsd: number | null;
     reviewApproved: boolean | null;
+    tokensIn?: number | null;
+    tokensOut?: number | null;
+    cacheReadTokens?: number | null;
+    cacheCreationTokens?: number | null;
   }>;
   finalFeedback: string;
   effectiveMaxTurns: number;
@@ -706,14 +710,19 @@ function buildTokenSummary(
   passes: RunLocalAutonomousResult["passes"],
 ): LocalRunTokenSummary | null {
   if (passes.length === 0) return null;
-  const totalCost = passes.reduce((sum, p) => sum + (p.costUsd ?? 0), 0);
-  return {
-    costUsd: totalCost > 0 ? totalCost : null,
-    tokensIn: null,
-    tokensOut: null,
-    cacheReadTokens: null,
-    cacheCreationTokens: null,
-  };
+  let costUsd: number | null = null;
+  let tokensIn: number | null = null;
+  let tokensOut: number | null = null;
+  let cacheReadTokens: number | null = null;
+  let cacheCreationTokens: number | null = null;
+  for (const p of passes) {
+    if (typeof p.costUsd === "number") costUsd = (costUsd ?? 0) + p.costUsd;
+    if (typeof p.tokensIn === "number") tokensIn = (tokensIn ?? 0) + p.tokensIn;
+    if (typeof p.tokensOut === "number") tokensOut = (tokensOut ?? 0) + p.tokensOut;
+    if (typeof p.cacheReadTokens === "number") cacheReadTokens = (cacheReadTokens ?? 0) + p.cacheReadTokens;
+    if (typeof p.cacheCreationTokens === "number") cacheCreationTokens = (cacheCreationTokens ?? 0) + p.cacheCreationTokens;
+  }
+  return { costUsd, tokensIn, tokensOut, cacheReadTokens, cacheCreationTokens };
 }
 
 export async function runAutonomousLocally(

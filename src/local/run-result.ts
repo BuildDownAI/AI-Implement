@@ -14,6 +14,10 @@ export interface LocalRunPass {
   implementOutcome: string;
   costUsd: number | null;
   reviewApproved: boolean | null;
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
 }
 
 /**

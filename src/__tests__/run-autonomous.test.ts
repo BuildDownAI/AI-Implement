@@ -1882,7 +1882,7 @@ describe("runAutonomousLocally", () => {
     expect(result.effectiveMaxIterations).toBe(3);
   });
 
-  it("returns tokenSummary with summed costUsd from passes, other fields null", async () => {
+  it("returns tokenSummary with summed costUsd from passes; token fields null when passes lack them", async () => {
     const passes = [
       { iteration: 1, implementTurns: 5, implementOutcome: "ok", costUsd: 0.05, reviewApproved: true },
     ];
@@ -1929,6 +1929,103 @@ describe("runAutonomousLocally", () => {
 
     expect(result.exitCode).toBe(1);
     expect(result.tokenSummary).toBeNull();
+  });
+
+  it("aggregates token counters across passes and preserves numeric zero", async () => {
+    const passes = [
+      { iteration: 1, implementTurns: 5, implementOutcome: "ok", costUsd: 0.05, reviewApproved: false,
+        tokensIn: 100, tokensOut: 50, cacheReadTokens: 20, cacheCreationTokens: 10 },
+      { iteration: 2, implementTurns: 5, implementOutcome: "ok", costUsd: 0,    reviewApproved: true,
+        tokensIn: 200, tokensOut: 75, cacheReadTokens: 0,  cacheCreationTokens: 5 },
+    ];
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 2,
+        terminationReason: "approved",
+        passes,
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.tokenSummary).not.toBeNull();
+    expect(result.tokenSummary!.costUsd).toBeCloseTo(0.05);
+    expect(result.tokenSummary!.tokensIn).toBe(300);
+    expect(result.tokenSummary!.tokensOut).toBe(125);
+    expect(result.tokenSummary!.cacheReadTokens).toBe(20);
+    expect(result.tokenSummary!.cacheCreationTokens).toBe(15);
+  });
+
+  it("preserves zero cost and token counts as numeric zero, not null", async () => {
+    const passes = [
+      { iteration: 1, implementTurns: 5, implementOutcome: "ok", costUsd: 0, reviewApproved: true,
+        tokensIn: 0, tokensOut: 0, cacheReadTokens: 0, cacheCreationTokens: 0 },
+    ];
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes,
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.tokenSummary).not.toBeNull();
+    expect(result.tokenSummary!.costUsd).toBe(0);
+    expect(result.tokenSummary!.tokensIn).toBe(0);
+    expect(result.tokenSummary!.tokensOut).toBe(0);
+    expect(result.tokenSummary!.cacheReadTokens).toBe(0);
+    expect(result.tokenSummary!.cacheCreationTokens).toBe(0);
+  });
+
+  it("returns null for token metrics absent from every pass", async () => {
+    const passes = [
+      { iteration: 1, implementTurns: 5, implementOutcome: "ok", costUsd: 0.05, reviewApproved: true,
+        tokensIn: 100, tokensOut: 50 },
+    ];
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockResolvedValue({
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes,
+        finalFeedback: "",
+      }),
+    });
+
+    const result = await runAutonomousLocally({
+      workspaceDir,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      pipeline,
+      runner,
+    });
+
+    expect(result.tokenSummary).not.toBeNull();
+    expect(result.tokenSummary!.tokensIn).toBe(100);
+    expect(result.tokenSummary!.tokensOut).toBe(50);
+    expect(result.tokenSummary!.cacheReadTokens).toBeNull();
+    expect(result.tokenSummary!.cacheCreationTokens).toBeNull();
   });
 
   it.skipIf(isWindows)("setup failure returns exitCode 1 with terminationReason setup_failed", async () => {
