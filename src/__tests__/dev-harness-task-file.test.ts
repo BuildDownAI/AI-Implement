@@ -141,9 +141,15 @@ describe("parseTaskFile — compatibility adapter (new field names)", () => {
     expect(result.maxTurns).toBe(99);
   });
 
-  it("accepts 'profiles' field (new schema) without error", () => {
+  it("returns profiles from the task file", () => {
     const content = `---\ntitle: T\nprofiles:\n  - backend\n  - webapp\n---\n\nBody.`;
-    expect(() => parseTaskFile(content)).not.toThrow();
+    const result = parseTaskFile(content);
+    expect(result.profiles).toEqual(["backend", "webapp"]);
+  });
+
+  it("leaves profiles undefined when not specified", () => {
+    const result = parseTaskFile(`---\ntitle: T\n---\n\nBody.`);
+    expect(result.profiles).toBeUndefined();
   });
 
   it("rejects unknown fields not in the legacy or new schema", () => {

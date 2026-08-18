@@ -112,12 +112,16 @@ export function parseTaskDocument(content: string, issueId?: string): RunConfigV
     );
   }
 
+  let trimmedProfiles: string[] | undefined;
+
   if (fm.profiles !== undefined) {
     if (!Array.isArray(fm.profiles) || fm.profiles.length === 0) {
       throw new Error(
         "Field 'profiles' must be a non-empty list of strings.\nExample:\n  profiles:\n    - backend",
       );
     }
+    const seen = new Set<string>();
+    trimmedProfiles = [];
     for (const p of fm.profiles) {
       if (typeof p !== "string" || !(p as string).trim()) {
         throw new Error(
@@ -125,16 +129,15 @@ export function parseTaskDocument(content: string, issueId?: string): RunConfigV
             "Example:\n  profiles:\n    - backend\n    - webapp",
         );
       }
-    }
-    const seen = new Set<string>();
-    for (const p of fm.profiles as string[]) {
-      if (seen.has(p)) {
+      const trimmed = (p as string).trim();
+      if (seen.has(trimmed)) {
         throw new Error(
-          `Field 'profiles' contains duplicate value '${p}'. Values must be unique.\n` +
+          `Field 'profiles' contains duplicate value '${trimmed}'. Values must be unique.\n` +
             "Example:\n  profiles:\n    - backend\n    - webapp",
         );
       }
-      seen.add(p);
+      seen.add(trimmed);
+      trimmedProfiles.push(trimmed);
     }
   }
 
@@ -181,7 +184,7 @@ export function parseTaskDocument(content: string, issueId?: string): RunConfigV
       description: body.trim(),
       identifier: typeof fm.id === "string" ? fm.id.trim() : undefined,
       baseBranch: typeof fm.base === "string" ? fm.base.trim() : undefined,
-      profiles: fm.profiles as string[] | undefined,
+      profiles: trimmedProfiles,
       maxTurns,
       maxIterations,
     },

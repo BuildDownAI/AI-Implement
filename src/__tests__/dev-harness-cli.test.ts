@@ -17,6 +17,7 @@ function makeHandle(): DevRunHandle {
       maxIterations: undefined,
       repo: undefined,
       branch: undefined,
+      profiles: undefined,
     },
     workspace: "/tmp/workspace",
   };

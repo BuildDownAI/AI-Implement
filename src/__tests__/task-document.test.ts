@@ -226,6 +226,18 @@ describe("parseTaskDocument", () => {
     expect(() => parseTaskDocument(content)).toThrow("backend");
   });
 
+  it("rejects whitespace-normalized duplicate profile values", () => {
+    const content = `---\ntitle: T\nprofiles:\n  - backend\n  - "  backend  "\n---\n\nBody.`;
+    expect(() => parseTaskDocument(content)).toThrow("duplicate");
+    expect(() => parseTaskDocument(content)).toThrow("backend");
+  });
+
+  it("trims whitespace from profile values before output", () => {
+    const content = `---\ntitle: T\nprofiles:\n  - "  backend  "\n  - webapp\n---\n\nBody.`;
+    const result = parseTaskDocument(content);
+    expect(result.profiles).toEqual(["backend", "webapp"]);
+  });
+
   it("rejects non-object limits", () => {
     const content = `---\ntitle: T\nlimits: 50\n---\n\nBody.`;
     expect(() => parseTaskDocument(content)).toThrow(/'limits'/);
