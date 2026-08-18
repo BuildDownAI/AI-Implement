@@ -1,6 +1,6 @@
 import { execFile as nodeExecFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -46,10 +46,12 @@ export async function launchLocalSession(
   opts: LocalSessionLaunchOptions,
 ): Promise<LocalSessionHandle> {
   const envFilePath = await writeSessionSecretEnvFile(opts.secretEnv);
+  const cidFilePath = join(tmpdir(), "ai-implement-local-session", `${randomUUID()}.cid`);
 
   const args = [
     "run", "-d",
     "--name", opts.containerName,
+    "--cidfile", cidFilePath,
     "--add-host", "host.docker.internal:host-gateway",
   ];
 
@@ -71,13 +73,18 @@ export async function launchLocalSession(
     const { stdout } = await execFile("docker", args);
     containerId = stdout.trim();
   } catch (err) {
-    await execFile("docker", ["rm", "-f", opts.containerName]).catch(() => undefined);
+    const cidFileContent = await readFile(cidFilePath, "utf8").catch(() => null);
+    const cidFileId = cidFileContent?.trim() || null;
+    if (cidFileId) {
+      await execFile("docker", ["rm", "-f", cidFileId]).catch(() => undefined);
+    }
     const msg =
       (err as { stderr?: string }).stderr?.trim() ||
       (err instanceof Error ? err.message : String(err));
     throw new Error(`Failed to launch local session container: ${msg}`);
   } finally {
     await unlink(envFilePath).catch(() => undefined);
+    await unlink(cidFilePath).catch(() => undefined);
   }
 
   return { containerId, containerName: opts.containerName, startedAt };

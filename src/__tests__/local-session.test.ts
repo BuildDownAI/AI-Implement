@@ -11,6 +11,7 @@ vi.mock("node:fs/promises", () => ({
   writeFile: vi.fn().mockResolvedValue(undefined),
   chmod: vi.fn().mockResolvedValue(undefined),
   unlink: vi.fn().mockResolvedValue(undefined),
+  readFile: vi.fn().mockRejectedValue(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
 }));
 
 vi.mock("../local-docker.js", () => ({
@@ -21,7 +22,7 @@ vi.mock("../local-docker.js", () => ({
 }));
 
 import { execFile as rawExecFile, spawn } from "node:child_process";
-import { unlink } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { inspectLocalContainer } from "../local-docker.js";
 import {
   awaitSessionResult,
@@ -77,6 +78,9 @@ describe("launchLocalSession", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     makeExecFileMock();
+    vi.mocked(readFile).mockImplementation(() =>
+      Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" })),
+    );
   });
 
   it("returns a handle with the container id from docker output", async () => {
@@ -151,12 +155,12 @@ describe("launchLocalSession", () => {
     expect(capturedArgs).toContain("--env-file");
   });
 
-  it("removes the secret env file after a successful launch", async () => {
+  it("removes the secret env file and cidfile after a successful launch", async () => {
     await launchLocalSession(BASE_OPTS);
-    expect(vi.mocked(unlink)).toHaveBeenCalledOnce();
+    expect(vi.mocked(unlink)).toHaveBeenCalledTimes(2);
   });
 
-  it("removes the secret env file even when docker launch fails", async () => {
+  it("removes the secret env file and cidfile even when docker launch fails", async () => {
     vi.mocked(rawExecFile).mockImplementation(
       (_cmd: unknown, _args: unknown, cb: unknown) => {
         (cb as (err: Error) => void)(Object.assign(new Error("image not found"), { stderr: "image not found" }));
@@ -165,15 +169,16 @@ describe("launchLocalSession", () => {
     );
 
     await expect(launchLocalSession(BASE_OPTS)).rejects.toThrow("Failed to launch local session container");
-    expect(vi.mocked(unlink)).toHaveBeenCalledOnce();
+    expect(vi.mocked(unlink)).toHaveBeenCalledTimes(2);
   });
 
-  it("best-effort removes the container by name when launch fails", async () => {
+  it("removes the exact container ID from cidfile when launch fails and cidfile exists", async () => {
     const capturedCalls: string[][] = [];
+    vi.mocked(readFile).mockImplementation(() => Promise.resolve("cidfile-abc123\n"));
     vi.mocked(rawExecFile)
       .mockImplementationOnce((_cmd: unknown, args: unknown, cb: unknown) => {
         capturedCalls.push([...(args as string[])]);
-        (cb as (err: Error) => void)(Object.assign(new Error("image not found"), { stderr: "image not found" }));
+        (cb as (err: Error) => void)(Object.assign(new Error("container start failed"), { stderr: "container start failed" }));
         return {} as ReturnType<typeof rawExecFile>;
       })
       .mockImplementationOnce((_cmd: unknown, args: unknown, cb: unknown) => {
@@ -184,10 +189,26 @@ describe("launchLocalSession", () => {
 
     await expect(launchLocalSession(BASE_OPTS)).rejects.toThrow();
 
-    expect(capturedCalls.some((a) => a[0] === "rm" && a[1] === "-f" && a[2] === BASE_OPTS.containerName)).toBe(true);
+    expect(capturedCalls.some((a) => a[0] === "rm" && a[1] === "-f" && a[2] === "cidfile-abc123")).toBe(true);
+    expect(capturedCalls.every((a) => !(a[0] === "rm" && a[2] === BASE_OPTS.containerName))).toBe(true);
+  });
+
+  it("does not run docker rm when launch fails and no cidfile was produced", async () => {
+    const capturedCalls: string[][] = [];
+    // readFile throws by default (ENOENT) — no cidfile written by Docker
+    vi.mocked(rawExecFile).mockImplementation((_cmd: unknown, args: unknown, cb: unknown) => {
+      capturedCalls.push([...(args as string[])]);
+      (cb as (err: Error) => void)(Object.assign(new Error("Conflict: name already in use"), { stderr: "Conflict: name already in use" }));
+      return {} as ReturnType<typeof rawExecFile>;
+    });
+
+    await expect(launchLocalSession(BASE_OPTS)).rejects.toThrow();
+
+    expect(capturedCalls.every((a) => a[0] !== "rm")).toBe(true);
   });
 
   it("preserves the original launch error even when container cleanup also fails", async () => {
+    vi.mocked(readFile).mockImplementation(() => Promise.resolve("cidfile-cleanup-id\n"));
     vi.mocked(rawExecFile).mockImplementation(
       (_cmd: unknown, args: unknown, cb: unknown) => {
         const argsArr = args as string[];
