@@ -12,6 +12,7 @@ export interface ParsedTaskFile {
   repo: string | undefined;
   /** Base branch; undefined = auto-detect from current HEAD. */
   branch: string | undefined;
+  profiles: string[] | undefined;
 }
 
 const FRONT_MATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
@@ -116,6 +117,7 @@ export function parseTaskFile(content: string, defaultIdentifier?: string): Pars
     maxIterations: runConfig.maxIterations,
     repo,
     branch: runConfig.baseBranch,
+    profiles: runConfig.profiles,
   };
 }
 

@@ -34,6 +34,7 @@ vi.mock("../local/session.js", () => ({
 import { spawnSync } from "node:child_process";
 import { launchLocalSession } from "../local/session.js";
 import { startDevRun } from "../dev-harness/index.js";
+import { parseTaskFileFromPath } from "../dev-harness/task-file.js";
 
 const TASK_CONTENT = `---\nidentifier: DEV-1\ntitle: Add feature\nmaxTurns: 15\n---\n\nImplement the feature.`;
 
@@ -160,6 +161,43 @@ describe("startDevRun", () => {
     expect(cfg.issue.title).toBe("Add feature");
     expect(cfg.maxTurns).toBe(15);
     expect(cfg.runnerPhase).toBe("implementation");
+  });
+
+  it("includes profiles in the run config when the task file has profiles", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    makeSpawnSyncMock("");
+
+    vi.mocked(parseTaskFileFromPath).mockReturnValueOnce({
+      identifier: "DEV-2",
+      title: "Profile Task",
+      description: "Implement.",
+      maxTurns: undefined,
+      maxIterations: undefined,
+      repo: undefined,
+      branch: undefined,
+      profiles: ["backend", "webapp"],
+    });
+
+    await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
+
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    const encoded = opts.publicEnv["AI_IMPLEMENT_RUN_CONFIG"];
+    const cfg = decodeRunConfig(encoded!);
+    expect(cfg.profiles).toEqual(["backend", "webapp"]);
+  });
+
+  it("omits profiles from the run config when the task file has none", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    makeSpawnSyncMock("");
+
+    await startDevRun({ workspace: "/tmp/repo", task: "task.md" });
+
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    const encoded = opts.publicEnv["AI_IMPLEMENT_RUN_CONFIG"];
+    const cfg = decodeRunConfig(encoded!);
+    expect(cfg.profiles).toBeUndefined();
   });
 
   it("ANTHROPIC_API_KEY is in the secret (secretEnv) bucket, not publicEnv", async () => {

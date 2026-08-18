@@ -152,6 +152,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     baseBranch: branch,
     ...(task.maxTurns !== undefined ? { maxTurns: task.maxTurns } : {}),
     ...(task.maxIterations !== undefined ? { maxIterations: task.maxIterations } : {}),
+    ...(task.profiles !== undefined ? { profiles: task.profiles } : {}),
   });
 
   const allEnv: Record<string, string> = {
