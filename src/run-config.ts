@@ -55,6 +55,39 @@ export function decodeRunConfig(encoded: string): RunConfigV1 {
   return pickKnownKeys(cfg as RunConfigV1);
 }
 
+/** Parameters accepted by a portable task document (subset of RunConfigV1). */
+export interface TaskDocumentParams {
+  title: string;
+  description: string;
+  identifier?: string;
+  baseBranch?: string;
+  profiles?: string[];
+  maxTurns?: number;
+  maxIterations?: number;
+}
+
+/**
+ * Build a minimal local RunConfigV1 from a parsed task document.
+ * The caller is responsible for supplying a stable `issueId` (UUID).
+ * When `params.identifier` is absent, a timestamp-based fallback is used.
+ */
+export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: string): RunConfigV1 {
+  const config: RunConfigV1 = {
+    v: 1,
+    issue: {
+      id: issueId,
+      identifier: params.identifier ?? `DEV-${Date.now()}`,
+      title: params.title,
+      description: params.description,
+    },
+  };
+  if (params.baseBranch !== undefined) config.baseBranch = params.baseBranch;
+  if (params.profiles !== undefined) config.profiles = params.profiles;
+  if (params.maxTurns !== undefined) config.maxTurns = params.maxTurns;
+  if (params.maxIterations !== undefined) config.maxIterations = params.maxIterations;
+  return config;
+}
+
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
