@@ -503,8 +503,18 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
 
     const fbOutputs = context.getOutputs("feedback-loop");
     const pushOutputs = context.getOutputs("push");
+    const postPushReviewOutputs = context.getOutputs("post-push-review");
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
-    const approved = fbOutputs.approved === true;
+    // Mirror the post-push-review skip contract: a statically registered step is
+    // authoritative only when the internal review approved and push produced the
+    // branch/PR inputs that cause the step to run. Otherwise its outputs are empty.
+    const postPushReviewRequired = fbOutputs.approved === true
+      && pushOutputs.branchPushed === true
+      && Boolean(pushOutputs.prNumber)
+      && Boolean(prUrl)
+      && pipeline.steps.some((step) => step.id === "post-push-review");
+    const approved = fbOutputs.approved === true
+      && (!postPushReviewRequired || postPushReviewOutputs.approved === true);
 
     // Case B: grouping-parent run where the agent produced genuinely no changes. Push returned
     // a no-op (branchPushed=false, prUrl=null). Report success without a prUrl so the
@@ -558,20 +568,36 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       return { exitCode: 0 };
     }
 
-    // The pipeline completed mechanically but the review loop never approved
-    // (or push produced no PR). This is NOT a success: report a coded failure
+    // The pipeline completed mechanically but either the internal loop or the
+    // authoritative post-push review did not approve (or push produced no PR).
+    // This is NOT a success: report a coded failure
     // so the ticket is updated and notifications fire, leave a run autopsy for
     // the ticket, and flag the GHA run — but keep the job green (warning only).
-    const terminationReason =
-      typeof fbOutputs.terminationReason === "string" ? fbOutputs.terminationReason : "unknown";
-    const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : 0;
-    const finalFeedback = typeof fbOutputs.finalFeedback === "string" ? fbOutputs.finalFeedback : "";
+    const postPushReviewRejected = postPushReviewRequired && postPushReviewOutputs.approved !== true;
+    const authoritativeReviewOutputs = postPushReviewRejected
+      ? postPushReviewOutputs
+      : fbOutputs;
+    const terminationReason = typeof authoritativeReviewOutputs.terminationReason === "string"
+      ? authoritativeReviewOutputs.terminationReason
+      : postPushReviewRejected
+        ? "post_push_review_unapproved"
+        : "unknown";
+    const iterations = typeof authoritativeReviewOutputs.iterations === "number"
+      ? authoritativeReviewOutputs.iterations
+      : 0;
+    const finalFeedback = typeof authoritativeReviewOutputs.finalFeedback === "string"
+      ? authoritativeReviewOutputs.finalFeedback
+      : "";
     const failureCode = terminationReason === "max_turns" ? "MAX_TURNS_EXHAUSTED" : "REVIEW_UNAPPROVED";
     const failureReason =
       `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
       finalFeedback.slice(0, 500);
 
-    disposition = `${prUrl ? `draft PR ${prUrl}` : "no PR"} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
+    const prKind = pushOutputs.draft === true ? "draft PR" : "PR";
+    const prDisposition = prUrl
+      ? `${prKind} ${prUrl}`
+      : "no PR";
+    disposition = `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
 
     writeRunAutopsy(workspaceDir, {
       issueIdentifier,
@@ -584,7 +610,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     });
     console.warn(
       `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
-        (prUrl ? `draft PR opened: ${prUrl}` : "no PR opened"),
+        (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
     );
     await postRunnerResult({
       workspaceDir,
