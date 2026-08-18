@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,6 +85,10 @@ describe("resolveArtifactDir", () => {
 
   it("uses a custom outputRoot", () => {
     expect(resolveArtifactDir(VALID_ID, "/custom/root")).toBe(`/custom/root/${VALID_ID}`);
+  });
+
+  it("rejects an invalid run ID", () => {
+    expect(() => resolveArtifactDir("../evil", "/output/runs")).toThrow(/Invalid run ID/);
   });
 });
 
@@ -259,6 +263,38 @@ describe("writeRunArtifacts", () => {
       await expect(writeRunArtifacts(baseInput({ outputRoot: root }))).rejects.toThrow(/Symlink/);
     } finally {
       rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects when summary.json is a symlink and leaves the outside target unchanged", async () => {
+    root = mkdtempSync(join(tmpdir(), "aii-art-"));
+    const outsideFile = join(tmpdir(), `aii-outside-${Date.now()}.txt`);
+    writeFileSync(outsideFile, "original content");
+    try {
+      const dir = join(root, VALID_ID);
+      mkdirSync(dir);
+      await symlink(outsideFile, join(dir, "summary.json"));
+      await expect(writeRunArtifacts(baseInput({ outputRoot: root }))).rejects.toThrow(/Symlink/);
+      expect(readFileSync(outsideFile, "utf-8")).toBe("original content");
+    } finally {
+      rmSync(outsideFile, { force: true });
+    }
+  });
+
+  it("rejects when an optional artifact target is a symlink and leaves the outside target unchanged", async () => {
+    root = mkdtempSync(join(tmpdir(), "aii-art-"));
+    const outsideFile = join(tmpdir(), `aii-outside-${Date.now()}.txt`);
+    writeFileSync(outsideFile, "original content");
+    try {
+      const dir = join(root, VALID_ID);
+      mkdirSync(dir);
+      await symlink(outsideFile, join(dir, "run.log"));
+      await expect(
+        writeRunArtifacts(baseInput({ outputRoot: root, logs: "injected log" })),
+      ).rejects.toThrow(/Symlink/);
+      expect(readFileSync(outsideFile, "utf-8")).toBe("original content");
+    } finally {
+      rmSync(outsideFile, { force: true });
     }
   });
 });
