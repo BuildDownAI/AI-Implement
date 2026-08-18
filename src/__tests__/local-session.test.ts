@@ -27,6 +27,7 @@ import {
   awaitSessionResult,
   getSessionStatus,
   launchLocalSession,
+  stopLocalSession,
   streamSessionLogs,
   streamSessionLogsUntilShellReady,
 } from "../local/session.js";
@@ -166,6 +167,43 @@ describe("launchLocalSession", () => {
     await expect(launchLocalSession(BASE_OPTS)).rejects.toThrow("Failed to launch local session container");
     expect(vi.mocked(unlink)).toHaveBeenCalledOnce();
   });
+
+  it("best-effort removes the container by name when launch fails", async () => {
+    const capturedCalls: string[][] = [];
+    vi.mocked(rawExecFile)
+      .mockImplementationOnce((_cmd: unknown, args: unknown, cb: unknown) => {
+        capturedCalls.push([...(args as string[])]);
+        (cb as (err: Error) => void)(Object.assign(new Error("image not found"), { stderr: "image not found" }));
+        return {} as ReturnType<typeof rawExecFile>;
+      })
+      .mockImplementationOnce((_cmd: unknown, args: unknown, cb: unknown) => {
+        capturedCalls.push([...(args as string[])]);
+        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, { stdout: "", stderr: "" });
+        return {} as ReturnType<typeof rawExecFile>;
+      });
+
+    await expect(launchLocalSession(BASE_OPTS)).rejects.toThrow();
+
+    expect(capturedCalls.some((a) => a[0] === "rm" && a[1] === "-f" && a[2] === BASE_OPTS.containerName)).toBe(true);
+  });
+
+  it("preserves the original launch error even when container cleanup also fails", async () => {
+    vi.mocked(rawExecFile).mockImplementation(
+      (_cmd: unknown, args: unknown, cb: unknown) => {
+        const argsArr = args as string[];
+        if (argsArr[0] === "run") {
+          (cb as (err: Error) => void)(Object.assign(new Error("image not found"), { stderr: "image not found" }));
+        } else {
+          (cb as (err: Error) => void)(new Error("cleanup also failed"));
+        }
+        return {} as ReturnType<typeof rawExecFile>;
+      },
+    );
+
+    await expect(launchLocalSession(BASE_OPTS)).rejects.toThrow(
+      "Failed to launch local session container: image not found",
+    );
+  });
 });
 
 describe("getSessionStatus", () => {
@@ -257,5 +295,39 @@ describe("awaitSessionResult", () => {
     const handle = { containerId: "cid", containerName: "n", startedAt: new Date() };
     const { exitCode } = await awaitSessionResult(handle);
     expect(exitCode).toBe(1);
+  });
+});
+
+describe("stopLocalSession", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("removes the container using docker rm -f", async () => {
+    const capturedArgs: string[] = [];
+    vi.mocked(rawExecFile).mockImplementation(
+      (_cmd: unknown, args: unknown, cb: unknown) => {
+        capturedArgs.push(...(args as string[]));
+        (cb as (err: null, result: { stdout: string; stderr: string }) => void)(null, { stdout: "", stderr: "" });
+        return {} as ReturnType<typeof rawExecFile>;
+      },
+    );
+
+    const handle = { containerId: "cid123", containerName: "test-container", startedAt: new Date() };
+    await stopLocalSession(handle);
+
+    expect(capturedArgs).toEqual(["rm", "-f", "cid123"]);
+  });
+
+  it("swallows docker errors without rethrowing", async () => {
+    vi.mocked(rawExecFile).mockImplementation(
+      (_cmd: unknown, _args: unknown, cb: unknown) => {
+        (cb as (err: Error) => void)(new Error("no such container"));
+        return {} as ReturnType<typeof rawExecFile>;
+      },
+    );
+
+    const handle = { containerId: "cid123", containerName: "test-container", startedAt: new Date() };
+    await expect(stopLocalSession(handle)).resolves.toBeUndefined();
   });
 });

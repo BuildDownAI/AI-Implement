@@ -4,6 +4,7 @@ import {
   collectRunArtifacts,
   getRunStatus,
   startDevRun,
+  stopDevRun,
   streamLogs,
   streamLogsUntilShellReady,
 } from "./index.js";
@@ -14,6 +15,7 @@ export interface DevHarnessCliDependencies {
   streamLogsUntilShellReady: typeof streamLogsUntilShellReady;
   getRunStatus: typeof getRunStatus;
   collectRunArtifacts: typeof collectRunArtifacts;
+  stopSession: typeof stopDevRun;
   spawnDocker: (args: string[], stdio: "inherit" | "ignore") => number;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
@@ -26,6 +28,7 @@ const DEFAULT_DEPENDENCIES: DevHarnessCliDependencies = {
   streamLogsUntilShellReady,
   getRunStatus,
   collectRunArtifacts,
+  stopSession: stopDevRun,
   spawnDocker: (args, stdio) => spawnSync("docker", args, { stdio }).status ?? 1,
   writeStdout: (text) => process.stdout.write(text),
   writeStderr: (text) => process.stderr.write(text),
@@ -99,7 +102,7 @@ export async function runDevHarnessCli(
         artifactsCollected = true;
       } finally {
         deps.writeStderr("[dev:run] shell exited; removing container...\n");
-        deps.spawnDocker(["rm", "-f", handle.containerId], "ignore");
+        await deps.stopSession(handle).catch(() => undefined);
       }
     } else {
       const state = await deps.getRunStatus(handle);

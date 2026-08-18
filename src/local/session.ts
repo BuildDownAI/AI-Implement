@@ -71,6 +71,7 @@ export async function launchLocalSession(
     const { stdout } = await execFile("docker", args);
     containerId = stdout.trim();
   } catch (err) {
+    await execFile("docker", ["rm", "-f", opts.containerName]).catch(() => undefined);
     const msg =
       (err as { stderr?: string }).stderr?.trim() ||
       (err instanceof Error ? err.message : String(err));
