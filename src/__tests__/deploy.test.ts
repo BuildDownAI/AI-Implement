@@ -237,7 +237,11 @@ describe("makeStartDeploy onBuildFailure callback", () => {
     // resolveFlyctl uses global fetch; a 404 makes it reject before any subprocess.
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("nope", { status: 404 })));
 
-    const onBuildFailure = vi.fn();
+    // Resolved by the callback itself rather than waited out: runDeploy is fire-and-forget,
+    // so the test needs a signal, and a fixed sleep is a guess that gets tighter under load.
+    let signalCalled = () => {};
+    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
+    const onBuildFailure = vi.fn(() => signalCalled());
     const start = localDeploy.makeStartDeploy({
       flyDeployToken: "fly-token",
       flyOrchestratorApp: "orchestrator",
@@ -251,8 +255,7 @@ describe("makeStartDeploy onBuildFailure callback", () => {
     const result = await start();
     expect(result).toMatchObject({ started: true, commit: "def5678" });
 
-    // runDeploy is fire-and-forget; wait for the .catch to execute
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await called;
 
     expect(onBuildFailure).toHaveBeenCalledWith("def5678", expect.any(Error));
   });

@@ -257,6 +257,8 @@ export const deploymentsScript = `
       } else {
         setBadge(statusBadge, 'running', 'Building');
         statusEl.textContent = 'Building and releasing the new image';
+        // Blank without a clock, unlike Draining above: the value here is a whole sentence,
+        // so filler beside it would add nothing. Only a pre-clock hold reaches that.
         statusUnit.textContent = elapsed;
       }
       // Identical in both phases deliberately: the pause is a property of deploying,
