@@ -1,4 +1,4 @@
-import { getInstallationToken } from "./github-app-auth.js";
+import { getScopedInstallationToken } from "./github-app-auth.js";
 import { getBranchSha } from "./github.js";
 
 declare global {
@@ -78,7 +78,12 @@ export function getAvailability(): DeploymentAvailability | null {
 
 export async function refreshAvailability(input: AvailabilityInput): Promise<DeploymentAvailability> {
   const { appId, privateKey, owner, repo, branch, runningCommit } = input;
-  const token = await getInstallationToken(appId, privateKey, owner);
+  // Scoped to the single repository whose branch this reads. The options match the deploy
+  // path's mint exactly, so the two share one cache entry rather than minting separately.
+  const { token } = await getScopedInstallationToken(appId, privateKey, owner, {
+    permissions: { contents: "read" },
+    repositories: [repo],
+  });
   // null on 404 — a deleted or renamed branch reads as unknown, not as up to date.
   const headCommit = await getBranchSha(token, owner, repo, branch);
 

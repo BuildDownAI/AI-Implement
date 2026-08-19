@@ -35,7 +35,7 @@ export const deploymentsHtml = `
     <div class="card" id="deployments-policy" hidden>
       <div class="card-header"><h2 class="card-title">When a deployment becomes available...</h2></div>
       <div class="card-body">
-        <label class="checkbox-row" id="deployments-auto-row">
+        <label class="checkbox-row">
           <input type="checkbox" id="deployments-auto" onchange="window.refreshPolicyDirty()">
           <span>Deploy it automatically</span>
         </label>
