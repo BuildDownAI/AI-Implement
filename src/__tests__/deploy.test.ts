@@ -81,42 +81,6 @@ describe("drainPollMs", () => {
   });
 });
 
-describe("interpretMcpProbe", () => {
-  it("treats 401 as serving — alive and OAuth-gated", () => {
-    expect(deploy.interpretMcpProbe(401)).toEqual({ serving: true });
-  });
-
-  it("treats 503 as not serving and carries the body, which names the cause", () => {
-    // 503 has two causes that the status alone cannot separate: no KG sidecar, or an
-    // unset OAUTH_REDIRECT_BASE_URL. The body distinguishes them; we pass it through
-    // rather than parse it.
-    const probe = deploy.interpretMcpProbe(503, '{"error":"KG sidecar not configured"}');
-    expect(probe).toEqual({
-      serving: false,
-      reason: "mcp-unavailable",
-      detail: '{"error":"KG sidecar not configured"}',
-    });
-  });
-
-  it("reports any other status as not responding, keeping the status", () => {
-    expect(deploy.interpretMcpProbe(502)).toEqual({
-      serving: false,
-      reason: "not-responding",
-      status: 502,
-    });
-  });
-
-  it("treats a failed request (status 0) as not responding, not as a bad release", () => {
-    // A machine mid-restart refuses connections; that is not the same as shipping a
-    // broken image, so it must stay retryable rather than terminal.
-    expect(deploy.interpretMcpProbe(0)).toEqual({
-      serving: false,
-      reason: "not-responding",
-      status: 0,
-    });
-  });
-});
-
 describe("makeStartDeploy", () => {
   const configured = {
     flyDeployToken: "fly-token",

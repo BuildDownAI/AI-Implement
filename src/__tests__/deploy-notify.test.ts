@@ -3,7 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DedupModule from "../dedup.js";
-import type * as DeployModule from "../deploy.js";
 import type * as DeployNotifyModule from "../deploy-notify.js";
 import type * as NotifyModule from "../notify.js";
 
@@ -11,21 +10,17 @@ import type * as NotifyModule from "../notify.js";
 // payload reaches them, so the whole notify module is replaced by a spy.
 vi.mock("../notify.js", () => ({ notifyDeploy: vi.fn() }));
 
-// interpretMcpProbe is tested by deploy.test.ts; mock it so deploy-notify tests
-// control the probe result without fetching or spawning flyctl.
-vi.mock("../deploy.js", () => ({ interpretMcpProbe: vi.fn() }));
-
 const IMAGE_A = "registry.fly.io/orch:deployment-AAA";
 const IMAGE_B = "registry.fly.io/orch:deployment-BBB";
 const LAST_IMAGE_REF_KEY = "deploy_last_image_ref";
 const LAST_SHUTDOWN_AT_KEY = "deploy_last_shutdown_at";
 const DEPLOY_OUTCOME_KEY = "deploy_last_outcome";
+const SIDECAR = "http://127.0.0.1:8765";
 
-const config = { notifyType: "slack", notifyWebhookUrl: "https://hook.example.com" };
+const config = { notifyType: "slack", notifyWebhookUrl: "https://hook.example.com", kgSidecarUrl: SIDECAR };
 
 let dbPath: string;
 let dedup: typeof DedupModule;
-let deployModule: typeof DeployModule;
 let deployNotify: typeof DeployNotifyModule;
 let notify: typeof NotifyModule;
 
@@ -36,7 +31,6 @@ beforeEach(async () => {
   dedup = await import("../dedup.js");
   const runnerMode = await import("../runner-mode.js");
   runnerMode.initSettingsTable();
-  deployModule = await import("../deploy.js");
   deployNotify = await import("../deploy-notify.js");
   notify = await import("../notify.js");
 });
@@ -122,6 +116,49 @@ describe("recordShutdown", () => {
   it("records nothing off Fly", () => {
     deployNotify.recordShutdown();
     expect(readKey(LAST_SHUTDOWN_AT_KEY)).toBeNull();
+  });
+});
+
+describe("decideDeployOutcome", () => {
+  const base = {
+    holdWasSet: true,
+    prevImageRef: IMAGE_A,
+    currentImageRef: IMAGE_B,
+    kgSidecarUrl: SIDECAR,
+    commit: "abc1234",
+    now: 1_700_000_000_000,
+  };
+
+  it("is null when no hold was set — nothing was deploying", () => {
+    expect(deployNotify.decideDeployOutcome({ ...base, holdWasSet: false })).toBeNull();
+  });
+
+  it("is null on a fresh volume, where a replacement cannot be distinguished from a first boot", () => {
+    expect(deployNotify.decideDeployOutcome({ ...base, prevImageRef: null })).toBeNull();
+  });
+
+  it("is null when the image is unchanged — a crash and restart, not a release", () => {
+    expect(deployNotify.decideDeployOutcome({ ...base, currentImageRef: IMAGE_A })).toBeNull();
+  });
+
+  it("is deployed-ok when the sidecar URL is present", () => {
+    expect(deployNotify.decideDeployOutcome(base)).toEqual({
+      kind: "deployed-ok",
+      commit: "abc1234",
+      timestamp: 1_700_000_000_000,
+    });
+  });
+
+  // The entrypoint exports KG_SIDECAR_URL only after the sidecar answers, so an absent
+  // value means the image shipped without one — the failure this whole outcome exists for.
+  it("is deployed-not-serving when the sidecar URL is absent, and says why", () => {
+    const outcome = deployNotify.decideDeployOutcome({ ...base, kgSidecarUrl: null });
+    expect(outcome).toMatchObject({ kind: "deployed-not-serving", commit: "abc1234" });
+    expect(outcome?.detail).toContain("sidecar");
+  });
+
+  it("carries a null commit through rather than inventing one", () => {
+    expect(deployNotify.decideDeployOutcome({ ...base, commit: null })?.commit).toBeNull();
   });
 });
 
@@ -239,109 +276,67 @@ describe("postBootNotice", () => {
   });
 
   // ---------- Hold-aware outcome recording ----------
+  // The branch table is decideDeployOutcome's; these cover the wiring around it —
+  // where each input comes from, and that the record lands independently of the webhook.
 
-  it("does not probe or record an outcome when holdWasSet is false", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_B);
-    const fetchMock = vi.fn();
-    await deployNotify.postBootNotice(config, { holdWasSet: false, fetchImpl: fetchMock });
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(deployNotify.getDeployOutcome()).toBeNull();
-  });
-
-  it("records deployed-ok when the hold was set and /mcp returns 401", async () => {
+  it("records deployed-ok, taking the commit from the build stamp", async () => {
     writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
     onFly(IMAGE_B);
     vi.stubEnv("AI_IMPLEMENT_SOURCE_COMMIT", "abc1234");
-    vi.mocked(deployModule.interpretMcpProbe).mockReturnValue({ serving: true });
-    const fetchMock = vi.fn().mockResolvedValue({ status: 401, text: vi.fn().mockResolvedValue("") });
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
+
+    await deployNotify.postBootNotice(config, { holdWasSet: true });
+
     const outcome = deployNotify.getDeployOutcome();
     expect(outcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234" });
     expect(typeof outcome?.timestamp).toBe("number");
   });
 
-  it("records deployed-not-serving when /mcp returns 503", async () => {
+  it("records deployed-not-serving when the config carries no sidecar URL", async () => {
     writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
     onFly(IMAGE_B);
-    vi.mocked(deployModule.interpretMcpProbe).mockReturnValue({
-      serving: false,
-      reason: "mcp-unavailable" as const,
-      detail: "KG sidecar unavailable",
-    });
-    const fetchMock = vi.fn().mockResolvedValue({ status: 503, text: vi.fn().mockResolvedValue("KG sidecar unavailable") });
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
-    const outcome = deployNotify.getDeployOutcome();
-    expect(outcome?.kind).toBe("deployed-not-serving");
-    expect(outcome?.detail).toBe("KG sidecar unavailable");
+
+    await deployNotify.postBootNotice({ ...config, kgSidecarUrl: null }, { holdWasSet: true });
+
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-not-serving");
   });
 
-  it("records deployed-not-serving when the fetch probe throws", async () => {
+  it("records nothing when no hold was set", async () => {
     writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
     onFly(IMAGE_B);
-    const fetchMock = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
-    const outcome = deployNotify.getDeployOutcome();
-    expect(outcome?.kind).toBe("deployed-not-serving");
-    expect(outcome?.detail).toContain("ECONNREFUSED");
-  });
 
-  it("records deployed-not-serving when FLY_APP_NAME is not set", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    // FLY_IMAGE_REF set (so postBootNotice runs) but FLY_APP_NAME absent (so probe URL unknown)
-    vi.stubEnv("FLY_IMAGE_REF", IMAGE_B);
-    const fetchMock = vi.fn();
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
-    expect(fetchMock).not.toHaveBeenCalled();
-    const outcome = deployNotify.getDeployOutcome();
-    expect(outcome?.kind).toBe("deployed-not-serving");
-    expect(outcome?.detail).toContain("FLY_APP_NAME");
-  });
+    await deployNotify.postBootNotice(config, { holdWasSet: false });
 
-  it("does not record an outcome when holdWasSet is true but the image is unchanged", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_A); // same image — no replacement
-    const fetchMock = vi.fn();
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
-    expect(fetchMock).not.toHaveBeenCalled();
     expect(deployNotify.getDeployOutcome()).toBeNull();
   });
 
-  it("does not record an outcome on a fresh volume even with the hold set", async () => {
-    // prevImageRef is null — first boot; we cannot tell if this is a replacement.
-    onFly(IMAGE_B);
-    const fetchMock = vi.fn();
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(deployNotify.getDeployOutcome()).toBeNull();
-  });
-
-  it("uses AI_IMPLEMENT_SOURCE_COMMIT as the outcome commit when set", async () => {
-    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
-    onFly(IMAGE_B);
-    vi.stubEnv("AI_IMPLEMENT_SOURCE_COMMIT", "deadbeef");
-    vi.mocked(deployModule.interpretMcpProbe).mockReturnValue({ serving: true });
-    const fetchMock = vi.fn().mockResolvedValue({ status: 401, text: vi.fn().mockResolvedValue("") });
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
-    expect(deployNotify.getDeployOutcome()?.commit).toBe("deadbeef");
-  });
-
-  it("records null commit when AI_IMPLEMENT_SOURCE_COMMIT is not set", async () => {
+  it("records a null commit when the image carries no build stamp", async () => {
     writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
     onFly(IMAGE_B);
     delete process.env.AI_IMPLEMENT_SOURCE_COMMIT;
-    vi.mocked(deployModule.interpretMcpProbe).mockReturnValue({ serving: true });
-    const fetchMock = vi.fn().mockResolvedValue({ status: 401, text: vi.fn().mockResolvedValue("") });
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
+
+    await deployNotify.postBootNotice(config, { holdWasSet: true });
+
     expect(deployNotify.getDeployOutcome()?.commit).toBeNull();
   });
 
-  it("sends exactly one webhook notification even when the outcome is recorded", async () => {
+  // The point of the record: a deployment with no webhook still learns how its deploy went.
+  it("records the outcome with no webhook configured, and posts nothing", async () => {
     writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
     onFly(IMAGE_B);
-    vi.mocked(deployModule.interpretMcpProbe).mockReturnValue({ serving: true });
-    const fetchMock = vi.fn().mockResolvedValue({ status: 401, text: vi.fn().mockResolvedValue("") });
-    await deployNotify.postBootNotice(config, { holdWasSet: true, fetchImpl: fetchMock });
+
+    await deployNotify.postBootNotice({ ...config, notifyWebhookUrl: null }, { holdWasSet: true });
+
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+  });
+
+  it("sends exactly one webhook notification alongside the record", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice(config, { holdWasSet: true });
+
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
     expect(notify.notifyDeploy).toHaveBeenCalledOnce();
     expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kind: "deployed" });
   });
@@ -446,7 +441,7 @@ describe("recordDeployOutcome / getDeployOutcome", () => {
   it("returns null when the stored value is corrupt JSON", () => {
     dedup.getDb()
       .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
-      .run("deploy_last_outcome", "not-json{");
+      .run(DEPLOY_OUTCOME_KEY, "not-json{");
     expect(deployNotify.getDeployOutcome()).toBeNull();
   });
 });

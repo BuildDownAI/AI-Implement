@@ -32,7 +32,7 @@ import type { DeployStart } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
-import { isDeployHeld } from "./deploy-hold.js";
+import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
@@ -244,6 +244,7 @@ export function handleAdminRequest(
         configured: !!deps.startDeploy,
         available: availability?.available ?? null,
         held: isDeployHeld(),
+        deployStartedAt: getDeployStartedAt(),
         inFlight: getInFlightWork(),
         checkedAt: availability?.checkedAt ?? null,
         runningCommit: availability?.runningCommit ?? null,

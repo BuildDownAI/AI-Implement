@@ -11,18 +11,6 @@ import { fetchRepoTarball, getBranchSha } from "./github.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import type { SelfDeployTarget } from "./deploy-availability.js";
 
-/**
- * What a /mcp probe says about a freshly released version.
-*
-* - 401 is success: alive and OAuth-gated.
-* - 503 means /mcp is not serving, from either an absent KG sidecar or an unset OAUTH_REDIRECT_BASE_URL
-* (the status alone cannot tell them apart) so the body is carried through rather than parsed.
-*/
-export type McpProbe =
-| { serving: true }
-| { serving: false; reason: "mcp-unavailable"; detail: string }
-| { serving: false; reason: "not-responding"; status: number };
-
 export interface DeployArgsInput {
   app: string;
   kgToken: string;
@@ -208,13 +196,6 @@ function runFlyctl(
       else fail(`[deploy] flyctl exited ${code}`);
     });
   });
-}
-
-/** Pure. `status` is 0 when the request itself failed (refused, timed out). */
-export function interpretMcpProbe(status: number, body = ""): McpProbe {
-  if (status === 401) return { serving: true };
-  if (status === 503) return { serving: false, reason: "mcp-unavailable", detail: body };
-  return { serving: false, reason: "not-responding", status };
 }
 
 export function deployArgs(input: DeployArgsInput): string[] {

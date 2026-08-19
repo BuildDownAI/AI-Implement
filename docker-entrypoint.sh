@@ -54,7 +54,7 @@ _start_sidecar() {
         _i=$((_i + 1))
     done
 
-    printf '[kg] sidecar readiness timeout after 30 s — degraded mode; /mcp will return 503\n' >&2
+    printf '[kg] sidecar readiness timeout after 30 s — degraded mode; /mcp serves no kg_* tools\n' >&2
     return 1
 }
 
@@ -62,8 +62,8 @@ if _start_sidecar; then
     export KG_SIDECAR_URL="${KG_MCP_URL}"
     printf '[kg] KG_SIDECAR_URL set to %s\n' "${KG_SIDECAR_URL}" >&2
 else
-    printf '[kg] continuing without sidecar; /mcp will return 503\n' >&2
-    # KG_SIDECAR_URL stays unset; src/index.ts degrades /mcp to 503.
+    printf '[kg] continuing without sidecar; /mcp serves no kg_* tools\n' >&2
+    # KG_SIDECAR_URL stays unset. /mcp still answers 401 unauthenticated, so this log is the signal.
 fi
 
 exec node dist/index.js "$@"

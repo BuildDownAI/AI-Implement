@@ -1,6 +1,5 @@
 import { getDb } from "./dedup.js";
 import { notifyDeploy, type DeployNotification } from "./notify.js";
-import { interpretMcpProbe } from "./deploy.js";
 
 export interface BootStateInput {
   currentImageRef: string;
@@ -17,6 +16,7 @@ export interface BootDecision {
 export interface DeployNotifyConfig {
   notifyType: string;
   notifyWebhookUrl: string | null;
+  kgSidecarUrl: string | null;
 }
 
 export interface DeployOutcome {
@@ -25,6 +25,16 @@ export interface DeployOutcome {
   commit: string | null;
   timestamp: number;
   detail?: string;
+}
+
+export interface DeployOutcomeInput {
+  holdWasSet: boolean;
+  prevImageRef: string | null;
+  currentImageRef: string;
+  /** Absent means the sidecar never came up — see decideDeployOutcome. */
+  kgSidecarUrl: string | null;
+  commit: string | null;
+  now: number;
 }
 
 const LAST_IMAGE_REF_KEY = "deploy_last_image_ref";
@@ -64,6 +74,26 @@ export function decideBootNotification(input: BootStateInput): BootDecision | nu
   // Same version. Only speak if a shutdown notice went out, so the notification pair stays matched;
   // otherwise this is a boot nobody was told about.
   return lastShutdownAt != null ? { kind: "restarted", downtimeMs } : null;
+}
+
+/**
+ * Whether this boot is the far side of a self-deploy, and whether that release serves.
+ *
+ * docker-entrypoint.sh exports KG_SIDECAR_URL only after the sidecar answers its readiness
+ * check, so an absent value here is the sidecar-less signal. Probing /mcp cannot substitute:
+ * its 401 gate sits above the sidecar check, so an unauthenticated caller sees 401 either way.
+ */
+export function decideDeployOutcome(input: DeployOutcomeInput): DeployOutcome | null {
+  const { holdWasSet, prevImageRef, currentImageRef, kgSidecarUrl, commit, now } = input;
+
+  // No hold means no deploy was in flight. A null or unchanged ref means this process
+  // was not replaced by one — a fresh volume, or a restart on the same version.
+  if (!holdWasSet) return null;
+  if (prevImageRef === null || prevImageRef === currentImageRef) return null;
+
+  return kgSidecarUrl
+    ? { kind: "deployed-ok", commit, timestamp: now }
+    : { kind: "deployed-not-serving", commit, timestamp: now, detail: "KG sidecar did not start" };
 }
 
 /** Present only inside a Fly Machine, so it doubles as the "this is a real deployment" gate. */
@@ -121,7 +151,7 @@ export async function postShutdownNotice(config: DeployNotifyConfig): Promise<vo
 
 export async function postBootNotice(
   config: DeployNotifyConfig,
-  opts: { holdWasSet?: boolean; fetchImpl?: typeof fetch } = {},
+  opts: { holdWasSet?: boolean } = {},
 ): Promise<void> {
   const imageRef = flyImageRef();
   if (!imageRef) return;
@@ -135,27 +165,26 @@ export async function postBootNotice(
     now: Date.now(),
   });
 
+  const outcome = decideDeployOutcome({
+    holdWasSet: opts.holdWasSet ?? false,
+    prevImageRef,
+    currentImageRef: imageRef,
+    kgSidecarUrl: config.kgSidecarUrl,
+    commit: process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
+    now: Date.now(),
+  });
+
   // State advances even when nothing is posted, and even when the webhook is unset — otherwise
   // a run with notifications disabled would leave a stale ref and mis-classify the next boot.
+  // Every write here stays above this function's first await: it is called fire-and-forget,
+  // so anything below one is lost whenever the webhook hangs.
   try {
     writeSetting(LAST_IMAGE_REF_KEY, imageRef);
     writeSetting(LAST_SHUTDOWN_AT_KEY, null);
   } catch (err) {
     console.error("[deploy-notify] failed to persist deploy state:", err);
   }
-
-  // A deploy hold was set and the image changed: the release replaced this process.
-  // Probe /mcp to confirm the sidecar is reachable, then record the outcome durably —
-  // independent of whether a webhook is configured.
-  if (opts.holdWasSet && prevImageRef !== null && prevImageRef !== imageRef) {
-    const commit = process.env.AI_IMPLEMENT_SOURCE_COMMIT || null;
-    const { serving, detail } = await probeMcp(opts.fetchImpl ?? fetch);
-    recordDeployOutcome(
-      serving
-        ? { kind: "deployed-ok", commit, timestamp: Date.now() }
-        : { kind: "deployed-not-serving", commit, timestamp: Date.now(), detail },
-    );
-  }
+  if (outcome) recordDeployOutcome(outcome);
 
   if (!decision || !config.notifyWebhookUrl) return;
   try {
@@ -183,21 +212,5 @@ export async function postAvailableNotice(config: DeployNotifyConfig, commit: st
     });
   } catch (err) {
     console.error("[deploy-notify] availability notice failed:", err);
-  }
-}
-
-async function probeMcp(fetchImpl: typeof fetch): Promise<{ serving: boolean; detail?: string }> {
-  const appName = process.env.FLY_APP_NAME;
-  if (!appName) return { serving: false, detail: "FLY_APP_NAME not set" };
-  const url = `https://${appName}.fly.dev/mcp`;
-  try {
-    const res = await fetchImpl(url, { signal: AbortSignal.timeout(30_000) });
-    const body = res.status === 503 ? await res.text().catch(() => "") : "";
-    const probe = interpretMcpProbe(res.status, body);
-    if (probe.serving) return { serving: true };
-    if (probe.reason === "mcp-unavailable") return { serving: false, detail: probe.detail || "503" };
-    return { serving: false, detail: `status ${probe.status}` };
-  } catch (err) {
-    return { serving: false, detail: String(err) };
   }
 }
