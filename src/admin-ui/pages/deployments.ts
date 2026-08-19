@@ -12,18 +12,25 @@ export const deploymentsHtml = `
   <div class="page-body">
     <div id="deployments-error" hidden></div>
 
-    <div class="kpi-grid" id="deployments-kpis" style="grid-template-columns: 1fr">
+    <div class="kpi-grid" id="deployments-kpis" style="grid-template-columns: 1fr 1fr">
       <div class="kpi">
         <div class="kpi-label">Availability <span class="badge neutral" id="kpi-deploy-badge">—</span></div>
         <div class="kpi-value"><span id="kpi-deploy-commit">—</span><span class="kpi-unit" id="kpi-deploy-checked"></span></div>
         <div class="kpi-trend" id="kpi-deploy-source"></div>
       </div>
-      <div class="kpi" id="deployments-status-kpi" hidden>
+      <div class="kpi" id="deployments-last-outcome">
+        <div class="kpi-label">Last deploy <span class="badge neutral" id="kpi-deploy-outcome-badge">—</span></div>
+        <div class="kpi-value"><span id="kpi-deploy-outcome-commit">—</span><span class="kpi-unit" id="kpi-deploy-outcome-when"></span></div>
+        <div class="kpi-trend" id="kpi-deploy-outcome-meta"></div>
+      </div>
+      <div class="kpi" id="deployments-status-kpi" hidden style="grid-column: 1 / -1">
         <div class="kpi-label">Deploy status <span class="badge neutral" id="kpi-deploy-status-badge">—</span></div>
         <div class="kpi-value"><span id="kpi-deploy-status">—</span><span class="kpi-unit" id="kpi-deploy-status-unit"></span></div>
         <div class="kpi-trend" id="kpi-deploy-dispatch"></div>
       </div>
     </div>
+
+    <div class="alert" id="deployments-outcome-alert" hidden></div>
 
     <div class="card" id="deployments-policy" hidden>
       <div class="card-header"><h2 class="card-title">When a deployment becomes available...</h2></div>
@@ -71,7 +78,19 @@ export const deploymentsScript = `
     const m = Math.floor(s / 60);
     if (m < 60) return m + 'm ago';
     const h = Math.floor(m / 60);
-    return h + 'h ago';
+    if (h < 24) return h + 'h ago';
+    // The last deploy of a quiet orchestrator is weeks old, and "504h ago" is unreadable.
+    const d = Math.floor(h / 24);
+    return d + 'd ago';
+  }
+  
+  // Duration since a start, not distance from now — deliberately not fmtAgo, whose
+  // "Xm ago" wording reads wrong for something still running.
+  function fmtElapsed(startedAt) {
+    const s = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60);
+    return m < 60 ? m + 'm' : Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
   }
 
   function short(sha) { return sha ? sha.slice(0, 7) : ''; }
@@ -124,7 +143,11 @@ export const deploymentsScript = `
     if (available === true && data.headCommit && data.headCommit === data.lastActedCommit) {
       return short(data.headCommit) + ' is available now but was already announced, so this applies from the next push. Use Deploy now to release it immediately.';
     }
-    return 'A push to ' + (data.branch || 'the watched branch') + ' pauses dispatch and releases without asking.';
+    // The one-attempt rule is the load-bearing fact about this switch and appeared nowhere:
+    // the already-announced branch above implies it, and an operator who never hits that
+    // branch would not learn that a failed automatic deploy simply stops.
+    return 'Once per commit: a push to ' + (data.branch || 'the watched branch')
+      + ' pauses dispatch and releases without asking. A failed deploy is not retried.';
   }
 
   function notifyHint(data) {
@@ -179,7 +202,14 @@ export const deploymentsScript = `
     document.getElementById('deployments-not-configured').hidden = configured;
     document.getElementById('deployments-kpis').hidden = !configured;
 
-    document.getElementById('deployments-cta').hidden = !configured || held || available !== true;
+    // A bad outcome is its own reason to deploy, and availability cannot express it: a
+    // degraded release shipped the head commit, so availability reads "up to date" while the
+    // running version is the broken one. Gating on availability alone hid the single control
+    // that fixes what the page was warning about.
+    const outcome = data.lastDeployOutcome;
+    const troubled = configured && !held && !!outcome && outcome.kind !== 'deployed-ok';
+    document.getElementById('deployments-cta').hidden =
+      !configured || held || (available !== true && !troubled);
 
     // The policy card follows the tiles: meaningless on an orchestrator that cannot
     // deploy itself, where the banner below is the whole story.
@@ -219,18 +249,83 @@ export const deploymentsScript = `
     const dispatchEl = document.getElementById('kpi-deploy-dispatch');
     statusKpi.hidden = !held;
     if (held) {
+      const elapsed = data.deployStartedAt ? fmtElapsed(data.deployStartedAt) + ' elapsed' : '';
       if (inFlight.length > 0) {
         setBadge(statusBadge, 'warn', 'Draining');
         statusEl.textContent = inFlight.map(function (w) { return plural(w.count, w.kind); }).join(', ');
-        statusUnit.textContent = 'waiting for in-flight work to finish';
+        statusUnit.textContent = elapsed || 'waiting for in-flight work to finish';
       } else {
         setBadge(statusBadge, 'running', 'Building');
-        statusEl.textContent = 'All in-flight work drained';
-        statusUnit.textContent = 'building and releasing the new image';
+        statusEl.textContent = 'Building and releasing the new image';
+        // Blank without a clock, unlike Draining above: the value here is a whole sentence,
+        // so filler beside it would add nothing. Only a pre-clock hold reaches that.
+        statusUnit.textContent = elapsed;
       }
       // Identical in both phases deliberately: the pause is a property of deploying,
       // not of a phase, so varying the wording would imply it varies with the phase.
       dispatchEl.textContent = 'New dispatches are paused until the deploy completes.';
+    }
+
+    // Last deploy outcome — persists after the hold clears, survives restarts.
+    // Reserved rather than conditional: this goes from absent to present on the poll right
+    // after a deploy lands, which is exactly when someone is watching. A grid reflow at that
+    // moment costs more than an empty tile does on a first run.
+    const outcomeBadge = document.getElementById('kpi-deploy-outcome-badge');
+    const outcomeCommit = document.getElementById('kpi-deploy-outcome-commit');
+    const outcomeWhen = document.getElementById('kpi-deploy-outcome-when');
+    const outcomeMeta = document.getElementById('kpi-deploy-outcome-meta');
+    if (!outcome) {
+      setBadge(outcomeBadge, 'neutral', 'None yet');
+      outcomeCommit.textContent = '\u2014';
+      outcomeWhen.textContent = '';
+      outcomeMeta.textContent = 'No self-deploy has completed on this orchestrator.';
+    } else {
+      // Vocabulary follows drawer.ts's shared status mapping: completed/failed, with warn
+      // reserved for a thing that finished but is not wholly right — the same call
+      // review_failed gets. A release whose sidecar is missing serves every route but
+      // /mcp, so it is degraded rather than failed.
+      if (outcome.kind === 'deployed-ok') {
+        setBadge(outcomeBadge, 'success', 'Completed');
+      } else if (outcome.kind === 'deployed-not-serving') {
+        setBadge(outcomeBadge, 'warn', 'Degraded');
+      } else {
+        setBadge(outcomeBadge, 'fail', 'Failed');
+      }
+      // A build failure names the commit it tried, not the one running, so this can
+      // legitimately differ from the tile beside it. Only that case says so — for the
+      // other two the commit here and the running one are the same value.
+      outcomeCommit.innerHTML = commitLink(data.repo, outcome.commit) || '\u2014';
+      outcomeWhen.textContent = outcome.timestamp ? fmtAgo(outcome.timestamp) : '';
+      outcomeMeta.textContent = outcome.kind === 'build-failed' ? 'attempted — never released' : '';
+    }
+
+    // What went wrong is a page-level notice, not a footnote inside a tile: a KPI trend
+    // line is where secondary context goes, and a dead knowledge graph is not secondary.
+    // The troubled flag is decided above because the deploy control shares it — one
+    // condition, so the notice and the way to act on it cannot appear without each other.
+    const outcomeAlert = document.getElementById('deployments-outcome-alert');
+    outcomeAlert.hidden = !troubled;
+    if (troubled) {
+      const degraded = outcome.kind === 'deployed-not-serving';
+      outcomeAlert.className = 'alert ' + (degraded ? 'warn' : 'fail');
+      const title = degraded
+        ? 'Released, but the knowledge graph is not serving'
+        : 'Deploy did not release';
+      const explain = degraded
+        ? '/mcp answers 503 while every other route is healthy. Deploy now, below, rebuilds and releases the same commit.'
+        : 'The running version is unchanged, and the commit is still available to deploy.';
+      // The record carries a one-line reason on purpose. flyctl's real output is a 64 KB
+      // tail that is logged and never stored, because the KG token rides in its argv and a
+      // stored copy would outlive a rotating log and be served on every status poll.
+      // Naming where the output is beats reproducing it somewhere it should not be.
+      outcomeAlert.innerHTML =
+        '<div class="alert-icon">' + (degraded ? '!' : '\u00d7') + '</div>'
+        + '<div style="flex:1">'
+        + '<div class="alert-title">' + window.esc(title) + '</div>'
+        + '<div class="alert-desc">' + window.esc(explain) + '</div>'
+        + (outcome.detail ? '<div class="alert-desc" style="margin-top:4px; font-family: var(--font-mono)">' + window.esc(outcome.detail) + '</div>' : '')
+        + '<div class="alert-desc" style="margin-top:4px">Full output is in the orchestrator logs.</div>'
+        + '</div>';
     }
 
     // Availability is the least of the three signals here, so it rides in the label as

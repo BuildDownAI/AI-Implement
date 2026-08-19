@@ -16,9 +16,16 @@ Readiness is polled for up to 30 seconds. **Any HTTP response counts as ready**,
 
 For local development, start the sidecar yourself and set `KG_SIDECAR_URL` in `.env`, or leave it blank to run without `/mcp`.
 
-## `/mcp` returns 503 for two different reasons
+## What `/mcp` tells you, and what it hides
 
-The endpoint requires **both** `KG_SIDECAR_URL` and `OAUTH_REDIRECT_BASE_URL`. Missing either produces the same 503. A sidecar-enabled image deployed without an OAuth base URL therefore looks exactly like a sidecar-less build from the outside — worth checking both before concluding the sidecar failed to start.
+The endpoint needs **both** `KG_SIDECAR_URL` and `OAUTH_REDIRECT_BASE_URL`, but the two are not equally visible from outside, because the auth gate sits between their checks.
+
+- **`OAUTH_REDIRECT_BASE_URL` unset** — `/mcp` answers **503** to every caller.
+- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. Only an authenticated request that actually needs the sidecar reaches the 503; an authenticated `tools/list` still answers **200**, listing the built-in diagnostic tools alone. The sidecar check sits below both the auth gate and that routing deliberately, so those diagnostics stay reachable on a sidecar-less image.
+
+**So an unauthenticated probe of `/mcp` cannot distinguish a sidecar-less release from a healthy one — both answer 401.** The public endpoint that can is `/.well-known/oauth-protected-resource`, which 503s when either variable is missing.
+
+Inside the container the question is settled without a request at all: `docker-entrypoint.sh` exports `KG_SIDECAR_URL` only after the sidecar answers its readiness check, so an absent value is the sidecar-less signal. That is what the orchestrator itself reads at boot.
 
 ## Building the image
 
@@ -74,7 +81,9 @@ Three separate mistakes each produce a silently degraded deploy, and each has ha
 
 Self-deploy carries all three by construction: they are assembled in one place and a test asserts each is present, so they cannot be dropped the way a hand-typed command can. The exported-token trap disappears entirely there, because the secret is passed as an argument rather than through a shell.
 
-Verify any deploy by polling `/mcp` until it answers **401** — a release that boots is not necessarily a release that serves, and the difference is invisible from the Fly dashboard.
+A release that boots is not necessarily a release that serves, and the difference is invisible from the Fly dashboard. **After a self-deploy** the orchestrator checks itself: the process that comes up in place of the one that started the deploy records whether its own image carries a sidecar, and `/admin#deployments` shows the result. A release made any other way records nothing, because no deploy hold was taken for it — those still need the manual check below.
+
+To check by hand, poll **`/.well-known/oauth-protected-resource`** — 200 means both variables are set, 503 means one is missing. Polling `/mcp` for a 401 proves only that the route is configured.
 
 ### Verifying more than "it answers"
 

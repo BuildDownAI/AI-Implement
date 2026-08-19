@@ -11,18 +11,6 @@ import { fetchRepoTarball, getBranchSha } from "./github.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import type { SelfDeployTarget } from "./deploy-availability.js";
 
-/**
- * What a /mcp probe says about a freshly released version.
-*
-* - 401 is success: alive and OAuth-gated.
-* - 503 means /mcp is not serving, from either an absent KG sidecar or an unset OAUTH_REDIRECT_BASE_URL
-* (the status alone cannot tell them apart) so the body is carried through rather than parsed.
-*/
-export type McpProbe =
-| { serving: true }
-| { serving: false; reason: "mcp-unavailable"; detail: string }
-| { serving: false; reason: "not-responding"; status: number };
-
 export interface DeployArgsInput {
   app: string;
   kgToken: string;
@@ -210,13 +198,6 @@ function runFlyctl(
   });
 }
 
-/** Pure. `status` is 0 when the request itself failed (refused, timed out). */
-export function interpretMcpProbe(status: number, body = ""): McpProbe {
-  if (status === 401) return { serving: true };
-  if (status === 503) return { serving: false, reason: "mcp-unavailable", detail: body };
-  return { serving: false, reason: "not-responding", status };
-}
-
 export function deployArgs(input: DeployArgsInput): string[] {
   // An empty value is the failure this function exists to prevent: an empty build
   // secret fail-softs to a sidecar-less image, and an empty stamp leaves the next
@@ -316,6 +297,8 @@ export interface StartDeployConfig {
   pollIntervalMs: number;
   githubAppId: string;
   githubAppPrivateKey: string;
+  /** Called when the build or release step fails, so the caller can record the outcome. */
+  onBuildFailure?: (commit: string, err: unknown) => void;
 }
 
 /** `StartDeployConfig` with the three optional fields proven present. */
@@ -366,7 +349,10 @@ export function makeStartDeploy(
         pollIntervalMs: config.pollIntervalMs,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-      }).catch((err) => console.error("[deploy] failed:", err));
+      }).catch((err) => {
+        console.error("[deploy] failed:", err);
+        config.onBuildFailure?.(head, err);
+      });
 
       return { started: true, commit: head };
     } catch (err) {

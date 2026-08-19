@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { deploymentsHtml, deploymentsScript } from "../pages/deployments.js";
 
 describe("deployments page", () => {
@@ -11,10 +11,16 @@ describe("deployments page", () => {
       "kpi-deploy-checked",
       "kpi-deploy-source",
       "deployments-status-kpi",
+      "deployments-outcome-alert",
       "kpi-deploy-status-badge",
       "kpi-deploy-status",
       "kpi-deploy-status-unit",
       "kpi-deploy-dispatch",
+      "deployments-last-outcome",
+      "kpi-deploy-outcome-badge",
+      "kpi-deploy-outcome-commit",
+      "kpi-deploy-outcome-when",
+      "kpi-deploy-outcome-meta",
       "deployments-cta",
       "deployments-deploy-btn",
       "deployments-not-configured",
@@ -54,9 +60,8 @@ describe("deployments page", () => {
     // Availability and status both describe an action this orchestrator cannot take,
     // so the not-configured banner is the whole page.
     expect(deploymentsScript).toContain("getElementById('deployments-kpis').hidden = !configured");
-    expect(deploymentsScript).toContain(
-      "getElementById('deployments-cta').hidden = !configured || held || available !== true",
-    );
+    expect(deploymentsScript).toContain("getElementById('deployments-cta').hidden =");
+    expect(deploymentsScript).toContain("!configured || held || (available !== true && !troubled)");
   });
 
   it("shows the deploy-status tile only while a deploy holds", () => {
@@ -119,6 +124,9 @@ describe("deployments page", () => {
       ["warn", "Available"],
       ["success", "Up to date"],
       ["neutral", "Unknown"],
+      ["success", "Completed"],
+      ["warn", "Degraded"],
+      ["fail", "Failed"],
     ]) {
       expect(deploymentsScript).toContain(`, '${kind}', '${label}')`);
     }
@@ -126,6 +134,20 @@ describe("deployments page", () => {
     // set a badge directly, which is precisely how the dots were lost before.
     const writers = deploymentsScript.match(/className\s*=\s*'badge/g) ?? [];
     expect(writers).toHaveLength(1);
+  });
+
+  it("leaves no superseded badge vocabulary behind", () => {
+    // A renamed label is added by prepending the new branch and is easy to ship beside the
+    // old one: setBadge replaces className and innerHTML outright, so the second block wins
+    // and the page looks correct while running both. A toContain assertion cannot see that
+    // — it passes on the new labels whether or not the old ones are still there. This
+    // shipped once, dead, and was caught in review rather than by the suite.
+    for (const gone of ["Deployed OK", "Not serving", "Build failed"]) {
+      expect(deploymentsScript).not.toContain(gone);
+    }
+    // One write per outcome state: the empty state plus the three kinds.
+    const outcomeWrites = deploymentsScript.match(/setBadge\(outcomeBadge,/g) ?? [];
+    expect(outcomeWrites).toHaveLength(4);
   });
 
   it("keeps the commit links at value size rather than using .mono", () => {
@@ -199,6 +221,14 @@ describe("deployments page", () => {
     expect(deploymentsScript).toContain("autoHint(data, available, held)");
   });
 
+  it("states the one-attempt rule on the default hint, not only on the edge case", () => {
+    // The already-announced branch implies it; an operator who never hits that branch would
+    // otherwise never learn that a failed automatic deploy simply stops. It is the fact that
+    // decides whether leaving the switch on is safe, so it belongs on the ordinary reading.
+    expect(deploymentsScript).toContain("Once per commit: a push to ");
+    expect(deploymentsScript).toContain("A failed deploy is not retried.");
+  });
+
   it("offers the manual path when automatic deploying cannot act on the waiting commit", () => {
     // One attempt per commit means enabling the toggle does not reach back for a commit
     // already announced. Saying so, and naming the button, is the whole point.
@@ -218,6 +248,17 @@ describe("deployments page", () => {
     const at = (id: string) => deploymentsHtml.indexOf(`id="${id}"`);
     expect(at("deployments-kpis")).toBeLessThan(at("deployments-policy"));
     expect(at("deployments-policy")).toBeLessThan(at("deployments-cta"));
+  });
+
+  it("pairs availability with the outcome, and gives deploy status its own full-width row", () => {
+    // Two columns, and the status tile spans both. Its DOM position is load-bearing: a
+    // spanning element placed between the pair would push the outcome onto a half-width
+    // row by itself, so status has to come last even though it renders above nothing.
+    expect(deploymentsHtml).toContain('id="deployments-kpis" style="grid-template-columns: 1fr 1fr"');
+    expect(deploymentsHtml).toContain('id="deployments-status-kpi" hidden style="grid-column: 1 / -1"');
+    const at = (id: string) => deploymentsHtml.indexOf(`id="${id}"`);
+    expect(at("kpi-deploy-badge")).toBeLessThan(at("deployments-last-outcome"));
+    expect(at("deployments-last-outcome")).toBeLessThan(at("deployments-status-kpi"));
   });
 
   it("saves on submit rather than on every click", () => {
@@ -270,5 +311,210 @@ describe("deployments page", () => {
   it("updates the nav indicator based on availability", () => {
     expect(deploymentsScript).toContain("deploy-available");
     expect(deploymentsScript).toContain("navCount.hidden");
+  });
+
+  it("keeps the outcome tile in the layout before any deploy has happened", () => {
+    // The tile is never hidden. It fills from absent to present on the poll right after a
+    // deploy completes — the one moment somebody is certainly looking — so a grid that
+    // reflows then is worse than an empty tile on a first run. The empty state says so
+    // rather than rendering a bare dash with no explanation.
+    expect(deploymentsHtml).not.toMatch(/id="deployments-last-outcome"[^>]*\shidden/);
+    expect(deploymentsScript).toContain("'None yet'");
+    expect(deploymentsScript).toContain("No self-deploy has completed on this orchestrator.");
+  });
+
+  it("drives the outcome tile from the outcome alone, never from the hold", () => {
+    // An outcome has to survive the hold clearing, which is the entire point of recording
+    // it. Scoped to the render block by its real first and last statements — an unanchored
+    // slice silently matches nothing once the ids move, and passes for the wrong reason.
+    const from = deploymentsScript.indexOf("const outcomeBadge = document.getElementById");
+    const to = deploymentsScript.indexOf("const outcomeAlert = document.getElementById");
+    expect(from).toBeGreaterThan(-1);
+    expect(to).toBeGreaterThan(from);
+    expect(deploymentsScript.slice(from, to)).not.toContain("held");
+  });
+
+  it("escapes the flyctl detail everywhere it reaches markup", () => {
+    // outcome.detail carries flyctl output, and it lands in the alert through innerHTML,
+    // so esc() is required — the text-content rule of the three-way escaping convention.
+    // Asserting the absence of raw concatenation is the half that catches a regression:
+    // adding a second, unescaped write site is the plausible mistake, not removing this one.
+    expect(deploymentsScript).toContain("window.esc(outcome.detail)");
+    expect(deploymentsScript).not.toMatch(/\+ outcome\.detail/);
+    expect(deploymentsScript).not.toMatch(/outcome\.detail \+/);
+  });
+
+  it("calls a release with no sidecar degraded, not failed", () => {
+    // It released. Every route works except /mcp — the same shape as review_failed in
+    // drawer.ts, which is a run that shipped a PR without approval and gets warn, not fail.
+    // Red here would have an operator roll back a deployment that is serving traffic.
+    expect(deploymentsScript).toContain("setBadge(outcomeBadge, 'warn', 'Degraded')");
+    expect(deploymentsScript).not.toContain("'fail', 'Degraded'");
+    expect(deploymentsScript).toContain("outcomeAlert.className = 'alert ' + (degraded ? 'warn' : 'fail')");
+  });
+
+  it("raises a bad outcome to a page-level alert instead of a tile footnote", () => {
+    // A dead knowledge graph is not secondary context, and the trend line is where
+    // secondary context lives. Clean outcomes raise nothing.
+    expect(deploymentsScript).toContain("outcome.kind !== 'deployed-ok'");
+    expect(deploymentsScript).toContain("Released, but the knowledge graph is not serving");
+    expect(deploymentsScript).toContain("Deploy did not release");
+  });
+
+  it("hides the outcome alert when it cannot be the current story", () => {
+    // Two suppressions in one condition. Not configured: the tiles are already hidden, so a
+    // leftover alert would be the only thing contradicting the banner. Held: the notice
+    // describes the previous deploy while a new one runs, which is the same contradiction
+    // the auto hint had when it said "applies from the next push" during a live build.
+    expect(deploymentsScript).toContain(
+      "const troubled = configured && !held && !!outcome && outcome.kind !== 'deployed-ok';",
+    );
+  });
+
+  it("reveals the existing deploy control for a bad outcome instead of adding a second one", () => {
+    // Availability cannot express this: a degraded release shipped the head commit, so the
+    // page reads "up to date" while the running version is the broken one, and gating the
+    // control on availability alone hid the only thing that fixes it. Widening that one
+    // condition beats a button in the alert — the confirm gate, the disable-in-finally and
+    // the caption all already live on the existing control and would need duplicating.
+    expect(deploymentsScript).toContain("!configured || held || (available !== true && !troubled)");
+    expect(deploymentsScript).not.toContain("alert-actions");
+
+    // Exactly one place in the markup starts a deploy.
+    const triggers = deploymentsHtml.match(/triggerDeploy\(\)/g) ?? [];
+    expect(triggers).toHaveLength(1);
+  });
+
+  it("points the degraded notice at the control that fixes it", () => {
+    expect(deploymentsScript).toContain("Deploy now, below, rebuilds and releases the same commit.");
+  });
+
+  it("points at the logs rather than storing the flyctl tail", () => {
+    // runFlyctl keeps 64 KB of output and console.errors it without attaching it to the
+    // Error, so detail stays a single line. That is deliberate: the KG token rides in
+    // flyctl's argv, and a stored copy would outlive a rotating log and be served on every
+    // status poll. The alert says where the output is instead of reproducing it.
+    expect(deploymentsScript).toContain("Full output is in the orchestrator logs.");
+  });
+
+  it("marks a failed build's commit as one that never ran", () => {
+    // This tile's commit usually equals the running one in the tile beside it. For a build
+    // failure it is the commit that was attempted, so the difference has to be stated.
+    expect(deploymentsScript).toContain("'attempted — never released'");
+  });
+
+  it("calls /api/deployment-status to retrieve lastDeployOutcome", () => {
+    // The outcome is a field on the existing endpoint — no second request needed.
+    expect(deploymentsScript).toContain("lastDeployOutcome");
+  });
+});
+
+describe("fmtElapsed", () => {
+  // The page ships as one concatenated script string, so its helpers are only reachable
+  // by extraction. Worth the reach here: the interesting behaviour is the 60s and 60m
+  // boundaries, and a toContain assertion cannot see which side of one the code lands on.
+  const source = deploymentsScript.match(/function fmtElapsed\(startedAt\) \{[\s\S]*?\n  \}/);
+  if (!source) throw new Error("fmtElapsed not found in deploymentsScript");
+  const fmtElapsed = new Function(`return (${source[0]});`)() as (startedAt: number) => string;
+
+  const NOW = 1_700_000_000_000;
+  const secondsAgo = (n: number) => NOW - n * 1000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reads in seconds under a minute", () => {
+    expect(fmtElapsed(secondsAgo(0))).toBe("0s");
+    expect(fmtElapsed(secondsAgo(45))).toBe("45s");
+    expect(fmtElapsed(secondsAgo(59))).toBe("59s");
+  });
+
+  it("switches to whole minutes at exactly one minute", () => {
+    expect(fmtElapsed(secondsAgo(60))).toBe("1m");
+    expect(fmtElapsed(secondsAgo(90))).toBe("1m");
+    expect(fmtElapsed(secondsAgo(59 * 60))).toBe("59m");
+  });
+
+  it("switches to hours and minutes at exactly one hour", () => {
+    expect(fmtElapsed(secondsAgo(60 * 60))).toBe("1h 0m");
+    expect(fmtElapsed(secondsAgo(95 * 60))).toBe("1h 35m");
+  });
+
+  it("clamps a start in the future to zero rather than counting down", () => {
+    // The stamp is written by whichever process claimed the hold, and read by whichever
+    // is alive now. A host whose clock moved backwards must not render "-3s elapsed".
+    expect(fmtElapsed(NOW + 3000)).toBe("0s");
+  });
+});
+
+describe("deploy status tile", () => {
+  it("reads the start time the status endpoint reports", () => {
+    expect(deploymentsScript).toContain("data.deployStartedAt");
+    expect(deploymentsScript).toContain("fmtElapsed(data.deployStartedAt) + ' elapsed'");
+  });
+
+  it("puts the activity in the value and elapsed in the unit, matching Draining", () => {
+    // Draining already puts its live counts in the value slot. Building previously read
+    // "All in-flight work drained" there — a completed fact where the other phase shows a
+    // live one — with the activity demoted to the unit. Swapping makes the two consistent
+    // and frees the unit for the number that says the deploy is still moving.
+    expect(deploymentsScript).toContain("statusEl.textContent = 'Building and releasing the new image';");
+    expect(deploymentsScript).toContain("statusUnit.textContent = elapsed;");
+    expect(deploymentsScript).not.toContain("All in-flight work drained");
+  });
+
+  it("falls back to the old Draining wording when no start time exists", () => {
+    // A hold claimed by a process that predates the clock, or set by hand, still renders
+    // something rather than an empty unit.
+    expect(deploymentsScript).toContain("statusUnit.textContent = elapsed || 'waiting for in-flight work to finish';");
+  });
+
+  it("uses fmtAgo for past events and fmtElapsed for the running one", () => {
+    // fmtAgo bakes "ago" into its output, which is wrong for a duration still accruing.
+    expect(deploymentsScript).toContain("'checked ' + fmtAgo(data.checkedAt)");
+    expect(deploymentsScript).toContain("fmtAgo(outcome.timestamp)");
+    const elapsedCalls = deploymentsScript.match(/fmtElapsed\(/g) ?? [];
+    expect(elapsedCalls).toHaveLength(2); // the declaration and its single call site
+  });
+});
+
+describe("fmtAgo", () => {
+  const source = deploymentsScript.match(/function fmtAgo\(ms\) \{[\s\S]*?\n  \}/);
+  if (!source) throw new Error("fmtAgo not found in deploymentsScript");
+  const fmtAgo = new Function(`return (${source[0]});`)() as (ms: number) => string;
+
+  const NOW = 1_700_000_000_000;
+  const ago = (n: number, unitMs: number) => NOW - n * unitMs;
+  const MIN = 60_000;
+  const HOUR = 60 * MIN;
+  const DAY = 24 * HOUR;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("steps through seconds, minutes and hours", () => {
+    expect(fmtAgo(ago(45, 1000))).toBe("45s ago");
+    expect(fmtAgo(ago(12, MIN))).toBe("12m ago");
+    expect(fmtAgo(ago(5, HOUR))).toBe("5h ago");
+    expect(fmtAgo(ago(23, HOUR))).toBe("23h ago");
+  });
+
+  // The availability check runs every poll, so it never leaves seconds. The last deploy of a
+  // quiet orchestrator is weeks old, and hours do not survive that: three weeks read as
+  // "504h ago" before this tier existed.
+  it("reaches days, so an old deploy does not read in hundreds of hours", () => {
+    expect(fmtAgo(ago(24, HOUR))).toBe("1d ago");
+    expect(fmtAgo(ago(21, DAY))).toBe("21d ago");
+    expect(fmtAgo(ago(400, DAY))).toBe("400d ago");
   });
 });

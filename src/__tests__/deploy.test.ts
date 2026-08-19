@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import type * as DeployModule from "../deploy.js";
@@ -78,42 +78,6 @@ describe("drainPollMs", () => {
   it("floors at 5s so a very short configured interval cannot spin the database", () => {
     expect(deploy.drainPollMs(1_000)).toBe(5_000);
     expect(deploy.drainPollMs(0)).toBe(5_000);
-  });
-});
-
-describe("interpretMcpProbe", () => {
-  it("treats 401 as serving — alive and OAuth-gated", () => {
-    expect(deploy.interpretMcpProbe(401)).toEqual({ serving: true });
-  });
-
-  it("treats 503 as not serving and carries the body, which names the cause", () => {
-    // 503 has two causes that the status alone cannot separate: no KG sidecar, or an
-    // unset OAUTH_REDIRECT_BASE_URL. The body distinguishes them; we pass it through
-    // rather than parse it.
-    const probe = deploy.interpretMcpProbe(503, '{"error":"KG sidecar not configured"}');
-    expect(probe).toEqual({
-      serving: false,
-      reason: "mcp-unavailable",
-      detail: '{"error":"KG sidecar not configured"}',
-    });
-  });
-
-  it("reports any other status as not responding, keeping the status", () => {
-    expect(deploy.interpretMcpProbe(502)).toEqual({
-      serving: false,
-      reason: "not-responding",
-      status: 502,
-    });
-  });
-
-  it("treats a failed request (status 0) as not responding, not as a bad release", () => {
-    // A machine mid-restart refuses connections; that is not the same as shipping a
-    // broken image, so it must stay retryable rather than terminal.
-    expect(deploy.interpretMcpProbe(0)).toEqual({
-      serving: false,
-      reason: "not-responding",
-      status: 0,
-    });
   });
 });
 
@@ -233,5 +197,66 @@ describe("canSelfDeploy", () => {
     expect(deploy.canSelfDeploy(configured)).toBe(deploy.makeStartDeploy(configured) !== undefined);
     const unconfigured = { ...configured, flyDeployToken: null };
     expect(deploy.canSelfDeploy(unconfigured)).toBe(deploy.makeStartDeploy(unconfigured) !== undefined);
+  });
+});
+
+describe("makeStartDeploy onBuildFailure callback", () => {
+  // Needs real SQLite (deploy-hold.ts writes to it), but mocks the two GitHub helpers
+  // so we can control what commit is returned and skip the App-token mint.
+  let localDeploy: typeof DeployModule;
+  let closeDb: () => void;
+
+  beforeEach(async () => {
+    // Re-reset so the mocks below are visible when deploy.js is imported.
+    vi.resetModules();
+    process.env.DEDUP_DB_PATH = path.join(os.tmpdir(), `deploy-onbf-${Date.now()}.sqlite`);
+
+    vi.doMock("../github-app-auth.js", () => ({
+      getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "tok", expiresAt: "" }),
+    }));
+    vi.doMock("../github.js", () => ({
+      fetchRepoTarball: vi.fn(),
+      getBranchSha: vi.fn().mockResolvedValue("def5678"),
+    }));
+
+    localDeploy = await import("../deploy.js");
+    const { initSettingsTable } = await import("../runner-mode.js");
+    initSettingsTable();
+    const dedup = await import("../dedup.js");
+    closeDb = dedup.closeDb;
+  });
+
+  afterEach(() => {
+    closeDb?.();
+    vi.doUnmock("../github-app-auth.js");
+    vi.doUnmock("../github.js");
+    vi.unstubAllGlobals();
+  });
+
+  it("calls onBuildFailure when runDeploy rejects", async () => {
+    // resolveFlyctl uses global fetch; a 404 makes it reject before any subprocess.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("nope", { status: 404 })));
+
+    // Resolved by the callback itself rather than waited out: runDeploy is fire-and-forget,
+    // so the test needs a signal, and a fixed sleep is a guess that gets tighter under load.
+    let signalCalled = () => {};
+    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
+    const onBuildFailure = vi.fn(() => signalCalled());
+    const start = localDeploy.makeStartDeploy({
+      flyDeployToken: "fly-token",
+      flyOrchestratorApp: "orchestrator",
+      selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
+      pollIntervalMs: 60_000,
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      onBuildFailure,
+    })!;
+
+    const result = await start();
+    expect(result).toMatchObject({ started: true, commit: "def5678" });
+
+    await called;
+
+    expect(onBuildFailure).toHaveBeenCalledWith("def5678", expect.any(Error));
   });
 });

@@ -2247,6 +2247,26 @@ describe("GET /api/deployment-status", () => {
     expect(res.body.inFlight).toEqual([{ kind: "workflow-sync", count: 1 }]);
   });
 
+  it("reports no start time when nothing is being deployed", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.deployStartedAt).toBeNull();
+  });
+
+  it("reports when the current deploy started, so the page can show elapsed time", async () => {
+    // An eight-minute build with no moving number is indistinguishable from a hang.
+    // The clock belongs to the hold, so it arrives on the same read as `held`.
+    const { setDeployHold } = await import("../deploy-hold.js");
+    const before = Date.now();
+    setDeployHold();
+
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.held).toBe(true);
+    expect(res.body.deployStartedAt as number).toBeGreaterThanOrEqual(before);
+    expect(res.body.deployStartedAt as number).toBeLessThanOrEqual(Date.now());
+  });
+
   it("reports whether a notification webhook exists, so the toggle can explain itself", async () => {
     // Without this the page cannot tell an enabled announcement from an inert one, and
     // would show "no webhook configured" forever regardless of the truth.
@@ -2269,6 +2289,16 @@ describe("GET /api/deployment-status", () => {
     expect((await statusRequest(token)).body.lastActedCommit).toBeNull();
     setLastActedCommit("def5678");
     expect((await statusRequest(token)).body.lastActedCommit).toBe("def5678");
+  });
+
+  it("reports the last deploy outcome, so the page can render deployed-ok and build-failed cards", async () => {
+    const { recordDeployOutcome } = await import("../deploy-notify.js");
+    const token = await login("secret");
+
+    expect((await statusRequest(token)).body.lastDeployOutcome).toBeNull();
+    recordDeployOutcome({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
+    const body = (await statusRequest(token)).body;
+    expect(body.lastDeployOutcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
   });
 });
 

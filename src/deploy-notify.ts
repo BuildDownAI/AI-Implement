@@ -16,10 +16,30 @@ export interface BootDecision {
 export interface DeployNotifyConfig {
   notifyType: string;
   notifyWebhookUrl: string | null;
+  kgSidecarUrl: string | null;
+}
+
+export interface DeployOutcome {
+  kind: "deployed-ok" | "deployed-not-serving" | "build-failed";
+  /** null when the image was not stamped with AI_IMPLEMENT_SOURCE_COMMIT at build time */
+  commit: string | null;
+  timestamp: number;
+  detail?: string;
+}
+
+export interface DeployOutcomeInput {
+  holdWasSet: boolean;
+  prevImageRef: string | null;
+  currentImageRef: string;
+  /** Absent means the sidecar never came up — see decideDeployOutcome. */
+  kgSidecarUrl: string | null;
+  commit: string | null;
+  now: number;
 }
 
 const LAST_IMAGE_REF_KEY = "deploy_last_image_ref";
 const LAST_SHUTDOWN_AT_KEY = "deploy_last_shutdown_at";
+const DEPLOY_OUTCOME_KEY = "deploy_last_outcome";
 
 function readSetting(key: string): string | null {
   try {
@@ -56,6 +76,26 @@ export function decideBootNotification(input: BootStateInput): BootDecision | nu
   return lastShutdownAt != null ? { kind: "restarted", downtimeMs } : null;
 }
 
+/**
+ * Whether this boot is the far side of a self-deploy, and whether that release serves.
+ *
+ * docker-entrypoint.sh exports KG_SIDECAR_URL only after the sidecar answers its readiness
+ * check, so an absent value here is the sidecar-less signal. Probing /mcp cannot substitute:
+ * its 401 gate sits above the sidecar check, so an unauthenticated caller sees 401 either way.
+ */
+export function decideDeployOutcome(input: DeployOutcomeInput): DeployOutcome | null {
+  const { holdWasSet, prevImageRef, currentImageRef, kgSidecarUrl, commit, now } = input;
+
+  // No hold means no deploy was in flight. A null or unchanged ref means this process
+  // was not replaced by one — a fresh volume, or a restart on the same version.
+  if (!holdWasSet) return null;
+  if (prevImageRef === null || prevImageRef === currentImageRef) return null;
+
+  return kgSidecarUrl
+    ? { kind: "deployed-ok", commit, timestamp: now }
+    : { kind: "deployed-not-serving", commit, timestamp: now, detail: "KG sidecar did not start" };
+}
+
 /** Present only inside a Fly Machine, so it doubles as the "this is a real deployment" gate. */
 function flyImageRef(): string | null {
   return process.env.FLY_IMAGE_REF || null;
@@ -69,6 +109,24 @@ function describe(kind: DeployNotification["kind"], imageRef: string, downtimeMs
     imageRef,
     downtimeMs,
   };
+}
+
+export function getDeployOutcome(): DeployOutcome | null {
+  const raw = readSetting(DEPLOY_OUTCOME_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as DeployOutcome;
+  } catch {
+    return null;
+  }
+}
+
+export function recordDeployOutcome(outcome: DeployOutcome): void {
+  try {
+    writeSetting(DEPLOY_OUTCOME_KEY, JSON.stringify(outcome));
+  } catch (err) {
+    console.error("[deploy-notify] failed to record deploy outcome:", err);
+  }
 }
 
 /** Records the stop so the next boot can measure downtime. Must run before closeDb(). */
@@ -91,25 +149,42 @@ export async function postShutdownNotice(config: DeployNotifyConfig): Promise<vo
   }
 }
 
-export async function postBootNotice(config: DeployNotifyConfig): Promise<void> {
+export async function postBootNotice(
+  config: DeployNotifyConfig,
+  opts: { holdWasSet?: boolean } = {},
+): Promise<void> {
   const imageRef = flyImageRef();
   if (!imageRef) return;
 
+  const prevImageRef = readSetting(LAST_IMAGE_REF_KEY);
+
   const decision = decideBootNotification({
     currentImageRef: imageRef,
-    prevImageRef: readSetting(LAST_IMAGE_REF_KEY),
+    prevImageRef,
     lastShutdownAt: Number(readSetting(LAST_SHUTDOWN_AT_KEY)) || null,
+    now: Date.now(),
+  });
+
+  const outcome = decideDeployOutcome({
+    holdWasSet: opts.holdWasSet ?? false,
+    prevImageRef,
+    currentImageRef: imageRef,
+    kgSidecarUrl: config.kgSidecarUrl,
+    commit: process.env.AI_IMPLEMENT_SOURCE_COMMIT || null,
     now: Date.now(),
   });
 
   // State advances even when nothing is posted, and even when the webhook is unset — otherwise
   // a run with notifications disabled would leave a stale ref and mis-classify the next boot.
+  // Every write here stays above this function's first await: it is called fire-and-forget,
+  // so anything below one is lost whenever the webhook hangs.
   try {
     writeSetting(LAST_IMAGE_REF_KEY, imageRef);
     writeSetting(LAST_SHUTDOWN_AT_KEY, null);
   } catch (err) {
     console.error("[deploy-notify] failed to persist deploy state:", err);
   }
+  if (outcome) recordDeployOutcome(outcome);
 
   if (!decision || !config.notifyWebhookUrl) return;
   try {

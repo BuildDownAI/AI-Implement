@@ -25,7 +25,7 @@ curl -X POST https://<app-name>.fly.dev/api/deploy -H "Authorization: Bearer <se
 | `503 head-unknown` | The watched branch's HEAD could not be read. |
 | `501` | This orchestrator is not configured to deploy itself. |
 
-It pauses dispatch, waits for in-flight work to drain, fetches the source at the branch HEAD, builds with the sidecar secret and the source stamps, then releases. **The release replaces the machine running the deploy**, so the process is killed partway through and the 202 is the last thing it can tell you. Nothing checks the result afterwards — confirm it yourself with the `/mcp` probe below.
+It pauses dispatch, waits for in-flight work to drain, fetches the source at the branch HEAD, builds with the sidecar secret and the source stamps, then releases. **The release replaces the machine running the deploy**, so the process is killed partway through and the 202 is the last thing it can tell you. The *incoming* process reports the outcome instead: at boot it records whether the release completed, came up without a working knowledge graph, or never released at all, and `/admin#deployments` shows that record. A build failure is recorded by the process that survived it, since a build that fails never replaces anything.
 
 Four things must be true, and they are not all reported the same way:
 
@@ -37,6 +37,15 @@ Four things must be true, and they are not all reported the same way:
 The first two and the app name collapse into a single `501`, which says the orchestrator cannot deploy itself without saying which piece is missing. The third is a different 503, raised at the `/api/` gate before this route is reached. The fourth is **not checked up front** — a token that cannot read a repository surfaces as a failed build, after the hold has already been taken and released.
 
 The app it deploys is never configured: Fly injects `FLY_APP_NAME` into every machine, so an orchestrator can only ever deploy itself.
+
+### Automatic self-deploy
+
+`/admin#deployments` can release every new commit on the watched branch without being asked. Two properties make that safe to leave on:
+
+- **One attempt per commit**, remembered across restarts. A commit is deployed at most once whether the attempt succeeds or fails, so a failed automatic deploy waits for the next push or a manual trigger rather than being retried. Without that rule a persistently failing build would re-take the hold every poll cycle and dispatch would never resume.
+- **The hold is taken by the poll that notices the commit**, before the build starts, so nothing is dispatched into a version that is about to be replaced.
+
+Switching it on does not reach back for a commit that has already been announced; that one needs the manual trigger. The trigger itself applies no availability check, so it will rebuild and re-release a commit that is already running — which is how a degraded release gets repaired.
 
 ### Manual deploy — cold start and recovery
 

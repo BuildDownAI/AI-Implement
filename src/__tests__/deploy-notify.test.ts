@@ -14,8 +14,10 @@ const IMAGE_A = "registry.fly.io/orch:deployment-AAA";
 const IMAGE_B = "registry.fly.io/orch:deployment-BBB";
 const LAST_IMAGE_REF_KEY = "deploy_last_image_ref";
 const LAST_SHUTDOWN_AT_KEY = "deploy_last_shutdown_at";
+const DEPLOY_OUTCOME_KEY = "deploy_last_outcome";
+const SIDECAR = "http://127.0.0.1:8765";
 
-const config = { notifyType: "slack", notifyWebhookUrl: "https://hook.example.com" };
+const config = { notifyType: "slack", notifyWebhookUrl: "https://hook.example.com", kgSidecarUrl: SIDECAR };
 
 let dbPath: string;
 let dedup: typeof DedupModule;
@@ -114,6 +116,49 @@ describe("recordShutdown", () => {
   it("records nothing off Fly", () => {
     deployNotify.recordShutdown();
     expect(readKey(LAST_SHUTDOWN_AT_KEY)).toBeNull();
+  });
+});
+
+describe("decideDeployOutcome", () => {
+  const base = {
+    holdWasSet: true,
+    prevImageRef: IMAGE_A,
+    currentImageRef: IMAGE_B,
+    kgSidecarUrl: SIDECAR,
+    commit: "abc1234",
+    now: 1_700_000_000_000,
+  };
+
+  it("is null when no hold was set — nothing was deploying", () => {
+    expect(deployNotify.decideDeployOutcome({ ...base, holdWasSet: false })).toBeNull();
+  });
+
+  it("is null on a fresh volume, where a replacement cannot be distinguished from a first boot", () => {
+    expect(deployNotify.decideDeployOutcome({ ...base, prevImageRef: null })).toBeNull();
+  });
+
+  it("is null when the image is unchanged — a crash and restart, not a release", () => {
+    expect(deployNotify.decideDeployOutcome({ ...base, currentImageRef: IMAGE_A })).toBeNull();
+  });
+
+  it("is deployed-ok when the sidecar URL is present", () => {
+    expect(deployNotify.decideDeployOutcome(base)).toEqual({
+      kind: "deployed-ok",
+      commit: "abc1234",
+      timestamp: 1_700_000_000_000,
+    });
+  });
+
+  // The entrypoint exports KG_SIDECAR_URL only after the sidecar answers, so an absent
+  // value means the image shipped without one — the failure this whole outcome exists for.
+  it("is deployed-not-serving when the sidecar URL is absent, and says why", () => {
+    const outcome = deployNotify.decideDeployOutcome({ ...base, kgSidecarUrl: null });
+    expect(outcome).toMatchObject({ kind: "deployed-not-serving", commit: "abc1234" });
+    expect(outcome?.detail).toContain("sidecar");
+  });
+
+  it("carries a null commit through rather than inventing one", () => {
+    expect(deployNotify.decideDeployOutcome({ ...base, commit: null })?.commit).toBeNull();
   });
 });
 
@@ -229,6 +274,72 @@ describe("postBootNotice", () => {
 
     expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ downtimeMs: null });
   });
+
+  // ---------- Hold-aware outcome recording ----------
+  // The branch table is decideDeployOutcome's; these cover the wiring around it —
+  // where each input comes from, and that the record lands independently of the webhook.
+
+  it("records deployed-ok, taking the commit from the build stamp", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    vi.stubEnv("AI_IMPLEMENT_SOURCE_COMMIT", "abc1234");
+
+    await deployNotify.postBootNotice(config, { holdWasSet: true });
+
+    const outcome = deployNotify.getDeployOutcome();
+    expect(outcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234" });
+    expect(typeof outcome?.timestamp).toBe("number");
+  });
+
+  it("records deployed-not-serving when the config carries no sidecar URL", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice({ ...config, kgSidecarUrl: null }, { holdWasSet: true });
+
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-not-serving");
+  });
+
+  it("records nothing when no hold was set", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice(config, { holdWasSet: false });
+
+    expect(deployNotify.getDeployOutcome()).toBeNull();
+  });
+
+  it("records a null commit when the image carries no build stamp", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    delete process.env.AI_IMPLEMENT_SOURCE_COMMIT;
+
+    await deployNotify.postBootNotice(config, { holdWasSet: true });
+
+    expect(deployNotify.getDeployOutcome()?.commit).toBeNull();
+  });
+
+  // The point of the record: a deployment with no webhook still learns how its deploy went.
+  it("records the outcome with no webhook configured, and posts nothing", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice({ ...config, notifyWebhookUrl: null }, { holdWasSet: true });
+
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
+    expect(notify.notifyDeploy).not.toHaveBeenCalled();
+  });
+
+  it("sends exactly one webhook notification alongside the record", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice(config, { holdWasSet: true });
+
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
+    expect(notify.notifyDeploy).toHaveBeenCalledOnce();
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kind: "deployed" });
+  });
 });
 
 // ---------- The two halves in sequence, which is how they actually run ----------
@@ -301,5 +412,36 @@ describe("postAvailableNotice", () => {
     onFly(IMAGE_A);
     vi.mocked(notify.notifyDeploy).mockRejectedValueOnce(new Error("Slack webhook failed: 500"));
     await expect(deployNotify.postAvailableNotice(config, "def5678")).resolves.toBeUndefined();
+  });
+});
+
+describe("recordDeployOutcome / getDeployOutcome", () => {
+  it("returns null when nothing has been recorded", () => {
+    expect(deployNotify.getDeployOutcome()).toBeNull();
+  });
+
+  it("round-trips a deployed-ok outcome", () => {
+    const outcome = { kind: "deployed-ok" as const, commit: "abc123", timestamp: 12345 };
+    deployNotify.recordDeployOutcome(outcome);
+    expect(deployNotify.getDeployOutcome()).toEqual(outcome);
+  });
+
+  it("round-trips a build-failed outcome with a detail", () => {
+    const outcome = { kind: "build-failed" as const, commit: "def456", timestamp: 99999, detail: "flyctl exited 1" };
+    deployNotify.recordDeployOutcome(outcome);
+    expect(deployNotify.getDeployOutcome()).toEqual(outcome);
+  });
+
+  it("overwrites a previous outcome with the latest one", () => {
+    deployNotify.recordDeployOutcome({ kind: "build-failed" as const, commit: "old", timestamp: 1 });
+    deployNotify.recordDeployOutcome({ kind: "deployed-ok" as const, commit: "new", timestamp: 2 });
+    expect(deployNotify.getDeployOutcome()?.kind).toBe("deployed-ok");
+  });
+
+  it("returns null when the stored value is corrupt JSON", () => {
+    dedup.getDb()
+      .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+      .run(DEPLOY_OUTCOME_KEY, "not-json{");
+    expect(deployNotify.getDeployOutcome()).toBeNull();
   });
 });
