@@ -89,8 +89,11 @@ what it did:
 ```bash
 git status --short
 git diff
-git diff --cached             # also inspect anything the implementation staged
+git diff --cached
 ```
+
+The demo's one-file scope is an instruction to the model, not a filesystem
+boundary. Inspect all changed and staged files before keeping the result.
 
 Reset the demo whenever you want to run it again:
 
