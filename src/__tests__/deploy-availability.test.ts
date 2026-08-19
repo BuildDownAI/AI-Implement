@@ -5,7 +5,7 @@ import type * as GithubModule from "../github.js";
 
 // Both dependencies exist only to reach GitHub; what matters here is what they
 // return, so each is replaced by a spy exposing the single function we call.
-vi.mock("../github-app-auth.js", () => ({ getInstallationToken: vi.fn() }));
+vi.mock("../github-app-auth.js", () => ({ getScopedInstallationToken: vi.fn() }));
 vi.mock("../github.js", () => ({ getBranchSha: vi.fn() }));
 
 const RUNNING = "1111111111111111111111111111111111111111";
@@ -35,7 +35,10 @@ beforeEach(async () => {
   vi.resetModules();
   githubAppAuth = await import("../github-app-auth.js");
   github = await import("../github.js");
-  vi.mocked(githubAppAuth.getInstallationToken).mockResolvedValue("installation-token");
+  vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue({
+    token: "installation-token",
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+  });
   availability = await import("../deploy-availability.js");
 });
 
@@ -115,6 +118,23 @@ describe("refreshAvailability", () => {
     const state = await availability.refreshAvailability(input());
 
     expect(state).toMatchObject({ available: true, runningCommit: RUNNING, headCommit: HEAD });
+  });
+
+  it("mints a token scoped to the one repository it reads", async () => {
+    // This runs on every poll cycle, so the broad installation-wide mint it used to make
+    // was the orchestrator's most frequently issued credential and its widest. The option
+    // shape also has to match the deploy path's mint exactly — the cache is keyed on
+    // (owner, permissions, repositories), so an identical shape means one token serves both.
+    vi.mocked(github.getBranchSha).mockResolvedValue(HEAD);
+
+    await availability.refreshAvailability(input());
+
+    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      "BuildDownAI",
+      { permissions: { contents: "read" }, repositories: ["AI-Implement"] },
+    );
   });
 
   it("reports up to date when the running commit is the branch head", async () => {

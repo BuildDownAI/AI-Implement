@@ -87,7 +87,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
-| Deploying, clients, Bedrock | `src/deploy.ts` | [docs/deployment.md](docs/deployment.md) |
+| Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
 | Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
 | Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | |
