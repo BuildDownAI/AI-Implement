@@ -3284,7 +3284,15 @@ async function main(): Promise<void> {
 
   // total amount of time allotted for a graceful shutdown, otherwise the shutdown is forced
   const SHUTDOWN_BUDGET_MS = 10_000; // 10s
-  const shutdown = async (signal: string) => {
+  // Fly can send a second signal before the first shutdown finishes. The latch needs no
+  // reset: the forced-exit timer below is armed before any await, so the process always dies.
+  let shuttingDown = false;
+  const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
+    if (shuttingDown) {
+      console.log(`[main] Received ${signal} while already shutting down; ignoring`);
+      return;
+    }
+    shuttingDown = true;
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
 
