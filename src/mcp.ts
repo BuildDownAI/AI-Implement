@@ -6,6 +6,7 @@ import { getMappings } from "./config.js";
 import { getInFlightJobs } from "./log.js";
 import { getDb } from "./dedup.js";
 import { getIssueReportCard, getFleetReport } from "./report-card.js";
+import { isKgDegraded } from "./deploy-notify.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -104,7 +105,7 @@ function callDiagnosticTool(name: string, args: Record<string, unknown>): unknow
         .prepare("SELECT COUNT(*) as n FROM comment_gapfill_queue WHERE status = 'pending'")
         .get() as { n: number };
       const projectCount = Object.keys(getMappings()).length;
-      return { runnerMode: { mode, source }, inFlightJobCount: inFlight.length, pendingGapfillCount, projectCount };
+      return { runnerMode: { mode, source }, inFlightJobCount: inFlight.length, pendingGapfillCount, projectCount, kgDegraded: isKgDegraded() };
     }
 
     case "get_runner_mode": {

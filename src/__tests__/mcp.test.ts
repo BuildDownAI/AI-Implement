@@ -23,6 +23,10 @@ vi.mock("../dedup.js", () => ({
   getDb: vi.fn(),
 }));
 
+vi.mock("../deploy-notify.js", () => ({
+  isKgDegraded: vi.fn(),
+}));
+
 const BASE_URL = "https://orchestrator.example.com";
 const SIDECAR_URL = "http://127.0.0.1:8765/mcp";
 
@@ -86,6 +90,7 @@ let runnerModeMock: typeof import("../runner-mode.js");
 let configMock: typeof import("../config.js");
 let logMock: typeof import("../log.js");
 let dedupMock: typeof import("../dedup.js");
+let deployNotifyMock: typeof import("../deploy-notify.js");
 
 beforeEach(async () => {
   mockHttpRequest = vi.fn();
@@ -96,6 +101,8 @@ beforeEach(async () => {
   configMock = await import("../config.js");
   logMock = await import("../log.js");
   dedupMock = await import("../dedup.js");
+  deployNotifyMock = await import("../deploy-notify.js");
+  (deployNotifyMock.isKgDegraded as ReturnType<typeof vi.fn>).mockReturnValue(false);
 
   // Sensible defaults for diagnostic tool mocks
   (runnerModeMock.getRunnerMode as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -438,6 +445,43 @@ describe("handleMcpRequest", () => {
       expect(data.inFlightJobCount).toBe(2);
       expect(data.pendingGapfillCount).toBe(5);
       expect(data.projectCount).toBe(2);
+      expect(data.kgDegraded).toBe(false);
+    });
+
+    it("get_tenant_health includes kgDegraded=true when KG_EMBEDDINGS_DEGRADED=1", async () => {
+      (deployNotifyMock.isKgDegraded as ReturnType<typeof vi.fn>).mockReturnValue(true);
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.kgDegraded).toBe(true);
+    });
+
+    it("get_tenant_health includes kgDegraded=false when KG_EMBEDDINGS_DEGRADED is unset", async () => {
+      (deployNotifyMock.isKgDegraded as ReturnType<typeof vi.fn>).mockReturnValue(false);
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.kgDegraded).toBe(false);
     });
 
     it("handles get_runner_mode", async () => {
