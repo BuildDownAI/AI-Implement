@@ -340,6 +340,25 @@ describe("postBootNotice", () => {
     expect(notify.notifyDeploy).toHaveBeenCalledOnce();
     expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kind: "deployed" });
   });
+
+  it("propagates kgDegraded=true when KG_EMBEDDINGS_DEGRADED=1 is set", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+    vi.stubEnv("KG_EMBEDDINGS_DEGRADED", "1");
+
+    await deployNotify.postBootNotice(config);
+
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgDegraded: true });
+  });
+
+  it("propagates kgDegraded=false when KG_EMBEDDINGS_DEGRADED is unset", async () => {
+    writeKey(LAST_IMAGE_REF_KEY, IMAGE_A);
+    onFly(IMAGE_B);
+
+    await deployNotify.postBootNotice(config);
+
+    expect(vi.mocked(notify.notifyDeploy).mock.calls[0][2]).toMatchObject({ kgDegraded: false });
+  });
 });
 
 // ---------- The two halves in sequence, which is how they actually run ----------

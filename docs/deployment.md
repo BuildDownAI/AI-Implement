@@ -154,3 +154,16 @@ IAM trust policy shape, scoped to one repo:
 ```
 
 Credentials are configured once before the containerized runner step with a **4-hour session duration**, covering the implementation and gap-analysis runs in a single job. Only GitHub OIDC is supported — there is no static-key path.
+
+## KG embeddings health
+
+Two steps in the image build bake the embedding model and graph embeddings — both can fail without failing the build (fail-soft, so lexical search still works). The risk is a silent regression: a build that skips embeddings is indistinguishable from a healthy build in the deploy log.
+
+**Receipt rule:** every fail-soft build step that skips meaningful work must write `/app/kg/.embeddings-failed` into the image. `|| echo` alone is not sufficient — the failure is visible in build logs but invisible to monitoring across deploys. The marker is the machine-readable contract between the build and the boot-time entrypoint.
+
+When the sidecar starts and the marker is present (or `out/embeddings.npz` is absent), `docker-entrypoint.sh` logs a warning and sets `KG_EMBEDDINGS_DEGRADED=1` in the Node process. The flag surfaces in two places:
+
+- **`GET /`** returns `kgDegraded: true` so uptime monitors can alert on it.
+- The **`deployed` / `restarted` deploy notification** includes a warning line: _⚠️ KG embeddings missing — /mcp is lexical-only_.
+
+To repair a degraded image, re-deploy with `--no-cache` and a working `--build-secret kg_token`. A cached layer from a previous degraded build will reuse the bad output even when the underlying problem is fixed — `--no-cache` is not optional for this recovery.

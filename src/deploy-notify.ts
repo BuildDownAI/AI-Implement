@@ -108,6 +108,7 @@ function describe(kind: DeployNotification["kind"], imageRef: string, downtimeMs
     region: process.env.FLY_REGION || null,
     imageRef,
     downtimeMs,
+    kgDegraded: process.env.KG_EMBEDDINGS_DEGRADED === "1",
   };
 }
 

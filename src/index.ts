@@ -2795,7 +2795,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
     // Health check
     if (url === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", polls: pollCount }));
+      res.end(JSON.stringify({ status: "ok", polls: pollCount, kgDegraded: process.env.KG_EMBEDDINGS_DEGRADED === "1" }));
       return;
     }
 

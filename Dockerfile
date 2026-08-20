@@ -60,6 +60,14 @@ COPY workflows/ ./workflows/
 #
 # When the secret is absent the build succeeds and logs "sidecar-less build".
 # All other routes remain healthy; only /mcp returns 503.
+#
+# Receipt rule: any fail-soft build step that skips a meaningful piece of work must
+# write /app/kg/.embeddings-failed into the image. Using || echo alone is a
+# silent-regression factory — the failure is visible in build logs but invisible to
+# monitoring across deploys. The marker is checked by docker-entrypoint.sh at boot,
+# which exports KG_EMBEDDINGS_DEGRADED=1 and surfaces the fact via GET / and the
+# deploy notification. The || true copy guards below are exempt: they are part of
+# the deliberate sidecar-less mode, not unexpected failures.
 COPY kg/ /app/kg/
 RUN --mount=type=secret,id=kg_token,required=false \
     if [ -f /run/secrets/kg_token ] && [ -s /run/secrets/kg_token ]; then \
@@ -96,7 +104,7 @@ RUN if [ -x /app/kg/.venv/bin/python ]; then \
         && FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache \
            /app/kg/.venv/bin/python -c \
              "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')" \
-        || echo "[kg] WARNING: EMBEDDINGS BUILD FAILED — model warm failed; image will run lexical-only"; \
+        || (touch /app/kg/.embeddings-failed && echo "[kg] WARNING: EMBEDDINGS BUILD FAILED — model warm failed; image will run lexical-only"); \
     else \
         echo "[kg] no venv — skipping model warm (sidecar-less)"; \
     fi
@@ -107,7 +115,7 @@ RUN if [ -x /app/kg/.venv/bin/python ] && [ -d /app/kg/snapshot/parts ]; then \
         && ( echo "[kg] embedding graph with baked fastembed cache" \
              && FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache \
                 PYTHONPATH=. .venv/bin/python -m kg_ingest.materialize \
-             || echo "[kg] WARNING: EMBEDDINGS BUILD FAILED — embed step failed; image ships graph-only (lexical search only)" ); \
+             || (touch /app/kg/.embeddings-failed && echo "[kg] WARNING: EMBEDDINGS BUILD FAILED — embed step failed; image ships graph-only (lexical search only)") ); \
     else \
         echo "[kg] no venv or snapshot — skipping materialize (sidecar-less)"; \
     fi
