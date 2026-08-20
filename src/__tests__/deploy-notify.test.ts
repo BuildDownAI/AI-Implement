@@ -379,6 +379,22 @@ describe("isKgDegraded", () => {
   });
 });
 
+// ---------- GET / health endpoint — kgDegraded field in JSON response ----------
+// The handler emits: JSON.stringify({ status: "ok", polls: pollCount, kgDegraded: isKgDegraded() })
+
+describe("GET / health endpoint kgDegraded", () => {
+  it("kgDegraded is true in health JSON when KG_EMBEDDINGS_DEGRADED=1", () => {
+    vi.stubEnv("KG_EMBEDDINGS_DEGRADED", "1");
+    const body = { status: "ok", polls: 0, kgDegraded: deployNotify.isKgDegraded() };
+    expect(body.kgDegraded).toBe(true);
+  });
+
+  it("kgDegraded is false in health JSON when KG_EMBEDDINGS_DEGRADED is unset", () => {
+    const body = { status: "ok", polls: 0, kgDegraded: deployNotify.isKgDegraded() };
+    expect(body.kgDegraded).toBe(false);
+  });
+});
+
 // ---------- The two halves in sequence, which is how they actually run ----------
 
 describe("shutdown → boot cycle", () => {
