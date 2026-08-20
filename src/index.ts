@@ -13,7 +13,7 @@ import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "
 import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
-import { postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
+import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
@@ -2795,7 +2795,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
     // Health check
     if (url === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", polls: pollCount }));
+      res.end(JSON.stringify({ status: "ok", polls: pollCount, kgDegraded: isKgDegraded() }));
       return;
     }
 

@@ -52,6 +52,7 @@ export interface DeployNotification {
   imageRef: string | null; // Full FLY_IMAGE_REF, only the deployment-<id> tag is displayed.
   downtimeMs?: number | null; // Gap between the shutdown notice and the boot that answered it, when both were observed.
   commit?: string | null; // Only the "available" kind — there is no image to reference yet.
+  kgDegraded?: boolean; // True when embeddings were not built — /mcp serves lexical-only search.
 }
 
 // Human label for a run phase, reused across notification kinds (dispatch, completion, …).
@@ -456,6 +457,9 @@ async function notifyDeploySlack(webhookUrl: string, n: DeployNotification): Pro
   if (version) details.push(`Version: \`${version}\``);
   if (n.downtimeMs != null) details.push(`Down for ${formatDuration(n.downtimeMs)}`);
 
+  let text = `${event.slackEmoji} ${mention}*${event.title}* — ${event.summary}\n${details.join(" · ")}`;
+  if (n.kgDegraded) text += "\n⚠️ KG embeddings missing — /mcp is lexical-only";
+
   const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -465,7 +469,7 @@ async function notifyDeploySlack(webhookUrl: string, n: DeployNotification): Pro
           type: "section",
           text: {
             type: "mrkdwn",
-            text: `${event.slackEmoji} ${mention}*${event.title}* — ${event.summary}\n${details.join(" · ")}`,
+            text,
           },
         },
       ],
@@ -489,6 +493,15 @@ async function notifyDeployTeams(webhookUrl: string, n: DeployNotification): Pro
   if (version) facts.push({ title: "Version", value: version });
   if (n.downtimeMs != null) facts.push({ title: "Down for", value: formatDuration(n.downtimeMs) });
 
+  const cardBody: unknown[] = [
+    { type: "TextBlock", text: `${event.teamsIcon} ${event.title}`, weight: "Bolder", size: "Medium" },
+    { type: "TextBlock", text: event.summary, wrap: true },
+    { type: "FactSet", facts },
+  ];
+  if (n.kgDegraded) {
+    cardBody.push({ type: "TextBlock", text: "⚠️ KG embeddings missing — /mcp is lexical-only", wrap: true });
+  }
+
   const card = {
     type: "message",
     attachments: [
@@ -498,11 +511,7 @@ async function notifyDeployTeams(webhookUrl: string, n: DeployNotification): Pro
           $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
           type: "AdaptiveCard",
           version: "1.4",
-          body: [
-            { type: "TextBlock", text: `${event.teamsIcon} ${event.title}`, weight: "Bolder", size: "Medium" },
-            { type: "TextBlock", text: event.summary, wrap: true },
-            { type: "FactSet", facts },
-          ],
+          body: cardBody,
         },
       },
     ],

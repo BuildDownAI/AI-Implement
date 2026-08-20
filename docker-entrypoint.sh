@@ -61,6 +61,14 @@ _start_sidecar() {
 if _start_sidecar; then
     export KG_SIDECAR_URL="${KG_MCP_URL}"
     printf '[kg] KG_SIDECAR_URL set to %s\n' "${KG_SIDECAR_URL}" >&2
+    # Detect degraded embeddings: marker written at build time by the fail-soft embed step,
+    # or the npz file itself is absent (belt-and-suspenders for images without the marker).
+    # out/embeddings.npz is the embed-pass output — written by kg_ingest/embed.py and read by
+    # kg_query/semantic.py in the sidecar repo; verified 2026-08-20 (operator, image v117).
+    if [ -f "${KG_DIR}/.embeddings-failed" ] || [ ! -f "${KG_DIR}/out/embeddings.npz" ]; then
+        printf '[kg] WARNING: embeddings missing — hybrid search is lexical-only\n' >&2
+        export KG_EMBEDDINGS_DEGRADED=1
+    fi
 else
     printf '[kg] continuing without sidecar; /mcp serves no kg_* tools\n' >&2
     # KG_SIDECAR_URL stays unset. /mcp still answers 401 unauthenticated, so this log is the signal.

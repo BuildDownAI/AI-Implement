@@ -407,6 +407,46 @@ describe("notifyDeploy", () => {
     });
   });
 
+  describe("kgDegraded", () => {
+    it("slack / kgDegraded=true shows warning line on deployed", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kgDegraded: true });
+      expect(slackText()).toContain("⚠️ KG embeddings missing — /mcp is lexical-only");
+    });
+
+    it("slack / kgDegraded=false emits no warning", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kgDegraded: false });
+      expect(slackText()).not.toContain("KG embeddings missing");
+    });
+
+    it("slack / kgDegraded absent emits no warning", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", deployBase);
+      expect(slackText()).not.toContain("KG embeddings missing");
+    });
+
+    it("slack / kgDegraded=true shows warning on restarted", async () => {
+      await notifyDeploy("slack", "https://webhook.example.com/slack", { ...deployBase, kind: "restarted", kgDegraded: true });
+      expect(slackText()).toContain("⚠️ KG embeddings missing — /mcp is lexical-only");
+    });
+
+    it("teams / kgDegraded=true shows warning TextBlock in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", { ...deployBase, kgDegraded: true });
+      const cardBody: Array<{ type: string; text?: string }> = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).toContain("KG embeddings missing");
+    });
+
+    it("teams / kgDegraded=false emits no warning in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", { ...deployBase, kgDegraded: false });
+      const cardBody = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).not.toContain("KG embeddings missing");
+    });
+
+    it("teams / kgDegraded absent emits no warning in card body", async () => {
+      await notifyDeploy("teams", "https://webhook.example.com/teams", deployBase);
+      const cardBody = sentBody().attachments[0].content.body;
+      expect(JSON.stringify(cardBody)).not.toContain("KG embeddings missing");
+    });
+  });
+
   describe("availability notice", () => {
     const available: DeployNotification = {
       ...deployBase,

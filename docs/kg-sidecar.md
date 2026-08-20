@@ -54,8 +54,10 @@ The mount is declared `required=false`, so a build with no secret still succeeds
 
 1. **Clone** — copies `kg_query`, `kg_ingest`, and `snapshot` plus the top-level files, then generates `start.sh` with the runtime environment baked in.
 2. **Dependency install** — creates `/app/kg/.venv` from `requirements.txt`. Absent requirements means no venv, and everything downstream skips.
-3. **Model bake** — warms the fastembed model `BAAI/bge-small-en-v1.5` into `FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache` so the running sidecar never fetches it at query time. **Soft failure** — logs `[kg] WARNING: EMBEDDINGS BUILD FAILED` and continues lexical-only.
-4. **Materialize and embed** — `kg_ingest.materialize --no-embed` produces `out/graph.trig`, then a second full pass adds semantic vectors. The graph pass is a **hard failure**: it is the one step not wrapped in a fallback, so a broken graph fails the build. The embed pass is **soft**, falling back to lexical-only search.
+3. **Model bake** — warms the fastembed model `BAAI/bge-small-en-v1.5` into `FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache` so the running sidecar never fetches it at query time. **Soft failure** — logs `[kg] WARNING: EMBEDDINGS BUILD FAILED`, writes `kg/.embeddings-failed`, and continues lexical-only.
+4. **Materialize and embed** — `kg_ingest.materialize --no-embed` produces `out/graph.trig`, then a second full pass adds semantic vectors. The graph pass is a **hard failure**: it is the one step not wrapped in a fallback, so a broken graph fails the build. The embed pass is **soft**: it writes `kg/.embeddings-failed` and falls back to lexical-only search.
+
+When `docker-entrypoint.sh` detects `kg/.embeddings-failed` at boot (or finds `out/embeddings.npz` absent as a belt-and-suspenders fallback for images built without the marker) it exports `KG_EMBEDDINGS_DEGRADED=1`, logs a warning, and the orchestrator surfaces this in two places: `GET /` returns `{"kgDegraded": true}` in the health payload, and deploy notifications include a warning line so the degraded state is visible immediately after a deploy.
 
 `start.sh` exports the same `FASTEMBED_CACHE_PATH`, so the running sidecar reads the baked cache rather than downloading on first query. `kg_hybrid_search` therefore returns results immediately on boot with no separate data-load step.
 
