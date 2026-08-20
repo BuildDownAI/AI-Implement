@@ -102,6 +102,7 @@ chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 export WORKSPACE_DIR
 RUNNER_PHASE="${RUNNER_PHASE:-implementation}"
 export RUNNER_PHASE
+# Managed gap-analysis is an implementation run with PR_NUMBER set, so it uses the default entry.
 case "$RUNNER_PHASE" in
   planning) RUNNER_ENTRY="run-planning.js" ;;
   local-planning) RUNNER_ENTRY="run-local-planning.js" ;;
