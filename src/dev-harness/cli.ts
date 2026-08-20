@@ -44,6 +44,7 @@ export async function runDevHarnessCli(
   let image: string | undefined;
   let untilStep: string | undefined;
   let shell = false;
+  let phase: "implementation" | "planning" | "full" = "implementation";
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -51,13 +52,26 @@ export async function runDevHarnessCli(
     else if ((arg === "--task" || arg === "-t") && args[i + 1]) task = args[++i] as string;
     else if (arg === "--image" && args[i + 1]) image = args[++i];
     else if (arg === "--until" && args[i + 1]) untilStep = args[++i];
+    else if (arg === "--phase") {
+      const value = args[i + 1];
+      if (value !== "implementation" && value !== "planning" && value !== "full") {
+        deps.writeStderr("Invalid --phase: expected implementation, planning, or full\n");
+        return 1;
+      }
+      phase = value;
+      i++;
+    }
     else if (arg === "--shell") shell = true;
   }
 
   if (!workspace || !task) {
     deps.writeStderr(
-      "Usage: npm run dev:run -- --workspace <dir> --task <task.md> [--image <image>] [--until <step>] [--shell]\n",
+      "Usage: npm run dev:run -- --workspace <dir> --task <task.md> [--phase implementation|planning|full] [--image <image>] [--until <step>] [--shell]\n",
     );
+    return 1;
+  }
+  if (phase !== "implementation" && (untilStep || shell)) {
+    deps.writeStderr("--until and --shell are only supported for --phase implementation\n");
     return 1;
   }
 
@@ -67,6 +81,7 @@ export async function runDevHarnessCli(
     image,
     untilStep,
     shell,
+    phase,
   });
 
   deps.writeStderr(

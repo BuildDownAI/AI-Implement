@@ -2,11 +2,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 
 const isWindows = process.platform === "win32";
 import { runLocalFullLoop } from "../local/full-loop.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
+import { getDiff } from "../pipeline/steps/feedback-loop.js";
 
 function makeMockExecutor(exitCode = 0): LLMExecutor {
   return {
@@ -248,6 +250,42 @@ describe("runLocalFullLoop", () => {
 
     expect(result.planningContext).toContain("Context data");
     expect(capturedPlanningContext).toContain("Context data");
+  });
+
+  it("keeps planning scratch files out of the implementation review diff", async () => {
+    spawnSync("git", ["init"], { cwd: ws });
+    spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: ws });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: ws });
+    writeFileSync(join(ws, "source.txt"), "original\n");
+    spawnSync("git", ["add", "source.txt"], { cwd: ws });
+    spawnSync("git", ["commit", "-m", "initial"], { cwd: ws });
+
+    let reviewedDiff = "";
+    const { pipeline, runner } = makeFeedbackLoopPipeline({
+      run: vi.fn().mockImplementation(async (ctx) => {
+        reviewedDiff = getDiff(String(ctx.data.workspaceDir));
+        return {
+          approved: true,
+          iterations: 1,
+          terminationReason: "approved",
+          passes: [],
+          finalFeedback: "",
+        };
+      }),
+    });
+
+    await runLocalFullLoop({
+      workspaceDir: ws,
+      issueIdentifier: "TEST-1",
+      issueTitle: "Test",
+      issueDescription: "Desc",
+      planningExecutor: planningExecutorWithPlan(),
+      llmExecutor: makeMockExecutor(0),
+      pipeline,
+      runner,
+    });
+
+    expect(reviewedDiff).not.toContain("ai-output/comments");
   });
 
   it("exposes phase outcomes, review status, limits, passes, and tokenSummary in the result", async () => {

@@ -16,8 +16,11 @@ import {
 } from "../local/session.js";
 import { parseTaskFileFromPath } from "./task-file.js";
 import type { ParsedTaskFile } from "./task-file.js";
+import { collectPlanningArtifact } from "./planning-artifacts.js";
 
 export type { ParsedTaskFile };
+
+export type DevRunPhase = "implementation" | "planning" | "full";
 
 export interface DevRunOptions {
   /** Absolute or relative path to the local target-repo checkout. */
@@ -38,6 +41,8 @@ export interface DevRunOptions {
   artifactsDir?: string;
   /** Extra env vars injected into the container. */
   env?: Record<string, string>;
+  /** Runner phase. Defaults to implementation. */
+  phase?: DevRunPhase;
   /**
    * Run only up through this named step (by step id), then stop. The critical
    * case is "setup": clone/mount → install → setup hook, no Claude invocation,
@@ -60,6 +65,7 @@ export interface DevRunHandle {
   startedAt: Date;
   task: ParsedTaskFile;
   workspace: string;
+  phase: DevRunPhase;
 }
 
 export interface DevRunResult {
@@ -144,11 +150,14 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
   const issueId = randomUUID();
   const runId = randomUUID();
   const containerName = sanitizeContainerName(task.identifier);
+  const phase = opts.phase ?? "implementation";
+  const runnerPhase = phase === "full" ? "implementation" : phase;
+  const entryPhase = phase === "planning" ? "local-planning" : phase;
 
   const runConfig = encodeRunConfig({
     v: 1,
     issue: { id: issueId, identifier: task.identifier, title: task.title, description: task.description },
-    runnerPhase: "implementation",
+    runnerPhase,
     baseBranch: branch,
     ...(task.maxTurns !== undefined ? { maxTurns: task.maxTurns } : {}),
     ...(task.maxIterations !== undefined ? { maxIterations: task.maxIterations } : {}),
@@ -173,7 +182,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     SESSION_TOKEN: runId,
     MACHINE_NONCE: runId,
     SESSION_MODE: "autonomous",
-    RUNNER_PHASE: "implementation",
+    RUNNER_PHASE: entryPhase,
     ...(process.getuid ? { AI_IMPLEMENT_HOST_UID: String(process.getuid()) } : {}),
     ...(process.getgid ? { AI_IMPLEMENT_HOST_GID: String(process.getgid()) } : {}),
     ...(anthropicApiKey ? { ANTHROPIC_API_KEY: anthropicApiKey } : {}),
@@ -199,6 +208,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     startedAt: session.startedAt,
     task,
     workspace,
+    phase,
   };
 }
 
@@ -269,6 +279,10 @@ export async function collectRunArtifacts(
   });
   await writeFile(join(artifactsDir, "run.log"), logs);
 
+  if (handle.phase === "planning" || handle.phase === "full") {
+    await collectPlanningArtifact(workspace, artifactsDir);
+  }
+
   const diffstatResult = spawnSync("git", ["diff", "--stat"], {
     cwd: workspace,
     stdio: ["ignore", "pipe", "pipe"],
@@ -286,6 +300,7 @@ export async function collectRunArtifacts(
     containerId: containerId.slice(0, 12),
     identifier: task.identifier,
     title: task.title,
+    phase: handle.phase,
     exitCode,
     startedAt: startedAt.toISOString(),
     endedAt: new Date().toISOString(),

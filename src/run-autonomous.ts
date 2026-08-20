@@ -18,6 +18,7 @@ import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
+import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -755,6 +756,7 @@ export async function runAutonomousLocally(
   opts: RunLocalAutonomousOptions,
 ): Promise<RunLocalAutonomousResult> {
   const workspaceDir = opts.workspaceDir;
+  prepareScratchExclusionIfGit(workspaceDir);
   const planningContext = opts.planningContext ?? "";
   const effectiveMaxTurns = opts.maxTurns ?? 50;
   const effectiveMaxIterations = opts.maxIterations ?? 3;
