@@ -232,6 +232,8 @@ describe("session/entrypoint.sh", () => {
   it("exec's the phase-selected TS runner as the final step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toContain('RUNNER_ENTRY="run-planning.js"');
+    expect(content).toContain('RUNNER_ENTRY="run-local-planning.js"');
+    expect(content).toContain('RUNNER_ENTRY="run-local-full-loop.js"');
     expect(content).toContain('RUNNER_ENTRY="run-autonomous.js"');
     expect(content).toContain('exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"');
   });

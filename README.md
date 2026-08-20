@@ -47,9 +47,9 @@ You should look elsewhere if:
 
 ## Try it locally
 
-You can run a complete implementation-and-review loop in Docker without setting up
-a tracker, GitHub App, orchestrator, or web UI. Local runs operate on a checkout you
-choose and leave the resulting file changes there for you to inspect.
+You can run a complete planning, implementation, and review loop in Docker without
+setting up a tracker, GitHub App, orchestrator, or web UI. Local runs operate on a
+checkout you choose and leave the resulting file changes there for you to inspect.
 
 You need Docker, Node 24, and one Claude credential:
 
@@ -80,11 +80,12 @@ else. It uses model credits and usually takes a few minutes:
 ```bash
 npm run dev:run -- \
   --workspace "$PWD" \
-  --task examples/local-demo/task.md
+  --task examples/local-demo/task.md \
+  --phase full
 ```
 
-The command streams the implementation and review loop. When it finishes, inspect
-what it did:
+The command plans the task, passes that plan into implementation, and runs the
+review/fix loop. When it finishes, inspect what it did:
 
 ```bash
 git status --short
@@ -103,6 +104,38 @@ git restore --staged --worktree examples/local-demo/message.txt
 
 Every run prints its artifact directory. By default, complete logs, summaries, and
 run metadata are saved under `.dev-runs/<timestamp>/` in the AI-Implement checkout.
+Planning and full-loop runs also save the assembled plan as `plan.md` there.
+
+### Exercise planning and implementation separately
+
+Use `--phase` to choose the test surface:
+
+| Phase | What it exercises |
+| --- | --- |
+| `planning` | Reads `PLANNING.md` (or the built-in planning prompt), produces a plan, and stops before implementation. |
+| `implementation` | Runs implementation and review without a planning pass. This remains the default. |
+| `full` | Runs planning, passes the exact resulting plan into implementation, and completes the review/fix loop. |
+
+For example, iterate on a repository's `PLANNING.md` without spending tokens on an
+implementation:
+
+```bash
+TARGET_REPO="$HOME/src/my-project"
+TASK_FILE="$HOME/ai-tasks/add-health-check.md"
+
+npm run dev:run -- \
+  --workspace "$TARGET_REPO" \
+  --task "$TASK_FILE" \
+  --phase planning
+```
+
+Inspect the printed artifact directory's `plan.md` to compare planning-prompt
+changes. The mounted target checkout also contains the individual planning files
+under `ai-output/comments/`; the harness adds `ai-output/` to the repository-local
+Git exclude so those scratch files do not enter the implementation diff or a commit.
+Use `--phase full` when you want to test whether those planning decisions actually
+survive the handoff into implementation. Edit `WORKFLOW.md` to iterate on
+implementation behavior independently.
 
 ### Implement a task in another local repo
 
@@ -139,14 +172,15 @@ TASK_FILE="$HOME/ai-tasks/add-health-check.md"
 cd "$AI_IMPLEMENT_DIR"
 npm run dev:run -- \
   --workspace "$TARGET_REPO" \
-  --task "$TASK_FILE"
+  --task "$TASK_FILE" \
+  --phase full
 ```
 
 `--workspace` is how you choose the repository; do not put a repository path in
 the task document. AI-Implement detects the GitHub `owner/repo` from the checkout's
 `origin` remote and uses its current branch unless the optional task field `base` is
-set. If the target repo has a `WORKFLOW.md`, the run follows it; otherwise it uses
-the built-in implementation prompt.
+set. If the target repo has `PLANNING.md` or `WORKFLOW.md`, the corresponding phase
+follows it; otherwise that phase uses its built-in prompt.
 
 Use a clean checkout or review pre-existing changes carefully. The local pipeline
 does not create a branch, commit, push, or pull request—it leaves the implementation

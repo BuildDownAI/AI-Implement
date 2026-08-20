@@ -163,6 +163,32 @@ describe("startDevRun", () => {
     expect(cfg.runnerPhase).toBe("implementation");
   });
 
+  it("routes a full run to the full-loop entry while keeping a valid implementation envelope", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    makeSpawnSyncMock("");
+
+    const handle = await startDevRun({ workspace: "/tmp/repo", task: "task.md", phase: "full" });
+
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.publicEnv["RUNNER_PHASE"]).toBe("full");
+    expect(decodeRunConfig(opts.publicEnv["AI_IMPLEMENT_RUN_CONFIG"]!).runnerPhase).toBe("implementation");
+    expect(handle.phase).toBe("full");
+  });
+
+  it("routes planning-only runs through the validating local planner", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    makeSpawnSyncMock("");
+
+    const handle = await startDevRun({ workspace: "/tmp/repo", task: "task.md", phase: "planning" });
+
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.publicEnv["RUNNER_PHASE"]).toBe("local-planning");
+    expect(decodeRunConfig(opts.publicEnv["AI_IMPLEMENT_RUN_CONFIG"]!).runnerPhase).toBe("planning");
+    expect(handle.phase).toBe("planning");
+  });
+
   it("includes profiles in the run config when the task file has profiles", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");

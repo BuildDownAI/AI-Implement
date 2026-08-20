@@ -102,13 +102,11 @@ chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 export WORKSPACE_DIR
 RUNNER_PHASE="${RUNNER_PHASE:-implementation}"
 export RUNNER_PHASE
-# Only "planning" has a dedicated entry. "implementation" and "gap-analysis"
-# both run run-autonomous.js (gap-fill is an implementation run with PR_NUMBER set),
-# so they intentionally share the default branch.
-if [ "$RUNNER_PHASE" = "planning" ]; then
-  RUNNER_ENTRY="run-planning.js"
-else
-  RUNNER_ENTRY="run-autonomous.js"
-fi
+case "$RUNNER_PHASE" in
+  planning) RUNNER_ENTRY="run-planning.js" ;;
+  local-planning) RUNNER_ENTRY="run-local-planning.js" ;;
+  full) RUNNER_ENTRY="run-local-full-loop.js" ;;
+  *) RUNNER_ENTRY="run-autonomous.js" ;;
+esac
 log "Invoking TS pipeline (node /app/dist/$RUNNER_ENTRY, phase=$RUNNER_PHASE)..."
 exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"

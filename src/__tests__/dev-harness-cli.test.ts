@@ -20,10 +20,106 @@ function makeHandle(): DevRunHandle {
       profiles: undefined,
     },
     workspace: "/tmp/workspace",
+    phase: "implementation",
   };
 }
 
 describe("runDevHarnessCli", () => {
+  it("passes planning phase through the public CLI", async () => {
+    const deps: DevHarnessCliDependencies = {
+      startDevRun: vi.fn().mockResolvedValue(makeHandle()),
+      streamLogs: vi.fn().mockResolvedValue(undefined),
+      streamLogsUntilShellReady: vi.fn(),
+      getRunStatus: vi.fn().mockResolvedValue({ exitCode: 0 }),
+      collectRunArtifacts: vi.fn().mockResolvedValue(undefined),
+      stopSession: vi.fn(),
+      spawnDocker: vi.fn(),
+      writeStdout: vi.fn(),
+      writeStderr: vi.fn(),
+      now: () => Date.now(),
+    };
+
+    await runDevHarnessCli(
+      ["--workspace", "/tmp/workspace", "--task", "/tmp/task.md", "--phase", "planning"],
+      deps,
+    );
+
+    expect(deps.startDevRun).toHaveBeenCalledWith(expect.objectContaining({ phase: "planning" }));
+  });
+
+  it("passes the full planning-to-implementation loop through the public CLI", async () => {
+    const deps: DevHarnessCliDependencies = {
+      startDevRun: vi.fn().mockResolvedValue(makeHandle()),
+      streamLogs: vi.fn().mockResolvedValue(undefined),
+      streamLogsUntilShellReady: vi.fn(),
+      getRunStatus: vi.fn().mockResolvedValue({ exitCode: 0 }),
+      collectRunArtifacts: vi.fn().mockResolvedValue(undefined),
+      stopSession: vi.fn(),
+      spawnDocker: vi.fn(),
+      writeStdout: vi.fn(),
+      writeStderr: vi.fn(),
+      now: () => Date.now(),
+    };
+
+    await runDevHarnessCli(
+      ["--workspace", "/tmp/workspace", "--task", "/tmp/task.md", "--phase", "full"],
+      deps,
+    );
+
+    expect(deps.startDevRun).toHaveBeenCalledWith(expect.objectContaining({ phase: "full" }));
+  });
+
+  it("rejects an unknown phase before starting Docker", async () => {
+    const deps: DevHarnessCliDependencies = {
+      startDevRun: vi.fn(),
+      streamLogs: vi.fn(),
+      streamLogsUntilShellReady: vi.fn(),
+      getRunStatus: vi.fn(),
+      collectRunArtifacts: vi.fn(),
+      stopSession: vi.fn(),
+      spawnDocker: vi.fn(),
+      writeStdout: vi.fn(),
+      writeStderr: vi.fn(),
+      now: () => Date.now(),
+    };
+
+    const exitCode = await runDevHarnessCli(
+      ["--workspace", "/tmp/workspace", "--task", "/tmp/task.md", "--phase", "other"],
+      deps,
+    );
+
+    expect(exitCode).toBe(1);
+    expect(deps.startDevRun).not.toHaveBeenCalled();
+    expect(deps.writeStderr).toHaveBeenCalledWith(expect.stringContaining("implementation, planning, or full"));
+  });
+
+  it.each([
+    ["--until", "setup"],
+    ["--shell"],
+  ])("rejects implementation-only option %s for a full-loop run", async (...extraArgs: string[]) => {
+    const deps: DevHarnessCliDependencies = {
+      startDevRun: vi.fn(),
+      streamLogs: vi.fn(),
+      streamLogsUntilShellReady: vi.fn(),
+      getRunStatus: vi.fn(),
+      collectRunArtifacts: vi.fn(),
+      stopSession: vi.fn(),
+      spawnDocker: vi.fn(),
+      writeStdout: vi.fn(),
+      writeStderr: vi.fn(),
+      now: () => Date.now(),
+    };
+
+    const exitCode = await runDevHarnessCli(
+      ["--workspace", "/tmp/workspace", "--task", "/tmp/task.md", "--phase", "full", ...extraArgs],
+      deps,
+    );
+
+    expect(exitCode).toBe(1);
+    expect(deps.startDevRun).not.toHaveBeenCalled();
+    expect(deps.writeStderr).toHaveBeenCalledWith(expect.stringContaining("only supported for --phase implementation"));
+  });
+
   it("collects shell-mode artifacts before removing the container", async () => {
     const events: string[] = [];
     const deps: DevHarnessCliDependencies = {
