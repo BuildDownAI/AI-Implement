@@ -6,6 +6,8 @@ Reference for `src/deploy.ts`, `scripts/provision-client.sh`, `clients/`, `.gith
 
 ## Deploy paths
 
+Every path below ships the orchestrator **and** the knowledge graph as one image: a data refresh is a code deploy, and a code deploy re-materializes the graph from the KG repository's default branch. [kg-architecture.md](kg-architecture.md#the-monolith) covers what that couples.
+
 Three ways an orchestrator gets deployed, in descending order of how often they are actually used.
 
 ### Self-deploy — the standard path
