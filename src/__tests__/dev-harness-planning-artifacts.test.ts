@@ -30,4 +30,18 @@ describe("collectPlanningArtifact", () => {
       "## Map\nChange one file.\n\n## Acceptance\nShip it.\n",
     );
   });
+
+  it("does not create plan.md when the run produced no planning comments", async () => {
+    const root = mkdtempSync(join(tmpdir(), "dev-plan-artifact-"));
+    roots.push(root);
+    const workspace = join(root, "workspace");
+    const artifactsDir = join(root, "artifacts");
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(artifactsDir, { recursive: true });
+
+    const collected = await collectPlanningArtifact(workspace, artifactsDir);
+
+    expect(collected).toBe(false);
+    expect(existsSync(join(artifactsDir, "plan.md"))).toBe(false);
+  });
 });

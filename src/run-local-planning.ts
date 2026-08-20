@@ -1,8 +1,6 @@
 import { runPlanningLocally } from "./run-planning.js";
 import { decodeRunConfig } from "./run-config.js";
-import { prepareScratchExclusion } from "./pipeline/scratch-exclude.js";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 
 export interface LocalPlanningRunnerDependencies {
   runPlanning: typeof runPlanningLocally;
@@ -25,9 +23,7 @@ export async function runLocalPlanningFromEnv(
 
   const config = decodeRunConfig(encoded);
   const workspaceDir = env.WORKSPACE_DIR ?? "/workspace";
-  if (existsSync(join(workspaceDir, ".git"))) {
-    prepareScratchExclusion(workspaceDir);
-  }
+  prepareScratchExclusionIfGit(workspaceDir);
   deps.writeStdout("[dev:run] planning: analyzing repository and writing plan artifacts\n");
   const result = await deps.runPlanning({
     workspaceDir,
