@@ -4,6 +4,8 @@ The orchestrator bundles a Python knowledge-graph sidecar that serves `kg_*` too
 
 Reference for `docker-entrypoint.sh`, the KG stages of `Dockerfile`, `src/mcp.ts`, `src/mcp-oauth.ts`, and `src/deploy.ts`. `CLAUDE.md` carries the summary and points here.
 
+This document is the orchestrator's half. For the graph's full lifecycle — the ingest stack in the KG repository, the committed snapshot format, and what it means that the orchestrator and the KG are one deployable unit — see [kg-architecture.md](kg-architecture.md).
+
 ## Deploy shape
 
 The sidecar runs **inside the orchestrator container on loopback** — no separate service, no public port, no second Fly app. `docker-entrypoint.sh` starts it on `127.0.0.1:8765`, waits for it, exports `KG_SIDECAR_URL`, and only then executes Node.
