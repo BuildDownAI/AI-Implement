@@ -361,6 +361,24 @@ describe("postBootNotice", () => {
   });
 });
 
+// ---------- isKgDegraded — the same flag read by GET / health endpoint ----------
+
+describe("isKgDegraded", () => {
+  it("returns true when KG_EMBEDDINGS_DEGRADED=1", () => {
+    vi.stubEnv("KG_EMBEDDINGS_DEGRADED", "1");
+    expect(deployNotify.isKgDegraded()).toBe(true);
+  });
+
+  it("returns false when KG_EMBEDDINGS_DEGRADED is unset", () => {
+    expect(deployNotify.isKgDegraded()).toBe(false);
+  });
+
+  it("returns false for any value other than '1'", () => {
+    vi.stubEnv("KG_EMBEDDINGS_DEGRADED", "true");
+    expect(deployNotify.isKgDegraded()).toBe(false);
+  });
+});
+
 // ---------- The two halves in sequence, which is how they actually run ----------
 
 describe("shutdown → boot cycle", () => {

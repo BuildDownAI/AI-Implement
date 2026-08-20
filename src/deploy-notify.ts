@@ -101,6 +101,10 @@ function flyImageRef(): string | null {
   return process.env.FLY_IMAGE_REF || null;
 }
 
+export function isKgDegraded(): boolean {
+  return process.env.KG_EMBEDDINGS_DEGRADED === "1";
+}
+
 function describe(kind: DeployNotification["kind"], imageRef: string, downtimeMs: number | null): DeployNotification {
   return {
     kind,
@@ -108,7 +112,7 @@ function describe(kind: DeployNotification["kind"], imageRef: string, downtimeMs
     region: process.env.FLY_REGION || null,
     imageRef,
     downtimeMs,
-    kgDegraded: process.env.KG_EMBEDDINGS_DEGRADED === "1",
+    kgDegraded: isKgDegraded(),
   };
 }
 

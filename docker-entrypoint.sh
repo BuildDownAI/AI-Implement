@@ -61,9 +61,8 @@ _start_sidecar() {
 if _start_sidecar; then
     export KG_SIDECAR_URL="${KG_MCP_URL}"
     printf '[kg] KG_SIDECAR_URL set to %s\n' "${KG_SIDECAR_URL}" >&2
-    # Detect degraded embeddings: marker written at build time by any fail-soft embed step.
-    # Belt-and-suspenders: also catch a future fail-soft path that forgets the marker.
-    if [ -f "${KG_DIR}/.embeddings-failed" ] || [ ! -f "${KG_DIR}/out/embeddings.npz" ]; then
+    # Detect degraded embeddings: marker written at build time by the fail-soft embed step.
+    if [ -f "${KG_DIR}/.embeddings-failed" ]; then
         printf '[kg] WARNING: embeddings missing — hybrid search is lexical-only\n' >&2
         export KG_EMBEDDINGS_DEGRADED=1
     fi
