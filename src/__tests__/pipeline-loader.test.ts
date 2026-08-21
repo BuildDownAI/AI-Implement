@@ -289,6 +289,7 @@ describe("loadPipelineDefinition", () => {
       repoRepo: "api",
       githubToken: "tok",
       branch: "main",
+      clonedRef: "base-sha",
     });
 
     const step = pipeline.steps.find((s) => s.id === "push")!;
@@ -301,6 +302,7 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.machineNonce).toBe("nonce");
     expect(inputs.branchName).toBe("ai-implement/eng-42-add-profile-page");
     expect(inputs.baseBranch).toBe("main");
+    expect(inputs.baseRef).toBe("base-sha");
     expect(inputs.prTitle).toBe("ENG-42: Add profile page");
   });
 

@@ -108,8 +108,9 @@ a cancelled child doesn't block the parent forever.
 - At dispatch time, `resolveBaseBranch` (`src/feature-branch.ts`) walks the chain and
   **creates each branch that doesn't exist, cut from the previous one** (or from the repo
   base for the first), returning the branch the PR should target. Branch creation is
-  idempotent and **fails open**: any GitHub error falls back to the base branch, so a
-  grouping failure never blocks the work.
+  idempotent and **fails closed for grouped work**: a GitHub error leaves the issue
+  queued for the next poll instead of silently dispatching it against the repository
+  base branch.
 
 This resolution is the same in all execution modes — the resolved branch is passed to the
 runner as the `base_branch` workflow input (GitHub Actions) or as the runner's default
@@ -251,8 +252,9 @@ Feature-branch grouping is supported on **both providers**:
   orchestrator's done-on-merge path only sets the custom field, never the native status,
   so without the OR the cascade would stall waiting for a manual status move. The gating
   children query fails **closed** (candidates are deferred for the poll rather than
-  dispatched prematurely); the branch-targeting ancestor walk fails **open** (chains
-  default to the base branch).
+  dispatched prematurely). Jira's provider-side ancestor discovery still fails open
+  when it cannot discover a chain; once a non-empty chain is attached, remote branch
+  materialization fails closed and leaves the issue queued rather than targeting base.
 
 ---
 

@@ -190,6 +190,7 @@ function applyWiring(step: YamlStep): StepDefinition {
             machineNonce: ctx.data.nonce,
             branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
             baseBranch: ctx.getOutputs("clone").branch,
+            baseRef: ctx.getOutputs("clone").clonedRef,
             prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
             sensitiveFiles: ctx.data.sensitiveFiles,
             groupingParent: ctx.data.groupingParent,

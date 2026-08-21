@@ -2,6 +2,7 @@ import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
+import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 
 interface ReviewInputs extends Record<string, unknown> {
   model?: string;
@@ -89,6 +90,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     const result = await context.llmExecutor.invoke({
       prompt,
       model: model ?? "claude-sonnet-4-6",
+      tools: READ_ONLY_ALLOWED_TOOLS,
     });
 
     if (result.exitCode !== 0) {

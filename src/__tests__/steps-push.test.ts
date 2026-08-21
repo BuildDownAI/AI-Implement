@@ -29,6 +29,7 @@ const BASE_INPUTS = {
   githubToken: "gh-token",
   branchName: "ai-implement/eng-42-feature",
   baseBranch: "main",
+  baseRef: "main",
 };
 
 function spawnResult(status: number, stdout = "", stderr = ""): ReturnType<typeof spawnSync> {
@@ -728,6 +729,15 @@ describe("pushStep", () => {
     expect(spawnSync).not.toHaveBeenCalled();
   });
 
+  it("fails closed when the immutable clone ref is missing", async () => {
+    const { baseRef: _baseRef, ...missingBaseRef } = BASE_INPUTS;
+
+    await expect(
+      pushStep.run(makeContext(), missingBaseRef, new NoopStepReporter()),
+    ).rejects.toThrow(/Missing immutable base ref/);
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
   it("logs a token-redacted push trace at stream log level", async () => {
     const prev = process.env.AI_IMPLEMENT_LOG_LEVEL;
     process.env.AI_IMPLEMENT_LOG_LEVEL = "stream";
@@ -955,6 +965,53 @@ describe("pushStep — Case A (agent-committed changes)", () => {
     expect(spawnSync).not.toHaveBeenCalledWith(
       "git", expect.arrayContaining(["commit"]), expect.anything(),
     );
+  });
+
+  it("uses the immutable clone ref when the agent committed on the checked-out grouped base", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, "");
+      if (gitArgs[0] === "rev-list") {
+        return spawnResult(0, gitArgs.includes("clone-sha..HEAD") ? "1\n" : "0\n");
+      }
+      if (gitArgs[0] === "diff" && gitArgs[1] === "--diff-filter=d") {
+        return spawnResult(0, "src/app.ts\n");
+      }
+      if (gitArgs[0] === "diff" && gitArgs[1] === "--name-status") {
+        return spawnResult(0, "M\tsrc/app.ts\n");
+      }
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "agent-commit\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, "");
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/21", number: 21 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        branchName: "ai-implement/ans-901-field-links",
+        baseBranch: "ai-implement/feature/ans-899",
+        baseRef: "clone-sha",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["rev-list", "--count", "clone-sha..HEAD"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    const [, request] = vi.mocked(fetch).mock.calls[0];
+    expect(JSON.parse(String(request?.body))).toEqual(expect.objectContaining({
+      head: "ai-implement/ans-901-field-links",
+      base: "ai-implement/feature/ans-899",
+    }));
   });
 
   it("runs the sensitive-file guard against the committed diff in Case A", async () => {

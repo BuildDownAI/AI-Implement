@@ -88,14 +88,14 @@ describe("resolveBaseBranch", () => {
     expect(vi.mocked(fetch).mock.calls.length).toBe(0);
   });
 
-  it("fails open to defaultBranch when branch creation errors", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("fails closed when a grouped branch cannot be resolved", async () => {
     vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "boom" } as Response);
 
-    const base = await resolveBaseBranch({ ghToken: "t", issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]), mapping: makeMapping() });
-
-    expect(base).toBe("testing");
-    expect(warn).toHaveBeenCalled();
+    await expect(resolveBaseBranch({
+      ghToken: "t",
+      issue: makeIssue([{ identifier: "OOL-78", mode: "feature" }]),
+      mapping: makeMapping(),
+    })).rejects.toThrow(/refusing to dispatch against "testing"/);
   });
 });
 
