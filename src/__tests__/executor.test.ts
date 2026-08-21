@@ -72,6 +72,7 @@ printf '%s\n' "\${GITHUB_TOKEN-unset}" > "${binDir}/github-token.txt"
 printf '%s\n' "\${GH_TOKEN-unset}" > "${binDir}/gh-token.txt"
 printf '%s\n' "\${GH_ENTERPRISE_TOKEN-unset}" > "${binDir}/gh-enterprise-token.txt"
 printf '%s\n' "\${GITHUB_ENTERPRISE_TOKEN-unset}" > "${binDir}/github-enterprise-token.txt"
+printf '%s\n' "\${GIT_PASSWORD-unset}" > "${binDir}/git-password.txt"
 git remote get-url origin > "${binDir}/origin-url.txt" 2>/dev/null || true
 printf '%s\n' '${resultLine}'
 exit 0
@@ -228,6 +229,7 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     vi.stubEnv("GH_TOKEN", "gh-write-token");
     vi.stubEnv("GH_ENTERPRISE_TOKEN", "gh-enterprise-write-token");
     vi.stubEnv("GITHUB_ENTERPRISE_TOKEN", "github-enterprise-write-token");
+    vi.stubEnv("GIT_PASSWORD", "git-write-password");
     const tokenizedOrigin = "https://x-access-token:github-write-token@github.com/acme/app.git";
     execFileSync("git", ["init", "-q"], { cwd: binDir });
     execFileSync("git", ["remote", "add", "origin", tokenizedOrigin], { cwd: binDir });
@@ -238,6 +240,7 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(readFileSync(join(binDir, "gh-token.txt"), "utf-8").trim()).toBe("unset");
     expect(readFileSync(join(binDir, "gh-enterprise-token.txt"), "utf-8").trim()).toBe("unset");
     expect(readFileSync(join(binDir, "github-enterprise-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "git-password.txt"), "utf-8").trim()).toBe("unset");
     expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe("https://github.com/acme/app.git");
     expect(execFileSync("git", ["remote", "get-url", "origin"], { cwd: binDir, encoding: "utf-8" }).trim()).toBe(tokenizedOrigin);
   });
@@ -256,5 +259,20 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(readFileSync(join(binDir, "github-token.txt"), "utf-8").trim()).toBe("github-write-token");
     expect(readFileSync(join(binDir, "gh-token.txt"), "utf-8").trim()).toBe("gh-write-token");
     expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe(tokenizedOrigin);
+  });
+
+  it("leaves SSH origins unchanged while withholding environment credentials", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installEnvironmentRecordingClaude();
+    vi.stubEnv("GITHUB_TOKEN", "github-write-token");
+    const sshOrigin = "ssh://git@github.com/acme/app.git";
+    execFileSync("git", ["init", "-q"], { cwd: binDir });
+    execFileSync("git", ["remote", "add", "origin", sshOrigin], { cwd: binDir });
+
+    await new ClaudeCliExecutor(binDir, "summary", false).invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "github-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe(sshOrigin);
+    expect(execFileSync("git", ["remote", "get-url", "origin"], { cwd: binDir, encoding: "utf-8" }).trim()).toBe(sshOrigin);
   });
 });

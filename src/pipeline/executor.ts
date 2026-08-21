@@ -40,6 +40,7 @@ function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null
   } catch {
     return null;
   }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
   if (!parsed.username && !parsed.password) return null;
 
   parsed.username = "";

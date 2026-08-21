@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -31,6 +31,25 @@ function makeMockExecutor(exitCode = 0): LLMExecutor {
   return {
     invoke: vi.fn().mockResolvedValue({ stdout: "", exitCode, tokensUsed: 0 }),
   };
+}
+
+function installCredentialRecordingClaude(workspaceDir: string): string {
+  const tokenPath = join(workspaceDir, "claude-github-token.txt");
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    result: "ok",
+    num_turns: 1,
+    duration_ms: 1,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const claudePath = join(workspaceDir, "claude");
+  writeFileSync(
+    claudePath,
+    `#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s\\n' "\${GITHUB_TOKEN-unset}" > ${JSON.stringify(tokenPath)}\nprintf '%s\\n' '${resultLine}'\n`,
+  );
+  chmodSync(claudePath, 0o755);
+  return tokenPath;
 }
 
 function makeSingleStepPipeline(stepId: string, mod: StepModule): {
@@ -131,6 +150,26 @@ describe("runAutonomous", () => {
     });
 
     expect(result.exitCode).toBe(1);
+  });
+
+  it.each([
+    { label: "initial implementation", prNumber: "", expectedToken: "unset" },
+    { label: "gap-fill", prNumber: "42", expectedToken: REQUIRED_ENV.GITHUB_TOKEN },
+  ])("routes repository write authority for $label runs", async ({ prNumber, expectedToken }) => {
+    const tokenPath = installCredentialRecordingClaude(workspaceDir);
+    vi.stubEnv("PATH", `${workspaceDir}:${process.env.PATH ?? ""}`);
+    vi.stubEnv("PR_NUMBER", prNumber);
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        await ctx.llmExecutor.invoke({ prompt: "record credentials", model: "claude-test" });
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("record-credentials", mod);
+
+    await runAutonomous({ workspaceDir, pipeline, runner, reporter: new NoopStepReporter() });
+
+    expect(readFileSync(tokenPath, "utf-8").trim()).toBe(expectedToken);
   });
 
   it("uses the checked-out branch when GITHUB_DEFAULT_BRANCH is not set", async () => {
