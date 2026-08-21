@@ -27,6 +27,8 @@ interface PushInputs extends Record<string, unknown> {
   machineNonce?: string;
   branchName: string;
   baseBranch?: string;
+  /** Immutable commit checked out at clone time. Used for diff/ahead checks even if the agent commits on the base branch. */
+  baseRef?: string;
   prTitle?: string;
   implementationSummary?: string;
   testsSummary?: string;
@@ -68,6 +70,10 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     if (!baseBranch) {
       throw new Error("Missing base branch for PR creation");
     }
+    const baseRef = String(inputs.baseRef ?? "").trim();
+    if (!baseRef) {
+      throw new Error("Missing immutable base ref for implementation diff");
+    }
     const prTitle = String(inputs.prTitle ?? `${issueIdentifier}: ${issueTitle || "AI implementation"}`);
 
     if (!branchName || branchName === baseBranch) {
@@ -79,7 +85,7 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     const hasWTChanges = hasWorkingTreeChanges(workspaceDir, githubToken);
     // Only check commits-ahead when working tree is clean: if there ARE working-tree changes
     // we always take the standard add→commit path regardless of prior commits.
-    const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseBranch, githubToken);
+    const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseRef, githubToken);
 
     if (!hasWTChanges && !agentCommitted) {
       if (inputs.groupingParent) {
@@ -127,19 +133,19 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
       commitSha = resolveCommitSha(workspaceDir);
     }
 
-    // Authoritative sensitive-file guard: scan the FULL committed diff (baseBranch..HEAD) —
+    // Authoritative sensitive-file guard: scan the FULL committed diff (baseRef..HEAD) —
     // the complete set of files that will land in the PR — before push. This closes the
     // mixed commit+working-tree gap where the standard path's --cached scan (newly-staged
     // files only) would miss files the agent committed itself earlier in the run (present in
     // HEAD but not the index). --diff-filter=d allows intentional deletions (e.g. removing a
     // committed secret); getCommittedDiffFiles fails closed on git error.
-    const committedDiffFiles = getCommittedDiffFiles(workspaceDir, baseBranch, githubToken);
+    const committedDiffFiles = getCommittedDiffFiles(workspaceDir, baseRef, githubToken);
     const committedSensitiveHits = findSensitiveFiles(committedDiffFiles, inputs.sensitiveFiles);
     if (committedSensitiveHits.length > 0) {
       throw new SensitiveFilesError(committedSensitiveHits);
     }
 
-    const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken, agentCommitted ? baseBranch : undefined);
+    const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken, agentCommitted ? baseRef : undefined);
     const prBody = buildPullRequestBody(context, inputs, changedFilesSummary);
 
     // The dispatch-time installation token may already be close to its one-hour

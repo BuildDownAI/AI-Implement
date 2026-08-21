@@ -9,6 +9,7 @@ import {
   formatReviewLedgerForPrompt,
   type ReviewLedgerFinding,
 } from "../review-ledger.js";
+import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -805,7 +806,12 @@ ${diffRes.stdout}
 
 Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string", "location": "file/function; omit when unknown", "problem": "full failing behavior", "required_fix": "full required fix"}], "score": int, "progress_delta": int, "feedback": "string"}.`;
 
-      const reviewResult = await context.llmExecutor.invoke({ prompt: reviewPrompt, model, maxTurns: REVIEW_MAX_TURNS });
+      const reviewResult = await context.llmExecutor.invoke({
+        prompt: reviewPrompt,
+        model,
+        maxTurns: REVIEW_MAX_TURNS,
+        tools: READ_ONLY_ALLOWED_TOOLS,
+      });
       if (reviewResult.exitCode !== 0) {
         terminationReason = "review_failed";
         const failure = `Reviewer LLM failed (${llmResultMessage(reviewResult)})`;

@@ -27,9 +27,10 @@ import { buildGroupingBranchName } from "./pipeline/branch-name.js";
  * `ensureBranchExists` is idempotent (422-tolerant), so an existing ancestor branch is
  * reused and only the missing tip of the chain is cut.
  *
- * Fails open: any error (branch creation, GitHub API) logs a warning and returns
- * mapping.defaultBranch so the issue still dispatches. Grouping is an enhancement,
- * not a gate.
+ * Fails closed for grouped issues: dispatching against mapping.defaultBranch after
+ * a resolution error would bypass the grouping contract and can open the child PR
+ * against the wrong base. The poller's outer issue guard logs the error and leaves
+ * the issue queued for a later retry.
  */
 export async function resolveBaseBranch(opts: {
   ghToken: string;
@@ -51,12 +52,12 @@ export async function resolveBaseBranch(opts: {
     }
     return target;
   } catch (err) {
-    console.warn(
-      `[poll] Feature-branch resolution failed for ${issue.identifier} ` +
-        `(chain ${chain.map((e) => `${e.mode}:${e.identifier}`).join(" -> ")}); falling back to base branch "${mapping.defaultBranch}":`,
-      err,
+    throw new Error(
+      `Feature-branch resolution failed for ${issue.identifier} ` +
+        `(chain ${chain.map((e) => `${e.mode}:${e.identifier}`).join(" -> ")}); ` +
+        `refusing to dispatch against "${mapping.defaultBranch}"`,
+      { cause: err },
     );
-    return mapping.defaultBranch;
   }
 }
 

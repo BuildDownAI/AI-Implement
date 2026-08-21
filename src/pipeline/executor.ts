@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { LLMExecutor, LLMResult, LogLevel } from "./types.js";
 import {
   parseLine,
@@ -8,6 +9,61 @@ import {
   summaryLine,
   type StreamEvent,
 } from "./claude-stream.js";
+
+const GITHUB_WRITE_CREDENTIAL_KEYS = [
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GIT_PASSWORD",
+] as const;
+
+function claudeEnvironment(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (!allowRepositoryWrites) {
+    for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
+  }
+  return env;
+}
+
+function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
+  const current = spawnSync("git", ["remote", "get-url", "origin"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (current.status !== 0) return null;
+
+  const originalRemote = current.stdout.toString().trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(originalRemote);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (!parsed.username && !parsed.password) return null;
+
+  parsed.username = "";
+  parsed.password = "";
+  const protectedRemote = parsed.toString();
+  const protect = spawnSync("git", ["remote", "set-url", "origin", protectedRemote], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (protect.status !== 0) {
+    throw new Error("Failed to remove the repository write credential before invoking Claude");
+  }
+
+  return () => {
+    const restore = spawnSync("git", ["remote", "set-url", "origin", originalRemote], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (restore.status !== 0) {
+      throw new Error("Failed to restore the repository credential after invoking Claude");
+    }
+  };
+}
 
 /**
  * Shells out to the Claude Code CLI in stream-json mode. Each JSONL event is
@@ -20,6 +76,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
   constructor(
     private readonly workspaceDir: string,
     private readonly logLevel: LogLevel = "summary",
+    private readonly allowRepositoryWrites = false,
   ) {}
 
   invoke(params: {
@@ -28,7 +85,22 @@ export class ClaudeCliExecutor implements LLMExecutor {
     maxTurns?: number;
     tools?: string[];
   }): Promise<LLMResult> {
+    let restoreOrigin: (() => void) | null = null;
+    if (!this.allowRepositoryWrites) {
+      try {
+        restoreOrigin = suspendOriginWriteCredential(this.workspaceDir);
+      } catch (err) {
+        return Promise.reject(err);
+      }
+    }
+
     return new Promise((resolve, reject) => {
+      let originRestored = false;
+      const restoreProtectedOrigin = (): void => {
+        if (originRestored) return;
+        originRestored = true;
+        restoreOrigin?.();
+      };
       const args: string[] = [
         "--dangerously-skip-permissions",
         "--output-format",
@@ -46,11 +118,22 @@ export class ClaudeCliExecutor implements LLMExecutor {
       // `claude -p` reads the prompt from stdin, so there is no size ceiling.
       args.push("-p");
 
-      const proc = spawn("claude", args, {
-        cwd: this.workspaceDir,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env },
-      });
+      let proc: ChildProcessWithoutNullStreams;
+      try {
+        proc = spawn("claude", args, {
+          cwd: this.workspaceDir,
+          stdio: ["pipe", "pipe", "pipe"],
+          env: claudeEnvironment(this.allowRepositoryWrites),
+        });
+      } catch (err) {
+        try {
+          restoreProtectedOrigin();
+          reject(err);
+        } catch (restoreErr) {
+          reject(restoreErr);
+        }
+        return;
+      }
 
       const events: StreamEvent[] = [];
       const stderrChunks: Buffer[] = [];
@@ -61,7 +144,12 @@ export class ClaudeCliExecutor implements LLMExecutor {
         // EPIPE here means the child exited before consuming the prompt. Mark
         // settled so the close handler doesn't log a phantom success summary.
         settled = true;
-        reject(err);
+        try {
+          restoreProtectedOrigin();
+          reject(err);
+        } catch (restoreErr) {
+          reject(restoreErr);
+        }
       });
       proc.stdin.end(params.prompt);
 
@@ -95,6 +183,12 @@ export class ClaudeCliExecutor implements LLMExecutor {
         if (stderr.trim()) console.error("[claude] stderr:", stderr.trim());
         const telemetry = extractTelemetry(events);
         console.log(summaryLine(telemetry));
+        try {
+          restoreProtectedOrigin();
+        } catch (err) {
+          reject(err);
+          return;
+        }
         resolve({
           stdout: finalText(events),
           stderr,
@@ -106,7 +200,12 @@ export class ClaudeCliExecutor implements LLMExecutor {
 
       proc.on("error", (err) => {
         settled = true;
-        reject(err);
+        try {
+          restoreProtectedOrigin();
+          reject(err);
+        } catch (restoreErr) {
+          reject(restoreErr);
+        }
       });
     });
   }

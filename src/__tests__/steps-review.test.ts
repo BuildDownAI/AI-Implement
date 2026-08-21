@@ -123,6 +123,16 @@ describe("reviewStep", () => {
     );
   });
 
+  it("constrains review sessions to read-only tools", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+
+    await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
+
+    expect(executor.invoke).toHaveBeenCalledWith(expect.objectContaining({
+      tools: ["Read", "Glob", "Grep", "Bash(curl *)"],
+    }));
+  });
+
   it("throws when executor returns non-zero exit code", async () => {
     const executor = makeExecutor("", 1);
     await expect(

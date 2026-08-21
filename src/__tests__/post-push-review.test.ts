@@ -211,7 +211,14 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("cap") && c.includes("Blocking issues:\n1. bug"))).toBe(true);
     expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({ maxTurns: 12 }),
+      expect.objectContaining({
+        maxTurns: 12,
+        tools: ["Read", "Glob", "Grep", "Bash(curl *)"],
+      }),
+    );
+    expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
+      2,
+      expect.not.objectContaining({ tools: expect.anything() }),
     );
   });
 

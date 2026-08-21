@@ -4,6 +4,7 @@ const isWindows = process.platform === "win32";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 
 let binDir: string;
@@ -57,6 +58,30 @@ exit 0
   chmodSync(path, 0o755);
 }
 
+function installEnvironmentRecordingClaude(): void {
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    result: "ok",
+    num_turns: 1,
+    duration_ms: 1,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const script = `#!/usr/bin/env bash
+printf '%s\n' "\${GITHUB_TOKEN-unset}" > "${binDir}/github-token.txt"
+printf '%s\n' "\${GH_TOKEN-unset}" > "${binDir}/gh-token.txt"
+printf '%s\n' "\${GH_ENTERPRISE_TOKEN-unset}" > "${binDir}/gh-enterprise-token.txt"
+printf '%s\n' "\${GITHUB_ENTERPRISE_TOKEN-unset}" > "${binDir}/github-enterprise-token.txt"
+printf '%s\n' "\${GIT_PASSWORD-unset}" > "${binDir}/git-password.txt"
+git remote get-url origin > "${binDir}/origin-url.txt" 2>/dev/null || true
+printf '%s\n' '${resultLine}'
+exit 0
+`;
+  const path = join(binDir, "claude");
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
 const SUCCESS_LINES = [
   JSON.stringify({ type: "system", subtype: "init", model: "claude-x", cwd: "/workspace" }),
   JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pnpm check" } }] } }),
@@ -72,6 +97,7 @@ beforeEach(() => {
 afterEach(() => {
   process.env.PATH = originalPath;
   rmSync(binDir, { recursive: true, force: true });
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -194,5 +220,59 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(argv).toContain("claude-sonnet-4-6");
     expect(argv).toContain("--max-turns");
     expect(argv).toContain("7");
+  });
+
+  it("withholds GitHub write credentials from initial implementation sessions", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installEnvironmentRecordingClaude();
+    vi.stubEnv("GITHUB_TOKEN", "github-write-token");
+    vi.stubEnv("GH_TOKEN", "gh-write-token");
+    vi.stubEnv("GH_ENTERPRISE_TOKEN", "gh-enterprise-write-token");
+    vi.stubEnv("GITHUB_ENTERPRISE_TOKEN", "github-enterprise-write-token");
+    vi.stubEnv("GIT_PASSWORD", "git-write-password");
+    const tokenizedOrigin = "https://x-access-token:github-write-token@github.com/acme/app.git";
+    execFileSync("git", ["init", "-q"], { cwd: binDir });
+    execFileSync("git", ["remote", "add", "origin", tokenizedOrigin], { cwd: binDir });
+
+    await new ClaudeCliExecutor(binDir, "summary", false).invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "github-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "gh-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "gh-enterprise-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "github-enterprise-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "git-password.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe("https://github.com/acme/app.git");
+    expect(execFileSync("git", ["remote", "get-url", "origin"], { cwd: binDir, encoding: "utf-8" }).trim()).toBe(tokenizedOrigin);
+  });
+
+  it("preserves GitHub credentials for gap-fill sessions that own their existing PR branch", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installEnvironmentRecordingClaude();
+    vi.stubEnv("GITHUB_TOKEN", "github-write-token");
+    vi.stubEnv("GH_TOKEN", "gh-write-token");
+    const tokenizedOrigin = "https://x-access-token:github-write-token@github.com/acme/app.git";
+    execFileSync("git", ["init", "-q"], { cwd: binDir });
+    execFileSync("git", ["remote", "add", "origin", tokenizedOrigin], { cwd: binDir });
+
+    await new ClaudeCliExecutor(binDir, "summary", true).invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "github-token.txt"), "utf-8").trim()).toBe("github-write-token");
+    expect(readFileSync(join(binDir, "gh-token.txt"), "utf-8").trim()).toBe("gh-write-token");
+    expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe(tokenizedOrigin);
+  });
+
+  it("leaves SSH origins unchanged while withholding environment credentials", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installEnvironmentRecordingClaude();
+    vi.stubEnv("GITHUB_TOKEN", "github-write-token");
+    const sshOrigin = "ssh://git@github.com/acme/app.git";
+    execFileSync("git", ["init", "-q"], { cwd: binDir });
+    execFileSync("git", ["remote", "add", "origin", sshOrigin], { cwd: binDir });
+
+    await new ClaudeCliExecutor(binDir, "summary", false).invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "github-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe(sshOrigin);
+    expect(execFileSync("git", ["remote", "get-url", "origin"], { cwd: binDir, encoding: "utf-8" }).trim()).toBe(sshOrigin);
   });
 });
