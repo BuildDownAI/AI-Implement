@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import type * as DeployModule from "../deploy.js";
 
 let deploy: typeof DeployModule;
@@ -17,6 +18,7 @@ beforeEach(async () => {
 const ARGS = {
   app: "orchestrator",
   kgToken: "kg-token",
+  kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
   sourceCommit: "abc1234",
   sourceRepo: "Owner/Repo",
   sourceBranch: "testing",
@@ -41,6 +43,7 @@ describe("deployArgs", () => {
     // Without the secret the KG clone fail-softs and /mcp ships dead.
     expect(args).toContain("--build-secret");
     expect(args).toContain("kg_token=kg-token");
+    expect(args).toContain("KG_SOURCE_REPO=BuildDownAI/knowledge-graph-ai-implement");
     // A build secret is not part of the layer cache key, so a repeat deploy would
     // otherwise reuse a stale, possibly sidecar-less layer.
     expect(args).toContain("--no-cache");
@@ -63,6 +66,49 @@ describe("deployArgs", () => {
     expect(() => deploy.deployArgs({ ...ARGS, [field]: "" })).toThrow(
       new RegExp(`empty ${field}`),
     );
+  });
+
+  it("accepts a configured project-specific KG repo", () => {
+    const args = deploy.deployArgs({ ...ARGS, kgSourceRepo: "Answer9-llc/knowledge-graph-answer9-app" });
+    expect(args).toContain("KG_SOURCE_REPO=Answer9-llc/knowledge-graph-answer9-app");
+  });
+
+  it.each([
+    "https://github.com/Answer9-llc/knowledge-graph-answer9-app",
+    "Answer9-llc/knowledge-graph-answer9-app.git;echo nope",
+    "Answer9-llc",
+    "Answer9-llc/knowledge-graph-answer9-app/extra",
+    "../knowledge-graph-answer9-app",
+  ])("rejects malformed KG source repo %s", (kgSourceRepo) => {
+    expect(() => deploy.deployArgs({ ...ARGS, kgSourceRepo })).toThrow(/KG_SOURCE_REPO/);
+  });
+});
+
+describe("readKgSourceRepo", () => {
+  it("uses the backwards-compatible default when the setting is absent", () => {
+    expect(deploy.readKgSourceRepo(undefined)).toBe("BuildDownAI/knowledge-graph-ai-implement");
+  });
+
+  it("accepts a valid project-specific repository", () => {
+    expect(deploy.readKgSourceRepo("Answer9-llc/knowledge-graph-answer9-app")).toBe(
+      "Answer9-llc/knowledge-graph-answer9-app",
+    );
+  });
+
+  it("warns and disables self-deploy for a malformed explicit value", () => {
+    const warn = vi.fn();
+    expect(deploy.readKgSourceRepo("https://github.com/Answer9-llc/kg", warn)).toBeNull();
+    expect(warn).toHaveBeenCalledWith("[deploy] invalid KG_SOURCE_REPO; self-deploy disabled");
+  });
+});
+
+describe("Dockerfile KG source repo wiring", () => {
+  it("persists the KG_SOURCE_REPO build arg into the runtime image for later self-deploys", () => {
+    const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
+
+    expect(dockerfile).toContain("ARG KG_SOURCE_REPO=BuildDownAI/knowledge-graph-ai-implement");
+    expect(dockerfile).toContain("ENV KG_SOURCE_REPO=$KG_SOURCE_REPO");
+    expect(dockerfile).toContain('[ "$kg_owner" = "$KG_SOURCE_REPO" ]');
   });
 });
 
@@ -89,13 +135,14 @@ describe("makeStartDeploy", () => {
     pollIntervalMs: 60_000,
     githubAppId: "1",
     githubAppPrivateKey: "key",
+    kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
   };
 
   it("returns a starter when everything a deploy needs is present", () => {
     expect(typeof deploy.makeStartDeploy(configured)).toBe("function");
   });
 
-  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget"] as const)(
+  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget", "kgSourceRepo"] as const)(
     "returns undefined when %s is missing, so the route answers 501",
     (field) => {
       // Undefined here is what distinguishes "cannot deploy" from "deploy failed" —
@@ -174,13 +221,14 @@ describe("canSelfDeploy", () => {
     pollIntervalMs: 60_000,
     githubAppId: "1",
     githubAppPrivateKey: "key",
+    kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
   };
 
   it("is true when a token, an app and build stamps are all present", () => {
     expect(deploy.canSelfDeploy(configured)).toBe(true);
   });
 
-  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget"] as const)(
+  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget", "kgSourceRepo"] as const)(
     "is false without %s",
     (field) => {
       // The predicate is the single definition of "can this orchestrator deploy itself",
@@ -249,6 +297,7 @@ describe("makeStartDeploy onBuildFailure callback", () => {
       pollIntervalMs: 60_000,
       githubAppId: "1",
       githubAppPrivateKey: "key",
+      kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
       onBuildFailure,
     })!;
 

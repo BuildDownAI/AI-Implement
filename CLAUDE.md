@@ -56,6 +56,9 @@ Bindings for the KG skills (bd-kg-search, kg recon — format: skills `plugin/sk
 - kg.local_search_tool: mcp__ai-implement-kg__kg_hybrid_search
 - kg.prefer:       orchestrator
 
+Project-specific orchestrator instances can override the bundled graph with `KG_SOURCE_REPO=owner/repo`.
+The value is a GitHub repo identifier, not a URL; see `docs/kg-sidecar.md`.
+
 ## Architecture
 
 ```

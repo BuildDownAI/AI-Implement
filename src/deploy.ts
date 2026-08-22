@@ -14,6 +14,7 @@ import type { SelfDeployTarget } from "./deploy-availability.js";
 export interface DeployArgsInput {
   app: string;
   kgToken: string;
+  kgSourceRepo: string;
   sourceCommit: string;
   sourceRepo: string;
   sourceBranch: string;
@@ -29,6 +30,7 @@ export interface RunDeployInput {
   commit: string;
   githubAppId: string;
   githubAppPrivateKey: string;
+  kgSourceRepo: string;
   pollIntervalMs: number;
 }
 
@@ -44,11 +46,50 @@ const FLYCTL_SHA256: Record<string, string> = {
 // Only the tail of flyctl's output is kept: flyctl's errors land at the end, the head is apt output.
 const FLYCTL_LOG_TAIL_BYTES = 64 * 1024;
 
-// The KG repository the image clones at build time. The Dockerfile holds the other
-// copy of this; the two must agree or the scoped token cannot read it and the build
-// fail-softs to a sidecar-less image.
-const KG_OWNER = "BuildDownAI";
-const KG_REPO = "knowledge-graph-ai-implement";
+// The KG repository the image clones at build time unless a deployment overrides it.
+// The Dockerfile holds the same default. Keep them in sync.
+export const DEFAULT_KG_SOURCE_REPO = "BuildDownAI/knowledge-graph-ai-implement";
+
+export interface KgSourceRepo {
+  owner: string;
+  repo: string;
+  fullName: string;
+}
+
+const GITHUB_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const GITHUB_REPO_RE = /^[A-Za-z0-9._-]+$/;
+
+export function parseKgSourceRepo(value: string | null | undefined): KgSourceRepo {
+  const raw = (value || DEFAULT_KG_SOURCE_REPO).trim();
+  const parts = raw.split("/");
+  if (parts.length !== 2) {
+    throw new Error(`[deploy] KG_SOURCE_REPO must be an owner/repo GitHub repository, got "${raw}"`);
+  }
+
+  const [owner, repo] = parts;
+  if (!GITHUB_OWNER_RE.test(owner) || !GITHUB_REPO_RE.test(repo) || repo.length > 100) {
+    throw new Error(`[deploy] KG_SOURCE_REPO must be an owner/repo GitHub repository, got "${raw}"`);
+  }
+
+  return { owner, repo, fullName: `${owner}/${repo}` };
+}
+
+/**
+ * Resolve the configured KG repository without making a typo fatal to the
+ * orchestrator. An invalid explicit value disables self-deploy rather than
+ * silently switching a project instance back to the default graph.
+ */
+export function readKgSourceRepo(
+  value: string | null | undefined,
+  warn: (message: string) => void = console.warn,
+): string | null {
+  try {
+    return parseKgSourceRepo(value).fullName;
+  } catch {
+    warn("[deploy] invalid KG_SOURCE_REPO; self-deploy disabled");
+    return null;
+  }
+}
 
 const DEPLOY_TIMEOUT_MS = 20 * 60 * 1000;
 // A runner job is force-terminated 60 minutes after its dispatch,
@@ -65,7 +106,8 @@ const DRAIN_TIMEOUT_MS = 75 * 60 * 1000;
 * machine is touched — comes back to this function.
 */
 export async function runDeploy(input: RunDeployInput): Promise<void> {
-  const { app, flyDeployToken, owner, repo, branch, commit, githubAppId, githubAppPrivateKey, pollIntervalMs } = input;
+  const { app, flyDeployToken, owner, repo, branch, commit, githubAppId, githubAppPrivateKey, kgSourceRepo, pollIntervalMs } = input;
+  const kgSource = parseKgSourceRepo(kgSourceRepo);
   
   setDeployHold();
   try {
@@ -85,9 +127,9 @@ export async function runDeploy(input: RunDeployInput): Promise<void> {
       scratch,
     );
     
-    const kg = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, KG_OWNER, {
+    const kg = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, kgSource.owner, {
       permissions: { contents: "read" },
-      repositories: [KG_REPO],
+      repositories: [kgSource.repo],
     });
     
     console.log(`[deploy] deploying ${owner}/${repo}@${commit.slice(0, 7)} to ${app}`);
@@ -96,6 +138,7 @@ export async function runDeploy(input: RunDeployInput): Promise<void> {
       deployArgs({
         app,
         kgToken: kg.token,
+        kgSourceRepo: kgSource.fullName,
         sourceCommit: commit,
         sourceRepo: `${owner}/${repo}`,
         sourceBranch: branch,
@@ -212,6 +255,7 @@ export function deployArgs(input: DeployArgsInput): string[] {
     "--no-cache",
     // --build-secret takes only NAME=VALUE, so the token rides in argv; execFile runs flyctl without a shell.
     "--build-secret", `kg_token=${input.kgToken}`,
+    "--build-arg", `KG_SOURCE_REPO=${parseKgSourceRepo(input.kgSourceRepo).fullName}`,
     "--build-arg", `SOURCE_COMMIT=${input.sourceCommit}`,
     "--build-arg", `SOURCE_REPO=${input.sourceRepo}`,
     "--build-arg", `SOURCE_BRANCH=${input.sourceBranch}`,
@@ -297,15 +341,17 @@ export interface StartDeployConfig {
   pollIntervalMs: number;
   githubAppId: string;
   githubAppPrivateKey: string;
+  kgSourceRepo: string | null;
   /** Called when the build or release step fails, so the caller can record the outcome. */
   onBuildFailure?: (commit: string, err: unknown) => void;
 }
 
-/** `StartDeployConfig` with the three optional fields proven present. */
+/** `StartDeployConfig` with every optional deploy prerequisite proven present. */
 type SelfDeployReady = StartDeployConfig & {
   flyDeployToken: string;
   flyOrchestratorApp: string;
   selfDeployTarget: SelfDeployTarget;
+  kgSourceRepo: string;
 };
 
 /**
@@ -349,6 +395,7 @@ export function makeStartDeploy(
         pollIntervalMs: config.pollIntervalMs,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
+        kgSourceRepo: config.kgSourceRepo,
       }).catch((err) => {
         console.error("[deploy] failed:", err);
         config.onBuildFailure?.(head, err);
@@ -366,8 +413,8 @@ export function makeStartDeploy(
 
 /**
  * Whether this orchestrator can deploy itself: a token with deploy rights, an app to
- * deploy, and build stamps naming what to build.
+ * deploy, build stamps naming what to build, and a validated KG source repository.
  */
 export function canSelfDeploy(config: StartDeployConfig): config is SelfDeployReady {
-  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget);
+  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget && config.kgSourceRepo);
 }
