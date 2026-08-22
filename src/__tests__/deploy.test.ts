@@ -84,6 +84,24 @@ describe("deployArgs", () => {
   });
 });
 
+describe("readKgSourceRepo", () => {
+  it("uses the backwards-compatible default when the setting is absent", () => {
+    expect(deploy.readKgSourceRepo(undefined)).toBe("BuildDownAI/knowledge-graph-ai-implement");
+  });
+
+  it("accepts a valid project-specific repository", () => {
+    expect(deploy.readKgSourceRepo("Answer9-llc/knowledge-graph-answer9-app")).toBe(
+      "Answer9-llc/knowledge-graph-answer9-app",
+    );
+  });
+
+  it("warns and disables self-deploy for a malformed explicit value", () => {
+    const warn = vi.fn();
+    expect(deploy.readKgSourceRepo("https://github.com/Answer9-llc/kg", warn)).toBeNull();
+    expect(warn).toHaveBeenCalledWith("[deploy] invalid KG_SOURCE_REPO; self-deploy disabled");
+  });
+});
+
 describe("Dockerfile KG source repo wiring", () => {
   it("persists the KG_SOURCE_REPO build arg into the runtime image for later self-deploys", () => {
     const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
@@ -124,7 +142,7 @@ describe("makeStartDeploy", () => {
     expect(typeof deploy.makeStartDeploy(configured)).toBe("function");
   });
 
-  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget"] as const)(
+  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget", "kgSourceRepo"] as const)(
     "returns undefined when %s is missing, so the route answers 501",
     (field) => {
       // Undefined here is what distinguishes "cannot deploy" from "deploy failed" —
@@ -210,7 +228,7 @@ describe("canSelfDeploy", () => {
     expect(deploy.canSelfDeploy(configured)).toBe(true);
   });
 
-  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget"] as const)(
+  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget", "kgSourceRepo"] as const)(
     "is false without %s",
     (field) => {
       // The predicate is the single definition of "can this orchestrator deploy itself",

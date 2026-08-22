@@ -88,7 +88,8 @@ Substitute your own `SOURCE_REPO` when deploying a fork; it must be `owner/repo`
 `KG_SOURCE_REPO` is not a secret. Manual deploys bake the build arg into the image as `ENV KG_SOURCE_REPO`,
 and `loadConfig()` reads that value at runtime for the next self-deploy. A Fly secret or environment
 variable with the same name still wins at runtime, which is useful for changing the graph repo before
-the next deploy; the next image will then bake that resolved value.
+the next deploy; the next image will then bake that resolved value. A malformed runtime override logs a
+warning and disables self-deploy instead of crashing the orchestrator or silently selecting a different graph.
 
 ### Fly's native GitHub integration
 

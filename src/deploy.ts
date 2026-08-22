@@ -74,6 +74,23 @@ export function parseKgSourceRepo(value: string | null | undefined): KgSourceRep
   return { owner, repo, fullName: `${owner}/${repo}` };
 }
 
+/**
+ * Resolve the configured KG repository without making a typo fatal to the
+ * orchestrator. An invalid explicit value disables self-deploy rather than
+ * silently switching a project instance back to the default graph.
+ */
+export function readKgSourceRepo(
+  value: string | null | undefined,
+  warn: (message: string) => void = console.warn,
+): string | null {
+  try {
+    return parseKgSourceRepo(value).fullName;
+  } catch {
+    warn("[deploy] invalid KG_SOURCE_REPO; self-deploy disabled");
+    return null;
+  }
+}
+
 const DEPLOY_TIMEOUT_MS = 20 * 60 * 1000;
 // A runner job is force-terminated 60 minutes after its dispatch,
 // so with new dispatches paused the in-flight set always drains.
@@ -324,16 +341,17 @@ export interface StartDeployConfig {
   pollIntervalMs: number;
   githubAppId: string;
   githubAppPrivateKey: string;
-  kgSourceRepo: string;
+  kgSourceRepo: string | null;
   /** Called when the build or release step fails, so the caller can record the outcome. */
   onBuildFailure?: (commit: string, err: unknown) => void;
 }
 
-/** `StartDeployConfig` with the three optional fields proven present. */
+/** `StartDeployConfig` with every optional deploy prerequisite proven present. */
 type SelfDeployReady = StartDeployConfig & {
   flyDeployToken: string;
   flyOrchestratorApp: string;
   selfDeployTarget: SelfDeployTarget;
+  kgSourceRepo: string;
 };
 
 /**
@@ -395,8 +413,8 @@ export function makeStartDeploy(
 
 /**
  * Whether this orchestrator can deploy itself: a token with deploy rights, an app to
- * deploy, and build stamps naming what to build.
+ * deploy, build stamps naming what to build, and a validated KG source repository.
  */
 export function canSelfDeploy(config: StartDeployConfig): config is SelfDeployReady {
-  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget);
+  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget && config.kgSourceRepo);
 }

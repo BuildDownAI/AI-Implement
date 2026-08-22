@@ -17,7 +17,7 @@ import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, 
 import { refreshAvailability, readStampedTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
-import { canSelfDeploy, DEFAULT_KG_SOURCE_REPO, makeStartDeploy, parseKgSourceRepo } from "./deploy.js";
+import { canSelfDeploy, makeStartDeploy, readKgSourceRepo } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -117,7 +117,7 @@ interface AppConfig {
   localRunnerImage: string;
   localRunnerOrchestratorUrl: string | null;
   kgSidecarUrl: string | null;
-  kgSourceRepo: string;
+  kgSourceRepo: string | null;
   selfDeployTarget: SelfDeployTarget | null; // build-stamped; null when the image carries no stamps
 }
 
@@ -239,7 +239,7 @@ function loadConfig(): AppConfig {
     localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
     kgSidecarUrl: process.env.KG_SIDECAR_URL || null,
-    kgSourceRepo: parseKgSourceRepo(process.env.KG_SOURCE_REPO || DEFAULT_KG_SOURCE_REPO).fullName,
+    kgSourceRepo: readKgSourceRepo(process.env.KG_SOURCE_REPO),
     selfDeployTarget: readStampedTarget(process.env),
   };
 }
