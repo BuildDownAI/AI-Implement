@@ -241,6 +241,41 @@ export function updateJobRunId(jobId: number, runId: number): void {
     .run(runId, jobId);
 }
 
+export function attachJobRunIdIfMissing(jobId: number, runId: number): boolean {
+  const result = getDb()
+    .prepare("UPDATE dispatch_log SET run_id = ?, status = 'running' WHERE id = ? AND run_id IS NULL AND status IN ('dispatched', 'running')")
+    .run(runId, jobId);
+  return result.changes > 0;
+}
+
+export function claimJobRunId(jobId: number, runId: number): number {
+  const db = getDb();
+  return db.transaction(() => {
+    const released = db
+      .prepare(
+        `UPDATE dispatch_log
+         SET run_id = NULL, status = 'dispatched', conclusion = NULL, completed_at = NULL
+         WHERE run_id = ?
+           AND id != ?
+           AND status NOT IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')`,
+      )
+      .run(runId, jobId);
+
+    db.prepare(
+      `UPDATE dispatch_log
+       SET run_id = ?,
+           status = CASE
+             WHEN status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed') THEN status
+             ELSE 'running'
+           END
+       WHERE id = ?`,
+    )
+      .run(runId, jobId);
+
+    return released.changes;
+  })();
+}
+
 export function updateJobStatus(
   jobId: number,
   status: JobStatus,

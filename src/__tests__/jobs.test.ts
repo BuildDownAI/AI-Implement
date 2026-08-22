@@ -66,6 +66,69 @@ describe("jobs table", () => {
     expect(jobs[0].status).toBe("running");
   });
 
+  it("attachJobRunIdIfMissing does not replace an existing exact run", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.claimJobRunId(jobId, 12345);
+
+    const attached = log.attachJobRunIdIfMissing(jobId, 67890);
+
+    expect(attached).toBe(false);
+    expect(log.getJobById(jobId)).toMatchObject({
+      runId: 12345,
+      status: "running",
+    });
+  });
+
+  it("attachJobRunIdIfMissing does not attach to a terminal row with no run ID", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.updateJobStatus(jobId, "completed", "success");
+
+    const attached = log.attachJobRunIdIfMissing(jobId, 67890);
+
+    expect(attached).toBe(false);
+    expect(log.getJobById(jobId)).toMatchObject({
+      runId: null,
+      status: "completed",
+      conclusion: "success",
+    });
+  });
+
+  it("claimJobRunId releases a nonterminal sibling that heuristically claimed the run", () => {
+    const firstJobId = log.appendLog({ issueId: "issue-1" });
+    const secondJobId = log.appendLog({ issueId: "issue-2" });
+    log.updateJobRunId(firstJobId, 101);
+    log.updateJobRunId(secondJobId, 202);
+
+    const released = log.claimJobRunId(secondJobId, 101);
+
+    expect(released).toBe(1);
+    const jobs = log.listLog();
+    expect(jobs.find((job) => job.id === firstJobId)).toMatchObject({
+      runId: null,
+      status: "dispatched",
+    });
+    expect(jobs.find((job) => job.id === secondJobId)).toMatchObject({
+      runId: 101,
+      status: "running",
+    });
+  });
+
+  it("claimJobRunId preserves target terminal status on a late progress retry", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.updateJobStatus(jobId, "completed", "success");
+    const completedAt = log.getJobById(jobId)?.completedAt;
+
+    const released = log.claimJobRunId(jobId, 101);
+
+    expect(released).toBe(0);
+    expect(log.getJobById(jobId)).toMatchObject({
+      runId: 101,
+      status: "completed",
+      conclusion: "success",
+      completedAt,
+    });
+  });
+
   it("updateJobStatus sets terminal state with completion time", () => {
     const jobId = log.appendLog({ issueId: "issue-1" });
     log.updateJobRunId(jobId, 12345);

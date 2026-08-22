@@ -81,4 +81,24 @@ describe("TokenStepReporter", () => {
     });
     expect(JSON.parse(String(calls[0].init.body))).toEqual({ step: STEP });
   });
+
+  it("includes the GitHub run ID when the workflow provides one", async () => {
+    vi.stubEnv("GITHUB_RUN_ID", "32595525188");
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const reporter = new TokenStepReporter("https://orchestrator.example", "progress-token", {
+      fetchImpl: async (url, init) => {
+        calls.push({ url: String(url), init: init! });
+        return response(200);
+      },
+      retryDelaysMs: [],
+    });
+
+    await reporter.report(STEP);
+
+    expect(JSON.parse(String(calls[0].init.body))).toEqual({
+      step: STEP,
+      githubRunId: 32595525188,
+    });
+    vi.unstubAllEnvs();
+  });
 });

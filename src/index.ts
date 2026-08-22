@@ -21,7 +21,7 @@ import { canSelfDeploy, makeStartDeploy } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
@@ -1678,8 +1678,11 @@ async function postDispatch(
         getClaimedRunIds(),
       );
       if (runId) {
-        updateJobRunId(jobId, runId);
-        console.log(`[poll] Linked ${issue.identifier} to run ${runId}`);
+        if (attachJobRunIdIfMissing(jobId, runId)) {
+          console.log(`[poll] Linked ${issue.identifier} to run ${runId}`);
+        } else {
+          console.log(`[poll] Skipped heuristic run link for ${issue.identifier}; job already has a run ID`);
+        }
       } else {
         console.log(`[poll] Run ID not yet available for ${issue.identifier}, will retry next cycle`);
       }
@@ -1865,13 +1868,19 @@ async function monitorGitHubActionsJob(
     );
 
     if (runId) {
-      updateJobRunId(job.id, runId);
-      claimedRunIds.add(runId);
-      job.runId = runId;
-      console.log(`[monitor] Found run ID ${runId} for job ${job.id} (${job.issueIdentifier})`);
+      if (attachJobRunIdIfMissing(job.id, runId)) {
+        claimedRunIds.add(runId);
+        job.runId = runId;
+        console.log(`[monitor] Found run ID ${runId} for job ${job.id} (${job.issueIdentifier})`);
+      } else {
+        console.log(`[monitor] Skipped heuristic run link for job ${job.id} (${job.issueIdentifier}); job already has a run ID`);
+        return;
+      }
     } else if (Date.now() - job.dispatchedAt > RUN_ID_TIMEOUT_MS) {
+      if (!isMonitorRunIdStillCurrent(job)) return;
       console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) timed out waiting for run ID`);
       const provider = await providerForJob(registry, job);
+      if (!isMonitorRunIdStillCurrent(job)) return;
       await remediateStuckJob(watchdogConfig, provider, job, "run_not_found");
       return;
     } else {
@@ -1882,6 +1891,7 @@ async function monitorGitHubActionsJob(
   // Check run status
   const runStatus = await getWorkflowRunStatus(ghToken, owner, repo, job.runId);
   if (!runStatus) return;
+  if (!isMonitorRunIdStillCurrent(job)) return;
 
   // Detect stuck: non-terminal past the configured workflow timeout plus reconciliation grace.
   const watchdog = githubActionsWatchdogDecision({
@@ -1897,6 +1907,7 @@ async function monitorGitHubActionsJob(
         `(threshold ${watchdog.jobTimeoutMinutes}m + ${watchdog.graceMinutes}m grace)`,
     );
     const provider = await providerForJob(registry, job);
+    if (!isMonitorRunIdStillCurrent(job)) return;
     await remediateStuckJob(watchdogConfig, provider, job, runStatus.status);
     return;
   }
@@ -1931,6 +1942,7 @@ async function monitorGitHubActionsJob(
       }
     }
 
+    if (!isMonitorRunIdStillCurrent(job)) return;
     updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl);
     console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) → ${jobStatus} (${runStatus.conclusion})`);
 
@@ -1957,6 +1969,16 @@ async function monitorGitHubActionsJob(
   else if (job.status === "dispatched") {
     updateJobRunId(job.id, job.runId);
   }
+}
+
+function isMonitorRunIdStillCurrent(job: Job): boolean {
+  const current = getJobById(job.id);
+  if (!current) return false;
+  if (current.runId === job.runId) return true;
+  console.log(
+    `[monitor] Skipping stale cycle for job ${job.id} (${job.issueIdentifier}); run ID changed from ${job.runId ?? "none"} to ${current.runId ?? "none"}`,
+  );
+  return false;
 }
 
 /**
