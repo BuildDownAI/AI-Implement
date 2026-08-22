@@ -115,6 +115,7 @@ describe("jobs table", () => {
 
   it("claimJobRunId preserves target terminal status on a late progress retry", () => {
     const jobId = log.appendLog({ issueId: "issue-1" });
+    log.updateJobRunId(jobId, 101);
     log.updateJobStatus(jobId, "completed", "success");
     const completedAt = log.getJobById(jobId)?.completedAt;
 
@@ -126,6 +127,48 @@ describe("jobs table", () => {
       status: "completed",
       conclusion: "success",
       completedAt,
+    });
+  });
+
+  it("claimJobRunId repairs a target terminalized against the wrong run", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.updateJobRunId(jobId, 202);
+    log.updateJobStatus(jobId, "failed", "failure");
+    log.markJobNotified(jobId);
+
+    const released = log.claimJobRunId(jobId, 101);
+
+    expect(released).toBe(0);
+    expect(log.getJobById(jobId)).toMatchObject({
+      runId: 101,
+      status: "running",
+      conclusion: null,
+      completedAt: null,
+      notifiedAt: null,
+    });
+  });
+
+  it("claimJobRunId reopens a terminal sibling that claimed the exact run", () => {
+    const siblingJobId = log.appendLog({ issueId: "issue-1" });
+    const exactJobId = log.appendLog({ issueId: "issue-2" });
+    log.updateJobRunId(siblingJobId, 101);
+    log.updateJobStatus(siblingJobId, "completed", "success");
+    log.markJobNotified(siblingJobId);
+    log.updateJobRunId(exactJobId, 202);
+
+    const released = log.claimJobRunId(exactJobId, 101);
+
+    expect(released).toBe(1);
+    expect(log.getJobById(siblingJobId)).toMatchObject({
+      runId: null,
+      status: "dispatched",
+      conclusion: null,
+      completedAt: null,
+      notifiedAt: null,
+    });
+    expect(log.getJobById(exactJobId)).toMatchObject({
+      runId: 101,
+      status: "running",
     });
   });
 

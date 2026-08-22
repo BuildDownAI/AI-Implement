@@ -1957,11 +1957,13 @@ async function monitorGitHubActionsJob(
     // parent would strand In Progress — finalize it here so merge-up opens the roll-up PR.
     if (jobStatus === "completed" && !prUrl && job.phase !== "planning" && job.groupingParent) {
       const provider = await providerForJob(registry, job);
+      if (!isMonitorRunIdStillCurrent(job)) return;
       await finalizeNoOpGroupingParent(provider, job);
     }
 
     if (jobStatus === "failed") {
       const provider = await providerForJob(registry, job);
+      if (!isMonitorRunIdStillCurrent(job)) return;
       await remediateFailedJob(watchdogConfig, provider, job, runStatus.conclusion ?? "failure");
     }
   }

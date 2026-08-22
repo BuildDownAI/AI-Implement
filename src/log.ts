@@ -241,6 +241,7 @@ export function updateJobRunId(jobId: number, runId: number): void {
     .run(runId, jobId);
 }
 
+/** Best-effort heuristic binding. An authenticated callback may have won the race already. */
 export function attachJobRunIdIfMissing(jobId: number, runId: number): boolean {
   const result = getDb()
     .prepare("UPDATE dispatch_log SET run_id = ?, status = 'running' WHERE id = ? AND run_id IS NULL AND status IN ('dispatched', 'running')")
@@ -248,29 +249,54 @@ export function attachJobRunIdIfMissing(jobId: number, runId: number): boolean {
   return result.changes > 0;
 }
 
+/**
+ * Authoritatively binds the run reported by a job's authenticated progress token.
+ * Any sibling holding that run was matched heuristically and is reopened so it can
+ * discover its own run. A terminal target is preserved only when it already owns
+ * this exact run, which makes late progress retries harmless.
+ */
 export function claimJobRunId(jobId: number, runId: number): number {
   const db = getDb();
   return db.transaction(() => {
     const released = db
       .prepare(
         `UPDATE dispatch_log
-         SET run_id = NULL, status = 'dispatched', conclusion = NULL, completed_at = NULL
+         SET run_id = NULL,
+             status = 'dispatched',
+             conclusion = NULL,
+             completed_at = NULL,
+             notified_at = NULL
          WHERE run_id = ?
-           AND id != ?
-           AND status NOT IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')`,
+           AND id != ?`,
       )
       .run(runId, jobId);
 
     db.prepare(
       `UPDATE dispatch_log
-       SET run_id = ?,
-           status = CASE
-             WHEN status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed') THEN status
+       SET status = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN status
              ELSE 'running'
-           END
+           END,
+           conclusion = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN conclusion
+             ELSE NULL
+           END,
+           completed_at = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN completed_at
+             ELSE NULL
+           END,
+           notified_at = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN notified_at
+             ELSE NULL
+           END,
+           run_id = ?
        WHERE id = ?`,
     )
-      .run(runId, jobId);
+      .run(runId, runId, runId, runId, runId, jobId);
 
     return released.changes;
   })();
