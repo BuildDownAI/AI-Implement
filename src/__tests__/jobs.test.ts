@@ -94,8 +94,8 @@ describe("jobs table", () => {
   });
 
   it("claimJobRunId releases a nonterminal sibling that heuristically claimed the run", () => {
-    const firstJobId = log.appendLog({ issueId: "issue-1" });
-    const secondJobId = log.appendLog({ issueId: "issue-2" });
+    const firstJobId = log.appendLog({ issueId: "issue-1", repo: "org/repo" });
+    const secondJobId = log.appendLog({ issueId: "issue-2", repo: "org/repo" });
     log.updateJobRunId(firstJobId, 101);
     log.updateJobRunId(secondJobId, 202);
 
@@ -149,8 +149,8 @@ describe("jobs table", () => {
   });
 
   it("claimJobRunId reopens a terminal sibling that claimed the exact run", () => {
-    const siblingJobId = log.appendLog({ issueId: "issue-1" });
-    const exactJobId = log.appendLog({ issueId: "issue-2" });
+    const siblingJobId = log.appendLog({ issueId: "issue-1", repo: "org/repo" });
+    const exactJobId = log.appendLog({ issueId: "issue-2", repo: "org/repo" });
     log.updateJobRunId(siblingJobId, 101);
     log.updateJobStatus(siblingJobId, "completed", "success");
     log.markJobNotified(siblingJobId);
@@ -170,6 +170,36 @@ describe("jobs table", () => {
       runId: 101,
       status: "running",
     });
+  });
+
+  it("claimJobRunId never resets a job from another repository", () => {
+    const foreignJobId = log.appendLog({ issueId: "issue-1", repo: "other/repo" });
+    const exactJobId = log.appendLog({ issueId: "issue-2", repo: "org/repo" });
+    log.updateJobRunId(foreignJobId, 101);
+    log.updateJobStatus(foreignJobId, "completed", "success");
+    log.markJobNotified(foreignJobId);
+    log.updateJobRunId(exactJobId, 202);
+
+    const released = log.claimJobRunId(exactJobId, 101);
+
+    expect(released).toBe(0);
+    expect(log.getJobById(foreignJobId)).toMatchObject({
+      runId: 101,
+      status: "completed",
+      conclusion: "success",
+    });
+    expect(log.getJobById(exactJobId)).toMatchObject({
+      runId: 101,
+      status: "running",
+    });
+  });
+
+  it("indexes run IDs used by exact and heuristic correlation", () => {
+    const indexes = dedup.getDb()
+      .prepare("PRAGMA index_list(dispatch_log)")
+      .all() as Array<{ name: string }>;
+
+    expect(indexes.map((index) => index.name)).toContain("idx_dispatch_log_run_id");
   });
 
   it("updateJobStatus sets terminal state with completion time", () => {

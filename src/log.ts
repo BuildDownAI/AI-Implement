@@ -130,6 +130,7 @@ function ensureLogColumns(): void {
   if (!names.has("grouping_parent")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN grouping_parent INTEGER NOT NULL DEFAULT 0");
   }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_run_id ON dispatch_log(run_id)");
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -251,13 +252,19 @@ export function attachJobRunIdIfMissing(jobId: number, runId: number): boolean {
 
 /**
  * Authoritatively binds the run reported by a job's authenticated progress token.
- * Any sibling holding that run was matched heuristically and is reopened so it can
- * discover its own run. A terminal target is preserved only when it already owns
- * this exact run, which makes late progress retries harmless.
+ * Any sibling in the same repository holding that run was matched heuristically
+ * and is reopened so it can discover its own run. Repository scoping prevents a
+ * runner token from mutating another repository's jobs. A terminal target is
+ * preserved only when it already owns this exact run, which makes late progress
+ * retries harmless.
  */
 export function claimJobRunId(jobId: number, runId: number): number {
   const db = getDb();
   return db.transaction(() => {
+    const target = db
+      .prepare("SELECT repo FROM dispatch_log WHERE id = ?")
+      .get(jobId) as { repo: string | null } | undefined;
+
     const released = db
       .prepare(
         `UPDATE dispatch_log
@@ -267,9 +274,10 @@ export function claimJobRunId(jobId: number, runId: number): number {
              completed_at = NULL,
              notified_at = NULL
          WHERE run_id = ?
-           AND id != ?`,
+           AND id != ?
+           AND repo = ?`,
       )
-      .run(runId, jobId);
+      .run(runId, jobId, target?.repo ?? null);
 
     db.prepare(
       `UPDATE dispatch_log
