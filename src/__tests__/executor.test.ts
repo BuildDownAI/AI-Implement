@@ -73,6 +73,10 @@ printf '%s\n' "\${GH_TOKEN-unset}" > "${binDir}/gh-token.txt"
 printf '%s\n' "\${GH_ENTERPRISE_TOKEN-unset}" > "${binDir}/gh-enterprise-token.txt"
 printf '%s\n' "\${GITHUB_ENTERPRISE_TOKEN-unset}" > "${binDir}/github-enterprise-token.txt"
 printf '%s\n' "\${GIT_PASSWORD-unset}" > "${binDir}/git-password.txt"
+printf '%s\n' "\${RUN_PROGRESS_TOKEN-unset}" > "${binDir}/run-progress-token.txt"
+printf '%s\n' "\${RUN_PUBLICATION_TOKEN-unset}" > "${binDir}/run-publication-token.txt"
+printf '%s\n' "\${RUN_TOKEN-unset}" > "${binDir}/run-token.txt"
+printf '%s\n' "\${SAFE_EXECUTOR_VAR-unset}" > "${binDir}/safe-executor-var.txt"
 git remote get-url origin > "${binDir}/origin-url.txt" 2>/dev/null || true
 printf '%s\n' '${resultLine}'
 exit 0
@@ -230,6 +234,10 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     vi.stubEnv("GH_ENTERPRISE_TOKEN", "gh-enterprise-write-token");
     vi.stubEnv("GITHUB_ENTERPRISE_TOKEN", "github-enterprise-write-token");
     vi.stubEnv("GIT_PASSWORD", "git-write-password");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "run-progress-token");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "run-publication-token");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    vi.stubEnv("SAFE_EXECUTOR_VAR", "safe");
     const tokenizedOrigin = "https://x-access-token:github-write-token@github.com/acme/app.git";
     execFileSync("git", ["init", "-q"], { cwd: binDir });
     execFileSync("git", ["remote", "add", "origin", tokenizedOrigin], { cwd: binDir });
@@ -241,15 +249,26 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(readFileSync(join(binDir, "gh-enterprise-token.txt"), "utf-8").trim()).toBe("unset");
     expect(readFileSync(join(binDir, "github-enterprise-token.txt"), "utf-8").trim()).toBe("unset");
     expect(readFileSync(join(binDir, "git-password.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-progress-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-publication-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "safe-executor-var.txt"), "utf-8").trim()).toBe("safe");
     expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe("https://github.com/acme/app.git");
     expect(execFileSync("git", ["remote", "get-url", "origin"], { cwd: binDir, encoding: "utf-8" }).trim()).toBe(tokenizedOrigin);
+    expect(process.env.RUN_PROGRESS_TOKEN).toBe("run-progress-token");
+    expect(process.env.RUN_PUBLICATION_TOKEN).toBe("run-publication-token");
+    expect(process.env.RUN_TOKEN).toBe("run-token");
   });
 
-  it("preserves GitHub credentials for gap-fill sessions that own their existing PR branch", async () => {
+  it("preserves GitHub credentials for gap-fill sessions that own their existing PR branch but withholds runner tokens", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     installEnvironmentRecordingClaude();
     vi.stubEnv("GITHUB_TOKEN", "github-write-token");
     vi.stubEnv("GH_TOKEN", "gh-write-token");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "run-progress-token");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "run-publication-token");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+    vi.stubEnv("SAFE_EXECUTOR_VAR", "safe");
     const tokenizedOrigin = "https://x-access-token:github-write-token@github.com/acme/app.git";
     execFileSync("git", ["init", "-q"], { cwd: binDir });
     execFileSync("git", ["remote", "add", "origin", tokenizedOrigin], { cwd: binDir });
@@ -258,7 +277,14 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
 
     expect(readFileSync(join(binDir, "github-token.txt"), "utf-8").trim()).toBe("github-write-token");
     expect(readFileSync(join(binDir, "gh-token.txt"), "utf-8").trim()).toBe("gh-write-token");
+    expect(readFileSync(join(binDir, "run-progress-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-publication-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "safe-executor-var.txt"), "utf-8").trim()).toBe("safe");
     expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe(tokenizedOrigin);
+    expect(process.env.RUN_PROGRESS_TOKEN).toBe("run-progress-token");
+    expect(process.env.RUN_PUBLICATION_TOKEN).toBe("run-publication-token");
+    expect(process.env.RUN_TOKEN).toBe("run-token");
   });
 
   it("leaves SSH origins unchanged while withholding environment credentials", async () => {

@@ -142,6 +142,7 @@ describe("drainCommentGapfillQueue", () => {
     // Envelope contract: run_config carries the issue + gap-fill fields
     expect(inputs.run_config).toBeDefined();
     expect(inputs.run_token).toBeDefined();
+    expect("run_publication_token" in inputs).toBe(false);
     expect("issue_id" in inputs).toBe(false);
     expect("runner_phase" in inputs).toBe(false);
 
@@ -378,6 +379,77 @@ describe("drainCommentGapfillQueue", () => {
     expect(decoded.commentInstruction).toBe("please add error handling");
     expect(decoded.runnerPhase).toBe("gap-analysis");
     expect(decoded.prNumber).toBe("42");
+  });
+
+  it("adds a publication token to envelope gap-fill dispatches only when the workflow advertises support", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+
+    queue.enqueueCommentGapfill({
+      owner: "acme",
+      repo: "billing",
+      prNumber: 42,
+      commentId: 7501,
+      commenter: "iris",
+      instruction: "please address the review",
+    });
+    seedDispatchLog("issue-75", "AII-175", "Publication token test", "acme", "billing", 42);
+
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+    const checkContractSpy = vi.fn(async () => ({
+      contract: "envelope" as const,
+      supportsRunPublicationToken: true,
+    }));
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      runnerCallbackBaseUrl: "https://orch.example.com",
+      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+      dispatch: dispatchSpy,
+      checkContract: checkContractSpy,
+    }));
+
+    expect(checkContractSpy).toHaveBeenCalledWith({
+      owner: "acme",
+      repo: "billing",
+      workflowFile: "claude-implement.yml",
+      token: "gh-token",
+      ref: "main",
+    });
+    const [, , inputs] = dispatchSpy.mock.calls[0];
+    expect(inputs.run_config).toBeDefined();
+    expect(inputs.run_publication_token).toBeTruthy();
+    expect(typeof inputs.run_publication_token).toBe("string");
+  });
+
+  it("does not add a publication token when an envelope workflow lacks the publication input", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+
+    queue.enqueueCommentGapfill({
+      owner: "acme",
+      repo: "billing",
+      prNumber: 42,
+      commentId: 7502,
+      commenter: "ivy",
+      instruction: "",
+    });
+    seedDispatchLog("issue-76", "AII-176", "No publication token test", "acme", "billing", 42);
+
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      runnerCallbackBaseUrl: "https://orch.example.com",
+      runnerTokenSecret: "runner-token-secret-with-enough-entropy",
+      dispatch: dispatchSpy,
+      checkContract: vi.fn(async () => ({
+        contract: "envelope" as const,
+        supportsRunPublicationToken: false,
+      })),
+    }));
+
+    const [, , inputs] = dispatchSpy.mock.calls[0];
+    expect(inputs.run_config).toBeDefined();
+    expect("run_publication_token" in inputs).toBe(false);
   });
 
   it("mapping caps are forwarded inside run_config in envelope mode", async () => {

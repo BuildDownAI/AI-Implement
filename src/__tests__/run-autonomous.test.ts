@@ -6,10 +6,12 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAutonomous, resolveLogLevel, waitForContainerRemoval, runAutonomousLocally } from "../run-autonomous.js";
+import { DEFAULT_PIPELINE } from "../pipeline/default-pipeline.js";
 import { PipelineRunner } from "../pipeline/runner.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import { encodeRunConfig } from "../run-config.js";
 import type { LLMExecutor, PipelineDefinition, StepModule } from "../pipeline/types.js";
+import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 
 const REQUIRED_ENV: Record<string, string> = {
   ISSUE_ID: "issue-abc",
@@ -91,6 +93,7 @@ describe("runAutonomous", () => {
   let workspaceDir: string;
 
   beforeEach(() => {
+    __resetPublicationCredentialForTests();
     workspaceDir = mkdtempSync(join(tmpdir(), "run-autonomous-test-"));
     stubRequiredEnv();
     vi.stubEnv("LINEAR_API_KEY", "");
@@ -112,12 +115,34 @@ describe("runAutonomous", () => {
   });
 
   afterEach(() => {
+    __resetPublicationCredentialForTests();
     vi.unstubAllEnvs();
     try {
       rmSync(workspaceDir, { recursive: true, force: true });
     } catch {
       // On Windows, bash-created files may be locked briefly after the process exits
     }
+  });
+
+  it("removes the publication bearer before any pipeline step runs", async () => {
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    const mod: StepModule = {
+      run: vi.fn().mockImplementation(async () => {
+        expect(process.env.RUN_PUBLICATION_TOKEN).toBeUndefined();
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("do-work", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(mod.run).toHaveBeenCalledTimes(1);
   });
 
   it("returns exitCode 0 on successful pipeline run", async () => {
@@ -154,7 +179,7 @@ describe("runAutonomous", () => {
 
   it.each([
     { label: "initial implementation", prNumber: "", expectedToken: "unset" },
-    { label: "gap-fill", prNumber: "42", expectedToken: REQUIRED_ENV.GITHUB_TOKEN },
+    { label: "gap-fill", prNumber: "42", expectedToken: "unset" },
   ])("routes repository write authority for $label runs", async ({ prNumber, expectedToken }) => {
     const tokenPath = installCredentialRecordingClaude(workspaceDir);
     vi.stubEnv("PATH", `${workspaceDir}:${process.env.PATH ?? ""}`);
@@ -377,7 +402,30 @@ describe("runAutonomous", () => {
     expect(capturedPrompt).toContain("Do NOT commit, push, or open a pull request");
   });
 
-  it("appends a credential refresh command for gap-fill pushes", async () => {
+  it("tells implementation passes to reuse expensive validation output instead of rerunning unchanged commands", async () => {
+    let capturedPrompt: string | undefined;
+    const mod: StepModule = {
+      run: vi.fn(async (ctx) => {
+        capturedPrompt = ctx.data.implementationPrompt;
+        return {};
+      }),
+    };
+    const { pipeline, runner } = makeSingleStepPipeline("check-prompt", mod);
+
+    await runAutonomous({
+      workspaceDir,
+      pipeline,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+    });
+
+    expect(capturedPrompt).toContain("Validation command discipline");
+    expect(capturedPrompt).toContain("Do not rerun an unchanged full build or full test suite");
+    expect(capturedPrompt).toContain("capture its complete output once");
+  });
+
+  it("keeps gap-fill Git writes under pipeline control", async () => {
     vi.stubEnv("PR_NUMBER", "42");
 
     let capturedPrompt: string | undefined;
@@ -399,9 +447,10 @@ describe("runAutonomous", () => {
 
     expect(capturedPrompt).toContain("Gap-fill run");
     expect(capturedPrompt).not.toContain("Pipeline-owned Git and PR handling");
-    expect(capturedPrompt).toContain("Runner GitHub credential refresh");
-    expect(capturedPrompt).toContain("refresh-runner-github-credentials.js");
-    expect(capturedPrompt).toContain("Immediately before every `git push`");
+    expect(capturedPrompt).toContain("Pipeline-owned gap-fill Git");
+    expect(capturedPrompt).toContain("Do NOT commit, push, or open a pull request");
+    expect(capturedPrompt).toContain("existing PR branch");
+    expect(capturedPrompt).not.toContain("refresh-runner-github-credentials.js");
     expect(capturedPrompt).not.toContain("Operator instruction for this run");
   });
 
@@ -1049,11 +1098,68 @@ describe("runAutonomous", () => {
     }
   });
 
-  it("gap-fill run (prNumber set, unapproved) skips push — outcome derivation still reports a coded failure with no prUrl", async () => {
-    // Mirrors pipeline-loader.ts's push skip condition for gap-fill runs: Claude owns git on
-    // the existing PR branch there, so a gap-fill run must not run push against an
-    // already-clean tree (it would throw "Nothing to commit"). This verifies the skip and the
-    // outcome-derivation fallback compose correctly for the unapproved case.
+  it("the default dirty gap-fill existing-PR pipeline reports REVIEW_UNAPPROVED instead of success", async () => {
+    vi.stubEnv("PR_NUMBER", "42");
+    vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    const mockFetch = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const pushRun = vi.fn().mockResolvedValue({
+      prNumber: 42,
+      branchPushed: true,
+    });
+    const runner = new PipelineRunner()
+      .register("clone", {
+        run: vi.fn().mockResolvedValue({
+          workspaceDir,
+          repoOwner: "acme",
+          repoRepo: "app",
+          githubToken: "ghs_test",
+          branch: "ai-implement/pr-42",
+          clonedRef: "base-sha",
+        }),
+      })
+      .register("install", { run: vi.fn().mockResolvedValue({}) })
+      .register("feedback-loop", {
+        run: vi.fn().mockResolvedValue({
+          approved: false,
+          iterations: 2,
+          finalFeedback: "missing regression coverage",
+          terminationReason: "iterations_exhausted",
+          passes: [],
+        }),
+      })
+      .register("push", {
+        run: pushRun,
+      });
+
+    const result = await runAutonomous({
+      workspaceDir,
+      pipeline: DEFAULT_PIPELINE,
+      runner,
+      reporter: new NoopStepReporter(),
+      llmExecutor: makeMockExecutor(0),
+      fetchImpl: mockFetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
+      phase: string;
+      outcome: string;
+      failureCode: string;
+      prUrl?: string;
+    };
+    expect(body.phase).toBe("gap-analysis");
+    expect(body.outcome).toBe("failure");
+    expect(body.failureCode).toBe("REVIEW_UNAPPROVED");
+    expect(body.prUrl).toBeUndefined();
+    expect(pushRun).not.toHaveBeenCalled();
+  });
+
+  it("a custom gap-fill pipeline that skips push still reports an unapproved coded failure", async () => {
+    // Custom pipelines may still choose to skip an existing-PR update. Verify
+    // that compatibility path composes with unapproved outcome derivation.
     vi.stubEnv("PR_NUMBER", "42");
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");
@@ -1093,7 +1199,7 @@ describe("runAutonomous", () => {
       fetchImpl: mockFetch,
     });
 
-    expect(pushRun).not.toHaveBeenCalled(); // push was skipped, not run against a clean tree
+    expect(pushRun).not.toHaveBeenCalled();
     expect(result.exitCode).toBe(0); // job stays green — warning only
     const body = JSON.parse(mockFetch.mock.calls[0][1].body as string) as {
       outcome: string;
@@ -1105,10 +1211,9 @@ describe("runAutonomous", () => {
     expect(body.prUrl).toBeUndefined();
   });
 
-  it("gap-fill run (prNumber set, approved) with push skipped posts a gap-analysis success callback and exits 0", async () => {
-    // Approved gap-fill: Claude already committed and pushed to the existing PR branch
-    // itself, so push is skipped and there are no push outputs (no prUrl). That is a
-    // successful gap-analysis run — it must NOT fall down the REVIEW_UNAPPROVED path.
+  it("a custom approved gap-fill pipeline may skip a no-op push and still report success", async () => {
+    // A custom pipeline can determine that an existing PR needs no update. An
+    // approved no-op remains successful without a new PR URL.
     vi.stubEnv("PR_NUMBER", "42");
     vi.stubEnv("RUNNER_CALLBACK_URL", "https://orchestrator.example");
     vi.stubEnv("RUN_TOKEN", "run-token");

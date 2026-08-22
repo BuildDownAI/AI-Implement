@@ -71,7 +71,12 @@ const REVIEW_PROMPT = (
   "score": <0-100 quality score>,
   "progress_delta": <0-100 percentage of issue addressed>,
   "feedback": "<concise reviewer notes>"
-}`;
+}
+
+Approval contract:
+- If issues[] is non-empty, approved must be false.
+- Do not set approved=true while listing unresolved issues.
+- Put every required fix in issues[]; feedback is only summary context.`;
 
   return prompt;
 };
@@ -107,8 +112,10 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
       const parsed = extractFirstJsonObject(result.stdout);
       if (parsed) {
         const json = parsed as ReviewJson;
-        approved = json.approved ?? false;
-        issues = Array.isArray(json.issues) ? json.issues : [];
+        issues = Array.isArray(json.issues)
+          ? json.issues.filter((issue): issue is string => typeof issue === "string" && issue.trim().length > 0)
+          : [];
+        approved = (json.approved ?? false) && issues.length === 0;
         score = typeof json.score === "number" ? json.score : 0;
         progressDelta = typeof json.progress_delta === "number" ? json.progress_delta : 0;
         feedback = json.feedback ?? "";

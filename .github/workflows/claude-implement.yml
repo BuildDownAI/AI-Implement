@@ -70,6 +70,11 @@ on:
         required: false
         type: string
         default: ""
+      run_publication_token:
+        description: "Dedicated bearer token authorizing one publication-token mint; empty uses the workflow GitHub App token"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -218,6 +223,9 @@ jobs:
           if [ -n "${{ inputs.run_progress_token }}" ]; then
             echo "::add-mask::${{ inputs.run_progress_token }}"
           fi
+          if [ -n "${{ inputs.run_publication_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_publication_token }}"
+          fi
 
       - name: Run pipeline
         env:
@@ -228,4 +236,5 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
+          RUN_PUBLICATION_TOKEN: ${{ inputs.run_publication_token }}
         run: /opt/ai-implement/entrypoint.sh

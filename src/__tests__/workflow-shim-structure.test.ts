@@ -87,6 +87,16 @@ describe("GHA workflow shims", () => {
     );
   });
 
+  it("keeps seeded gap-fill Git writes under pipeline control", () => {
+    const workflow = readFileSync("workflows/WORKFLOW.md", "utf-8");
+    const gapFill = workflow.split("## Gap-fill instructions")[1]?.split("## Issue")[0] ?? "";
+
+    expect(gapFill).toContain("Do NOT commit or push");
+    expect(gapFill).toContain("leave your file changes unstaged and uncommitted");
+    expect(gapFill).toContain("pipeline will\ncommit and push them to the existing PR branch");
+    expect(gapFill).not.toContain("Commit your changes to the current\nbranch and push");
+  });
+
   for (const f of SYNCED_WORKFLOW_FILES) {
     it(`${f} pins external actions to full commit SHAs`, () => {
       const yaml = readFileSync(f, "utf-8");
@@ -174,6 +184,20 @@ describe("GHA workflow shims", () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
+    });
+
+    it(`${f} accepts and masks a dedicated publication token only for the pipeline step`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      expect(doc.on.workflow_dispatch.inputs.run_publication_token).toBeDefined();
+      expect(doc.on.workflow_dispatch.inputs.run_publication_token.required).toBe(false);
+      expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_publication_token\s*\}\}/);
+      expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
+
+      const pipelineStep = doc.jobs.implement.steps.find((step: any) => step.name === "Run pipeline");
+      expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBe("${{ inputs.run_publication_token }}");
+      const nonPipelineSteps = doc.jobs.implement.steps.filter((step: any) => step.name !== "Run pipeline");
+      expect(JSON.stringify(nonPipelineSteps)).not.toContain("RUN_PUBLICATION_TOKEN");
     });
 
     it(`${f} validates Bedrock config before configuring AWS credentials`, () => {
@@ -312,6 +336,8 @@ describe("GHA workflow shims", () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).toMatch(/RUN_TOKEN:\s*\$\{\{\s*inputs\.run_token\s*\}\}/);
       expect(yaml).toMatch(/RUN_PROGRESS_TOKEN:\s*\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      expect(yaml).not.toMatch(/run_publication_token/);
+      expect(yaml).not.toMatch(/RUN_PUBLICATION_TOKEN/);
     });
 
     it(`${f} wires bedrock configure-aws-credentials guarded by provider == 'bedrock'`, () => {

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { getDb } from "./dedup.js";
 
-export type RunTokenAudience = "result" | "progress";
+export type RunTokenAudience = "result" | "progress" | "publication";
 
 export interface RunTokenClaims {
   issueId: string;
@@ -9,6 +9,8 @@ export interface RunTokenClaims {
   audience: RunTokenAudience;
   dispatchId: string;
   exp: number;
+  /** Exact owner/repository bound at dispatch time for publication credentials. */
+  repository?: string;
 }
 
 export interface MintInput {
@@ -19,6 +21,8 @@ export interface MintInput {
   ttlSeconds: number;
   secret: string;
   dispatchId?: string;
+  /** Required for publication credentials; ignored by other audiences. */
+  repository?: string;
 }
 
 export interface MintOutput {
@@ -49,12 +53,18 @@ function sign(payload: string, secret: string): string {
 
 export function mintRunToken(input: MintInput): MintOutput {
   const dispatchId = input.dispatchId ?? crypto.randomUUID();
+  const audience = input.audience ?? "result";
+  const repository = input.repository?.trim();
+  if (audience === "publication" && !repository?.match(/^[^/\s]+\/[^/\s]+$/)) {
+    throw new Error("Publication tokens require an exact owner/repository binding");
+  }
   const claims: RunTokenClaims = {
     issueId: input.issueId,
     phase: input.phase,
-    audience: input.audience ?? "result",
+    audience,
     dispatchId,
     exp: Date.now() + input.ttlSeconds * 1000,
+    ...(audience === "publication" ? { repository } : {}),
   };
   const payload = b64url(Buffer.from(JSON.stringify(claims)));
   const sig = sign(payload, input.secret);

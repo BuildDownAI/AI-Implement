@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { pushStep } from "../pipeline/steps/push.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
@@ -51,7 +52,7 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
     if (gitArgs[0] === "rev-parse") return spawnResult(0, `${sha}\n`);
     if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\nA\tsrc/app.test.ts\n");
     if (gitArgs[0] === "ls-remote") {
-      return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
     }
     return spawnResult(0);
   });
@@ -59,8 +60,14 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
 
 describe("pushStep", () => {
   beforeEach(() => {
+    __resetPublicationCredentialForTests();
     vi.clearAllMocks();
     vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    __resetPublicationCredentialForTests();
+    vi.unstubAllEnvs();
   });
 
   it("creates PR and returns prUrl, prNumber, commitSha on success", async () => {
@@ -138,6 +145,186 @@ describe("pushStep", () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+
+  it("exchanges the process-only publication credential immediately before GHA remote writes", async () => {
+    mockGitSuccess("abc123");
+    vi.stubEnv("GITHUB_TOKEN", "workflow-token");
+    vi.stubEnv("GH_TOKEN", "workflow-token");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+        text: async () => "",
+      } as Response);
+
+    try {
+      await pushStep.run(
+        makeContext({ orchestratorUrl: "", callbackUrl: "https://orchestrator.example" }),
+        {
+          ...BASE_INPUTS,
+          orchestratorUrl: "",
+          machineNonce: "",
+          callbackUrl: "https://orchestrator.example",
+        },
+        new NoopStepReporter(),
+      );
+
+      expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
+        "https://orchestrator.example/api/runner/publication-token",
+      );
+      expect(vi.mocked(fetch).mock.calls[0][1]?.headers).toEqual({
+        Authorization: "Bearer one-use-publication-token",
+      });
+      expect(process.env.RUN_PUBLICATION_TOKEN).toBeUndefined();
+
+      const remoteCalls = vi.mocked(spawnSync).mock.calls.filter(([, args]) =>
+        ["ls-remote", "push"].includes((args as string[])[0]),
+      );
+      expect(remoteCalls).toHaveLength(2);
+      for (const [, args] of remoteCalls) {
+        expect((args as string[]).join(" ")).toContain("fresh-token");
+        expect((args as string[]).join(" ")).not.toContain("one-use-publication-token");
+      }
+      const prRequest = vi.mocked(fetch).mock.calls[1];
+      expect(prRequest[1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer fresh-token" }));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("updates an existing PR branch with a freshly vended token without creating another PR", async () => {
+    mockGitSuccess("abc123");
+    vi.stubEnv("GITHUB_TOKEN", "workflow-token");
+    vi.stubEnv("GH_TOKEN", "workflow-token");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        baseRef: "beadfeed",
+        existingPrNumber: "42",
+        callbackUrl: "https://orchestrator.example",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs).toEqual({
+      prUrl: null,
+      prNumber: 42,
+      branchPushed: true,
+      commitSha: "abc123",
+      draft: false,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["checkout", "feature/existing-pr"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git",
+      ["checkout", "-B", "feature/existing-pr"],
+      expect.anything(),
+    );
+  });
+
+  it("pushes an existing PR gap-fill with the original branch head as the force-with-lease", async () => {
+    mockGitSuccess("abc123");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        baseRef: "beadfeed",
+        existingPrNumber: "42",
+        callbackUrl: "https://orchestrator.example",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prUrl).toBeNull();
+    expect(outputs.prNumber).toBe(42);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining([
+        "push",
+        expect.any(String),
+        "HEAD:refs/heads/feature/existing-pr",
+        "--force-with-lease=refs/heads/feature/existing-pr:beadfeed",
+      ]),
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+  });
+
+  it("refuses to overwrite an existing PR branch that changed during the run", async () => {
+    mockGitSuccess("abc123");
+
+    await expect(pushStep.run(
+      makeContext({ prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        baseRef: "original-pr-head",
+        existingPrNumber: "42",
+      },
+      new NoopStepReporter(),
+    )).rejects.toThrow(/refusing to overwrite concurrent work/);
+
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining(["push"]),
+      expect.anything(),
+    );
+  });
+
+  it("treats an already-satisfied existing PR gap-fill as a clean no-op", async () => {
+    mockGitSuccess("abc123", false);
+
+    const outputs = await pushStep.run(
+      makeContext({ prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        existingPrNumber: "42",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs).toEqual({
+      prUrl: null,
+      prNumber: 42,
+      branchPushed: false,
+      commitSha: "abc123",
+      draft: false,
+    });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("completes the push with the boot token when credential vending returns 403", async () => {

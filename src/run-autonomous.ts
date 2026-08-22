@@ -1,8 +1,8 @@
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
+import { getPublicationCredential } from "./publication-credential.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
@@ -91,7 +91,7 @@ function buildDefaultImplementationPrompt(params: {
 
 ## Gap-fill run (PR #${prNumber})
 
-You are filling implementation gaps on existing PR #${prNumber}. Do NOT create a new branch or PR. Commit your changes to the current branch and push.
+You are filling implementation gaps on existing PR #${prNumber}. Do not create or switch branches, commit, push, or open a PR. Leave your changes unstaged and uncommitted; the AI-Implement pipeline will commit and push them to the existing PR branch after review.
 
 **Issue:** ${issueIdentifier}
 **Title:** ${issueTitle}
@@ -113,18 +113,14 @@ ${issueDescription}`;
 
 function appendPipelineOwnedGitInstructions(prompt: string, prNumber: string): string {
   if (prNumber) {
-    if (prompt.includes("Runner GitHub credential refresh")) return prompt;
-    const refreshScript = join(
-      dirname(fileURLToPath(import.meta.url)),
-      "refresh-runner-github-credentials.js",
-    );
+    if (prompt.includes("Pipeline-owned gap-fill Git")) return prompt;
     return `${prompt.trimEnd()}
 
-## Runner GitHub credential refresh
+## Pipeline-owned gap-fill Git
 
-Immediately before every \`git push\`, run \`node ${JSON.stringify(refreshScript)}\`.
-This re-vends the GitHub token and updates \`origin\`; if vending is temporarily
-unavailable, it keeps the latest token already stored in \`origin\`.`;
+Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
+Modify files only in the current checkout and leave the working tree changes unstaged and uncommitted.
+The AI-Implement pipeline will commit and push the reviewed changes to the existing PR branch.`;
   }
   if (prompt.includes("Pipeline-owned Git")) return prompt;
   return `${prompt.trimEnd()}
@@ -134,6 +130,19 @@ unavailable, it keeps the latest token already stored in \`origin\`.`;
 Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
 Modify files only in the current checkout and leave the working tree changes unstaged and uncommitted.
 The AI-Implement pipeline will create the implementation commit, push an issue-scoped branch, and open the PR after review passes.`;
+}
+
+function appendValidationCommandDiscipline(prompt: string): string {
+  if (prompt.includes("Validation command discipline")) return prompt;
+  return `${prompt.trimEnd()}
+
+## Validation command discipline
+
+Run targeted checks while iterating. Do not rerun an unchanged full build or full test suite
+solely to apply a different grep, tail, or other output filter. If a command's output is
+too large to inspect directly, capture its complete output once, then inspect that saved output.
+Only repeat an expensive validation command after a relevant code, configuration, dependency,
+or environment change.`;
 }
 
 function appendOperatorInstruction(prompt: string, instruction: string | null): string {
@@ -358,6 +367,11 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
+  // Move the one-use publication bearer out of the inherited environment
+  // before hooks, package installs, repository scripts, or model subprocesses
+  // can run. Runner-owned publication steps retrieve it from private memory.
+  getPublicationCredential();
+
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
   const {
     issueId,
@@ -430,10 +444,12 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     teardownHook = parsed.frontMatter.teardown;
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
-  implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
+  implementationPrompt = appendValidationCommandDiscipline(
+    appendPipelineOwnedGitInstructions(implementationPrompt, prNumber),
+  );
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
   const model = claudeModel || workflowModel || "claude-sonnet-4-6";
-  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel, Boolean(prNumber));
+  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
   const orchestratorUrl = process.env.ORCHESTRATOR_URL;
   const nonce = process.env.MACHINE_NONCE ?? "";
   if (orchestratorUrl && !nonce) {
@@ -520,8 +536,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     // Case B: grouping-parent run where the agent produced genuinely no changes. Push returned
     // a no-op (branchPushed=false, prUrl=null). Report success without a prUrl so the
     // orchestrator finalizes the issue and merge-up.ts opens the feature→base roll-up PR.
-    // (Gap-fill runs never set groupingParent, so this cannot collide with the skip-push
-    // gap-fill path below.)
+    // (Gap-fill runs never set groupingParent, so this cannot collide with the
+    // existing-PR update path below.)
     if (context.data.groupingParent && pushOutputs.branchPushed === false && !prUrl) {
       disposition = "no-op (grouping parent: no own work; finalized for roll-up)";
       await postRunnerResult({
@@ -535,9 +551,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       return { exitCode: 0 };
     }
 
-    // A gap-fill run (prNumber set) never produces push outputs: the pipeline skips
-    // push because Claude commits and pushes to the existing PR branch itself. An
-    // approved gap-fill without a prUrl is therefore a success, not REVIEW_UNAPPROVED.
+    // A gap-fill run updates an existing PR and intentionally does not create a
+    // new prUrl. An approved gap-fill is therefore a success even when the push
+    // step reports only the existing PR number (or a clean no-op).
     // Similarly, an approved mounted dev-harness run has no push step and no PR URL,
     // but is a genuine local success.
     if (approved && (prUrl || prNumber || devHarnessMode)) {
@@ -789,7 +805,9 @@ export async function runAutonomousLocally(
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
 
-  implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, "");
+  implementationPrompt = appendValidationCommandDiscipline(
+    appendPipelineOwnedGitInstructions(implementationPrompt, ""),
+  );
   const model = opts.model ?? workflowModel ?? "claude-sonnet-4-6";
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary");
   const reporter = opts.reporter ?? new NoopStepReporter();

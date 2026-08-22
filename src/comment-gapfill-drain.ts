@@ -8,6 +8,9 @@ import { buildEnvelopeDispatchInputs, providerDispatchFields, capDispatchFields,
 import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
 import { resolveSessionImage } from "./repo-image.js";
+import type { WorkflowCapabilities, WorkflowContract } from "./workflow-probe.js";
+
+type ContractProbeResult = WorkflowContract | WorkflowCapabilities;
 
 export interface DrainCommentGapfillsInput {
   getMappings(): Record<string, RepoMapping>;
@@ -18,7 +21,7 @@ export interface DrainCommentGapfillsInput {
   runnerTokenSecret: string | null;
   getInstallationToken(owner: string): Promise<string>;
   resolveRunnerImage(mapping: RepoMapping, ghToken: string): Promise<string | undefined>;
-  checkContract(opts: { owner: string; repo: string; workflowFile: string; token: string; ref: string }): Promise<"legacy" | "envelope">;
+  checkContract(opts: { owner: string; repo: string; workflowFile: string; token: string; ref: string }): Promise<ContractProbeResult>;
   dispatch(token: string, mapping: RepoMapping, inputs: Record<string, string | undefined>): Promise<{ success: boolean; status: number; error?: string }>;
   postComment(token: string, owner: string, repo: string, prNumber: number, body: string): Promise<void>;
   onDispatchFailure(failure: { status: number; error?: string }, notifyType: string, notifyWebhookUrl: string | null, ctx: DispatchFailureContext): Promise<void>;
@@ -31,6 +34,12 @@ export interface DrainCommentGapfillsInput {
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   sessionImage: string;
+}
+
+function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapabilities {
+  return typeof result === "string"
+    ? { contract: result, supportsRunPublicationToken: false }
+    : result;
 }
 
 export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput): Promise<void> {
@@ -245,13 +254,26 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
       } else {
         // GitHub Actions path (includes "both" shadow mode — GHA is primary)
         const runnerImage = await opts.resolveRunnerImage(mapping, ghToken);
-        const contract = await opts.checkContract({
+        const capabilities = normalizeContractProbeResult(await opts.checkContract({
           owner: mapping.owner,
           repo: mapping.repo,
           workflowFile: mapping.workflowFile,
           token: ghToken,
           ref: mapping.defaultBranch,
-        });
+        }));
+        const { contract } = capabilities;
+        const runPublicationToken = dispatchId && opts.runnerCallbackBaseUrl && opts.runnerTokenSecret && capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
+          ? mintRunToken({
+              issueId: prLog.issueId,
+              mappingTeamKey: scopeKey,
+              phase: "gap-analysis",
+              audience: "publication",
+              dispatchId,
+              repository: `${mapping.owner}/${mapping.repo}`,
+              ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+              secret: opts.runnerTokenSecret,
+            }).token
+          : undefined;
 
         const gapFillInputs = contract === "envelope"
           ? buildEnvelopeDispatchInputs(mapping, gapFillIssue, {
@@ -261,6 +283,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
               runnerCallbackUrl: runnerCallbackUrl || undefined,
               runToken,
               runProgressToken,
+              runPublicationToken,
               runnerImage,
             })
           : {
