@@ -66,6 +66,142 @@ describe("jobs table", () => {
     expect(jobs[0].status).toBe("running");
   });
 
+  it("attachJobRunIdIfMissing does not replace an existing exact run", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.claimJobRunId(jobId, 12345);
+
+    const attached = log.attachJobRunIdIfMissing(jobId, 67890);
+
+    expect(attached).toBe(false);
+    expect(log.getJobById(jobId)).toMatchObject({
+      runId: 12345,
+      status: "running",
+    });
+  });
+
+  it("attachJobRunIdIfMissing does not attach to a terminal row with no run ID", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.updateJobStatus(jobId, "completed", "success");
+
+    const attached = log.attachJobRunIdIfMissing(jobId, 67890);
+
+    expect(attached).toBe(false);
+    expect(log.getJobById(jobId)).toMatchObject({
+      runId: null,
+      status: "completed",
+      conclusion: "success",
+    });
+  });
+
+  it("claimJobRunId releases a nonterminal sibling that heuristically claimed the run", () => {
+    const firstJobId = log.appendLog({ issueId: "issue-1", repo: "org/repo" });
+    const secondJobId = log.appendLog({ issueId: "issue-2", repo: "org/repo" });
+    log.updateJobRunId(firstJobId, 101);
+    log.updateJobRunId(secondJobId, 202);
+
+    const released = log.claimJobRunId(secondJobId, 101);
+
+    expect(released).toBe(1);
+    const jobs = log.listLog();
+    expect(jobs.find((job) => job.id === firstJobId)).toMatchObject({
+      runId: null,
+      status: "dispatched",
+    });
+    expect(jobs.find((job) => job.id === secondJobId)).toMatchObject({
+      runId: 101,
+      status: "running",
+    });
+  });
+
+  it("claimJobRunId preserves target terminal status on a late progress retry", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.updateJobRunId(jobId, 101);
+    log.updateJobStatus(jobId, "completed", "success");
+    const completedAt = log.getJobById(jobId)?.completedAt;
+
+    const released = log.claimJobRunId(jobId, 101);
+
+    expect(released).toBe(0);
+    expect(log.getJobById(jobId)).toMatchObject({
+      runId: 101,
+      status: "completed",
+      conclusion: "success",
+      completedAt,
+    });
+  });
+
+  it("claimJobRunId repairs a target terminalized against the wrong run", () => {
+    const jobId = log.appendLog({ issueId: "issue-1" });
+    log.updateJobRunId(jobId, 202);
+    log.updateJobStatus(jobId, "failed", "failure");
+    log.markJobNotified(jobId);
+
+    const released = log.claimJobRunId(jobId, 101);
+
+    expect(released).toBe(0);
+    expect(log.getJobById(jobId)).toMatchObject({
+      runId: 101,
+      status: "running",
+      conclusion: null,
+      completedAt: null,
+      notifiedAt: null,
+    });
+  });
+
+  it("claimJobRunId reopens a terminal sibling that claimed the exact run", () => {
+    const siblingJobId = log.appendLog({ issueId: "issue-1", repo: "org/repo" });
+    const exactJobId = log.appendLog({ issueId: "issue-2", repo: "org/repo" });
+    log.updateJobRunId(siblingJobId, 101);
+    log.updateJobStatus(siblingJobId, "completed", "success");
+    log.markJobNotified(siblingJobId);
+    log.updateJobRunId(exactJobId, 202);
+
+    const released = log.claimJobRunId(exactJobId, 101);
+
+    expect(released).toBe(1);
+    expect(log.getJobById(siblingJobId)).toMatchObject({
+      runId: null,
+      status: "dispatched",
+      conclusion: null,
+      completedAt: null,
+      notifiedAt: null,
+    });
+    expect(log.getJobById(exactJobId)).toMatchObject({
+      runId: 101,
+      status: "running",
+    });
+  });
+
+  it("claimJobRunId never resets a job from another repository", () => {
+    const foreignJobId = log.appendLog({ issueId: "issue-1", repo: "other/repo" });
+    const exactJobId = log.appendLog({ issueId: "issue-2", repo: "org/repo" });
+    log.updateJobRunId(foreignJobId, 101);
+    log.updateJobStatus(foreignJobId, "completed", "success");
+    log.markJobNotified(foreignJobId);
+    log.updateJobRunId(exactJobId, 202);
+
+    const released = log.claimJobRunId(exactJobId, 101);
+
+    expect(released).toBe(0);
+    expect(log.getJobById(foreignJobId)).toMatchObject({
+      runId: 101,
+      status: "completed",
+      conclusion: "success",
+    });
+    expect(log.getJobById(exactJobId)).toMatchObject({
+      runId: 101,
+      status: "running",
+    });
+  });
+
+  it("indexes run IDs used by exact and heuristic correlation", () => {
+    const indexes = dedup.getDb()
+      .prepare("PRAGMA index_list(dispatch_log)")
+      .all() as Array<{ name: string }>;
+
+    expect(indexes.map((index) => index.name)).toContain("idx_dispatch_log_run_id");
+  });
+
   it("updateJobStatus sets terminal state with completion time", () => {
     const jobId = log.appendLog({ issueId: "issue-1" });
     log.updateJobRunId(jobId, 12345);

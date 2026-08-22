@@ -130,6 +130,7 @@ function ensureLogColumns(): void {
   if (!names.has("grouping_parent")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN grouping_parent INTEGER NOT NULL DEFAULT 0");
   }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_run_id ON dispatch_log(run_id)");
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -239,6 +240,74 @@ export function updateJobRunId(jobId: number, runId: number): void {
   getDb()
     .prepare("UPDATE dispatch_log SET run_id = ?, status = 'running' WHERE id = ?")
     .run(runId, jobId);
+}
+
+/** Best-effort heuristic binding. An authenticated callback may have won the race already. */
+export function attachJobRunIdIfMissing(jobId: number, runId: number): boolean {
+  const result = getDb()
+    .prepare("UPDATE dispatch_log SET run_id = ?, status = 'running' WHERE id = ? AND run_id IS NULL AND status IN ('dispatched', 'running')")
+    .run(runId, jobId);
+  return result.changes > 0;
+}
+
+/**
+ * Authoritatively binds the run reported by a job's authenticated progress token.
+ * Any sibling in the same repository holding that run was matched heuristically
+ * and is reopened so it can discover its own run. Repository scoping prevents a
+ * runner token from mutating another repository's jobs. A terminal target is
+ * preserved only when it already owns this exact run, which makes late progress
+ * retries harmless.
+ */
+export function claimJobRunId(jobId: number, runId: number): number {
+  const db = getDb();
+  return db.transaction(() => {
+    const target = db
+      .prepare("SELECT repo FROM dispatch_log WHERE id = ?")
+      .get(jobId) as { repo: string | null } | undefined;
+
+    const released = db
+      .prepare(
+        `UPDATE dispatch_log
+         SET run_id = NULL,
+             status = 'dispatched',
+             conclusion = NULL,
+             completed_at = NULL,
+             notified_at = NULL
+         WHERE run_id = ?
+           AND id != ?
+           AND repo = ?`,
+      )
+      .run(runId, jobId, target?.repo ?? null);
+
+    db.prepare(
+      `UPDATE dispatch_log
+       SET status = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN status
+             ELSE 'running'
+           END,
+           conclusion = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN conclusion
+             ELSE NULL
+           END,
+           completed_at = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN completed_at
+             ELSE NULL
+           END,
+           notified_at = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN notified_at
+             ELSE NULL
+           END,
+           run_id = ?
+       WHERE id = ?`,
+    )
+      .run(runId, runId, runId, runId, runId, jobId);
+
+    return released.changes;
+  })();
 }
 
 export function updateJobStatus(

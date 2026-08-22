@@ -1,4 +1,4 @@
-import { getJobByDispatchId, updateJobPrUrl, updateJobStatus } from "./log.js";
+import { claimJobRunId, getJobByDispatchId, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
@@ -40,6 +40,7 @@ export interface HandleRunnerResultOutput {
 
 export interface RunnerProgressBody {
   step: Step;
+  githubRunId?: number;
 }
 
 export interface HandleRunnerProgressInput {
@@ -121,6 +122,16 @@ function validateStepBody(body: unknown): Step | HandleRunnerResultOutput {
   if (!s.started_at || typeof s.started_at !== "string") return bad(400, "invalid_step_started_at");
 
   return raw.step as Step;
+}
+
+function validateGithubRunId(body: unknown): number | null | HandleRunnerResultOutput {
+  const raw = body as { githubRunId?: unknown } | null | undefined;
+  if (!raw || typeof raw !== "object" || !("githubRunId" in raw)) return null;
+  return typeof raw.githubRunId === "number" &&
+    Number.isSafeInteger(raw.githubRunId) &&
+    raw.githubRunId > 0
+    ? raw.githubRunId
+    : bad(400, "invalid_github_run_id");
 }
 
 export async function handleRunnerResult(
@@ -327,8 +338,15 @@ export async function handleRunnerProgress(
   const stepOrError = validateStepBody(input.body);
   if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
 
+  const githubRunIdOrError = validateGithubRunId(input.body);
+  if (githubRunIdOrError && typeof githubRunIdOrError === "object") return githubRunIdOrError;
+
   const job = getJobByDispatchId(verified.claims.dispatchId);
   if (!job) return bad(404, "job_not_found");
+
+  if (typeof githubRunIdOrError === "number") {
+    claimJobRunId(job.id, githubRunIdOrError);
+  }
 
   upsertStepRecord(job.id, stepOrError);
   return { status: 200, body: { acknowledged: true } };

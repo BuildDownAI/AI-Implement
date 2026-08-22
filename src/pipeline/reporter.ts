@@ -55,6 +55,7 @@ export class HttpStepReporter implements StepReporter {
 export class TokenStepReporter implements StepReporter {
   private readonly fetchImpl: typeof fetch;
   private readonly retryDelaysMs: number[];
+  private readonly githubRunId: number | null;
 
   constructor(
     private readonly callbackUrl: string,
@@ -63,11 +64,13 @@ export class TokenStepReporter implements StepReporter {
   ) {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.retryDelaysMs = options.retryDelaysMs ?? [250, 1000, 2500];
+    this.githubRunId = parseGithubRunId(process.env.GITHUB_RUN_ID);
   }
 
   async report(step: Step): Promise<void> {
     const url = `${this.callbackUrl.replace(/\/$/, "")}/runner/progress`;
     const attempts = this.retryDelaysMs.length + 1;
+    const body = this.githubRunId === null ? { step } : { step, githubRunId: this.githubRunId };
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
@@ -77,7 +80,7 @@ export class TokenStepReporter implements StepReporter {
             "Content-Type": "application/json",
             Authorization: `Bearer ${this.progressToken}`,
           },
-          body: JSON.stringify({ step }),
+          body: JSON.stringify(body),
         });
         if (res.ok) return;
         if (!isRetryableStatus(res.status) || attempt === attempts) {
@@ -111,6 +114,13 @@ function errorSummary(err: unknown): string {
     return `${err.name}: ${err.message}${causeMessage}`;
   }
   return String(err);
+}
+
+function parseGithubRunId(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  if (!/^[1-9]\d*$/.test(value)) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 function sleep(ms: number): Promise<void> {
