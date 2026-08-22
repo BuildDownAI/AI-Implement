@@ -106,6 +106,7 @@ function buildImplementPrompt(
   issueTitle: string,
   issueDescription: string,
   reviewFeedback: string | undefined,
+  reviewIssues: string[],
   issueIdentifier: string,
   implementationPrompt?: string,
 ): string {
@@ -114,10 +115,18 @@ function buildImplementPrompt(
       ? implementationPrompt
       : `Implement the following issue.\n\nTitle: ${issueTitle}\n\nDescription:\n${issueDescription}`;
 
-  if (reviewFeedback) {
-    return `${basePrompt}\n\n## Reviewer Feedback\n\nYou previously attempted to implement ${issueIdentifier}: ${issueTitle}.\n\nReviewer feedback:\n${reviewFeedback}\n\nPlease address the feedback and improve the implementation.`;
+  if (reviewFeedback || reviewIssues.length > 0) {
+    const issueBlock =
+      reviewIssues.length > 0
+        ? `\n\nReviewer issues:\n${reviewIssues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")}`
+        : "";
+    return `${basePrompt}\n\n## Reviewer Feedback\n\nYou previously attempted to implement ${issueIdentifier}: ${issueTitle}.${issueBlock}\n\nReviewer feedback:\n${reviewFeedback ?? "(none)"}\n\nPlease address every listed issue and use the feedback for context.`;
   }
   return basePrompt;
+}
+
+function exceededConfiguredMaxTurns(telemetry: RunTelemetry | undefined, maxTurns: number): boolean {
+  return typeof telemetry?.numTurns === "number" && telemetry.numTurns > maxTurns;
 }
 
 /**
@@ -338,6 +347,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     let iteration = 0;
     let approved = false;
     let feedback = "";
+    let reviewIssues: string[] = [];
     let terminationReason: TerminationReason = "iterations_exhausted";
     const passes: PassStat[] = [];
     let postMortem: string | undefined;
@@ -365,6 +375,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         String(inputs.issueTitle),
         String(inputs.issueDescription),
         feedback || undefined,
+        reviewIssues,
         context.data.issueIdentifier,
         inputs.implementationPrompt !== undefined ? String(inputs.implementationPrompt) : undefined,
       );
@@ -433,7 +444,10 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       // Hard max_turns: the pass ran out of budget mid-work. Reviewing or
       // re-implementing an over-scoped task just burns more passes — stop,
       // post-mortem where the turns went, and let the pipeline open a draft PR.
-      if (implementTelemetry?.outcome === "max_turns") {
+      if (
+        implementTelemetry &&
+        (implementTelemetry.outcome === "max_turns" || exceededConfiguredMaxTurns(implementTelemetry, effectiveMaxTurns))
+      ) {
         terminationReason = "max_turns";
         feedback = `Implementation hit the ${effectiveMaxTurns}-turn cap before completing (${implementTelemetry.numTurns ?? "?"} turns used).`;
         postMortem =
@@ -496,6 +510,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
 
         approved = reviewOutputs.approved;
         feedback = reviewOutputs.feedback;
+        reviewIssues = [...reviewOutputs.issues];
         pass.reviewApproved = reviewOutputs.approved;
         if (approved) terminationReason = "approved";
       } catch (err) {

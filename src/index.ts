@@ -6,7 +6,7 @@ import {
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment } from "./github.js";
-import { resolveWorkflowContract } from "./workflow-probe.js";
+import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
@@ -31,6 +31,7 @@ import { configureAuthorizationPolicy } from "./oauth/authorize.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
+import { handlePublicationTokenRequest } from "./publication-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { classifyCompletion, renderClassification } from "./completion-classification.js";
@@ -80,6 +81,7 @@ import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
+import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 
 // ---------- Configuration ----------
 
@@ -671,7 +673,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       runnerTokenSecret: config.runnerTokenSecret,
       getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
       resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
-      checkContract: (params) => resolveWorkflowContract(params),
+      checkContract: (params) => resolveWorkflowCapabilities(params),
       dispatch: dispatchWorkflow,
       postComment: postPrComment,
       onDispatchFailure: surfaceDispatchFailure,
@@ -818,13 +820,30 @@ async function dispatchGitHubActions(
 
   const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
-  const contract = await resolveWorkflowContract({
+  const workflowCapabilities = await resolveWorkflowCapabilities({
     owner: mapping.owner,
     repo: mapping.repo,
     workflowFile: mapping.workflowFile,
     token: ghToken,
     ref: mapping.defaultBranch,
   });
+  const { contract } = workflowCapabilities;
+  const runPublicationToken = contract === "envelope"
+    && workflowCapabilities.supportsRunPublicationToken
+    && dispatchId
+    && config.runnerCallbackBaseUrl
+    && config.runnerTokenSecret
+    ? mintRunToken({
+        issueId: issue.id,
+        mappingTeamKey: issue.scopeKey,
+        phase: "implementation",
+        audience: "publication",
+        dispatchId,
+        repository: `${mapping.owner}/${mapping.repo}`,
+        ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+        secret: config.runnerTokenSecret,
+      }).token
+    : undefined;
 
   const dispatchInputs = contract === "envelope"
     ? buildEnvelopeDispatchInputs(mapping, issue, {
@@ -833,6 +852,7 @@ async function dispatchGitHubActions(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken,
         runProgressToken,
+        runPublicationToken,
         runnerImage,
         groupingParent: isGroupingParentDispatch(issue) || undefined,
       })
@@ -1677,9 +1697,6 @@ const RUN_ID_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 /** Maximum age (ms) for a Fly Machine job before it's considered timed out. */
 const FLY_MACHINE_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
 
-/** Maximum age (ms) for a GHA job (once a run ID is bound) before it's considered stuck. */
-const STUCK_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
-
 /** Maximum characters to include in a Linear "Session Logs" comment. */
 const LOG_MAX_CHARS = 5_000;
 
@@ -1818,6 +1835,9 @@ async function monitorGitHubActionsJob(
   const [owner, repo] = repoFullName.split("/");
   if (!owner || !repo) return;
 
+  const mapping = Object.values(teamRepoMap).find(
+    (m) => `${m.owner}/${m.repo}` === repoFullName,
+  );
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
 
   const watchdogConfig: StuckWatchdogConfig = {
@@ -1830,9 +1850,6 @@ async function monitorGitHubActionsJob(
   // If we don't have a run ID yet, try to find it
   if (!job.runId) {
     const dispatchTime = new Date(job.dispatchedAt - 30_000);
-    const mapping = Object.values(teamRepoMap).find(
-      (m) => `${m.owner}/${m.repo}` === repoFullName,
-    );
     if (!mapping) return;
 
     const workflowFile = workflowFileForJob(job, mapping);
@@ -1866,11 +1883,18 @@ async function monitorGitHubActionsJob(
   const runStatus = await getWorkflowRunStatus(ghToken, owner, repo, job.runId);
   if (!runStatus) return;
 
-  // Detect stuck: non-terminal past the wall-clock cap
-  if (runStatus.status !== "completed" && Date.now() - job.dispatchedAt > STUCK_TIMEOUT_MS) {
-    const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
+  // Detect stuck: non-terminal past the configured workflow timeout plus reconciliation grace.
+  const watchdog = githubActionsWatchdogDecision({
+    status: runStatus.status,
+    dispatchedAtMs: job.dispatchedAt,
+    nowMs: Date.now(),
+    maxJobMinutes: mapping?.maxJobMinutes ?? null,
+  });
+  if (watchdog.overdue) {
+    const elapsedMin = Math.round(watchdog.elapsedMs / 60000);
     console.warn(
-      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck in ${runStatus.status} after ${elapsedMin}m`,
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck in ${runStatus.status} after ${elapsedMin}m ` +
+        `(threshold ${watchdog.jobTimeoutMinutes}m + ${watchdog.graceMinutes}m grace)`,
     );
     const provider = await providerForJob(registry, job);
     await remediateStuckJob(watchdogConfig, provider, job, runStatus.status);
@@ -2671,13 +2695,30 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
-      const reviewFixContract = await resolveWorkflowContract({
+      const reviewFixCapabilities = await resolveWorkflowCapabilities({
         owner: mapping.owner,
         repo: mapping.repo,
         workflowFile: mapping.workflowFile,
         token: ghToken,
         ref: mapping.defaultBranch,
       });
+      const reviewFixContract = reviewFixCapabilities.contract;
+      const runPublicationToken = reviewFixContract === "envelope"
+        && reviewFixCapabilities.supportsRunPublicationToken
+        && dispatchId
+        && config.runnerCallbackBaseUrl
+        && config.runnerTokenSecret
+        ? mintRunToken({
+            issueId: fix.issueId,
+            mappingTeamKey: scopeKey,
+            phase: "gap-analysis",
+            audience: "publication",
+            dispatchId,
+            repository: `${mapping.owner}/${mapping.repo}`,
+            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+            secret: config.runnerTokenSecret,
+          }).token
+        : undefined;
 
       const fixIssue = {
         id: fix.issueId,
@@ -2693,6 +2734,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken,
             runProgressToken,
+            runPublicationToken,
             runnerImage,
           })
         : {
@@ -2824,6 +2866,33 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[dependency-token] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Publication token vending — dedicated, single-use runner credential;
+    // returns a fresh token scoped to the exact repository signed at dispatch.
+    if (url === "/api/runner/publication-token" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const result = await handlePublicationTokenRequest({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          githubAppId: config.githubAppId,
+          githubAppPrivateKey: config.githubAppPrivateKey,
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[publication-token] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

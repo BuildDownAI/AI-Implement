@@ -12,9 +12,9 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 
 ---
 
-## 7-Input Contract
+## 8-Input Implementation Contract
 
-`claude-implement.yml` (post-envelope generation) exposes exactly these seven `workflow_dispatch` inputs:
+`claude-implement.yml` (post-envelope generation) exposes exactly these eight `workflow_dispatch` inputs:
 
 | Input | Required | Type | Notes |
 |-------|----------|------|-------|
@@ -25,8 +25,9 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 | `aws_region` | No | string | Required when `provider=bedrock`; passed to `configure-aws-credentials` before the container runs |
 | `run_token` | No | string | HMAC bearer token for result callback to the orchestrator; empty skips callback. **Masked by the workflow before the runner starts.** |
 | `run_progress_token` | No | string | HMAC bearer token for in-progress callbacks; empty skips progress posts. **Masked.** |
+| `run_publication_token` | No | string | Dedicated, single-use bearer token that may be exchanged immediately before repository publication for a fresh repo-scoped GitHub credential. **Masked. Implementation and gap-analysis only.** |
 
-`run_token` and `run_progress_token` stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA.
+The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs.
 
 ---
 
@@ -72,11 +73,11 @@ Field notes:
 
 ## Probe Semantics and TTL
 
-Before every dispatch the orchestrator calls `resolveWorkflowContract` (`src/workflow-probe.ts`). The probe:
+Before every dispatch the orchestrator calls `resolveWorkflowCapabilities` (`src/workflow-probe.ts`; `resolveWorkflowContract` remains the backward-compatible contract-only wrapper). The probe:
 
 1. Fetches `https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflowFile}` from the **default branch**.
-2. Base64-decodes the YAML and tests it against `/^\s{2,}run_config:\s*$/m` (at least two leading spaces — the standard YAML indentation for an input name inside `workflow_dispatch.inputs`).
-3. Returns `"envelope"` if the pattern matches, `"legacy"` otherwise.
+2. Base64-decodes the YAML and detects the required `run_config` input plus optional capability inputs such as `run_publication_token`.
+3. Returns the envelope/legacy contract and optional capability bits. Publication credentials are minted and dispatched only when the target explicitly advertises support.
 4. On any fetch error (network failure, 404, non-200, malformed JSON) returns `"legacy"` and logs a warning — fail-safe.
 
 Results are cached in-process per `owner/repo/workflowFile` key for **5 minutes** (`CACHE_TTL_MS = 300_000 ms`). A re-sync that merges the envelope template will be picked up at most one poll cycle (60 s) after the cache expires.
@@ -97,7 +98,7 @@ Results are cached in-process per `owner/repo/workflowFile` key for **5 minutes*
 1. **Open the orchestrator admin UI** at `/admin` → Projects.
 2. Find the repo row and click **Sync workflows**.
 3. The sync opens a PR in the target repo titled something like `chore: sync AI-Implement workflow templates`. Review and **merge it**.
-   - The PR replaces the existing `claude-implement.yml` with the 7-input envelope version.
+   - The PR replaces the existing `claude-implement.yml` with the 8-input envelope version.
    - It **removes** `.github/workflows/comment-trigger.yml` (if present) — `/ai-implement` comments are now handled by the orchestrator webhook.
    - `claude-plan.yml` is updated alongside.
    - `WORKFLOW.md` and `PLANNING.md` are left untouched if they already exist.

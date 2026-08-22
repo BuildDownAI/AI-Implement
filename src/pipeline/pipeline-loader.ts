@@ -70,6 +70,12 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
   return { id, steps: parsedSteps };
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
 /**
  * Standard input wiring for the autonomous pipeline steps. Applied by step ID
  * so the YAML only needs to declare IDs, types, and optional moduleIds.
@@ -166,31 +172,41 @@ function applyWiring(step: YamlStep): StepDefinition {
       };
 
     case "push":
-      // Push always runs after the feedback loop on an initial run: unapproved work ships
-      // as a draft PR (with the reviewer feedback in the body) instead of being silently
-      // discarded. Gap-fill runs are different: Claude commits and pushes to the *existing*
-      // PR branch itself (the pipeline never owns git there — see run-autonomous.ts's
-      // gap-fill prompt), so the tree is clean by the time push would run and it would just
-      // throw "Nothing to commit" — turning an approved gap-fill into a red failure. Skip
-      // push for every gap-fill run; run-autonomous.ts's outcome derivation handles both
-      // gap-fill outcomes without push outputs (approved → gap-analysis success, unapproved
-      // → coded failure callback with no prUrl plus autopsy).
+      // The pipeline owns repository writes for both initial and gap-fill runs.
+      // Initial runs create an issue branch and PR; gap-fill runs commit and push
+      // directly to the already checked-out PR branch. This keeps the model
+      // read-only and lets credential vending occur at the actual write boundary.
       return {
         ...step,
-        skip: (ctx: PipelineContext) => Boolean(ctx.data.prNumber),
+        skip: (ctx: PipelineContext) => {
+          const existingPrNumber = ctx.data.prNumber?.trim();
+          return Boolean(existingPrNumber && ctx.getOutputs("feedback-loop").approved !== true);
+        },
         inputs: (ctx: PipelineContext) => {
           const fb = ctx.getOutputs("feedback-loop");
           const approved = fb.approved === true;
+          const existingPrNumber = ctx.data.prNumber?.trim() || undefined;
+          const cloneOutputs = ctx.getOutputs("clone");
+          const checkedOutBranch = nonEmptyString(cloneOutputs.branch) ?? nonEmptyString(ctx.data.branch);
+          if (existingPrNumber && !checkedOutBranch) {
+            throw new Error(
+              "Missing checked-out branch for gap-fill push: clone step must output branch or context branch must be set",
+            );
+          }
           return {
-            workspaceDir: ctx.getOutputs("clone").workspaceDir,
-            repoOwner: ctx.getOutputs("clone").repoOwner,
-            repoRepo: ctx.getOutputs("clone").repoRepo,
-            githubToken: ctx.getOutputs("clone").githubToken,
+            workspaceDir: cloneOutputs.workspaceDir,
+            repoOwner: cloneOutputs.repoOwner,
+            repoRepo: cloneOutputs.repoRepo,
+            githubToken: cloneOutputs.githubToken,
             orchestratorUrl: ctx.data.orchestratorUrl,
             machineNonce: ctx.data.nonce,
-            branchName: buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
-            baseBranch: ctx.getOutputs("clone").branch,
-            baseRef: ctx.getOutputs("clone").clonedRef,
+            callbackUrl: ctx.data.callbackUrl,
+            branchName: existingPrNumber
+              ? checkedOutBranch
+              : buildIssueBranchName(ctx.data.issueIdentifier, ctx.data.issueTitle, ctx.data.branchPrefix),
+            existingPrNumber,
+            baseBranch: checkedOutBranch,
+            baseRef: cloneOutputs.clonedRef,
             prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
             sensitiveFiles: ctx.data.sensitiveFiles,
             groupingParent: ctx.data.groupingParent,
@@ -231,6 +247,9 @@ function applyWiring(step: YamlStep): StepDefinition {
           reviewCheckNames: ctx.getOutputs("install").reviewCheckNames,
         }),
         skip: (ctx: PipelineContext) => {
+          // Gap-fill runs update an existing PR and retain their established
+          // review flow; do not start a second post-push review cycle here.
+          if (ctx.data.prNumber) return true;
           // Never run further review/force-push cycles against an unapproved
           // draft — the review budget is already exhausted.
           if (ctx.getOutputs("feedback-loop").approved !== true) return true;

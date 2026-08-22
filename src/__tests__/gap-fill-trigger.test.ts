@@ -87,6 +87,7 @@ function makeInput(overrides: Partial<Parameters<typeof handleGapFillTrigger>[0]
     resolveProvider: async (_m: RepoMapping): Promise<TicketingProvider> => new FakeProvider(),
     getInstallationToken: async (_owner: string) => "gh-token",
     dispatchWorkflow: vi.fn(async () => ({ success: true, status: 204 })),
+    resolveWorkflowCapabilities: vi.fn(async () => ({ contract: "legacy" as const, supportsRunPublicationToken: false })),
     ...overrides,
   };
 }
@@ -209,6 +210,80 @@ describe("handleGapFillTrigger", () => {
     expect(typeof inputs.run_token).toBe("string");
     expect(inputs.run_progress_token).toBeTruthy();
     expect(typeof inputs.run_progress_token).toBe("string");
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+
+  it("dispatches envelope inputs with a publication token only when the workflow advertises support", async () => {
+    const { decodeRunConfig } = await import("../run-config.js");
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    const issue = makeIssue({ id: "issue-uuid-1", identifier: "ACME-123", scopeKey: "ACME" });
+    const provider = new FakeProvider({ initialIssues: [issue] });
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+    const resolveWorkflowCapabilities = vi.fn(async () => ({
+      contract: "envelope" as const,
+      supportsRunPublicationToken: true,
+    }));
+
+    const res = await handleGapFillTrigger(
+      makeInput({
+        body: { issueKey: "ACME-123", prNumber: 42 },
+        getMappings: () => ({ ACME: mapping }),
+        resolveProvider: async () => provider,
+        runnerCallbackBaseUrl: CALLBACK_URL,
+        runnerTokenSecret: RUNNER_SECRET,
+        dispatchWorkflow: dispatchSpy,
+        resolveWorkflowCapabilities,
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(resolveWorkflowCapabilities).toHaveBeenCalledWith({
+      owner: "acme",
+      repo: "billing",
+      workflowFile: "claude-implement.yml",
+      token: "gh-token",
+      ref: "main",
+    });
+    const [, , inputs] = dispatchSpy.mock.calls[0];
+    expect(inputs.run_config).toBeDefined();
+    expect("issue_id" in inputs).toBe(false);
+    expect(inputs.run_token).toBeTruthy();
+    expect(inputs.run_progress_token).toBeTruthy();
+    expect(inputs.run_publication_token).toBeTruthy();
+    expect(typeof inputs.run_publication_token).toBe("string");
+    const decoded = decodeRunConfig(inputs.run_config);
+    expect(decoded.issue.id).toBe("issue-uuid-1");
+    expect(decoded.issue.identifier).toBe("ACME-123");
+    expect(decoded.prNumber).toBe("42");
+    expect(decoded.runnerPhase).toBe("gap-analysis");
+    expect(decoded.runnerCallbackUrl).toBe(CALLBACK_URL);
+  });
+
+  it("does not add a publication token for envelope workflows without the new input", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+    const issue = makeIssue({ id: "issue-uuid-1", identifier: "ACME-123", scopeKey: "ACME" });
+    const provider = new FakeProvider({ initialIssues: [issue] });
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+
+    const res = await handleGapFillTrigger(
+      makeInput({
+        body: { issueKey: "ACME-123", prNumber: 42 },
+        getMappings: () => ({ ACME: mapping }),
+        resolveProvider: async () => provider,
+        runnerCallbackBaseUrl: CALLBACK_URL,
+        runnerTokenSecret: RUNNER_SECRET,
+        dispatchWorkflow: dispatchSpy,
+        resolveWorkflowCapabilities: vi.fn(async () => ({
+          contract: "envelope" as const,
+          supportsRunPublicationToken: false,
+        })),
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    const [, , inputs] = dispatchSpy.mock.calls[0];
+    expect(inputs.run_config).toBeDefined();
+    expect("run_publication_token" in inputs).toBe(false);
   });
 
   it("dispatches with empty token/url when runner callback env not configured", async () => {

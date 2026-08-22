@@ -3,6 +3,7 @@ import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { getPublicationCredential } from "../../publication-credential.js";
 import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
   collectExternalReviewFindingsFromGh,
@@ -95,6 +96,8 @@ async function refreshCredentialsBeforePush(
     currentToken,
     orchestratorUrl: context.data.orchestratorUrl,
     machineNonce: context.data.nonce,
+    callbackUrl: context.data.callbackUrl,
+    publicationToken: getPublicationCredential(),
     owner,
     repo,
     workspaceDir: inputs.workspaceDir,

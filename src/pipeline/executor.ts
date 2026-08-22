@@ -18,8 +18,15 @@ const GITHUB_WRITE_CREDENTIAL_KEYS = [
   "GIT_PASSWORD",
 ] as const;
 
+const MODEL_CHILD_CREDENTIAL_KEYS = [
+  "RUN_PROGRESS_TOKEN",
+  "RUN_PUBLICATION_TOKEN",
+  "RUN_TOKEN",
+] as const;
+
 function claudeEnvironment(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
   const env = { ...process.env };
+  for (const key of MODEL_CHILD_CREDENTIAL_KEYS) delete env[key];
   if (!allowRepositoryWrites) {
     for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
   }

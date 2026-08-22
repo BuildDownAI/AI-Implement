@@ -77,6 +77,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     expect(inputs.run_config).toBeDefined();
     expect(inputs.run_token).toBe("tok-abc");
     expect(inputs.run_progress_token).toBe("prog-xyz");
+    expect("run_publication_token" in inputs).toBe(false);
 
     // Legacy per-field keys must be absent
     expect("issue_id" in inputs).toBe(false);
@@ -95,6 +96,17 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     // Provider not included for anthropic
     expect("provider" in inputs).toBe(false);
     expect("aws_region" in inputs).toBe(false);
+  });
+
+  it("includes a dedicated publication token only when explicitly provided", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase: "implementation",
+      runToken: "result-token",
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+    });
+
+    expect(inputs.run_publication_token).toBe("publication-token");
   });
 
   it("decodes run_config back to original issue fields and runnerPhase", () => {
@@ -312,6 +324,16 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
     });
 
     expect("run_progress_token" in inputs).toBe(false);
+  });
+
+  it("never includes a publication token for planning", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase: "planning",
+      runToken: "plan-token",
+      runPublicationToken: "must-not-leak",
+    });
+
+    expect("run_publication_token" in inputs).toBe(false);
   });
 
   it("still includes run_token for callback auth", () => {

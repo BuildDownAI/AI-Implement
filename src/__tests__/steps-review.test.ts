@@ -67,6 +67,22 @@ describe("reviewStep", () => {
     expect(outputs.progressDelta).toBe(50);
   });
 
+  it("fails closed when reviewer returns approved=true with non-empty issues", async () => {
+    const executor = makeExecutor(JSON.stringify({
+      approved: true,
+      issues: ["Still missing a regression test"],
+      score: 79,
+      progress_delta: 85,
+      feedback: "Nearly ready, but one blocker remains.",
+    }));
+
+    const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.issues).toEqual(["Still missing a regression test"]);
+    expect(outputs.feedback).toContain("Nearly ready");
+  });
+
   it("extracts JSON embedded in surrounding text", async () => {
     const stdout = `Here is my review:\n${APPROVED_JSON}\nEnd of review.`;
     const executor = makeExecutor(stdout);
@@ -96,6 +112,16 @@ describe("reviewStep", () => {
     const call = vi.mocked(executor.invoke).mock.calls[0][0];
     expect(call.prompt).toContain("Implementation Diff");
     expect(call.prompt).toContain("added line");
+  });
+
+  it("tells reviewers that any listed issue blocks approval", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+
+    await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt).toContain("If issues[] is non-empty, approved must be false");
+    expect(call.prompt).toContain("Do not set approved=true while listing unresolved issues");
   });
 
   it("includes iteration number in prompt", async () => {
@@ -177,7 +203,7 @@ describe("reviewStep", () => {
     // Marker reports the line-boundary cut (150_000), not the hard cap (200_000).
     expect(call.prompt).toContain(`showing first 150000 of ${diff.length} characters`);
     // The tail past the newline must not be embedded.
-    expect(call.prompt).not.toContain("x");
+    expect(call.prompt).not.toContain(tail.slice(0, 100));
   });
 
   it("does not truncate a normal-sized diff", async () => {

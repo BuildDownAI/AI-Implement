@@ -46,6 +46,8 @@ interface DispatchInputs {
   run_token?: string;
   /** Signed reusable token authorizing step progress POSTs. Empty when progress callback disabled. */
   run_progress_token?: string;
+  /** Signed single-use token authorizing a late publication credential mint. */
+  run_publication_token?: string;
   /**
    * Overrides the runner container image the target workflow runs in. Only set
    * when the orchestrator has an explicit image to pin (a per-repo
@@ -189,6 +191,8 @@ export interface EnvelopeDispatchOpts {
   runToken?: string;
   /** Include for implementation/gap-analysis; omit for planning (no progress token). */
   runProgressToken?: string;
+  /** Include only when the target workflow advertises publication-token support. */
+  runPublicationToken?: string;
   runnerImage?: string | null;
   prNumber?: string;
   /** Operator instruction forwarded from an /ai-implement PR comment. Rides inside run_config. */
@@ -200,7 +204,7 @@ export interface EnvelopeDispatchOpts {
 }
 
 /**
- * Assembles the 7-input envelope dispatch payload for target repos that have
+ * Assembles the envelope dispatch payload for target repos that have
  * re-synced to the envelope-style workflow contract. Issue fields, caps,
  * branchPrefix, skillsRepo, and baseBranch ride inside run_config; only the
  * pass-through inputs (tokens, provider, image, timeout) stay top-level so
@@ -241,6 +245,9 @@ export function buildEnvelopeDispatchInputs(
     run_config: encodeRunConfig(runConfig),
     run_token: opts.runToken ?? "",
     ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
+    ...(opts.runnerPhase !== "planning" && opts.runPublicationToken !== undefined
+      ? { run_publication_token: opts.runPublicationToken }
+      : {}),
     ...providerDispatchFields(mapping),
     ...(mapping.maxJobMinutes != null ? { job_timeout_minutes: String(mapping.maxJobMinutes) } : {}),
     ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),

@@ -4,6 +4,7 @@ import { formatGitNameStatusSummary } from "../step-utils.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { getPublicationCredential } from "../../publication-credential.js";
 
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
@@ -25,7 +26,10 @@ interface PushInputs extends Record<string, unknown> {
   githubToken: string;
   orchestratorUrl?: string;
   machineNonce?: string;
+  callbackUrl?: string;
   branchName: string;
+  /** Existing PR to update in-place; absent for initial implementation runs. */
+  existingPrNumber?: string;
   baseBranch?: string;
   /** Immutable commit checked out at clone time. Used for diff/ahead checks even if the agent commits on the base branch. */
   baseRef?: string;
@@ -55,6 +59,8 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     inputs: PushInputs,
     _reporter: StepReporter,
   ): Promise<PushOutputs> {
+    const publicationToken = getPublicationCredential();
+
     if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
       // Dev-harness mounted workspace: never push. The mount is the user's live
       // checkout, dirty by design (uncommitted WORKFLOW.md/hook edits under test),
@@ -66,8 +72,12 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
 
     const { workspaceDir, repoOwner, repoRepo, githubToken, branchName } = inputs;
     const { issueIdentifier, issueTitle } = context.data;
+    const existingPrNumber = inputs.existingPrNumber?.trim();
+    if (existingPrNumber && !/^[1-9]\d*$/.test(existingPrNumber)) {
+      throw new Error("Existing PR number must be a positive integer");
+    }
     const baseBranch = String(inputs.baseBranch ?? context.data.branch ?? "").trim();
-    if (!baseBranch) {
+    if (!existingPrNumber && !baseBranch) {
       throw new Error("Missing base branch for PR creation");
     }
     const baseRef = String(inputs.baseRef ?? "").trim();
@@ -76,11 +86,16 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     }
     const prTitle = String(inputs.prTitle ?? `${issueIdentifier}: ${issueTitle || "AI implementation"}`);
 
-    if (!branchName || branchName === baseBranch) {
+    if (!branchName || (!existingPrNumber && branchName === baseBranch)) {
       throw new Error(`Refusing to push implementation branch "${branchName}" over base branch "${baseBranch}"`);
     }
 
-    runGit(workspaceDir, ["checkout", "-B", branchName], githubToken, "git checkout");
+    runGit(
+      workspaceDir,
+      existingPrNumber ? ["checkout", branchName] : ["checkout", "-B", branchName],
+      githubToken,
+      "git checkout",
+    );
 
     const hasWTChanges = hasWorkingTreeChanges(workspaceDir, githubToken);
     // Only check commits-ahead when working tree is clean: if there ARE working-tree changes
@@ -88,6 +103,15 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     const agentCommitted = !hasWTChanges && hasCommitsAheadOfBase(workspaceDir, baseRef, githubToken);
 
     if (!hasWTChanges && !agentCommitted) {
+      if (existingPrNumber) {
+        return {
+          prUrl: null,
+          prNumber: Number(existingPrNumber),
+          branchPushed: false,
+          commitSha: resolveCommitSha(workspaceDir),
+          draft: false,
+        };
+      }
       if (inputs.groupingParent) {
         // Case B: grouping-parent run that genuinely produced no changes. Return a clean
         // no-op so the orchestrator can finalize the issue and merge-up.ts opens the
@@ -146,17 +170,18 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     }
 
     const changedFilesSummary = summarizeCommittedChanges(workspaceDir, githubToken, agentCommitted ? baseRef : undefined);
-    const prBody = buildPullRequestBody(context, inputs, changedFilesSummary);
+    const prBody = existingPrNumber ? "" : buildPullRequestBody(context, inputs, changedFilesSummary);
 
     // The dispatch-time installation token may already be close to its one-hour
-    // expiry. Fly/local-docker runners re-vend immediately before the first
-    // authenticated remote write; GHA has no orchestrator URL/nonce and keeps
-    // using its workflow-minted token. A vending outage falls back to the boot
-    // token so an otherwise-valid credential can still complete the run.
+    // expiry. Refresh immediately before the first authenticated remote write.
+    // Fly/local-docker runners use a machine nonce; compatible GHA workflows
+    // use the private, single-use publication credential captured at startup.
     const activeGithubToken = await refreshRunnerGithubCredentials({
       currentToken: githubToken,
       orchestratorUrl: inputs.orchestratorUrl,
       machineNonce: inputs.machineNonce,
+      callbackUrl: inputs.callbackUrl,
+      publicationToken,
       owner: repoOwner,
       repo: repoRepo,
       workspaceDir,
@@ -166,9 +191,15 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     // stdout/stderr. Token is redacted from any error messages.
     const remote = `https://x-access-token:${activeGithubToken}@github.com/${repoOwner}/${repoRepo}.git`;
     const remoteRef = `refs/heads/${branchName}`;
-    const expectedRemoteSha = await span("git-ls-remote", async () =>
+    const remoteBranchSha = await span("git-ls-remote", async () =>
       resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken),
     );
+    if (existingPrNumber && remoteBranchSha !== baseRef) {
+      throw new Error(
+        `Existing PR branch changed during the run (expected ${baseRef}, found ${remoteBranchSha ?? "missing"}); refusing to overwrite concurrent work`,
+      );
+    }
+    const expectedRemoteSha = existingPrNumber ? baseRef : remoteBranchSha;
     const tracePush = process.env.AI_IMPLEMENT_LOG_LEVEL === "stream";
     const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
       remote,
@@ -199,6 +230,16 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     if (pushResult.status !== 0) {
       const stderr = (pushResult.stderr?.toString() ?? "").replaceAll(activeGithubToken, "***");
       throw new Error(`git push failed (exit ${pushResult.status ?? "null"}): ${stderr}`);
+    }
+
+    if (existingPrNumber) {
+      return {
+        prUrl: null,
+        prNumber: Number(existingPrNumber),
+        branchPushed: true,
+        commitSha,
+        draft: false,
+      };
     }
 
     const draft = inputs.draft === true;

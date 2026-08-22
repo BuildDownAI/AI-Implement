@@ -98,7 +98,7 @@ model: claude-sonnet-4-6
   NEW IMPLEMENTATION vs GAP-FILL RUNS
   -------------------------------------
   When ${PR_NUMBER} is empty  → Claude edits the checkout and leaves the changes uncommitted; the pipeline commits, pushes the branch, and opens the PR.
-  When ${PR_NUMBER} is set    → Claude commits and pushes to the existing PR branch itself; the pipeline skips its push step.
+  When ${PR_NUMBER} is set    → Claude edits the existing PR checkout and leaves changes uncommitted; the pipeline commits and pushes to that PR branch.
 
   Both scenarios use this same file. The conditional sections below handle both.
 
@@ -151,13 +151,13 @@ that pathway is handled by the orchestrator's runner-callback.
 ## Gap-fill instructions _(only when PR_NUMBER is set)_
 
 You are adding missing work to existing PR #${PR_NUMBER}.
-**Do NOT create a new branch or PR.** Commit your changes to the current
-branch and push. Review the gap analysis comment on the PR to understand
-what is still missing.
+**Do NOT create a new branch or PR. Do NOT commit or push.** Review the gap
+analysis comment on the PR to understand what is still missing, then leave your file changes unstaged and uncommitted. The AI-Implement pipeline will
+commit and push them to the existing PR branch after review passes.
 
-After your changes are pushed, write a short note about what you addressed
-to `ai-output/comments/01-gap-fill-summary.md`. The orchestrator reads
-this file and posts it back to the ticketing issue.
+After making the changes, write a short note about what you addressed to
+`ai-output/comments/01-gap-fill-summary.md`. The orchestrator reads this
+file and posts it back to the ticketing issue.
 
 External review tools should communicate findings through native GitHub
 review surfaces: submit `CHANGES_REQUESTED` for blocking feedback, use inline

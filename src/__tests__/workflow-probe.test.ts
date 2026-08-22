@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   resolveWorkflowContract,
+  resolveWorkflowCapabilities,
   __clearWorkflowProbeCacheForTests,
 } from "../workflow-probe.js";
 
@@ -9,6 +10,9 @@ const ENVELOPE_YML =
 
 const LEGACY_YML =
   "on:\n  workflow_dispatch:\n    inputs:\n      issue_id:\n        required: true\n";
+
+const PUBLICATION_TOKEN_YML =
+  "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      run_publication_token:\n        required: false\n";
 
 function mockContents(yamlBody: string): ReturnType<typeof vi.fn> {
   return vi.fn().mockResolvedValue({
@@ -48,6 +52,56 @@ describe("resolveWorkflowContract", () => {
     expect(mode).toBe("envelope");
   });
 
+  it("reports publication-token support separately from ordinary envelope support", async () => {
+    const fetchImpl = mockContents(PUBLICATION_TOKEN_YML);
+    const capabilities = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl,
+    });
+    expect(capabilities).toEqual({
+      contract: "envelope",
+      supportsRunPublicationToken: true,
+    });
+  });
+
+  it("does not require publication-token support for envelope compatibility", async () => {
+    const fetchImpl = mockContents(ENVELOPE_YML);
+    const capabilities = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl,
+    });
+    expect(capabilities).toEqual({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+    });
+  });
+
+  it("does not report publication-token support when the input is only mentioned in a YAML comment", async () => {
+    const commentYml =
+      "on:\n  workflow_dispatch:\n    inputs:\n      run_config:\n        required: true\n      # run_publication_token: would go here\n";
+    const fetchImpl = mockContents(commentYml);
+    const capabilities = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl,
+    });
+    expect(capabilities).toEqual({
+      contract: "envelope",
+      supportsRunPublicationToken: false,
+    });
+  });
+
   it("classifies a workflow without run_config as legacy", async () => {
     const fetchImpl = mockContents(LEGACY_YML);
     const mode = await resolveWorkflowContract({
@@ -72,6 +126,22 @@ describe("resolveWorkflowContract", () => {
       fetchImpl,
     });
     expect(mode).toBe("legacy");
+  });
+
+  it("reports no optional capabilities when the workflow is legacy", async () => {
+    const fetchImpl = mockContents(LEGACY_YML);
+    const capabilities = await resolveWorkflowCapabilities({
+      owner: "o",
+      repo: "r",
+      workflowFile: "claude-implement.yml",
+      token: "t",
+      ref: "main",
+      fetchImpl,
+    });
+    expect(capabilities).toEqual({
+      contract: "legacy",
+      supportsRunPublicationToken: false,
+    });
   });
 
   it("returns legacy when fetch throws without rethrowing", async () => {
