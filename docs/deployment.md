@@ -34,7 +34,7 @@ Four things must be true, and they are not all reported the same way:
 - **`FLY_DEPLOY_TOKEN`** is set, scoped to this app. `FLY_SESSIONS_TOKEN` is a different credential and cannot deploy the orchestrator.
 - **The running image carries its source stamps.** `AI_IMPLEMENT_SOURCE_REPO` (as `owner/repo`) and `AI_IMPLEMENT_SOURCE_BRANCH` are both required; an image built without them cannot self-deploy at all. `AI_IMPLEMENT_SOURCE_COMMIT` is not required — without it a deploy still runs, but availability reports *unknown* rather than telling you a new version exists.
 - **An admin auth method is configured** — SSO providers or `ADMIN_ACCESS_CODE`. Every `/api/` route answers 503 otherwise, this one included.
-- **The GitHub App installation can read this repository and the KG repository.** Both tokens are minted from it, each scoped to one repo with `contents: read`.
+- **The GitHub App installation can read this repository and the configured KG repository.** Both tokens are minted from it, each scoped to one repo with `contents: read`. The KG repository defaults to `BuildDownAI/knowledge-graph-ai-implement`; set `KG_SOURCE_REPO=owner/repo` for a project-specific graph. The Docker build arg is baked into the image as a non-secret environment value so later self-deploys keep using the same graph repo unless runtime env overrides it.
 
 The first two and the app name collapse into a single `501`, which says the orchestrator cannot deploy itself without saying which piece is missing. The third is a different 503, raised at the `/api/` gate before this route is reached. The fourth is **not checked up front** — a token that cannot read a repository surfaces as a failed build, after the hold has already been taken and released.
 
@@ -60,6 +60,7 @@ export GH_TOKEN="$(gh auth token)"
 
 fly deploy --remote-only --no-cache \
     --build-secret kg_token="$GH_TOKEN" \
+    --build-arg KG_SOURCE_REPO="${KG_SOURCE_REPO:-BuildDownAI/knowledge-graph-ai-implement}" \
     --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
     --build-arg SOURCE_REPO=BuildDownAI/AI-Implement \
     --build-arg SOURCE_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
@@ -77,11 +78,17 @@ curl -s -w '\n%{http_code}\n' -X POST https://<app-name>.fly.dev/mcp -d '{}'
 Every flag above is load-bearing, and each was learned from a silently degraded deploy:
 
 - **`--build-secret`** — the KG is cloned at build time through it. Without it the build fail-softs to a sidecar-less image and reports success.
+- **`--build-arg KG_SOURCE_REPO`** — the GitHub `owner/repo` to clone for the sidecar. Omit it to use `BuildDownAI/knowledge-graph-ai-implement`; set it to a project-specific graph such as `Answer9-llc/knowledge-graph-answer9-app` when needed. URLs and malformed values are rejected.
 - **`--no-cache`** — a build secret is not part of the layer cache key, so a repeat deploy otherwise reuses a stale, possibly sidecar-less clone layer even when the secret is present.
 - **`--build-arg SOURCE_*`** — the stamps. Omit `SOURCE_REPO` or `SOURCE_BRANCH` and the image you just deployed cannot deploy itself, which is how a manual recovery quietly disables the automatic path.
 - **`--app`** — always explicit. A default would let a fork deploy itself over the upstream app.
 
 Substitute your own `SOURCE_REPO` when deploying a fork; it must be `owner/repo`, and a malformed value logs a warning and disables self-deploy on the resulting image.
+
+`KG_SOURCE_REPO` is not a secret. Manual deploys bake the build arg into the image as `ENV KG_SOURCE_REPO`,
+and `loadConfig()` reads that value at runtime for the next self-deploy. A Fly secret or environment
+variable with the same name still wins at runtime, which is useful for changing the graph repo before
+the next deploy; the next image will then bake that resolved value.
 
 ### Fly's native GitHub integration
 

@@ -4,10 +4,11 @@ End-to-end shape of the knowledge graph: the two repositories it spans, the tech
 lifecycle stage, and the single fact that governs every operational decision — **the orchestrator
 and the KG are one deployable unit.**
 
-Reference for `BuildDownAI/knowledge-graph-ai-implement` (`kg_ingest/`, `kg_query/`, `snapshot/`),
-the KG stages of `Dockerfile`, `docker-entrypoint.sh`, and `src/deploy.ts`. For the `/mcp` endpoint,
-the OAuth flow, and the ways a build ships degraded, see [kg-sidecar.md](kg-sidecar.md). For deploy
-paths and their flags, see [deployment.md](deployment.md).
+Reference for the configured KG source repository (`BuildDownAI/knowledge-graph-ai-implement` by
+default; override with `KG_SOURCE_REPO` for project-specific graphs), its `kg_ingest/`, `kg_query/`,
+and `snapshot/` directories, the KG stages of `Dockerfile`, `docker-entrypoint.sh`, and
+`src/deploy.ts`. For the `/mcp` endpoint, the OAuth flow, and the ways a build ships degraded, see
+[kg-sidecar.md](kg-sidecar.md). For deploy paths and their flags, see [deployment.md](deployment.md).
 
 ## The monolith
 
@@ -84,7 +85,7 @@ STAGE 4  SERVE      Fly machine, 512 MB                  lazy load on first quer
 STAGE 5  ACCESS     MCP client over HTTPS + OAuth
 ```
 
-The repository boundary sits between stages 2 and 3. `knowledge-graph-ai-implement` owns the
+The repository boundary sits between stages 2 and 3. The configured KG source repository owns the
 mechanism and the data. `AI-Implement` owns the image, the proxy, and the release.
 
 ### Stage 1 — Ingest

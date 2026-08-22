@@ -50,7 +50,7 @@ COPY workflows/ ./workflows/
 # GitHub token out of image history and build logs — it is readable only inside
 # the RUN that uses it and is never written to any ENV/ARG.
 #
-# To build WITH the sidecar (requires read access to BuildDownAI/knowledge-graph-ai-implement):
+# To build WITH the sidecar (requires read access to KG_SOURCE_REPO, default BuildDownAI/knowledge-graph-ai-implement):
 #   docker build --secret id=kg_token,env=GH_TOKEN .
 #   fly deploy --remote-only --build-secret kg_token="$(gh auth token)"
 #
@@ -68,15 +68,24 @@ COPY workflows/ ./workflows/
 # which exports KG_EMBEDDINGS_DEGRADED=1 and surfaces the fact via GET / and the
 # deploy notification. The || true copy guards below are exempt: they are part of
 # the deliberate sidecar-less mode, not unexpected failures.
+ARG KG_SOURCE_REPO=BuildDownAI/knowledge-graph-ai-implement
+ENV KG_SOURCE_REPO=$KG_SOURCE_REPO
 COPY kg/ /app/kg/
 RUN --mount=type=secret,id=kg_token,required=false \
-    if [ -f /run/secrets/kg_token ] && [ -s /run/secrets/kg_token ]; then \
-        echo "[kg] secret present — cloning BuildDownAI/knowledge-graph-ai-implement" \
+    kg_owner="${KG_SOURCE_REPO%%/*}" \
+    && kg_repo="${KG_SOURCE_REPO#*/}" \
+    && if [ "$kg_owner" = "$KG_SOURCE_REPO" ] || [ -z "$kg_owner" ] || [ -z "$kg_repo" ] || [ "$kg_repo" != "${kg_repo%%/*}" ]; then \
+        echo "[kg] invalid KG_SOURCE_REPO: $KG_SOURCE_REPO" >&2; exit 1; \
+    fi \
+    && case "$kg_owner" in *[!A-Za-z0-9-]* | -* | *- ) echo "[kg] invalid KG_SOURCE_REPO owner: $KG_SOURCE_REPO" >&2; exit 1 ;; esac \
+    && case "$kg_repo" in *[!A-Za-z0-9._-]* ) echo "[kg] invalid KG_SOURCE_REPO repo: $KG_SOURCE_REPO" >&2; exit 1 ;; esac \
+    && if [ -f /run/secrets/kg_token ] && [ -s /run/secrets/kg_token ]; then \
+        echo "[kg] secret present — cloning ${KG_SOURCE_REPO}" \
         && apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
         && rm -rf /var/lib/apt/lists/* \
         && KG_TOKEN="$(cat /run/secrets/kg_token)" \
         && git clone --depth 1 \
-               "https://x-access-token:${KG_TOKEN}@github.com/BuildDownAI/knowledge-graph-ai-implement.git" \
+               "https://x-access-token:${KG_TOKEN}@github.com/${KG_SOURCE_REPO}.git" \
                /tmp/kg-src \
         && unset KG_TOKEN \
         && mkdir -p /app/kg \
