@@ -83,10 +83,17 @@ const asRes = (res: MockResponse) => res as unknown as http.ServerResponse;
 // Modules reloaded per test to get fresh DB state
 let mcpOauth: typeof import("../mcp-oauth.js");
 let providers: typeof import("../oauth/providers.js");
-let authz: typeof import("../oauth/authorize.js");
+let access: typeof import("../access-entries.js");
 let oidc: typeof import("../oauth/oidc.js");
 let dedup: typeof import("../dedup.js");
 let dbPath: string;
+
+/** Seed the list in force the way a pre-handover deployment does — from the env. */
+function setAllowedDomains(domains: string): void {
+  process.env.OAUTH_ALLOWED_DOMAINS = domains;
+  process.env.OAUTH_ALLOWED_EMAILS = "";
+  access.refreshEffectiveAllowlist();
+}
 
 beforeEach(async () => {
   vi.resetModules();
@@ -96,13 +103,14 @@ beforeEach(async () => {
 
   mcpOauth = await import("../mcp-oauth.js");
   providers = await import("../oauth/providers.js");
-  authz = await import("../oauth/authorize.js");
+  access = await import("../access-entries.js");
   oidc = await import("../oauth/oidc.js");
   dedup = await import("../dedup.js");
 
   mcpOauth.initMcpOAuthTables();
+  access.initAccessEntriesTable();
   providers.configureOAuthProviders([googleProvider]);
-  authz.configureAuthorizationPolicy({ allowedDomains: ["eudoxus.ai"], allowedEmails: [] });
+  setAllowedDomains("eudoxus.ai");
   (oidc.buildAuthUrl as ReturnType<typeof vi.fn>).mockResolvedValue(OIDC_START);
 });
 
@@ -720,7 +728,7 @@ describe("handleMcpTokenRequest — refresh_token grant", () => {
   it("re-checks the allowlist and refuses if user is removed", async () => {
     const { refreshToken, clientId } = await getTokens();
     // Remove user from allowlist
-    authz.configureAuthorizationPolicy({ allowedDomains: [], allowedEmails: [] });
+    setAllowedDomains("");
     const res = new MockResponse();
     await mcpOauth.handleMcpTokenRequest(makeRefreshReq(refreshToken, clientId), asRes(res));
     expect(res.statusCode).toBe(400);

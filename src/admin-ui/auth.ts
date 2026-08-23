@@ -142,14 +142,34 @@ export const authJs = `
     history.replaceState(null, '', location.pathname + location.hash); // drop the query so a refresh won't re-show it
   }
 
-  // Ask the server whether we're authed. 200 => authed, 401 => not.
-  async function probeSession() {
+  let sessionIdentity = null;
+
+  // Doubles as the sign-in probe: a 200 means the session is live. 401 if not
+  async function loadSessionIdentity() {
     const headers = {};
     if (token) headers['Authorization'] = 'Bearer ' + token;
     try {
-      const res = await fetch(API + '/api/admin/config-status', { credentials: 'include', headers });
-      return res.ok;
-    } catch (e) { return false; }
+      const res = await fetch(API + '/api/session-identity', { credentials: 'include', headers });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) { return null; }
+  }
+  window.getSessionIdentity = function () { return sessionIdentity; };
+
+  function applySessionIdentity(s) {
+    // The bright slot always carries the most identifying value we have.
+    const primary = s.name || s.email || 'Access code';
+    const secondary = s.name ? (s.email || '') : '';
+    const nameEl = document.getElementById('session-name');
+    const emailEl = document.getElementById('session-email');
+    const avatarEl = document.getElementById('session-avatar');
+    if (nameEl) { nameEl.textContent = primary; nameEl.title = primary; }
+    if (emailEl) {
+      emailEl.textContent = secondary;
+      emailEl.hidden = !secondary;
+      emailEl.title = secondary;
+    }
+    if (avatarEl) avatarEl.textContent = primary.charAt(0).toUpperCase();
   }
 
   async function login() {
@@ -163,6 +183,8 @@ export const authJs = `
     if (data.token) {
       token = data.token;
       localStorage.setItem('admin_token', token);
+      sessionIdentity = await loadSessionIdentity();
+      if (sessionIdentity) applySessionIdentity(sessionIdentity);
       showAdmin();
     } else {
       const el = document.getElementById('login-error');
@@ -176,6 +198,7 @@ export const authJs = `
     try { await fetch(API + '/api/auth/logout', { method: 'POST', credentials: 'include' }); } catch (e) { /* ignore */ }
     localStorage.removeItem('admin_token');
     token = null;
+    sessionIdentity = null;
     await renderLogin(); // repaint the buttons — bootstrap skipped them when we were authed
     showLogin();
   }
@@ -187,7 +210,9 @@ export const authJs = `
     if (ac) ac.addEventListener('keydown', function (e) { if (e.key === 'Enter') login(); });
 
     showAuthError();
-    if (await probeSession()) {
+    sessionIdentity = await loadSessionIdentity();
+    if (sessionIdentity) {
+      applySessionIdentity(sessionIdentity);
       showAdmin();
     } else {
       await renderLogin();

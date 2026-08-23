@@ -130,10 +130,12 @@ export const componentsCss = `
   font-size: 12.5px;
   font-weight: 500;
   color: var(--fg-primary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .sidebar-user .user-email {
   font-size: 11px;
   color: var(--fg-tertiary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
 /* ── Main content area ─────────────────────────────────────── */

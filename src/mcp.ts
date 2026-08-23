@@ -7,6 +7,7 @@ import { getInFlightJobs } from "./log.js";
 import { getDb } from "./dedup.js";
 import { getIssueReportCard, getFleetReport } from "./report-card.js";
 import { isKgDegraded } from "./deploy-notify.js";
+import { recheckIdentity } from "./access-entries.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -383,14 +384,24 @@ export async function handleMcpRequest(
 
   const auth = req.headers.authorization;
   const submitted = auth?.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!verifyMcpToken(submitted)) {
+  const unauthorized = (): void => {
     res.writeHead(401, {
       "Content-Type": "application/json",
       "WWW-Authenticate": `Bearer realm="MCP", resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`,
     });
     res.end(JSON.stringify({ error: "unauthorized" }));
+  };
+
+  const identity = verifyMcpToken(submitted);
+  if (!identity) return unauthorized();
+
+  // An access token outlives a removal by up to an hour; re-checking closes that window.
+  const recheck = recheckIdentity(identity);
+  if (recheck.status === "unavailable") {
+    json(res, 503, { error: "access control is unavailable" });
     return;
   }
+  if (recheck.status === "denied") return unauthorized();
 
   let body: Buffer;
   try {

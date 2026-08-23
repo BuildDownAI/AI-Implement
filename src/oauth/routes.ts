@@ -10,6 +10,7 @@ import { authorize } from "./authorize.js";
 import { putTransaction, takeTransaction } from "./state-store.js";
 import { createSession, revokeSession, getRequestToken, SESSION_TTL_MS } from "../admin-session.js";
 import { serializeSessionCookie, clearSessionCookie } from "../cookies.js";
+import { bindAccessEntry, getEffectiveAllowlist } from "../access-entries.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -90,10 +91,21 @@ export async function handleOAuthCallback(
     return redirect(res, "/admin?auth_error=failed");
   }
 
-  const decision = authorize(identity);
+  const allowlist = getEffectiveAllowlist();
+  if (!allowlist) {
+    console.error(`[oauth] ${providerId} sign-in denied: the access list could not be loaded`);
+    return redirect(res, "/admin?auth_error=failed");
+  }
+
+  const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
     console.warn(`[oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirect(res, "/admin?auth_error=denied");
+  }
+
+  // First sign-in binds the entry; the provider identity is what matches from then on.
+  if (decision.entry.kind === "address") {
+    bindAccessEntry(decision.entry.value, identity.provider, identity.sub);
   }
 
   const token = createSession({

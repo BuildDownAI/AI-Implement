@@ -27,7 +27,7 @@ import {
 } from "./runner-mode.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
-import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
+import { createSession, accessCodeMatches, authenticateAdminRequest } from "./admin-session.js";
 import type { DeployStart } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
@@ -217,8 +217,20 @@ export function handleAdminRequest(
 
   // All other /api routes require auth
   if (url.startsWith("/api/")) {
-    if (!isValidSession(getRequestToken(req))) {
-      json(res, 401, { error: "Unauthorized" });
+    const gate = authenticateAdminRequest(req);
+    if (!gate.ok) {
+      json(res, gate.status, { error: gate.error });
+      return true;
+    }
+
+    // Must stay reachable by every authenticated session — the SPA probes it to decide it is signed in.
+    if (url === "/api/session-identity" && method === "GET") {
+      json(res, 200, {
+        email: gate.identity?.email ?? null,
+        name: gate.identity?.name ?? null,
+        provider: gate.identity?.provider ?? null,
+        authMethod: gate.identity ? "sso" : "access-code",
+      });
       return true;
     }
 

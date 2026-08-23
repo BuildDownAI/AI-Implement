@@ -55,7 +55,7 @@ const asRes = (res: MockResponse) => res as unknown as http.ServerResponse;
 
 let routes: typeof import("../oauth/routes.js");
 let providers: typeof import("../oauth/providers.js");
-let authz: typeof import("../oauth/authorize.js");
+let access: typeof import("../access-entries.js");
 let oidc: typeof import("../oauth/oidc.js");
 let store: typeof import("../oauth/state-store.js");
 let session: typeof import("../admin-session.js");
@@ -69,12 +69,20 @@ beforeEach(async () => {
   process.env.DEDUP_DB_PATH = dbPath;
   routes = await import("../oauth/routes.js");
   providers = await import("../oauth/providers.js");
-  authz = await import("../oauth/authorize.js");
+  access = await import("../access-entries.js");
   oidc = await import("../oauth/oidc.js");
   store = await import("../oauth/state-store.js");
   session = await import("../admin-session.js");
   dedup = await import("../dedup.js");
+  access.initAccessEntriesTable();
 });
+
+/** Seed the list in force the way a pre-handover deployment does — from the env. */
+function allowDomain(domain: string): void {
+  process.env.OAUTH_ALLOWED_DOMAINS = domain;
+  process.env.OAUTH_ALLOWED_EMAILS = "";
+  access.refreshEffectiveAllowlist();
+}
 
 afterEach(() => {
   dedup.closeDb();
@@ -172,7 +180,7 @@ describe("handleOAuthCallback", () => {
 
   it("redirects to auth_error=denied with no session when the identity is not allowed", async () => {
     providers.configureOAuthProviders([googleProvider]);
-    authz.configureAuthorizationPolicy({ allowedDomains: ["eudoxus.ai"], allowedEmails: [] });
+    allowDomain("eudoxus.ai");
     store.putTransaction({ state: "dn", provider: "google", codeVerifier: "v", nonce: "n", redirectTo: "/admin" });
     vi.mocked(oidc.completeAuth).mockResolvedValue(identity({ email: "stranger@evil.com" }));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -189,7 +197,7 @@ describe("handleOAuthCallback", () => {
 
   it("on success sets a session cookie and 302-redirects to the stored path", async () => {
     providers.configureOAuthProviders([googleProvider]);
-    authz.configureAuthorizationPolicy({ allowedDomains: ["eudoxus.ai"], allowedEmails: [] });
+    allowDomain("eudoxus.ai");
     store.putTransaction({ state: "ok", provider: "google", codeVerifier: "v", nonce: "n", redirectTo: "/admin/pipelines" });
     vi.mocked(oidc.completeAuth).mockResolvedValue(identity({ email: "ada@eudoxus.ai" }));
 
@@ -201,20 +209,20 @@ describe("handleOAuthCallback", () => {
     const setCookie = res.headers["Set-Cookie"] as string;
     expect(setCookie).toContain("ai_admin_session=");
     const token = decodeURIComponent(setCookie.split(";")[0].split("=")[1]);
-    expect(session.isValidSession(token)).toBe(true);
+    expect(session.resolveSession(token)).not.toBeNull();
   });
 });
 
 describe("handleOAuthLogout", () => {
   it("revokes the session and clears the cookie", () => {
     const token = session.createSession({ email: "ada@eudoxus.ai", sub: "s", provider: "google", name: "Ada" });
-    expect(session.isValidSession(token)).toBe(true);
+    expect(session.resolveSession(token)).not.toBeNull();
 
     const res = new MockResponse();
     routes.handleOAuthLogout(mkReq("/api/auth/logout", { cookie: `ai_admin_session=${token}` }), asRes(res), false);
 
     expect(res.statusCode).toBe(200);
     expect(res.headers["Set-Cookie"] as string).toContain("Max-Age=0");
-    expect(session.isValidSession(token)).toBe(false);
+    expect(session.resolveSession(token)).toBeNull();
   });
 });

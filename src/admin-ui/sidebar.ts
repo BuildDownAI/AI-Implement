@@ -59,10 +59,10 @@ export function sidebarHtml(): string {
     </div>
     <div class="sidebar-footer">
       <div class="sidebar-user">
-        <div class="avatar">·</div>
+        <div class="avatar" id="session-avatar">·</div>
         <div style="min-width:0;flex:1">
-          <div class="user-name">Admin</div>
-          <div class="user-email">signed in</div>
+          <div class="user-name" id="session-name">Signed in</div>
+          <div class="user-email" id="session-email"></div>
         </div>
         <button class="btn btn-ghost btn-icon" onclick="window.toggleTheme()" title="Toggle theme">
           <span class="theme-icon-sun">${icon("sun", 14)}</span>
