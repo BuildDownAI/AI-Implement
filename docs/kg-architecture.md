@@ -77,13 +77,13 @@ the image build, not only on query latency.
 
 ## The five stages
 
-```
-STAGE 1  INGEST     local machine, python >= 3.10        the only stage that fetches source data
-STAGE 2  COMMIT     git — snapshot/parts/*.nt            the transport between the repos
-STAGE 3  BUILD      Docker: node:24-slim + python venv   the graph is materialized here
-STAGE 4  SERVE      Fly machine, 512 MB                  lazy load on first query
-STAGE 5  ACCESS     MCP client over HTTPS + OAuth
-```
+| Stage | Name | Where | Note |
+|---|---|---|---|
+| 1 | **Ingest** | local machine, python ≥ 3.10 | the only stage that fetches source data |
+| 2 | **Commit** | git — `snapshot/parts/*.nt` | the transport between the repos |
+| 3 | **Build** | Docker: node:24-slim + python venv | the graph is materialized here |
+| 4 | **Serve** | Fly machine, 512 MB | lazy load on first query |
+| 5 | **Access** | MCP client over HTTPS + OAuth | |
 
 The repository boundary sits between stages 2 and 3. The configured KG source repository owns the
 mechanism and the data. `AI-Implement` owns the image, the proxy, and the release.
@@ -222,40 +222,28 @@ the process above is the only refresh path. This section records the target desi
 reads correctly during the transition.
 
 
-```
-══════════ AFTER AII-424 — code and data take separate paths ══════════
+```mermaid
+flowchart TD
+    subgraph CODE["CODE — deploy (same shape, safer build)"]
+        C1["deploy hold · drain"] --> C2["rebuild — the image COPIES committed vectors:<br/>nothing embeds, no OOM path"]
+        C2 --> C3["machine replaced"]
+        C3 --> C4["boot: Node SUPERVISES the sidecar<br/>(owned child, testable)"]
+    end
 
-  CODE — deploy (same shape, safer build)
-      deploy hold · drain · rebuild · machine replaced
-      the build COPIES committed vectors — nothing embeds, no OOM path
-      boot: Node SUPERVISES the sidecar (owned child, testable)
+    subgraph DATA["DATA — refresh (new; rides no release)"]
+        D1["POST /api/kg/refresh<br/>(admin session; refused while a deploy holds)"]
+        D1 --> D2["fetch KG_SOURCE_REPO<br/>(read-only single-repo token)"]
+        D2 --> D3["stage /data/kg/staging → materialize, no embed<br/>completion marker written LAST"]
+        D3 --> D4["atomic rename:<br/>current → previous · staging → current"]
+        D4 --> D5["restart sidecar<br/>(seconds; only /mcp blinks — dispatch untouched)"]
+        D5 --> G{"4 gates on the SERVING graph:<br/>answers · vectors stamp-matched ·<br/>canary non-empty · stamp newer"}
+        G -->|pass| P["refresh done — age stamp moved"]
+        G -->|fail| F["revert to previous · restart · report the gate"]
+    end
 
-  DATA — refresh (new; rides no release)
-      POST /api/kg/refresh   (admin session; refused while deploy holds)
-      │
-      ▼
-      fetch KG_SOURCE_REPO with a read-only single-repo token
-      │
-      ▼
-      stage /data/kg/staging → materialize (no embed)
-      completion marker written LAST
-      │
-      ▼
-      atomic rename:  current → previous,  staging → current
-      │
-      ▼
-      restart sidecar   (seconds; only /mcp blinks — dispatch untouched)
-      │
-      ▼
-      4 gates on the SERVING graph:
-        answers · vectors stamp-matched · canary non-empty · stamp newer
-      │
-      ├─ pass → refresh done, age stamp moved
-      └─ fail → revert to previous, restart, report the gate
-
-  SERVING RULE (where the two paths meet)
-      the sidecar serves /data/kg/current when valid (marker present),
-      else the baked copy — delete /data/kg + restart = full rollback
+    S["SERVING RULE — where the two paths meet:<br/>the sidecar serves /data/kg/current when valid (marker present), else the baked copy.<br/>delete /data/kg + restart = full rollback"]
+    CODE -.-> S
+    DATA -.-> S
 ```
 
 ### What changes, and what deliberately does not
