@@ -1,7 +1,12 @@
-# 005. Run the full AI loop in local mode
+# ADR 005: Run the full AI loop in local mode
 
 **Status:** Accepted
+
 **Date:** 2026-08-18
+
+**Implementation status (verified 2026-08-24, branch `testing`):** **Integrated.** `src/local/full-loop.ts`, reached through `session/entrypoint.sh` (`RUNNER_ENTRY="run-local-full-loop.js"` under the `full` mode).
+
+---
 
 ## Context
 

@@ -1,7 +1,12 @@
-# 003. Isolate local runs from source checkouts
+# ADR 003: Isolate local runs from source checkouts
 
 **Status:** Accepted
+
 **Date:** 2026-08-18
+
+**Implementation status (verified 2026-08-24, branch `testing`):** **Not yet integrated.** `src/local/workspace.ts` implements the isolated copy and `--include-dirty` opt-in, but has no callers outside its own test. The shipped `npm run dev:run` path (`src/dev-harness/index.ts`) sets `AI_IMPLEMENT_WORKSPACE_MODE=mounted` and bind-mounts the checkout **read-write**, mutating it in place — the developer-harness behaviour this ADR contrasts local runs against.
+
+---
 
 ## Context
 

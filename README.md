@@ -360,9 +360,19 @@ custom/               Fork-local step/provider/pipeline overrides (see custom/RE
 scripts/              provision-client.sh (interactive onboarding for multi-tenant operators)
 session/              Entrypoint scripts for the Fly Machines runner image
 docs/                 Design notes, ADRs
+CONTEXT.md            Domain glossary — the terms the ADRs turn on (developer harness
+                      vs. local run, local artifact, task document, demo/managed run)
 .github/workflows/    deploy-clients.yml, sync-workflow.yml, build-runner.yml,
                       claude-review.yml
 ```
+
+## Vocabulary
+
+[`CONTEXT.md`](CONTEXT.md) is the domain glossary. It fixes the distinctions the
+architecture depends on — most importantly **developer harness** (bind-mounted live
+checkout, mutates it, never publishes) versus **local run** (isolated copy, source
+checkout untouched) — each with an explicit "not to be confused with". The ADRs in
+[`docs/adr/`](docs/adr/) are written in those terms.
 
 ## PR reviews
 

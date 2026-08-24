@@ -1,7 +1,12 @@
-# 009. Limit model credential exposure in trusted repositories
+# ADR 009: Limit model credential exposure in trusted repositories
 
 **Status:** Accepted
+
 **Date:** 2026-08-18
+
+**Implementation status (verified 2026-08-24, branch `testing`):** **Not yet integrated.** No credential-stripping logic exists in `src/`. `src/dev-harness/index.ts` passes `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` straight into the container environment. **The exposure limit described here is not a guarantee that holds today.**
+
+---
 
 ## Context
 

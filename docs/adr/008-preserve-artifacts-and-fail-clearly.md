@@ -1,7 +1,12 @@
-# 008. Preserve artifacts and fail clearly
+# ADR 008: Preserve artifacts and fail clearly
 
 **Status:** Accepted
+
 **Date:** 2026-08-18
+
+**Implementation status (verified 2026-08-24, branch `testing`):** **Not yet integrated.** The exit-code and artifact-retention behaviour lives in `src/local/artifacts.ts`, which has no callers outside its own test.
+
+---
 
 ## Context
 

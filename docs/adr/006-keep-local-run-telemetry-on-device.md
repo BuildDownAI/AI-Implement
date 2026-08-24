@@ -1,7 +1,12 @@
-# 006. Keep local run telemetry on device
+# ADR 006: Keep local run telemetry on device
 
 **Status:** Accepted
+
 **Date:** 2026-08-18
+
+**Implementation status (verified 2026-08-24, branch `testing`):** **Not yet integrated.** `writeRunArtifacts` in `src/local/artifacts.ts` carries the on-device telemetry fields this ADR specifies, but has no callers outside its own test.
+
+---
 
 ## Context
 

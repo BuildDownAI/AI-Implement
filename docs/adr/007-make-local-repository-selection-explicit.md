@@ -1,7 +1,12 @@
-# 007. Make local repository selection explicit
+# ADR 007: Make local repository selection explicit
 
 **Status:** Accepted
+
 **Date:** 2026-08-18
+
+**Implementation status (verified 2026-08-24, branch `testing`):** **Not yet integrated.** `resolveRepository` in `src/local/workspace.ts` has no callers outside its own test, and the `local run --repo … --task …` invocation shown below is not runnable today — no such subcommand exists.
+
+---
 
 ## Context
 

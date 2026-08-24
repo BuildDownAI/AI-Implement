@@ -1,7 +1,12 @@
-# 010. Use a minimal portable task document
+# ADR 010: Use a minimal portable task document
 
 **Status:** Accepted
+
 **Date:** 2026-08-18
+
+**Implementation status (verified 2026-08-24, branch `testing`):** **Integrated**, except the optional task-authoring skill. `src/task-document.ts` owns the schema and validator; `src/dev-harness/task-file.ts` is the compatibility adapter this ADR calls for.
+
+---
 
 ## Context
 

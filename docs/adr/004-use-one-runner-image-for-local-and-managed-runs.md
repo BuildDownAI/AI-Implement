@@ -1,7 +1,12 @@
-# 004. Use one runner image for local and managed runs
+# ADR 004: Use one runner image for local and managed runs
 
 **Status:** Accepted
+
 **Date:** 2026-08-18
+
+**Implementation status (verified 2026-08-24, branch `testing`):** **Partially integrated.** One runner image is shipped, as decided. The "explicit local command" the decision adds does not exist: there is no `local run` subcommand in `package.json`, the `Dockerfile`, or `session/entrypoint.sh`.
+
+---
 
 ## Context
 
