@@ -221,6 +221,43 @@ KGA-3, KGA-4, AII-425, AII-426), all staged and undesignated as of 2026-08-24. U
 the process above is the only refresh path. This section records the target design so the doc
 reads correctly during the transition.
 
+
+```
+══════════ AFTER AII-424 — code and data take separate paths ══════════
+
+  CODE — deploy (same shape, safer build)
+      deploy hold · drain · rebuild · machine replaced
+      the build COPIES committed vectors — nothing embeds, no OOM path
+      boot: Node SUPERVISES the sidecar (owned child, testable)
+
+  DATA — refresh (new; rides no release)
+      POST /api/kg/refresh   (admin session; refused while deploy holds)
+      │
+      ▼
+      fetch KG_SOURCE_REPO with a read-only single-repo token
+      │
+      ▼
+      stage /data/kg/staging → materialize (no embed)
+      completion marker written LAST
+      │
+      ▼
+      atomic rename:  current → previous,  staging → current
+      │
+      ▼
+      restart sidecar   (seconds; only /mcp blinks — dispatch untouched)
+      │
+      ▼
+      4 gates on the SERVING graph:
+        answers · vectors stamp-matched · canary non-empty · stamp newer
+      │
+      ├─ pass → refresh done, age stamp moved
+      └─ fail → revert to previous, restart, report the gate
+
+  SERVING RULE (where the two paths meet)
+      the sidecar serves /data/kg/current when valid (marker present),
+      else the baked copy — delete /data/kg + restart = full rollback
+```
+
 ### What changes, and what deliberately does not
 
 - **The image keeps baking a graph.** The runtime copy at `/data/kg/current` is an overlay the
