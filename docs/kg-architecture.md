@@ -212,6 +212,59 @@ Run `bd-kg-refresh`, or these steps by hand.
 Steps 5 to 7 exist entirely because of the monolith. In a two-service design the data would be
 reloadable on its own; here it rides a release, so the release has to be sequenced and verified.
 
+## Planned: decoupling the refresh (AII-424)
+
+[AII-424](https://linear.app/eudoxus/issue/AII-424) plans a refresh path that does not ride a
+release: fetch the newest committed snapshot, stage it on the volume, swap atomically, restart
+the sidecar, verify, revert on failure. Six children across three repositories (KGB-9, KGB-10,
+KGA-3, KGA-4, AII-425, AII-426), all staged and undesignated as of 2026-08-24. Until they land,
+the process above is the only refresh path. This section records the target design so the doc
+reads correctly during the transition.
+
+### What changes, and what deliberately does not
+
+- **The image keeps baking a graph.** The runtime copy at `/data/kg/current` is an overlay the
+  sidecar prefers when present. Deleting it and restarting returns the orchestrator to exactly
+  the behaviour this doc describes — that is the rollback path.
+- **"A data refresh is a code deploy" stops being true.** A refresh restarts only the sidecar:
+  no deploy hold, no dispatch pause, no drain. `/mcp` blinks for a few seconds — already a
+  non-fatal condition.
+- **"A code deploy is a data refresh" stays true.** The build still clones the configured KG
+  source repository's default branch unpinned, so a release still re-materializes the graph.
+  The overlay then wins over whatever the release baked. The refresh fetches that same
+  configured repository (`KG_SOURCE_REPO`), never a hard-coded slug.
+- **The embeddings become a committed artifact** (`snapshot/embeddings.npz`, written with
+  `np.savez_compressed`), because the serving machine can never compute them — KGB-8's OOM is
+  the proof. The graph stays derived; only the vectors ship. Measured 2026-08-21 at ~21k quads:
+  12.0 MB uncompressed (7.0 MB of it fixed-width-column zero-padding), 2.5 MB compressed.
+  Peak refresh footprint is ~75 MB against the 1 GB volume — tenfold headroom.
+
+### The `index.ts` budget
+
+Full separation from `index.ts` is not achievable, because reuse forbids it: admin auth reaches
+a route only through `handleAdminRequest` → `AdminDeps` → `index.ts`, and an endpoint anywhere
+else would mean a new public surface and a new credential. The design is therefore a budget,
+not an absence — `index.ts` gains exactly **one config field, one supervisor construction, one
+`main()` lifecycle hook, and one `AdminDeps` entry**. All logic lives in injected-dependency
+modules (`src/kg-sidecar.ts`, `src/kg-refresh.ts`), built in the `makeStartDeploy` shape from
+the start. No new top-level function, no new route branch.
+
+### Invariants the refresh must hold
+
+- **Atomic overlay.** `current` is only ever created by a rename of a fully staged directory
+  whose completion marker was written last. Boot ignores a `current` without the marker, so a
+  crash mid-stage can never mask the baked fallback.
+- **Respect the deploy hold.** A manual refresh refuses while a deploy holds; an automatic mode,
+  when it lands, rides the existing poll loop the way the availability passenger does — never
+  its own timer, because the hold is only observed from that loop.
+- **Four gates, after the restart** — sidecar answers; vectors present and stamp-matched;
+  canary query non-empty and `degraded: false`; served age stamp strictly newer. Validating the
+  serving graph rather than a staged copy keeps memory at one graph. Any gate failing reverts
+  to `previous` and restarts again.
+- **Signals are the supervisor's problem.** Once Node spawns the sidecar instead of the shell
+  `exec` chain, the orchestrator owns forwarding, reaping, and a bounded kill — a child must
+  never outlive shutdown or block it.
+
 ## Failure history
 
 Each of these shipped a degraded or blocked deploy, and each is now covered by a guard.
