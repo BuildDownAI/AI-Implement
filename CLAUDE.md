@@ -30,7 +30,7 @@ A Node.js service that polls Linear or Jira for issues labeled `AI-Implement` an
 Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, etc.). These are read by name — keep the keys intact when editing.
 
 - tracker.kind: linear
-- MCP server: `linear-eudoxus` (declared in the project `.mcp.json`; **not** pre-approved — `.claude/` is gitignored and absent here, so each machine approves the server on first use)
+- MCP server: `linear-eudoxus` (declared in the project `.mcp.json`, which is **gitignored** — copy `.mcp.json.example` to `.mcp.json` on a fresh clone and add any machine-local servers there. Also **not** pre-approved: `.claude/` is gitignored and absent here, so each machine approves the server on first use)
 - Workspace: `eudoxus` (bound at OAuth time)
 - Team: `AII`  ← issues filed/listed/searched against this team
 - Team URL: https://linear.app/eudoxus/team/AII/overview
