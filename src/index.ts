@@ -44,7 +44,7 @@ import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, planningDispatchBlockReason } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
@@ -969,6 +969,17 @@ async function dispatchPlanning(
   if (!planningEligibility.eligible) {
     console.log(
       `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}`,
+    );
+    return;
+  }
+
+  // AII-430: every planning execution path (GHA, Fly, local Docker) advances the
+  // ticket through the runner callback. Without it the run cannot report, the
+  // label never reaches Plan-Complete, and planning re-dispatches every poll.
+  const callbackBlockReason = planningDispatchBlockReason(config);
+  if (callbackBlockReason) {
+    console.error(
+      `[poll] Refusing to dispatch planning for ${issue.identifier}: ${callbackBlockReason}`,
     );
     return;
   }
