@@ -10,6 +10,47 @@ import { renderClassification, TROUBLESHOOTING_URL, type Classification } from "
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
 
+/**
+ * AII-430: planning depends entirely on the runner callback to advance.
+ *
+ * The runner posts the plan through /runner/result, and that is what moves the
+ * ticket to Plan-Complete. Without the callback the plan is dropped, the label
+ * never advances, and the issue is eligible for planning again on the next
+ * poll — a full Claude planning run burned every cycle, forever.
+ *
+ * Three things that normally bound a retry loop all miss this case:
+ *   - Planning deliberately never writes to the dedup table (`dispatchSession`
+ *     is called with `doMarkDispatched: false`), so the label is the only brake.
+ *   - The dispatch breaker scores it a *success*: a run that cannot report
+ *     still exits 0, so `recordDispatchSuccess` resets the counter each cycle.
+ *   - Boot only warns that the callback path is disabled, then carries on.
+ *
+ * `resolveRunnerCallbackBaseUrl` already defaults the URL under
+ * RUNNER_MODE=local, so in practice the secret is the half most likely to be
+ * missing — but both are checked, since an explicit-URL deployment that omits
+ * the secret lands in the same loop.
+ *
+ * Returns a human-readable reason to refuse the dispatch, or null when the
+ * callback path is configured.
+ */
+export function planningDispatchBlockReason(config: {
+  runnerCallbackBaseUrl: string | null;
+  runnerTokenSecret: string | null;
+}): string | null {
+  const missing = [
+    config.runnerCallbackBaseUrl ? null : "RUNNER_CALLBACK_BASE_URL",
+    config.runnerTokenSecret ? null : "RUNNER_TOKEN_SECRET",
+  ].filter((name): name is string => name !== null);
+
+  if (missing.length === 0) return null;
+
+  return (
+    `planning needs the runner callback to post the plan and set Plan-Complete, `
+    + `but the callback path is disabled (${missing.join(" and ")} not set) — `
+    + `dispatching would re-run planning every poll without ever advancing the issue`
+  );
+}
+
 export interface RunnerResultBody {
   phase: RunnerPhase;
   outcome: "success" | "failure";
