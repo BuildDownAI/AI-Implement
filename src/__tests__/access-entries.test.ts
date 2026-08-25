@@ -426,6 +426,49 @@ describe("getEffectiveAllowlist", () => {
     warn.mockRestore();
   });
 
+  it("re-reads after one poll interval, so a write from another process lands without a restart", () => {
+    vi.useFakeTimers();
+    try {
+      process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
+      expect(access.getEffectiveAllowlist()!.source).toBe("env");
+
+      // Stands in for the recovery command: a write this process cannot be told about, so only
+      // the age of the cached list can bring it into effect.
+      dedup
+        .getDb()
+        .prepare(
+          "INSERT INTO access_entries (kind, value, role, provider, subject, added_at, added_by) VALUES ('address', 'ada@eudoxus.ai', 'admin', NULL, NULL, 0, NULL)",
+        )
+        .run();
+      expect(access.getEffectiveAllowlist()!.source).toBe("env");
+
+      vi.advanceTimersByTime(60_000);
+      expect(access.getEffectiveAllowlist()!.source).toBe("db");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("warns once per window while a read keeps failing, not on every request", () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
+      expect(access.getEffectiveAllowlist()!.entries).toHaveLength(1);
+      dedup.getDb().exec("DROP TABLE access_entries");
+
+      vi.advanceTimersByTime(60_000);
+      access.getEffectiveAllowlist(); // the window elapsed: one failed read, one warning
+      access.getEffectiveAllowlist(); // inside the new window: no read, no warning
+      access.getEffectiveAllowlist();
+
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("returns null when a read fails with nothing cached, and recovers on a later call", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     dedup.getDb().exec("DROP TABLE access_entries");

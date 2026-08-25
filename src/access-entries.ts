@@ -7,7 +7,7 @@
  * and a reassigned address inherits nothing.
  */
 
-import { recordAccessChange } from "./access-audit.js";
+import { recordAccessChange, type AccessAuditAction } from "./access-audit.js";
 import { getDb } from "./dedup.js";
 
 /**
@@ -63,6 +63,18 @@ const ADDRESS_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DOMAIN_SHAPE = /^[^\s@.]+(\.[^\s@.]+)+$/;
 
 let cached: EffectiveAllowlist | null = null;
+let cachedAt = 0;
+
+/**
+ * How long a cached list serves before it is re-read: one poll interval, so a write from another
+ * process — the recovery command — takes effect without a restart. Writes made in this process
+ * refresh immediately, so removing someone still takes effect on their next request.
+ *
+ * Parsed strictly: a NaN would make every freshness comparison false and silently stop the re-read.
+ */
+const CONFIGURED_POLL_MS = parseInt(process.env.POLL_INTERVAL_MS || "", 10);
+const ALLOWLIST_TTL_MS =
+  Number.isFinite(CONFIGURED_POLL_MS) && CONFIGURED_POLL_MS > 0 ? CONFIGURED_POLL_MS : 60_000;
 
 export function initAccessEntriesTable(): void {
   getDb().exec(`
@@ -114,21 +126,26 @@ export function matchAccessEntry(identity: MatchableIdentity, entries: AccessEnt
 
 /** The list in force. Null only when no list has ever loaded — callers must deny. */
 export function getEffectiveAllowlist(): EffectiveAllowlist | null {
-  if (!cached) refreshEffectiveAllowlist();
+  if (!cached || Date.now() - cachedAt >= ALLOWLIST_TTL_MS) refreshEffectiveAllowlist();
   return cached;
 }
 
-/** Re-read after a write, so a change applies without a restart. */
+/** Re-read after a write, or once the cached list has aged out. */
 export function refreshEffectiveAllowlist(): void {
   try {
     const stored = listAccessEntries();
     cached = stored.length > 0
       ? { entries: stored, source: "db" }
       : { entries: allowlistFromEnv(process.env), source: "env" };
+    cachedAt = Date.now();
   } catch (err) {
     if (cached) {
-      console.warn("[access] allowlist read failed; serving the last good list, will retry on the next request:", err);
+      // Back off to one attempt per window: the last good list serves correctly meanwhile, and
+      // retrying per request would warn on every one.
+      cachedAt = Date.now();
+      console.warn("[access] allowlist read failed; serving the last good list, will retry shortly:", err);
     } else {
+      // cachedAt stays 0 so the next request retries — nothing is being served yet.
       console.error("[access] allowlist unreadable with none cached. admin and MCP denied, will retry on the next request:", err);
     }
   }
@@ -208,7 +225,7 @@ export function parseAccessEntries(raw: unknown): ParsedAccess {
 export function saveAccessEntries(
   next: AccessEntryInput[],
   actor: string | null,
-  mustAdmit?: MatchableIdentity | null,
+  opts: { mustAdmit?: MatchableIdentity | null; action?: AccessAuditAction } = {},
 ): void {
   const normalized = next.map((e) => ({ ...e, value: e.value.trim().toLowerCase() }));
 
@@ -238,10 +255,10 @@ export function saveAccessEntries(
     for (const e of normalized) upsert.run(e.kind, e.value, e.role, now, actor);
 
     // Evaluated against the real result, and a throw rolls the whole save back.
-    if (mustAdmit && !matchAccessEntry(mustAdmit, listAccessEntries())) {
+    if (opts.mustAdmit && !matchAccessEntry(opts.mustAdmit, listAccessEntries())) {
       throw new Error("this change would remove your own access");
     }
-    recordAccessChange({ actor, action: "save", before, after: normalized });
+    recordAccessChange({ actor, action: opts.action ?? "save", before, after: normalized });
   })();
   // After the transaction, never inside it — the lockout guard above rolls the save back by
   // throwing, and a refresh from within would cache what was rolled back.
@@ -263,4 +280,5 @@ export function bindAccessEntry(value: string, provider: string, subject: string
 /** Test hook: drop the cached list. */
 export function __resetAllowlistCacheForTest(): void {
   cached = null;
+  cachedAt = 0;
 }

@@ -1171,7 +1171,7 @@ async function handlePostAccess(
   }
 
   try {
-    saveAccessEntries(parsed.entries, identity.email, identity);
+    saveAccessEntries(parsed.entries, identity.email, { mustAdmit: identity });
   } catch (err) {
     json(res, 400, { error: err instanceof Error ? err.message : "the access list could not be saved" });
     return;
