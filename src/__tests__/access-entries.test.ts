@@ -179,6 +179,28 @@ describe("bindAccessEntry", () => {
     expect(row.provider).toBeNull();
     expect(row.subject).toBeNull();
   });
+
+  // The three above assert on the stored row. Authorization reads the cache instead, so a binding
+  // that reaches the database and not the cache passes all of them while doing nothing.
+  it("takes effect against the live allowlist, without a refresh in between", () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    // Warms the cache with the entry still unbound, and pins the pre-bind behaviour. Skip it and
+    // the assertion below passes vacuously, because a cold cache re-reads and sees the binding.
+    expect(access.recheckIdentity({ provider: "google", sub: "google|123", email: "ada@eudoxus.ai" }).status).toBe("ok");
+
+    access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
+
+    const reassigned = access.recheckIdentity({ provider: "microsoft", sub: "ms|999", email: "ada@eudoxus.ai" });
+    expect(reassigned.status).toBe("denied");
+  });
+
+  it("keeps admitting the identity it bound to", () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    access.recheckIdentity({ provider: "google", sub: "google|123", email: "ada@eudoxus.ai" });
+    access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
+
+    expect(access.recheckIdentity({ provider: "google", sub: "google|123", email: "ada@eudoxus.ai" }).status).toBe("ok");
+  });
 });
 
 describe("parseAccessEntries", () => {
@@ -340,6 +362,16 @@ describe("getEffectiveAllowlist", () => {
     expect(effective.entries).toEqual([]);
   });
 
+  it("applies a save without a manual refresh, so no caller has to remember one", () => {
+    process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
+    // Warm on the env list first; a cold cache would re-read and pass regardless of the save.
+    expect(access.getEffectiveAllowlist()!.source).toBe("env");
+
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+
+    expect(access.getEffectiveAllowlist()!.source).toBe("db");
+  });
+
   it("hands authority to the stored list once a row exists, ignoring the env from then on", () => {
     process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
@@ -362,11 +394,18 @@ describe("getEffectiveAllowlist", () => {
     expect(access.getEffectiveAllowlist()!.source).toBe("env");
   });
 
-  it("holds the list in memory until an explicit refresh, so the per-request check costs no query", () => {
+  it("holds the list in memory, so the per-request check costs no query", () => {
     process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
     expect(access.getEffectiveAllowlist()!.source).toBe("env");
 
-    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    // Inserted behind the module's back: every write it owns refreshes the cache itself, so only
+    // a read that re-queries could observe this row.
+    dedup
+      .getDb()
+      .prepare(
+        "INSERT INTO access_entries (kind, value, role, provider, subject, added_at, added_by) VALUES ('address', 'ada@eudoxus.ai', 'admin', NULL, NULL, 0, NULL)",
+      )
+      .run();
     expect(access.getEffectiveAllowlist()!.source).toBe("env");
 
     access.refreshEffectiveAllowlist();

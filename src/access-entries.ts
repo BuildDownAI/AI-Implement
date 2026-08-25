@@ -243,15 +243,21 @@ export function saveAccessEntries(
     }
     recordAccessChange({ actor, action: "save", before, after: normalized });
   })();
+  // After the transaction, never inside it — the lockout guard above rolls the save back by
+  // throwing, and a refresh from within would cache what was rolled back.
+  refreshEffectiveAllowlist();
 }
 
 /** Record the provider identity an address resolved to, the first time it signs in. */
 export function bindAccessEntry(value: string, provider: string, subject: string): void {
-  getDb()
+  const result = getDb()
     .prepare(
       "UPDATE access_entries SET provider = ?, subject = ? WHERE kind = 'address' AND value = ? AND provider IS NULL",
     )
     .run(provider, subject, value.trim().toLowerCase());
+  // Without this the binding is written but never consulted: the cache still holds the entry as
+  // unbound, so matching keeps taking the address branch and admits whoever holds it.
+  if (result.changes > 0) refreshEffectiveAllowlist();
 }
 
 /** Test hook: drop the cached list. */

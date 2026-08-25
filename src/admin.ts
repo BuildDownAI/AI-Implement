@@ -28,7 +28,7 @@ import {
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type SessionIdentity } from "./admin-session.js";
-import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, refreshEffectiveAllowlist, saveAccessEntries } from "./access-entries.js";
+import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
 import type { DeployStart } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
@@ -1177,7 +1177,6 @@ async function handlePostAccess(
     return;
   }
 
-  refreshEffectiveAllowlist();
   handleGetAccess(res, identity);
 }
 
