@@ -89,8 +89,53 @@ systems and interoperate with them through the same socket.
   no new per-tenant service.
 - Three work items follow this ADR: the memory-provider interface (AII), the MCP-source
   ingester (KGB), and the Oxigraph spike (KGB). Filed parked; promoted on demand.
-- Customer-brought memory systems (e.g. a GBrain vault with an MCP server) integrate as
-  either a knowledge *source* (ingested into the tenant KG) or, post-interface, an alternate
-  *provider* — without displacing the orchestrator's operational GitHub/Linear access.
+- Customer-brought memory systems integrate through the lanes worked out below — never by
+  displacing the orchestrator's operational GitHub/Linear access.
 - The zero-token, provenance-enforced, self-hostable combination is the stated competitive
   position against Zep/Mem0/GraphRAG-class systems.
+
+---
+
+## Worked example: a customer arrives with a GBrain vault + MCP server
+
+The expected near-term case. Three integration lanes; the third is a redirect.
+
+### Lane 1 — GBrain as a knowledge *source* (works today, no new code)
+
+GBrain's substance is a git-backed markdown vault — the shape the spine ingester already
+eats. Clone the vault as a sibling checkout, add it to the tenant KG's `sources.yml` under
+`secondary_repos:`, refresh. Every vault page becomes a `Doc` node with title + snippet;
+their "Compiled Truth" pages become searchable cards next to the tenant's issues and PRs.
+This is the day-one answer: their source of truth is files in git, and files in git are our
+native food. The MCP-server route (reading the vault through their server instead of git) is
+what the MCP-source ingester (KGB-12) adds — needed only when the customer will expose the
+MCP endpoint but not the repo.
+
+### Lane 2 — GBrain as the memory *provider* (after the provider interface, AII-433)
+
+If the customer wants GBrain to *be* the memory rather than feed ours: an adapter maps the
+five-tool contract onto GBrain's search. State the capability flags up front — GBrain can
+serve hybrid-search-shaped queries over its pages, but it has **no equivalent of
+`kg_neighbors`, `kg_path`, or `kg_provenance`**: no typed graph, no enforced provenance.
+Skills degrade gracefully (the dual-target rules already handle missing capabilities), but
+recon quality drops: no issue-relation walks, no provenance chains, no exact-key boost over
+typed Issue nodes. Sellable as "your memory, our discipline — with these named gaps."
+
+### Lane 3 — "use GBrain for GitHub and Linear access": no, redirect it
+
+The likely customer misconception. GBrain's MCP server exposes memory pages *about* GitHub
+and Linear (webhook-fed timelines), not GitHub and Linear themselves. The orchestrator's
+operational core — polling for labeled issues, dispatching runs, opening PRs, callbacks,
+completing tickets on merge — needs real API access with real credentials (the GitHub App,
+the Linear client-credentials app). No memory system, ours included, sits in that path.
+
+The legitimate instinct underneath is **avoiding double ingestion**. If their GBrain already
+ingests Linear/GitHub events, offer the choice explicitly: keep both (recommended — GBrain
+pages ride in as Lane-1 Doc nodes *alongside* our typed, related, provenanced
+Issue↔PR↔Commit spine, which their compiled pages cannot replicate and which costs zero
+tokens, so the duplication is nearly free), or Lane 2 with the named capability losses.
+
+One-line version: "Point us at your GBrain repo and it is searchable inside AI-Implement the
+same day; if you want GBrain to be the memory engine itself, that is the provider socket
+with three named capability gaps; and the pipeline's GitHub/Linear operations keep their own
+credentials regardless."
