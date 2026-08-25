@@ -20,6 +20,21 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 
 Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.
 
+## Diagram conventions
+
+Adopted 2026-08-24 (from the AII-424 / PR #327 review):
+
+- **Flow diagrams in rendered markdown use mermaid** (```` ```mermaid ```` blocks). GitHub,
+  Linear, and the Mintlify docs site all render it natively — the same source draws everywhere.
+- **Validate before committing:** `npx -y @mermaid-js/mermaid-cli -i <file>.mmd -o /tmp/out.svg`.
+  A mermaid syntax error renders as an error box, which is worse than ASCII art.
+- **Tabular data uses markdown tables**, never a diagram — if the content is rows and columns
+  wearing box art, it is a table.
+- **ASCII diagrams are reserved for agent-context files** (`CLAUDE.md`), which are consumed as
+  raw text every invocation. Everywhere a human sees rendered markdown, mermaid wins.
+
+This applies to `docs/`, tracker issue bodies, and PR descriptions alike.
+
 ## Typed artifacts
 
 | Directory | Contents |
