@@ -83,6 +83,7 @@ import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
+import { makeKgRefresh } from "./kg-refresh.js";
 
 // ---------- Configuration ----------
 
@@ -2854,8 +2855,9 @@ function onDeployBuildFailure(commit: string, err: unknown): void {
   recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
 }
 
-function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
+function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgSidecar): http.Server {
   const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
+  const kgRefresh = makeKgRefresh({ sidecar, githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, kgSourceRepo: config.kgSourceRepo });
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -3275,7 +3277,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
         notifyWebhookUrl: config.notifyWebhookUrl,
-      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget })) return;
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -3363,7 +3365,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const server = startServer(config, registry);
+  const server = startServer(config, registry, sidecar);
 
   // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
   // Every write postBootNotice makes — LAST_IMAGE_REF_KEY, LAST_SHUTDOWN_AT_KEY and

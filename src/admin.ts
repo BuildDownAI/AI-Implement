@@ -190,6 +190,11 @@ export interface AdminDeps {
   /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
   startDeploy?: () => Promise<DeployStart>;
   selfDeployTarget?: SelfDeployTarget | null;
+  /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
+  kgRefresh?: {
+    trigger(): Promise<{ status: number; body: Record<string, unknown> }>;
+    status(): Promise<unknown>;
+  };
 }
 
 export function handleAdminRequest(
@@ -234,6 +239,30 @@ export function handleAdminRequest(
 
     if (url === "/api/deploy" && method === "POST") {
       handleDeployTrigger(res, deps);
+      return true;
+    }
+
+    if (url === "/api/kg/refresh" && method === "POST") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      deps.kgRefresh.trigger().then(
+        (r) => json(res, r.status, r.body),
+        (err) => json(res, 500, { error: String(err) }),
+      );
+      return true;
+    }
+
+    if (url === "/api/kg/status" && method === "GET") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      deps.kgRefresh.status().then(
+        (body) => json(res, 200, body as Record<string, unknown>),
+        (err) => json(res, 500, { error: String(err) }),
+      );
       return true;
     }
 
