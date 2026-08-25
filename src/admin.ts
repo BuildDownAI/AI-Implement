@@ -27,7 +27,9 @@ import {
 } from "./runner-mode.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
-import { createSession, accessCodeMatches, authenticateAdminRequest } from "./admin-session.js";
+import { createSession, accessCodeMatches, authenticateAdminRequest, type SessionIdentity } from "./admin-session.js";
+import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, refreshEffectiveAllowlist, saveAccessEntries } from "./access-entries.js";
+import { listAccessChanges } from "./access-audit.js";
 import type { DeployStart } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
@@ -456,6 +458,16 @@ export function handleAdminRequest(
 
     if (url === "/api/settings" && method === "POST") {
       handlePostSettings(req, res, config);
+      return true;
+    }
+
+    if (url === "/api/access" && method === "GET") {
+      handleGetAccess(res, gate.identity);
+      return true;
+    }
+
+    if (url === "/api/access" && method === "POST") {
+      handlePostAccess(req, res, gate.identity);
       return true;
     }
 
@@ -1106,6 +1118,67 @@ async function handlePostSettings(
     },
     restartRequired,
   });
+}
+
+function handleGetAccess(res: http.ServerResponse, identity: SessionIdentity | null): void {
+  const effective = getEffectiveAllowlist();
+  // getEffectiveAllowlist() is guarded; these two are not, and an access-code session is exempt
+  // from the re-check, so it reaches this route even when the tables are unreadable.
+  // An empty `stored` here can mean "unreadable", so read it only alongside a null `source`.
+  let stored: ReturnType<typeof listAccessEntries> = [];
+  let changes: ReturnType<typeof listAccessChanges> = [];
+  try {
+    stored = listAccessEntries();
+    changes = listAccessChanges(20);
+  } catch {
+    /* a null source tells the page what happened */
+  }
+  json(res, 200, {
+    source: effective?.source ?? null,
+    entries: effective?.entries ?? [],
+    stored,
+    env: getEnvAllowlist(),
+    changes,
+    // The same rule the POST enforces, so the page never has to infer it.
+    canEdit: identity !== null,
+    you: identity?.email ?? null,
+  });
+}
+
+async function handlePostAccess(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: SessionIdentity | null,
+): Promise<void> {
+  // An anonymous session cannot make an attributable change to who gets in.
+  if (!identity) {
+    json(res, 403, { error: "Editing the access list requires a signed-in identity" });
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+    return;
+  }
+
+  const parsed = parseAccessEntries((body as { entries?: unknown } | null)?.entries);
+  if (!parsed.ok) {
+    json(res, 400, { error: parsed.error });
+    return;
+  }
+
+  try {
+    saveAccessEntries(parsed.entries, identity.email, identity);
+  } catch (err) {
+    json(res, 400, { error: err instanceof Error ? err.message : "the access list could not be saved" });
+    return;
+  }
+
+  refreshEffectiveAllowlist();
+  handleGetAccess(res, identity);
 }
 
 async function handleListGlobalSecrets(

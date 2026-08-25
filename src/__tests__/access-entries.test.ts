@@ -6,6 +6,7 @@ import path from "node:path";
 // dedup.ts freezes its DB path at import time, so each test sets a unique DEDUP_DB_PATH and
 // re-imports the modules fresh (the same isolation pattern admin-session.test.ts uses).
 let access: typeof import("../access-entries.js");
+let audit: typeof import("../access-audit.js");
 let dedup: typeof import("../dedup.js");
 let dbPath: string;
 
@@ -14,8 +15,11 @@ beforeEach(async () => {
   dbPath = path.join(os.tmpdir(), `access-entries-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   process.env.DEDUP_DB_PATH = dbPath;
   access = await import("../access-entries.js");
+  audit = await import("../access-audit.js");
   dedup = await import("../dedup.js");
   access.initAccessEntriesTable();
+  // saveAccessEntries records every write, so the audit table is a hard requirement here.
+  audit.initAccessAuditTable();
 });
 
 afterEach(() => {
@@ -174,6 +178,87 @@ describe("bindAccessEntry", () => {
     const row = rawRow("domain", "eudoxus.ai")!;
     expect(row.provider).toBeNull();
     expect(row.subject).toBeNull();
+  });
+});
+
+describe("parseAccessEntries", () => {
+  const ok = (raw: unknown) => {
+    const parsed = access.parseAccessEntries(raw);
+    if (!parsed.ok) throw new Error(`expected accept, got: ${parsed.error}`);
+    return parsed.entries;
+  };
+  const rejection = (raw: unknown) => {
+    const parsed = access.parseAccessEntries(raw);
+    return parsed.ok ? null : parsed.error;
+  };
+
+  it("accepts a well-formed list and normalizes each value", () => {
+    expect(
+      ok([
+        { kind: "domain", value: " Eudoxus.AI ", role: "user" },
+        { kind: "address", value: "Ada@Eudoxus.ai", role: "admin" },
+      ]),
+    ).toEqual([
+      { kind: "domain", value: "eudoxus.ai", role: "user" },
+      { kind: "address", value: "ada@eudoxus.ai", role: "admin" },
+    ]);
+  });
+
+  it("accepts an empty list — clearing the stored list is a legitimate edit", () => {
+    expect(ok([])).toEqual([]);
+  });
+
+  it("rejects anything that is not an array of objects", () => {
+    expect(rejection(undefined)).toMatch(/must be an array/);
+    expect(rejection("eudoxus.ai")).toMatch(/must be an array/);
+    expect(rejection([null])).toMatch(/must be an object/);
+  });
+
+  it("rejects an unknown kind or role rather than coercing it", () => {
+    expect(rejection([{ kind: "wildcard", value: "eudoxus.ai", role: "user" }])).toMatch(/kind must be/);
+    expect(rejection([{ kind: "address", value: "ada@eudoxus.ai", role: "owner" }])).toMatch(/role must be/);
+  });
+
+  it("rejects a missing or blank value", () => {
+    expect(rejection([{ kind: "address", role: "admin" }])).toMatch(/non-empty string/);
+    expect(rejection([{ kind: "address", value: "   ", role: "admin" }])).toMatch(/non-empty string/);
+  });
+
+  it("rejects an address that is not an address, which would otherwise save and match nobody", () => {
+    expect(rejection([{ kind: "address", value: "eudoxus.ai", role: "admin" }])).toMatch(/not an email address/);
+    expect(rejection([{ kind: "address", value: "ada@localhost", role: "admin" }])).toMatch(/not an email address/);
+  });
+
+  it("rejects a domain that is not a domain, for the same reason", () => {
+    expect(rejection([{ kind: "domain", value: "ada@eudoxus.ai", role: "user" }])).toMatch(/not a domain/);
+    expect(rejection([{ kind: "domain", value: "localhost", role: "user" }])).toMatch(/not a domain/);
+  });
+
+  it("rejects a duplicate, including one that only collides after normalizing", () => {
+    expect(
+      rejection([
+        { kind: "address", value: "ada@eudoxus.ai", role: "admin" },
+        { kind: "address", value: "ADA@eudoxus.ai", role: "user" },
+      ]),
+    ).toMatch(/listed twice/);
+  });
+
+  it("allows the same value under both kinds, which are different entries", () => {
+    // Nonsensical in practice, but they key differently and neither shadows the other.
+    expect(ok([
+      { kind: "domain", value: "eudoxus.ai", role: "user" },
+      { kind: "address", value: "ada@eudoxus.ai", role: "admin" },
+    ])).toHaveLength(2);
+  });
+
+  it("bounds the list, since it is scanned on every authenticated request", () => {
+    const many = Array.from({ length: 201 }, (_, i) => ({
+      kind: "address" as const,
+      value: `user${i}@eudoxus.ai`,
+      role: "user" as const,
+    }));
+    expect(rejection(many)).toMatch(/at most/);
+    expect(access.parseAccessEntries(many.slice(0, 200)).ok).toBe(true);
   });
 });
 

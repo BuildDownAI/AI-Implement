@@ -4,6 +4,7 @@ import { sidebarHtml } from "./sidebar.js";
 import { themeJs } from "./theme.js";
 import { routerJs } from "./router.js";
 import { authJs } from "./auth.js";
+import { accessHtml, accessScript } from "./pages/access.js";
 import { overviewHtml, overviewScript } from "./pages/overview.js";
 import { settingsHtml, settingsScript } from "./pages/settings.js";
 import { projectsHtml, projectsScript } from "./pages/projects.js";
@@ -55,6 +56,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${runnersHtml}
     ${reportsHtml}
     ${deploymentsHtml}
+    ${accessHtml}
     ${stubsHtml}
   </main>
 </div>`;
@@ -85,7 +87,7 @@ const body = `<body>
 ${shell}
 ${drawerHtml}
 ${stepperHtml}
-<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${issuesScript}${pullsScript}${blockersScript}${customizationsScript}${pipelinesAndStepsScript}${modelsAndProvidersScript}${runnersScript}${reportsScript}${deploymentsScript}${drawerScript}${stepperScript}</script>
+<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${issuesScript}${pullsScript}${blockersScript}${customizationsScript}${pipelinesAndStepsScript}${modelsAndProvidersScript}${runnersScript}${reportsScript}${deploymentsScript}${accessScript}${drawerScript}${stepperScript}</script>
 </body></html>`;
 
 export const adminHtml = head + body;

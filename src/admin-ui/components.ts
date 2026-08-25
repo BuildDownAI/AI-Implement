@@ -114,10 +114,20 @@ export const componentsCss = `
   align-items: center;
   gap: 10px;
   padding: 8px;
-  border-radius: var(--r-sm);
-  cursor: pointer;
 }
-.sidebar-user:hover { background: var(--bg-hover); }
+.sidebar-user-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px 8px;
+}
+/* Squared to the avatar above so the two column-align; the default icon padding insets the glyph. */
+.sidebar-user-actions .btn-icon {
+  width: 24px; height: 24px;
+  padding: 0;
+  justify-content: center;
+}
+.sidebar-user-actions .btn-danger { background: transparent; border-color: transparent; }
 .sidebar-user .avatar {
   width: 24px; height: 24px;
   border-radius: 6px;
@@ -134,7 +144,7 @@ export const componentsCss = `
 }
 .sidebar-user .user-email {
   font-size: 11px;
-  color: var(--fg-tertiary);
+  color: var(--fg-secondary);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
@@ -410,6 +420,12 @@ export const componentsCss = `
 .tbl tbody tr.failed-row:hover td { background: rgba(220, 38, 38, 0.05); }
 .tbl tbody tr.redispatch-row td { background: var(--st-warn-bg); }
 .tbl tbody tr.redispatch-row:hover td { background: var(--bg-hover); }
+.tbl tbody tr.row-new td { background: var(--st-success-bg); }
+.tbl tbody tr.row-new td:first-child { box-shadow: inset 3px 0 0 var(--st-success-dot); }
+.tbl tbody tr.row-changed td { background: var(--st-warn-bg); }
+.tbl tbody tr.row-changed td:first-child { box-shadow: inset 3px 0 0 var(--st-warn-dot); }
+.tbl tbody tr.row-new:hover td,
+.tbl tbody tr.row-changed:hover td { background: var(--bg-hover); }
 
 .mono {
   font-family: var(--font-mono);

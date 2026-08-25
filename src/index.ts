@@ -29,6 +29,7 @@ import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { initAccessEntriesTable } from "./access-entries.js";
+import { initAccessAuditTable } from "./access-audit.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationTokenRequest } from "./publication-token-vending.js";
@@ -3312,6 +3313,7 @@ async function main(): Promise<void> {
   initReconciliationTable();
   initStepLogTable();
   initMcpOAuthTables();
+  initAccessAuditTable();
 
   // A process that died mid-deploy must not leave dispatch paused forever.
   const holdWasSet = clearDeployHold();

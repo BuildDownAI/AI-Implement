@@ -7,7 +7,15 @@
  * and a reassigned address inherits nothing.
  */
 
+import { recordAccessChange } from "./access-audit.js";
 import { getDb } from "./dedup.js";
+
+/**
+ * The identity fields a decision needs. Deliberately not exported and deliberately not a fourth
+ * identity type — VerifiedIdentity, SessionIdentity and McpTokenIdentity all satisfy it
+ * structurally, and its `email: string | null` is wider than the two persisted shapes.
+ */
+type MatchableIdentity = { provider: string; sub: string; email: string | null };
 
 export type AccessEntryKind = "domain" | "address";
 export type AccessRole = "user" | "admin";
@@ -15,6 +23,9 @@ export type RecheckResult =
   | { status: "ok"; entry: AccessEntry }
   | { status: "unavailable" }
   | { status: "denied" };
+type ParsedAccess =
+  | { ok: true; entries: AccessEntryInput[] }
+  | { ok: false; error: string };
 
 export interface EffectiveAllowlist {
   entries: AccessEntry[];
@@ -47,6 +58,10 @@ interface AccessEntryRow {
   added_by: string | null;
 }
 
+const MAX_ACCESS_ENTRIES = 200;
+const ADDRESS_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const DOMAIN_SHAPE = /^[^\s@.]+(\.[^\s@.]+)+$/;
+
 let cached: EffectiveAllowlist | null = null;
 
 export function initAccessEntriesTable(): void {
@@ -65,21 +80,15 @@ export function initAccessEntriesTable(): void {
 }
 
 /** Re-check a persisted identity against the list in force. */
-export function recheckIdentity(identity: { provider: string; sub: string; email: string | null }): RecheckResult {
+export function recheckIdentity(identity: MatchableIdentity): RecheckResult {
   const allowlist = getEffectiveAllowlist();
   if (!allowlist) return { status: "unavailable" };
   const entry = matchAccessEntry(identity, allowlist.entries);
   return entry ? { status: "ok", entry } : { status: "denied" };
 }
 
-/**
- * The entry admitting this identity, or null. Takes the three fields every identity shape
- * in the codebase carries, so a session row and an MCP token row both fit without adapting.
- */
-export function matchAccessEntry(
-  identity: { provider: string; sub: string; email: string | null },
-  entries: AccessEntry[],
-): AccessEntry | null {
+/** The entry admitting this identity, or null. Entries arrive normalized; only the identity is folded here. */
+export function matchAccessEntry(identity: MatchableIdentity, entries: AccessEntry[]): AccessEntry | null {
   const email = (identity.email ?? "").trim().toLowerCase();
   const domain = email.split("@").pop() ?? "";
 
@@ -140,6 +149,11 @@ function allowlistFromEnv(env: NodeJS.ProcessEnv): AccessEntry[] {
   ];
 }
 
+/** What the env supplies, whether or not it is still in force. The page shows it as stale after handover. */
+export function getEnvAllowlist(): AccessEntry[] {
+  return allowlistFromEnv(process.env);
+}
+
 /** Every stored entry. Zero rows means the env->DB handover has not happened and the env list still applies. */
 export function listAccessEntries(): AccessEntry[] {
   const rows = getDb()
@@ -158,8 +172,44 @@ export function listAccessEntries(): AccessEntry[] {
   }));
 }
 
+export function parseAccessEntries(raw: unknown): ParsedAccess {
+  if (!Array.isArray(raw)) return { ok: false, error: "entries must be an array" };
+  if (raw.length > MAX_ACCESS_ENTRIES) {
+    // The list is scanned on every authenticated request, so its length is bounded.
+    return { ok: false, error: `at most ${MAX_ACCESS_ENTRIES} entries` };
+  }
+
+  const entries: AccessEntryInput[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) return { ok: false, error: "each entry must be an object" };
+    const { kind, value, role } = item as Record<string, unknown>;
+    if (kind !== "domain" && kind !== "address") return { ok: false, error: "kind must be 'domain' or 'address'" };
+    if (role !== "user" && role !== "admin") return { ok: false, error: "role must be 'user' or 'admin'" };
+    if (typeof value !== "string" || !value.trim()) return { ok: false, error: "value must be a non-empty string" };
+
+    const normalized = value.trim().toLowerCase();
+    // A shape mismatch would save cleanly and then match nobody — an entry that looks right and is inert.
+    if (kind === "address" && !ADDRESS_SHAPE.test(normalized)) {
+      return { ok: false, error: `"${normalized}" is not an email address` };
+    }
+    if (kind === "domain" && !DOMAIN_SHAPE.test(normalized)) {
+      return { ok: false, error: `"${normalized}" is not a domain` };
+    }
+    if (seen.has(`${kind}:${normalized}`)) return { ok: false, error: `"${normalized}" is listed twice` };
+
+    seen.add(`${kind}:${normalized}`);
+    entries.push({ kind, value: normalized, role });
+  }
+  return { ok: true, entries };
+}
+
 /** Replace the stored list. Surviving entries keep their binding and provenance. */
-export function saveAccessEntries(next: AccessEntryInput[], actor: string | null): void {
+export function saveAccessEntries(
+  next: AccessEntryInput[],
+  actor: string | null,
+  mustAdmit?: MatchableIdentity | null,
+): void {
   const normalized = next.map((e) => ({ ...e, value: e.value.trim().toLowerCase() }));
 
   for (const e of normalized) {
@@ -174,9 +224,10 @@ export function saveAccessEntries(next: AccessEntryInput[], actor: string | null
   const keep = new Set(normalized.map((e) => `${e.kind}:${e.value}`));
 
   db.transaction(() => {
-    for (const existing of listAccessEntries()) {
-      if (!keep.has(`${existing.kind}:${existing.value}`)) {
-        db.prepare("DELETE FROM access_entries WHERE kind = ? AND value = ?").run(existing.kind, existing.value);
+    const before = listAccessEntries();
+    for (const entry of before) {
+      if (!keep.has(`${entry.kind}:${entry.value}`)) {
+        db.prepare("DELETE FROM access_entries WHERE kind = ? AND value = ?").run(entry.kind, entry.value);
       }
     }
     const upsert = db.prepare(
@@ -185,6 +236,12 @@ export function saveAccessEntries(next: AccessEntryInput[], actor: string | null
        ON CONFLICT(kind, value) DO UPDATE SET role = excluded.role`,
     );
     for (const e of normalized) upsert.run(e.kind, e.value, e.role, now, actor);
+
+    // Evaluated against the real result, and a throw rolls the whole save back.
+    if (mustAdmit && !matchAccessEntry(mustAdmit, listAccessEntries())) {
+      throw new Error("this change would remove your own access");
+    }
+    recordAccessChange({ actor, action: "save", before, after: normalized });
   })();
 }
 
