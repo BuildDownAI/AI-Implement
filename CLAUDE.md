@@ -104,6 +104,8 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Admin SSO / OIDC | `src/oauth/`, `src/admin-session.ts` | |
 | Admin SPA | `src/admin-ui/` | |
 
+**Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
+
 ## Running locally
 
 ```bash
