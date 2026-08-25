@@ -101,7 +101,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Stuck-run recovery | `src/reaper.ts`, `src/stuck-watchdog.ts` | |
 | Per-team dispatch capacity | `src/poll-selection.ts` | |
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
-| Admin SSO / OIDC | `src/oauth/`, `src/admin-session.ts` | |
+| Admin SSO / OIDC, sign-in allowlist | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
@@ -162,7 +162,7 @@ Only the non-obvious ones are worth restating:
 
 - `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` — the only pair that throws at boot when absent. Everything else warns and degrades a feature.
 - `RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET` — **not Fly-specific.** All three execution modes report through them; the GHA path receives the URL as a workflow input rather than an env var. Without them a planning run never reports completion and the issue stalls.
-- `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` — fail-closed. Empty means deny everyone.
+- `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` — fail-closed, and a **seed rather than the list**: they apply until the first save at `/admin#access`, then go inert while the stored list has entries. Empty and nothing stored means deny everyone.
 - `KG_SIDECAR_URL` — unset degrades `/mcp`, but an unauthenticated probe still gets **401** and cannot detect it. Only an unset `OAUTH_REDIRECT_BASE_URL` 503s every caller.
 - `AI_IMPLEMENT_LOG_LEVEL`, `AI_IMPLEMENT_RUNNER_LABEL`, `AI_IMPLEMENT_PROVIDER` — repo/org **Actions variables**, not orchestrator env, and effective only after the target repo re-syncs `claude-implement.yml`. `LOG_LEVEL` is `summary` (one result line per invocation — outcome, turns, duration, cost, tokens) or `stream` (additionally tees each tool call, not its output); telemetry is captured at both. `RUNNER_LABEL` overrides `runs-on`, default `ubuntu-latest` — pointing it at a larger runner roughly halves the CPU-bound implement job, but **write access to that variable lets the holder retarget the job to an arbitrary self-hosted runner that would then see the job's secrets.**
 - `AI_IMPLEMENT_SOURCE_COMMIT` / `_REPO` / `_BRANCH` — **stamped by the image build, not set by an operator** (`Dockerfile` build args). Self-deploy compares the stamp against the branch head, so an image built without all three goes inert and reports availability as *unknown*, never as up to date — a hand-run `fly deploy` that omits them silently disables the feature. No webhook or inbound reachability is needed; those only cut detection latency from one poll cycle to seconds.
@@ -268,7 +268,11 @@ Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll dete
 
 ## Admin UI and auth
 
-SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. **Authorization and session identity key on different claims, and it is easy to state this backwards:** authorization is a fail-closed allowlist matched against the verified *email*, while the session stores the provider's stable `sub`, because email is mutable.
+SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. The fail-closed allowlist is **database-backed and edited at `/admin#access`** — `OAUTH_ALLOWED_*` seed it and apply until the first save, which hands authority to the stored list permanently.
+
+Three things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`.** An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
+
+Every authenticated request re-checks against an in-memory list, so a removal ends a session on the next request rather than at token expiry. **Full reference: [docs/access-model.md](docs/access-model.md)** — precedence, the audit trail, and the host command that recovers from lockout.
 
 The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — all client JS is concatenated into one inline `<script>` at module load. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the HTML-escaping helpers (below) rather than bare globals. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts`.
 
@@ -276,11 +280,11 @@ The SPA at `/admin` is composed from string-exporting modules under `src/admin-u
 
 | Context | Helper | Why |
 |---|---|---|
-| Text content (`innerHTML`, `textContent`) | `window.esc()` | Escapes `&`, `<`, `>` via DOM round-trip |
+| Text interpolated into markup (`innerHTML`) | `window.esc()` | Escapes `&`, `<`, `>` via DOM round-trip. A value assigned to `textContent` needs **no** helper — it is never parsed as HTML |
 | Quoted attribute value (`title=`, `data-*`, path in `href=`) | `window.escAttr()` | Also escapes `"` and `'` |
 | Full URL in `href=`/`src=` (scheme from data) | `window.safeUrl()` | Validates scheme; `javascript:` returns `'#'` |
 
-`window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first. Use `window.raw(markup)` to opt out for pre-built HTML. Use `html` for all new markup-building code. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. Note: when a URL is assembled in a variable and then placed in `html`, the template cannot detect the URL context — call `safeUrl()` explicitly in that case.
+`window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first, and `window.raw(markup)` opts out for pre-built HTML. **No page module uses it** — every call site concatenates strings with explicit `esc()`/`escAttr()`, because nesting a template literal inside the page's own script template means escaping every backtick and `${`. Follow the call sites. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. And when a URL is assembled in a variable before being interpolated, no helper can detect the URL context — call `safeUrl()` explicitly there.
 
 Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
 

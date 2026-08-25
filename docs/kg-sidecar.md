@@ -121,7 +121,9 @@ fly deploy --remote-only       # degraded: /mcp returns 503, all other routes he
 | `GET /.well-known/oauth-protected-resource` | Resource metadata pointing at the authorization server |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 authorization-server metadata |
 
-Authorization is **fail-closed**: a verified identity must pass the same `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` allowlist as the admin UI.
+Authorization is **fail-closed**, against the same allowlist the admin UI uses — which is database-backed and edited at `/admin#access`, with `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` seeding it until the first save. See [access-model.md](access-model.md).
+
+The list is re-checked on **every `/mcp` request**, not only at sign-in. An access token otherwise outlives a removal by up to its full hour; re-checking closes that window to a single request. A removed identity gets the same 401 an invalid token does, while an unreadable allowlist answers 503 — a database fault must not look like a revoked token.
 
 ### Token lifetimes and rotation
 
