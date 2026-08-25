@@ -234,7 +234,7 @@ interface SidecarRpcResponse {
  * the first event carrying a `result` (falling back to one carrying an
  * `error`), or null if nothing in the reply is a JSON-RPC response.
  */
-function parseSidecarRpcResponse(raw: string, contentType: string | undefined): SidecarRpcResponse | null {
+export function parseSidecarRpcResponse(raw: string, contentType: string | undefined): SidecarRpcResponse | null {
   if (contentType?.includes("text/event-stream")) {
     let errorReply: SidecarRpcResponse | null = null;
     // Events are separated by blank lines; one event's data may span several

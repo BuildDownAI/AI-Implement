@@ -191,9 +191,25 @@ read with `kg_neighbors`. Compare it against the ingest date. An unchanged stamp
 the build served the old snapshot — usually because the push had not landed, or because the remote
 builder's git cache served a stale `--depth 1` clone. Both are benign. Wait, redeploy, re-verify.
 
-## Process: refresh is redeploy
+## Process: refreshing the graph
 
-Run `bd-kg-refresh`, or these steps by hand.
+With the refresh rail (AII-426), publishing data no longer rides a release. Run `bd-kg-refresh`,
+or these steps by hand.
+
+1. Reconcile scope, ingest, and commit + push the snapshot — steps 1–5 below, unchanged.
+2. **Trigger the refresh**: `POST /api/kg/refresh` with an admin session token (or the
+   Deployments page's "Refresh graph now"). `202` = accepted; `409` = a refresh or a deploy is
+   already in progress — the trigger refuses while the deploy hold is set. The orchestrator
+   fetches the configured `KG_SOURCE_REPO`, stages under `/data/kg/staging` (materialize with
+   the image's venv — nothing embeds), writes the completion marker last, swaps by rename, and
+   restarts the sidecar.
+3. **The four gates run on the serving graph**: the sidecar answers; the vectors are present;
+   a canary query returns non-empty with `degraded: false`; and the served age stamp is
+   strictly newer than before the swap. Any failure reverts to the previous overlay and
+   restarts again. `GET /api/kg/status` reports the outcome and the gate that fired.
+
+**Redeploy remains the fallback** — an orchestrator predating the rail (the route answers 404),
+or a change that touches the sidecar's code rather than its data, still refreshes by deploy:
 
 1. **Reconcile scope.** Call `list_projects` on the orchestrator MCP, diff against `sources.yml`, and
    commit the manifest before ingesting.
