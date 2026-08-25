@@ -41,6 +41,11 @@ function writeScript(path: string, body: string): void {
   chmodSync(path, 0o755);
 }
 
+/** Spawn with stdio: 'ignore' to avoid open file-handle leaks in the test process. */
+function testSpawn(cmd: string, args: string[], opts: object) {
+  return realSpawn(cmd, args, { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+}
+
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   delete process.env.KG_SIDECAR_URL;
@@ -100,7 +105,7 @@ describe("entry-point resolution", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -121,7 +126,7 @@ describe("entry-point resolution", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -172,7 +177,7 @@ describe("readiness polling", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 50 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -192,7 +197,7 @@ describe("readiness polling", () => {
     let calls = 0;
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
-      { httpGet: async () => ++calls >= 5 },
+      { httpGet: async () => ++calls >= 5, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -213,7 +218,7 @@ describe("readiness polling", () => {
     // The real defaultHttpGet resolves true on any HTTP status (inc. 4xx).
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
-      { httpGet: async () => true }, // simulates a 4xx response (still "ready")
+      { httpGet: async () => true, spawn: testSpawn }, // simulates a 4xx response (still "ready")
     );
     await sidecar.start();
 
@@ -232,7 +237,7 @@ describe("readiness polling", () => {
     // httpGet always fails (not reachable)
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 3_000, pollIntervalMs: 50 },
-      { httpGet: async () => false },
+      { httpGet: async () => false, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -245,7 +250,7 @@ describe("readiness polling", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 200, pollIntervalMs: 50 },
-      { httpGet: async () => false }, // never ready
+      { httpGet: async () => false, spawn: testSpawn }, // never ready
     );
     await sidecar.start();
 
@@ -264,7 +269,7 @@ describe("readiness polling", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -292,7 +297,7 @@ describe("runtime data directory overlay", () => {
     let capturedEnv: NodeJS.ProcessEnv | undefined;
     const spawnCapture = (cmd: string, args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
-      return realSpawn("sh", ["-c", "sleep 60"], opts as Parameters<typeof realSpawn>[2]);
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
 
     writeScript(join(kgDir, "start.sh"), "sleep 60");
@@ -318,7 +323,7 @@ describe("runtime data directory overlay", () => {
     let capturedEnv: NodeJS.ProcessEnv | undefined;
     const spawnCapture = (cmd: string, args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
-      return realSpawn("sh", ["-c", "sleep 60"], opts as Parameters<typeof realSpawn>[2]);
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
 
     writeScript(join(kgDir, "start.sh"), "sleep 60");
@@ -344,7 +349,7 @@ describe("runtime data directory overlay", () => {
     let capturedEnv: NodeJS.ProcessEnv | undefined;
     const spawnCapture = (cmd: string, args: string[], opts: object) => {
       capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
-      return realSpawn("sh", ["-c", "sleep 60"], opts as Parameters<typeof realSpawn>[2]);
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
     };
 
     writeScript(join(kgDir, "start.sh"), "sleep 60");
@@ -383,7 +388,7 @@ describe("stop / shutdown", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -403,7 +408,7 @@ describe("stop / shutdown", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 3_000, pollIntervalMs: 50 },
-      { httpGet: async () => false },
+      { httpGet: async () => false, spawn: testSpawn },
     );
     await sidecar.start(); // child dies during poll; KG_SIDECAR_URL not set
 
@@ -432,7 +437,7 @@ describe("stop / shutdown", () => {
         pollIntervalMs: 10,
         stopTimeoutMs: 200, // short timeout so SIGKILL fires quickly
       },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -452,7 +457,7 @@ describe("stop / shutdown", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -482,7 +487,7 @@ describe("restart()", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -517,7 +522,7 @@ describe("shutdown re-entrancy", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
 
@@ -542,7 +547,7 @@ describe("shutdown re-entrancy", () => {
 
     const sidecar = new KgSidecar(
       { kgDir, runtimeDataDir: makeTmpDir(), pollTimeoutMs: 5_000, pollIntervalMs: 10 },
-      { httpGet: async () => true },
+      { httpGet: async () => true, spawn: testSpawn },
     );
     await sidecar.start();
     await sidecar.stop(); // first stop

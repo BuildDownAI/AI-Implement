@@ -225,7 +225,7 @@ export class KgSidecar {
     }
 
     console.error(
-      "[kg] sidecar readiness timeout after 30 s — degraded mode; /mcp serves no kg_* tools",
+      `[kg] sidecar readiness timeout after ${this._pollTimeoutMs / 1_000} s — degraded mode; /mcp serves no kg_* tools`,
     );
     return false;
   }

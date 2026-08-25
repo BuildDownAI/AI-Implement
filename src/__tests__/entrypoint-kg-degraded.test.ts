@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 // Verify docker-entrypoint.sh itself passes shellcheck when available.
 describe("docker-entrypoint.sh shellcheck", () => {
   it("passes shellcheck cleanly", () => {
-    const r = spawnSync("shellcheck", ["docker-entrypoint.sh"], { stdio: ["ignore", "pipe", "pipe"] });
+    const r = spawnSync("shellcheck", ["docker-entrypoint.sh"], { stdio: "ignore" });
     if ((r.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return; // skip when shellcheck not installed
     expect(r.status).toBe(0);
   });
