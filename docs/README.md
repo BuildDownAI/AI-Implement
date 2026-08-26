@@ -17,6 +17,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [runner-images.md](runner-images.md) | The image resolution ladder, publishing channels, and why a private image constrains the execution mode |
 | [kg-sidecar.md](kg-sidecar.md) | The knowledge-graph sidecar, the `/mcp` proxy and its OAuth flow, and the image build |
 | [deployment.md](deployment.md) | Deploy paths, client instances, and the AWS Bedrock setup |
+| [access-model.md](access-model.md) | Who may sign in: the allowlist and its env-to-database handover, provider binding, the per-request re-check, the audit trail, and host recovery from lockout |
 
 Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.
 

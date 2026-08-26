@@ -24,6 +24,7 @@ const groups: NavGroup[] = [
     { key: "sessions",    label: "Sessions",    icon: "server" },
     { key: "deployments", label: "Deployments", icon: "rocket", count: "deploy-available" },
     { key: "reaper",      label: "Reaper",      icon: "broom" },
+    { key: "access",      label: "Access",      icon: "shield" },
     { key: "secrets",     label: "Secrets",     icon: "key" },
     { key: "settings",    label: "Settings",    icon: "settings" },
   ]},
@@ -59,16 +60,18 @@ export function sidebarHtml(): string {
     </div>
     <div class="sidebar-footer">
       <div class="sidebar-user">
-        <div class="avatar">·</div>
+        <div class="avatar" id="session-avatar">·</div>
         <div style="min-width:0;flex:1">
-          <div class="user-name">Admin</div>
-          <div class="user-email">signed in</div>
+          <div class="user-name" id="session-name">Signed in</div>
+          <div class="user-email" id="session-email"></div>
         </div>
+      </div>
+      <div class="sidebar-user-actions">
         <button class="btn btn-ghost btn-icon" onclick="window.toggleTheme()" title="Toggle theme">
           <span class="theme-icon-sun">${icon("sun", 14)}</span>
           <span class="theme-icon-moon">${icon("moon", 14)}</span>
         </button>
-        <button class="btn btn-ghost btn-icon" onclick="logout()" title="Log out">${icon("x", 12)}</button>
+        <button class="btn btn-sm btn-danger" onclick="logout()">${icon("x", 12)}Log out</button>
       </div>
     </div>
   `;

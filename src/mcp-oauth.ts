@@ -23,6 +23,7 @@ import { getDb } from "./dedup.js";
 import { getProvider, listConfiguredProviders } from "./oauth/providers.js";
 import { buildAuthUrl, completeAuth } from "./oauth/oidc.js";
 import { authorize } from "./oauth/authorize.js";
+import { bindAccessEntry, getEffectiveAllowlist, matchAccessEntry } from "./access-entries.js";
 
 // Token and state lifetimes
 export const MCP_TOKEN_TTL_MS: number = (() => {
@@ -418,10 +419,20 @@ export async function handleMcpOidcCallback(
   }
 
   // Fail-closed allowlist check
-  const decision = authorize(identity);
+  const allowlist = getEffectiveAllowlist();
+  if (!allowlist) {
+    console.error(`[mcp-oauth] ${providerId} sign-in denied: the access list could not be loaded`);
+    return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "server_error");
+  }
+
+  const decision = authorize(identity, allowlist.entries);
   if (!decision.ok) {
     console.warn(`[mcp-oauth] denied ${identity.email ?? "?"} via ${providerId}: ${decision.reason}`);
     return redirectWithError(res, stateRow.redirect_uri, stateRow.client_state, "access_denied");
+  }
+
+  if (decision.entry.kind === "address") {
+    bindAccessEntry(decision.entry.value, identity.provider, identity.sub);
   }
 
   db.prepare("UPDATE mcp_clients SET used_at = ? WHERE client_id = ?").run(Date.now(), stateRow.client_id);
@@ -584,18 +595,14 @@ function handleRefreshTokenGrant(
     return json(res, 400, { error: "invalid_grant", error_description: "Refresh token already used" });
   }
 
-  // Allowlist re-check (fail-closed: user removed from allowlist must not outlive their access token)
-  const decision = authorize({
-    provider: row.provider,
-    sub: row.sub,
-    email: row.email,
-    emailVerified: true,
-    name: null,
-    hd: null,
-    tid: null,
-    rawClaims: {},
-  });
-  if (!decision.ok) {
+  // Allowlist re-check (fail-closed: a removed user must not outlive their access token)
+  const allowlist = getEffectiveAllowlist();
+  if (!allowlist) {
+    // Do NOT revoke the chain here — a transient read failure is not a removal.
+    console.error("[mcp-oauth] refresh deferred: the access list could not be loaded");
+    return json(res, 503, { error: "temporarily_unavailable", error_description: "Access control is unavailable" });
+  }
+  if (!matchAccessEntry(row, allowlist.entries)) {
     db.prepare("DELETE FROM mcp_refresh_tokens WHERE family_id = ?").run(row.family_id);
     console.warn(`[mcp-oauth] refresh denied: ${row.email} no longer on allowlist`);
     return json(res, 400, { error: "invalid_grant", error_description: "Identity no longer authorized" });

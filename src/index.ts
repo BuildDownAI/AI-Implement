@@ -27,8 +27,9 @@ import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
-import { configureAuthorizationPolicy } from "./oauth/authorize.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
+import { initAccessEntriesTable } from "./access-entries.js";
+import { initAccessAuditTable } from "./access-audit.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationTokenRequest } from "./publication-token-vending.js";
@@ -147,10 +148,6 @@ function loadConfig(): AppConfig {
     const modes: string[] = [];
     if (oauthConfigured) {
       configureOAuthProviders(oauthProviders);
-      configureAuthorizationPolicy({
-        allowedDomains: (process.env.OAUTH_ALLOWED_DOMAINS || "").split(",").map((s) => s.trim()).filter(Boolean),
-        allowedEmails: (process.env.OAUTH_ALLOWED_EMAILS || "").split(",").map((s) => s.trim()).filter(Boolean),
-      });
 
       modes.push(`SSO (${oauthProviders.map((p) => p.id).join(", ")})`);
     }
@@ -3312,9 +3309,11 @@ async function main(): Promise<void> {
   initDispatchBreakerTable();
   sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
+  initAccessEntriesTable();
   initReconciliationTable();
   initStepLogTable();
   initMcpOAuthTables();
+  initAccessAuditTable();
 
   // A process that died mid-deploy must not leave dispatch paused forever.
   const holdWasSet = clearDeployHold();

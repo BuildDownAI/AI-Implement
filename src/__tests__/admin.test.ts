@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as AdminModule from "../admin.js";
+import type * as AdminSessionModule from "../admin-session.js";
+import type * as AccessEntriesModule from "../access-entries.js";
 import type * as ConfigModule from "../config.js";
 import type * as DedupModule from "../dedup.js";
 import type * as RunnerModeModule from "../runner-mode.js";
@@ -97,6 +99,9 @@ let log: typeof LogModule;
 let stepLog: typeof StepLogModule;
 let installState: typeof InstallStateModule;
 let queue: typeof WorkflowSyncQueueModule;
+let adminSession: typeof AdminSessionModule;
+let accessEntries: typeof AccessEntriesModule;
+let accessAudit: typeof import("../access-audit.js");
 let provider: FakeProvider;
 
 beforeEach(async () => {
@@ -105,6 +110,9 @@ beforeEach(async () => {
   process.env.DEDUP_DB_PATH = dbPath;
   provider = new FakeProvider();
   admin = await import("../admin.js");
+  adminSession = await import("../admin-session.js");
+  accessEntries = await import("../access-entries.js");
+  accessAudit = await import("../access-audit.js");
   config = await import("../config.js");
   dedup = await import("../dedup.js");
   runnerMode = await import("../runner-mode.js");
@@ -116,6 +124,12 @@ beforeEach(async () => {
   log.initLogTable();
   stepLog.initStepLogTable();
   runnerMode.initSettingsTable();
+  accessEntries.initAccessEntriesTable();
+  accessAudit.initAccessAuditTable();
+  // Every /api/* request now re-checks the signed-in identity, so the suite needs a list in force.
+  process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
+  process.env.OAUTH_ALLOWED_EMAILS = "";
+  accessEntries.refreshEffectiveAllowlist();
 });
 
 afterEach(() => {
@@ -246,6 +260,136 @@ describe("admin auth", () => {
     // Row should be deleted from DB
     const row = getDb().prepare("SELECT * FROM admin_sessions WHERE token = ?").get(token);
     expect(row).toBeUndefined();
+  });
+});
+
+describe("admin access endpoint", () => {
+  const ada = { email: "ada@eudoxus.ai", sub: "google|123", provider: "google" };
+  const body = (entries: unknown) => ({ entries });
+
+  it("returns 401 without a session", async () => {
+    expect((await request("/api/access", "GET", "secret")).statusCode).toBe(401);
+  });
+
+  it("reports the env list as the one in force before any save", async () => {
+    const token = adminSession.createSession(ada);
+    const res = await request("/api/access", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const payload = JSON.parse(res.body);
+    expect(payload.source).toBe("env");
+    expect(payload.stored).toEqual([]);
+    expect(payload.env.map((e: { value: string }) => e.value)).toEqual(["eudoxus.ai"]);
+    expect(payload.changes).toEqual([]);
+  });
+
+  it("tells the page whether the caller may edit, so it never has to infer identity", async () => {
+    const sso = await request("/api/access", "GET", "secret", undefined, adminSession.createSession(ada));
+    expect(JSON.parse(sso.body)).toMatchObject({ canEdit: true, you: "ada@eudoxus.ai" });
+
+    const code = await request("/api/access", "GET", "secret", undefined, await login("secret"));
+    expect(JSON.parse(code.body)).toMatchObject({ canEdit: false, you: null });
+  });
+
+  it("refuses a save from an access-code session, which cannot attribute the change", async () => {
+    const token = await login("secret");
+    const res = await request("/api/access", "POST", "secret", body([]), token);
+    expect(res.statusCode).toBe(403);
+    expect(accessEntries.listAccessEntries()).toEqual([]);
+  });
+
+  it("saves, hands authority to the stored list, and returns the new state", async () => {
+    const token = adminSession.createSession(ada);
+    const res = await request(
+      "/api/access",
+      "POST",
+      "secret",
+      body([
+        { kind: "domain", value: "eudoxus.ai", role: "user" },
+        { kind: "address", value: "ada@eudoxus.ai", role: "admin" },
+      ]),
+      token,
+    );
+
+    expect(res.statusCode).toBe(200);
+    const payload = JSON.parse(res.body);
+    // The first save is the handover, and the response is what makes that visible.
+    expect(payload.source).toBe("db");
+    expect(payload.stored).toHaveLength(2);
+    expect(payload.changes[0].actor).toBe("ada@eudoxus.ai");
+  });
+
+  it("applies immediately, without waiting for a restart", async () => {
+    const token = adminSession.createSession(ada);
+    await request("/api/access", "POST", "secret", body([{ kind: "domain", value: "eudoxus.ai", role: "user" }]), token);
+    expect(accessEntries.getEffectiveAllowlist()?.source).toBe("db");
+  });
+
+  it("rejects malformed input without touching the stored list", async () => {
+    const token = adminSession.createSession(ada);
+    const res = await request("/api/access", "POST", "secret", body([{ kind: "domain", value: "ada@eudoxus.ai", role: "user" }]), token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/not a domain/);
+    expect(accessEntries.listAccessEntries()).toEqual([]);
+  });
+
+  it("refuses a save that would remove the saver's own access, leaving no trace of the attempt", async () => {
+    const token = adminSession.createSession(ada);
+    const res = await request(
+      "/api/access",
+      "POST",
+      "secret",
+      body([{ kind: "address", value: "someone-else@eudoxus.ai", role: "admin" }]),
+      token,
+    );
+
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/remove your own access/);
+    // Rolled back whole: no entries, and no audit row for a change that did not happen.
+    expect(accessEntries.listAccessEntries()).toEqual([]);
+    expect(accessAudit.listAccessChanges()).toEqual([]);
+  });
+});
+
+describe("admin session-identity endpoint", () => {
+  it("returns 401 without a session", async () => {
+    const res = await request("/api/session-identity", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("reports an access-code session as unattributed", async () => {
+    const token = await login("secret");
+    const res = await request("/api/session-identity", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      email: null,
+      name: null,
+      provider: null,
+      authMethod: "access-code",
+    });
+  });
+
+  it("returns the signed-in identity for an SSO session", async () => {
+    const token = adminSession.createSession({
+      email: "ada@eudoxus.ai",
+      sub: "google|123",
+      provider: "google",
+      name: "Ada",
+    });
+    const res = await request("/api/session-identity", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      email: "ada@eudoxus.ai",
+      name: "Ada",
+      provider: "google",
+      authMethod: "sso",
+    });
+  });
+
+  it("stays reachable when access-code login is disabled, so an SSO-only deployment can probe it", async () => {
+    const token = adminSession.createSession({ email: "ada@eudoxus.ai", sub: "google|123", provider: "google" });
+    const res = await requestRaw("/api/session-identity", "GET", null, undefined, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).email).toBe("ada@eudoxus.ai");
   });
 });
 

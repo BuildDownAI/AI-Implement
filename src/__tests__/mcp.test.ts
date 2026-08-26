@@ -7,6 +7,10 @@ vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
 }));
 
+vi.mock("../access-entries.js", () => ({
+  recheckIdentity: vi.fn(),
+}));
+
 vi.mock("../runner-mode.js", () => ({
   getRunnerMode: vi.fn(),
 }));
@@ -86,6 +90,7 @@ class MockResponse extends Writable {
 
 let mockHttpRequest: ReturnType<typeof vi.fn>;
 let mcpOauth: typeof import("../mcp-oauth.js");
+let accessMock: typeof import("../access-entries.js");
 let runnerModeMock: typeof import("../runner-mode.js");
 let configMock: typeof import("../config.js");
 let logMock: typeof import("../log.js");
@@ -97,6 +102,7 @@ beforeEach(async () => {
   vi.spyOn(http, "request").mockImplementation(mockHttpRequest as never);
 
   mcpOauth = await import("../mcp-oauth.js");
+  accessMock = await import("../access-entries.js");
   runnerModeMock = await import("../runner-mode.js");
   configMock = await import("../config.js");
   logMock = await import("../log.js");
@@ -116,6 +122,20 @@ beforeEach(async () => {
       get: vi.fn(() => ({ n: 0 })),
       all: vi.fn(() => []),
     })),
+  });
+
+  // The gate re-checks the token's identity on every request; allow it unless a test says otherwise.
+  (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({
+    status: "ok",
+    entry: {
+      kind: "address",
+      value: "ada@eudoxus.ai",
+      role: "admin",
+      provider: null,
+      subject: null,
+      addedAt: 0,
+      addedBy: null,
+    },
   });
 });
 
@@ -224,6 +244,23 @@ describe("handleMcpRequest", () => {
     it("does not proxy on auth failure", async () => {
       await callMcp({ authorization: "Bearer invalid" }, false);
       expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+
+    it("returns 401 for a valid token whose identity is no longer admitted", async () => {
+      (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({ status: "denied" });
+      // The token itself is still valid — an access token would otherwise outlive a removal by an hour.
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
+      expect(result.statusCode).toBe(401);
+      expect(result.responseHeaders["WWW-Authenticate"]).toContain("oauth-protected-resource");
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+
+    it("returns 503 rather than 401 when the allowlist cannot be read", async () => {
+      (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({ status: "unavailable" });
+      const result = await callMcp({ authorization: "Bearer tok" }, true);
+      expect(result.statusCode).toBe(503);
+      // Not an authentication failure, so no challenge to re-authenticate against.
+      expect(result.responseHeaders["WWW-Authenticate"]).toBeUndefined();
     });
   });
 
