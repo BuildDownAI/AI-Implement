@@ -16,6 +16,7 @@ import {
   type ResolvedFieldIds,
 } from "./jira-fields.js";
 import type { RepoMapping } from "../config.js";
+import { resolveRepoFieldValue } from "./ticketing-config.js";
 import { classifyByChildren, ancestorChain, type ChildState } from "./jira-hierarchy.js";
 import { parseIssueConfig } from "../issue-config.js";
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
@@ -185,6 +186,21 @@ export class JiraProvider implements TicketingProvider {
     this.onRepoFieldMismatch = c.onRepoFieldMismatch ?? (() => {});
   }
 
+  /**
+   * True when some *other* Jira mapping matches issues on this repo-field value.
+   * Distinguishes a sibling repo sharing the Jira project (normal) from a value
+   * nothing is configured for (the operator error worth reporting).
+   */
+  private repoValueClaimedElsewhere(scopeKey: string, value: string): boolean {
+    if (value === "") return false;
+    return Object.entries(this.getMappings()).some(
+      ([key, m]) =>
+        key !== scopeKey &&
+        m.ticketingConfig.kind === "jira" &&
+        resolveRepoFieldValue(m) === value,
+    );
+  }
+
   private childrenJql(parentKeys: string[], fieldIds: ResolvedFieldIds): string {
     const list = parentKeys.map((k) => JSON.stringify(k)).join(",");
     const base = `parent in (${list})`;
@@ -245,14 +261,21 @@ export class JiraProvider implements TicketingProvider {
       const bucketJql = `(${cfg.jql}) AND ${statusJqlField} in (Ready, "Plan Approved")`;
       const bucketIssues = await this.client.searchJql(bucketJql, fieldsToFetch);
 
+      const expectedRepo = resolveRepoFieldValue(m);
+
       // Filter pass: drop repo-mismatches and blocked issues (unchanged behavior).
       const candidates = bucketIssues.filter((raw) => {
         const actualRepo = readRepoFieldValue(raw.fields[fieldIds.repoFieldId]);
-        if (actualRepo !== cfg.repoFieldValue) {
-          const mismatchKey = `${scopeKey}::${raw.key}`;
-          if (!this.notifiedMismatches.has(mismatchKey)) {
-            this.notifiedMismatches.add(mismatchKey);
-            this.onRepoFieldMismatch(scopeKey, raw.key, actualRepo);
+        if (actualRepo !== expectedRepo) {
+          // A mapping's JQL is normally scoped to a whole Jira project, so seeing a
+          // sibling repo's issues here is expected, not a misconfiguration. Only
+          // report values no mapping claims - an empty field or a typo.
+          if (!this.repoValueClaimedElsewhere(scopeKey, actualRepo)) {
+            const mismatchKey = `${scopeKey}::${raw.key}`;
+            if (!this.notifiedMismatches.has(mismatchKey)) {
+              this.notifiedMismatches.add(mismatchKey);
+              this.onRepoFieldMismatch(scopeKey, raw.key, actualRepo);
+            }
           }
           return false;
         }
@@ -265,7 +288,7 @@ export class JiraProvider implements TicketingProvider {
 
       // Feature-branch enrichment: classify each candidate (leaf / feature-node / waiting)
       // and compute its featureBranchChain. Fails open to plain leaves on any error.
-      const chains = await this.enrichFeatureBranches(candidates, cfg.repoFieldValue, fieldIds);
+      const chains = await this.enrichFeatureBranches(candidates, expectedRepo, fieldIds);
 
       for (const raw of candidates) {
         const info = chains.get(raw.key);
@@ -457,9 +480,10 @@ export class JiraProvider implements TicketingProvider {
       if (m.ticketingConfig.kind !== "jira") continue;
       const cfg = m.ticketingConfig;
       const fieldIds = await this.fields(scopeKey);
+      const expectedRepo = resolveRepoFieldValue(m);
       const designated = (fields: Record<string, unknown>): boolean =>
         readStatusValue(fields, fieldIds.statusFieldId) !== "" &&
-        readRepoFieldValue(fields[fieldIds.repoFieldId]) === cfg.repoFieldValue;
+        readRepoFieldValue(fields[fieldIds.repoFieldId]) === expectedRepo;
 
       const epicLinkFields = fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : [];
 

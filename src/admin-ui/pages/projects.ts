@@ -85,6 +85,9 @@ export const projectsHtml = `
               <button type="button" class="btn btn-ghost" onclick="validateJqlButton()">Validate</button>
               <span id="md-jira-jql-status" class="text-tertiary" style="font-size:0.85em"></span>
             </div>
+            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
+              Scope only (e.g. &ldquo;project = TEST&rdquo;). The orchestrator adds the status filter and matches the repo field itself, so don&rsquo;t include status or repo clauses here.
+            </div>
           </div>
           <div class="md-field">
             <label>Status Field</label>
@@ -114,11 +117,14 @@ export const projectsHtml = `
             </div>
           </div>
           <div class="md-field">
-            <label>Repo Field Value</label>
+            <label>Repo Field Value <span class="text-tertiary" style="font-size:0.85em">(override, optional)</span></label>
             <select id="md-jira-repo-value">
               <option value="">Select a Repo Field first</option>
             </select>
             <input id="md-jira-repo-value-text" type="text" class="hidden" placeholder="owner/repo">
+            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
+              Leave blank to match on the GitHub Repository below (&ldquo;owner/repo&rdquo;). Set this only when your Repo field&rsquo;s options are labelled with something other than owner/repo.
+            </div>
           </div>
         </div>
       </fieldset>
@@ -126,8 +132,7 @@ export const projectsHtml = `
         <fieldset>
           <legend>Basic</legend>
           <div class="md-field"><label>Team Key</label><input id="md-team-key" placeholder="MY_TEAM"></div>
-          <div class="md-field"><label>Owner</label><input id="md-owner" placeholder="acme-corp"></div>
-          <div class="md-field"><label>Repo</label><input id="md-repo" placeholder="backend"></div>
+          <div class="md-field" style="grid-column:1 / -1"><label>GitHub Repository</label><input id="md-github-repo" class="mono" placeholder="acme-corp/backend"><div class="text-tertiary" style="font-size:0.85em;margin-top:4px">Owner and repository name, slash-separated. This is the only place the repo is entered - it also matches the Jira repo field unless overridden above.</div></div>
           <div class="md-field"><label>Workflow File</label><input id="md-wf" value="claude-implement.yml"></div>
           <div class="md-field"><label>Default Branch</label><input id="md-branch" placeholder="development"></div>
           <div class="md-field"><label>Max AI Issues</label><input id="md-max-ai" type="number" min="1" value="3"></div>
@@ -329,8 +334,7 @@ export const projectsScript = `
 
     const m = key ? (mappingsData[key] || {}) : {};
     document.getElementById('md-team-key').value = key || '';
-    document.getElementById('md-owner').value = m.owner || '';
-    document.getElementById('md-repo').value = m.repo || '';
+    document.getElementById('md-github-repo').value = (m.owner && m.repo) ? (m.owner + '/' + m.repo) : (m.owner || m.repo || '');
     document.getElementById('md-wf').value = m.workflowFile || 'claude-implement.yml';
     document.getElementById('md-branch').value = m.defaultBranch || '';
     document.getElementById('md-max-ai').value = String(m.maxInProgressAiIssues ?? 3);
@@ -558,6 +562,43 @@ export const projectsScript = `
   }
   window.onRepoFieldChange = onRepoFieldChange;
 
+  // Parses the single "owner/repo" input into its two stored halves. Returns null
+  // when the value isn't exactly one slash with both sides non-empty, so callers
+  // can treat "unparseable" and "empty" the same way. A pasted GitHub URL is
+  // accepted, since that is what a browser hands you when you copy a repo.
+  function splitGithubRepo(raw) {
+    let v = String(raw == null ? '' : raw).trim();
+    v = v.replace(/^https?:\\/\\/(?:www\\.)?github\\.com\\//i, '').replace(/\\.git$/i, '');
+    v = v.replace(/^\\/+/, '').replace(/\\/+$/, '');
+    const parts = v.split('/');
+    if (parts.length !== 2) return null;
+    const owner = parts[0].trim();
+    const repo = parts[1].trim();
+    if (!owner || !repo) return null;
+    return { owner: owner, repo: repo };
+  }
+
+  function detectRepoFilterInJql(jql, repoFieldOverride) {
+    // Returns a warning string if the JQL looks like it references the AI-Implement Repo
+    // field. The orchestrator filters candidates by the repo field itself (client-side),
+    // so a repo clause in the JQL is redundant and can silently drop issues when the
+    // field serializes differently than the clause expects.
+    if (/ai[\\s\\-_]?implement[\\s\\-_]?repo/i.test(jql)) {
+      return 'JQL appears to reference the AI-Implement Repo field. ' +
+        'The orchestrator already filters issues by the repo field for you - a repo clause ' +
+        'here is redundant and can drop issues when the field is text-typed. Remove it and let ' +
+        'the GitHub Repository (or the Repo Field Value override) do the matching.';
+    }
+    if (repoFieldOverride) {
+      const idPattern = new RegExp('\\\\b' + repoFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
+      if (idPattern.test(jql)) {
+        return 'JQL appears to reference customfield ' + repoFieldOverride + ' (your repo field). ' +
+          'The orchestrator already filters by the repo field - remove the repo clause here.';
+      }
+    }
+    return null;
+  }
+
   function detectStatusFilterInJql(jql, statusFieldOverride) {
     // Returns a warning string if the JQL looks like it references the AI-Implement Status
     // field. The orchestrator wraps the user's JQL with its own status filter, so any
@@ -598,7 +639,8 @@ export const projectsScript = `
         return;
       }
       await res.json();
-      const warning = detectStatusFilterInJql(jql, statusFieldOverride);
+      const repoFieldOverride = document.getElementById('md-jira-repo-field').value.trim();
+      const warning = detectStatusFilterInJql(jql, statusFieldOverride) || detectRepoFilterInJql(jql, repoFieldOverride);
       if (warning) {
         status.textContent = '⚠ Valid but: ' + warning;
         status.style.color = 'var(--st-warn-fg, #c80)';
@@ -649,10 +691,11 @@ export const projectsScript = `
       return;
     }
 
+    const ghParts = splitGithubRepo(document.getElementById('md-github-repo').value);
     const body = {
       teamKey,
-      owner: document.getElementById('md-owner').value.trim(),
-      repo: document.getElementById('md-repo').value.trim(),
+      owner: ghParts ? ghParts.owner : '',
+      repo: ghParts ? ghParts.repo : '',
       workflowFile: document.getElementById('md-wf').value.trim(),
       defaultBranch,
       maxInProgressAiIssues: parseInt(document.getElementById('md-max-ai').value, 10),
@@ -685,7 +728,9 @@ export const projectsScript = `
       const jql = document.getElementById('md-jira-jql').value;
       const sel = document.getElementById('md-jira-repo-value');
       const txt = document.getElementById('md-jira-repo-value-text');
-      const repoFieldValue = sel.classList.contains('hidden') ? txt.value.trim() : sel.value.trim();
+      const rawRepoFieldValue = sel.classList.contains('hidden') ? txt.value.trim() : sel.value.trim();
+      // Blank means "derive from owner/repo" - the orchestrator resolves it at read time.
+      const repoFieldValue = rawRepoFieldValue === '' ? null : rawRepoFieldValue;
       const statusFieldOverride = document.getElementById('md-jira-status-field').value.trim() || null;
       const repoFieldOverride = document.getElementById('md-jira-repo-field').value.trim() || null;
       const profilesFieldOverride = document.getElementById('md-jira-profiles-field').value.trim() || null;
@@ -699,8 +744,13 @@ export const projectsScript = `
       };
     }
 
-    if (!body.teamKey || !body.owner || !body.repo) {
-      errEl.textContent = 'Team Key, Owner, and Repo are required.';
+    if (!body.teamKey) {
+      errEl.textContent = 'Team Key is required.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+    if (!body.owner || !body.repo) {
+      errEl.textContent = 'GitHub Repository is required, as owner/repo (e.g. acme-corp/backend).';
       errEl.classList.remove('hidden');
       return;
     }
