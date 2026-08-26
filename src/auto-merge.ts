@@ -3,11 +3,28 @@ import { getInstallationToken } from "./github-app-auth.js";
 import {
   listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest,
 } from "./github.js";
+import {
+  countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
+} from "./comment-gapfill-queue.js";
 
 export interface AutoMergeDeps {
   githubAppId: string;
   githubAppPrivateKey: string;
   notify?: (message: string) => Promise<void>;
+}
+
+export const MAX_CONFLICT_RESOLUTION_ATTEMPTS = 2;
+
+// AII-277 (Finding 4): cap-exhausted notifications fired every poll cycle for the
+// same PR (observed ~60s Slack spam). Notify once per PR per process; a restart
+// re-notifies at most once more. The log line stays every cycle (cheap, greppable).
+const capExhaustedNotified = new Set<string>();
+export function resetCapExhaustedNotifications(): void { capExhaustedNotified.clear(); }
+export type StalledChildKind = "conflict" | "other";
+
+/** Named seam: AII-263 (max_turns/draft stalls) extends this classification later. */
+export function classifyStalledChild(mergeResult: string): StalledChildKind {
+  return mergeResult === "blocked" || mergeResult === "conflict" ? "conflict" : "other";
 }
 
 /** Only ai-implement/feature/* and ai-implement/multi-issue/* are grouping branches.
@@ -20,6 +37,30 @@ export async function runAutoMerges(mappings: RepoMapping[], deps: AutoMergeDeps
   const seen = new Set<string>();
   for (const mapping of mappings) {
     if (!mapping.autoMerge || mapping.paused) continue;
+    const repoKey = `${mapping.owner}/${mapping.repo}`;
+    if (seen.has(repoKey)) continue;
+    seen.add(repoKey);
+    try {
+      await autoMergeRepo(mapping, deps);
+    } catch (err) {
+      console.error(`[auto-merge] Failed for ${repoKey}:`, err);
+    }
+  }
+}
+
+/**
+ * Merge approved child PRs into grouping branches (feature/multi-issue) for all non-paused
+ * mappings, regardless of the mapping's `autoMerge` setting. The top-of-tree feature→base PR
+ * still requires human review.
+ *
+ * Unlike `runAutoMerges` this is unconditional — it runs every poll for cascade self-healing
+ * so that a reopened parent's approved children merge without requiring per-project opt-in.
+ * (AII-349 reopen re-arm.)
+ */
+export async function runGroupingBranchAutoMerge(mappings: RepoMapping[], deps: AutoMergeDeps): Promise<void> {
+  const seen = new Set<string>();
+  for (const mapping of mappings) {
+    if (mapping.paused) continue;
     const repoKey = `${mapping.owner}/${mapping.repo}`;
     if (seen.has(repoKey)) continue;
     seen.add(repoKey);
@@ -53,7 +94,32 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
           await deps.notify(`Auto-merged child PR #${pr.number} into \`${pr.base}\` (${owner}/${repo})`).catch(() => {});
         }
       } else {
-        console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: ${result} — leaving for a human`);
+        const kind = classifyStalledChild(result);
+        if (kind === "conflict") {
+          if (hasPendingConflictResolution(owner, repo, pr.number)) {
+            console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: resolution in flight`);
+          } else {
+            const attempts = countConflictAttempts(owner, repo, pr.number);
+            if (attempts >= MAX_CONFLICT_RESOLUTION_ATTEMPTS) {
+              const capKey = `${owner}/${repo}#${pr.number}`;
+              const firstSighting = !capExhaustedNotified.has(capKey);
+              if (firstSighting) {
+                capExhaustedNotified.add(capKey);
+                console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: conflict resolution cap (${attempts}) exhausted — leaving for a human`);
+              }
+              if (deps.notify && firstSighting) {
+                await deps.notify(
+                  `Conflict on PR #${pr.number} → \`${pr.base}\` (${owner}/${repo}): ${attempts} resolution attempt${attempts === 1 ? "" : "s"} exhausted — leaving for a human.`
+                ).catch(() => {});
+              }
+            } else {
+              enqueueConflictResolution({ owner, repo, prNumber: pr.number, featureBranch: pr.base });
+              console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: enqueued conflict resolution (attempt ${attempts + 1})`);
+            }
+          }
+        } else {
+          console.log(`[auto-merge] PR #${pr.number} -> ${pr.base}: ${result} — leaving for a human`);
+        }
       }
     } catch (err) {
       console.error(`[auto-merge] Failed on PR #${pr.number} (${owner}/${repo}):`, err);

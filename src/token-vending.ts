@@ -1,6 +1,6 @@
 import http from "node:http";
 import { getJobByNonce } from "./log.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { getScopedInstallationToken } from "./github-app-auth.js";
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -46,8 +46,11 @@ export async function handleTokenRequest(
       return;
     }
 
-    const token = await getInstallationToken(githubAppId, githubAppPrivateKey, body.owner);
-    const expiresAt = new Date(Date.now() + 55 * 60 * 1000).toISOString();
+    // forceRefresh mirrors the refreshInstallationToken semantics this endpoint had on
+    // testing: a vend must return a full-lifetime token, never a cache hit that may be
+    // minutes from expiry.
+    const repoName = job.repo!.split("/")[1];
+    const { token, expiresAt } = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, body.owner, { repositories: [repoName], forceRefresh: true });
 
     json(res, 200, { token, expires_at: expiresAt });
   } catch (err) {

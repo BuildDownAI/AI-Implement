@@ -6,29 +6,40 @@ import {
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
 import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment } from "./github.js";
-import { resolveWorkflowContract } from "./workflow-probe.js";
+import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
-import { selectIssuesToDispatch } from "./poll-selection.js";
+import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
-import { remediateStuckJob } from "./stuck-watchdog.js";
+import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
+import { refreshAvailability, readStampedTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
+import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
+import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
+import { canSelfDeploy, makeStartDeploy, readKgSourceRepo } from "./deploy.js";
+import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
+import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
+import { configureAuthorizationPolicy } from "./oauth/authorize.js";
+import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { handleTokenRequest } from "./token-vending.js";
+import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
+import { handlePublicationTokenRequest } from "./publication-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { classifyCompletion, renderClassification } from "./completion-classification.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
-import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl } from "./runner-mode.js";
+import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
-import { initReconciliationTable } from "./reconciliation.js";
+import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
@@ -37,6 +48,17 @@ import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult }
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
+import { handleMcpRequest } from "./mcp.js";
+import { withRequestErrorBoundary } from "./http-server.js";
+import {
+  initMcpOAuthTables,
+  handleMcpProtectedResourceMetadata,
+  handleMcpAuthorizationServerMetadata,
+  handleMcpClientRegistration,
+  handleMcpAuthorize,
+  handleMcpOidcCallback,
+  handleMcpTokenRequest,
+} from "./mcp-oauth.js";
 import type { GapFillTriggerBody } from "./gap-fill-trigger.js";
 import { buildPlanningContextInputs } from "./planning-context.js";
 import {
@@ -46,17 +68,20 @@ import {
   startLocalRunnerContainer,
   sweepExitedLocalContainers,
 } from "./local-docker.js";
-import { resolveTerminalStatus, workflowFileForJob } from "./monitor-status.js";
-import { branchMatchesIssueIdentifier } from "./pipeline/branch-name.js";
+import { clearPrNotFoundGrace, decideCleanExitOutcome, workflowFileForJob } from "./monitor-status.js";
+import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
+import { pickPrForRun } from "./monitor-status.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
-import { resolveBaseBranch } from "./feature-branch.js";
-import { runMergeUps } from "./merge-up.js";
-import { runAutoMerges } from "./auto-merge.js";
+import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
+import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
+import { runGroupingBranchAutoMerge } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
+import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
-import { detectMergedPrs } from "./poll-merged-prs.js";
+import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
+import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 
 // ---------- Configuration ----------
 
@@ -66,6 +91,7 @@ interface AppConfig {
   notifyWebhookUrl: string | null;
   notifyType: string;
   adminAccessCode: string | null;
+  oauthRedirectBaseUrl: string | null;
   pollIntervalMs: number;
   healthPort: number;
   // Fly Machines (optional — only needed if any mapping uses fly-machines mode)
@@ -73,6 +99,7 @@ interface AppConfig {
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
   flyOrchestratorApp: string | null;
+  flyDeployToken: string | null;
   tenantId: string | null;
   sessionImage: string;
   /** Deprecation state of SESSION_IMAGE, used for the startup warning. */
@@ -89,6 +116,9 @@ interface AppConfig {
   gapFillTriggerSecret: string | null;
   localRunnerImage: string;
   localRunnerOrchestratorUrl: string | null;
+  kgSidecarUrl: string | null;
+  kgSourceRepo: string | null;
+  selfDeployTarget: SelfDeployTarget | null; // build-stamped; null when the image carries no stamps
 }
 
 function loadConfig(): AppConfig {
@@ -97,10 +127,41 @@ function loadConfig(): AppConfig {
     if (!val) throw new Error(`Missing required env var: ${key}`);
     return val;
   };
-
+  
+  // Microsoft's tid-based "email verified" only holds for a single-tenant issuer
+  // so it's dropped as an OAuth provider if a multi-tenant env value is provided
+  let oauthProviders = providersFromEnv(process.env);
+  const msMultiTenant = oauthProviders.some((p) => p.id === "microsoft") &&
+    ["common", "organizations", "consumers"].includes((process.env.MICROSOFT_OAUTH_TENANT || "").toLowerCase());
+  if (msMultiTenant) {
+    oauthProviders = oauthProviders.filter((p) => p.id !== "microsoft");
+    console.warn("[main] MICROSOFT_OAUTH_TENANT is a multi-tenant value — Microsoft SSO disabled. Pin a specific tenant GUID (single-tenant).");
+  }
+  
+  // Resolved admin-auth posture — now that both access-code and SSO are known.
   const adminAccessCode = process.env.ADMIN_ACCESS_CODE || null;
-  if (!adminAccessCode) {
-    console.warn("[main] ADMIN_ACCESS_CODE not set — admin UI disabled");
+  const oauthConfigured = oauthProviders.length > 0; // derive from the list, not the not-yet-seeded singleton
+  if (!adminAccessCode && !oauthConfigured) {
+    console.warn("[main] admin UI disabled — set ADMIN_ACCESS_CODE and/or configure OAuth providers");
+  } else {
+    const modes: string[] = [];
+    if (oauthConfigured) {
+      configureOAuthProviders(oauthProviders);
+      configureAuthorizationPolicy({
+        allowedDomains: (process.env.OAUTH_ALLOWED_DOMAINS || "").split(",").map((s) => s.trim()).filter(Boolean),
+        allowedEmails: (process.env.OAUTH_ALLOWED_EMAILS || "").split(",").map((s) => s.trim()).filter(Boolean),
+      });
+
+      modes.push(`SSO (${oauthProviders.map((p) => p.id).join(", ")})`);
+    }
+    if (adminAccessCode) modes.push("access code");
+
+    console.log(`[main] admin auth: ${modes.join(" + ")}`);
+  }
+
+  const oauthRedirectBaseUrl = process.env.OAUTH_REDIRECT_BASE_URL || null;
+  if (oauthConfigured && !oauthRedirectBaseUrl) {
+    console.warn("[main] OAuth providers configured but OAUTH_REDIRECT_BASE_URL not set — SSO redirect URIs can't be built");
   }
 
   const notifyWebhookUrl = process.env.NOTIFY_WEBHOOK_URL || null;
@@ -147,6 +208,7 @@ function loadConfig(): AppConfig {
     notifyWebhookUrl,
     notifyType,
     adminAccessCode,
+    oauthRedirectBaseUrl,
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
     healthPort: parseInt(process.env.PORT || "8080", 10),
     flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
@@ -161,6 +223,7 @@ function loadConfig(): AppConfig {
       return getOrchestratorSettings().flySessionsRegion;
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
+    flyDeployToken: process.env.FLY_DEPLOY_TOKEN || null,
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
     sessionImage: defaultRunner.image,
     sessionImageStatus: defaultRunner.sessionImageStatus,
@@ -175,6 +238,9 @@ function loadConfig(): AppConfig {
     gapFillTriggerSecret,
     localRunnerImage: process.env.LOCAL_RUNNER_IMAGE || "ai-implement-runner:local",
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
+    kgSidecarUrl: process.env.KG_SIDECAR_URL || null,
+    kgSourceRepo: readKgSourceRepo(process.env.KG_SOURCE_REPO),
+    selfDeployTarget: readStampedTarget(process.env),
   };
 }
 
@@ -207,6 +273,69 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   try {
   console.log(`[poll] Starting poll cycle #${++pollCount}`);
 
+  // Independent of tracker providers so self-deploy still works on an orchestrator with none configured.
+  // Best-effort — never blocks the poll.
+  if (config.selfDeployTarget) {
+    try {
+      await refreshAvailability({
+        appId: config.githubAppId,
+        privateKey: config.githubAppPrivateKey,
+        ...config.selfDeployTarget,
+      });
+    } catch (err) {
+      console.error("[deploy] availability check failed:", err);
+    }
+    
+    // Act on what the refresh above found.
+    try {
+      // A factory over config with no state of its own, so building one per tick is
+      // free and behaves identically to the server's — the hold that actually
+      // serializes deploys lives in SQLite, not in this closure.
+      const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
+      const availability = getAvailability();
+      const head = availability?.headCommit ?? null;
+
+      const action = decideAvailabilityAction({
+        configured: canSelfDeploy(config),
+        available: availability?.available ?? null,
+        headCommit: head,
+        held: isDeployHeld(),
+        policy: getDeployPolicy(),
+        lastActedCommit: getLastActedCommit(),
+      });
+
+      if (action !== "none" && head) {
+        // Recorded before acting, not after. A successful self-deploy kills this
+        // process inside the await below, so a write afterwards would never land and
+        // every boot would retry the same commit forever.
+        setLastActedCommit(head);
+
+        if (action === "deploy") {
+          console.log(`[deploy] Auto-deploying ${head.slice(0, 7)} — dispatch pauses now`);
+          const result = await startDeploy?.();
+          if (result && !result.started) {
+            console.warn(`[deploy] Auto-deploy did not start: ${result.reason}`);
+          }
+          // The starter resolves HEAD itself, one round trip after the cached read
+          // above. A push landing in that window means the commit recorded as acted on
+          // is not the commit being deployed — so correct it to what actually went out,
+          // or a later poll would retry the commit that really failed.
+          if (result?.started && result.commit !== head) {
+            console.log(`[deploy] head moved during the trigger: deploying ${result.commit.slice(0, 7)}`);
+            setLastActedCommit(result.commit);
+          }
+        } else {
+          await postAvailableNotice(config, head);
+        }
+      }
+    } catch (err) {
+      console.error("[deploy] availability action failed:", err);
+    }
+  }
+  // Read once for the surfaces this poll owns, so they agree even if the hold is set part-way through a tick.
+  // runWorkflowSync reads it independently — the admin fire-immediately path has no tick to share.
+  const deployHeld = isDeployHeld();
+
   const allMappings = Object.values(getMappings());
   const providers = await registry.forAllMappings(allMappings);
 
@@ -237,6 +366,14 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           deleteDispatched(id);
           const reason = observedTerminal ? "terminal" : "not found";
           console.log(`[reconcile] Cleared dedup for ${id} (state: ${reason})`);
+          // observedTerminal means the tracker issue reached completed/cancelled —
+          // a success signal, not a dispatch failure. Only count failures for not-found entries.
+          if (!observedTerminal) {
+            const _brReconcile = recordDispatchFailure(id, "implementation", `reconcile_${reason}`);
+            if (_brReconcile.tripped) {
+              await fireBreakerTrip(config, null, id, null, "implementation", _brReconcile.failures, `reconcile_${reason}`);
+            }
+          }
         }
       }
     } catch (err) {
@@ -254,6 +391,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     for (let i = 0; i < providers.length; i++) {
       for (const entry of snapshots[i].parentsToFinalize) {
         console.log(`[${providers[i].id}] Finalizing empty grouping parent ${entry.identifier} (no own work)`);
+        // AII-349 reopen re-arm: clear any stale handled markers so merge-up re-runs and opens
+        // a new roll-up PR when the parent was previously finalized and then reopened.
+        const m = getMappings()[entry.scopeKey];
+        if (m) clearRollUpHandledMarkersByIdentifier(m.owner, m.repo, entry.identifier);
         await providers[i].markMerged(entry.issueId, entry.scopeKey).catch((err) => {
           console.error(`[${providers[i].id}] Failed to finalize empty grouping parent ${entry.identifier}:`, err);
         });
@@ -311,12 +452,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       }
     }
 
-    // Auto-merge child PRs into their grouping branch once checks pass (opt-in per project;
-    // never merges into defaultBranch — the top-of-tree PR stays human-reviewed). Best-effort.
+    // Merge approved child PRs into grouping branches (cascade self-healing). Runs for all
+    // non-paused projects — the top-of-tree feature→base PR still requires human review.
+    // (AII-349: always-on so a reopened parent's approved children merge without per-project opt-in.)
     try {
-      const autoMergeMappings = Object.values(teamRepoMap).filter((m) => m.autoMerge);
-      if (autoMergeMappings.length > 0) {
-        await runAutoMerges(autoMergeMappings, {
+      const nonPausedMappings = Object.values(teamRepoMap);
+      if (nonPausedMappings.length > 0) {
+        await runGroupingBranchAutoMerge(nonPausedMappings, {
           githubAppId: config.githubAppId,
           githubAppPrivateKey: config.githubAppPrivateKey,
           notify: config.notifyWebhookUrl
@@ -334,22 +476,56 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     const needsPlanningIds = new Set(needsPlanning.map((i) => i.id));
 
     const inFlightIssueIds = getInFlightIssueIds();
-    const isDispatchBlocked = (issueId: string) =>
-      isAlreadyDispatched(issueId) || inFlightIssueIds.has(issueId);
+    const isDispatchBlocked = (issueId: string) => {
+      const phase = needsPlanningIds.has(issueId) ? "planning" : "implementation";
+      return isAlreadyDispatched(issueId) || inFlightIssueIds.has(issueId) || isParked(issueId, phase);
+    };
 
-    const toProcess = selectIssuesToDispatch(
-      allCandidates,
+    // A deploy is holding new work back. Skipping selection cannot lose work:
+    // selectIssuesToDispatch is pure, and markDispatched runs only after a
+    // successful dispatch — so every candidate stays queued with dedup untouched.
+    if (deployHeld && allCandidates.length > 0) {
+      console.log(`[deploy] Dispatch paused — ${allCandidates.length} candidate(s) stay queued`);
+    }
+
+    const toProcess = deployHeld
+      ? []
+      : selectIssuesToDispatch(
+          allCandidates,
+          teamRepoMap,
+          inProgressCountsByTeam,
+          isDispatchBlocked,
+        );
+
+    // AII-278 Finding 3: in-flight issues carry AI-Working and drop OUT of the
+    // candidate snapshot, so filtering allCandidates made the in-flight set
+    // near-always empty. Remember every candidate we've seen this process and
+    // resolve in-flight ids through that cache instead (shared with the admin
+    // blockers preview via poll-selection.ts).
+    rememberCandidates(allCandidates);
+    const inFlightSiblings = resolveInFlightSiblings(inFlightIssueIds);
+
+    // AII-388: fetch planning contexts for candidates and in-flight siblings whose
+    // description carries no file bullets — the planning block lives in the planning
+    // *comment*, not the description, so the guard needs the assembled comment text.
+    const planningContexts = await getOrFetchPlanningContexts(
+      [...toProcess, ...inFlightSiblings],
       teamRepoMap,
-      inProgressCountsByTeam,
-      isDispatchBlocked,
+      registry,
     );
+    const fileOverlapDeferrals = selectFileOverlapDeferrals(toProcess, inFlightSiblings, planningContexts);
+    const deferredIds = new Set(fileOverlapDeferrals.map((b) => b.issueId));
+    for (const b of fileOverlapDeferrals) {
+      console.log(`[poll] Deferring ${b.issueIdentifier}: ${b.detail}`);
+    }
+    const readyToDispatch = deferredIds.size > 0 ? toProcess.filter((i) => !deferredIds.has(i.id)) : toProcess;
 
     for (const issue of allCandidates) {
       if (teamRepoMap[issue.scopeKey]) continue;
       console.log(`[poll] No repo mapping for team ${issue.scopeKey}, skipping ${issue.identifier}`);
     }
 
-    for (const issue of toProcess) {
+    for (const issue of readyToDispatch) {
       try {
         const mapping = teamRepoMap[issue.scopeKey]!;
         const issueProvider = await registry.forMapping(mapping);
@@ -386,11 +562,35 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           const { mode: runnerMode } = getRunnerMode();
           const execPath = resolveExecutionPath(runnerMode, mapping.executionMode);
 
+          // AII-306: a forced global mode can point at a backend this mapping
+          // cannot run on (bedrock is GHA-only; Fly needs a sessions app).
+          // Skip — issue stays queued, dedup untouched — instead of
+          // dispatching a run that cannot work.
+          const eligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
+          if (!eligibility.eligible) {
+            console.log(
+              `[poll] Skipping ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${eligibility.reason}`,
+            );
+            continue;
+          }
+
           // Resolve the base branch once per issue (feature-branch grouping). Doing it
           // here — before the exec-path switch — guarantees the "both" shadow path's two
           // dispatches agree on one base, and never creates the branch twice. The token
           // is per-owner cached, so the in-dispatch-fn fetches below are cache hits.
           const baseGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
+
+          // AII-264 r3: a grouping parent with an OPEN top-of-tree roll-up PR has no
+          // dispatchable work — hold it (dedup untouched) until the PR merges or closes.
+          // Checked BEFORE resolveBaseBranch so the hold never (re)creates branches.
+          if (isGroupingParentDispatch(issue)) {
+            const rollUp = await findOpenRollUpPr({ ghToken: baseGhToken, issue, mapping });
+            if (rollUp) {
+              console.log(`[poll] Holding ${issue.identifier}: roll-up PR #${rollUp.number} is open — no parent work until it merges/closes`);
+              continue;
+            }
+          }
+
           const baseBranch = await resolveBaseBranch({ ghToken: baseGhToken, issue, mapping });
 
           if (execPath === "both") {
@@ -457,32 +657,38 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // Process any pending reconciliation jobs triggered by merged PRs
   await processReconciliations(config, registry);
 
-  // Process pending late review feedback that arrived after the original run.
-  await processReviewFixQueue(config);
+  // Both of these launch runner jobs, so they pause with issue dispatch —
+  // otherwise the hold would block on work it is itself still creating.
+  if (deployHeld) {
+    console.log("[deploy] Review-fix and gap-fill drains paused. self-deployment in progress");
+  } else {
+    // Process pending late review feedback that arrived after the original run.
+    await processReviewFixQueue(config);
 
-  // Drain orchestrator-mediated /ai-implement comment gap-fills.
-  await drainCommentGapfillQueue({
-    getMappings,
-    runnerMode: getRunnerMode().mode,
-    notifyType: config.notifyType,
-    notifyWebhookUrl: config.notifyWebhookUrl,
-    runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
-    runnerTokenSecret: config.runnerTokenSecret,
-    getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
-    resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
-    checkContract: (params) => resolveWorkflowContract(params),
-    dispatch: dispatchWorkflow,
-    postComment: postPrComment,
-    onDispatchFailure: surfaceDispatchFailure,
-    flySessionsToken: config.flySessionsToken,
-    flySessionsApp: config.flySessionsApp,
-    flySessionsRegion: config.flySessionsRegion,
-    flyOrchestratorApp: config.flyOrchestratorApp,
-    tenantId: config.tenantId,
-    anthropicApiKey: config.anthropicApiKey,
-    claudeOAuthToken: config.claudeOAuthToken,
-    sessionImage: config.sessionImage,
-  });
+    // Drain orchestrator-mediated /ai-implement comment gap-fills.
+    await drainCommentGapfillQueue({
+      getMappings,
+      runnerMode: getRunnerMode().mode,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+      runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+      runnerTokenSecret: config.runnerTokenSecret,
+      getInstallationToken: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+      resolveRunnerImage: (mapping, ghToken) => resolveDispatchRunnerImage(config, mapping, ghToken),
+      checkContract: (params) => resolveWorkflowCapabilities(params),
+      dispatch: dispatchWorkflow,
+      postComment: postPrComment,
+      onDispatchFailure: surfaceDispatchFailure,
+      flySessionsToken: config.flySessionsToken,
+      flySessionsApp: config.flySessionsApp,
+      flySessionsRegion: config.flySessionsRegion,
+      flyOrchestratorApp: config.flyOrchestratorApp,
+      tenantId: config.tenantId,
+      anthropicApiKey: config.anthropicApiKey,
+      claudeOAuthToken: config.claudeOAuthToken,
+      sessionImage: config.sessionImage,
+    });
+  }
 
   // Crash-recovery safety net for workflow syncs. (NOT the primary trigger. the admin handlers fire runWorkflowSync immediately on save) 
   // this only re-runs jobs that lost their runner to a restart or a wedge.
@@ -490,6 +696,61 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   } finally {
     pollInProgress = false;
+  }
+}
+
+// ---------- Dispatch breaker ----------
+
+/**
+ * Fires after recordDispatchFailure returns tripped=true. Posts a tracker
+ * comment and a webhook notification, both best-effort. Never throws.
+ */
+async function fireBreakerTrip(
+  config: AppConfig,
+  provider: TicketingProvider | null,
+  issueId: string,
+  issueIdentifier: string | null,
+  phase: string,
+  failures: number,
+  conclusion: string,
+): Promise<void> {
+  console.warn(
+    `[breaker] Parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, conclusion: ${conclusion})`,
+  );
+
+  const runUrls = getRecentFailedRunUrls(issueId, phase, 3);
+  const commentLines = [
+    `**⛔ AI-Implement parked this issue**`,
+    ``,
+    `This issue has been parked after ${failures} consecutive failed dispatches.`,
+    ``,
+    `- Phase: \`${phase}\``,
+    `- Failures: ${failures}`,
+    `- Last conclusion: \`${conclusion}\``,
+    ...(runUrls.length > 0
+      ? [`- Failed runs:`, ...runUrls.map((u) => `  - ${u}`)]
+      : []),
+    ``,
+    `Unpark: admin → Runners → Unpark, or ask the operator.`,
+  ];
+
+  if (provider) {
+    try {
+      await provider.postComment(issueId, commentLines.join("\n"));
+    } catch (err) {
+      console.error(`[breaker] Failed to post park comment for ${issueIdentifier ?? issueId}:`, err);
+    }
+  }
+
+  if (config.notifyWebhookUrl) {
+    try {
+      await notifyText(
+        config.notifyWebhookUrl,
+        `⛔ AI-Implement parked ${issueIdentifier ?? issueId} (phase: ${phase}, failures: ${failures}, last: ${conclusion}). Unpark: admin → Runners → Unpark.`,
+      );
+    } catch (err) {
+      console.error(`[breaker] Failed to send park notification for ${issueIdentifier ?? issueId}:`, err);
+    }
   }
 }
 
@@ -561,13 +822,30 @@ async function dispatchGitHubActions(
 
   const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
-  const contract = await resolveWorkflowContract({
+  const workflowCapabilities = await resolveWorkflowCapabilities({
     owner: mapping.owner,
     repo: mapping.repo,
     workflowFile: mapping.workflowFile,
     token: ghToken,
     ref: mapping.defaultBranch,
   });
+  const { contract } = workflowCapabilities;
+  const runPublicationToken = contract === "envelope"
+    && workflowCapabilities.supportsRunPublicationToken
+    && dispatchId
+    && config.runnerCallbackBaseUrl
+    && config.runnerTokenSecret
+    ? mintRunToken({
+        issueId: issue.id,
+        mappingTeamKey: issue.scopeKey,
+        phase: "implementation",
+        audience: "publication",
+        dispatchId,
+        repository: `${mapping.owner}/${mapping.repo}`,
+        ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+        secret: config.runnerTokenSecret,
+      }).token
+    : undefined;
 
   const dispatchInputs = contract === "envelope"
     ? buildEnvelopeDispatchInputs(mapping, issue, {
@@ -576,6 +854,7 @@ async function dispatchGitHubActions(
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken,
         runProgressToken,
+        runPublicationToken,
         runnerImage,
         groupingParent: isGroupingParentDispatch(issue) || undefined,
       })
@@ -621,6 +900,11 @@ async function dispatchGitHubActions(
         phase: "implementation",
       },
     );
+    // No dedup row was written at this point (markDispatched is called only on success below).
+    const _brImpl = recordDispatchFailure(issue.id, "implementation", "workflow_dispatch_failed");
+    if (_brImpl.tripped) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "implementation", _brImpl.failures, "workflow_dispatch_failed");
+    }
     return;
   }
 
@@ -638,6 +922,7 @@ async function dispatchGitHubActions(
     runnerMode,
     sessionImage: runnerImage ?? null,
     contract,
+    groupingParent: isGroupingParentDispatch(issue),
   });
 
   // Suppress pending notifications for earlier failed attempts — they're stale.
@@ -678,6 +963,15 @@ async function dispatchPlanning(
   // Shadow collapses to GHA-only: planning posts user-visible Linear comments,
   // so a shadow second backend would double-post.
   const execPath = resolvePlanningExecutionPath(runnerMode, mapping.executionMode);
+
+  // AII-306: same forced-mode eligibility guard as implementation dispatch.
+  const planningEligibility = checkForcedPathEligibility(runnerMode, mapping, Boolean(config.flySessionsApp));
+  if (!planningEligibility.eligible) {
+    console.log(
+      `[poll] Skipping planning for ${issue.identifier}: forced runner mode "${runnerMode}" but team ${issue.scopeKey} is ineligible — ${planningEligibility.reason}`,
+    );
+    return;
+  }
 
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) for all execution paths.
   const planningContextInputs = await buildPlanningContextInputs({
@@ -953,6 +1247,11 @@ async function dispatchPlanning(
         phase: "planning",
       },
     );
+    // Planning never writes a dedup row (intentional), but we still count the failure.
+    const _brPlan = recordDispatchFailure(issue.id, "planning", "workflow_dispatch_failed");
+    if (_brPlan.tripped) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, "planning", _brPlan.failures, "workflow_dispatch_failed");
+    }
     return;
   }
 
@@ -1060,44 +1359,58 @@ async function dispatchSession(
     markDispatched(issue.id, issue.identifier, issue.title);
   }
 
-  const jobId = appendLog({
-    issueId: issue.id,
-    issueIdentifier: issue.identifier,
-    issueTitle: issue.title,
-    teamKey: issue.scopeKey,
-    repo: `${mapping.owner}/${mapping.repo}`,
-    issueState: issue.nativeStatus,
-    dispatchId,
-    dispatchNumber: prior.count + 1,
-    executionMode: result.executionMode,
-    machineNonce,
-    machineId: result.machineId,
-    runnerMode,
-    sessionImage: result.sessionImage,
-    phase: opts.phase,
-  });
+  // AII-194: if anything after markDispatched throws, clean up the orphaned dedup row
+  // so the issue can be re-dispatched and the failure is counted.
+  try {
+    const jobId = appendLog({
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      issueTitle: issue.title,
+      teamKey: issue.scopeKey,
+      repo: `${mapping.owner}/${mapping.repo}`,
+      issueState: issue.nativeStatus,
+      dispatchId,
+      dispatchNumber: prior.count + 1,
+      executionMode: result.executionMode,
+      machineNonce,
+      machineId: result.machineId,
+      runnerMode,
+      sessionImage: result.sessionImage,
+      phase: opts.phase,
+      groupingParent: opts.phase === "implementation" && isGroupingParentDispatch(issue),
+    });
 
-  if (!opts.shadow) {
-    const suppressed = suppressStaleNotifications(issue.id, jobId);
-    if (suppressed > 0) {
-      console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
+    if (!opts.shadow) {
+      const suppressed = suppressStaleNotifications(issue.id, jobId);
+      if (suppressed > 0) {
+        console.log(`[poll] Suppressed ${suppressed} stale notification(s) for ${issue.identifier} (superseded by new dispatch)`);
+      }
+
+      const doPostDispatch = opts.onPostDispatch ?? postDispatch;
+      await doPostDispatch(config, provider, issue, mapping, result.ghToken, jobId, result.executionMode);
+
+      if (result.statusComment) {
+        postStatusComment(provider, issue.id, {
+          type: "machine_created",
+          machineName: result.statusComment.machineName,
+        }, result.statusComment.logsUrl).catch((err) => {
+          console.error(`[poll] Failed to post machine_created status for ${issue.identifier}:`, err);
+        });
+      }
     }
 
-    const doPostDispatch = opts.onPostDispatch ?? postDispatch;
-    await doPostDispatch(config, provider, issue, mapping, result.ghToken, jobId, result.executionMode);
-
-    if (result.statusComment) {
-      postStatusComment(provider, issue.id, {
-        type: "machine_created",
-        machineName: result.statusComment.machineName,
-      }, result.statusComment.logsUrl).catch((err) => {
-        console.error(`[poll] Failed to post machine_created status for ${issue.identifier}:`, err);
-      });
+    if (result.dispatchedLogLine) {
+      console.log(result.dispatchedLogLine);
     }
-  }
-
-  if (result.dispatchedLogLine) {
-    console.log(result.dispatchedLogLine);
+  } catch (err) {
+    if (opts.doMarkDispatched) {
+      deleteDispatched(issue.id);
+    }
+    const _brSession = recordDispatchFailure(issue.id, opts.phase, "dispatch_error");
+    if (_brSession.tripped) {
+      await fireBreakerTrip(config, provider, issue.id, issue.identifier, opts.phase, _brSession.failures, "dispatch_error");
+    }
+    throw err;
   }
 }
 
@@ -1179,6 +1492,7 @@ async function dispatchFlyMachine(
         ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
         ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
         ...(isGroupingParentDispatch(issue) ? { groupingParent: true } : {}),
+        ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
       };
 
       const machineConfig = buildSessionMachineConfig({
@@ -1281,6 +1595,7 @@ async function dispatchLocalDocker(
         ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
         ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),
         ...(isGroupingParentDispatch(issue) ? { groupingParent: true } : {}),
+        ...(mapping.dependencyTokenScope != null ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
       };
 
       const container = await startLocalRunnerContainer({
@@ -1365,8 +1680,11 @@ async function postDispatch(
         getClaimedRunIds(),
       );
       if (runId) {
-        updateJobRunId(jobId, runId);
-        console.log(`[poll] Linked ${issue.identifier} to run ${runId}`);
+        if (attachJobRunIdIfMissing(jobId, runId)) {
+          console.log(`[poll] Linked ${issue.identifier} to run ${runId}`);
+        } else {
+          console.log(`[poll] Skipped heuristic run link for ${issue.identifier}; job already has a run ID`);
+        }
       } else {
         console.log(`[poll] Run ID not yet available for ${issue.identifier}, will retry next cycle`);
       }
@@ -1383,9 +1701,6 @@ const RUN_ID_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 /** Maximum age (ms) for a Fly Machine job before it's considered timed out. */
 const FLY_MACHINE_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
-
-/** Maximum age (ms) for a GHA job (once a run ID is bound) before it's considered stuck. */
-const STUCK_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
 
 /** Maximum characters to include in a Linear "Session Logs" comment. */
 const LOG_MAX_CHARS = 5_000;
@@ -1525,6 +1840,9 @@ async function monitorGitHubActionsJob(
   const [owner, repo] = repoFullName.split("/");
   if (!owner || !repo) return;
 
+  const mapping = Object.values(teamRepoMap).find(
+    (m) => `${m.owner}/${m.repo}` === repoFullName,
+  );
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
 
   const watchdogConfig: StuckWatchdogConfig = {
@@ -1537,9 +1855,6 @@ async function monitorGitHubActionsJob(
   // If we don't have a run ID yet, try to find it
   if (!job.runId) {
     const dispatchTime = new Date(job.dispatchedAt - 30_000);
-    const mapping = Object.values(teamRepoMap).find(
-      (m) => `${m.owner}/${m.repo}` === repoFullName,
-    );
     if (!mapping) return;
 
     const workflowFile = workflowFileForJob(job, mapping);
@@ -1555,13 +1870,19 @@ async function monitorGitHubActionsJob(
     );
 
     if (runId) {
-      updateJobRunId(job.id, runId);
-      claimedRunIds.add(runId);
-      job.runId = runId;
-      console.log(`[monitor] Found run ID ${runId} for job ${job.id} (${job.issueIdentifier})`);
+      if (attachJobRunIdIfMissing(job.id, runId)) {
+        claimedRunIds.add(runId);
+        job.runId = runId;
+        console.log(`[monitor] Found run ID ${runId} for job ${job.id} (${job.issueIdentifier})`);
+      } else {
+        console.log(`[monitor] Skipped heuristic run link for job ${job.id} (${job.issueIdentifier}); job already has a run ID`);
+        return;
+      }
     } else if (Date.now() - job.dispatchedAt > RUN_ID_TIMEOUT_MS) {
+      if (!isMonitorRunIdStillCurrent(job)) return;
       console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) timed out waiting for run ID`);
       const provider = await providerForJob(registry, job);
+      if (!isMonitorRunIdStillCurrent(job)) return;
       await remediateStuckJob(watchdogConfig, provider, job, "run_not_found");
       return;
     } else {
@@ -1572,14 +1893,23 @@ async function monitorGitHubActionsJob(
   // Check run status
   const runStatus = await getWorkflowRunStatus(ghToken, owner, repo, job.runId);
   if (!runStatus) return;
+  if (!isMonitorRunIdStillCurrent(job)) return;
 
-  // Detect stuck: non-terminal past the wall-clock cap
-  if (runStatus.status !== "completed" && Date.now() - job.dispatchedAt > STUCK_TIMEOUT_MS) {
-    const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
+  // Detect stuck: non-terminal past the configured workflow timeout plus reconciliation grace.
+  const watchdog = githubActionsWatchdogDecision({
+    status: runStatus.status,
+    dispatchedAtMs: job.dispatchedAt,
+    nowMs: Date.now(),
+    maxJobMinutes: mapping?.maxJobMinutes ?? null,
+  });
+  if (watchdog.overdue) {
+    const elapsedMin = Math.round(watchdog.elapsedMs / 60000);
     console.warn(
-      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck in ${runStatus.status} after ${elapsedMin}m`,
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck in ${runStatus.status} after ${elapsedMin}m ` +
+        `(threshold ${watchdog.jobTimeoutMinutes}m + ${watchdog.graceMinutes}m grace)`,
     );
     const provider = await providerForJob(registry, job);
+    if (!isMonitorRunIdStillCurrent(job)) return;
     await remediateStuckJob(watchdogConfig, provider, job, runStatus.status);
     return;
   }
@@ -1596,6 +1926,7 @@ async function monitorGitHubActionsJob(
 
     // Try to find PR URL for successful runs
     let prUrl: string | null = null;
+    let fallbackPrMatch: RunPrMatch | null = null;
     if (jobStatus === "completed") {
       try {
         prUrl = await findPrForRun(ghToken, owner, repo, job.runId);
@@ -1604,21 +1935,54 @@ async function monitorGitHubActionsJob(
       }
       // workflow_dispatch runs report the ref they were dispatched on (the default
       // branch) as head_branch, so findPrForRun misses the PR the runner created
-      // during the run. Fall back to matching an open PR by the issue's branch
-      // naming. Planning runs never open PRs — skip them so an implementation PR
-      // from an earlier dispatch is not misattributed to a planning row.
+      // during the run. Fall back to matching a PR (open or already merged — AII-264 r6)
+      // by the issue's branch naming. Planning runs never open PRs — skip them so an
+      // implementation PR from an earlier dispatch is not misattributed to a planning row.
       if (!prUrl && job.phase !== "planning") {
-        prUrl = (await findPrForIssue(config, job.repo, job.issueIdentifier))?.url ?? null;
+        fallbackPrMatch = await findPrForIssue(config, job.repo, job.issueIdentifier);
+        prUrl = fallbackPrMatch?.url ?? null;
       }
     }
 
+    if (!isMonitorRunIdStillCurrent(job)) return;
     updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl);
     console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) → ${jobStatus} (${runStatus.conclusion})`);
+
+    // AII-264 r6: the run's PR already merged (auto-merge beat this check) — route straight
+    // to the Done-reconcile so the ticket completes even if the merge-poll never sees it.
+    if (fallbackPrMatch?.merged && prUrl) {
+      reconcileAlreadyMergedPr(job, prUrl);
+    }
+
+    // AII-264 r5: a grouping parent's clean GHA run with no PR is Case-B (the runner's push
+    // step no-op'd because the agent produced no changes). Without a reachable callback the
+    // parent would strand In Progress — finalize it here so merge-up opens the roll-up PR.
+    if (jobStatus === "completed" && !prUrl && job.phase !== "planning" && job.groupingParent) {
+      const provider = await providerForJob(registry, job);
+      if (!isMonitorRunIdStillCurrent(job)) return;
+      await finalizeNoOpGroupingParent(provider, job);
+    }
+
+    if (jobStatus === "failed") {
+      const provider = await providerForJob(registry, job);
+      if (!isMonitorRunIdStillCurrent(job)) return;
+      await remediateFailedJob(watchdogConfig, provider, job, runStatus.conclusion ?? "failure");
+    }
   }
   // If status is queued or in_progress, ensure job is marked running
   else if (job.status === "dispatched") {
     updateJobRunId(job.id, job.runId);
   }
+}
+
+function isMonitorRunIdStillCurrent(job: Job): boolean {
+  const current = getJobById(job.id);
+  if (!current) return false;
+  if (current.runId === job.runId) return true;
+  console.log(
+    `[monitor] Skipping stale cycle for job ${job.id} (${job.issueIdentifier}); run ID changed from ${job.runId ?? "none"} to ${current.runId ?? "none"}`,
+  );
+  return false;
 }
 
 /**
@@ -1630,13 +1994,17 @@ async function findPrForIssue(
   config: AppConfig,
   repo: string | null,
   issueIdentifier: string | null,
-): Promise<{ url: string; draft: boolean } | null> {
+): Promise<RunPrMatch | null> {
   const [owner, repoName] = (repo || "").split("/");
   if (!owner || !repoName || !issueIdentifier) return null;
 
   try {
     const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-    const prSearchUrl = `https://api.github.com/repos/${owner}/${repoName}/pulls?state=open&per_page=10`;
+    // AII-264 r6: state=all, not state=open — auto-merge routinely lands a fast child's PR
+    // before the monitor's first post-exit check, and a merged PR is a SUCCESS, not
+    // pr_not_found. Matching/selection (incl. skipping closed-unmerged PRs from torn-down
+    // earlier attempts) lives in pickPrForRun.
+    const prSearchUrl = `https://api.github.com/repos/${owner}/${repoName}/pulls?state=all&sort=updated&direction=desc&per_page=30`;
     const prRes = await fetch(prSearchUrl, {
       headers: {
         Authorization: `Bearer ${ghToken}`,
@@ -1644,13 +2012,8 @@ async function findPrForIssue(
       },
     });
     if (prRes.ok) {
-      const prs = (await prRes.json()) as Array<{ html_url: string; head: { ref: string }; draft?: boolean }>;
-      // Accept both the legacy ${IDENTIFIER}/... branch shape and the TS
-      // pipeline's ai-implement/${identifier}-... branch shape.
-      const match = prs.find((pr) => {
-        return branchMatchesIssueIdentifier(pr.head.ref, issueIdentifier);
-      });
-      if (match) return { url: match.html_url, draft: match.draft === true };
+      const prs = (await prRes.json()) as RunPrCandidate[];
+      return pickPrForRun(prs, issueIdentifier);
     }
   } catch {
     // Non-critical
@@ -1672,19 +2035,7 @@ async function monitorFlyMachineJob(
       await postSessionLogs(config, provider, job, "machine_timeout");
     }
 
-    try {
-      await destroyMachine(config.flySessionsToken, config.flySessionsApp, job.machineId);
-      console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
-    } catch (err) {
-      // Machine may already be gone — that's fine
-      if (!(err instanceof Error && err.message.includes("404"))) {
-        console.error(`[monitor] Failed to destroy timed-out machine ${job.machineId}:`, err);
-      }
-    }
-    updateJobStatus(job.id, "timed_out", "machine_timeout");
-    invalidateNonce(job.id);
     const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
-    console.warn(`[monitor] Fly machine job ${job.id} (${job.issueIdentifier}) timed out after ${elapsedMin}m`);
 
     // Post timeout status comment to Linear (best-effort, skip shadow jobs)
     if (job.runnerMode !== "shadow" && job.issueId) {
@@ -1697,7 +2048,27 @@ async function monitorFlyMachineJob(
       });
     }
 
-    await resetTicket(provider, job);
+    const watchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+
+    const stopRunner = async () => {
+      try {
+        await destroyMachine(config.flySessionsToken!, config.flySessionsApp!, job.machineId!);
+        console.log(`[monitor] Destroyed timed-out machine ${job.machineId}`);
+      } catch (err) {
+        // Machine may already be gone — that's fine
+        if (!(err instanceof Error && err.message.includes("404"))) {
+          console.error(`[monitor] Failed to destroy timed-out machine ${job.machineId}:`, err);
+        }
+      }
+      invalidateNonce(job.id);
+    };
+
+    await remediateStuckJob(watchdogConfig, provider, job, "machine_timeout", stopRunner);
     return;
   }
 
@@ -1743,9 +2114,18 @@ async function monitorFlyMachineJob(
     // check below, but the two must be handled differently: see the markReadyForReview guard.
     const isDraftPr = matchedPr?.draft === true;
     // Use PR existence to distinguish success from failure:
-    // if a PR was created, the session completed its job; otherwise it failed
-    const reviewNeedsAttention = !!prUrl && postPushReviewNeedsAttention(job.id);
-    const jobStatus: JobStatus = resolveTerminalStatus(machineExitCode, prUrl, reviewNeedsAttention, job.phase, isDraftPr);
+    // if a PR was created, the session completed its job; otherwise it failed.
+    // A PR that already MERGED (auto-merge beat this check) is unconditionally a success —
+    // the review stage is over, so needs-attention no longer applies.
+    const reviewNeedsAttention = !matchedPr?.merged && !!prUrl && postPushReviewNeedsAttention(job.id);
+    // AII-264 r5: a grouping parent's clean no-PR exit is Case-B finalize, not pr_not_found;
+    // a child's clean no-PR exit gets a bounded grace re-check (PR-visibility race).
+    const decision = decideCleanExitOutcome(job, machineExitCode, prUrl, reviewNeedsAttention, isDraftPr, Date.now());
+    if (decision.deferForPrRecheck) {
+      console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) exited 0 with no PR — re-checking before declaring pr_not_found`);
+      return;
+    }
+    const jobStatus: JobStatus = decision.jobStatus;
 
     // Stamp pr_number on the machine before it's destroyed so reaper/audit
     // tools can read it. Only possible when machine is still accessible.
@@ -1778,9 +2158,13 @@ async function monitorFlyMachineJob(
     }
 
     const durationMs = Date.now() - job.dispatchedAt;
-    updateJobStatus(job.id, jobStatus, machineConclusion, prUrl);
+    updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : machineConclusion, prUrl);
     invalidateNonce(job.id);
+    clearPrNotFoundGrace(job.id);
     console.log(`[monitor] Fly machine ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (${machineConclusion}, PR: ${prUrl || "none"})`);
+    if (decision.finalizeGroupingParent) {
+      await finalizeNoOpGroupingParent(provider, job);
+    }
 
     // Post machine_destroyed status comment to Linear (best-effort, skip shadow jobs)
     if (job.runnerMode !== "shadow" && job.issueId) {
@@ -1793,7 +2177,11 @@ async function monitorFlyMachineJob(
       });
     }
 
-    if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
+    if (matchedPr?.merged && prUrl) {
+      // AII-264 r6: the PR already merged — Ready for Review would be a lie and a reset
+      // would loop an already-landed child. Route straight to the Done-reconcile.
+      reconcileAlreadyMergedPr(job, prUrl);
+    } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
       if (isDraftPr) {
         // Unapproved run: the runner callback (or, absent one, this job row + the
         // status comment already posted above) owns the ticket transition for a
@@ -1808,8 +2196,13 @@ async function monitorFlyMachineJob(
         await markReadyForReview(provider, job, prUrl);
       }
     } else if (jobStatus === "failed") {
-      // On failure/timeout, reset the Linear issue so it can be re-dispatched
-      await resetTicket(provider, job);
+      const flyWatchdogConfig: StuckWatchdogConfig = {
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+        notifyType: config.notifyType,
+        notifyWebhookUrl: config.notifyWebhookUrl,
+      };
+      await remediateFailedJob(flyWatchdogConfig, provider, job, machineConclusion);
     }
   }
 }
@@ -1823,17 +2216,8 @@ async function monitorLocalDockerJob(
 
   if (Date.now() - job.dispatchedAt > FLY_MACHINE_TIMEOUT_MS) {
     await postLocalContainerLogs(provider, job, "container_timeout");
-    try {
-      await removeLocalContainer(job.machineId);
-      console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
-    } catch (err) {
-      console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
-    }
 
-    updateJobStatus(job.id, "timed_out", "container_timeout");
-    invalidateNonce(job.id);
     const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
-    console.warn(`[monitor] Local Docker job ${job.id} (${job.issueIdentifier}) timed out after ${elapsedMin}m`);
 
     if (job.issueId) {
       postStatusComment(provider, job.issueId, {
@@ -1844,7 +2228,24 @@ async function monitorLocalDockerJob(
       });
     }
 
-    await resetTicket(provider, job);
+    const watchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+
+    const stopRunner = async () => {
+      try {
+        await removeLocalContainer(job.machineId!);
+        console.log(`[monitor] Removed timed-out local Docker container ${job.machineId}`);
+      } catch (err) {
+        console.error(`[monitor] Failed to remove timed-out local Docker container ${job.machineId}:`, err);
+      }
+      invalidateNonce(job.id);
+    };
+
+    await remediateStuckJob(watchdogConfig, provider, job, "container_timeout", stopRunner);
     return;
   }
 
@@ -1867,8 +2268,17 @@ async function monitorLocalDockerJob(
   // reviewNeedsAttention: both resolve to "review_failed", but only a draft PR must skip
   // markReadyForReview/resetTicket below.
   const isDraftPr = matchedPr?.draft === true;
-  const reviewNeedsAttention = state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
-  const jobStatus = resolveTerminalStatus(state.exitCode, prUrl, reviewNeedsAttention, job.phase, isDraftPr);
+  // A PR that already MERGED (auto-merge beat this check) is unconditionally a success.
+  const reviewNeedsAttention = !matchedPr?.merged && state.exitCode === 0 && !!prUrl && postPushReviewNeedsAttention(job.id);
+  // AII-264 r5: a grouping parent's clean no-PR exit is Case-B finalize, not pr_not_found;
+  // a child's clean no-PR exit gets a bounded grace re-check (PR-visibility race). The
+  // exited container is left in place while deferred so the next pass can re-inspect it.
+  const decision = decideCleanExitOutcome(job, state.exitCode, prUrl, reviewNeedsAttention, isDraftPr, Date.now());
+  if (decision.deferForPrRecheck) {
+    console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) exited 0 with no PR — re-checking before declaring pr_not_found`);
+    return;
+  }
+  const jobStatus = decision.jobStatus;
 
   if (jobStatus === "failed") {
     await postLocalContainerLogs(provider, job, state.exitCode === 0 ? "pr_not_found" : "container_failed");
@@ -1884,8 +2294,9 @@ async function monitorLocalDockerJob(
   }
 
   const durationMs = Date.now() - job.dispatchedAt;
-  updateJobStatus(job.id, jobStatus, `exit_${state.exitCode}`, prUrl);
+  updateJobStatus(job.id, jobStatus, decision.finalizeGroupingParent ? "no_op_finalized" : `exit_${state.exitCode}`, prUrl);
   invalidateNonce(job.id);
+  clearPrNotFoundGrace(job.id);
   console.log(`[monitor] Local Docker container ${job.machineId} (${job.issueIdentifier}) → ${jobStatus} (exit ${state.exitCode}, PR: ${prUrl || "none"})`);
 
   if (job.issueId) {
@@ -1897,7 +2308,13 @@ async function monitorLocalDockerJob(
     });
   }
 
-  if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
+  if (decision.finalizeGroupingParent) {
+    await finalizeNoOpGroupingParent(provider, job);
+  } else if (matchedPr?.merged && prUrl) {
+    // AII-264 r6: the PR already merged — route straight to the Done-reconcile,
+    // never Ready for Review, never reset.
+    reconcileAlreadyMergedPr(job, prUrl);
+  } else if ((jobStatus === "completed" || jobStatus === "review_failed") && prUrl) {
     if (isDraftPr) {
       // Unapproved run: the runner callback (or, absent one, this job row + the
       // status comment already posted above) owns the ticket transition for a
@@ -1906,8 +2323,58 @@ async function monitorLocalDockerJob(
       await markReadyForReview(provider, job, prUrl);
     }
   } else {
-    await resetTicket(provider, job);
+    const localWatchdogConfig: StuckWatchdogConfig = {
+      githubAppId: config.githubAppId,
+      githubAppPrivateKey: config.githubAppPrivateKey,
+      notifyType: config.notifyType,
+      notifyWebhookUrl: config.notifyWebhookUrl,
+    };
+    await remediateFailedJob(localWatchdogConfig, provider, job, `exit_${state.exitCode}`);
   }
+}
+
+/**
+ * AII-264 r5: finalize a grouping parent whose closing run produced no changes (Case B).
+ * Mirrors the runner-callback `noWork` path: markMerged clears AI-Working and completes the
+ * issue, so fetchFeatureNodeRollUps finds the feature node done and merge-up.ts opens the
+ * feature→base roll-up PR — after which the r3 roll-up hold keeps the parent parked. The
+ * stuck-attempt counter is reset so a prior pr_not_found streak can't re-arm the watchdog.
+ */
+async function finalizeNoOpGroupingParent(provider: TicketingProvider | null, job: Job): Promise<void> {
+  if (!provider || !job.issueId) return;
+  if (!job.teamKey) {
+    console.error(`[monitor] Cannot finalize grouping parent ${job.issueIdentifier}: job has no teamKey`);
+    return;
+  }
+  try {
+    await provider.markMerged(job.issueId, job.teamKey);
+    resetStuckAttempts(job.issueId);
+    console.log(`[monitor] Grouping parent ${job.issueIdentifier}: closing run produced no changes — finalized for roll-up (no reset)`);
+  } catch (err) {
+    console.error(`[monitor] Failed to finalize grouping parent ${job.issueIdentifier}:`, err);
+  }
+}
+
+/**
+ * AII-264 r6: the run's PR was already merged (auto-merge beat the monitor's first
+ * post-exit check — routine for fast children). That is a SUCCESS with the review stage
+ * already over: route straight to the Done-reconcile (same queue the merge-poll and
+ * webhook feed) instead of markReadyForReview, and never reset. Keyed by repo+PR, so a
+ * later job-row mangling cannot orphan the ticket — the queue row survives independently.
+ */
+function reconcileAlreadyMergedPr(job: Job, prUrl: string): void {
+  const prNumber = prNumberFromUrl(prUrl);
+  if (prNumber === null || !job.repo) return;
+  if (hasReconciliationForPr(job.repo, prNumber)) return;
+  enqueueReconciliation({
+    issueId: job.issueId,
+    issueIdentifier: job.issueIdentifier,
+    prNumber,
+    repo: job.repo,
+    mergeCommitSha: "",
+  });
+  resetStuckAttempts(job.issueId);
+  console.log(`[monitor] PR #${prNumber} for ${job.issueIdentifier} already merged — queued Done-reconcile (no reset)`);
 }
 
 /** Mark a Linear issue as Ready for Review after a successful job. */
@@ -1956,6 +2423,27 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
   const mappings = getMappings();
   for (const job of terminalJobs) {
     try {
+      // Record dispatch breaker state for ALL terminal jobs before any early-continue.
+      // Uses reportJobCompletion as the single integration point because it sees every
+      // terminal job regardless of which backend or path produced it (GHA callback,
+      // GHA monitor, Fly, local-docker).
+      let pendingBreakerTrip: { phase: string; failures: number; conclusion: string } | null = null;
+      if (job.issueId) {
+        const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
+        if (job.status === "completed") {
+          recordDispatchSuccess(job.issueId, breakerPhase);
+        } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
+          const breakerConclusion = job.conclusion ?? job.status;
+          // Don't fire the trip notification for stuck conclusions — stuck_giveup already
+          // fires notifyStuckGiveUp; we still record the failure so the counter advances.
+          const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
+          const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+          if (br.tripped && !isStuck) {
+            pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+          }
+        }
+      }
+
       // Suppress ordinary completion notice for stuck conclusions — stuck_giveup
       // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
       // requeue that will produce its own dispatch notice on the next cycle.
@@ -1999,6 +2487,19 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
         } catch (err) {
           console.warn(`[monitor] Failed to resolve provider for job ${job.id}, using fallback URL:`, err);
         }
+      }
+
+      // Fire breaker trip notification now that provider is resolved.
+      if (pendingBreakerTrip && job.issueId) {
+        await fireBreakerTrip(
+          config,
+          provider,
+          job.issueId,
+          job.issueIdentifier,
+          pendingBreakerTrip.phase,
+          pendingBreakerTrip.failures,
+          pendingBreakerTrip.conclusion,
+        );
       }
 
       // Tracker comment — ALWAYS, independent of the Slack/Teams webhook (failures only)
@@ -2132,14 +2633,23 @@ async function startupReconciliation(config: AppConfig, registry: ProviderRegist
 /**
  * Thin wrapper: adapts registry + mappings to runReconciliations.
  */
-async function processReconciliations(_config: AppConfig, registry: ProviderRegistry): Promise<void> {
+async function processReconciliations(config: AppConfig, registry: ProviderRegistry): Promise<void> {
   const teamRepoMap = getMappings();
+  let appBotLogin: string | undefined;
+  try {
+    const slug = await getAppSlug(config.githubAppId, config.githubAppPrivateKey);
+    appBotLogin = `${slug}[bot]`;
+  } catch {
+    // Non-fatal; runner commits won't be bucketed separately
+  }
   await runReconciliations({
     mappingForRepo: (repo) => {
       const entry = Object.entries(teamRepoMap).find(([, m]) => `${m.owner}/${m.repo}` === repo);
       return entry ? { scopeKey: entry[0], mapping: entry[1] } : undefined;
     },
     resolveProvider: (mapping) => registry.forMapping(mapping),
+    tokenForOwner: (owner) => getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner),
+    appBotLogin,
   });
 }
 
@@ -2211,13 +2721,30 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
-      const reviewFixContract = await resolveWorkflowContract({
+      const reviewFixCapabilities = await resolveWorkflowCapabilities({
         owner: mapping.owner,
         repo: mapping.repo,
         workflowFile: mapping.workflowFile,
         token: ghToken,
         ref: mapping.defaultBranch,
       });
+      const reviewFixContract = reviewFixCapabilities.contract;
+      const runPublicationToken = reviewFixContract === "envelope"
+        && reviewFixCapabilities.supportsRunPublicationToken
+        && dispatchId
+        && config.runnerCallbackBaseUrl
+        && config.runnerTokenSecret
+        ? mintRunToken({
+            issueId: fix.issueId,
+            mappingTeamKey: scopeKey,
+            phase: "gap-analysis",
+            audience: "publication",
+            dispatchId,
+            repository: `${mapping.owner}/${mapping.repo}`,
+            ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+            secret: config.runnerTokenSecret,
+          }).token
+        : undefined;
 
       const fixIssue = {
         id: fix.issueId,
@@ -2233,6 +2760,7 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
             runnerCallbackUrl: runnerCallbackUrl || undefined,
             runToken,
             runProgressToken,
+            runPublicationToken,
             runnerImage,
           })
         : {
@@ -2321,20 +2849,81 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
+function onDeployBuildFailure(commit: string, err: unknown): void {
+  recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
+}
+
 function startServer(config: AppConfig, registry: ProviderRegistry): http.Server {
-  const server = http.createServer((req, res) => {
+  const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
+
+  const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
+    const pathname = url.split("?")[0];
 
     // Health check
     if (url === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", polls: pollCount }));
+      res.end(JSON.stringify({ status: "ok", polls: pollCount, kgDegraded: isKgDegraded() }));
       return;
     }
 
     // Token vending — no admin auth (used by session machines)
     if (url === "/api/token" && req.method === "POST") {
       handleTokenRequest(req, res, config.githubAppId, config.githubAppPrivateKey);
+      return;
+    }
+
+    // Dependency token vending — runner progress token authenticated, scoped contents:read mint
+    if (url === "/api/runner/dependency-token" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const result = await handleDependencyTokenRequest({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          githubAppId: config.githubAppId,
+          githubAppPrivateKey: config.githubAppPrivateKey,
+          resolveMapping: (key) => getMappings()[key],
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[dependency-token] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Publication token vending — dedicated, single-use runner credential;
+    // returns a fresh token scoped to the exact repository signed at dispatch.
+    if (url === "/api/runner/publication-token" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const result = await handlePublicationTokenRequest({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          githubAppId: config.githubAppId,
+          githubAppPrivateKey: config.githubAppPrivateKey,
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[publication-token] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
       return;
     }
 
@@ -2369,7 +2958,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         res.end(JSON.stringify({ error: "Webhook endpoint not configured: GITHUB_WEBHOOK_SECRET is not set" }));
         return;
       }
-      handleGitHubWebhook(req, res, config.githubWebhookSecret, config.githubAppId, config.githubAppPrivateKey).catch((err) => {
+      handleGitHubWebhook(req, res, config.githubWebhookSecret, config.githubAppId, config.githubAppPrivateKey, config.selfDeployTarget ?? undefined).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -2411,6 +3000,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
             const mapping = getMappings()[mappingTeamKey];
             if (!mapping) return null;
             return await registry.forMapping(mapping);
+          },
+          watchdogConfig: {
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            notifyType: config.notifyType,
+            notifyWebhookUrl: config.notifyWebhookUrl,
           },
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
@@ -2539,12 +3134,135 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
       return;
     }
 
-    // Admin routes
-    if (url === "/admin" || url.startsWith("/api/")) {
-      if (!config.adminAccessCode) {
+    // MCP well-known metadata endpoints (public — no auth required)
+    if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        return;
+      }
+      handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
+      return;
+    }
+    if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        return;
+      }
+      handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
+      return;
+    }
+
+    // MCP OAuth routes — dynamic client registration, authorization, token exchange
+    if (pathname.startsWith("/mcp/")) {
+      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        return;
+      }
+      if (pathname === "/mcp/register" && req.method === "POST") {
+        handleMcpClientRegistration(req, res).catch((err) => {
+          console.error("[mcp-oauth] register error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      if (pathname === "/mcp/authorize" && req.method === "GET") {
+        handleMcpAuthorize(req, res, config.oauthRedirectBaseUrl).catch((err) => {
+          console.error("[mcp-oauth] authorize error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      const callbackMatch = pathname.match(/^\/mcp\/callback\/([^/]+)$/);
+      if (callbackMatch && req.method === "GET") {
+        const [, providerId] = callbackMatch;
+        handleMcpOidcCallback(req, res, providerId, config.oauthRedirectBaseUrl).catch((err) => {
+          console.error("[mcp-oauth] callback error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      if (pathname === "/mcp/token" && req.method === "POST") {
+        handleMcpTokenRequest(req, res).catch((err) => {
+          console.error("[mcp-oauth] token error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+    }
+
+    // MCP endpoint — OAuth bearer token authenticated
+    if (pathname === "/mcp") {
+      handleMcpRequest(req, res, config.kgSidecarUrl, config.oauthRedirectBaseUrl).catch((err) => {
+        console.error("[mcp] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // OAuth / SSO — its own auth model (public providers endpoint + the OAuth flow);
+    // mounted before the admin 503-gate so it works when ADMIN_ACCESS_CODE is unset.
+    if (url.startsWith("/api/auth/")) {
+      // `secure` reflects the real scheme from Fly's proxy-set x-forwarded-proto.
+      // The app is only reachable through that proxy, so the header is trusted; don't copy this to a directly-exposed server.
+      const secure = String(req.headers["x-forwarded-proto"] ?? "").includes("https");
+
+      if (pathname === "/api/auth/providers" && req.method === "GET") {
+        handleOAuthProviders(res, config.adminAccessCode !== null);
+        return;
+      }
+      if (pathname === "/api/auth/logout" && req.method === "POST") {
+        handleOAuthLogout(req, res, secure);
+        return;
+      }
+      const m = pathname.match(/^\/api\/auth\/([^/]+)\/(start|callback)$/);
+      if (m && req.method === "GET") {
+        const [, providerId, action] = m;
+        if (!config.oauthRedirectBaseUrl) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "OAuth is not configured (OAUTH_REDIRECT_BASE_URL is unset)." }));
+          return;
+        }
+        const oauthResult = action === "start"
+          ? handleOAuthStart(req, res, providerId, config.oauthRedirectBaseUrl)
+          : handleOAuthCallback(req, res, providerId, config.oauthRedirectBaseUrl, secure);
+        oauthResult.catch((err) => {
+          console.error("[oauth] Unhandled error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+          }
+        });
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+
+    // Admin routes - match on the path only, so query params can still be read when needed
+    if (url.split("?")[0] === "/admin" || url.startsWith("/api/")) {
+      if (!config.adminAccessCode && !isOAuthConfigured()) {
         res.writeHead(503, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
-          error: "Admin UI is disabled because the ADMIN_ACCESS_CODE secret is not set. Set it and redeploy to enable the admin UI.",
+          error: "Admin UI is disabled. Configure SSO (OAuth providers + the OAUTH_ALLOWED_* allowlist) or set ADMIN_ACCESS_CODE, then redeploy to enable the Admin UI.",
         }));
         return;
       }
@@ -2555,12 +3273,14 @@ function startServer(config: AppConfig, registry: ProviderRegistry): http.Server
         flySessionsRegion: config.flySessionsRegion,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
-      }, registry)) return;
+        notifyWebhookUrl: config.notifyWebhookUrl,
+      }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget })) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
-  });
+  };
+  const server = http.createServer(withRequestErrorBoundary(handleRequest));
 
   server.listen(config.healthPort, () => {
     console.log(`[server] Listening on port ${config.healthPort}`);
@@ -2578,9 +3298,18 @@ async function main(): Promise<void> {
   // Initialize DB tables before loadConfig() so DB-backed settings are readable on first boot
   initMappingsTable();
   initLogTable();
+  initDispatchBreakerTable();
+  sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
   initReconciliationTable();
   initStepLogTable();
+  initMcpOAuthTables();
+
+  // A process that died mid-deploy must not leave dispatch paused forever.
+  const holdWasSet = clearDeployHold();
+  if (holdWasSet) {
+    console.warn("[main] Cleared a hold left by the previous deployment process, resuming paused dispatches...");
+  }
 
   const config = loadConfig();
 
@@ -2630,6 +3359,13 @@ async function main(): Promise<void> {
 
   const server = startServer(config, registry);
 
+  // Fire-and-forget: a hanging webhook must not delay reconciliation or the first poll.
+  // Every write postBootNotice makes — LAST_IMAGE_REF_KEY, LAST_SHUTDOWN_AT_KEY and
+  // DEPLOY_OUTCOME_KEY — happens synchronously before its first await, so nothing is lost
+  // if the webhook never answers. Keep it that way: a write moved below an await here stops
+  // persisting silently and misclassifies every later boot.
+  void postBootNotice(config, { holdWasSet });
+
   // Reconcile machines from any previous run before starting the poll loop
   await startupReconciliation(config, registry);
 
@@ -2641,26 +3377,43 @@ async function main(): Promise<void> {
     poll(config, registry);
   }, config.pollIntervalMs);
 
-  // Graceful shutdown
-  const shutdown = (signal: string) => {
+  // total amount of time allotted for a graceful shutdown, otherwise the shutdown is forced
+  const SHUTDOWN_BUDGET_MS = 10_000; // 10s
+  // Fly can send a second signal before the first shutdown finishes. The latch needs no
+  // reset: the forced-exit timer below is armed before any await, so the process always dies.
+  let shuttingDown = false;
+  const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
+    if (shuttingDown) {
+      console.log(`[main] Received ${signal} while already shutting down; ignoring`);
+      return;
+    }
+    shuttingDown = true;
     console.log(`[main] Received ${signal}, shutting down...`);
     clearInterval(interval);
+
+    // forced exit armed before any awaiting, so shutdowns aren't dependent on notifications settling
+    setTimeout(() => {
+      console.error(`[main] Forced shutdown after timeout`);
+      closeDb();
+      process.exit(1);
+    }, SHUTDOWN_BUDGET_MS).unref();
+
+    // Written before closeDb() so the next boot can measure how long we were gone.
+    recordShutdown();
+    await Promise.race([
+      postShutdownNotice(config),
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
+    ]);
+
     server.close(() => {
       closeDb();
       console.log(`[main] Shutdown complete`);
       process.exit(0);
     });
-
-    // Force exit after 10 seconds if graceful shutdown hangs
-    setTimeout(() => {
-      console.error(`[main] Forced shutdown after timeout`);
-      closeDb();
-      process.exit(1);
-    }, 10_000).unref();
   };
 
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+  process.on("SIGINT", () => { void shutdown("SIGINT"); });
 }
 
 main().catch((err) => {

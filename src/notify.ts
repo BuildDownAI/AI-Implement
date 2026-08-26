@@ -45,12 +45,61 @@ export interface CompletionNotification {
   docsUrl?: string;
 }
 
+export interface DeployNotification {
+  kind: "shutdown" | "deployed" | "restarted" | "available";
+  appName: string;
+  region: string | null;
+  imageRef: string | null; // Full FLY_IMAGE_REF, only the deployment-<id> tag is displayed.
+  downtimeMs?: number | null; // Gap between the shutdown notice and the boot that answered it, when both were observed.
+  commit?: string | null; // Only the "available" kind — there is no image to reference yet.
+  kgDegraded?: boolean; // True when embeddings were not built — /mcp serves lexical-only search.
+}
+
 // Human label for a run phase, reused across notification kinds (dispatch, completion, …).
 // Keyed on NotificationPhase, so widening that union is a compile error here until the new phase gets a label — no silent fallthrough.
 const PHASE_LABELS: Record<NotificationPhase, string> = {
   planning: "AI Planning",
   implementation: "AI Implementation",
   "dispatch-failed": "Dispatch Failed",
+};
+
+const DEPLOY_EVENTS: Record<DeployNotification["kind"], {
+  slackEmoji: string;
+  teamsIcon: string;
+  title: string;
+  summary: string;
+  broadcast: boolean
+}> = {
+  // Only the shutdown notice broadcasts since the boot notices answer it.
+  // (broadcasting those too would double-ping the channel per deploy)
+  shutdown: {
+    slackEmoji: ":warning:",
+    teamsIcon: "&#x26A0;",
+    title: "Orchestrator restarting",
+    summary: "Dispatches are paused until it returns.",
+    broadcast: true,
+  },
+  deployed: {
+    slackEmoji: ":rocket:",
+    teamsIcon: "&#x2705;",
+    title: "Orchestrator redeployed",
+    summary: "A new version is live and polling.",
+    broadcast: false,
+  },
+  restarted: {
+    slackEmoji: ":white_check_mark:",
+    teamsIcon: "&#x21BB;",
+    title: "Orchestrator back up",
+    summary: "Same version — a restart, not a new deploy.",
+    broadcast: false,
+  },
+  available: {
+    slackEmoji: ":arrow_up:",
+    teamsIcon: "&#x2B06;",
+    title: "Deployment available",
+    summary: "Deploy from /admin#deployments when you are ready.",
+    broadcast: false,
+  },
 };
 
 export async function notifyStuckGiveUp(
@@ -102,6 +151,20 @@ export async function notifyCompletion(
     case "slack":
     default:
       return notifyCompletionSlack(webhookUrl, n);
+  }
+}
+
+export async function notifyDeploy(
+  type: string,
+  webhookUrl: string,
+  n: DeployNotification,
+): Promise<void> {
+  switch (type.toLowerCase()) {
+    case "teams":
+      return notifyDeployTeams(webhookUrl, n);
+    case "slack":
+    default:
+      return notifyDeploySlack(webhookUrl, n);
   }
 }
 
@@ -290,6 +353,182 @@ async function notifyCompletionSlack(
   }
 }
 
+async function notifyCompletionTeams(
+  webhookUrl: string,
+  n: CompletionNotification,
+): Promise<void> {
+  const icon = completionTeamsIcon(n.status);
+  const label = completionLabel(n.status, n.phase);
+
+  const facts = [
+    {
+      title: "Issue",
+      value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})`,
+    },
+    {
+      title: "Repo",
+      value: n.repoFullName,
+    },
+  ];
+  if (n.prUrl) {
+    facts.push({ title: "PR", value: `[View Pull Request](${n.prUrl})` });
+  }
+  if (n.runUrl) {
+    facts.push({ title: "Run", value: `[View Workflow Run](${n.runUrl})` });
+  }
+  if (n.durationMs != null) {
+    facts.push({ title: "Duration", value: formatDuration(n.durationMs) });
+  }
+
+  const classification: string[] = [];
+  if (n.summary) classification.push(n.summary);
+  if (n.detail) classification.push(n.detail);
+  if (n.remediation) classification.push(`**Next step:** ${n.remediation}`);
+  if (n.docsUrl) classification.push(`[Troubleshooting guide](${n.docsUrl})`);
+
+  const card = {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        content: {
+          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: [
+            {
+              type: "TextBlock",
+              text: `${icon} ${label}`,
+              weight: "Bolder",
+              size: "Medium",
+            },
+            {
+              type: "FactSet",
+              facts,
+            },
+            ...(classification.length
+              ? [{
+                  type: "TextBlock",
+                  text: classification.join("\n\n"),
+                  wrap: true
+                }]
+              : []),
+          ],
+        },
+      },
+    ],
+  };
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(card),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Teams webhook failed: ${res.status} — ${body}`);
+  }
+}
+
+// ---------- Deploy lifecycle notifications ----------
+
+/** extracts the tag from `registry.fly.io/my-app:deployment-01H9RK…` → `deployment-01H9RK…` */
+function imageTag(imageRef: string | null): string | null {
+  if (!imageRef) return null;
+  return imageRef.slice(imageRef.lastIndexOf(":") + 1) || imageRef;
+}
+
+// The shutdown notice runs in the outgoing process, so its ref is the version being replaced:
+// printing it would be ambiguous (two differing versions for same deploy, same version twice for a restart)
+function displayedVersion(n: DeployNotification): string | null {
+  // An availability notice names the commit that is waiting; no image exists yet.
+  if (n.kind === "available") return n.commit ? n.commit.slice(0, 7) : null;
+  return n.kind === "shutdown" ? null : imageTag(n.imageRef);
+}
+
+async function notifyDeploySlack(webhookUrl: string, n: DeployNotification): Promise<void> {
+  const event = DEPLOY_EVENTS[n.kind];
+  const mention = event.broadcast ? "<!channel> " : "";
+
+  const details = [`App: \`${n.appName}\``];
+  if (n.region) details.push(`Region: \`${n.region}\``);
+  const version = displayedVersion(n);
+  if (version) details.push(`Version: \`${version}\``);
+  if (n.downtimeMs != null) details.push(`Down for ${formatDuration(n.downtimeMs)}`);
+
+  let text = `${event.slackEmoji} ${mention}*${event.title}* — ${event.summary}\n${details.join(" · ")}`;
+  if (n.kgDegraded) text += "\n⚠️ KG embeddings missing — /mcp is lexical-only";
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text,
+          },
+        },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Slack webhook failed: ${res.status} — ${body}`);
+  }
+}
+
+async function notifyDeployTeams(webhookUrl: string, n: DeployNotification): Promise<void> {
+  const event = DEPLOY_EVENTS[n.kind];
+
+  // No mention syntax: Teams has no incoming-webhook equivalent, and `<!channel>`
+  // would render literally in the card.
+  const facts = [{ title: "App", value: n.appName }];
+  if (n.region) facts.push({ title: "Region", value: n.region });
+  const version = displayedVersion(n);
+  if (version) facts.push({ title: "Version", value: version });
+  if (n.downtimeMs != null) facts.push({ title: "Down for", value: formatDuration(n.downtimeMs) });
+
+  const cardBody: unknown[] = [
+    { type: "TextBlock", text: `${event.teamsIcon} ${event.title}`, weight: "Bolder", size: "Medium" },
+    { type: "TextBlock", text: event.summary, wrap: true },
+    { type: "FactSet", facts },
+  ];
+  if (n.kgDegraded) {
+    cardBody.push({ type: "TextBlock", text: "⚠️ KG embeddings missing — /mcp is lexical-only", wrap: true });
+  }
+
+  const card = {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        content: {
+          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: cardBody,
+        },
+      },
+    ],
+  };
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(card),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Teams webhook failed: ${res.status} — ${body}`);
+  }
+}
+
 // ---------- Reaper burst alerts ----------
 
 async function notifyStuckGiveUpSlack(
@@ -417,84 +656,6 @@ async function notifyReaperBurstTeams(
                 { title: "Threshold", value: String(n.threshold) },
               ],
             },
-          ],
-        },
-      },
-    ],
-  };
-
-  const res = await fetch(webhookUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(card),
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Teams webhook failed: ${res.status} — ${body}`);
-  }
-}
-
-async function notifyCompletionTeams(
-  webhookUrl: string,
-  n: CompletionNotification,
-): Promise<void> {
-  const icon = completionTeamsIcon(n.status);
-  const label = completionLabel(n.status, n.phase);
-
-  const facts = [
-    {
-      title: "Issue",
-      value: `[${n.issueIdentifier}: ${n.issueTitle}](${n.issueUrl})`,
-    },
-    {
-      title: "Repo",
-      value: n.repoFullName,
-    },
-  ];
-  if (n.prUrl) {
-    facts.push({ title: "PR", value: `[View Pull Request](${n.prUrl})` });
-  }
-  if (n.runUrl) {
-    facts.push({ title: "Run", value: `[View Workflow Run](${n.runUrl})` });
-  }
-  if (n.durationMs != null) {
-    facts.push({ title: "Duration", value: formatDuration(n.durationMs) });
-  }
-
-  const classification: string[] = [];
-  if (n.summary) classification.push(n.summary);
-  if (n.detail) classification.push(n.detail);
-  if (n.remediation) classification.push(`**Next step:** ${n.remediation}`);
-  if (n.docsUrl) classification.push(`[Troubleshooting guide](${n.docsUrl})`);
-
-  const card = {
-    type: "message",
-    attachments: [
-      {
-        contentType: "application/vnd.microsoft.card.adaptive",
-        content: {
-          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
-          type: "AdaptiveCard",
-          version: "1.4",
-          body: [
-            {
-              type: "TextBlock",
-              text: `${icon} ${label}`,
-              weight: "Bolder",
-              size: "Medium",
-            },
-            {
-              type: "FactSet",
-              facts,
-            },
-            ...(classification.length
-              ? [{
-                  type: "TextBlock",
-                  text: classification.join("\n\n"),
-                  wrap: true 
-                }]
-              : []),
           ],
         },
       },

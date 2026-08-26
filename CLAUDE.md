@@ -1,15 +1,36 @@
+<!--
+  MAINTAINER NOTE — why this file is short, and how to keep it that way.
+
+  CLAUDE.md is loaded into EVERY Claude invocation: implement and review on each
+  feedback-loop iteration, plus every post-push-review fix pass. Length is a
+  correctness lever, not tidiness — Claude Code's own guidance is to target under
+  200 lines, because a longer file reduces adherence to what it says.
+
+  So the rule for what belongs here: keep what an agent CANNOT derive by reading
+  the repo — pitfalls, rationale, why-nots, and conventions that differ from tool
+  defaults. Anything derivable (directory trees, exhaustive field tables,
+  architecture narration) belongs in docs/ behind a "Full reference:" link, or
+  nowhere.
+
+  These HTML comments are stripped before the file reaches the model, verified
+  empirically — so maintainer notes here are free to the agent, and visible to
+  whoever reads the file to edit it. Use them rather than prose for guidance
+  aimed at humans.
+
+  Before adding a section, ask whether `ls` or one file-read would answer it. If
+  so, don't.
+-->
+
 # AI-Implement — Codebase Guide
 
-## What this is
+A Node.js service that polls Linear or Jira for issues labeled `AI-Implement` and dispatches containerized runs of Claude Code to implement them. It also serves an admin UI and manages the workflow templates synced to target repos.
 
-A Node.js service that polls Linear for issues labeled "AI-Implement" and dispatches GitHub Actions workflows that run Claude Code to implement them. It also provides an admin UI and manages workflow templates synced to target repos.
+## Issue tracker bindings
 
-## Issue tracker — Linear (BuildDown skills)
-
-Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, etc.):
+Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, etc.). These are read by name — keep the keys intact when editing.
 
 - tracker.kind: linear
-- MCP server: `linear-eudoxus` (project `.mcp.json`; pre-approved in `.claude/settings.json`)
+- MCP server: `linear-eudoxus` (declared in the project `.mcp.json`; **not** pre-approved — `.claude/` is gitignored and absent here, so each machine approves the server on first use)
 - Workspace: `eudoxus` (bound at OAuth time)
 - Team: `AII`  ← issues filed/listed/searched against this team
 - Team URL: https://linear.app/eudoxus/team/AII/overview
@@ -17,435 +38,258 @@ Bindings for the BuildDown skills (bd-build-up, bd-build-down, bd-summit-push, e
 - Implement label: `AI-Implement` (orchestrator pickup trigger)
 - Agent mention (PR comment re-trigger): `/ai-implement`
 
-> Note: a separate global `claude.ai Linear` connector is authenticated to the **oolidata** workspace.
-> `linear-eudoxus` is a distinctly-named project server with its own token on **eudoxus**, so the two
-> never collide.
+
+## Knowledge graph
+
+Bindings for the KG skills (bd-kg-search, kg recon — format: skills `plugin/skills/bd-shared/kg-binding.md`):
+
+> **Path note (skills PR #49):** the skills repo moved its shared docs from `docs/` into
+> `plugin/skills/bd-shared/`. Stubs remain at the old `docs/` paths, so old citations still
+> resolve. Use the `bd-shared/` path in new references.
+
+- kg.present:      true
+- kg.orchestrator: https://ai-implement-testing-orchestrator.fly.dev
+- kg.mcp_server:   orch-ai-implement-testing
+- kg.search_tool:  mcp__orch-ai-implement-testing__kg_hybrid_search
+- kg.source_repo:  BuildDownAI/knowledge-graph-ai-implement
+- kg.local_mcp_server:  ai-implement-kg
+- kg.local_search_tool: mcp__ai-implement-kg__kg_hybrid_search
+- kg.prefer:       orchestrator
+
+Project-specific orchestrator instances can override the bundled graph with `KG_SOURCE_REPO=owner/repo`.
+The value is a GitHub repo identifier, not a URL; see `docs/kg-sidecar.md`.
 
 ## Architecture
 
 ```
-Linear (AI-Implement label)
-    ↓ poll every 60s (src/index.ts)
-Node.js service on Fly.io
-    ↓ workflow_dispatch (src/github.ts)
-GitHub Actions in target repos (.github/workflows/claude-implement.yml)
-    ↓ anthropics/claude-code-action
-PR created → gap analysis posted → Linear updated
-    ↓ /ai-implement comment → orchestrator webhook (POST /api/github/webhook)
-Gap-fill run dispatched via orchestrator poll loop
+Linear / Jira  ──poll every 60s──▶  orchestrator (src/index.ts)
+                                          │
+                                          ▼  dispatch
+                     GitHub Actions │ Fly Machines │ local Docker
+                                          │
+                                          ▼  all three enter session/entrypoint.sh
+                                    runner container
+                                          │
+                              pipeline (src/pipeline/) runs the steps
+                                          │
+                                          ▼
+                        PR opened → review → callbacks → tracker updated
 ```
 
-## Project structure
+The runner never holds a ticketing credential. It reports through authenticated callbacks and the orchestrator performs every tracker write with its own.
 
-```
-src/
-  index.ts          — main entry: polling loop + HTTP server
-  linear.ts         — Linear GraphQL client
-  github.ts         — GitHub workflow_dispatch
-  notify.ts         — notification adapter (slack | teams)
-  config.ts         — SQLite-backed team→repo mappings
-  dedup.ts          — SQLite deduplication + DB singleton
-  poll-selection.ts — per-team capacity selection logic
-  log.ts            — dispatch audit log (SQLite)
-  admin.ts          — admin HTTP API (auth + CRUD)
-  admin-html.ts     — re-exports the assembled admin HTML from admin-ui/index.ts
-  admin-ui/         — string-composed admin SPA (see "admin-ui" section below)
-  __tests__/        — Vitest unit tests
+## Subsystem index
 
-workflows/          — templates synced to target repos
-  claude-implement.yml
-  comment-trigger.yml    — legacy comment trigger (kept for legacy-generation repos; removed from envelope repos by sync)
-  claude-plan.yml   — planning workflow template (always synced)
-  WORKFLOW.md       — Claude implementation prompt template (seeded once)
-  PLANNING.md       — Claude planning prompt template (seeded once)
-  custom/           — repo-local override scaffold seeded once (README + .gitkeep placeholders)
+Entry points for areas that are easy to miss. Each names the module to start from; the ones with references have depth behind them.
 
-clients/            — one .toml per deployed client
-  example-client.toml  — copy this to onboard a new client
-
-scripts/
-  provision-client.sh  — interactive client onboarding helper
-
-.github/workflows/
-  deploy-clients.yml — matrix deploy to all clients on push to main
-  sync-workflow.yml  — sync workflow templates to target repos
-  claude-review.yml  — Claude reviews PRs (auto for same-repo, /claude-review for forks)
-  build-runner.yml   — build and push the session runner image to GHCR
-
-docs/
-  plans/      — implementation plans (decision artifacts; progress derived from git)
-  solutions/  — documented solutions to past problems (bugs, best practices, workflow
-                patterns), by category with YAML frontmatter (module, tags, problem_type);
-                relevant when implementing or debugging in documented areas
-```
+| Subsystem | Start at | Reference |
+|---|---|---|
+| Pipeline, steps, custom overrides | `src/pipeline/` | [docs/pipeline-architecture.md](docs/pipeline-architecture.md) |
+| Review findings → fix dispatches | `src/review-fix-queue.ts` | [docs/review-fix-rail.md](docs/review-fix-rail.md) |
+| Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
+| Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
+| Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
+| Knowledge graph end-to-end (ingest → snapshot → image → serve) | `Dockerfile` KG stages, `docker-entrypoint.sh` | [docs/kg-architecture.md](docs/kg-architecture.md) |
+| KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
+| Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
+| Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
+| Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
+| Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | |
+| Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
+| Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | |
+| `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | |
+| Stuck-run recovery | `src/reaper.ts`, `src/stuck-watchdog.ts` | |
+| Per-team dispatch capacity | `src/poll-selection.ts` | |
+| Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
+| Admin SSO / OIDC | `src/oauth/`, `src/admin-session.ts` | |
+| Admin SPA | `src/admin-ui/` | |
 
 ## Running locally
 
 ```bash
-cp .env.example .env   # fill in LINEAR_CLIENT_ID + LINEAR_CLIENT_SECRET, GITHUB_PAT
+cp .env.example .env   # GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY are the only required pair
 npm install
-npm run dev            # runs src/index.ts via tsx
-npm run dev:local      # rebuilds local session image, then runs local Docker jobs
+npm run dev            # checks the Node major, loads .env when present, runs src/index.ts via tsx
+npm run dev:local      # rebuilds the local runner image, then runs dispatches in local Docker
 ```
 
-Health check: `curl http://localhost:8080/`
-Admin UI: `http://localhost:8080/admin` (requires ADMIN_ACCESS_CODE)
+Only the GitHub App pair is hard-required — `loadConfig` throws without it. Ticketing credentials are not: an absent Linear or Jira configuration logs a warning and skips that provider's mappings, so the orchestrator still boots and serves.
+
+Health check `curl http://localhost:8080/` · Admin UI `http://localhost:8080/admin` (needs an OAuth provider **or** `ADMIN_ACCESS_CODE`).
+
+Node is pinned to 24 (`engines`, `.tool-versions`). On a Node-major switch, `npm test` fails wholesale inside `getDb()` with a `NODE_MODULE_VERSION` mismatch — check which Node you are on before reaching for `npm rebuild better-sqlite3`, since the native modules are usually right and the shell is wrong.
+
+## Local dev harness
+
+`npm run dev:run` launches a single runner container against a local target-repo checkout — no orchestrator, no poll loop, no tracker. It is the only local path that can iterate on `WORKFLOW.md` and hook scripts, because it bind-mounts your working tree instead of cloning.
+
+```bash
+npm run dev:run -- --workspace ../target-repo --task task.md
+npm run dev:run -- --workspace ../target-repo --task task.md --until setup --shell
+```
+
+The task file is Markdown with front matter: `title` required; `identifier`, `maxTurns`, `maxIterations`, `repo`, `branch` optional.
+
+- `--until <step>` stops after that pipeline step, **including when the step is skipped**; an unknown step name fails before execution rather than falling through to a full run. Since `setup` precedes `feedback-loop`, `--until setup` is a token-free hook loop.
+- `--shell` holds the container open at that boundary and attaches a shell in `/workspace`, with setup-hook `$GITHUB_ENV` exports loaded. Exiting collects artifacts, then removes the container.
+- **Mounted mode never pushes** — the mount is your live checkout, dirty by design, so a push would sweep in-progress work into the commit. The mutated tree is left for `git diff`.
+- The clone and install steps both detect mounted mode and no-op, so uncommitted edits take effect immediately and your `node_modules` is left alone.
+
+Per-run artifacts land in `.dev-runs/<timestamp>/` (gitignored): `run.log`, `changes.diff`, `diffstat.txt`, `telemetry.json`.
 
 ## Running tests
 
 ```bash
-npm test              # vitest run (all tests)
-npm run test:watch    # watch mode
-npm run typecheck     # tsc --noEmit
+npm test          # vitest run
+npm run typecheck # tsc --noEmit
 ```
 
-## SQLite databases
+**`typecheck` excludes `src/__tests__`, and vitest strips types without checking them** — so type errors in a test file are caught by nothing. Type-check a new test file explicitly with a throwaway tsconfig. `src/admin-ui/__tests__/` *is* covered and can break the build.
 
-All tables live in a single SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite` in production, `./dedup.sqlite` locally).
+## Data layer
 
-| Table | Purpose |
-|-------|---------|
-| `dispatched` | Dedup — issue IDs dispatched in the last 24h |
-| `mappings` | Team key → GitHub repo config |
-| `dispatch_log` | Audit log, last 500 dispatches |
+One SQLite file at `DEDUP_DB_PATH` (default `/data/dedup.sqlite`; `./dedup.sqlite` locally) holding 22 tables. `dedup.ts` owns the singleton — every other module imports `getDb` from it rather than opening its own handle.
 
-`dedup.ts` owns the DB singleton (`getDb()`). All other modules import `getDb` from `dedup.ts`.
+**Dedup has no TTL.** The `dispatched` table is a bare existence check with no retention logic: an entry clears only when something explicitly removes it — a failed or timed-out run, the reconcile loop reaching a terminal issue, or a manual delete. There is no time-based auto-retry. This is a recurring source of documentation errors claiming a 24-hour window; the only genuine 24-hour figure belongs to the reaper's summary statistic.
 
-## Key environment variables
+## Environment variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `LINEAR_CLIENT_ID` | Yes | Linear OAuth app client ID (client-credentials grant) |
-| `LINEAR_CLIENT_SECRET` | Yes | Linear OAuth app client secret |
-| `GITHUB_APP_ID` | Yes | GitHub App numeric ID |
-| `GITHUB_APP_PRIVATE_KEY` | Yes | GitHub App RSA private key (PEM, `\n`-escaped) |
-| `NOTIFY_TYPE` | No | `slack` (default) or `teams` |
-| `NOTIFY_WEBHOOK_URL` | No | Webhook URL; notifications skipped if unset |
-| `ADMIN_ACCESS_CODE` | No | Admin UI password; UI disabled if unset |
-| `DEDUP_DB_PATH` | No | SQLite path (default `/data/dedup.sqlite`) |
-| `POLL_INTERVAL_MS` | No | Poll interval ms (default `60000`) |
-| `PORT` | No | HTTP port (default `8080`) |
-| `AI_IMPLEMENT_LOG_LEVEL` | No | Runner log verbosity: `summary` (default) or `stream`. `stream` tees per-turn tool activity to the log. Telemetry (turns/cost/tokens/outcome) is captured at both levels. |
+**`.env.example` is canonical** — it carries every orchestrator variable with grouped comments, and is kept in lockstep with the code. Consult it rather than a second list here.
+
+Only the non-obvious ones are worth restating:
+
+- `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` — the only pair that throws at boot when absent. Everything else warns and degrades a feature.
+- `RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET` — **not Fly-specific.** All three execution modes report through them; the GHA path receives the URL as a workflow input rather than an env var. Without them a planning run never reports completion and the issue stalls.
+- `OAUTH_ALLOWED_DOMAINS` / `OAUTH_ALLOWED_EMAILS` — fail-closed. Empty means deny everyone.
+- `KG_SIDECAR_URL` — unset degrades `/mcp`, but an unauthenticated probe still gets **401** and cannot detect it. Only an unset `OAUTH_REDIRECT_BASE_URL` 503s every caller.
+- `AI_IMPLEMENT_LOG_LEVEL`, `AI_IMPLEMENT_RUNNER_LABEL`, `AI_IMPLEMENT_PROVIDER` — repo/org **Actions variables**, not orchestrator env, and effective only after the target repo re-syncs `claude-implement.yml`. `LOG_LEVEL` is `summary` (one result line per invocation — outcome, turns, duration, cost, tokens) or `stream` (additionally tees each tool call, not its output); telemetry is captured at both. `RUNNER_LABEL` overrides `runs-on`, default `ubuntu-latest` — pointing it at a larger runner roughly halves the CPU-bound implement job, but **write access to that variable lets the holder retarget the job to an arbitrary self-hosted runner that would then see the job's secrets.**
+- `AI_IMPLEMENT_SOURCE_COMMIT` / `_REPO` / `_BRANCH` — **stamped by the image build, not set by an operator** (`Dockerfile` build args). Self-deploy compares the stamp against the branch head, so an image built without all three goes inert and reports availability as *unknown*, never as up to date — a hand-run `fly deploy` that omits them silently disables the feature. No webhook or inbound reachability is needed; those only cut detection latency from one poll cycle to seconds.
+- `FLY_DEPLOY_TOKEN` — the orchestrator's own deploy credential, distinct from `FLY_SESSIONS_TOKEN`, which is scoped to the sessions app and cannot deploy the orchestrator. Scope it to the single app it deploys. The app name needs no variable: Fly injects `FLY_APP_NAME` into every machine, so an orchestrator can only ever deploy itself.
+
+Adding or renaming a variable means updating `.env.example` in the same change; it is the operator's only discovery surface.
 
 ## Adding a new target repo
 
-1. Add the project mapping in the admin UI at `/admin` — the **New project** stepper (or **Edit** on an existing row). On the **Source** step, enter the owner/repo and click **Check installation**: the stepper probes whether the GitHub App is installed and can see the repo, and links straight to the fix when it can't —
-   - **App not installed** → "Install the App" (GitHub's install flow; org members who aren't owners get GitHub's "request the owner to install" path),
-   - **Repo not selected** → "Add this repo" (same install flow — adjusts the install's selected-repositories set),
-   - **Ready** → green confirmation.
+1. Add the mapping at `/admin` via the **New project** stepper. On the Source step, **Check installation** probes whether the App is installed and can see the repo, linking straight to the fix — install the App, or add the repo to an existing install. The check is advisory; you can save regardless.
+2. **Save.** The mapping persists immediately and sync runs in the background, polling to a terminal state. The mapping is saved however the sync resolves.
+3. Merge the sync PR in the target repo.
 
-   Use **Re-check** after installing/adding in the opened tab. The check is advisory — you can still save without it.
-2. **Save.** The mapping persists immediately, and the workflow sync runs in the background. The project row's Sync button shows **"Syncing…"**, then polls a status endpoint to a terminal state: **"Workflows synced — PR opened ↗"** (or a transient "Up to date"), or it reverts with an alert naming the failure (App not installed, permission denied, clock skew, …). The mapping is saved regardless of how the sync resolves.
-3. Merge the sync PR in the target repo
-4. Enable "Allow GitHub Actions to create and approve pull requests" in the target repo settings
+The GitHub App needs **Workflows** permission alongside **Contents** — GitHub rejects writes under `.github/workflows/` without it, and the sync fails with "permission denied" before opening its PR. If the orchestrator restarts mid-sync, the poll loop reclaims the orphaned job after a stale window.
 
-The **Sync workflows** button on each project row re-runs the sync manually at any time, and `.github/workflows/sync-workflow.yml` remains as a manual/bulk fallback. If the orchestrator restarts mid-sync, the poll loop reclaims the orphaned job after a short stale window and finishes it.
+The target repo's "Allow GitHub Actions to create and approve pull requests" toggle is **not** a prerequisite, despite older instructions saying so. Every synced workflow opens PRs with a **GitHub App token**, while that toggle governs the default `github-actions[bot]` actor — a different identity. Leaving it on is harmless; the real prerequisite is the App installed with contents, pull-requests, and workflows permissions.
 
-The GitHub App must have **Workflows** permission in addition to **Contents** permission. GitHub rejects writes under `.github/workflows/` without it, so the sync will fail (surfaced as a "permission denied" message) before opening or updating the target-repo PR.
-
-
-## admin-ui
-
-The admin SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/`. `src/admin-html.ts` is a thin re-export of `src/admin-ui/index.ts`. There is **no client-side build step** — all client JS is concatenated into a single inline `<script>` block at module load time.
-
-| Module | Owns |
-|---|---|
-| `tokens.ts` | CSS custom properties (light + dark + accent + spacing + type + radius + shadow) |
-| `components.ts` | All component classes (`.card`, `.tbl`, `.btn`, `.badge`, `.kpi`, `.alert`, `.drawer`, `.modal-card`, etc.) |
-| `icons.ts` | SVG icon registry + `icon(name, size)` helper |
-| `sidebar.ts` | Sidebar render + `SIDEBAR_ROUTES` |
-| `router.ts` | Hash-based router; `window.registerPage(key, init)` runs an init once on first show |
-| `theme.ts` | Reads/writes `data-theme` from localStorage; default `dark` |
-| `auth.ts` | Shared auth: `window.api()`, `window.esc()`, `window.login()`, `window.logout()`, token storage |
-| `pages/<name>.ts` | One per sidebar item — exports `<name>Html` and `<name>Script` strings |
-
-Page conventions: each `<name>.ts` exports two strings. The HTML uses `data-page="<route>"` matching the sidebar's `data-route`. The script is an IIFE that defines page-specific functions, exposes any `onclick=`-referenced ones on `window`, and ends with `window.registerPage('<route>', () => { /* init */ });`. Page scripts call `window.api()` and `window.esc()` rather than referencing them as bare globals.
-
-When adding a new page: create the page module, append both strings to the lists in `src/admin-ui/index.ts`, and add the route to `sidebar.ts`. When adding a new design token: extend `tokens.ts` and the `tokens.test.ts` spot-check. When adding a new icon: drop the SVG inner markup into `iconRegistry`.
-
-Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still stubbed in `src/admin-ui/pages/stubs.ts` with "Coming soon" placeholders (badged "Not implemented yet" or "Partially implemented") that explain what exists today and link to the related built pages.
-
-## Notification adapter
-
-`src/notify.ts` exports a single `notify(type, webhookUrl, notification)` function. Set `NOTIFY_TYPE=slack` or `NOTIFY_TYPE=teams` to switch providers. Adding a new provider means adding a private function in `notify.ts` and a new case in the switch.
+`.github/workflows/sync-workflow.yml` remains a manual bulk fallback, but normal distribution happens from the orchestrator.
 
 ## Workflow templates
 
-`workflows/claude-implement.yml` is the main implementation workflow synced to target repos. It supports:
-- **WORKFLOW.md** — per-repo Claude prompt template; front matter carries `model:` (required for bedrock, defaults to `claude-sonnet-4-6` for anthropic) and optional `gap_analysis_model:`
-- **Gap analysis** — secondary Claude invocation after each PR
-- **Unapproved runs → draft PR** — when the implement/review feedback loop exhausts its iterations (or a pass hits the hard `max_turns` cap) without reviewer approval, the pipeline still pushes the working tree and opens a **draft PR** whose body carries the reviewer's final feedback, per-pass turn/cost stats, and (on `max_turns`) a read-only post-mortem. The runner reports the run as a coded failure (`REVIEW_UNAPPROVED` or `MAX_TURNS_EXHAUSTED`, with the draft-PR URL) so the ticket is updated and notifications fire; a run-autopsy comment is posted to the ticket; the GHA job stays green with a `::warning::` annotation. If the repo plan rejects draft PRs (422), the PR is opened normally with the title prefix `[NEEDS REVIEW — unapproved]`.
-- **Comment trigger** — a PR comment that **starts with** `/ai-implement` on an envelope-generation repo is handled by the orchestrator webhook (`POST /api/github/webhook`). The orchestrator verifies the commenter has write/maintain/admin permission on the repo, posts a 👀 reaction as acknowledgement, and enqueues a gap-fill dispatch that runs through the same unified dispatch path as orchestrator-initiated runs. Any text after the `/ai-implement` token is forwarded as an operator instruction (rides `run_config.commentInstruction`). `/ai-implementfoo` and comments that merely contain the token mid-text do not fire. Legacy repos (whose `claude-implement.yml` does not have a `run_config:` input) are silently ignored by the webhook; they continue to use `comment-trigger.yml` if it is still present in the target repo.
-- **Triple auth** — bedrock (when orchestrator sets `provider=bedrock`), OAuth (`CLAUDE_CODE_OAUTH_TOKEN`), or API key (`ANTHROPIC_API_KEY`)
-- **setup / verify / teardown hooks** — `WORKFLOW.md` front-matter keys `setup:` / `verify:` / `teardown:` are paths (relative to repo root) to shell scripts that the runner now executes: `setup` before the implement loop (its failure aborts the run early), `verify` after a successful push, and `teardown` always (even on failure, via a `finally` in the runner). Scripts run with `set -euo pipefail`; env vars a setup script appends via `echo "VAR=value" >> "$GITHUB_ENV"` are visible to Claude and to the verify/teardown scripts (the runner manages `$GITHUB_ENV` across all execution modes). Repos with no hooks behave exactly as before.
+`workflows/claude-implement.yml` and `claude-plan.yml` are synced to target repos; `WORKFLOW.md` and `PLANNING.md` are **seeded once and never overwritten**, so every repo keeps whatever template it was created with. Sync also *removes* `comment-trigger.yml`, since the orchestrator webhook now handles `/ai-implement` for envelope repos.
 
-### Operational prerequisites (webhook-based /ai-implement)
+That seed-once rule has a consequence worth internalising: **a template correction never reaches an existing repo.** Fixing a bug in `workflows/WORKFLOW.md` fixes it for repos onboarded afterward and for nobody else.
 
-The orchestrator handles `/ai-implement` PR comments directly via `POST /api/github/webhook`. Three prerequisites must be met before comment-triggered gap-fill runs work for a repo:
+Non-obvious behaviour:
 
-- **GitHub App subscribed to `issue_comment`** — add `issue_comment` to the App's webhook event subscriptions (GitHub App settings). Without this, comment events are never delivered.
-- **`GITHUB_WEBHOOK_SECRET` set** — the orchestrator verifies HMAC-SHA256 signatures on every delivery; set the same secret value in both the App webhook configuration and the orchestrator's environment. Deliveries with an invalid or missing signature are rejected 401.
-- **Orchestrator publicly reachable** — Fly deployments expose a public HTTPS endpoint by default. For local development, a tunnel is required (see [AII-115](https://linear.app/eudoxus/issue/AII-115)); the orchestrator must be reachable from GitHub's webhook IPs.
-- **Envelope-generation target repo** — only repos whose `claude-implement.yml` has a `run_config:` input receive orchestrator-dispatched gap-fill runs. Legacy repos are silently ignored; they still use `comment-trigger.yml` if present.
+- **Model IDs pass through verbatim**, and nothing validates them against the provider. A Bedrock mapping with an Anthropic-style `model:` fails at Claude invocation time rather than at dispatch. Per-phase model selection lives in `.ai-implement/config.yml`, not front matter.
+- **Prompt assembly** — the runner uses `WORKFLOW.md`'s body with front matter and HTML comments stripped and `${UPPER_SNAKE}` substituted, then appends its own blocks. Any *unrecognised* `${TOKEN}` becomes an empty string, so a shell example containing one is silently blanked. Never put `${PLANNING_CONTEXT}` in the body: it is substituted *and* appended, emitting the block twice.
+- **The pipeline owns repository writes on every autonomous run.** Initial runs create the branch, commit, push, and PR. Gap-fill runs leave the existing PR branch checked out, then the pipeline commits and pushes reviewed changes to it. Templates must tell the agent to leave changes uncommitted in both modes.
+- **Unapproved runs still ship** as a draft PR carrying the reviewer's final feedback and per-pass stats, reported as a coded failure (`REVIEW_UNAPPROVED` / `MAX_TURNS_EXHAUSTED`) so the ticket updates and notifications fire, while the GHA job stays green with a `::warning::`. If the repo plan rejects draft PRs (422), it opens normally prefixed `[NEEDS REVIEW — unapproved]`.
+- **Hooks work in every execution mode.** `setup` / `verify` / `teardown` front-matter paths run around the implement loop — setup failure aborts early, teardown always runs. All three modes enter through `session/entrypoint.sh`, which populates the workspace before the runner starts.
+- **Planning writes files, it does not post.** A planning run writes `ai-output/comments/NN-*.md`; the orchestrator posts them to the ticket. Runner-written files are collected in lexicographic order — avoid the `90-` prefix, which the run autopsy uses.
 
-### Workflow envelope (run_config)
+`/ai-implement` comment handling requires the App subscribed to `issue_comment`, `GITHUB_WEBHOOK_SECRET` set on both sides, a publicly reachable orchestrator, and an envelope-generation target repo. Legacy repos are silently ignored.
 
-`claude-implement.yml` exposes 7 top-level `workflow_dispatch` inputs. All issue fields, caps, branchPrefix, skillsRepo, sensitiveFiles, profiles, and planningContext ride inside the single `run_config` JSON blob (base64-encoded `RunConfigV1`); the remaining six inputs stay top-level because the workflow must `::add-mask::` or evaluate them before unpacking the envelope.
+## Per-project settings (admin UI)
 
-| Input | Required | Notes |
-|-------|----------|-------|
-| `run_config` | Yes | Base64-encoded `RunConfigV1` JSON envelope |
-| `runner_image` | No | Container image override (allowlist-validated) |
-| `job_timeout_minutes` | No | GHA job timeout in minutes (empty = 90) |
-| `provider` | No | `anthropic` (default) or `bedrock` |
-| `aws_region` | No | Required when `provider=bedrock` |
-| `run_token` | No | HMAC bearer token for result callback; empty skips callback |
-| `run_progress_token` | No | HMAC bearer token for progress callbacks |
+Editable per mapping; blank means the default.
 
-**`RunConfigV1` schema** — fields carried inside the envelope:
+| Field | Default | Notes |
+|---|---|---|
+| Max Turns | `50` | Claude turns per implement pass |
+| Max Iterations | bedrock `2`, anthropic `3` | implement/review cycles |
+| Job Timeout (min) | `90` | GHA only |
+| Branch Prefix | none | Path segment prepended to the implementation branch |
+| Sensitive Add / Allow Globs | none | Extends or un-blocks the push step's blocklist; **allow always wins** |
+| Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `v` | `1` | Version discriminant (must be 1) |
-| `issue` | `{ id, identifier, title, description }` | Required; description capped at 40,000 chars |
-| `prNumber` | string? | PR number for gap-fill or review passes |
-| `baseBranch` | string? | Feature-branch parent or repo default |
-| `runnerPhase` | `"implementation" \| "gap-analysis" \| "planning"` | Dispatch phase |
-| `branchPrefix` | string? | Optional path-segment prefix for the implementation branch |
-| `skillsRepo` | string? | Owner/repo or git URL for per-project skills |
-| `runnerCallbackUrl` | string? | Orchestrator callback URL for result posts |
-| `maxTurns` | number? | Claude turn cap |
-| `maxIterations` | number? | Implement/review cycle cap |
-| `commentInstruction` | string? | Operator instruction from `/ai-implement` comment |
-| `sensitiveFiles` | `{ add?: string[], allow?: string[] }` | Envelope-only guardrail config |
-| `profiles` | string[]? | Jira AI-Implement Profiles values |
-| `planningContext` | `{ parent?, siblings?, dependencies? }` | Planning context for child issues |
+Caps apply to re-dispatches, not just initial runs. Branch prefix affects only the initial run — gap-fill commits to the existing PR branch. Sensitive-file globs travel **exclusively** in the envelope, so a repo must be on envelope generation before setting them.
 
-**Dual-mode probe** — before every dispatch the orchestrator fetches the target repo's `claude-implement.yml` from the default branch and checks for a `run_config:` input declaration. If found, it uses the 7-input envelope contract; if not (or on any fetch error), it falls back to legacy per-field inputs. The probe result is cached per repo/workflow for 5 minutes (`CACHE_TTL_MS = 300_000`).
+On **legacy** repos only — those still carrying `comment-trigger.yml` — the repo variables `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, `AI_IMPLEMENT_MAX_JOB_MINUTES`, and `AI_IMPLEMENT_SKILLS_REPO` still cap comment-triggered gap-fill runs. They are deprecated and unnecessary once a repo is on envelope generation, where the mapping's own values ride the envelope instead.
 
-**Migration (re-sync once, then never again)** — a target repo migrates from the legacy contract to the envelope by running **Sync workflows** once. After the sync PR merges, all subsequent dispatches use the 7-input envelope automatically. No orchestrator restart or config change is needed.
+**Jira profiles** ride `run_config.profiles`, read from a multi-select custom field that must be named exactly `AI-Implement Profiles` unless `profilesFieldOverride` pins its ID. Option names must not contain commas — the contract is a comma-joined list. **No built-in step consumes profiles**; they exist as the contract surface for image-baked `custom/` steps.
 
-For the existing per-feature "must re-sync first" caveats: **legacy repos** continue to receive caps, branchPrefix, skillsRepo, and profiles as individual dispatch inputs (unchanged behavior); **envelope repos** carry all of these inside `run_config` and never see them as separate inputs.
+**Dependency Token Scope** runs on a deliberate two-token split. The **primary** token carries the App's full grants but is scoped to the target repository alone; the **dependency** token is installation-wide but strictly `contents: read`. The `dependency-auth` step fetches the second from `POST /api/runner/dependency-token`, installs it as a git credential helper for `github.com` and as `COMPOSER_AUTH`, and the helper re-mints it when under ten minutes remain. So the implementer can read sibling repos it needs and can never push to them.
 
-### Per-project run caps (admin UI)
+Two things to know before enabling it. The scope is **all-or-nothing** — the token reads every repository the App installation covers, not a chosen subset (a per-project list is a planned v2; the field is stored as text so a JSON array slots in without a migration). And it needs a **publicly reachable orchestrator**, since the token is fetched over the runner callback; runs dispatched without a progress token skip the fetch and proceed without private-dependency access rather than failing.
 
-Each project's mapping carries three optional caps, editable in the `/admin` Projects edit dialog (blank = use the default):
+> **Behaviour change for existing Fly deployments.** The Fly-mode `/api/token` endpoint used to mint a full-installation token. It now narrows the primary token to the target repository, matching the GHA path. A deployment that incidentally relied on org-wide primary-token access to read private sibling repos must set this field to restore it.
 
-| Field | Default when blank | Applies to |
-|-------|--------------------|------------|
-| **Max Turns** | `50` | Claude turns per implement pass (both providers) |
-| **Max Iterations** | bedrock `2`, anthropic `3` | implement/review cycles in the feedback loop |
-| **Job Timeout (min)** | `90` | GitHub Actions job `timeout-minutes` (GHA mode only) |
+## Per-repo configuration (`.ai-implement/config.yml`)
 
-`maxTurns`/`maxIterations` ride in `run_config` for envelope repos, or reach the runner as individual `workflow_dispatch` inputs for legacy repos (GHA) / runner env (Fly/local). `maxJobMinutes` is always a separate GHA `job_timeout_minutes` dispatch input. Caps apply to gap-fill and review-feedback re-dispatches, not just the initial run. For envelope repos, `/ai-implement` webhook-triggered gap-fill runs go through the orchestrator and inherit the same mapping caps automatically.
+Optional, in the target repo. Parsed with a real YAML parser; a missing file, malformed YAML, or an unexpected shape all resolve silently to "no config", so a typo disables a key rather than failing the run.
 
-> **Deprecated (legacy repos only):** `AI_IMPLEMENT_MAX_TURNS`, `AI_IMPLEMENT_MAX_ITERATIONS`, `AI_IMPLEMENT_MAX_JOB_MINUTES` — repo variables read by `comment-trigger.yml` to cap comment-triggered gap-fill runs on legacy-generation repos. Still honored where `comment-trigger.yml` is present. Not needed for envelope repos.
->
-> **Deprecated (legacy repos only):** `AI_IMPLEMENT_SKILLS_REPO` — repo variable that mirrored the per-project skills field for legacy `comment-trigger.yml` runs. Skills repo rides `run_config.skillsRepo` for envelope repos.
+| Key | Effect |
+|---|---|
+| `packageManager` | Overrides the install step's lockfile detection |
+| `models.implement` / `models.review` | Per-phase models |
+| `reviewProviders` | External review sources; `github-claude-code-review` is the only recognised value |
+| `reviewCheckNames` | Check-run names that identify the external review gate. Defaults to `review`, `code-review-plugin`, `claude-review`, `claude code review`, `claude-code-review`, plus any name containing both `claude` and `review`. A target repo with an unrelated CI job named `review` should set this to avoid that job becoming the review gate |
 
-### Per-project branch prefix (admin UI)
+**This is where per-phase model selection lives.** Both keys take precedence over `WORKFLOW.md`'s `model:` — the chain is `config.yml` → front matter → built-in default. Pairing a strong implement model with a cheap review model is the supported way to hold down review cost.
 
-Each project's mapping carries an optional **Branch Prefix** (blank = none, the default). When set, it is prepended as a path segment to the implementation branch name: with prefix `pr`, a branch that would be `ai-implement/PROJ-123-add-login` becomes `pr/ai-implement/PROJ-123-add-login`. Each `/`-separated segment of the prefix must start with a letter or digit and may otherwise contain only letters, digits, `.`, `_`, `-` (no `..` or `//`, ≤ 64 chars); the admin API rejects anything else.
+`reviewProviders` is **enabled when absent**. Two shapes disable collection quietly: an explicit empty list, and a list whose entries are all unrecognised (unknown names are filtered out, leaving empty).
 
-The prefix only affects the **initial orchestrator-driven run** — `/ai-implement` webhook-triggered gap-fill runs commit to the existing PR branch and are unaffected. For envelope repos, the prefix rides `run_config.branchPrefix`; for legacy repos, it is sent as a separate `branch_prefix` dispatch input (only when set — a legacy repo must have re-synced `claude-implement.yml` before setting a prefix, or GitHub rejects the dispatch with "unexpected inputs").
-
-### Jira: AI-Implement Profiles field (multi-select)
-
-When using the Jira provider, the orchestrator reads a multi-select custom field to populate `TicketIssue.profiles` on each dispatched issue. The field is discovered by name at runtime — **it must be named exactly `AI-Implement Profiles`** in your Jira instance for auto-discovery to work. If the field is absent the orchestrator logs a warning and continues without populating profiles (it does not fail).
-
-If the field exists under a different name, or if multiple fields share the same name, set `profilesFieldOverride` to the explicit `customfield_NNNNN` ID — via the **Profiles Field** dropdown in the `/admin` Projects edit dialog or the add-project wizard's Jira step, or directly on the mapping's `ticketingConfig` through the API. When all three overrides (`statusFieldOverride`, `repoFieldOverride`, `profilesFieldOverride`) are set, the orchestrator skips the `listFields` call entirely.
-
-At implementation-dispatch time the orchestrator embeds the issue's profiles (comma-joined) in `run_config.profiles` for envelope repos, or as a `profiles` workflow_dispatch input for legacy repos (only sent when non-empty; a legacy repo must have re-synced before setting profiles, or GitHub rejects the dispatch). Profile option names must not contain commas — the forwarding contract is a comma-joined list. The runner parses the value into `ctx.data.profiles`; **no built-in pipeline step consumes it** — it is the contract surface for image-baked `custom/` steps which branch their setup on the selected profiles. Profiles are per-issue: `/ai-implement` webhook-triggered gap-fill runs and review-feedback re-dispatches run without profiles (the initial profile-aware run already produced the PR they amend).
-
-### Runner log verbosity
-
-`AI_IMPLEMENT_LOG_LEVEL` controls how much the runner logs during an implement pass:
-- `summary` (default): logs a single result line per Claude invocation — outcome (incl. `max_turns`), turns, duration, cost (when reported), tokens.
-- `stream`: additionally tees each per-turn tool call (name + truncated input; not tool output) to the log.
-
-Set it as a repository or organization **variable** (Settings → Secrets and variables → Actions → Variables), mirroring `AI_IMPLEMENT_PROVIDER`. It is read inside the runner container, so it applies to both orchestrator-initiated and `/ai-implement` comment-triggered runs **after the target repo has re-synced `claude-implement.yml`**. It is not a per-project admin field and not a dispatch input.
-
-### Runner label (GHA mode)
-
-`AI_IMPLEMENT_RUNNER_LABEL` overrides the `runs-on` label for the `implement` job, defaulting to `ubuntu-latest`. Default GitHub-hosted runners are 2 vCPU; the test suites Claude runs during implement (and the verify-hook gauntlet) are CPU-bound and scale ~linearly with cores, so pointing this at a larger-runner label (e.g. `ubuntu-latest-4-cores`) roughly halves the implement job's wall-clock.
-
-Set it as a repository or organization **variable** (Settings → Secrets and variables → Actions → Variables), like `AI_IMPLEMENT_LOG_LEVEL`. It only affects the GitHub Actions execution mode and only after the target repo has re-synced `claude-implement.yml`. It takes a single label string, not a label array. Granting write access to this variable lets the holder retarget the job to an arbitrary (e.g. self-hosted) runner that would see the job's secrets — the same threat model as any org-variable-controlled `runs-on`.
-
-### Sensitive files (admin UI)
-
-Each project's mapping carries two optional glob-list fields, editable in the `/admin` Projects edit dialog:
-
-| Field | Effect |
-|-------|--------|
-| **Sensitive Add Globs** | Extends the built-in sensitive-file blocklist with additional picomatch glob patterns. Files matching these patterns cause the push step to abort with a `SENSITIVE_FILES_BLOCKED` error. |
-| **Sensitive Allow Globs** | Explicitly un-blocks files that would otherwise match. Allow wins over both the built-in list and any Add glob — if a file matches an allow glob, the push step never blocks it regardless of other patterns. |
-
-These globs are delivered **exclusively via the `run_config` envelope** (`sensitiveFiles.add` / `sensitiveFiles.allow`). They are not sent as legacy dispatch inputs. A project using sensitive file globs must therefore have re-synced `claude-implement.yml` to envelope generation before setting these fields.
-
-`workflows/claude-plan.yml` is the planning workflow synced to target repos. It runs read-only codebase analysis and posts structured planning comments to Linear when dispatched. It supports:
-- **PLANNING.md** — per-repo Claude prompt template; front matter carries `model:` (same rules as WORKFLOW.md)
-
-The Projects page **Sync workflows** action syncs `claude-implement.yml` (envelope generation) and `claude-plan.yml` into the target repo, and **removes** `comment-trigger.yml` from the target repo (the orchestrator webhook now handles `/ai-implement` comments for envelope repos). It seeds `WORKFLOW.md` and `PLANNING.md` once and never overwrites them. The `custom/` directory is an AI-Implement fork-local extension point; workflow sync never creates or modifies it in a target repository. `.github/workflows/sync-workflow.yml` remains as a manual fallback, but normal distribution should happen from the orchestrator.
-
-### Model IDs are passed through verbatim
-
-Neither workflow validates model IDs — whatever `model:` says in front matter goes directly to `claude-code --model`. This lets new Anthropic releases and Bedrock IDs (`anthropic.<name>-<date>-v1:0` or inference-profile ARNs) flow without a workflow template edit. Typos fail fast at Claude invocation time with a clear error. The seed `WORKFLOW.md` / `PLANNING.md` ship with `model: claude-sonnet-4-6`, so fresh target repos work out of the box on the Anthropic provider.
-
-### Using AWS Bedrock
-
-To run a target repo against AWS Bedrock instead of the Anthropic API, use the GitHub Actions execution mode. Bedrock is not supported on Fly Machines or local Docker because those backends do not have a role-assumption mechanism equivalent to GitHub OIDC.
-
-1. **In the orchestrator admin UI (`/admin`)**, edit the repo's mapping:
-   - Set **Provider** to `bedrock`
-   - Set **AWS Region** to the region that hosts your Bedrock inference profile (e.g. `us-west-2`)
-2. **In the target repo**, add a repository secret:
-   - `AWS_BEDROCK_ROLE_ARN` — an IAM role ARN that trusts the GitHub OIDC provider for this repo and grants `bedrock:InvokeModel` on the inference profiles you need
-3. **In the target repo**, add two repository *variables* (Settings → Secrets and variables → Actions → Variables) so `/ai-implement` comment-triggered gap-fill runs route to the same provider as the orchestrator-initiated runs:
-   - `AI_IMPLEMENT_PROVIDER` = `bedrock`
-   - `AI_IMPLEMENT_AWS_REGION` = the same region used in the admin UI mapping
-4. **In the target repo's `WORKFLOW.md` (and `PLANNING.md` if planning is enabled)**, change `model:` from the Anthropic default (`claude-sonnet-4-6`) to a Bedrock model ID or inference-profile ARN. There is no safe default for Bedrock — the workflow will hard-fail if `model:` isn't set when `provider=bedrock`.
-
-IAM trust policy shape (use the `sub` condition to restrict to this specific repo):
-
-```json
-{
-  "Effect": "Allow",
-  "Principal": { "Federated": "arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com" },
-  "Action": "sts:AssumeRoleWithWebIdentity",
-  "Condition": {
-    "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-    "StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:*" }
-  }
-}
-```
-
-The workflow runs `aws-actions/configure-aws-credentials` once before the containerized runner step with a 4-hour session duration, covering implementation and gap-analysis runs. Only GitHub OIDC is supported — there is no static-key path.
-
-## Feature-branch grouping (parent/child issues)
-
-A Linear **parent issue** tagged `AI-Implement` that has `AI-Implement` children becomes a **feature node**: it owns a long-running branch `ai-implement/feature/<issue-key>` (or `ai-implement/multi-issue/<issue-key>` — selectable via an `ai-implement.yml` block in the parent's description), its labelled children PR **into that branch** (not the repo base), and the tree cascades recursively. A parent's own work is deferred until its children finish, then runs onto its own branch; completed feature branches **roll up** into their parent automatically (internal levels via a direct merge, the top of the tree as a human-reviewed `feature → base` PR).
-
-Key labels: `AI-Implement` (trigger) → `AI-Planning` (planning in flight) → `Plan-Complete` (ready to implement) → `AI-Working` (implementing) → `Ready for Review` (PR open); the orchestrator moves the issue to Done when the PR merges (via poll detector and optional webhook; this complements any native Linear/Jira GitHub integration). A parent labelled before its children is left alone until a child is labelled (race guard).
-
-Parts: classification + roll-up discovery in `src/providers/linear.ts`; `TicketIssue.featureBranchChain` / `FeatureNodeRollUp` in `src/providers/types.ts`; per-issue config (`ai-implement.yml` mode selector) in `src/issue-config.ts`; cascade branch creation in `src/feature-branch.ts` (`resolveBaseBranch`); roll-up in `src/merge-up.ts`; GitHub helpers in `src/github.ts`; `Plan-Complete` via `src/runner-callback.ts`; wired into the poll loop in `src/index.ts`. Jira support lives in `src/providers/jira.ts` + `src/providers/jira-hierarchy.ts` (native parent with classic Epic Link fallback; roll-up completion = native Done **or** AI-Implement Status `Merged`). **Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
-
-Operational requirements: re-sync `claude-implement.yml` to the target repo (for the `base_branch` input); a **publicly reachable** runner callback (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`) so planning auto-advances and the cascade self-drives; and pair the runner image with the orchestrator channel (testing → `SESSION_IMAGE=…:next`).
-
-### Issue completion on PR merge
-
-When an AI-Implement PR merges, the orchestrator moves the tracker issue to a completed state (Linear: the team's `Done` state, else the first completed-type state; Jira: the AI-Implement status field value `Merged`) and clears the `Ready for Review` label. This runs even for paused projects.
-
-Two paths feed the same `reconciliation_queue` → `markMerged` worker:
-
-- **Poll detector (guaranteed):** every tick the orchestrator checks recent dispatches whose PR is not yet reconciled and asks GitHub whether the PR merged. This requires no webhook configuration.
-- **Webhook (optimization):** a `pull_request` `closed`+`merged` delivery to `POST /api/github/webhook` enqueues the same reconciliation immediately, reducing merge→Done latency. If the webhook is unconfigured or a delivery is dropped, the poll detector still completes the issue within one tick.
-
-Jira target repos must add a `Merged` option to their AI-Implement status field.
+The two `.ai-implement/` files read from different refs: `image.yml` from the **default branch**, so a PR cannot pick its own runner image; `config.yml` from the **checked-out workspace**, which on a gap-fill run is the PR head.
 
 ## Custom extensions
 
-Client forks can override built-in behaviour without touching upstream code by placing files under `custom/`. A file at `custom/<path>` takes precedence over the corresponding built-in.
+A file at `custom/<path>` overrides the corresponding built-in. Resolution searches the workspace root, then `AI_IMPLEMENT_CUSTOM_ROOT`, then the package root — see [docs/pipeline-architecture.md](docs/pipeline-architecture.md) for the mechanics and the step contract.
 
-Resolution is handled by two functions in `src/pipeline/resolve-module.ts`:
+Built-in step keys, in pipeline order: `clone`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `preflight`, `push`, `verify`, `post-push-review`.
 
-| Function | Use case | Return value |
-|----------|----------|--------------|
-| `resolveModule(path)` | YAML and template files | Absolute filesystem path |
-| `resolveModuleImport<T>(path)` | TypeScript/JavaScript modules | `default` export, or `null` if no override |
+- `custom/` belongs to an AI-Implement **fork**, not a target repo; sync never creates it there.
+- **Place client-specific behaviour in `custom/`** rather than editing built-in modules — that is what keeps a fork rebasing cleanly.
+- A `custom/` file with no `default` export warns and falls back to the built-in rather than misbehaving silently.
+- `protect-custom.yml` flags upstream PRs touching `custom/`, but is **advisory only** — it emits a `::warning::`, never fails, and only runs on PRs targeting `main`, so PRs into `testing` never trigger it.
 
-Both functions search two custom roots in order, then fall back to the built-in package root. There is no per-type discovery logic — the same two functions cover all extension points.
+## Feature-branch grouping
 
-1. **Workspace root** — `custom/<path>` relative to `process.cwd()`. This is how orchestrator-side loading picks up a fork's `custom/` (the orchestrator runs with cwd = app root).
-2. **Baked root** — `<AI_IMPLEMENT_CUSTOM_ROOT>/custom/<path>`, where the `AI_IMPLEMENT_CUSTOM_ROOT` env var names a directory that *contains* a `custom/` subdirectory. This is how the session runner picks up overrides: its cwd is `/workspace` (the target-repo clone dir, empty at process start), so the workspace root never matches there. `Dockerfile.session` copies the repo's `custom/` to `/app/custom/` and sets `AI_IMPLEMENT_CUSTOM_ROOT=/app`, so a client fork that builds its own runner image gets its `custom/pipelines/` and `custom/steps/` honored inside the runner — including the import-time load of `pipelines/autonomous.yml` and the eager step resolution in `createDefaultRunner()`, both of which happen before the clone step runs. With the env var unset (local dev, tests) resolution behaves exactly as before.
+A parent issue labelled `AI-Implement` with labelled children becomes a **feature node**: it owns `ai-implement/feature/<key>`, its children PR into that branch rather than the repo base, and the tree cascades recursively. Internal roll-ups merge directly; only the top-of-tree `feature → base` is a human-reviewed PR. A parent labelled before its children is left alone until a child is labelled.
 
-### Extension points
+Labels: `AI-Implement` → `AI-Planning` → `Plan-Complete` → `AI-Working` → `Ready for Review`, then Done on merge.
 
-**`custom/pipelines/`** — Override a pipeline YAML definition. Example: place `custom/pipelines/autonomous.yml` to replace the built-in autonomous loop.
+The cascade **self-advances** and self-heals: a child PR landing dirty is re-queued through the comment-gapfill rail (capped at 2 attempts), a parent with an open roll-up PR is held from dispatch, and siblings whose declared `Files:` overlap an in-flight sibling are deferred (failing open). Requires a publicly reachable runner callback, and the runner image channel paired to the orchestrator's.
 
-**`custom/steps/`** — Override a built-in step module. A file `custom/steps/<id>.ts` replaces the step registered under that key. It must export a `StepModule` as its default export. Built-in step keys: `clone`, `install`, `feedback-loop`, `preflight`, `push`.
+**Full reference: [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md).**
 
-**`custom/providers/`** — Reserved for provider overrides (TicketingProvider interface). Provider loading will call `resolveModuleImport("providers/<id>")`.
+## Issue completion on PR merge
 
-### Rules
+Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll detector** that needs no configuration and catches everything within a tick, and a **webhook** that merely reduces latency. Completion runs even for paused projects. Jira target repos need a `Merged` option on their AI-Implement status field.
 
-- `custom/` belongs to an AI-Implement fork, not a target repository: workflow sync never creates or overwrites it in target repos.
-- Upstream changes preserve fork-owned files under `custom/`; only `custom/README.md` may be maintained upstream.
-- A CI check (`protect-custom.yml`) rejects upstream PRs that touch other `custom/` files.
-- When implementing client-specific behaviour, **always place new files in `custom/`** rather than modifying built-in modules — this keeps the fork rebasing cleanly on upstream changes.
-- A `custom/` file that exists but has no `default` export produces a warning and falls back to the built-in rather than silently misbehaving.
+## Admin UI and auth
 
-## Runner image resolution
+SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. **Authorization and session identity key on different claims, and it is easy to state this backwards:** authorization is a fail-closed allowlist matched against the verified *email*, while the session stores the provider's stable `sub`, because email is mutable.
 
-Both execution modes resolve the runner image with the same ladder, highest priority first:
+The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — all client JS is concatenated into one inline `<script>` at module load. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the HTML-escaping helpers (below) rather than bare globals. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts`.
 
-1. **`.ai-implement/image.yml`** at the target repo's default branch — per-repo override:
+**HTML escaping — three-way rule** (full rationale: [docs/adr/002-admin-ui-html-escaping.md](docs/adr/002-admin-ui-html-escaping.md)):
 
-   ```yaml
-   image: ghcr.io/your-org/your-runner:v1
-   ```
+| Context | Helper | Why |
+|---|---|---|
+| Text content (`innerHTML`, `textContent`) | `window.esc()` | Escapes `&`, `<`, `>` via DOM round-trip |
+| Quoted attribute value (`title=`, `data-*`, path in `href=`) | `window.escAttr()` | Also escapes `"` and `'` |
+| Full URL in `href=`/`src=` (scheme from data) | `window.safeUrl()` | Validates scheme; `javascript:` returns `'#'` |
 
-   In `fly-machines` mode the orchestrator reads it via the GitHub contents API (`src/repo-image.ts`); in `github-actions` mode `claude-implement.yml` reads it with `gh api` from the **default branch only** (never a PR head, so a PR can't choose its own privileged image).
+`window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first. Use `window.raw(markup)` to opt out for pre-built HTML. Use `html` for all new markup-building code. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. Note: when a URL is assembled in a variable and then placed in `html`, the template cannot detect the URL context — call `safeUrl()` explicitly in that case.
 
-2. **`AI_IMPLEMENT_RUNNER_IMAGE`** — the operator/org default. A GitHub repo/org **variable** in `github-actions` mode (org-level applies to every repo); an orchestrator **env var** in `fly-machines` mode. `SESSION_IMAGE` is the deprecated former name of the env var — still honored, but the orchestrator logs a deprecation warning at startup.
+Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
 
-3. **Upstream fallback** — `ghcr.io/builddownai/ai-implement-runner:latest` (orchestrator / comment-trigger) or `:next` (claude-implement). In `github-actions` mode a manual `runner_image` dispatch input overrides everything for that one run.
+## Backend outage playbook
 
-The `github-actions` allowlist auto-trusts `ghcr.io/builddownai/` and the repo owner's own `ghcr.io/<owner>/` namespace, so a fork using its own published image needs no extra config; `AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES` is only for third-party registries. The `fly-machines` path validates image-reference format but has no allowlist.
+The global **runner mode** is the failover lever: `/admin#runners` or `POST /api/runner-mode` with `fly` forces Fly Machines, `gha` forces GitHub Actions, `default` restores per-project modes. In-flight runs keep their monitors; only new dispatches reroute.
 
-The image should be publicly pullable for the broadest compatibility (a private image restricts you to the GitHub Actions execution mode — see "Private runner images" below). The customer owns building and publishing it. If `.ai-implement/image.yml` is absent, malformed, or points at an unreachable reference, resolution falls through to the next ladder rung.
+Ineligible mappings are **skipped at dispatch** — `provider=bedrock` is GHA-only, and Fly needs a sessions app — staying queued with dedup untouched and appearing in the Runners banner and `GET /api/runner-mode`. Flip back to `default` afterward; skipped issues dispatch on the next poll.
 
-This resolution applies to **both** execution modes. On the Fly Machines path the orchestrator boots the session machine on the resolved image directly. On the GitHub Actions path the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-implement.yml` (which runs it as the job's `container.image`) — but only when the choice is explicit: a per-repo `.ai-implement/image.yml` override, or an explicitly-set `SESSION_IMAGE`. When neither is set the orchestrator sends no `runner_image`, so the workflow keeps its own resolution order (the `AI_IMPLEMENT_RUNNER_IMAGE` repo/org variable, then its built-in `:latest` default) and repos that pin via that variable are not overridden.
+## Notifications
 
-Planning runs (`claude-plan.yml`) now run on the same runner container and honor the **same** resolution: the orchestrator forwards the resolved image as the `runner_image` workflow_dispatch input to `claude-plan.yml` under the identical "only when explicit" rule, so a testing orchestrator pinned to `:next` steers planning to `:next` and a per-repo `.ai-implement/image.yml` pin is honored for planning too. (Unlike `claude-implement.yml`, `claude-plan.yml`'s own validate step does not read `image.yml`, so orchestrator-forwarding is the only path by which GHA planning picks up either — and a target repo must have **re-synced `claude-plan.yml`** before the orchestrator will forward `runner_image` to it, otherwise GitHub rejects the dispatch with "unexpected inputs", the same caveat as the run-caps and branch-prefix inputs.)
+`src/notify.ts` exports one function per notification shape — `notify`, `notifyCompletion`, `notifyDeploy`, `notifyStuckGiveUp`, `notifyReaperBurst` — each taking `(type, webhookUrl, payload)` and switching on `NOTIFY_TYPE` to a private per-provider implementation; any unrecognised value falls through to Slack. A sixth export, `notifyText`, deliberately skips the switch for cases with no issue context. Adding a provider means a private function per shape plus a case in each switch.
 
-The default runner image itself must also be public on GHCR — Fly pulls anonymously, so a private package surfaces as `failed to get manifest ... unauthorized` at machine-create time. New GHCR packages default to Private and the org must allow public container packages first (Org Settings → Packages). See the comment at the top of `.github/workflows/build-runner.yml`.
-
-### Private runner images
-
-A private GHCR runner image is only usable in the **GitHub Actions execution mode**. The Fly Machines and local Docker backends pull the image anonymously (no credential mechanism), so a private image fails at machine-create time with `failed to get manifest ... unauthorized`. There is no workaround on those backends — choosing a private image is effectively choosing GHA mode.
-
-On the GitHub Actions path, `claude-implement.yml` and `claude-plan.yml` authenticate the container pull with the job's `GITHUB_TOKEN`: each requests `packages: read` and passes the token through the container `credentials:` block. A bare `packages: read` is **not** enough on its own — GitHub Actions does not auto-authenticate a job-container image pull, so the `credentials:` block is what actually performs the authenticated pull.
-
-`GITHUB_TOKEN` can only read private packages owned by the **same org/account as the target repo**. So a private runner image must live in the target repo's own org — the realistic case is a customer pinning their own private image via `.ai-implement/image.yml` (the GHA allowlist auto-trusts the owner's `ghcr.io/<owner>/` namespace, so no extra prefix variable is needed) and linking that GHCR package to the repo. The default `ghcr.io/builddownai/ai-implement-runner` image stays public precisely because a cross-org `GITHUB_TOKEN` cannot pull it; making it private would break every customer repo. A private image hosted in a *different* org requires swapping a PAT (with `read:packages` on that org) into the workflow's `credentials.password` in place of `GITHUB_TOKEN`.
-
-Runner image channels:
-
-- `.github/workflows/build-runner.yml` publishes the runner image to `ghcr.io/<owner>/ai-implement-runner` (the lowercased owner of the repo it runs in), so a fork's builds land in its own namespace automatically — a namespace the `github-actions` allowlist already trusts. The built-in fallback in the code and synced workflows stays `ghcr.io/builddownai/ai-implement-runner` regardless; a fork that wants its own image used must pin it via `AI_IMPLEMENT_RUNNER_IMAGE` or `.ai-implement/image.yml` rather than editing the fallback.
-- The `:latest` channel is published from `main` and is the stable default for production orchestrators and synced target-repo workflows.
-- The `:next` channel is published from `testing` and is intended for staging/testing orchestrators. Set the orchestrator's runner-image env var to your namespace's `:next` tag (e.g. `AI_IMPLEMENT_RUNNER_IMAGE=ghcr.io/builddownai/ai-implement-runner:next`) to keep that environment paired with the testing runner.
-- Commit SHA tags are pushed first, then the build digest is smoke-tested before any mutable channel is promoted. Use the immutable digest for the strongest rollback pin; the SHA tag is a convenient lookup tag for the same build.
-- Channel-scoped date/debug tags are promoted only after the digest image passes smoke testing. They use `base-<channel>-vYYYYMMDD-<12-char-sha>` (for example, `base-next-v20260526-abc123def456`) so `latest` and `next` builds do not collide and same-day builds do not overwrite each other.
-- Cancelled or failed runs can leave SHA-only images with no channel pointer. That is intentional fail-closed behavior; clean old SHA-only images through GHCR retention/cleanup rather than relying on mutable channel tags for retention.
-
-Typical custom-image use: your repo needs a language runtime or tool that isn't in the base image (e.g. terraform, ruby, go). Build an image `FROM` the channel that matches your orchestrator (`latest` for production, `next` for testing), add your tools, push, and point `image.yml` at it.
-
-## Multi-client deploy
-
-Each client is a separate Fly.io app, defined by a file in `clients/<slug>.toml`. The `deploy-clients.yml` workflow reads these files and deploys each app in a matrix on every push to `main`.
-
-### Onboarding a new client
-
-```bash
-# Guided interactive setup:
-./scripts/provision-client.sh <client-slug>
-
-# Or manually:
-cp clients/example-client.toml clients/<slug>.toml
-# Edit the file, then:
-fly apps create <app_name> --org <org>
-fly volumes create dedup_data --size 1 --region iad --app <app_name>
-fly secrets set LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... GITHUB_APP_ID=... GITHUB_APP_PRIVATE_KEY=... --app <app_name>
-```
-
-Then commit `clients/<slug>.toml` and push — the workflow deploys all clients automatically using the single `FLY_API_TOKEN` org secret.
-
-### Fly.io commands
-
-```bash
-fly deploy --remote-only --app <app_name>   # manual deploy
-fly secrets set KEY=value --app <app_name>  # set secrets
-fly logs --app <app_name>                   # tail logs
-fly ssh console --app <app_name>            # shell into machine
-```
-
-The Fly volume `dedup_data` is mounted at `/data` for persistent SQLite storage.
+The orchestrator also announces its own deploys, comparing `FLY_IMAGE_REF` against a value in `settings` to distinguish "redeployed" from "restarted". Both notices gate on `FLY_IMAGE_REF`, which exists only inside a Fly Machine, so local runs never post. **A failure classification always reaches the tracker comment** regardless of whether a webhook is configured — the ticket is the highest-visibility surface, and the webhook send is gated separately and best-effort.

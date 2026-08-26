@@ -10,6 +10,7 @@ const groups: NavGroup[] = [
     { key: "jobs",     label: "Pipelines",     icon: "queue",   count: "running" },
     { key: "pulls",    label: "Pull requests", icon: "git",     count: "pulls" },
     { key: "blockers", label: "Blockers",      icon: "alert",   count: "blockers" },
+    { key: "reports",  label: "Reports",       icon: "layers" },
   ]},
   { label: "Configure", items: [
     { key: "projects",  label: "Projects",            icon: "folder" },
@@ -19,11 +20,12 @@ const groups: NavGroup[] = [
     { key: "policies",  label: "Policies & risk",     icon: "shield" },
   ]},
   { label: "Platform", items: [
-    { key: "runners",  label: "Runners",  icon: "cpu" },
-    { key: "sessions", label: "Sessions", icon: "server" },
-    { key: "reaper",   label: "Reaper",   icon: "broom" },
-    { key: "secrets",  label: "Secrets",  icon: "key" },
-    { key: "settings", label: "Settings", icon: "settings" },
+    { key: "runners",     label: "Runners",     icon: "cpu" },
+    { key: "sessions",    label: "Sessions",    icon: "server" },
+    { key: "deployments", label: "Deployments", icon: "rocket", count: "deploy-available" },
+    { key: "reaper",      label: "Reaper",      icon: "broom" },
+    { key: "secrets",     label: "Secrets",     icon: "key" },
+    { key: "settings",    label: "Settings",    icon: "settings" },
   ]},
   { label: "Developer", items: [
     { key: "mcp",            label: "MCP server",     icon: "plug" },
@@ -52,7 +54,9 @@ export function sidebarHtml(): string {
         <div class="brand-meta">orchestrator</div>
       </div>
     </div>
-    ${sections}
+    <div class="sidebar-nav">
+      ${sections}
+    </div>
     <div class="sidebar-footer">
       <div class="sidebar-user">
         <div class="avatar">·</div>

@@ -1,8 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { runMergeUps } from "../merge-up.js";
+import { resetClosedVetoLogGuard, resetRollUpHandledMarkers, isRollUpHandled, markRollUpHandled, clearRollUpHandledMarkersByIdentifier, runMergeUps } from "../merge-up.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureNodeRollUp } from "../providers/types.js";
 
+vi.mock("../dedup.js", async () => {
+  const Database = (await import("better-sqlite3")).default;
+  const db = new Database(":memory:");
+  return { getDb: () => db };
+});
 vi.mock("../github-app-auth.js", () => ({
   getInstallationToken: vi.fn(async () => "tok"),
 }));
@@ -41,6 +46,8 @@ const rollUp = (o: Partial<FeatureNodeRollUp> = {}): FeatureNodeRollUp => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetRollUpHandledMarkers();
+  resetClosedVetoLogGuard();
   vi.mocked(findOpenPullRequest).mockResolvedValue(null);
   vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
   vi.mocked(createPullRequest).mockResolvedValue({ number: 7, url: "https://gh/pr/7" });
@@ -193,6 +200,49 @@ describe("runMergeUps", () => {
     expect(finalizeMerged).toHaveBeenCalledWith("uuid-p", "OOL");
   });
 
+  it("logs the closed-without-merging veto once per process, not once per poll (r7 cleanup)", async () => {
+    vi.mocked(compareBranches).mockResolvedValue(3);
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 55, url: "https://gh/pr/55", state: "closed", merged: false,
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 3; i++) {
+        await runMergeUps([rollUp({ identifier: "OOL-106", parent: null })], deps(() => mapping()));
+      }
+      const vetoLines = logSpy.mock.calls.filter((c) => String(c[0]).includes("closed without merging"));
+      expect(vetoLines).toHaveLength(1);
+      // the veto is still respected on every cycle — no PR ever re-opened
+      expect(vi.mocked(createPullRequest)).not.toHaveBeenCalled();
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("handles a merged roll-up exactly once — repeats short-circuit with zero API calls (AII-286)", async () => {
+    vi.mocked(findPullRequestByBranches).mockResolvedValue({
+      number: 108, url: "https://gh/pr/108", state: "closed", merged: true,
+    });
+    const finalizeMerged = vi.fn(async () => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 3; i++) {
+        await runMergeUps(
+          [rollUp({ issueId: "uuid-286", identifier: "OOL-126", parent: null })],
+          deps(() => mapping(), finalizeMerged),
+        );
+      }
+      // first pass acts + logs; passes 2-3 short-circuit BEFORE any GitHub/Linear call
+      expect(vi.mocked(findPullRequestByBranches)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deleteBranch)).toHaveBeenCalledTimes(1);
+      expect(finalizeMerged).toHaveBeenCalledTimes(1);
+      const lines = logSpy.mock.calls.filter((c) => String(c[0]).includes("deleted branch + finalized"));
+      expect(lines).toHaveLength(1);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it("does not re-open the top-level PR after a human closed it without merging (veto)", async () => {
     vi.mocked(compareBranches).mockResolvedValue(3);
     vi.mocked(findPullRequestByBranches).mockResolvedValue({
@@ -228,5 +278,41 @@ describe("runMergeUps", () => {
     await runMergeUps([rollUp({ identifier: "OOL-107" }), rollUp({ identifier: "OOL-108" })], deps(() => mapping()));
     expect(err).toHaveBeenCalled();
     expect(vi.mocked(mergeBranch)).toHaveBeenCalledTimes(1); // second roll-up still processed
+  });
+});
+
+describe("clearRollUpHandledMarkersByIdentifier (AII-349 reopen re-arm)", () => {
+  beforeEach(() => {
+    resetRollUpHandledMarkers();
+  });
+
+  it("clears a feature-mode marker so isRollUpHandled returns false", () => {
+    markRollUpHandled("owner", "repo", "ai-implement/feature/ool-78");
+    expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-78")).toBe(true);
+
+    clearRollUpHandledMarkersByIdentifier("owner", "repo", "OOL-78");
+    expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-78")).toBe(false);
+  });
+
+  it("clears a multi-issue-mode marker so isRollUpHandled returns false", () => {
+    markRollUpHandled("owner", "repo", "ai-implement/multi-issue/ool-78");
+    expect(isRollUpHandled("owner", "repo", "ai-implement/multi-issue/ool-78")).toBe(true);
+
+    clearRollUpHandledMarkersByIdentifier("owner", "repo", "OOL-78");
+    expect(isRollUpHandled("owner", "repo", "ai-implement/multi-issue/ool-78")).toBe(false);
+  });
+
+  it("is a no-op when no marker exists (does not throw)", () => {
+    expect(() => clearRollUpHandledMarkersByIdentifier("owner", "repo", "OOL-99")).not.toThrow();
+  });
+
+  it("does not clear markers for other identifiers in the same repo", () => {
+    markRollUpHandled("owner", "repo", "ai-implement/feature/ool-78");
+    markRollUpHandled("owner", "repo", "ai-implement/feature/ool-79");
+
+    clearRollUpHandledMarkersByIdentifier("owner", "repo", "OOL-78");
+
+    expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-78")).toBe(false);
+    expect(isRollUpHandled("owner", "repo", "ai-implement/feature/ool-79")).toBe(true);
   });
 });

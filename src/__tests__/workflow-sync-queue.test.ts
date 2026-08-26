@@ -6,6 +6,8 @@ import type * as DedupModule from "../dedup.js";
 import type * as ConfigModule from "../config.js";
 import type * as WorkflowSyncQueueModule from "../workflow-sync-queue.js";
 import type * as WorkflowSyncModule from "../workflow-sync.js";
+import type * as DeployHoldModule from "../deploy-hold.js";
+import type * as RunnerModeModule from "../runner-mode.js";
 import { DEFAULT_TICKETING_CONFIG } from "../providers/ticketing-config.js";
 
 // runWorkflowSync (the executor) imports syncWorkflowTemplates from this module; mock it so the
@@ -24,6 +26,7 @@ let dedup: typeof DedupModule;
 let config: typeof ConfigModule;
 let queue: typeof WorkflowSyncQueueModule;
 let workflowSync: typeof WorkflowSyncModule;
+let deployHold: typeof DeployHoldModule;
 
 const CREDS = { githubAppId: "test-app-id", githubAppPrivateKey: "test-key" };
 
@@ -49,8 +52,11 @@ beforeEach(async () => {
   config = await import("../config.js");
   queue = await import("../workflow-sync-queue.js");
   workflowSync = await import("../workflow-sync.js");
+  deployHold = await import("../deploy-hold.js");
   dedup.getDb(); // creates workflow_sync_queue (its DDL lives in getDb)
   config.initMappingsTable(); // executor tests seed a mapping
+  const runnerMode: typeof RunnerModeModule = await import("../runner-mode.js");
+  runnerMode.initSettingsTable(); // the deploy hold is a `settings` row; runner-mode owns that DDL
 });
 
 afterEach(() => {
@@ -162,6 +168,16 @@ describe("workflow sync queue — lifecycle & dedup", () => {
       .run(Date.now() - queue.STALE_RUNNING_MS - 1000, id);
     expect(queue.getStaleRunningWorkflowSyncs().map((j) => j.id)).toEqual([id]);
   });
+
+  it("countRunningWorkflowSyncs counts only rows the worker is actively processing", () => {
+    queue.enqueueWorkflowSync("A"); // pending — durable, resumes in the next process
+    const b = queue.enqueueWorkflowSync("B");
+    const c = queue.enqueueWorkflowSync("C");
+    queue.updateWorkflowSyncStatus(b.id, "running");
+    queue.updateWorkflowSyncStatus(c.id, "completed");
+
+    expect(queue.countRunningWorkflowSyncs()).toBe(1);
+  });
 });
 
 describe("runWorkflowSync executor", () => {
@@ -209,6 +225,54 @@ describe("runWorkflowSync executor", () => {
 
     expect(workflowSync.syncWorkflowTemplates).not.toHaveBeenCalled();
     expect(queue.getWorkflowSyncById(id)?.status).toBe("running"); // left untouched for the live runner
+  });
+
+  it("defers without touching the row while a deploy holds work back", async () => {
+    seedMapping("ENG");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    deployHold.setDeployHold();
+
+    await queue.runWorkflowSync(id, CREDS);
+
+    expect(workflowSync.syncWorkflowTemplates).not.toHaveBeenCalled();
+    // Still 'pending', never 'running': the safety net re-runs it with no special-casing, and it
+    // never counts toward the in-flight work the deploy is waiting on.
+    expect(queue.getWorkflowSyncById(id)?.status).toBe("pending");
+    expect(queue.countRunningWorkflowSyncs()).toBe(0);
+  });
+
+  it("reclaims a stale running row to pending even while a deploy holds work back", async () => {
+    seedMapping("ENG");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "running");
+    // Age it past the stale window — an orchestrator that crashed mid-sync.
+    dedup
+      .getDb()
+      .prepare("UPDATE workflow_sync_queue SET updated_at = ? WHERE id = ?")
+      .run(Date.now() - queue.STALE_RUNNING_MS - 1000, id);
+    deployHold.setDeployHold();
+
+    await queue.runWorkflowSync(id, CREDS);
+
+    expect(workflowSync.syncWorkflowTemplates).not.toHaveBeenCalled();
+    // Left 'running' the row would count as in-flight work for the whole hold, and a deploy
+    // gated on that count reaching zero could never clear the hold that freezes it.
+    expect(queue.getWorkflowSyncById(id)?.status).toBe("pending");
+    expect(queue.countRunningWorkflowSyncs()).toBe(0);
+  });
+
+  it("runs the deferred sync once the hold clears", async () => {
+    seedMapping("ENG");
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    deployHold.setDeployHold();
+    await queue.runWorkflowSync(id, CREDS);
+
+    deployHold.clearDeployHold();
+    vi.mocked(workflowSync.syncWorkflowTemplates).mockResolvedValueOnce(RESULT);
+    await queue.runWorkflowSync(id, CREDS);
+
+    expect(workflowSync.syncWorkflowTemplates).toHaveBeenCalledOnce();
+    expect(queue.getWorkflowSyncById(id)?.status).toBe("completed");
   });
 });
 

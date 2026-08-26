@@ -1,6 +1,6 @@
 {
   "name": "ai-implement",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Polls Linear for issues labeled AI-Implement and runs Claude Code against them via GitHub Actions or Fly Machines.",
   "license": "Apache-2.0",
   "repository": {
@@ -18,20 +18,22 @@
     "dev": "npm run check:node && tsx --env-file-if-exists=.env src/index.ts",
     "build:runner:local": "DOCKER_BUILDKIT=1 docker build -f Dockerfile.session -t ai-implement-runner:local .",
     "dev:local": "npm run check:node && npm run build:runner:local && RUNNER_MODE=local LOCAL_RUNNER_IMAGE=ai-implement-runner:local tsx --env-file-if-exists=.env src/index.ts",
+    "dev:run": "npm run check:node && tsx --env-file-if-exists=.env src/dev-harness/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {
-    "better-sqlite3": "^11.0.0",
+    "better-sqlite3": "13.0.3",
+    "openid-client": "^6.8.4",
     "picomatch": "^4.0.0",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.0",
-    "@types/picomatch": "^4.0.0",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/jsdom": "^28.0.1",
     "@types/node": "^24.12.4",
+    "@types/picomatch": "^4.0.0",
     "jsdom": "^29.1.0",
     "tsx": "^4.0.0",
     "typescript": "^5.7.0",

@@ -7,9 +7,12 @@ export interface InstallationDetails {
   repositorySelection: "all" | "selected";
 }
 
-// Cache: org → { token, expiresAt }
+// Cache: owner → { token, expiresAt }
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+// Cache: scopedCacheKey(owner, options) → { token, real expiresAt (ISO), staleAt (cache cutoff, ms) }
+const scopedTokenCache = new Map<string, { token: string; expiresAt: string; staleAt: number }>();
 let cachedAppSlug: string | null = null;
+const TOKEN_CACHE_TTL_MS = 50 * 60 * 1000;
 
 /**
  * Wraps raw bytes in an ASN.1 TLV (tag-length-value) structure.
@@ -98,10 +101,38 @@ function githubAppHeaders(authValue: string): Record<string, string> {
 }
 
 /**
+ * Resolves the GitHub App installation ID for an owner.
+ * Tries the org endpoint first and falls back to the user endpoint on 404.
+ * Throws GitHubApiError on any non-ok response.
+ */
+async function resolveInstallationId(
+  headers: Record<string, string>,
+  owner: string,
+): Promise<{ id: number; repository_selection?: "all" | "selected" }> {
+  // `path` (…/installation) lets classifySyncError tell a 404-not-installed from a 404-repo-not-found.
+  let installPath = `/orgs/${owner}/installation`;
+  let installRes = await fetch(`https://api.github.com${installPath}`, { headers });
+  if (installRes.status === 404) {
+    installPath = `/users/${owner}/installation`;
+    installRes = await fetch(`https://api.github.com${installPath}`, { headers });
+  }
+  if (!installRes.ok) {
+    const body = await installRes.text();
+    throw new GitHubApiError({
+      status: installRes.status,
+      path: installPath,
+      bodyText: body,
+      message: `GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`,
+    });
+  }
+  return installRes.json() as Promise<{ id: number; repository_selection?: "all" | "selected" }>;
+}
+
+/**
  * Resolves the GitHub App installation for an owner and mints an installation token, returning both
  * the token and the install metadata (repo selection + account type) the install-state probe needs.
  * The org endpoint 404s on user accounts and vice versa, so try org first and fall back to user.
- * 
+ *
  * Uncached — getInstallationToken is the cached, token-only view.
  */
 export async function getInstallation(
@@ -113,26 +144,7 @@ export async function getInstallation(
   const jwt = createAppJwt(appId, normalizedKey);
   const headers = githubAppHeaders(jwt);
 
-  let installPath = `/orgs/${owner}/installation`;
-  let installRes = await fetch(`https://api.github.com${installPath}`, { headers });
-  if (installRes.status === 404) {
-    installPath = `/users/${owner}/installation`;
-    installRes = await fetch(`https://api.github.com${installPath}`, { headers });
-  }
-  if (!installRes.ok) {
-    const body = await installRes.text();
-    // `path` (…/installation) lets classifySyncError tell a 404-not-installed from a 404-repo-not-found.
-    throw new GitHubApiError({
-      status: installRes.status,
-      path: installPath,
-      bodyText: body,
-      message: `GitHub App not installed for owner "${owner}" (${installRes.status}): ${body}`,
-    });
-  }
-  const install = (await installRes.json()) as {
-    id: number;
-    repository_selection?: "all" | "selected";
-  };
+  const install = await resolveInstallationId(headers, owner);
 
   const tokenPath = `/app/installations/${install.id}/access_tokens`;
   const tokenRes = await fetch(`https://api.github.com${tokenPath}`, { method: "POST", headers });
@@ -152,6 +164,99 @@ export async function getInstallation(
     installationId: install.id,
     repositorySelection: install.repository_selection === "all" ? "all" : "selected",
   };
+}
+
+export interface ScopedTokenOptions {
+  /** GitHub App permission subset, e.g. { contents: "read" }. Omit for the App's full grants. */
+  permissions?: Record<string, string>;
+  /** Repo names (not owner/repo) to scope to. Omit for all installation repos. */
+  repositories?: string[];
+  /**
+   * Skip the cache read and always mint a fresh token (the cache is still updated).
+   * For vending endpoints that advertise a full lifetime on the returned token.
+   */
+  forceRefresh?: boolean;
+}
+
+export interface ScopedInstallationToken {
+  token: string;
+  /** GitHub's actual expiry for this token (ISO 8601), passed through verbatim. */
+  expiresAt: string;
+}
+
+function scopedCacheKey(owner: string, options?: ScopedTokenOptions): string {
+  const perms = options?.permissions
+    ? Object.entries(options.permissions)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => `${k}:${v}`)
+        .join(",")
+    : "";
+  const repos = options?.repositories ? [...options.repositories].sort().join(",") : "";
+  return `${owner}|${perms}|${repos}`;
+}
+
+/**
+ * Mints a scoped installation token for the given owner.
+ * Passes `permissions` and/or `repositories` in the request body when supplied; sends no body
+ * when neither is given (GitHub then grants the App's full installation permissions).
+ *
+ * Returns the token together with GitHub's real `expires_at`, so callers that advertise an
+ * expiry downstream never have to synthesize one.
+ *
+ * Cache TTL is derived from `expires_at` minus a 5-minute safety margin, so the
+ * cache stays accurate regardless of the actual token lifetime.
+ * Cached per (owner, permissions, repositories) tuple — distinct option sets never collide.
+ */
+export async function getScopedInstallationToken(
+  appId: string,
+  privateKey: string,
+  owner: string,
+  options?: ScopedTokenOptions,
+): Promise<ScopedInstallationToken> {
+  const cacheKey = scopedCacheKey(owner, options);
+  const cached = scopedTokenCache.get(cacheKey);
+  if (!options?.forceRefresh && cached && Date.now() < cached.staleAt) {
+    return { token: cached.token, expiresAt: cached.expiresAt };
+  }
+
+  const normalizedKey = privateKey.replace(/\\n/g, "\n");
+  const jwt = createAppJwt(appId, normalizedKey);
+  const headers = githubAppHeaders(jwt);
+
+  const install = await resolveInstallationId(headers, owner);
+
+  const bodyData: Record<string, unknown> = {};
+  if (options?.permissions && Object.keys(options.permissions).length > 0) bodyData.permissions = options.permissions;
+  if (options?.repositories && options.repositories.length > 0) bodyData.repositories = options.repositories;
+  const hasBody = Object.keys(bodyData).length > 0;
+
+  const tokenPath = `/app/installations/${install.id}/access_tokens`;
+  const tokenRes = await fetch(`https://api.github.com${tokenPath}`, {
+    method: "POST",
+    headers: hasBody ? { ...headers, "Content-Type": "application/json" } : headers,
+    body: hasBody ? JSON.stringify(bodyData) : undefined,
+  });
+
+  if (!tokenRes.ok) {
+    const body = await tokenRes.text();
+    throw new GitHubApiError({
+      status: tokenRes.status,
+      path: tokenPath,
+      bodyText: body,
+      message: `Failed to get scoped installation token for owner "${owner}" (${tokenRes.status}): ${body}`,
+    });
+  }
+
+  const tokenData = (await tokenRes.json()) as { token: string; expires_at: string };
+  const expMs = new Date(tokenData.expires_at).getTime();
+  // Fallbacks cover GitHub omitting or sending an unparseable expires_at: assume the
+  // standard ~60-minute lifetime, advertised conservatively at 55.
+  const expiresAt = Number.isFinite(expMs)
+    ? tokenData.expires_at
+    : new Date(Date.now() + 55 * 60 * 1000).toISOString();
+  const staleAt = Number.isFinite(expMs) ? expMs - 5 * 60 * 1000 : Date.now() + 50 * 60 * 1000;
+  scopedTokenCache.set(cacheKey, { token: tokenData.token, expiresAt, staleAt });
+  return { token: tokenData.token, expiresAt };
 }
 
 /**
@@ -229,12 +334,26 @@ export async function getInstallationToken(
   if (cached && Date.now() < cached.expiresAt) {
     return cached.token;
   }
+  return refreshInstallationToken(appId, privateKey, owner);
+}
+
+/**
+ * Mint and cache a new installation token even when an older cached token is
+ * still within the dispatch cache window. Runner vending uses this path so a
+ * refresh request cannot receive the same near-expiry token it booted with.
+ */
+export async function refreshInstallationToken(
+  appId: string,
+  privateKey: string,
+  owner: string,
+): Promise<string> {
   const { token } = await getInstallation(appId, privateKey, owner);
-  tokenCache.set(owner, { token, expiresAt: Date.now() + 50 * 60 * 1000 });
+  tokenCache.set(owner, { token, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS });
   return token;
 }
 
-/** Clears the token cache (useful for testing). */
+/** Clears both token caches (useful for testing). */
 export function clearTokenCache(): void {
   tokenCache.clear();
+  scopedTokenCache.clear();
 }

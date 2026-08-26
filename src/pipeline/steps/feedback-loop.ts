@@ -1,12 +1,61 @@
 import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { implementStep } from "./implement.js";
 import { reviewStep } from "./review.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
+import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-4-6";
+
+const ACCEPTANCE_BAR_HEADER = "## ✅ AI Planning: Acceptance Bar";
+const MAP_HEADER = "## 🗺 AI Planning: Implementation Map";
+
+// All recognised planning-section headers. A section ends only when one of
+// these appears, so internal subheadings (e.g. "## Files" inside the Map) do
+// not split the section prematurely.
+const PLANNING_HEADERS = [
+  "## 🏗️ AI Planning: Architecture Analysis",
+  "## 🧪 AI Planning: Test Plan",
+  "## 🔗 AI Planning: Cross-Story Context",
+  "## 🗺 AI Planning: Implementation Map",
+  "## ✅ AI Planning: Acceptance Bar",
+  "## ⚠️ AI Planning: Risks & Open Questions",
+];
+
+function extractSection(text: string, header: string): string | undefined {
+  const startIdx = text.indexOf(header);
+  if (startIdx === -1) return undefined;
+  const afterStart = startIdx + header.length;
+  let sectionEnd = text.length;
+  for (const h of PLANNING_HEADERS) {
+    if (h === header) continue;
+    const idx = text.indexOf(h, afterStart);
+    if (idx !== -1 && idx < sectionEnd) sectionEnd = idx;
+  }
+  // Strip planning_context wrapper tags that appear when this is the last section,
+  // then strip the trailing "---" separator from the "\n\n---\n\n" join format.
+  return text
+    .slice(startIdx, sectionEnd)
+    .replace(/<\s*\/?\s*planning_context\s*>/gi, "")
+    .trim()
+    .replace(/\n\n---\s*$/, "")
+    .trim();
+}
+
+export function splitPlanningContext(planningContext: string): {
+  acceptanceBar: string | undefined;
+  mapSection: string | undefined;
+} {
+  return {
+    acceptanceBar: extractSection(planningContext, ACCEPTANCE_BAR_HEADER),
+    mapSection: extractSection(planningContext, MAP_HEADER),
+  };
+}
 
 interface FeedbackLoopInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -38,6 +87,10 @@ export interface PassStat extends Record<string, unknown> {
   implementOutcome: string;   // RunTelemetry outcome or "unknown"
   costUsd: number | null;
   reviewApproved: boolean | null; // null when review never ran on this pass
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  cacheReadTokens?: number | null;
+  cacheCreationTokens?: number | null;
 }
 
 interface FeedbackLoopOutputs extends Record<string, unknown> {
@@ -53,6 +106,7 @@ function buildImplementPrompt(
   issueTitle: string,
   issueDescription: string,
   reviewFeedback: string | undefined,
+  reviewIssues: string[],
   issueIdentifier: string,
   implementationPrompt?: string,
 ): string {
@@ -61,10 +115,18 @@ function buildImplementPrompt(
       ? implementationPrompt
       : `Implement the following issue.\n\nTitle: ${issueTitle}\n\nDescription:\n${issueDescription}`;
 
-  if (reviewFeedback) {
-    return `${basePrompt}\n\n## Reviewer Feedback\n\nYou previously attempted to implement ${issueIdentifier}: ${issueTitle}.\n\nReviewer feedback:\n${reviewFeedback}\n\nPlease address the feedback and improve the implementation.`;
+  if (reviewFeedback || reviewIssues.length > 0) {
+    const issueBlock =
+      reviewIssues.length > 0
+        ? `\n\nReviewer issues:\n${reviewIssues.map((issue, index) => `${index + 1}. ${issue}`).join("\n")}`
+        : "";
+    return `${basePrompt}\n\n## Reviewer Feedback\n\nYou previously attempted to implement ${issueIdentifier}: ${issueTitle}.${issueBlock}\n\nReviewer feedback:\n${reviewFeedback ?? "(none)"}\n\nPlease address every listed issue and use the feedback for context.`;
   }
   return basePrompt;
+}
+
+function exceededConfiguredMaxTurns(telemetry: RunTelemetry | undefined, maxTurns: number): boolean {
+  return typeof telemetry?.numTurns === "number" && telemetry.numTurns > maxTurns;
 }
 
 /**
@@ -83,34 +145,95 @@ const REVIEW_DIFF_EXCLUDES = [
 ];
 
 export function getDiff(workspaceDir: string): string {
-  // Mark all untracked files as "intent to add" so git diff HEAD includes them
-  // as new-file additions. Without this, untracked files (e.g. newly created
-  // .mcp.json, .claude/settings.json) are invisible to the diff and the reviewer
-  // falsely rejects the implementation as "uncommitted". The push step runs
-  // git add -A unconditionally, so leaving intent-to-add markers is harmless.
-  spawnSync("git", ["add", "-N", "."], {
+  // Resolve the real index via git rev-parse --git-path index, which handles
+  // worktrees correctly (each worktree has its own index, not the one in the
+  // shared .git dir).
+  const gitPathResult = spawnSync("git", ["rev-parse", "--git-path", "index"], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  const result = spawnSync(
-    "git",
-    ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
-    {
-      cwd: workspaceDir,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-  if (result.status !== 0) {
-    // A non-zero exit means the reviewer sees an empty diff and may spuriously
-    // approve. Behaviour is unchanged (still return ""), but surface it so the
-    // failure is observable in the runner logs rather than silent.
+  if (gitPathResult.status !== 0) {
     console.warn(
-      `[getDiff] git diff failed (exit ${result.status ?? "null"}): ${result.stderr?.toString().trim() ?? ""}`,
+      `[getDiff] git rev-parse --git-path index failed (exit ${gitPathResult.status ?? "null"})`,
     );
     return "";
   }
-  return result.stdout.toString();
+
+  const rawIndexPath = gitPathResult.stdout.toString().trim();
+  if (!rawIndexPath) {
+    console.warn("[getDiff] git rev-parse --git-path index returned an empty path");
+    return "";
+  }
+  const realIndexPath = resolve(workspaceDir, rawIndexPath);
+
+  // mkdtempSync guarantees exclusive creation — no collision with existing paths
+  // or symlink-following attacks. The disposable index lives inside this dir.
+  const tmpDir = mkdtempSync(join(tmpdir(), "ai-implement-review-index-"));
+  const tmpIndexPath = join(tmpDir, "index");
+
+  try {
+    const env = { ...process.env, GIT_INDEX_FILE: tmpIndexPath };
+
+    if (existsSync(realIndexPath)) {
+      // Seed the disposable index from the real one so existing staged changes
+      // remain visible in the diff. The real index is only read here — never written.
+      copyFileSync(realIndexPath, tmpIndexPath);
+    } else {
+      // No real index (nothing staged yet): initialize the disposable index
+      // from HEAD so that git diff HEAD sees the full working-tree delta.
+      const readTreeResult = spawnSync("git", ["read-tree", "HEAD"], {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+      });
+      if (readTreeResult.status !== 0) {
+        console.warn(
+          `[getDiff] git read-tree HEAD failed (exit ${readTreeResult.status ?? "null"}): ${readTreeResult.stderr?.toString().trim() ?? ""}`,
+        );
+        return "";
+      }
+    }
+
+    // Apply intent-to-add to the disposable index only — the real index is
+    // never mutated. Pre-existing entries in the real index are byte-for-byte
+    // unchanged after this function returns.
+    const addResult = spawnSync("git", ["add", "-N", "."], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+    });
+    if (addResult.status !== 0) {
+      console.warn(
+        `[getDiff] git add -N failed (exit ${addResult.status ?? "null"}): ${addResult.stderr?.toString().trim() ?? ""}`,
+      );
+      return "";
+    }
+
+    const result = spawnSync(
+      "git",
+      ["diff", "HEAD", "--", ".", ...REVIEW_DIFF_EXCLUDES],
+      {
+        cwd: workspaceDir,
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+      },
+    );
+
+    if (result.status !== 0) {
+      console.warn(
+        `[getDiff] git diff failed (exit ${result.status ?? "null"}): ${result.stderr?.toString().trim() ?? ""}`,
+      );
+      return "";
+    }
+    return result.stdout.toString();
+  } finally {
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup failures
+    }
+  }
 }
 
 const POST_MORTEM_MAX_TURNS = 15;
@@ -224,17 +347,35 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     let iteration = 0;
     let approved = false;
     let feedback = "";
+    let reviewIssues: string[] = [];
     let terminationReason: TerminationReason = "iterations_exhausted";
     const passes: PassStat[] = [];
     let postMortem: string | undefined;
 
+    const rawPlanningContext =
+      inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined;
+    const { acceptanceBar, mapSection } = splitPlanningContext(rawPlanningContext ?? "");
+    const isNewFormatContext = acceptanceBar !== undefined || mapSection !== undefined;
+
     while (iteration < effectiveMaxIterations && !approved) {
       iteration++;
+
+      // On retries with new-format context, send only the map section — but
+      // re-wrap it with the untrusted-data guard so the security preamble is
+      // never dropped. Fall back to the full rawPlanningContext when mapSection
+      // is absent (partial planning output) rather than sending undefined.
+      const implementPlanningContext =
+        isNewFormatContext && iteration > 1
+          ? mapSection !== undefined
+            ? wrapWithPlanningGuard(mapSection)
+            : rawPlanningContext
+          : rawPlanningContext;
 
       const implementPrompt = buildImplementPrompt(
         String(inputs.issueTitle),
         String(inputs.issueDescription),
         feedback || undefined,
+        reviewIssues,
         context.data.issueIdentifier,
         inputs.implementationPrompt !== undefined ? String(inputs.implementationPrompt) : undefined,
       );
@@ -252,7 +393,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           prompt: implementPrompt,
           model: resolvedImplementModel,
           maxTurns: effectiveMaxTurns,
-          planningContext: inputs.planningContext,
+          planningContext: implementPlanningContext,
         },
         outputs: {},
         logs_url: null,
@@ -268,8 +409,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             prompt: implementPrompt,
             model: resolvedImplementModel,
             maxTurns: effectiveMaxTurns,
-            planningContext:
-              inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined,
+            planningContext: implementPlanningContext,
           },
           reporter,
         );
@@ -292,6 +432,10 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         implementOutcome: implementTelemetry?.outcome ?? "unknown",
         costUsd: implementTelemetry?.costUsd ?? null,
         reviewApproved: null,
+        tokensIn: implementTelemetry?.tokensIn ?? null,
+        tokensOut: implementTelemetry?.tokensOut ?? null,
+        cacheReadTokens: implementTelemetry?.cacheReadTokens ?? null,
+        cacheCreationTokens: implementTelemetry?.cacheCreationTokens ?? null,
       };
       passes.push(pass);
 
@@ -300,7 +444,10 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       // Hard max_turns: the pass ran out of budget mid-work. Reviewing or
       // re-implementing an over-scoped task just burns more passes — stop,
       // post-mortem where the turns went, and let the pipeline open a draft PR.
-      if (implementTelemetry?.outcome === "max_turns") {
+      if (
+        implementTelemetry &&
+        (implementTelemetry.outcome === "max_turns" || exceededConfiguredMaxTurns(implementTelemetry, effectiveMaxTurns))
+      ) {
         terminationReason = "max_turns";
         feedback = `Implementation hit the ${effectiveMaxTurns}-turn cap before completing (${implementTelemetry.numTurns ?? "?"} turns used).`;
         postMortem =
@@ -335,6 +482,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           iteration,
           issueTitle: inputs.issueTitle,
           issueDescription: inputs.issueDescription,
+          acceptanceBar,
         },
         outputs: {},
         logs_url: null,
@@ -351,6 +499,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             issueTitle: inputs.issueTitle !== undefined ? String(inputs.issueTitle) : undefined,
             issueDescription:
               inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
+            acceptanceBar,
           },
           reporter,
         );
@@ -361,6 +510,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
 
         approved = reviewOutputs.approved;
         feedback = reviewOutputs.feedback;
+        reviewIssues = [...reviewOutputs.issues];
         pass.reviewApproved = reviewOutputs.approved;
         if (approved) terminationReason = "approved";
       } catch (err) {

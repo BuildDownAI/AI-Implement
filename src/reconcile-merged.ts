@@ -6,12 +6,17 @@ import {
   recordReconciliationFailure,
   updateReconciliationStatus,
 } from "./reconciliation.js";
+import { capturePrMerge } from "./merge-capture.js";
 
 export interface ReconcileDeps {
   /** Resolve a repo to its mapping AND the scope/team key it is registered under —
    *  markMerged needs the authoritative scopeKey (Jira picks its mapping by it). */
   mappingForRepo: (repo: string) => { scopeKey: string; mapping: RepoMapping } | undefined;
   resolveProvider: (mapping: RepoMapping) => Promise<TicketingProvider>;
+  /** When provided, a merge-capture record is written after each successful markMerged. */
+  tokenForOwner?: (owner: string) => Promise<string>;
+  /** The GitHub App's bot login (e.g. "my-app[bot]") used to identify runner commits. */
+  appBotLogin?: string;
 }
 
 /**
@@ -37,6 +42,25 @@ export async function runReconciliations(deps: ReconcileDeps): Promise<void> {
       await provider.markMerged(job.issueId, resolved.scopeKey);
       updateReconciliationStatus(job.id, "dispatched");
       console.log(`[reconcile] Marked ${job.issueIdentifier ?? job.issueId} Done (PR #${job.prNumber} in ${job.repo})`);
+
+      if (deps.tokenForOwner) {
+        const [owner] = job.repo.split("/");
+        try {
+          const ghToken = await deps.tokenForOwner(owner!);
+          await capturePrMerge({
+            repo: job.repo,
+            prNumber: job.prNumber,
+            issueId: job.issueId,
+            token: ghToken,
+            appBotLogin: deps.appBotLogin,
+          });
+        } catch (err) {
+          console.error(
+            `[merge-capture] Failed to capture merge for ${job.repo}#${job.prNumber}:`,
+            err,
+          );
+        }
+      }
     } catch (err) {
       const { attempts, failed } = recordReconciliationFailure(job.id);
       if (failed) {

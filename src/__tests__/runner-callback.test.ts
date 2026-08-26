@@ -401,6 +401,86 @@ describe("handleRunnerProgress", () => {
       },
     ]);
   });
+
+  it("uses authenticated progress to correct a swapped concurrent run association", async () => {
+    const dispatchId = "dispatch-correct";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "correct-issue",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const correctJobId = log.appendLog({
+      issueId: "correct-issue",
+      issueIdentifier: "ENG-1",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const siblingJobId = log.appendLog({
+      issueId: "sibling-issue",
+      issueIdentifier: "ENG-2",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId: "dispatch-sibling",
+      executionMode: "github-actions",
+    });
+
+    // The heuristic lookup raced and assigned each job the other run.
+    log.updateJobRunId(correctJobId, 222);
+    log.updateJobRunId(siblingJobId, 111);
+
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { step: STEP, githubRunId: 111 },
+      secret: SECRET,
+    });
+
+    expect(res.status).toBe(200);
+    const jobs = log.listLog();
+    expect(jobs.find((job) => job.id === correctJobId)).toMatchObject({
+      runId: 111,
+      status: "running",
+    });
+    expect(jobs.find((job) => job.id === siblingJobId)).toMatchObject({
+      runId: null,
+      status: "dispatched",
+    });
+  });
+
+  it("rejects a malformed GitHub run ID without changing the job", async () => {
+    const dispatchId = "dispatch-invalid-run";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { step: STEP, githubRunId: -1 },
+      secret: SECRET,
+    });
+
+    expect(res).toMatchObject({ status: 400, body: { error: "invalid_github_run_id" } });
+    expect(log.listLog().find((job) => job.id === jobId)?.runId).toBeNull();
+    expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
+  });
 });
 
 describe("handleRunnerPlanningContext", () => {
@@ -898,6 +978,93 @@ describe("unapproved-run failure codes", () => {
     expect(call).toBeDefined();
     const [, , comment] = call!.args as [string, string, string];
     expect(comment).toContain("https://github.com/o/r/pull/9");
+  });
+});
+
+describe("watchdogConfig — remediateFailedJob gating", () => {
+  const watchdogConfig = {
+    githubAppId: "app-id",
+    githubAppPrivateKey: "key",
+    notifyType: "slack",
+    notifyWebhookUrl: null,
+  };
+
+  it("skips remediateFailedJob when prUrl is set (draft-PR coded failure)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "t",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        failureReason: "nope",
+        prUrl: "https://github.com/o/r/pull/9",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    // clearWorkingState is what remediateFailedJob calls via boundedCleanup;
+    // it must NOT fire when a draft PR is already open.
+    const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
+    expect(clearCall).toBeUndefined();
+  });
+
+  it("runs remediateFailedJob when watchdogConfig is set and no prUrl", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "t",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "build failed",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+      watchdogConfig,
+    });
+
+    expect(res.status).toBe(200);
+    const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
+    expect(clearCall).toBeDefined();
   });
 });
 

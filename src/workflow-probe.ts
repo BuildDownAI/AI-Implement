@@ -1,9 +1,14 @@
 const CACHE_TTL_MS = 300_000;
 const RUN_CONFIG_RE = /^\s{2,}run_config:\s*$/m;
+const RUN_PUBLICATION_TOKEN_RE = /^\s{2,}run_publication_token:\s*$/m;
 
 export type WorkflowContract = "envelope" | "legacy";
+export interface WorkflowCapabilities {
+  contract: WorkflowContract;
+  supportsRunPublicationToken: boolean;
+}
 
-type CacheEntry = { expiresAt: number; contract: WorkflowContract };
+type CacheEntry = { expiresAt: number; capabilities: WorkflowCapabilities };
 
 const cache = new Map<string, CacheEntry>();
 
@@ -27,6 +32,13 @@ export interface ResolveWorkflowContractInput {
 export async function resolveWorkflowContract(
   input: ResolveWorkflowContractInput,
 ): Promise<WorkflowContract> {
+  const capabilities = await resolveWorkflowCapabilities(input);
+  return capabilities.contract;
+}
+
+export async function resolveWorkflowCapabilities(
+  input: ResolveWorkflowContractInput,
+): Promise<WorkflowCapabilities> {
   const { owner, repo, workflowFile, token, ref } = input;
   const fetchImpl = input.fetchImpl ?? fetch;
   const now = (input.nowMs ?? Date.now)();
@@ -34,23 +46,27 @@ export async function resolveWorkflowContract(
   const cacheKey = `${owner}/${repo}/${workflowFile}/${ref}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
-    return cached.contract;
+    return cached.capabilities;
   }
 
-  const contract = await probeContract(owner, repo, workflowFile, ref, token, fetchImpl);
-  cache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, contract });
-  return contract;
+  const capabilities = await probeCapabilities(owner, repo, workflowFile, ref, token, fetchImpl);
+  cache.set(cacheKey, { expiresAt: now + CACHE_TTL_MS, capabilities });
+  return capabilities;
 }
 
-async function probeContract(
+async function probeCapabilities(
   owner: string,
   repo: string,
   workflowFile: string,
   ref: string,
   token: string,
   fetchImpl: typeof fetch,
-): Promise<WorkflowContract> {
+): Promise<WorkflowCapabilities> {
   const url = `https://api.github.com/repos/${owner}/${repo}/contents/.github/workflows/${workflowFile}?ref=${encodeURIComponent(ref)}`;
+  const legacy = (): WorkflowCapabilities => ({
+    contract: "legacy",
+    supportsRunPublicationToken: false,
+  });
   let res: Response;
   try {
     res = await fetchImpl(url, {
@@ -63,15 +79,15 @@ async function probeContract(
     });
   } catch (err) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: fetch failed (${err instanceof Error ? err.message : String(err)}); assuming legacy contract`);
-    return "legacy";
+    return legacy();
   }
 
   if (res.status === 404) {
-    return "legacy";
+    return legacy();
   }
   if (!res.ok) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: contents lookup returned HTTP ${res.status}; assuming legacy contract`);
-    return "legacy";
+    return legacy();
   }
 
   let body: { content?: string; encoding?: string; type?: string };
@@ -79,14 +95,18 @@ async function probeContract(
     body = (await res.json()) as typeof body;
   } catch (err) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: response was not JSON; assuming legacy contract`);
-    return "legacy";
+    return legacy();
   }
 
   if (body.type !== "file" || body.encoding !== "base64" || !body.content) {
     console.warn(`[workflow-probe] ${owner}/${repo}/${workflowFile}: response was not a file blob; assuming legacy contract`);
-    return "legacy";
+    return legacy();
   }
 
   const yamlText = Buffer.from(body.content, "base64").toString("utf8");
-  return RUN_CONFIG_RE.test(yamlText) ? "envelope" : "legacy";
+  const contract = RUN_CONFIG_RE.test(yamlText) ? "envelope" : "legacy";
+  return {
+    contract,
+    supportsRunPublicationToken: contract === "envelope" && RUN_PUBLICATION_TOKEN_RE.test(yamlText),
+  };
 }

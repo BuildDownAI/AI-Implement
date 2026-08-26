@@ -1,13 +1,16 @@
 import { spawnSync } from "node:child_process";
-import type { StepModule, StepReporter } from "../types.js";
+import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
+import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { getPublicationCredential } from "../../publication-credential.js";
 import {
   AI_IMPLEMENT_NATIVE_REVIEW_MARKER,
   collectExternalReviewFindingsFromGh,
   formatReviewLedgerForPrompt,
   type ReviewLedgerFinding,
 } from "../review-ledger.js";
+import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 
 interface PostPushReviewInputs extends Record<string, unknown> {
   prNumber: string;
@@ -24,15 +27,26 @@ interface PostPushReviewInputs extends Record<string, unknown> {
   ghSpawn?: (args: string[]) => SpawnResult;
   gitSpawn?: (args: string[]) => SpawnResult;
   sleep?: (ms: number) => Promise<void>;
+  /** Injectable credential refresh for tests. */
+  refreshCredentials?: () => Promise<void>;
 }
 
 type ExternalReviewState = "skipped" | "absent" | "running" | "completed";
+type PostPushReviewTerminationReason =
+  | "approved"
+  | "iterations_exhausted"
+  | "review_failed"
+  | "invalid_review"
+  | "external_review_pending"
+  | "fix_failed"
+  | "no_changes";
 
 interface PostPushReviewOutputs extends Record<string, unknown> {
   approved: boolean;
   iterations: number;
   finalFeedback: string;
   forcePushedRevisions: number;
+  terminationReason: PostPushReviewTerminationReason;
 }
 
 interface SpawnResult {
@@ -51,6 +65,44 @@ const DEFAULT_MAX_ITERATIONS = 3;
 const GITHUB_CLAUDE_CODE_REVIEW_PROVIDER = "github-claude-code-review";
 const DEFAULT_REVIEW_WAIT_POLL_MS = 5000;
 const DEFAULT_REVIEW_WAIT_TIMEOUT_MS = 300000;
+// Check-run names produced by the review workflows in this repository.
+// "review" comes from claude-review.yml (pull_request_target, resolves from the default branch).
+// "code-review-plugin" comes from claude-code-review.yml (pull_request, resolves from the PR head).
+// "claude-review", "claude code review", and "claude-code-review" cover repos running earlier
+// workflow versions. The heuristic fallback in isExternalReviewCheckName catches other variants.
+const DEFAULT_REVIEW_CHECK_NAMES = ["review", "code-review-plugin", "claude-review", "claude code review", "claude-code-review"];
+// Allowlist of check-run conclusions that represent a reviewer actually producing findings.
+// Anything outside this set — skipped, neutral, cancelled, timed_out, action_required, and any
+// future conclusion GitHub adds — routes to "no-real-verdict" and fails closed.
+const REAL_REVIEW_CONCLUSIONS = new Set(["success", "failure", "stale"]);
+
+async function refreshCredentialsBeforePush(
+  context: PipelineContext,
+  inputs: PostPushReviewInputs,
+): Promise<void> {
+  if (inputs.refreshCredentials) {
+    await inputs.refreshCredentials();
+    return;
+  }
+
+  const currentToken = process.env.GITHUB_TOKEN?.trim()
+    || process.env.GH_TOKEN?.trim()
+    || context.data.githubToken?.trim();
+  const owner = context.data.githubOwner?.trim();
+  const repo = context.data.githubRepo?.trim();
+  if (!currentToken || !owner || !repo) return;
+
+  await refreshRunnerGithubCredentials({
+    currentToken,
+    orchestratorUrl: context.data.orchestratorUrl,
+    machineNonce: context.data.nonce,
+    callbackUrl: context.data.callbackUrl,
+    publicationToken: getPublicationCredential(),
+    owner,
+    repo,
+    workspaceDir: inputs.workspaceDir,
+  });
+}
 
 interface ReviewFinding {
   iteration: number;
@@ -176,7 +228,9 @@ function parseReviewIssues(parsed: Record<string, unknown>): ReviewIssue[] {
       ? parsed.blockingIssues
       : Array.isArray(parsed.issues)
         ? parsed.issues
-        : [];
+        : Array.isArray(parsed.findings)
+          ? parsed.findings
+          : [];
 
   return source
     .map(parseReviewIssue)
@@ -341,10 +395,13 @@ function isExternalReviewCheckName(name: string, configured: string[] | undefine
   const normalized = name.trim().toLowerCase();
   if (!normalized) return false;
   if (configured && configured.length > 0) {
+    // Configured path: exact match only — the operator pinned exact names.
     return configured.some((candidate) => candidate.trim().toLowerCase() === normalized);
   }
-  if (normalized === "claude-review" || normalized === "claude code review") return true;
-  return /claude/.test(normalized) && /review/.test(normalized);
+  // Default path: exact match against the known list, then heuristic fallback for names like
+  // "claude-code-review" that don't appear in an explicit enumeration.
+  return DEFAULT_REVIEW_CHECK_NAMES.some((candidate) => candidate.trim().toLowerCase() === normalized)
+    || (normalized.includes("claude") && normalized.includes("review"));
 }
 
 function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): string {
@@ -358,7 +415,7 @@ function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: st
   }
 }
 
-function parseCheckRuns(stdout: string): { name: string; status: string }[] {
+function parseCheckRuns(stdout: string): { name: string; status: string; conclusion: string }[] {
   let payload: unknown;
   try {
     payload = JSON.parse(stdout);
@@ -367,7 +424,7 @@ function parseCheckRuns(stdout: string): { name: string; status: string }[] {
   }
   // `gh api` returns { check_runs: [...] }; with --slurp/--paginate it can be an array of pages.
   const pages = Array.isArray(payload) ? payload : [payload];
-  const runs: { name: string; status: string }[] = [];
+  const runs: { name: string; status: string; conclusion: string }[] = [];
   for (const page of pages) {
     const record = asRecord(page);
     const checkRuns = record?.check_runs;
@@ -376,7 +433,8 @@ function parseCheckRuns(stdout: string): { name: string; status: string }[] {
       const r = asRecord(run);
       const name = stringProp(r, "name");
       const status = stringProp(r, "status");
-      if (name) runs.push({ name, status });
+      const conclusion = stringProp(r, "conclusion");
+      if (name) runs.push({ name, status, conclusion });
     }
   }
   return runs;
@@ -386,13 +444,33 @@ function probeExternalReviewCheck(
   ghSpawn: (args: string[]) => SpawnResult,
   headSha: string,
   configuredCheckNames: string[] | undefined,
-): "absent" | "running" | "completed" {
+): "absent" | "running" | "completed" | "no-real-verdict" {
   const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
   // If we cannot read check state, fail open rather than stall the loop indefinitely.
   if (res.exitCode !== 0) return "absent";
-  const matching = parseCheckRuns(res.stdout).filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
-  if (matching.length === 0) return "absent";
-  return matching.every((run) => run.status === "completed") ? "completed" : "running";
+  const allRuns = parseCheckRuns(res.stdout);
+  const matching = allRuns.filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
+  if (matching.length === 0) {
+    // Warn unconditionally: "no runs at all" and "runs present but none matched" are both worth
+    // surfacing, since they are the two most common causes of silent fail-open.
+    if (allRuns.length === 0) {
+      console.warn(`[post-push-review] No check runs present at ${headSha}`);
+    } else {
+      const presentNames = allRuns.map((r) => r.name).join(", ");
+      const expected = (configuredCheckNames && configuredCheckNames.length > 0) ? configuredCheckNames : DEFAULT_REVIEW_CHECK_NAMES;
+      console.warn(`[post-push-review] No external review check matched; present: ${presentNames}; expected one of: ${expected.join(", ")}`);
+    }
+    return "absent";
+  }
+  if (matching.some((run) => run.status !== "completed")) return "running";
+  // Only conclusions a reviewer actually produces count as a real review. Cancelled, skipped,
+  // neutral, timed_out, action_required, and any future conclusion GitHub adds all fail closed —
+  // an unknown conclusion should never silently approve.
+  const hasRealReview = matching.some((run) => REAL_REVIEW_CONCLUSIONS.has(run.conclusion));
+  if (hasRealReview) return "completed";
+  // Every matching run is completed but none produced a real verdict. Return "no-real-verdict" so
+  // the caller can fail closed immediately rather than approving as if no check existed.
+  return "no-real-verdict";
 }
 
 /**
@@ -400,9 +478,10 @@ function probeExternalReviewCheck(
  * reaches a terminal state, so the merge-readiness decision is made against a real
  * external verdict instead of the empty snapshot that exists when both reviews start.
  *
- * - "completed": the external check finished — read its findings and gate normally.
+ * - "completed": the external check finished with a real verdict — read findings and gate normally.
  * - "absent": no external review check exists for this SHA — fail open (repo has none).
- * - "running": the check exists but did not finish within the budget — fail closed.
+ * - "running": the check is still in flight or concluded without a real verdict (cancelled, skipped,
+ *   etc.) — both cases fail closed; "no-real-verdict" is mapped to "running" immediately.
  */
 async function waitForExternalReviewCompletion(
   ghSpawn: (args: string[]) => SpawnResult,
@@ -420,6 +499,9 @@ async function waitForExternalReviewCompletion(
   let elapsed = 0;
   for (;;) {
     const state = probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames);
+    // "no-real-verdict": every matching check is completed but none produced a reviewer verdict
+    // (e.g. cancelled, skipped, timed_out). Fail closed immediately — a cancelled run is not a review.
+    if (state === "no-real-verdict") return "running";
     if (state !== "running") return state;
     if (elapsed >= opts.timeoutMs) return "running";
     await opts.sleep(opts.pollMs);
@@ -668,6 +750,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let approved = false;
     let feedback = "";
     let forcePushed = 0;
+    let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     const reviewHistory: ReviewFinding[] = [];
 
     while (iteration < maxIterations && !approved) {
@@ -726,8 +809,14 @@ ${diffRes.stdout}
 
 Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string", "location": "file/function; omit when unknown", "problem": "full failing behavior", "required_fix": "full required fix"}], "score": int, "progress_delta": int, "feedback": "string"}.`;
 
-      const reviewResult = await context.llmExecutor.invoke({ prompt: reviewPrompt, model, maxTurns: REVIEW_MAX_TURNS });
+      const reviewResult = await context.llmExecutor.invoke({
+        prompt: reviewPrompt,
+        model,
+        maxTurns: REVIEW_MAX_TURNS,
+        tools: READ_ONLY_ALLOWED_TOOLS,
+      });
       if (reviewResult.exitCode !== 0) {
+        terminationReason = "review_failed";
         const failure = `Reviewer LLM failed (${llmResultMessage(reviewResult)})`;
         feedback = compactErrorMessage(failure);
         await reporter.report({
@@ -752,9 +841,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       const parsed = extractFirstJsonObject(reviewResult.stdout) as
-        | { approved?: boolean; feedback?: string; issues?: unknown[]; blocking_issues?: unknown[]; blockingIssues?: unknown[] }
+        | { approved?: boolean; feedback?: string; issues?: unknown[]; findings?: unknown[]; blocking_issues?: unknown[]; blockingIssues?: unknown[] }
         | null;
       if (!parsed) {
+        terminationReason = "invalid_review";
         feedback = compactErrorMessage(`Reviewer returned non-JSON output: ${reviewResult.stdout || "(empty stdout)"}`);
         await reporter.report({
           id: `post-push-review.${iteration}`,
@@ -778,6 +868,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       if (typeof parsed.approved !== "boolean") {
+        terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: expected approved:boolean.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
@@ -800,12 +891,15 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       const externalFindings: ReviewLedgerFinding[] = externalReviewState === "skipped"
         ? []
         : collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
-      const hasExternalBlockers = externalFindings.some((finding) => finding.severity === "blocking");
+      // Approval is a zero-findings invariant. Severity controls presentation and
+      // prioritisation, not whether a reported Claude finding may be silently escaped.
+      const hasExternalFindings = externalFindings.length > 0;
 
       feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
       let issues = parseReviewIssues(parsed);
       issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
-      if (issues.length === 0 && parsed.approved === false && !hasExternalBlockers) {
+      if (issues.length === 0 && parsed.approved === false && !hasExternalFindings) {
+        terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
@@ -814,8 +908,9 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
       // external review check did not finish within the wait budget. Do not auto-approve
       // against a reviewer that is still in flight — defer to a human.
-      const internalApprovable = parsed.approved === true && issues.length === 0 && !hasExternalBlockers;
+      const internalApprovable = parsed.approved === true && issues.length === 0 && !hasExternalFindings;
       if (internalApprovable && externalReviewPending) {
+        terminationReason = "external_review_pending";
         feedback = "External review did not complete within the wait budget; not auto-approving.";
         await reporter.report({
           id: `post-push-review.${iteration}`,
@@ -854,6 +949,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       });
 
       if (approved) {
+        terminationReason = "approved";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
         submitPrReview(ghSpawn, prNumber, `${AI_IMPLEMENT_NATIVE_REVIEW_MARKER}\nAI-Implement post-push review approved this PR.`);
         postPrComment(
@@ -866,6 +962,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       }
 
       if (iteration >= maxIterations) {
+        terminationReason = "iterations_exhausted";
         const marker = `<!-- ai-implement post-push iter=${iteration} -->`;
         submitPrReview(
           ghSpawn,
@@ -875,7 +972,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalBlockers)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalFindings)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
@@ -885,7 +982,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       postPrComment(
         ghSpawn,
         prNumber,
-        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalBlockers)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalFindings)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
         feedbackMarker,
       );
 
@@ -928,6 +1025,7 @@ ${externalReviewFindingsBlock(externalFindings)}
 
       const fixResult = await context.llmExecutor.invoke({ prompt: fixPrompt, model, maxTurns: FIX_MAX_TURNS });
       if (fixResult.exitCode !== 0) {
+        terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);
         const marker = `<!-- ai-implement post-push iter=${iteration} fix-failed -->`;
         postPrComment(
@@ -946,6 +1044,7 @@ ${externalReviewFindingsBlock(externalFindings)}
       const status = gitSpawn(["status", "--porcelain"]);
       if (status.exitCode !== 0) throw new Error(`git status failed: ${resultMessage(status)}`);
       if (!status.stdout.trim()) {
+        terminationReason = "no_changes";
         const marker = `<!-- ai-implement post-push iter=${iteration} no-changes -->`;
         submitPrReview(
           ghSpawn,
@@ -975,6 +1074,10 @@ ${externalReviewFindingsBlock(externalFindings)}
 
       const branchName = currentBranchName(gitSpawn);
       const remoteRef = `refs/heads/${branchName}`;
+      // A fix pass can run long enough to outlive the token minted by pushStep.
+      // Re-vend at the actual write boundary; transient vending failures retain
+      // the latest token already present in the environment and origin URL.
+      await refreshCredentialsBeforePush(context, inputs);
       const expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
       const push = gitSpawn([
         "push",
@@ -994,7 +1097,13 @@ ${externalReviewFindingsBlock(externalFindings)}
       );
     }
 
-    return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed };
+    return {
+      approved,
+      iterations: iteration,
+      finalFeedback: feedback,
+      forcePushedRevisions: forcePushed,
+      terminationReason,
+    };
   },
 };
 

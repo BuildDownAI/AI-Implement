@@ -1,4 +1,5 @@
 import { getDb } from "./dedup.js";
+import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -36,6 +37,10 @@ export interface Job {
   sessionImage: string | null;
   phase: string;
   contract: string | null;
+  /** True when the dispatch was a grouping parent's own closing-work run (chain ends at
+   *  self). Lets the monitors treat a clean exit with no PR as Case-B finalize instead of
+   *  pr_not_found (AII-264 r5). */
+  groupingParent: boolean;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -122,6 +127,10 @@ function ensureLogColumns(): void {
   if (!names.has("trigger")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN trigger TEXT");
   }
+  if (!names.has("grouping_parent")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN grouping_parent INTEGER NOT NULL DEFAULT 0");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_run_id ON dispatch_log(run_id)");
 
   // Migrate legacy rows: jobs that were never actually tracked by the run
   // monitor should show 'unknown', not a misleading terminal status.
@@ -162,12 +171,14 @@ export function appendLog(entry: {
   contract?: "legacy" | "envelope";
   /** Trigger source: 'comment' for orchestrator-mediated /ai-implement runs, null = orchestrator-initiated. */
   trigger?: string;
+  /** True when this dispatch is a grouping parent's own closing-work run (AII-264 r5). */
+  groupingParent?: boolean;
 }): number {
   const db = getDb();
   const dispatchNumber = entry.dispatchNumber ?? countPriorDispatches(entry.issueId, entry.phase ?? "implementation").count + 1;
 
   const result = db.prepare(
-    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO dispatch_log (issue_id, issue_identifier, issue_title, team_key, repo, dispatched_at, dispatch_id, dispatch_number, issue_state, status, machine_nonce, execution_mode, machine_id, runner_mode, session_image, phase, contract, trigger, grouping_parent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
     entry.issueId,
     entry.issueIdentifier ?? null,
@@ -187,11 +198,16 @@ export function appendLog(entry: {
     entry.phase ?? "implementation",
     entry.contract ?? null,
     entry.trigger ?? null,
+    entry.groupingParent ? 1 : 0,
   );
 
-  // Keep only the most recent MAX_LOG_ENTRIES rows
+  // Keep only the most recent MAX_LOG_ENTRIES rows, but never evict a row while
+  // its machine nonce is active. Token vending and callbacks depend on that row
+  // for the run lifetime; invalidateNonce() makes it prunable when terminal.
   db.prepare(
-    "DELETE FROM dispatch_log WHERE id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)",
+    `DELETE FROM dispatch_log
+     WHERE machine_nonce IS NULL
+       AND id NOT IN (SELECT id FROM dispatch_log ORDER BY dispatched_at DESC LIMIT ?)`,
   ).run(MAX_LOG_ENTRIES);
 
   return Number(result.lastInsertRowid);
@@ -226,6 +242,74 @@ export function updateJobRunId(jobId: number, runId: number): void {
     .run(runId, jobId);
 }
 
+/** Best-effort heuristic binding. An authenticated callback may have won the race already. */
+export function attachJobRunIdIfMissing(jobId: number, runId: number): boolean {
+  const result = getDb()
+    .prepare("UPDATE dispatch_log SET run_id = ?, status = 'running' WHERE id = ? AND run_id IS NULL AND status IN ('dispatched', 'running')")
+    .run(runId, jobId);
+  return result.changes > 0;
+}
+
+/**
+ * Authoritatively binds the run reported by a job's authenticated progress token.
+ * Any sibling in the same repository holding that run was matched heuristically
+ * and is reopened so it can discover its own run. Repository scoping prevents a
+ * runner token from mutating another repository's jobs. A terminal target is
+ * preserved only when it already owns this exact run, which makes late progress
+ * retries harmless.
+ */
+export function claimJobRunId(jobId: number, runId: number): number {
+  const db = getDb();
+  return db.transaction(() => {
+    const target = db
+      .prepare("SELECT repo FROM dispatch_log WHERE id = ?")
+      .get(jobId) as { repo: string | null } | undefined;
+
+    const released = db
+      .prepare(
+        `UPDATE dispatch_log
+         SET run_id = NULL,
+             status = 'dispatched',
+             conclusion = NULL,
+             completed_at = NULL,
+             notified_at = NULL
+         WHERE run_id = ?
+           AND id != ?
+           AND repo = ?`,
+      )
+      .run(runId, jobId, target?.repo ?? null);
+
+    db.prepare(
+      `UPDATE dispatch_log
+       SET status = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN status
+             ELSE 'running'
+           END,
+           conclusion = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN conclusion
+             ELSE NULL
+           END,
+           completed_at = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN completed_at
+             ELSE NULL
+           END,
+           notified_at = CASE
+             WHEN run_id = ? AND status IN ('completed', 'review_failed', 'failed', 'timed_out', 'dispatch-failed')
+               THEN notified_at
+             ELSE NULL
+           END,
+           run_id = ?
+       WHERE id = ?`,
+    )
+      .run(runId, runId, runId, runId, runId, jobId);
+
+    return released.changes;
+  })();
+}
+
 export function updateJobStatus(
   jobId: number,
   status: JobStatus,
@@ -233,18 +317,36 @@ export function updateJobStatus(
   prUrl?: string | null,
 ): void {
   const isTerminal = status === "completed" || status === "review_failed" || status === "failed" || status === "timed_out" || status === "dispatch-failed";
+  // AII-277: a comment-triggered (gap-fill) run reaching a terminal state must
+  // terminalize its queue row, or hasPendingConflictResolution stays true
+  // forever and conflict-recovery attempt 2 is unreachable (observed livelock).
+  if (isTerminal) {
+    const job = getDb().prepare("SELECT repo, trigger, pr_url FROM dispatch_log WHERE id = ?").get(jobId) as
+      | { repo: string; trigger: string | null; pr_url: string | null } | undefined;
+    const prUrlForRow = prUrl ?? job?.pr_url ?? null;
+    const m = prUrlForRow ? /\/pull\/(\d+)$/.exec(prUrlForRow) : null;
+    if (job?.trigger === "comment" && m) {
+      const outcome = status === "completed" ? "completed" : "failed";
+      const n = markCommentGapfillRunTerminal(job.repo, Number(m[1]), outcome);
+      if (n > 0) console.log(`[gapfill] terminalized ${n} queue row(s) for ${job.repo}#${m[1]} -> ${outcome}`);
+    }
+  }
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
   // caller has none — the GHA monitor often can't resolve a PR for dispatch runs and
   // must not wipe the link on completion.
   getDb()
     .prepare(
-      "UPDATE dispatch_log SET status = ?, conclusion = ?, pr_url = COALESCE(?, pr_url), completed_at = ? WHERE id = ?",
+      `UPDATE dispatch_log
+       SET status = ?, conclusion = ?, pr_url = COALESCE(?, pr_url), completed_at = ?,
+           machine_nonce = CASE WHEN ? = 1 THEN NULL ELSE machine_nonce END
+       WHERE id = ?`,
     )
     .run(
       status,
       conclusion ?? null,
       prUrl ?? null,
       isTerminal ? Date.now() : null,
+      isTerminal ? 1 : 0,
       jobId,
     );
 }
@@ -368,6 +470,51 @@ export function getLatestDispatchForPr(owner: string, repo: string, prNumber: nu
   return mapRows([row])[0];
 }
 
+/**
+ * Returns the latest identifier, title, and repo recorded in dispatch_log for a
+ * given issue+phase, or null fields when no log entry exists. Used to enrich
+ * parked-issue rows whose metadata lives only in dispatch_log.
+ */
+export function getIssueEnrichment(
+  issueId: string,
+  phase: string,
+): { issueIdentifier: string | null; issueTitle: string | null; repo: string | null } {
+  const row = getDb()
+    .prepare(
+      `SELECT issue_identifier, issue_title, repo
+       FROM dispatch_log
+       WHERE issue_id = ? AND phase = ?
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(issueId, phase) as
+    | { issue_identifier: string | null; issue_title: string | null; repo: string | null }
+    | undefined;
+  return {
+    issueIdentifier: row?.issue_identifier ?? null,
+    issueTitle: row?.issue_title ?? null,
+    repo: row?.repo ?? null,
+  };
+}
+
+/**
+ * Returns GitHub Actions run URLs for the most recent failed/timed-out jobs for
+ * an issue+phase. Fly Machines and local-Docker jobs are excluded (no stable URL).
+ * Used by the dispatch-breaker trip comment.
+ */
+export function getRecentFailedRunUrls(issueId: string, phase: string, limit = 3): string[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT repo, run_id FROM dispatch_log
+       WHERE issue_id = ? AND phase = ?
+         AND status IN ('failed', 'timed_out')
+         AND execution_mode = 'github-actions'
+         AND run_id IS NOT NULL AND repo IS NOT NULL
+       ORDER BY dispatched_at DESC LIMIT ?`,
+    )
+    .all(issueId, phase, limit) as Array<{ repo: string; run_id: number }>;
+  return rows.map((r) => `https://github.com/${r.repo}/actions/runs/${r.run_id}`);
+}
+
 interface RawRow {
   id: number;
   issue_id: string;
@@ -393,6 +540,7 @@ interface RawRow {
   phase: string | null;
   contract: string | null;
   trigger: string | null;
+  grouping_parent: number | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -420,6 +568,7 @@ function mapRows(rows: RawRow[]): Job[] {
     sessionImage: (row.session_image as string | null) ?? null,
     phase: row.phase ?? "implementation",
     contract: row.contract ?? null,
+    groupingParent: row.grouping_parent === 1,
   }));
 }
 

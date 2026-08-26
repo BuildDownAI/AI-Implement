@@ -2,7 +2,8 @@ import crypto from "node:crypto";
 import type { RepoMapping } from "./config.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
-import { dispatchWorkflow, providerDispatchFields } from "./github.js";
+import { buildEnvelopeDispatchInputs, dispatchWorkflow, providerDispatchFields } from "./github.js";
+import { resolveWorkflowCapabilities } from "./workflow-probe.js";
 
 export interface GapFillTriggerBody {
   issueKey?: unknown;
@@ -19,6 +20,7 @@ export interface HandleGapFillTriggerInput {
   resolveProvider: (mapping: RepoMapping) => Promise<TicketingProvider>;
   getInstallationToken: (owner: string) => Promise<string>;
   dispatchWorkflow?: typeof dispatchWorkflow;
+  resolveWorkflowCapabilities?: typeof resolveWorkflowCapabilities;
 }
 
 export interface HandleGapFillTriggerOutput {
@@ -102,6 +104,7 @@ export async function handleGapFillTrigger(
   let runnerCallbackUrl = "";
   let runToken = "";
   let runProgressToken = "";
+  let dispatchId: string | undefined;
   if (input.runnerCallbackBaseUrl && input.runnerTokenSecret) {
     // Gap-fill dispatches run the implementation workflow and can take as
     // long as the initial implementation, even though they report back as
@@ -114,6 +117,7 @@ export async function handleGapFillTrigger(
       ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
       secret: input.runnerTokenSecret,
     });
+    dispatchId = minted.dispatchId;
     const progressMinted = mintRunToken({
       issueId: owningIssueId,
       mappingTeamKey: owningScopeKey,
@@ -141,18 +145,55 @@ export async function handleGapFillTrigger(
   // comment-trigger.yml are now unreachable from this path; they remain in
   // the file as inert code to keep the diff small.
   const dispatch = input.dispatchWorkflow ?? dispatchWorkflow;
-  const dispatchRes = await dispatch(ghToken, owningMapping, {
-    issue_id: owningIssueId,
-    issue_identifier: issueKey,
-    issue_title: "(gap-fill triggered from PR comment)",
-    issue_description: "(gap-fill triggered from PR comment)",
-    pr_number: String(prNumber),
-    runner_phase: "gap-analysis",
-    ...providerDispatchFields(owningMapping),
-    runner_callback_url: runnerCallbackUrl,
-    run_token: runToken,
-    run_progress_token: runProgressToken,
+  const checkCapabilities = input.resolveWorkflowCapabilities ?? resolveWorkflowCapabilities;
+  const capabilities = await checkCapabilities({
+    owner: owningMapping.owner,
+    repo: owningMapping.repo,
+    workflowFile: owningMapping.workflowFile,
+    token: ghToken,
+    ref: owningMapping.defaultBranch,
   });
+  const runPublicationToken = dispatchId && input.runnerCallbackBaseUrl && input.runnerTokenSecret && capabilities.contract === "envelope" && capabilities.supportsRunPublicationToken
+    ? mintRunToken({
+        issueId: owningIssueId,
+        mappingTeamKey: owningScopeKey,
+        phase: "gap-analysis",
+        audience: "publication",
+        dispatchId,
+        repository: `${owningMapping.owner}/${owningMapping.repo}`,
+        ttlSeconds: IMPLEMENTATION_TTL_SECONDS,
+        secret: input.runnerTokenSecret,
+      }).token
+    : undefined;
+
+  const dispatchInputs = capabilities.contract === "envelope"
+    ? buildEnvelopeDispatchInputs(owningMapping, {
+        id: owningIssueId,
+        identifier: issueKey,
+        title: "(gap-fill triggered from PR comment)",
+        description: "(gap-fill triggered from PR comment)",
+      }, {
+        runnerPhase: "gap-analysis",
+        prNumber: String(prNumber),
+        runnerCallbackUrl: runnerCallbackUrl || undefined,
+        runToken,
+        runProgressToken,
+        runPublicationToken,
+      })
+    : {
+        issue_id: owningIssueId,
+        issue_identifier: issueKey,
+        issue_title: "(gap-fill triggered from PR comment)",
+        issue_description: "(gap-fill triggered from PR comment)",
+        pr_number: String(prNumber),
+        runner_phase: "gap-analysis" as const,
+        ...providerDispatchFields(owningMapping),
+        runner_callback_url: runnerCallbackUrl,
+        run_token: runToken,
+        run_progress_token: runProgressToken,
+      };
+
+  const dispatchRes = await dispatch(ghToken, owningMapping, dispatchInputs);
 
   if (!dispatchRes.success) {
     return bad(502, "dispatch_failed", {

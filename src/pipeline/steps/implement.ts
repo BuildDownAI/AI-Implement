@@ -2,20 +2,12 @@ import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
 
-export interface WorkUnit {
-  id: string;
-  title: string;
-  files?: string[];
-  dependencies?: string[];
-}
-
 interface ImplementInputs extends Record<string, unknown> {
   workspaceDir: string;
   prompt: string;
   model?: string;
   maxTurns?: number;
   planningContext?: string;
-  workUnits?: WorkUnit[];
 }
 
 interface ImplementOutputs extends Record<string, unknown> {
@@ -26,43 +18,18 @@ interface ImplementOutputs extends Record<string, unknown> {
   telemetry?: RunTelemetry;
 }
 
-const PARALLEL_IMPL_INSTRUCTIONS = `
-
-## Parallel Implementation
-
-If the planning context includes a "Work Units" section with independent units,
-use subagents (Task tool) to implement them in parallel:
-- Assign each independent work unit to a separate subagent
-- Scope each subagent to the files listed in its work unit
-- After all independent units complete, implement sequential units yourself
-- Review all changes together for consistency before proceeding
-- If no work units are provided, implement the full issue in a single pass`;
-
 export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
   async run(
     context: PipelineContext,
     inputs: ImplementInputs,
     _reporter: StepReporter,
   ): Promise<ImplementOutputs> {
-    const { workspaceDir, model, maxTurns, planningContext, workUnits } = inputs;
+    const { workspaceDir, model, maxTurns, planningContext } = inputs;
 
     let fullPrompt = inputs.prompt;
 
     if (planningContext) {
       fullPrompt += `\n\n## Planning Context\n\n${planningContext}`;
-    }
-
-    if (workUnits && workUnits.length > 0) {
-      const unitsSection = workUnits
-        .map((u) => {
-          let entry = `### ${u.id}: ${u.title}`;
-          if (u.files?.length) entry += `\nFiles: ${u.files.join(", ")}`;
-          if (u.dependencies?.length) entry += `\nDependencies: ${u.dependencies.join(", ")}`;
-          return entry;
-        })
-        .join("\n\n");
-      fullPrompt += `\n\n## Work Units\n\n${unitsSection}`;
-      fullPrompt += PARALLEL_IMPL_INSTRUCTIONS;
     }
 
     const result = await context.llmExecutor.invoke({
@@ -82,9 +49,6 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       filesChanged: getChangedFiles(workspaceDir),
       tokensUsed: result.tokensUsed,
       exitCode: result.exitCode,
-      // subagentCount is not observable from the CLI's stdout; when workUnits parallelism
-      // is triggered, subagents run inside the single Claude session and are not reported
-      // separately. This always returns 0 until the CLI exposes subagent metrics.
       subagentCount: 0,
       telemetry: result.telemetry,
     };

@@ -1,6 +1,6 @@
 import { getDb } from "./dedup.js";
 
-export type CommentGapfillStatus = "pending" | "dispatched" | "skipped" | "failed";
+export type CommentGapfillStatus = "pending" | "dispatched" | "skipped" | "failed" | "completed";
 
 export interface CommentGapfillQueueItem {
   id: number;
@@ -87,4 +87,98 @@ function mapRow(row: CommentGapfillQueueRow): CommentGapfillQueueItem {
     createdAt: row.created_at,
     processedAt: row.processed_at,
   };
+}
+
+export const CONFLICT_COMMENTER = "ai-implement-orchestrator";
+
+/** FNV-1a 32-bit, negated: synthetic ids never collide with real (positive) webhook comment ids. */
+export function syntheticConflictCommentId(owner: string, repo: string, prNumber: number, attempt: number): number {
+  const s = `${owner}/${repo}#${prNumber}#conflict#${attempt}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return -(((h >>> 0) % 2_000_000_000) + 1);
+}
+
+/** Counts EVERY synthetic row regardless of status — including rows whose dispatch
+ *  failed before any resolution ran ("No dispatch log"). Deliberate (AII-264 r3):
+ *  dispatch failures for the same PR are typically persistent, so letting them burn
+ *  the cap converts a would-be infinite enqueue/fail loop into the proven bounded
+ *  give-up + notify path (same philosophy as AII-118's bounded remediation). The
+ *  cost — a cap exhausted with zero real attempts — is alerted, not silent. */
+export function countConflictAttempts(owner: string, repo: string, prNumber: number): number {
+  const row = getDb().prepare(
+    "SELECT COUNT(*) AS n FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0",
+  ).get(owner, repo, prNumber) as { n: number };
+  return row.n;
+}
+
+export function hasPendingConflictResolution(owner: string, repo: string, prNumber: number): boolean {
+  const row = getDb().prepare(
+    "SELECT 1 FROM comment_gapfill_queue WHERE owner=? AND repo=? AND pr_number=? AND comment_id<0 AND status IN ('pending','dispatched') LIMIT 1",
+  ).get(owner, repo, prNumber);
+  return !!row;
+}
+
+export function conflictResolutionInstruction(featureBranch: string): string {
+  return [
+    `This PR conflicts with its grouping branch \`${featureBranch}\` (sibling changes merged first).`,
+    `Run \`git fetch origin && git merge origin/${featureBranch}\` on this PR branch, resolve every conflict`,
+    `by keeping BOTH sides' intent (the sibling changes already on \`${featureBranch}\` AND this PR's changes),`,
+    `re-run the repo's tests, and push the merge commit to this branch. Do not force-push, do not revert sibling work.`,
+  ].join(" ");
+}
+
+export function enqueueConflictResolution(input: { owner: string; repo: string; prNumber: number; featureBranch: string }): number {
+  const attempt = countConflictAttempts(input.owner, input.repo, input.prNumber) + 1;
+  return enqueueCommentGapfill({
+    owner: input.owner, repo: input.repo, prNumber: input.prNumber,
+    commentId: syntheticConflictCommentId(input.owner, input.repo, input.prNumber, attempt),
+    commenter: CONFLICT_COMMENTER,
+    instruction: conflictResolutionInstruction(input.featureBranch),
+  });
+}
+
+/** Terminalize the dispatched gap-fill row(s) for a repo+PR when their run
+ *  finishes (AII-277). Called from the updateJobStatus choke point in log.ts —
+ *  the single spot every execution path (GHA / Fly / local / timeouts / admin)
+ *  passes through — so a successfully-dispatched conflict resolution can't
+ *  wedge `hasPendingConflictResolution` forever (the livelock the alpacaWheel
+ *  test exposed: PR #3533). `repoFull` is "owner/name" as stored on the job. */
+export function markCommentGapfillRunTerminal(
+  repoFull: string,
+  prNumber: number,
+  outcome: "completed" | "failed",
+): number {
+  const res = getDb().prepare(
+    "UPDATE comment_gapfill_queue SET status = ?, processed_at = ? " +
+    "WHERE owner || '/' || repo = ? AND pr_number = ? AND status = 'dispatched'",
+  ).run(outcome, Date.now(), repoFull, prNumber);
+  return res.changes;
+}
+
+/** One-time startup sweep (AII-279): rows stuck in 'dispatched' from BEFORE the
+ *  AII-277 terminal hook existed can never heal through updateJobStatus (their
+ *  job already terminalized). Terminalize each dispatched row by its latest
+ *  comment-triggered job for the same repo+PR: completed job -> completed;
+ *  failed/absent job -> failed. Rows whose job is still in flight are untouched.
+ *  Attempt counting is status-independent, so the sweep cannot distort the cap. */
+export function sweepOrphanedGapfillRows(): number {
+  const db = getDb();
+  const rows = db.prepare(
+    "SELECT id, owner, repo, pr_number FROM comment_gapfill_queue WHERE status = 'dispatched'",
+  ).all() as Array<{ id: number; owner: string; repo: string; pr_number: number }>;
+  let swept = 0;
+  for (const r of rows) {
+    const job = db.prepare(
+      "SELECT status FROM dispatch_log WHERE trigger = 'comment' AND repo = ? " +
+      "AND pr_url LIKE ? ORDER BY dispatched_at DESC, id DESC LIMIT 1",
+    ).get(`${r.owner}/${r.repo}`, `%/pull/${r.pr_number}`) as { status: string } | undefined;
+    if (job && (job.status === "dispatched" || job.status === "running")) continue; // genuinely in flight
+    const outcome = job?.status === "completed" ? "completed" : "failed";
+    db.prepare("UPDATE comment_gapfill_queue SET status = ?, processed_at = ? WHERE id = ?")
+      .run(outcome, Date.now(), r.id);
+    console.log(`[gapfill] startup sweep: row for ${r.owner}/${r.repo}#${r.pr_number} -> ${outcome} (pre-fix orphan)`);
+    swept++;
+  }
+  return swept;
 }

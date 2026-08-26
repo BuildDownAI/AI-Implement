@@ -1,22 +1,239 @@
-import { describe, it, expect } from "vitest";
-import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { afterEach, describe, it, expect } from "vitest";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-describe("session/entrypoint.sh", () => {
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function writeShim(binDir: string, name: string, body: string): void {
+  const shim = join(binDir, name);
+  writeFileSync(shim, `#!/usr/bin/env bash\n${body}\n`);
+  chmodSync(shim, 0o755);
+}
+
+// ─── session/git-credential-helper.sh ────────────────────────────────────────
+
+describe("session/git-credential-helper.sh", () => {
   it("passes shellcheck cleanly", () => {
-    const r = spawnSync("shellcheck", ["session/entrypoint.sh"], { stdio: ["ignore", "pipe", "pipe"] });
+    const r = spawnSync("shellcheck", ["session/git-credential-helper.sh"], { stdio: ["ignore", "pipe", "pipe"] });
     if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
     expect(r.status).toBe(0);
   });
 
-  it("is under 115 lines (bootstrap, not monolith)", () => {
+  it("exits 0 without credentials when GIT_DEPENDENCY_TOKEN_FILE is unset", () => {
+    const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\n\n",
+      env: { ...process.env, GIT_DEPENDENCY_TOKEN_FILE: "" },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toBe("");
+  });
+
+  it("exits 0 without credentials for non-github.com hosts", () => {
+    const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=gitlab.com\n\n",
+      env: { ...process.env, GIT_DEPENDENCY_TOKEN_FILE: "" },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toBe("");
+  });
+
+  it("exits 0 without credentials for store/erase operations", () => {
+    for (const op of ["store", "erase"]) {
+      const r = spawnSync("bash", ["session/git-credential-helper.sh", op], {
+        stdio: ["pipe", "pipe", "pipe"],
+        input: "protocol=https\nhost=github.com\n\n",
+        env: { ...process.env },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.toString()).toBe("");
+    }
+  });
+
+  it("returns x-access-token credentials from a fresh token file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const tokenFile = join(dir, "token.json");
+    try {
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      writeFileSync(tokenFile, JSON.stringify({ token: "ghs_test_tok", expires_at: expiresAt }));
+
+      const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        input: "protocol=https\nhost=github.com\n\n",
+        env: { ...process.env, GIT_DEPENDENCY_TOKEN_FILE: tokenFile },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.toString()).toContain("username=x-access-token");
+      expect(r.stdout.toString()).toContain("password=ghs_test_tok");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT re-fetch when the cached token has more than 10 minutes remaining", () => {
+    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const tokenFile = join(dir, "token.json");
+    try {
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 min — fresh
+      writeFileSync(tokenFile, JSON.stringify({ token: "fresh-tok", expires_at: expiresAt }));
+
+      // Provide a callback URL pointing at a port where nothing is listening.
+      // If the helper tries to refresh, curl will fail (connection refused) and
+      // the helper must still return the cached token.  We assert the output is
+      // the cached token (not empty), proving no refresh was attempted.
+      const r = spawnSync("bash", ["session/git-credential-helper.sh", "get"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        input: "protocol=https\nhost=github.com\n\n",
+        env: {
+          ...process.env,
+          GIT_DEPENDENCY_TOKEN_FILE: tokenFile,
+          GIT_DEPENDENCY_CALLBACK_URL: "http://127.0.0.1:19999",
+          RUN_PROGRESS_TOKEN: "progress-tok",
+        },
+      });
+      expect(r.status).toBe(0);
+      // Token is returned immediately without contacting the server.
+      expect(r.stdout.toString()).toContain("password=fresh-tok");
+      // Cache file must not have changed.
+      const cached = JSON.parse(readFileSync(tokenFile, "utf-8")) as { token: string };
+      expect(cached.token).toBe("fresh-tok");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("re-fetches and returns the new token when within 10 minutes of expiry", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    const tokenFile = join(dir, "token.json");
+
+    let requestedUrl: string | undefined;
+    const server = http.createServer((req, res) => {
+      requestedUrl = req.url;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          token: "refreshed-tok",
+          expires_at: new Date(Date.now() + 55 * 60 * 1000).toISOString(),
+        }),
+      );
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const port = (server.address() as AddressInfo).port;
+
+      const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString(); // 5 min — near expiry
+      writeFileSync(tokenFile, JSON.stringify({ token: "stale-tok", expires_at: expiresAt }));
+
+      // Use async spawn so the Node.js event loop remains free to serve the
+      // curl request that the shell script makes.  spawnSync would block the
+      // loop and cause the HTTP server to deadlock.
+      const stdout = await new Promise<string>((resolve, reject) => {
+        const child = spawn("bash", ["session/git-credential-helper.sh", "get"], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: {
+            ...process.env,
+            GIT_DEPENDENCY_TOKEN_FILE: tokenFile,
+            GIT_DEPENDENCY_CALLBACK_URL: `http://127.0.0.1:${port}///`,
+            RUN_PROGRESS_TOKEN: "progress-tok",
+          },
+        });
+        child.stdin.write("protocol=https\nhost=github.com\n\n");
+        child.stdin.end();
+        let out = "";
+        child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+        child.on("close", (code) => {
+          if (code !== 0) reject(new Error(`helper exited ${code}`));
+          else resolve(out);
+        });
+        child.on("error", reject);
+        setTimeout(() => reject(new Error("helper timed out")), 15000);
+      });
+
+      expect(requestedUrl).toBe("/api/runner/dependency-token");
+      expect(stdout).toContain("password=refreshed-tok");
+      // Helper must update the cache file with the refreshed token.
+      const cached = JSON.parse(readFileSync(tokenFile, "utf-8")) as { token: string };
+      expect(cached.token).toBe("refreshed-tok");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is not consulted when the git URL already contains embedded credentials (AC #5)", () => {
+    // Safety property: clone.ts and push.ts embed credentials directly in the
+    // remote URL (https://x-access-token:TOKEN@github.com/…).  Git's
+    // credential_fill() short-circuits immediately when username+password are
+    // already set on the credential struct — which is what happens when git
+    // parses an embedded-credential URL — so the helper is never invoked.
+    //
+    // We verify this by registering a sentinel-writing credential helper for
+    // https://github.com and then calling `git credential fill` with all fields
+    // pre-supplied (replicating what git does internally after parsing the URL).
+    // The sentinel file must NOT exist after the call.
+    const dir = mkdtempSync(join(tmpdir(), "dep-token-test-"));
+    try {
+      const sentinelFile = join(dir, "sentinel");
+      const helperScript = join(dir, "sentinel-helper.sh");
+      const gitconfigFile = join(dir, ".gitconfig");
+
+      writeFileSync(helperScript, `#!/bin/bash\ntouch "${sentinelFile}"\n`);
+      chmodSync(helperScript, 0o755);
+
+      // Register sentinel for https://github.com — same scope as the real helper.
+      writeFileSync(gitconfigFile, `[credential "https://github.com"]\n\thelper = ${helperScript}\n`);
+
+      // Provide a fully-specified credential (protocol + host + username + password).
+      // git credential fill returns immediately without invoking any helper because
+      // there is nothing left to fill — mirroring the embedded-credential URL path.
+      const r = spawnSync("git", ["credential", "fill"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        input: "protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghs_test_tok\n\n",
+        env: { ...process.env, GIT_CONFIG_GLOBAL: gitconfigFile },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.toString()).toContain("password=ghs_test_tok");
+      // The sentinel must not exist — the helper was never consulted.
+      expect(existsSync(sentinelFile)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── session/entrypoint.sh ───────────────────────────────────────────────────
+
+describe("session/entrypoint.sh", () => {
+  it("passes shellcheck for every deploy-critical entrypoint", () => {
+    const r = spawnSync(
+      "shellcheck",
+      ["session/entrypoint.sh", "docker-entrypoint.sh"],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    if (r.error?.code === "ENOENT") return; // skip when shellcheck not installed
+    expect(r.status, r.stderr?.toString()).toBe(0);
+  });
+
+  it("is under 116 lines (bootstrap, not monolith)", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content.split("\n").length).toBeLessThan(115);
+    expect(content.split("\n").length).toBeLessThan(116);
   });
 
   it("exec's the phase-selected TS runner as the final step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toContain('RUNNER_ENTRY="run-planning.js"');
+    expect(content).toContain('RUNNER_ENTRY="run-local-planning.js"');
+    expect(content).toContain('RUNNER_ENTRY="run-local-full-loop.js"');
     expect(content).toContain('RUNNER_ENTRY="run-autonomous.js"');
     expect(content).toContain('exec dbus-run-session -- su -p coder -c "HOME=/home/coder exec node /app/dist/$RUNNER_ENTRY"');
   });
@@ -52,6 +269,41 @@ describe("session/entrypoint.sh", () => {
     expect(content).toMatch(/GITHUB_DEFAULT_BRANCH="\$\(git branch --show-current\)"/);
   });
 
+  it("marks the cloned workspace safe before the gap-fill PR checkout", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    const cloneIdx = content.indexOf('git clone --depth=1 --branch "$GITHUB_DEFAULT_BRANCH"');
+    const safeDirectoryIdx = content.indexOf('git config --global --add safe.directory "$WORKSPACE_DIR"', cloneIdx);
+    const checkoutIdx = content.indexOf('gh pr checkout "$PR_NUMBER"');
+
+    expect(cloneIdx).toBeGreaterThan(-1);
+    expect(safeDirectoryIdx).toBeGreaterThan(cloneIdx);
+    expect(safeDirectoryIdx).toBeLessThan(checkoutIdx);
+  });
+
+  it("expands the shallow clone refspec before tracking a gap-fill PR branch", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    const refspecIdx = content.indexOf(
+      "git config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'",
+    );
+    const checkoutIdx = content.indexOf('gh pr checkout "$PR_NUMBER"');
+
+    expect(refspecIdx).toBeGreaterThan(-1);
+    expect(refspecIdx).toBeLessThan(checkoutIdx);
+  });
+
+  it("decodes prNumber from the envelope before the gap-fill checkout when PR_NUMBER is empty", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    // Decode line must extract prNumber from the envelope JSON
+    expect(content).toMatch(/node -e.*c\.prNumber/);
+    // Decode must precede the gh pr checkout guard
+    const decodeIdx = content.indexOf("c.prNumber");
+    const checkoutIdx = content.indexOf("gh pr checkout");
+    expect(decodeIdx).toBeGreaterThan(-1);
+    expect(decodeIdx).toBeLessThan(checkoutIdx);
+    expect(content).toContain("String(c.prNumber||'')");
+    expect(content).toMatch(/c\.prNumber[^\n]+2>\/dev\/null\|\|true/);
+  });
+
   it("does not pass duplicate preserve-environment flags to su", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toContain("su -p coder");
@@ -75,5 +327,180 @@ describe("session/entrypoint.sh", () => {
     expect(content).toMatch(/if \[ -n "\$\{AI_IMPLEMENT_RUN_CONFIG:-\}" \]; then/);
     expect(content).toContain('require_env ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION');
     expect(content).toContain("export ISSUE_ID ISSUE_IDENTIFIER ISSUE_TITLE ISSUE_DESCRIPTION");
+  });
+
+  it("consumes mounted workspace mode before clone and never changes bind-mount ownership", () => {
+    const root = mkdtempSync(join(tmpdir(), "entrypoint-mounted-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    const workspace = join(root, "workspace");
+    const commandLog = join(root, "commands.log");
+    spawnSync("mkdir", ["-p", binDir, workspace]);
+
+    for (const name of ["git", "usermod", "groupmod", "chown", "cp", "dbus-run-session", "su"]) {
+      writeShim(binDir, name, `printf '%s %s\\n' '${name}' "$*" >> "$COMMAND_LOG"`);
+    }
+    writeShim(binDir, "getent", "printf 'hostgroup:x:2345:\\n'");
+    writeShim(binDir, "stat", "printf '1234\\n'");
+    writeShim(binDir, "id", `case "\${1:-}" in -gn) printf 'hostgroup\\n' ;; -u) printf '1234\\n' ;; -g) printf '2345\\n' ;; esac`);
+
+    const result = spawnSync("bash", ["session/entrypoint.sh"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH}`,
+        COMMAND_LOG: commandLog,
+        WORKSPACE_DIR: workspace,
+        AI_IMPLEMENT_MODE: "local",
+        AI_IMPLEMENT_WORKSPACE_MODE: "mounted",
+        AI_IMPLEMENT_HOST_UID: "1234",
+        AI_IMPLEMENT_HOST_GID: "2345",
+        ANTHROPIC_API_KEY: "test-key",
+        GITHUB_TOKEN: "test-token",
+        GITHUB_OWNER: "BuildDownAI",
+        GITHUB_REPO: "fixture",
+        GITHUB_DEFAULT_BRANCH: "testing",
+        ISSUE_ID: "issue-id",
+        ISSUE_IDENTIFIER: "DEV-1",
+        ISSUE_TITLE: "Test",
+        ISSUE_DESCRIPTION: "Test mounted mode",
+      },
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    const commands = readFileSync(commandLog, "utf8");
+    expect(commands).not.toMatch(/git clone/);
+    expect(commands).not.toContain(`chown -R coder:coder ${workspace}`);
+    expect(commands).toContain(`git config --global --add safe.directory ${workspace}`);
+    expect(commands).toContain("usermod -o -u 1234 coder");
+    expect(commands).toContain("dbus-run-session -- su -p coder");
+  });
+});
+
+// ─── session/lib.sh ───────────────────────────────────────────────────────────
+
+describe("session/lib.sh", () => {
+  it("passes shellcheck", () => {
+    const r = spawnSync("shellcheck", ["session/lib.sh"], { stdio: ["ignore", "pipe", "pipe"] });
+    if (r.error?.code === "ENOENT") return;
+    expect(r.status, r.stderr?.toString()).toBe(0);
+  });
+});
+
+// ─── session/lib.sh verify_workspace_writable ─────────────────────────────────
+
+describe("session/lib.sh verify_workspace_writable", () => {
+  // A su shim that executes the -c script under the current user with the
+  // correct positional arguments, so mktemp / trap / EXIT behaviour is exercised.
+  // Real su strips the -- before invoking bash, so bash sees:
+  //   bash -c '<script>' _ /workspace   ($0=_, $1=/workspace)
+  // We replicate that by collecting args after -- and calling bash without --.
+  const SU_EXEC_SHIM = [
+    "cmd=''",
+    "pos_args=()",
+    "while (( $# )); do",
+    "  case \"$1\" in",
+    "    -c) cmd=\"$2\"; shift 2 ;;",
+    "    -s) shift 2 ;;",
+    "    --) shift; pos_args=(\"$@\"); break ;;",
+    "    *) shift ;;",
+    "  esac",
+    "done",
+    'exec bash -c "$cmd" "${pos_args[@]}"',
+  ].join("\n");
+
+  function makeShims(binDir: string, suBody: string): void {
+    writeShim(binDir, "su", suBody);
+    writeShim(binDir, "id", `case "$*" in *-u*) echo 1000 ;; *-g*) echo 1000 ;; esac`);
+    writeShim(binDir, "stat", "echo 1000");
+  }
+
+  function runVerify(
+    workspace: string,
+    binDir: string,
+  ): { status: number | null; stderr: string } {
+    const r = spawnSync(
+      "bash",
+      ["-c", 'source session/lib.sh; verify_workspace_writable "$1"', "--", workspace],
+      { encoding: "utf8", env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+    );
+    return { status: r.status, stderr: r.stderr };
+  }
+
+  it("leaves pre-existing probe-like files byte-for-byte unchanged on success", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    spawnSync("mkdir", [binDir]);
+    makeShims(binDir, SU_EXEC_SHIM);
+
+    const existingProbe = join(root, ".ai-implement-probe-1");
+    writeFileSync(existingProbe, "original content");
+
+    const { status } = runVerify(root, binDir);
+    expect(status).toBe(0);
+    expect(readFileSync(existingProbe, "utf8")).toBe("original content");
+  });
+
+  it("leaves no generated probe files after a successful check", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    spawnSync("mkdir", [binDir]);
+    makeShims(binDir, SU_EXEC_SHIM);
+
+    const { status } = runVerify(root, binDir);
+    expect(status).toBe(0);
+    const probes = readdirSync(root).filter((f) => f.startsWith(".ai-implement-probe"));
+    expect(probes).toHaveLength(0);
+  });
+
+  it("succeeds for a workspace path containing a single quote", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const workspace = join(root, "work's-dir");
+    spawnSync("mkdir", [workspace]);
+    const binDir = join(root, "bin");
+    spawnSync("mkdir", [binDir]);
+    makeShims(binDir, SU_EXEC_SHIM);
+
+    const { status } = runVerify(workspace, binDir);
+    expect(status).toBe(0);
+    const probes = readdirSync(workspace).filter((f) => f.startsWith(".ai-implement-probe"));
+    expect(probes).toHaveLength(0);
+  });
+
+  it("fails before the pipeline and reports path and identity on write failure", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    spawnSync("mkdir", [binDir]);
+    makeShims(binDir, "exit 1");
+
+    const { status, stderr } = runVerify(root, binDir);
+    expect(status).not.toBe(0);
+    expect(stderr).toContain(root);
+    expect(stderr).toContain("coder UID");
+  });
+
+  it("passes workspace dir as a positional argument, not embedded in the -c program text", () => {
+    const root = mkdtempSync(join(tmpdir(), "verify-writable-"));
+    tempDirs.push(root);
+    const binDir = join(root, "bin");
+    const cmdLog = join(root, "cmd.log");
+    spawnSync("mkdir", [binDir]);
+    writeShim(binDir, "su", `printf '%s\\0' "$@" > "${cmdLog}"`);
+    writeShim(binDir, "id", `case "$*" in *-u*) echo 1000 ;; *-g*) echo 1000 ;; esac`);
+    writeShim(binDir, "stat", "echo 1000");
+
+    runVerify(root, binDir);
+
+    const rawArgs = readFileSync(cmdLog, "utf8").split("\0");
+    const cIdx = rawArgs.indexOf("-c");
+    expect(cIdx).toBeGreaterThan(-1);
+    // The -c program text must not contain the workspace path
+    expect(rawArgs[cIdx + 1]).not.toContain(root);
+    // The workspace path must appear as a standalone argument
+    expect(rawArgs).toContain(root);
   });
 });

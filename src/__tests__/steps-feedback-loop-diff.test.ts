@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -170,5 +170,221 @@ describe("getDiff untracked-file inclusion", () => {
     writeFileSync(join(repo, "settings.local.json"), '{"secret":"value"}\n');
     const diff = getDiff(repo);
     expect(diff).not.toContain("settings.local.json");
+  });
+});
+
+describe("getDiff index state preservation", () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "diff-index-test-"));
+    git(repo, ["init", "-q"]);
+    git(repo, ["config", "user.email", "t@t.com"]);
+    git(repo, ["config", "user.name", "t"]);
+    writeFileSync(join(repo, "initial.ts"), "export const x = 1;\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "seed"]);
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(repo, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  it("leaves untracked files out of the index after return — no intent-to-add markers", () => {
+    writeFileSync(join(repo, "new-file.ts"), "export const y = 2;\n");
+
+    getDiff(repo);
+
+    const staged = spawnSync("git", ["diff", "--cached", "--name-only"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(staged.stdout.toString().trim()).toBe("");
+
+    const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(untracked.stdout.toString()).toContain("new-file.ts");
+  });
+
+  it("preserves already-staged changes across the getDiff call", () => {
+    writeFileSync(join(repo, "initial.ts"), "export const x = 2;\n");
+    spawnSync("git", ["add", "initial.ts"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+
+    writeFileSync(join(repo, "new-file.ts"), "export const y = 3;\n");
+
+    getDiff(repo);
+
+    const staged = spawnSync("git", ["diff", "--cached", "--name-only"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(staged.stdout.toString()).toContain("initial.ts");
+
+    const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(untracked.stdout.toString()).toContain("new-file.ts");
+  });
+
+  it("returns the correct diff while leaving the index unchanged", () => {
+    writeFileSync(join(repo, "new-file.ts"), "export const y = 2;\n");
+    writeFileSync(join(repo, "initial.ts"), "export const x = 99;\n");
+
+    const diff = getDiff(repo);
+
+    expect(diff).toContain("new-file.ts");
+    expect(diff).toContain("initial.ts");
+
+    const staged = spawnSync("git", ["diff", "--cached", "--name-only"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    expect(staged.stdout.toString().trim()).toBe("");
+  });
+
+  it("preserves real index bytes exactly (Buffer comparison) after getDiff with a pre-existing intent-to-add entry", () => {
+    // Developer staged a new file via `git add -N` before the review diff runs.
+    writeFileSync(join(repo, "pending.ts"), "export const z = 0;\n");
+    spawnSync("git", ["add", "-N", "pending.ts"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    // Resolve the real index path the same way getDiff does.
+    const gitPathResult = spawnSync("git", ["rev-parse", "--git-path", "index"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const realIndexPath = join(repo, gitPathResult.stdout.toString().trim());
+
+    const before = readFileSync(realIndexPath);
+    getDiff(repo);
+    const after = readFileSync(realIndexPath);
+
+    // Exact byte equality — not just logical path presence.
+    expect(Buffer.compare(before, after)).toBe(0);
+  });
+
+  it("includes a pre-existing intent-to-add file in the review diff", () => {
+    writeFileSync(join(repo, "pending.ts"), "export const z = 0;\n");
+    spawnSync("git", ["add", "-N", "pending.ts"], {
+      cwd: repo,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const diff = getDiff(repo);
+
+    expect(diff).toContain("pending.ts");
+  });
+});
+
+describe("getDiff exclusive temp dir cleanup", () => {
+  let repo: string;
+
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), "diff-cleanup-test-"));
+    spawnSync("git", ["init", "-q", repo], { stdio: ["ignore", "pipe", "pipe"] });
+    spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+    spawnSync("git", ["config", "user.name", "t"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+    writeFileSync(join(repo, "seed.ts"), "export const s = 0;\n");
+    spawnSync("git", ["add", "-A"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+    spawnSync("git", ["commit", "-qm", "seed"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(repo, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  function reviewIndexDirs(): string[] {
+    return readdirSync(tmpdir()).filter((d) => d.startsWith("ai-implement-review-index-"));
+  }
+
+  it("removes the exclusive temp dir after a successful diff", () => {
+    writeFileSync(join(repo, "new.ts"), "export const n = 1;\n");
+    const before = reviewIndexDirs();
+    getDiff(repo);
+    expect(reviewIndexDirs().length).toBe(before.length);
+  });
+
+  it("removes the exclusive temp dir when git diff fails (no HEAD — fresh repo with staged files)", () => {
+    // Fresh repo: real index exists (created by git add) but HEAD does not,
+    // so git diff HEAD will fail and getDiff must still clean up.
+    const fresh = mkdtempSync(join(tmpdir(), "diff-fresh-"));
+    try {
+      spawnSync("git", ["init", "-q", fresh], { stdio: ["ignore", "pipe", "pipe"] });
+      spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: fresh, stdio: ["ignore", "pipe", "pipe"] });
+      spawnSync("git", ["config", "user.name", "t"], { cwd: fresh, stdio: ["ignore", "pipe", "pipe"] });
+      writeFileSync(join(fresh, "file.ts"), "export const x = 1;\n");
+      // git add creates .git/index so existsSync(realIndexPath) is true;
+      // HEAD is not set, so git diff HEAD will fail.
+      spawnSync("git", ["add", "file.ts"], { cwd: fresh, stdio: ["ignore", "pipe", "pipe"] });
+
+      const before = reviewIndexDirs();
+      const result = getDiff(fresh);
+      expect(result).toBe("");
+      expect(reviewIndexDirs().length).toBe(before.length);
+    } finally {
+      rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+
+  it("removes the exclusive temp dir when setup fails (no HEAD and no real index)", () => {
+    // Completely empty repo: no commits, no staged files, so the real index
+    // does not exist. git read-tree HEAD fails → getDiff returns "" and cleans up.
+    const empty = mkdtempSync(join(tmpdir(), "diff-empty-"));
+    try {
+      spawnSync("git", ["init", "-q", empty], { stdio: ["ignore", "pipe", "pipe"] });
+      spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: empty, stdio: ["ignore", "pipe", "pipe"] });
+      spawnSync("git", ["config", "user.name", "t"], { cwd: empty, stdio: ["ignore", "pipe", "pipe"] });
+      writeFileSync(join(empty, "file.ts"), "export const x = 1;\n");
+
+      const before = reviewIndexDirs();
+      const result = getDiff(empty);
+      expect(result).toBe("");
+      expect(reviewIndexDirs().length).toBe(before.length);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("getDiff setup-failure index isolation", () => {
+  it("leaves real index bytes unchanged when git diff fails", () => {
+    // Fresh repo: real index exists (git add ran) but HEAD is absent.
+    // getDiff copies the real index to the disposable index (read-only operation),
+    // then git diff HEAD fails. Verify the real index bytes are unchanged.
+    const fresh = mkdtempSync(join(tmpdir(), "diff-iso-"));
+    try {
+      spawnSync("git", ["init", "-q", fresh], { stdio: ["ignore", "pipe", "pipe"] });
+      spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: fresh, stdio: ["ignore", "pipe", "pipe"] });
+      spawnSync("git", ["config", "user.name", "t"], { cwd: fresh, stdio: ["ignore", "pipe", "pipe"] });
+      writeFileSync(join(fresh, "file.ts"), "export const x = 1;\n");
+      spawnSync("git", ["add", "file.ts"], { cwd: fresh, stdio: ["ignore", "pipe", "pipe"] });
+
+      const gitPathResult = spawnSync("git", ["rev-parse", "--git-path", "index"], {
+        cwd: fresh,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const realIndexPath = join(fresh, gitPathResult.stdout.toString().trim());
+
+      const before = readFileSync(realIndexPath);
+      getDiff(fresh); // expected to return "" (git diff HEAD fails, no HEAD)
+      const after = readFileSync(realIndexPath);
+
+      expect(Buffer.compare(before, after)).toBe(0);
+    } finally {
+      rmSync(fresh, { recursive: true, force: true });
+    }
   });
 });

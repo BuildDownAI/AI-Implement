@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { parseWorkflowMd } from "./workflow-md.js";
@@ -43,17 +43,117 @@ ${s.ISSUE_DESCRIPTION}
 **Dependencies:** ${s.DEPENDENCIES}
 
 Use Read, Glob, and Grep to explore the codebase, then write structured planning comments as separate Markdown files under ai-output/comments/, prefixed with a two-digit sequence number:
-  ai-output/comments/01-architecture-analysis.md  → "## 🏗️ AI Planning: Architecture Analysis"
-  ai-output/comments/02-test-plan.md               → "## 🧪 AI Planning: Test Plan"
-  ai-output/comments/03-work-units.md              → "## 🔧 AI Planning: Work Units"
-  ai-output/comments/04-cross-story-context.md     → "## 🔗 AI Planning: Cross-Story Context" (only if parent/siblings/dependencies are not "None")
-Do NOT post to the ticketing system; the orchestrator posts the files you write.`;
+  ai-output/comments/01-implementation-map.md  → "## 🗺 AI Planning: Implementation Map"
+  ai-output/comments/02-acceptance-bar.md       → "## ✅ AI Planning: Acceptance Bar"
+  ai-output/comments/03-risks.md                → "## ⚠️ AI Planning: Risks & Open Questions"
+Do NOT post to the ticketing system; the orchestrator posts the files you write.
+
+For the Implementation Map (01-implementation-map.md), include a Files section with canonical verb bullets (Create, Modify, Test, or Delete), each with a backtick-quoted path:
+  - Modify: \`src/existing.ts\`
+  - Create: \`src/new-module.ts\`
+  - Test: \`src/__tests__/existing.test.ts\`
+
+Append this machine block as the very last lines of 01-implementation-map.md (fill in the files array and risk value):
+<!-- ai-implement-planning
+v: 1
+files: ["src/a.ts", "src/b.ts"]
+risk: low|medium|high
+-->`;
 }
 
 export interface RunPlanningOptions {
   workspaceDir?: string;
   executor?: PlanningExecutor;
   fetchImpl?: typeof fetch;
+}
+
+function collectLocalPlanningContext(workspaceDir: string): string {
+  const dir = join(workspaceDir, "ai-output", "comments");
+  if (!existsSync(dir)) return "";
+  try {
+    const files = readdirSync(dir)
+      .filter((n) => n.endsWith(".md"))
+      .sort();
+    return files.map((n) => readFileSync(join(dir, n), "utf-8")).join("\n\n");
+  } catch {
+    return "";
+  }
+}
+
+export interface RunPlanningLocalOptions {
+  workspaceDir: string;
+  issueIdentifier: string;
+  issueTitle: string;
+  issueDescription: string;
+  parent?: string;
+  siblings?: string;
+  dependencies?: string;
+  model?: string;
+  executor?: PlanningExecutor;
+}
+
+export interface RunPlanningLocalResult {
+  exitCode: number;
+  planningContext: string;
+  /** True when at least one readable Markdown plan file was produced. */
+  planFound: boolean;
+  /** Human-readable diagnostics for plan_failed outcomes. */
+  diagnostics: string;
+}
+
+export async function runPlanningLocally(
+  opts: RunPlanningLocalOptions,
+): Promise<RunPlanningLocalResult> {
+  const subs: Record<string, string> = {
+    ISSUE_ID: "",
+    ISSUE_IDENTIFIER: opts.issueIdentifier,
+    ISSUE_TITLE: opts.issueTitle,
+    ISSUE_DESCRIPTION: opts.issueDescription,
+    PARENT: opts.parent ?? "None",
+    SIBLINGS: opts.siblings ?? "None",
+    DEPENDENCIES: opts.dependencies ?? "None",
+  };
+  let model = opts.model ?? "claude-sonnet-4-6";
+  let prompt = buildDefaultPlanningPrompt(subs);
+  const planningMdPath = join(opts.workspaceDir, "PLANNING.md");
+  if (existsSync(planningMdPath)) {
+    const parsed = parseWorkflowMd(readFileSync(planningMdPath, "utf-8"), subs);
+    if (parsed.frontMatter.model) model = opts.model ?? parsed.frontMatter.model;
+    if (parsed.body.trim()) prompt = parsed.body;
+  }
+  const args = [
+    "--dangerously-skip-permissions",
+    "--model",
+    model,
+    "--max-turns",
+    "50",
+    "--allowedTools",
+    "Read",
+    "--allowedTools",
+    "Glob",
+    "--allowedTools",
+    "Grep",
+  ];
+  const executor = opts.executor ?? defaultExecutor;
+  const result = executor(prompt, args, opts.workspaceDir);
+  if (result.status !== 0) {
+    return {
+      exitCode: 1,
+      planningContext: "",
+      planFound: false,
+      diagnostics: (result.stderr || result.stdout || "planning executor exited with non-zero status").slice(0, 2000),
+    };
+  }
+  const planningContext = collectLocalPlanningContext(opts.workspaceDir);
+  if (!planningContext.trim()) {
+    return {
+      exitCode: 1,
+      planningContext: "",
+      planFound: false,
+      diagnostics: "Planning process exited successfully but produced no readable Markdown plan in ai-output/comments/",
+    };
+  }
+  return { exitCode: 0, planningContext, planFound: true, diagnostics: "" };
 }
 
 export async function runPlanning(opts: RunPlanningOptions = {}): Promise<{ exitCode: number }> {

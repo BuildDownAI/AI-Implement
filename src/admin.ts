@@ -1,5 +1,4 @@
 import http from "node:http";
-import crypto from "node:crypto";
 import {
   getMappings,
   DEFAULT_MAX_IN_PROGRESS_AI_ISSUES,
@@ -24,20 +23,31 @@ import {
   VALID_RUNNER_MODES,
   isRunnerMode,
   setFlySecretsMinVersion,
+  checkForcedPathEligibility,
 } from "./runner-mode.js";
-import { getDb, listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
+import { listParked, unpark } from "./dispatch-breaker.js";
+import { createSession, isValidSession, getRequestToken, accessCodeMatches } from "./admin-session.js";
+import type { DeployStart } from "./deploy.js";
+import { getDeployOutcome } from "./deploy-notify.js";
+import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
+import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
+import { getInFlightWork } from "./in-flight-work.js";
+import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, updateJobStatus, getJobById, getPulls } from "./log.js";
+import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
 import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
-import { selectBlockers } from "./poll-selection.js";
+import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
+import { getFleetReport } from "./report-card.js";
 import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
@@ -111,8 +121,6 @@ function normalizeSensitiveGlobs(raw: unknown): string[] | null {
   return globs;
 }
 
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
 let _adminJiraClient: JiraClient | null = null;
 function getAdminJiraClient(): JiraClient | null {
   if (_adminJiraClient) return _adminJiraClient;
@@ -125,27 +133,6 @@ function getAdminJiraClient(): JiraClient | null {
   if (email ? !siteUrl : !cloudId) return null;
   _adminJiraClient = new JiraClient({ token, email, siteUrl, cloudId });
   return _adminJiraClient;
-}
-
-function createSession(): string {
-  const token = crypto.randomBytes(32).toString("hex");
-  getDb()
-    .prepare("INSERT INTO admin_sessions (token, expires_at) VALUES (?, ?)")
-    .run(token, Date.now() + SESSION_TTL_MS);
-  return token;
-}
-
-function isValidSession(token: string | undefined): boolean {
-  if (!token) return false;
-  const row = getDb()
-    .prepare("SELECT expires_at FROM admin_sessions WHERE token = ?")
-    .get(token) as { expires_at: number } | undefined;
-  if (!row) return false;
-  if (Date.now() > row.expires_at) {
-    getDb().prepare("DELETE FROM admin_sessions WHERE token = ?").run(token);
-    return false;
-  }
-  return true;
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -188,19 +175,21 @@ function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketing
   return { ticketingProvider: provider, ticketingConfig: config };
 }
 
-function getToken(req: http.IncomingMessage): string | undefined {
-  const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ")) return auth.slice(7);
-  return undefined;
-}
-
 export interface AdminConfig {
-  adminAccessCode: string;
+  adminAccessCode: string | null;
   flySessionsToken: string | null;
   flySessionsApp: string | null;
   flySessionsRegion: string | null;
   githubAppId: string;
   githubAppPrivateKey: string;
+  /** AII-306: runner-mode swaps fire a plain-text notification when set. */
+  notifyWebhookUrl?: string | null;
+}
+
+export interface AdminDeps {
+  /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
+  startDeploy?: () => Promise<DeployStart>;
+  selfDeployTarget?: SelfDeployTarget | null;
 }
 
 export function handleAdminRequest(
@@ -208,12 +197,13 @@ export function handleAdminRequest(
   res: http.ServerResponse,
   config: AdminConfig,
   registry: ProviderRegistry,
+  deps: AdminDeps = {},
 ): boolean {
   const url = req.url || "/";
   const method = req.method || "GET";
 
   // Serve admin HTML
-  if (url === "/admin" && method === "GET") {
+  if (url.split("?")[0] === "/admin" && method === "GET") {
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(adminHtml);
     return true;
@@ -227,7 +217,7 @@ export function handleAdminRequest(
 
   // All other /api routes require auth
   if (url.startsWith("/api/")) {
-    if (!isValidSession(getToken(req))) {
+    if (!isValidSession(getRequestToken(req))) {
       json(res, 401, { error: "Unauthorized" });
       return true;
     }
@@ -239,6 +229,39 @@ export function handleAdminRequest(
 
     if (url === "/api/mappings" && method === "POST") {
       handleUpsertMapping(req, res, config, registry);
+      return true;
+    }
+
+    if (url === "/api/deploy" && method === "POST") {
+      handleDeployTrigger(res, deps);
+      return true;
+    }
+
+    if (url === "/api/deployment-status" && method === "GET") {
+      const availability = getAvailability();
+      const target = deps.selfDeployTarget ?? null;
+      json(res, 200, {
+        configured: !!deps.startDeploy,
+        available: availability?.available ?? null,
+        held: isDeployHeld(),
+        deployStartedAt: getDeployStartedAt(),
+        inFlight: getInFlightWork(),
+        checkedAt: availability?.checkedAt ?? null,
+        runningCommit: availability?.runningCommit ?? null,
+        headCommit: availability?.headCommit ?? null,
+        repo: target ? `${target.owner}/${target.repo}` : null,
+        branch: target?.branch ?? null,
+        ...getDeployPolicy(),
+        // a notice with no webhook goes nowhere, and automatic deploying will not act on a commit it has already announced.
+        notifyConfigured: Boolean(config.notifyWebhookUrl),
+        lastActedCommit: getLastActedCommit(),
+        lastDeployOutcome: getDeployOutcome(),
+      });
+      return true;
+    }
+
+    if (url === "/api/deploy-policy" && method === "POST") {
+      handleSetDeployPolicy(req, res);
       return true;
     }
 
@@ -359,13 +382,47 @@ export function handleAdminRequest(
       return true;
     }
 
+    if (url === "/api/parked" && method === "GET") {
+      const parkedRows = listParked();
+      json(
+        res,
+        200,
+        parkedRows.map((r) => {
+          const enrichment = getIssueEnrichment(r.issueId, r.phase);
+          return {
+            issueId: r.issueId,
+            phase: r.phase,
+            failures: r.failures,
+            lastConclusion: r.lastConclusion,
+            parkedAt: r.parkedAt,
+            issueIdentifier: enrichment.issueIdentifier,
+            issueTitle: enrichment.issueTitle,
+            repo: enrichment.repo,
+          };
+        }),
+      );
+      return true;
+    }
+
+    if (url === "/api/parked/unpark" && method === "POST") {
+      handleUnparkIssue(req, res);
+      return true;
+    }
+
     if (url === "/api/runner-mode" && method === "GET") {
-      json(res, 200, getRunnerMode());
+      const status = getRunnerMode();
+      // AII-306: under a forcing mode, surface which mappings the force cannot
+      // apply to (they are skipped at dispatch, staying queued).
+      const ineligible = Object.entries(getMappings())
+        .map(([teamKey, m]) => ({ teamKey, ...checkForcedPathEligibility(status.mode, m, Boolean(config.flySessionsApp)) }))
+        .filter((e) => !e.eligible)
+        .map((e) => ({ teamKey: e.teamKey, reason: e.reason }));
+      json(res, 200, { ...status, ineligible });
       return true;
     }
 
     if (url === "/api/runner-mode" && method === "POST") {
-      handleSetRunnerMode(req, res);
+      handleSetRunnerMode(req, res, config);
       return true;
     }
 
@@ -447,6 +504,18 @@ export function handleAdminRequest(
       return true;
     }
 
+    if ((url === "/api/report" || url.startsWith("/api/report?")) && method === "GET") {
+      const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+      const p = new URLSearchParams(qs);
+      const daysRaw = p.get("days");
+      const projectParam = p.get("project") || undefined;
+      const daysNum = daysRaw ? parseInt(daysRaw, 10) : NaN;
+      const days = Number.isFinite(daysNum) && daysNum > 0 ? daysNum : undefined;
+      const report = getFleetReport({ days, repo: projectParam });
+      json(res, 200, report);
+      return true;
+    }
+
     if (url.startsWith("/api/admin/github-install-state") && method === "GET") {
       handleGithubInstallState(req, res, config);
       return true;
@@ -469,6 +538,20 @@ export function handleAdminRequest(
   }
 
   return false;
+}
+
+async function handleUnparkIssue(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as { issueId?: string };
+    if (typeof body.issueId !== "string" || !body.issueId) {
+      json(res, 400, { error: "issueId is required" });
+      return;
+    }
+    const unparked = unpark(body.issueId);
+    json(res, 200, { unparked });
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+  }
 }
 
 async function fetchMergedSnapshot(registry: ProviderRegistry): Promise<AIImplementSnapshot> {
@@ -500,11 +583,30 @@ async function handleListBlockers(
     const allIssues = [...snapshot.readyForImplementation, ...snapshot.needsPlanning];
     const teamRepoMap = getMappings();
     const dispatchedSet = new Set(getDispatchedIds());
-    const blockers = selectBlockers(
+    const inFlightIds = getInFlightIssueIds();
+    const baseBlockers = selectBlockers(
       allIssues,
       teamRepoMap,
       snapshot.inProgressCountsByScope,
       (id) => dispatchedSet.has(id),
+    );
+    // In-flight issues drop out of the snapshot (AI-Working), so resolve them through the
+    // shared seen-candidates cache — same as the poll loop (PR #202 review finding #1).
+    const inFlightSiblings = resolveInFlightSiblings(inFlightIds);
+    const fileOverlapCandidates = allIssues.filter(
+      (i) => !inFlightIds.has(i.id) && !dispatchedSet.has(i.id) && teamRepoMap[i.scopeKey],
+    );
+    const planningContexts = await getOrFetchPlanningContexts(
+      [...fileOverlapCandidates, ...inFlightSiblings],
+      teamRepoMap,
+      registry,
+    );
+    const fileOverlapBlockers = selectFileOverlapDeferrals(fileOverlapCandidates, inFlightSiblings, planningContexts);
+    const blockers = [...baseBlockers, ...fileOverlapBlockers].sort(
+      (a, b) =>
+        a.reason.localeCompare(b.reason) ||
+        a.teamKey.localeCompare(b.teamKey) ||
+        a.issueIdentifier.localeCompare(b.issueIdentifier),
     );
     const teams = new Set(blockers.map((b) => b.teamKey));
     const byReason: Record<string, number> = {};
@@ -540,6 +642,7 @@ async function handleListIssues(
 async function handleSetRunnerMode(
   req: http.IncomingMessage,
   res: http.ServerResponse,
+  config: AdminConfig,
 ): Promise<void> {
   try {
     const body = JSON.parse(await readBody(req)) as { mode?: string };
@@ -547,8 +650,20 @@ async function handleSetRunnerMode(
       json(res, 400, { error: `mode must be one of: ${VALID_RUNNER_MODES.join(", ")}` });
       return;
     }
+    const previous = getRunnerMode();
     setRunnerMode(body.mode);
     const status = getRunnerMode();
+    // AII-306: swap observability — an execution-mode change is an operational
+    // event, not a quiet preference. Log it and fire the notify hook best-effort.
+    if (previous.mode !== status.mode) {
+      console.log(`[admin] Runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`);
+      if (config.notifyWebhookUrl) {
+        notifyText(
+          config.notifyWebhookUrl,
+          `⚙️ AI-Implement runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`,
+        ).catch((err) => console.error("[admin] runner-mode notify failed:", err));
+      }
+    }
     // The DB write succeeded but the RUNNER_MODE env var still wins at
     // runtime. Return 409 so direct API callers (not the UI, which already
     // disables the buttons) can tell their write was overridden.
@@ -662,11 +777,17 @@ async function handleDestroySession(
 async function handleAuth(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  accessCode: string,
+  accessCode: string | null,
 ): Promise<void> {
+  if (accessCode === null) {
+    json(res, 403, { error: "Access-code login is disabled" });
+    return;
+  }
+
   try {
     const body = JSON.parse(await readBody(req)) as { code?: string };
-    if (body.code === accessCode) {
+    if (typeof body.code === "string" && accessCodeMatches(body.code, accessCode)) {
+      console.warn("[admin] access-code login is deprecated; configure SSO (OAuth) providers instead");
       const token = createSession();
       json(res, 200, { token });
     } else {
@@ -730,6 +851,52 @@ function handleSyncWorkflows(
     console.error(`[admin] workflow sync failed for ${teamKey}:`, err)
   );
   json(res, 202, { teamKey, syncJobId: id });
+}
+
+async function handleDeployTrigger(
+  res: http.ServerResponse,
+  deps: AdminDeps,
+): Promise<void> {
+  if (!deps.startDeploy) {
+    json(res, 501, { error: "Self-deploy is not configured" });
+    return;
+  }
+  try {
+    const result = await deps.startDeploy();
+    if (!result.started) {
+      json(res, result.reason === "deploy-in-progress" ? 409 : 503, { error: result.reason });
+      return;
+    }
+    json(res, 202, { deploying: result.commit });
+  } catch (err) {
+    console.error("[admin] deploy trigger failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
+}
+
+async function handleSetDeployPolicy(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as Partial<Record<keyof DeployPolicy, unknown>>;
+    const patch: Partial<DeployPolicy> = {};
+    for (const key of ["autoDeploy", "notifyAvailable"] as const) {
+      if (body[key] === undefined) continue;
+      // Reject rather than coerce: a string "false" is truthy, and silently enabling
+      // automatic deploying because a caller sent the wrong type is not a small bug.
+      if (typeof body[key] !== "boolean") {
+        json(res, 400, { error: `${key} must be a boolean` });
+        return;
+      }
+      patch[key] = body[key];
+    }
+    setDeployPolicy(patch);
+    json(res, 200, getDeployPolicy());
+  } catch (err) {
+    console.error("[admin] deploy policy update failed:", err);
+    json(res, 500, { error: "Internal server error" });
+  }
 }
 
 async function handleListSecrets(
@@ -1068,6 +1235,7 @@ async function handleUpsertMapping(
       skillsRepo?: string | null;
       sensitiveAddPatterns?: string | string[] | null;
       sensitiveAllowPatterns?: string | string[] | null;
+      dependencyTokenScope?: string | null;
     };
 
     if (!body.teamKey || !body.owner || !body.repo) {
@@ -1223,6 +1391,20 @@ async function handleUpsertMapping(
       return;
     }
 
+    let dependencyTokenScope: "installation" | null;
+    const rawScope = body.dependencyTokenScope;
+    if (rawScope === undefined) {
+      // Preserve stored value on omit — silently clearing an opt-in permission grant is the worse failure mode.
+      dependencyTokenScope = existingMapping?.dependencyTokenScope ?? null;
+    } else if (rawScope === null || rawScope === "") {
+      dependencyTokenScope = null;
+    } else if (rawScope === "installation") {
+      dependencyTokenScope = "installation";
+    } else {
+      json(res, 400, { error: `dependencyTokenScope invalid: must be null or "installation"` });
+      return;
+    }
+
     const mapping: RepoMapping = {
       owner: body.owner,
       repo: body.repo,
@@ -1254,6 +1436,7 @@ async function handleUpsertMapping(
       skillsRepo,
       sensitiveAddPatterns,
       sensitiveAllowPatterns,
+      dependencyTokenScope,
     };
 
     upsertMapping(body.teamKey, mapping);

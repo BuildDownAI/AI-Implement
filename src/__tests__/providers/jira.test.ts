@@ -807,7 +807,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
         when: /parent in/,
         issues: [
           issue("OOL-78-c0", "PR Ready", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }),
-          issue("OOL-78-c1", "", "acme/x", { parentKey: "OOL-78", statusCategory: "indeterminate" }), // undesignated → no gate
+          issue("OOL-78-c1", "", "acme/x", { parentKey: "OOL-78", statusCategory: "done" }), // undesignated but terminal → no gate (AII-349: only active undesignated block)
         ],
       },
       { when: /key in/, issues: [] }, // OOL-78 has no parent

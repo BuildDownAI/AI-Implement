@@ -2,6 +2,7 @@
 # (or use `clients/<slug>.toml` with the multi-client deploy workflow).
 app = "ai-implement"
 primary_region = "iad"
+kill_timeout = 15
 
 [build]
 
@@ -14,7 +15,7 @@ primary_region = "iad"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  memory = "512mb"
 
 [mounts]
   source = "dedup_data"

@@ -150,6 +150,14 @@ export const projectsHtml = `
             <textarea id="md-sensitive-allow" rows="3" placeholder="one glob per line"></textarea>
             <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
           </div>
+          <div class="md-field">
+            <label>Dependency Token Scope <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
+            <select id="md-dep-token-scope">
+              <option value="">Off (default)</option>
+              <option value="installation">All repos the App can access (read-only)</option>
+            </select>
+            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos. When enabled, the runner mounts a scoped installation token as a git credential helper and sets <code>COMPOSER_AUTH</code>, so private dependencies resolve automatically during the install step.</div>
+          </div>
         </fieldset>
         <fieldset>
           <legend>Execution</legend>
@@ -241,9 +249,7 @@ export const projectsScript = `
       const tr = document.createElement('tr');
       const ek = window.esc(key);
       const recent = recentSync[key];
-      const syncCell = (recent && recent.prUrl)
-        ? '<a class="btn btn-sm btn-ghost" href="' + window.esc(recent.prUrl) + '" target="_blank" rel="noopener noreferrer" title="Workflow sync PR (just created)">Workflows synced — PR opened &#8599;</a> '
-        : '<button class="btn btn-sm btn-ghost" data-sync-btn data-key="' + ek + '" onclick="syncWorkflows(this)">Sync workflows</button> ';
+      // syncCell built via DOM below (avoids data-* + inline onclick pattern)
       const execBadge = m.executionMode === 'fly-machines'
         ? '<span class="badge info">fly</span>'
         : '<span class="badge neutral">gha</span>';
@@ -265,13 +271,51 @@ export const projectsScript = `
         + '<td>' + planBadge + '</td>'
         + '<td>' + providerBadge + '</td>'
         + '<td>' + statusBadge + '</td>'
-        + '<td style="white-space:nowrap">'
-          + '<button class="btn btn-sm" data-key="' + ek + '" data-paused="' + (m.paused ? '1' : '0') + '" onclick="togglePause(this.dataset.key, this.dataset.paused === \\'1\\')">' + pauseLabel + '</button> '
-          + '<button class="btn btn-sm" data-key="' + ek + '" onclick="openMappingDialog(this.dataset.key)">Edit</button> '
-          + '<button class="btn btn-sm btn-danger" data-key="' + ek + '" onclick="delMapping(this.dataset.key)">Del</button> '
-          + syncCell
-          + '<button class="btn btn-sm btn-ghost" data-key="' + ek + '" onclick="showSecrets(this.dataset.key)">Secrets</button>'
-        + '</td>';
+        + '<td style="white-space:nowrap"></td>';
+      const actionCell = tr.lastElementChild;
+      const pauseBtn = document.createElement('button');
+      pauseBtn.className = 'btn btn-sm';
+      pauseBtn.textContent = pauseLabel;
+      pauseBtn.addEventListener('click', function() { togglePause(key, m.paused); });
+      actionCell.appendChild(pauseBtn);
+      actionCell.appendChild(document.createTextNode(' '));
+      const editBtn = document.createElement('button');
+      editBtn.className = 'btn btn-sm';
+      editBtn.textContent = 'Edit';
+      editBtn.addEventListener('click', function() { openMappingDialog(key); });
+      actionCell.appendChild(editBtn);
+      actionCell.appendChild(document.createTextNode(' '));
+      const delMappingBtn = document.createElement('button');
+      delMappingBtn.className = 'btn btn-sm btn-danger';
+      delMappingBtn.textContent = 'Del';
+      delMappingBtn.addEventListener('click', function() { delMapping(key); });
+      actionCell.appendChild(delMappingBtn);
+      actionCell.appendChild(document.createTextNode(' '));
+      if (recent && recent.prUrl) {
+        const syncLink = document.createElement('a');
+        syncLink.className = 'btn btn-sm btn-ghost';
+        syncLink.href = window.safeUrl(recent.prUrl);
+        syncLink.target = '_blank';
+        syncLink.rel = 'noopener noreferrer';
+        syncLink.title = 'Workflow sync PR (just created)';
+        syncLink.textContent = 'Workflows synced \u2014 PR opened \u2197';
+        actionCell.appendChild(syncLink);
+        actionCell.appendChild(document.createTextNode(' '));
+      } else {
+        const syncBtn = document.createElement('button');
+        syncBtn.className = 'btn btn-sm btn-ghost';
+        syncBtn.dataset.syncBtn = '';
+        syncBtn.dataset.key = key;
+        syncBtn.textContent = 'Sync workflows';
+        syncBtn.addEventListener('click', function() { syncWorkflows(syncBtn); });
+        actionCell.appendChild(syncBtn);
+        actionCell.appendChild(document.createTextNode(' '));
+      }
+      const secretsBtn = document.createElement('button');
+      secretsBtn.className = 'btn btn-sm btn-ghost';
+      secretsBtn.textContent = 'Secrets';
+      secretsBtn.addEventListener('click', function() { showSecrets(key); });
+      actionCell.appendChild(secretsBtn);
       tbody.appendChild(tr);
     }
   }
@@ -308,6 +352,7 @@ export const projectsScript = `
     document.getElementById('md-skills-repo').value = m.skillsRepo || '';
     document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
     document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
+    document.getElementById('md-dep-token-scope').value = m.dependencyTokenScope || '';
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -629,6 +674,7 @@ export const projectsScript = `
       skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
+      dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;
@@ -858,7 +904,12 @@ export const projectsScript = `
         const tr = document.createElement('tr');
         tr.innerHTML = '<td class="mono">' + window.esc(s.name) + '</td>'
           + '<td><span class="badge success">Set</span></td>'
-          + '<td><button class="btn btn-sm btn-danger" data-name="' + window.esc(s.name) + '" onclick="delSecret(this.dataset.name)">Delete</button></td>';
+          + '<td></td>';
+        const delSecBtn = document.createElement('button');
+        delSecBtn.className = 'btn btn-sm btn-danger';
+        delSecBtn.textContent = 'Delete';
+        delSecBtn.addEventListener('click', function() { delSecret(s.name); });
+        tr.lastElementChild.appendChild(delSecBtn);
         tbody.appendChild(tr);
       }
     } catch (err) {

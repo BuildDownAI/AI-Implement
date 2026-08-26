@@ -1,11 +1,12 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { ClaudeCliExecutor } from "./pipeline/executor.js";
+import { getPublicationCredential } from "./publication-credential.js";
 import { DefaultPipelineContext } from "./pipeline/context.js";
 import { PipelineRunner } from "./pipeline/runner.js";
 import { DEFAULT_PIPELINE, createDefaultRunner } from "./pipeline/default-pipeline.js";
-import type { LLMExecutor, LogLevel, PipelineDefinition, StepReporter } from "./pipeline/types.js";
+import type { LLMExecutor, LogLevel, PipelineContext, PipelineDefinition, StepReporter } from "./pipeline/types.js";
 import { HttpStepReporter, NoopStepReporter, TokenStepReporter } from "./pipeline/reporter.js";
 import { TimingCollector, TimingStepReporter, runWithTiming, formatSummary } from "./pipeline/timing.js";
 import { runHookScript } from "./pipeline/steps/hooks.js";
@@ -14,7 +15,10 @@ import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
-import { writeRunAutopsy } from "./run-autopsy.js";
+import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
+import { parsePlanningBlock } from "./planning-block.js";
+import type { LocalRunTokenSummary } from "./local/run-result.js";
+import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -52,6 +56,15 @@ function currentGitBranch(workspaceDir: string): string | null {
   return branch || null;
 }
 
+function getCommittedFiles(workspaceDir: string, baseBranch: string): string[] | null {
+  const result = spawnSync("git", ["diff", "--name-only", baseBranch, "HEAD"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0) return null;
+  return result.stdout.toString().split("\n").map((f) => f.trim()).filter(Boolean);
+}
+
 function resolveBranch(workspaceDir: string, baseBranch?: string, prNumber?: string): string {
   // Envelope baseBranch is authoritative for non-gap-fill runs: it carries the grouping
   // feature branch and must override whatever the dispatch layer set (GHA may set the
@@ -78,7 +91,7 @@ function buildDefaultImplementationPrompt(params: {
 
 ## Gap-fill run (PR #${prNumber})
 
-You are filling implementation gaps on existing PR #${prNumber}. Do NOT create a new branch or PR. Commit your changes to the current branch and push.
+You are filling implementation gaps on existing PR #${prNumber}. Do not create or switch branches, commit, push, or open a PR. Leave your changes unstaged and uncommitted; the AI-Implement pipeline will commit and push them to the existing PR branch after review.
 
 **Issue:** ${issueIdentifier}
 **Title:** ${issueTitle}
@@ -99,7 +112,16 @@ ${issueDescription}`;
 }
 
 function appendPipelineOwnedGitInstructions(prompt: string, prNumber: string): string {
-  if (prNumber) return prompt;
+  if (prNumber) {
+    if (prompt.includes("Pipeline-owned gap-fill Git")) return prompt;
+    return `${prompt.trimEnd()}
+
+## Pipeline-owned gap-fill Git
+
+Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
+Modify files only in the current checkout and leave the working tree changes unstaged and uncommitted.
+The AI-Implement pipeline will commit and push the reviewed changes to the existing PR branch.`;
+  }
   if (prompt.includes("Pipeline-owned Git")) return prompt;
   return `${prompt.trimEnd()}
 
@@ -108,6 +130,19 @@ function appendPipelineOwnedGitInstructions(prompt: string, prNumber: string): s
 Do NOT create or switch branches. Do NOT commit, push, or open a pull request.
 Modify files only in the current checkout and leave the working tree changes unstaged and uncommitted.
 The AI-Implement pipeline will create the implementation commit, push an issue-scoped branch, and open the PR after review passes.`;
+}
+
+function appendValidationCommandDiscipline(prompt: string): string {
+  if (prompt.includes("Validation command discipline")) return prompt;
+  return `${prompt.trimEnd()}
+
+## Validation command discipline
+
+Run targeted checks while iterating. Do not rerun an unchanged full build or full test suite
+solely to apply a different grep, tail, or other output filter. If a command's output is
+too large to inspect directly, capture its complete output once, then inspect that saved output.
+Only repeat an expensive validation command after a relevant code, configuration, dependency,
+or environment change.`;
 }
 
 function appendOperatorInstruction(prompt: string, instruction: string | null): string {
@@ -127,6 +162,42 @@ export function resolveLogLevel(raw: string | undefined): LogLevel {
   return raw === "stream" ? "stream" : "summary";
 }
 
+export function isLocalDevHarness(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.AI_IMPLEMENT_MODE === "local" && env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted";
+}
+
+export function waitForContainerRemoval(
+  schedule: (callback: () => void, delayMs: number) => unknown = (callback, delayMs) =>
+    setInterval(callback, delayMs),
+): Promise<never> {
+  return new Promise<never>(() => {
+    schedule(() => undefined, 60_000);
+  });
+}
+
+/** Single-quote a shell value, escaping embedded single-quotes. */
+function shellQuote(val: string): string {
+  return "'" + val.replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * Write a bash init file at `dest` that sources ~/.bashrc then exports any
+ * env vars present in `current` that differ from `before`. Used by --shell to
+ * make hook-exported GITHUB_ENV vars visible in the docker exec session.
+ */
+function writeShellEnvFile(dest: string, before: Record<string, string | undefined>): void {
+  const lines: string[] = [
+    "# Dev-run shell init: sources ~/.bashrc then re-applies hook env exports",
+    "[ -f ~/.bashrc ] && . ~/.bashrc",
+  ];
+  for (const [key, val] of Object.entries(process.env)) {
+    if (val !== undefined && val !== before[key]) {
+      lines.push(`export ${key}=${shellQuote(val)}`);
+    }
+  }
+  writeFileSync(dest, lines.join("\n") + "\n");
+}
+
 export interface ResolvedRunnerInputs {
   issueId: string;
   issueIdentifier: string;
@@ -142,6 +213,7 @@ export interface ResolvedRunnerInputs {
   branchPrefix: string | undefined;
   skillsRepo: string | undefined;
   sensitiveFiles: { add?: string[]; allow?: string[] } | undefined;
+  dependencyTokenScope: "installation" | undefined;
   baseBranch: string | undefined;
   profiles: string[];
   githubOwner: string;
@@ -205,6 +277,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     branchPrefix: safeBranchPrefix(cfg.branchPrefix),
     skillsRepo: cfg.skillsRepo,
     sensitiveFiles: cfg.sensitiveFiles,
+    dependencyTokenScope: cfg.dependencyTokenScope,
     baseBranch: cfg.baseBranch,
     profiles: cfg.profiles
       ? cfg.profiles
@@ -260,6 +333,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     }
   })();
   const skillsRepo = env.AI_IMPLEMENT_SKILLS_REPO?.trim() || undefined;
+  const dependencyTokenScope = undefined;
   const profiles = (env.AI_IMPLEMENT_PROFILES ?? "")
     .split(",")
     .map((p) => p.trim())
@@ -279,6 +353,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     branchPrefix,
     skillsRepo,
     sensitiveFiles: undefined,
+    dependencyTokenScope,
     baseBranch: undefined,
     profiles,
     githubOwner,
@@ -292,6 +367,11 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
 }
 
 export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<RunAutonomousResult> {
+  // Move the one-use publication bearer out of the inherited environment
+  // before hooks, package installs, repository scripts, or model subprocesses
+  // can run. Runner-owned publication steps retrieve it from private memory.
+  getPublicationCredential();
+
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
   const {
     issueId,
@@ -311,6 +391,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     branchPrefix,
     skillsRepo,
     sensitiveFiles,
+    dependencyTokenScope,
     baseBranch,
     profiles,
     logLevel,
@@ -343,11 +424,10 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     prNumber,
   });
   // WORKFLOW.md (and therefore the hook paths, incl. teardown) is read once here,
-  // before the pipeline runs. In GHA mode the repo is already checked out into
-  // `workspaceDir`, so the hooks resolve and the captured teardown path stays valid
-  // through `finally`. In Fly/local modes the `clone` step runs later in the
-  // pipeline, so `workspaceDir` is empty at this point — WORKFLOW.md isn't found and
-  // all hooks resolve to undefined (hooks are effectively GHA-only; see WORKFLOW.md).
+  // before the pipeline runs. This holds in every execution mode: all three enter
+  // through session/entrypoint.sh, which populates `workspaceDir` — by clone, or by
+  // bind mount under the local dev harness — before this process starts. So the
+  // hooks resolve and the captured teardown path stays valid through `finally`.
   const wfPath = join(workspaceDir, "WORKFLOW.md");
   if (existsSync(wfPath)) {
     const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {
@@ -364,7 +444,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     teardownHook = parsed.frontMatter.teardown;
     if (parsed.body.trim()) implementationPrompt = parsed.body;
   }
-  implementationPrompt = appendPipelineOwnedGitInstructions(implementationPrompt, prNumber);
+  implementationPrompt = appendValidationCommandDiscipline(
+    appendPipelineOwnedGitInstructions(implementationPrompt, prNumber),
+  );
   implementationPrompt = appendOperatorInstruction(implementationPrompt, commentInstruction);
   const model = claudeModel || workflowModel || "claude-sonnet-4-6";
   const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, logLevel);
@@ -402,14 +484,17 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       githubRepo,
       githubToken,
       branch,
+      baseBranch,
       provider,
       maxTurns,
       maxIterations,
       branchPrefix,
       skillsRepo,
       sensitiveFiles,
+      dependencyTokenScope,
       profiles,
       groupingParent,
+      callbackUrl: callbackUrl ?? undefined,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
     llmExecutor,
@@ -417,20 +502,42 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
 
   let disposition: string | undefined;
 
+  const devHarnessMode = isLocalDevHarness();
+  const untilStep = devHarnessMode ? optionalEnv("AI_IMPLEMENT_UNTIL_STEP") ?? undefined : undefined;
+  const shellMode = devHarnessMode && process.env.AI_IMPLEMENT_SHELL_MODE === "true";
+  // Snapshot env before the pipeline runs so we can diff after to find hook exports.
+  const envSnap: Record<string, string | undefined> = shellMode ? { ...process.env } : {};
+
   try {
     const pipeline = opts.pipeline ?? DEFAULT_PIPELINE;
     const runner = opts.runner ?? (await createDefaultRunner());
-    await runWithTiming(timing, () => runner.run(pipeline, context, reporter));
+    await runWithTiming(timing, () => runner.run(pipeline, context, reporter, { stopAfterStep: untilStep }));
+
+    if (untilStep) {
+      disposition = `staged: stopped after step "${untilStep}"`;
+      return { exitCode: 0 };
+    }
+
     const fbOutputs = context.getOutputs("feedback-loop");
     const pushOutputs = context.getOutputs("push");
+    const postPushReviewOutputs = context.getOutputs("post-push-review");
     const prUrl = typeof pushOutputs.prUrl === "string" ? pushOutputs.prUrl : undefined;
-    const approved = fbOutputs.approved === true;
+    // Mirror the post-push-review skip contract: a statically registered step is
+    // authoritative only when the internal review approved and push produced the
+    // branch/PR inputs that cause the step to run. Otherwise its outputs are empty.
+    const postPushReviewRequired = fbOutputs.approved === true
+      && pushOutputs.branchPushed === true
+      && Boolean(pushOutputs.prNumber)
+      && Boolean(prUrl)
+      && pipeline.steps.some((step) => step.id === "post-push-review");
+    const approved = fbOutputs.approved === true
+      && (!postPushReviewRequired || postPushReviewOutputs.approved === true);
 
     // Case B: grouping-parent run where the agent produced genuinely no changes. Push returned
     // a no-op (branchPushed=false, prUrl=null). Report success without a prUrl so the
     // orchestrator finalizes the issue and merge-up.ts opens the feature→base roll-up PR.
-    // (Gap-fill runs never set groupingParent, so this cannot collide with the skip-push
-    // gap-fill path below.)
+    // (Gap-fill runs never set groupingParent, so this cannot collide with the
+    // existing-PR update path below.)
     if (context.data.groupingParent && pushOutputs.branchPushed === false && !prUrl) {
       disposition = "no-op (grouping parent: no own work; finalized for roll-up)";
       await postRunnerResult({
@@ -444,14 +551,29 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       return { exitCode: 0 };
     }
 
-    // A gap-fill run (prNumber set) never produces push outputs: the pipeline skips
-    // push because Claude commits and pushes to the existing PR branch itself. An
-    // approved gap-fill without a prUrl is therefore a success, not REVIEW_UNAPPROVED.
-    if (approved && (prUrl || prNumber)) {
+    // A gap-fill run updates an existing PR and intentionally does not create a
+    // new prUrl. An approved gap-fill is therefore a success even when the push
+    // step reports only the existing PR number (or a clean no-op).
+    // Similarly, an approved mounted dev-harness run has no push step and no PR URL,
+    // but is a genuine local success.
+    if (approved && (prUrl || prNumber || devHarnessMode)) {
+      const statPasses = Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [];
+      const planningBlock = parsePlanningBlock(planningContext);
+      // For new runs prUrl is set and branch is the base — compare committed diff.
+      // For gap-fill and mounted runs there is no prUrl; skip the comparison.
+      const filesChanged = prUrl ? getCommittedFiles(workspaceDir, branch) : [];
+      writeRunStats(workspaceDir, {
+        issueIdentifier,
+        passes: statPasses,
+        plannedFiles: prUrl ? (planningBlock?.files ?? []) : [],
+        filesChanged,
+      });
       const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?";
       disposition = prUrl
         ? `PR ${prUrl} (approved after ${iterations} iteration(s))`
-        : `gap-fill on PR #${prNumber} (approved after ${iterations} iteration(s))`;
+        : prNumber
+        ? `gap-fill on PR #${prNumber} (approved after ${iterations} iteration(s))`
+        : `local: approved after ${iterations} iteration(s) (mounted mode)`;
       await postRunnerResult({
         workspaceDir,
         phase: runnerPhase,
@@ -463,20 +585,36 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       return { exitCode: 0 };
     }
 
-    // The pipeline completed mechanically but the review loop never approved
-    // (or push produced no PR). This is NOT a success: report a coded failure
+    // The pipeline completed mechanically but either the internal loop or the
+    // authoritative post-push review did not approve (or push produced no PR).
+    // This is NOT a success: report a coded failure
     // so the ticket is updated and notifications fire, leave a run autopsy for
     // the ticket, and flag the GHA run — but keep the job green (warning only).
-    const terminationReason =
-      typeof fbOutputs.terminationReason === "string" ? fbOutputs.terminationReason : "unknown";
-    const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : 0;
-    const finalFeedback = typeof fbOutputs.finalFeedback === "string" ? fbOutputs.finalFeedback : "";
+    const postPushReviewRejected = postPushReviewRequired && postPushReviewOutputs.approved !== true;
+    const authoritativeReviewOutputs = postPushReviewRejected
+      ? postPushReviewOutputs
+      : fbOutputs;
+    const terminationReason = typeof authoritativeReviewOutputs.terminationReason === "string"
+      ? authoritativeReviewOutputs.terminationReason
+      : postPushReviewRejected
+        ? "post_push_review_unapproved"
+        : "unknown";
+    const iterations = typeof authoritativeReviewOutputs.iterations === "number"
+      ? authoritativeReviewOutputs.iterations
+      : 0;
+    const finalFeedback = typeof authoritativeReviewOutputs.finalFeedback === "string"
+      ? authoritativeReviewOutputs.finalFeedback
+      : "";
     const failureCode = terminationReason === "max_turns" ? "MAX_TURNS_EXHAUSTED" : "REVIEW_UNAPPROVED";
     const failureReason =
       `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
       finalFeedback.slice(0, 500);
 
-    disposition = `${prUrl ? `draft PR ${prUrl}` : "no PR"} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
+    const prKind = pushOutputs.draft === true ? "draft PR" : "PR";
+    const prDisposition = prUrl
+      ? `${prKind} ${prUrl}`
+      : "no PR";
+    disposition = `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
 
     writeRunAutopsy(workspaceDir, {
       issueIdentifier,
@@ -489,7 +627,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     });
     console.warn(
       `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
-        (prUrl ? `draft PR opened: ${prUrl}` : "no PR opened"),
+        (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
     );
     await postRunnerResult({
       workspaceDir,
@@ -533,6 +671,16 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         console.error(`teardown hook error: ${teardownErr}`);
       }
     }
+    if (shellMode) {
+      // Write a bash init file so `docker exec bash --init-file` picks up env
+      // vars exported by hooks via $GITHUB_ENV. Runs after teardown so all hook
+      // exports are captured. Non-fatal if it fails.
+      try {
+        writeShellEnvFile("/tmp/dev-run-env.sh", envSnap);
+      } catch (envFileErr) {
+        console.error(`[dev:run] failed to write shell env file: ${envFileErr}`);
+      }
+    }
   }
 }
 
@@ -542,9 +690,290 @@ function resolveRunnerPhase(rawPhase: string | undefined, prNumber: string): "im
   throw new Error(`Invalid RUNNER_PHASE: ${rawPhase}`);
 }
 
+const LOCAL_FEEDBACK_PIPELINE: PipelineDefinition = {
+  id: "local-feedback",
+  steps: [
+    {
+      id: "feedback-loop",
+      type: "custom",
+      moduleId: "feedback-loop",
+      inputs: (ctx: PipelineContext) => ({
+        workspaceDir: ctx.data.workspaceDir,
+        issueTitle: ctx.data.issueTitle,
+        issueDescription: ctx.data.issueDescription,
+        implementationPrompt: ctx.data.implementationPrompt,
+        planningContext: ctx.data.planningContext,
+        provider: ctx.data.provider,
+        maxTurns: ctx.data.maxTurns,
+        maxIterations: ctx.data.maxIterations,
+      }),
+    },
+  ],
+};
+
+export interface RunLocalAutonomousOptions {
+  workspaceDir: string;
+  issueIdentifier: string;
+  issueTitle: string;
+  issueDescription: string;
+  issueId?: string;
+  maxTurns?: number;
+  maxIterations?: number;
+  model?: string;
+  planningContext?: string;
+  reporter?: StepReporter;
+  llmExecutor?: LLMExecutor;
+  pipeline?: PipelineDefinition;
+  runner?: PipelineRunner;
+}
+
+export interface RunLocalAutonomousResult {
+  exitCode: number;
+  approved: boolean;
+  terminationReason: string;
+  iterations: number;
+  passes: Array<{
+    iteration: number;
+    implementTurns: number | null;
+    implementOutcome: string;
+    costUsd: number | null;
+    reviewApproved: boolean | null;
+    tokensIn?: number | null;
+    tokensOut?: number | null;
+    cacheReadTokens?: number | null;
+    cacheCreationTokens?: number | null;
+  }>;
+  finalFeedback: string;
+  effectiveMaxTurns: number;
+  effectiveMaxIterations: number;
+  tokenSummary: LocalRunTokenSummary | null;
+}
+
+function buildTokenSummary(
+  passes: RunLocalAutonomousResult["passes"],
+): LocalRunTokenSummary | null {
+  if (passes.length === 0) return null;
+  let costUsd: number | null = null;
+  let tokensIn: number | null = null;
+  let tokensOut: number | null = null;
+  let cacheReadTokens: number | null = null;
+  let cacheCreationTokens: number | null = null;
+  for (const p of passes) {
+    if (typeof p.costUsd === "number") costUsd = (costUsd ?? 0) + p.costUsd;
+    if (typeof p.tokensIn === "number") tokensIn = (tokensIn ?? 0) + p.tokensIn;
+    if (typeof p.tokensOut === "number") tokensOut = (tokensOut ?? 0) + p.tokensOut;
+    if (typeof p.cacheReadTokens === "number") cacheReadTokens = (cacheReadTokens ?? 0) + p.cacheReadTokens;
+    if (typeof p.cacheCreationTokens === "number") cacheCreationTokens = (cacheCreationTokens ?? 0) + p.cacheCreationTokens;
+  }
+  return { costUsd, tokensIn, tokensOut, cacheReadTokens, cacheCreationTokens };
+}
+
+export async function runAutonomousLocally(
+  opts: RunLocalAutonomousOptions,
+): Promise<RunLocalAutonomousResult> {
+  const workspaceDir = opts.workspaceDir;
+  prepareScratchExclusionIfGit(workspaceDir);
+  const planningContext = opts.planningContext ?? "";
+  const effectiveMaxTurns = opts.maxTurns ?? 50;
+  const effectiveMaxIterations = opts.maxIterations ?? 3;
+
+  let implementationPrompt = buildDefaultImplementationPrompt({
+    issueIdentifier: opts.issueIdentifier,
+    issueTitle: opts.issueTitle,
+    issueDescription: opts.issueDescription,
+    prNumber: "",
+  });
+
+  let workflowModel: string | undefined;
+  let setupHook: string | undefined;
+  let verifyHook: string | undefined;
+  let teardownHook: string | undefined;
+  const wfPath = join(workspaceDir, "WORKFLOW.md");
+  if (existsSync(wfPath)) {
+    const parsed = parseWorkflowMd(readFileSync(wfPath, "utf-8"), {
+      ISSUE_ID: opts.issueId ?? "",
+      ISSUE_IDENTIFIER: opts.issueIdentifier,
+      ISSUE_TITLE: opts.issueTitle,
+      ISSUE_DESCRIPTION: opts.issueDescription,
+      PR_NUMBER: "",
+      PLANNING_CONTEXT: planningContext,
+    });
+    workflowModel = parsed.frontMatter.model;
+    setupHook = parsed.frontMatter.setup;
+    verifyHook = parsed.frontMatter.verify;
+    teardownHook = parsed.frontMatter.teardown;
+    if (parsed.body.trim()) implementationPrompt = parsed.body;
+  }
+
+  implementationPrompt = appendValidationCommandDiscipline(
+    appendPipelineOwnedGitInstructions(implementationPrompt, ""),
+  );
+  const model = opts.model ?? workflowModel ?? "claude-sonnet-4-6";
+  const llmExecutor = opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary");
+  const reporter = opts.reporter ?? new NoopStepReporter();
+
+  const context = new DefaultPipelineContext(
+    {
+      jobId: 0,
+      issueId: opts.issueId ?? "",
+      issueIdentifier: opts.issueIdentifier,
+      issueTitle: opts.issueTitle,
+      issueDescription: opts.issueDescription,
+      nonce: "",
+      orchestratorUrl: "",
+      model,
+      workspaceDir,
+      planningContext,
+      implementationPrompt,
+      prNumber: "",
+      githubOwner: "",
+      githubRepo: "",
+      githubToken: "",
+      branch: "",
+      provider: "anthropic",
+      maxTurns: opts.maxTurns,
+      maxIterations: opts.maxIterations,
+      profiles: [],
+      groupingParent: false,
+    },
+    llmExecutor,
+  );
+
+  const pipeline = opts.pipeline ?? LOCAL_FEEDBACK_PIPELINE;
+  const runner = opts.runner ?? (await createDefaultRunner());
+
+  // Teardown runs only when setup ran successfully (or no setup was configured).
+  // If setup is configured but fails, setupRan stays false and teardown is skipped.
+  let setupRan = !setupHook;
+
+  try {
+    if (setupHook) {
+      try {
+        const setupResult = runHookScript("setup", setupHook, workspaceDir);
+        if (setupResult.exitCode !== 0) {
+          return {
+            exitCode: 1,
+            approved: false,
+            terminationReason: "setup_failed",
+            iterations: 0,
+            passes: [],
+            finalFeedback: `Setup hook exited with code ${setupResult.exitCode}`,
+            effectiveMaxTurns,
+            effectiveMaxIterations,
+            tokenSummary: null,
+          };
+        }
+      } catch (err) {
+        return {
+          exitCode: 1,
+          approved: false,
+          terminationReason: "setup_failed",
+          iterations: 0,
+          passes: [],
+          finalFeedback: `Setup hook error: ${String(err)}`,
+          effectiveMaxTurns,
+          effectiveMaxIterations,
+          tokenSummary: null,
+        };
+      }
+      setupRan = true;
+    }
+
+    await runner.run(pipeline, context, reporter);
+
+    const fb = context.getOutputs("feedback-loop");
+    const approved = fb.approved === true;
+    const terminationReason =
+      typeof fb.terminationReason === "string" ? fb.terminationReason : "unknown";
+    const iterations = typeof fb.iterations === "number" ? fb.iterations : 0;
+    const passes = Array.isArray(fb.passes)
+      ? (fb.passes as RunLocalAutonomousResult["passes"])
+      : [];
+    const finalFeedback = typeof fb.finalFeedback === "string" ? fb.finalFeedback : "";
+
+    if (approved && verifyHook) {
+      try {
+        const verifyResult = runHookScript("verify", verifyHook, workspaceDir);
+        if (verifyResult.exitCode !== 0) {
+          return {
+            exitCode: 1,
+            approved: false,
+            terminationReason: "verify_failed",
+            iterations,
+            passes,
+            finalFeedback: `Verify hook exited with code ${verifyResult.exitCode}`,
+            effectiveMaxTurns,
+            effectiveMaxIterations,
+            tokenSummary: buildTokenSummary(passes),
+          };
+        }
+      } catch (err) {
+        return {
+          exitCode: 1,
+          approved: false,
+          terminationReason: "verify_failed",
+          iterations,
+          passes,
+          finalFeedback: `Verify hook error: ${String(err)}`,
+          effectiveMaxTurns,
+          effectiveMaxIterations,
+          tokenSummary: buildTokenSummary(passes),
+        };
+      }
+    }
+
+    return {
+      exitCode: 0,
+      approved,
+      terminationReason,
+      iterations,
+      passes,
+      finalFeedback,
+      effectiveMaxTurns,
+      effectiveMaxIterations,
+      tokenSummary: buildTokenSummary(passes),
+    };
+  } catch (err) {
+    return {
+      exitCode: 1,
+      approved: false,
+      terminationReason: "error",
+      iterations: 0,
+      passes: [],
+      finalFeedback: err instanceof Error ? err.message : String(err),
+      effectiveMaxTurns,
+      effectiveMaxIterations,
+      tokenSummary: null,
+    };
+  } finally {
+    if (setupRan && teardownHook) {
+      try {
+        const result = runHookScript("teardown", teardownHook, workspaceDir);
+        if (result.exitCode !== 0) {
+          console.error(`teardown hook exited with code ${result.exitCode}`);
+        }
+      } catch (teardownErr) {
+        console.error(`teardown hook error: ${teardownErr}`);
+      }
+    }
+  }
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   runAutonomous()
-    .then((r) => process.exit(r.exitCode))
+    .then(async (r) => {
+      if (isLocalDevHarness() && process.env.AI_IMPLEMENT_SHELL_MODE === "true") {
+        // Signal the dev-harness CLI that the pipeline has finished and the
+        // container is ready for interactive inspection. The CLI will attach
+        // a bash session via `docker exec -it` and remove the container when
+        // the user exits. The exit code is embedded so the CLI can preserve it.
+        process.stdout.write(`[dev:run] shell-ready exit=${r.exitCode}\n`);
+        // A pending Promise alone does not keep Node's event loop alive. The
+        // referenced interval keeps the runner process alive until docker rm.
+        await waitForContainerRemoval();
+      }
+      process.exit(r.exitCode);
+    })
     .catch((err) => {
       console.error(err);
       process.exit(1);

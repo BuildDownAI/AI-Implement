@@ -68,7 +68,7 @@ describe("mintRunToken", () => {
     if (result.ok) expect(result.claims.audience).toBe("result");
   });
 
-  it("can mint result and progress tokens for the same dispatch id", () => {
+  it("can mint result, progress, and publication tokens for the same dispatch id", () => {
     const dispatchId = "dispatch-shared";
     runnerTokens.mintRunToken({
       issueId: "issue-1",
@@ -90,14 +90,51 @@ describe("mintRunToken", () => {
       secret: SECRET,
     });
 
+    const publication = runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "publication",
+      dispatchId,
+      repository: "acme/app",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
     const rows = dedup
       .getDb()
       .prepare("SELECT audience FROM runner_tokens WHERE dispatch_id = ? ORDER BY audience")
       .all(dispatchId) as Array<{ audience: string }>;
-    expect(rows.map((row) => row.audience)).toEqual(["progress", "result"]);
+    expect(rows.map((row) => row.audience)).toEqual(["progress", "publication", "result"]);
 
     const result = runnerTokens.verifyRunToken(token, SECRET, "progress", { consume: false });
     expect(result.ok).toBe(true);
+    const publicationResult = runnerTokens.verifyRunToken(
+      publication.token,
+      SECRET,
+      "publication",
+      { consume: true },
+    );
+    expect(publicationResult.ok).toBe(true);
+    const replay = runnerTokens.verifyRunToken(
+      publication.token,
+      SECRET,
+      "publication",
+      { consume: true },
+    );
+    expect(replay.ok).toBe(false);
+    if (!replay.ok) expect(replay.reason).toBe("already_consumed");
+  });
+
+  it("requires publication credentials to bind an exact repository", () => {
+    expect(() => runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "publication",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    })).toThrow(/owner\/repository binding/);
   });
 });
 

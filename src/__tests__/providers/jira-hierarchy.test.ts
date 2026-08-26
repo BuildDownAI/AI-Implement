@@ -16,21 +16,33 @@ describe("classifyByChildren", () => {
       ]).kind,
     ).toBe("feature-node-blocked");
   });
-  it("all designated children terminal → feature-node-ready (non-designated children don't gate)", () => {
+  it("all designated children terminal and no active undesignated children → feature-node-ready", () => {
     expect(
       classifyByChildren([
         { designated: true, terminal: true },
-        { designated: false, terminal: false },
+        { designated: false, terminal: true }, // non-designated but terminal — doesn't gate
       ]).kind,
     ).toBe("feature-node-ready");
   });
-  it("feature-node-ready even when a non-designated child is terminal (still doesn't gate)", () => {
+  it("AII-349 race guard: designated+terminal children exist but undesignated non-terminal child → waiting-parent", () => {
+    // Operator labeled the parent first; some children are Done (by hand) but siblings are
+    // not yet labeled. Wait until they are designated or terminal before finalizing/dispatching.
     expect(
       classifyByChildren([
         { designated: true, terminal: true },
-        { designated: false, terminal: true },
+        { designated: false, terminal: false }, // not yet labeled, still active
       ]).kind,
-    ).toBe("feature-node-ready");
+    ).toBe("waiting-parent");
+  });
+  it("AII-349 race guard: all-designated-terminal + multiple undesignated non-terminal → waiting-parent", () => {
+    expect(
+      classifyByChildren([
+        { designated: true, terminal: true },
+        { designated: true, terminal: true },
+        { designated: false, terminal: false },
+        { designated: false, terminal: false },
+      ]).kind,
+    ).toBe("waiting-parent");
   });
 });
 

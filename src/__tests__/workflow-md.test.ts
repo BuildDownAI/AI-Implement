@@ -46,10 +46,13 @@ describe("parseWorkflowMd", () => {
     expect((out.frontMatter as Record<string, unknown>).unknown_key).toBeUndefined();
   });
 
-  it("parses gap_analysis_model and teardown", () => {
+  it("parses teardown and ignores the removed gap_analysis_model key", () => {
     const md = `---\ngap_analysis_model: claude-haiku-4-5\nteardown: scripts/teardown.sh\n---\nbody\n`;
     const out = parseWorkflowMd(md, {});
-    expect(out.frontMatter.gap_analysis_model).toBe("claude-haiku-4-5");
     expect(out.frontMatter.teardown).toBe("scripts/teardown.sh");
+    // gap_analysis_model was parsed but never consumed by any caller. Dropping it
+    // from KEYS is behaviour-neutral; this pins that a repo still setting it is
+    // ignored at parse time rather than silently accepted and discarded later.
+    expect((out.frontMatter as Record<string, unknown>).gap_analysis_model).toBeUndefined();
   });
 });

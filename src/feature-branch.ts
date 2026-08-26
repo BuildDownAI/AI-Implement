@@ -1,6 +1,6 @@
 import type { RepoMapping } from "./config.js";
 import type { TicketIssue } from "./providers/types.js";
-import { ensureBranchExists } from "./github.js";
+import { ensureBranchExists, findPullRequestByBranches } from "./github.js";
 import { buildGroupingBranchName } from "./pipeline/branch-name.js";
 
 /**
@@ -27,9 +27,10 @@ import { buildGroupingBranchName } from "./pipeline/branch-name.js";
  * `ensureBranchExists` is idempotent (422-tolerant), so an existing ancestor branch is
  * reused and only the missing tip of the chain is cut.
  *
- * Fails open: any error (branch creation, GitHub API) logs a warning and returns
- * mapping.defaultBranch so the issue still dispatches. Grouping is an enhancement,
- * not a gate.
+ * Fails closed for grouped issues: dispatching against mapping.defaultBranch after
+ * a resolution error would bypass the grouping contract and can open the child PR
+ * against the wrong base. The poller's outer issue guard logs the error and leaves
+ * the issue queued for a later retry.
  */
 export async function resolveBaseBranch(opts: {
   ghToken: string;
@@ -51,11 +52,38 @@ export async function resolveBaseBranch(opts: {
     }
     return target;
   } catch (err) {
-    console.warn(
-      `[poll] Feature-branch resolution failed for ${issue.identifier} ` +
-        `(chain ${chain.map((e) => `${e.mode}:${e.identifier}`).join(" -> ")}); falling back to base branch "${mapping.defaultBranch}":`,
-      err,
+    throw new Error(
+      `Feature-branch resolution failed for ${issue.identifier} ` +
+        `(chain ${chain.map((e) => `${e.mode}:${e.identifier}`).join(" -> ")}); ` +
+        `refusing to dispatch against "${mapping.defaultBranch}"`,
+      { cause: err },
     );
-    return mapping.defaultBranch;
+  }
+}
+
+/** AII-264 r3 churn-loop guard: a grouping parent whose top-of-tree roll-up PR is
+ *  OPEN (awaiting human review) must not be dispatchable — every re-dispatch finds
+ *  no meaningful work and either opens a junk closing PR or exits pr_not_found,
+ *  after which the watchdog reset re-arms it (observed as a hard ~3-minute loop on
+ *  two parents at once, each iteration a full runner session). Returns the open
+ *  roll-up PR when the hold applies; null (fail-open) otherwise — including on
+ *  probe errors, so an API hiccup never wedges a legitimate dispatch. */
+export async function findOpenRollUpPr(opts: {
+  ghToken: string;
+  issue: TicketIssue;
+  mapping: RepoMapping;
+  finder?: typeof findPullRequestByBranches;
+}): Promise<{ number: number; url: string } | null> {
+  const chain = opts.issue.featureBranchChain ?? [];
+  if (chain.length === 0) return null;
+  const last = chain[chain.length - 1];
+  if (last.identifier !== opts.issue.identifier) return null; // leaf dispatch — guard is parent-only
+  const head = buildGroupingBranchName(last.identifier, last.mode);
+  const finder = opts.finder ?? findPullRequestByBranches;
+  try {
+    const pr = await finder(opts.ghToken, opts.mapping.owner, opts.mapping.repo, head, opts.mapping.defaultBranch);
+    return pr && pr.state === "open" ? { number: pr.number, url: pr.url } : null;
+  } catch {
+    return null;
   }
 }

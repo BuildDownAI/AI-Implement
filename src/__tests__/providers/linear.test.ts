@@ -342,12 +342,75 @@ describe("LinearProvider.fetchAIImplementSnapshot", () => {
           children: [
             { labels: ["AI-Implement"], stateType: "completed" },
             { labels: ["AI-Implement"], stateType: "canceled" },
-            { labels: ["Improvement"], stateType: "started" }, // non-AI child does not gate
+            { labels: ["Improvement"], stateType: "completed" }, // non-AI child, but terminal
           ],
         }),
       ]);
       const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
       const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
+      expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
+    });
+
+    it("AII-349 race guard: skips parent when some AI children are Done but unlabeled active children remain", async () => {
+      // Operator labeled parent first, then 325/326/327 are Done (by hand) but 328/329
+      // are not yet labeled with AI-Implement. The parent must wait — not finalize.
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "AII-324",
+          labels: ["AI-Implement"],
+          description: "Closing work spec.",
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" }, // 325 — Done by hand
+            { labels: ["AI-Implement"], stateType: "completed" }, // 326 — Done by hand
+            { labels: ["AI-Implement"], stateType: "completed" }, // 327 — Done by hand
+            { labels: [], stateType: "unstarted" },               // 328 — not yet labeled
+            { labels: [], stateType: "unstarted" },               // 329 — not yet labeled
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      expect(snap.needsPlanning).toEqual([]);
+      expect(snap.readyForImplementation).toEqual([]);
+      expect(snap.parentsToFinalize).toEqual([]);
+    });
+
+    it("AII-349 race guard: does not finalize blank-spec parent when unlabeled active children remain", async () => {
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "AII-324",
+          labels: ["AI-Implement"],
+          description: null, // blank spec → would finalize if guard didn't apply
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+            { labels: [], stateType: "unstarted" }, // not yet labeled
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      expect(snap.parentsToFinalize).toEqual([]);
+    });
+
+    it("AII-349 race guard: non-AI child in terminal state does NOT gate dispatch", async () => {
+      // A non-AI child that is Done (e.g. completed by human outside the pipeline) should
+      // not block the parent — only active undesignated children trigger the guard.
+      mockSinglePage([
+        makeIssue({
+          id: "parent",
+          identifier: "OOL-78",
+          labels: ["AI-Implement"],
+          description: "Closing work spec.",
+          children: [
+            { labels: ["AI-Implement"], stateType: "completed" },
+            { labels: ["Improvement"], stateType: "completed" }, // non-AI, terminal — OK
+            { labels: ["Improvement"], stateType: "canceled" },  // non-AI, terminal — OK
+          ],
+        }),
+      ]);
+      const snap = await new LinearProvider({}).fetchAIImplementSnapshot();
+      const parent = snap.needsPlanning.find((i) => i.id === "parent")!;
+      expect(parent).toBeDefined();
       expect(parent.featureBranchChain).toEqual([{ identifier: "OOL-78", mode: "feature" }]);
     });
 

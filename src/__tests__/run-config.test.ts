@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { encodeRunConfig, decodeRunConfig, type RunConfigV1 } from "../run-config.js";
+import {
+  encodeRunConfig,
+  decodeRunConfig,
+  runConfigFromTaskDocument,
+  type RunConfigV1,
+  type TaskDocumentParams,
+} from "../run-config.js";
 
 const full: RunConfigV1 = {
   v: 1,
@@ -16,6 +22,7 @@ const full: RunConfigV1 = {
   sensitiveFiles: { add: ["*.secrets.toml"], allow: [".env", ".env.*"] },
   profiles: ["backend", "webapp"],
   planningContext: { parent: "- AII-0: parent", siblings: "None", dependencies: "- [related] AII-2: dep" },
+  dependencyTokenScope: "installation",
 };
 
 describe("run-config envelope", () => {
@@ -97,5 +104,110 @@ describe("run-config envelope", () => {
     const decoded = decodeRunConfig(encodeRunConfig(min));
     expect(decoded.profiles).toBeUndefined();
     expect(decoded.planningContext).toBeUndefined();
+  });
+
+  it("round-trips dependencyTokenScope: installation", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-3", title: "t", description: "" },
+      dependencyTokenScope: "installation",
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).dependencyTokenScope).toBe("installation");
+  });
+
+  it("absent dependencyTokenScope decodes as undefined (no key materialized)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-4", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.dependencyTokenScope).toBeUndefined();
+    expect("dependencyTokenScope" in decoded).toBe(false);
+  });
+
+  it("pickKnownKeys preserves dependencyTokenScope and drops bogus extra keys", () => {
+    const withExtra = { ...full, bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withExtra), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.dependencyTokenScope).toBe("installation");
+    expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
+});
+
+describe("runConfigFromTaskDocument", () => {
+  const ISSUE_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+  it("builds a minimal RunConfigV1 from title and description", () => {
+    const params: TaskDocumentParams = { title: "My Task", description: "Do the thing." };
+    const result = runConfigFromTaskDocument(params, ISSUE_ID);
+    expect(result.v).toBe(1);
+    expect(result.issue.id).toBe(ISSUE_ID);
+    expect(result.issue.title).toBe("My Task");
+    expect(result.issue.description).toBe("Do the thing.");
+  });
+
+  it("uses the provided identifier", () => {
+    const params: TaskDocumentParams = { title: "T", description: "", identifier: "DEV-42" };
+    const result = runConfigFromTaskDocument(params, ISSUE_ID);
+    expect(result.issue.identifier).toBe("DEV-42");
+  });
+
+  it("falls back to a DEV-timestamp identifier when none is provided", () => {
+    const params: TaskDocumentParams = { title: "T", description: "" };
+    const result = runConfigFromTaskDocument(params, ISSUE_ID);
+    expect(result.issue.identifier).toMatch(/^DEV-\d+$/);
+  });
+
+  it("maps baseBranch to config.baseBranch", () => {
+    const params: TaskDocumentParams = { title: "T", description: "", baseBranch: "main" };
+    const result = runConfigFromTaskDocument(params, ISSUE_ID);
+    expect(result.baseBranch).toBe("main");
+  });
+
+  it("maps profiles to config.profiles", () => {
+    const params: TaskDocumentParams = {
+      title: "T",
+      description: "",
+      profiles: ["backend", "webapp"],
+    };
+    const result = runConfigFromTaskDocument(params, ISSUE_ID);
+    expect(result.profiles).toEqual(["backend", "webapp"]);
+  });
+
+  it("maps maxTurns to config.maxTurns", () => {
+    const params: TaskDocumentParams = { title: "T", description: "", maxTurns: 50 };
+    const result = runConfigFromTaskDocument(params, ISSUE_ID);
+    expect(result.maxTurns).toBe(50);
+  });
+
+  it("maps maxIterations to config.maxIterations", () => {
+    const params: TaskDocumentParams = { title: "T", description: "", maxIterations: 3 };
+    const result = runConfigFromTaskDocument(params, ISSUE_ID);
+    expect(result.maxIterations).toBe(3);
+  });
+
+  it("omits optional keys when absent (no spurious undefined properties)", () => {
+    const params: TaskDocumentParams = { title: "T", description: "" };
+    const result = runConfigFromTaskDocument(params, ISSUE_ID);
+    expect("baseBranch" in result).toBe(false);
+    expect("profiles" in result).toBe(false);
+    expect("maxTurns" in result).toBe(false);
+    expect("maxIterations" in result).toBe(false);
+  });
+
+  it("produces a config that round-trips through encode/decode", () => {
+    const params: TaskDocumentParams = {
+      title: "T",
+      description: "Body.",
+      identifier: "DEV-9",
+      baseBranch: "main",
+      profiles: ["backend"],
+      maxTurns: 10,
+      maxIterations: 2,
+    };
+    const config = runConfigFromTaskDocument(params, ISSUE_ID);
+    const decoded = decodeRunConfig(encodeRunConfig(config));
+    expect(decoded.issue.identifier).toBe("DEV-9");
+    expect(decoded.baseBranch).toBe("main");
+    expect(decoded.profiles).toEqual(["backend"]);
+    expect(decoded.maxTurns).toBe(10);
+    expect(decoded.maxIterations).toBe(2);
   });
 });

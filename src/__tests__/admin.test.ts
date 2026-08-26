@@ -15,6 +15,12 @@ import { FakeProvider } from "./providers/fake.js";
 import type { TicketIssue } from "../providers/types.js";
 import type { ProviderRegistry } from "../providers/registry.js";
 
+const notifyTextMock = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../notify.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../notify.js")>()),
+  notifyText: notifyTextMock,
+}));
+
 vi.mock("../workflow-sync.js", () => ({
   syncWorkflowTemplates: vi.fn(),
   classifySyncError: (err: unknown) => ({
@@ -25,6 +31,17 @@ vi.mock("../workflow-sync.js", () => ({
 
 vi.mock("../github-install-state.js", () => ({
   probeInstallState: vi.fn(),
+}));
+
+// getAvailability() is module state the poll loop populates. Mocking that one export
+// keeps the rest of the module real and lets the route's passthrough be exercised
+// without an App-token mint or a network call.
+const availabilityMock = vi.hoisted(() =>
+  vi.fn((): import("../deploy-availability.js").DeploymentAvailability | null => null),
+);
+vi.mock("../deploy-availability.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../deploy-availability.js")>()),
+  getAvailability: availabilityMock,
 }));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
@@ -106,7 +123,7 @@ afterEach(() => {
   try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
-function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminRequest>[2] {
+function adminConfig(accessCode: string | null): Parameters<typeof admin.handleAdminRequest>[2] {
   return {
     adminAccessCode: accessCode,
     flySessionsToken: null,
@@ -117,7 +134,7 @@ function adminConfig(accessCode: string): Parameters<typeof admin.handleAdminReq
   };
 }
 
-async function request(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
+async function request(url: string, method: string, accessCode: string | null, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   let requestBody = body;
   if (
     url === "/api/mappings" &&
@@ -136,7 +153,7 @@ async function request(url: string, method: string, accessCode: string, body?: u
   return requestRaw(url, method, accessCode, requestBody, token);
 }
 
-async function requestRaw(url: string, method: string, accessCode: string, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
+async function requestRaw(url: string, method: string, accessCode: string | null, body?: unknown, token?: string): Promise<{ statusCode: number; body: string }> {
   const req = new MockRequest(url, method, token ? { authorization: `Bearer ${token}` } : {}, body === undefined ? undefined : JSON.stringify(body));
   const res = new MockResponse();
   admin.handleAdminRequest(req as never, res as never, adminConfig(accessCode), makeFakeRegistry(provider));
@@ -161,9 +178,32 @@ describe("admin auth", () => {
     expect(res.statusCode).toBe(403);
   });
 
+  it("returns 403 when access-code login is disabled (adminAccessCode is null)", async () => {
+    const res = await requestRaw("/api/auth", "POST", null, { code: "anything" });
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toMatch(/disabled/);
+  });
+
+  it("a null code cannot bypass a disabled access code", async () => {
+    const res = await requestRaw("/api/auth", "POST", null, { code: null });
+    expect(res.statusCode).toBe(403);
+  });
+
   it("returns 401 on protected routes without token", async () => {
     const res = await request("/api/mappings", "GET", "secret");
     expect(res.statusCode).toBe(401);
+  });
+
+  it("serves the SPA shell for GET /admin, ignoring any query string (e.g. the OAuth ?auth_error= redirect)", async () => {
+    // Control: the bare path serves the shell.
+    const plain = await requestRaw("/admin", "GET", "secret");
+    expect(plain.statusCode).toBe(200);
+    expect(plain.body).toContain('id="login-page"');
+
+    // Regression: a query string must not cause a 404 — the callback's failure redirect lands here.
+    const withQuery = await requestRaw("/admin?auth_error=denied", "GET", "secret");
+    expect(withQuery.statusCode).toBe(200);
+    expect(withQuery.body).toContain('id="login-page"');
   });
 
   it("session token survives a module reload (simulates server restart)", async () => {
@@ -949,6 +989,74 @@ describe("admin mappings", () => {
     expect(res.statusCode).toBe(202);
     expect(JSON.parse(res.body).sensitiveAllowPatterns).toEqual(["**/secrets.env", ".env.*"]);
   });
+
+  it("persists dependencyTokenScope='installation' and returns it", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS1", owner: "org", repo: "app",
+      dependencyTokenScope: "installation",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).dependencyTokenScope).toBe("installation");
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).DTS1.dependencyTokenScope).toBe("installation");
+  });
+
+  it("treats null dependencyTokenScope as null", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS2", owner: "org", repo: "app",
+      dependencyTokenScope: null,
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).dependencyTokenScope).toBeNull();
+  });
+
+  it("treats empty string dependencyTokenScope as null", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS3", owner: "org", repo: "app",
+      dependencyTokenScope: "",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).dependencyTokenScope).toBeNull();
+  });
+
+  it("treats absent dependencyTokenScope as null on new mapping", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS4", owner: "org", repo: "app",
+    }, token);
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).dependencyTokenScope).toBeNull();
+  });
+
+  it("preserves existing dependencyTokenScope when omitted from update", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS5", owner: "org", repo: "app",
+      dependencyTokenScope: "installation",
+    }, token);
+
+    const update = await request("/api/mappings", "POST", "secret", {
+      teamKey: "DTS5", owner: "org", repo: "app-updated",
+    }, token);
+    expect(update.statusCode).toBe(202);
+    expect(JSON.parse(update.body).dependencyTokenScope).toBe("installation");
+  });
+
+  it("rejects invalid dependencyTokenScope values with 400", async () => {
+    const token = await login("secret");
+    for (const invalid of ["all", "true", "repo", "INSTALLATION"]) {
+      const res = await request("/api/mappings", "POST", "secret", {
+        teamKey: "DTSBAD", owner: "org", repo: "app",
+        dependencyTokenScope: invalid,
+      }, token);
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("dependencyTokenScope");
+    }
+  });
 });
 
 describe("admin runner-mode", () => {
@@ -980,6 +1088,54 @@ describe("admin runner-mode", () => {
     // Confirm it survives a fresh GET
     const get = await request("/api/runner-mode", "GET", "secret", undefined, token);
     expect(JSON.parse(get.body).mode).toBe("shadow");
+  });
+
+  it("GET /api/runner-mode lists ineligible mappings when a force is active (AII-306)", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", { teamKey: "BED", owner: "o", repo: "r", provider: "bedrock", awsRegion: "us-west-2" }, token);
+    expect(create.statusCode, create.body).toBeLessThan(300);
+    await request("/api/runner-mode", "POST", "secret", { mode: "fly" }, token);
+    const res = await request("/api/runner-mode", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.mode).toBe("fly");
+    expect(Array.isArray(body.ineligible)).toBe(true);
+    const bed = body.ineligible.find((m: { teamKey: string }) => m.teamKey === "BED");
+    expect(bed).toBeDefined();
+    expect(bed.reason).toMatch(/bedrock/i);
+  });
+
+  it("GET /api/runner-mode has no ineligible list under non-forcing modes (AII-306)", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "BED", owner: "o", repo: "r", provider: "bedrock", awsRegion: "us-west-2" }, token);
+    const res = await request("/api/runner-mode", "GET", "secret", undefined, token);
+    const body = JSON.parse(res.body);
+    expect(body.mode).toBe("default");
+    expect(body.ineligible ?? []).toEqual([]);
+  });
+
+  it("POST /api/runner-mode fires the notify hook with old→new when a webhook is configured (AII-306)", async () => {
+    notifyTextMock.mockClear();
+    const token = await login("secret");
+    const cfg = { ...adminConfig("secret"), notifyWebhookUrl: "https://hooks.example/x" };
+    const req = new MockRequest("/api/runner-mode", "POST", { authorization: `Bearer ${token}` }, JSON.stringify({ mode: "fly" }));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, cfg as never, makeFakeRegistry(provider));
+    await res.done;
+    expect(res.statusCode).toBe(200);
+    expect(notifyTextMock).toHaveBeenCalledTimes(1);
+    const [url, message] = notifyTextMock.mock.calls[0] as unknown as [string, string];
+    expect(url).toBe("https://hooks.example/x");
+    expect(message).toMatch(/default/);
+    expect(message).toMatch(/fly/);
+  });
+
+  it("POST /api/runner-mode does not notify when no webhook is configured (AII-306)", async () => {
+    notifyTextMock.mockClear();
+    const token = await login("secret");
+    const res = await request("/api/runner-mode", "POST", "secret", { mode: "fly" }, token);
+    expect(res.statusCode).toBe(200);
+    expect(notifyTextMock).not.toHaveBeenCalled();
   });
 
   it("POST /api/runner-mode rejects an invalid mode with 400", async () => {
@@ -1905,5 +2061,293 @@ describe("github-install-state endpoint", () => {
 
     const res = await request("/api/admin/github-install-state?owner=acme&repo=backend", "GET", "secret", undefined, token);
     expect(res.statusCode).toBe(500);
+  });
+});
+
+describe("POST /api/deploy", () => {
+  // The shared harness never passes deps, which is itself the 501 case; the rest need
+  // a stubbed starter, so the route is exercised without touching Fly or GitHub.
+  async function deployRequest(
+    token: string,
+    deps: AdminModule.AdminDeps,
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest("/api/deploy", "POST", { authorization: `Bearer ${token}` }, undefined);
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  it("rejects an unauthenticated request before consulting the starter", async () => {
+    let called = false;
+    const res = await deployRequest("not-a-session", {
+      startDeploy: async () => { called = true; return { started: true, commit: "abc1234" }; },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(called).toBe(false);
+  });
+
+  it("answers 501 when the orchestrator is not configured to deploy itself", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {});
+    expect(res.statusCode).toBe(501);
+  });
+
+  it("answers 202 with the commit when a deploy starts", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {
+      startDeploy: async () => ({ started: true, commit: "abc1234" }),
+    });
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body).deploying).toBe("abc1234");
+  });
+
+  it("answers 409 when a deploy is already running", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {
+      startDeploy: async () => ({ started: false, reason: "deploy-in-progress" }),
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it("answers 503 when HEAD cannot be resolved", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {
+      startDeploy: async () => ({ started: false, reason: "head-unknown" }),
+    });
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("answers 500 without echoing the error text", async () => {
+    const token = await login("secret");
+    const res = await deployRequest(token, {
+      startDeploy: async () => { throw new Error("kg_token=super-secret"); },
+    });
+    expect(res.statusCode).toBe(500);
+    // Admin 5xx bodies leaking raw error text is a known defect elsewhere; this route
+    // must not add to it, and the thrown message here would carry a build secret.
+    expect(res.body).not.toContain("super-secret");
+  });
+});
+
+describe("GET /api/deployment-status", () => {
+  // The page reads this once per poll; every field it renders comes from here, so the
+  // route is tested for shape and passthrough rather than for the values themselves.
+  async function statusRequest(
+    token: string,
+    deps: AdminModule.AdminDeps = {},
+  ): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    const req = new MockRequest("/api/deployment-status", "GET", { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
+  }
+
+  beforeEach(() => {
+    availabilityMock.mockReturnValue(null);
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    const res = await statusRequest("not-a-session");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("reports not configured when no starter is injected", async () => {
+    // This is the only signal that separates "nothing to deploy" from "this
+    // orchestrator cannot deploy itself" — otherwise only the trigger's 501 knows.
+    const token = await login("secret");
+    const res = await statusRequest(token, {});
+    expect(res.statusCode).toBe(200);
+    expect(res.body.configured).toBe(false);
+  });
+
+  it("reports configured when a starter is injected", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token, {
+      startDeploy: async () => ({ started: true, commit: "abc1234" }),
+    });
+    expect(res.body.configured).toBe(true);
+  });
+
+  it("passes an unresolved availability through as null, never as false", async () => {
+    // null is unknown. Collapsing it to false would have the page render "up to date"
+    // for an orchestrator that has no idea whether it is behind.
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.available).toBeNull();
+    expect(res.body.runningCommit).toBeNull();
+    expect(res.body.headCommit).toBeNull();
+    expect(res.body.checkedAt).toBeNull();
+  });
+
+  it("passes a derived availability and its commits through unchanged", async () => {
+    availabilityMock.mockReturnValue({
+      available: true,
+      runningCommit: "abc1234",
+      headCommit: "def5678",
+      checkedAt: 1_700_000_000_000,
+    });
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body).toMatchObject({
+      available: true,
+      runningCommit: "abc1234",
+      headCommit: "def5678",
+      checkedAt: 1_700_000_000_000,
+    });
+  });
+
+  it("keeps a resolved false distinct from unknown", async () => {
+    availabilityMock.mockReturnValue({
+      available: false,
+      runningCommit: "abc1234",
+      headCommit: "abc1234",
+      checkedAt: 1,
+    });
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.available).toBe(false);
+  });
+
+  it("names the watched repo and branch from the injected target", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token, {
+      selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement", branch: "testing", runningCommit: "abc1234" },
+    });
+    expect(res.body.repo).toBe("BuildDownAI/AI-Implement");
+    expect(res.body.branch).toBe("testing");
+  });
+
+  it("reports no target when the image carries no build stamps", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token, {});
+    expect(res.body.repo).toBeNull();
+    expect(res.body.branch).toBeNull();
+  });
+
+  it("reports nothing held and nothing executing on an idle orchestrator", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.held).toBe(false);
+    expect(res.body.inFlight).toEqual([]);
+  });
+
+  it("reports the hold and what is still executing", async () => {
+    // Held with work executing is the draining state the page names, and the counts
+    // come from the same inventory the deploy itself waits on.
+    const { setDeployHold } = await import("../deploy-hold.js");
+    setDeployHold();
+    const { id } = queue.enqueueWorkflowSync("ENG");
+    queue.updateWorkflowSyncStatus(id, "running");
+
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.held).toBe(true);
+    expect(res.body.inFlight).toEqual([{ kind: "workflow-sync", count: 1 }]);
+  });
+
+  it("reports no start time when nothing is being deployed", async () => {
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.deployStartedAt).toBeNull();
+  });
+
+  it("reports when the current deploy started, so the page can show elapsed time", async () => {
+    // An eight-minute build with no moving number is indistinguishable from a hang.
+    // The clock belongs to the hold, so it arrives on the same read as `held`.
+    const { setDeployHold } = await import("../deploy-hold.js");
+    const before = Date.now();
+    setDeployHold();
+
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.held).toBe(true);
+    expect(res.body.deployStartedAt as number).toBeGreaterThanOrEqual(before);
+    expect(res.body.deployStartedAt as number).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("reports whether a notification webhook exists, so the toggle can explain itself", async () => {
+    // Without this the page cannot tell an enabled announcement from an inert one, and
+    // would show "no webhook configured" forever regardless of the truth.
+    const token = await login("secret");
+    const withHook = { ...adminConfig("secret"), notifyWebhookUrl: "https://hook.example.com" };
+
+    const req = new MockRequest("/api/deployment-status", "GET", { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, withHook, makeFakeRegistry(provider), {});
+    await res.done;
+    expect(JSON.parse(res.body).notifyConfigured).toBe(true);
+
+    expect((await statusRequest(token)).body.notifyConfigured).toBe(false);
+  });
+
+  it("reports the last acted commit, so the page knows what automatic deploying already handled", async () => {
+    const { setLastActedCommit } = await import("../deploy-policy.js");
+    const token = await login("secret");
+
+    expect((await statusRequest(token)).body.lastActedCommit).toBeNull();
+    setLastActedCommit("def5678");
+    expect((await statusRequest(token)).body.lastActedCommit).toBe("def5678");
+  });
+
+  it("reports the last deploy outcome, so the page can render deployed-ok and build-failed cards", async () => {
+    const { recordDeployOutcome } = await import("../deploy-notify.js");
+    const token = await login("secret");
+
+    expect((await statusRequest(token)).body.lastDeployOutcome).toBeNull();
+    recordDeployOutcome({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
+    const body = (await statusRequest(token)).body;
+    expect(body.lastDeployOutcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
+  });
+});
+
+describe("POST /api/deploy-policy", () => {
+  async function policyRequest(token: string, body: unknown): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    const req = new MockRequest("/api/deploy-policy", "POST", { authorization: `Bearer ${token}` }, JSON.stringify(body));
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
+  }
+
+  it("rejects an unauthenticated request", async () => {
+    const res = await policyRequest("not-a-session", { autoDeploy: true });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("rejects a non-boolean rather than coercing it", async () => {
+    // "false" is a truthy string. Coercing would enable unattended deploying because
+    // a caller sent the wrong type, which is not a small bug.
+    const token = await login("secret");
+    const res = await policyRequest(token, { autoDeploy: "false" });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns the full policy so the page renders the server's view", async () => {
+    // The two flags interact — autoDeploy being on makes notifyAvailable inert — so an
+    // optimistic client-side update can disagree with what the server actually stored.
+    const token = await login("secret");
+    const res = await policyRequest(token, { autoDeploy: true });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({ autoDeploy: true, notifyAvailable: true });
+  });
+
+  it("leaves the unnamed flag untouched", async () => {
+    const token = await login("secret");
+    await policyRequest(token, { notifyAvailable: false });
+    const res = await policyRequest(token, { autoDeploy: true });
+    expect(res.body).toEqual({ autoDeploy: true, notifyAvailable: false });
+  });
+
+  it("surfaces the policy on the deployment-status read the page already makes", async () => {
+    const token = await login("secret");
+    await policyRequest(token, { autoDeploy: true });
+
+    const req = new MockRequest("/api/deployment-status", "GET", { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await res.done;
+    expect(JSON.parse(res.body)).toMatchObject({ autoDeploy: true, notifyAvailable: true });
   });
 });

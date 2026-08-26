@@ -49,7 +49,7 @@ const IMPLEMENT_OUTPUTS = {
   subagentCount: 0,
 };
 
-function makeContext(): DefaultPipelineContext {
+function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
   return new DefaultPipelineContext({
     jobId: 1,
     issueId: "issue-1",
@@ -58,6 +58,7 @@ function makeContext(): DefaultPipelineContext {
     issueDescription: "Description",
     nonce: "nonce",
     orchestratorUrl: "http://localhost:8080",
+    ...overrides,
   });
 }
 
@@ -181,6 +182,27 @@ describe("feedbackLoopStep", () => {
     expect(secondImplementCall[1]).toMatchObject({
       prompt: expect.stringContaining("Needs improvement"),
     });
+  });
+
+  it("passes reviewer issues and feedback to the second implement prompt", async () => {
+    vi.mocked(reviewStep.run)
+      .mockResolvedValueOnce({
+        ...REJECTED_REVIEW,
+        issues: ["Missing route matrix test", "Pagination can exceed page size"],
+        feedback: "The implementation is close, but the blockers remain.",
+      })
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, maxIterations: 2 },
+      new NoopStepReporter(),
+    );
+
+    const secondImplementCall = vi.mocked(implementStep.run).mock.calls[1];
+    expect(secondImplementCall[1].prompt).toContain("Missing route matrix test");
+    expect(secondImplementCall[1].prompt).toContain("Pagination can exceed page size");
+    expect(secondImplementCall[1].prompt).toContain("The implementation is close");
   });
 
   it("reports implement and review sub-steps via reporter", async () => {
@@ -526,7 +548,7 @@ describe("feedbackLoopStep termination reasons", () => {
 
     expect(outputs.terminationReason).toBe("approved");
     expect(outputs.passes).toEqual([
-      { iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true },
+      { iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true, tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null },
     ]);
   });
 
@@ -567,6 +589,27 @@ describe("feedbackLoopStep termination reasons", () => {
     expect(call.tools).toEqual(["Read", "Glob", "Grep", "Bash(curl *)"]);
     expect(call.maxTurns).toBe(15);
     expect(call.prompt).toContain("Bash npm test"); // tool trace embedded
+  });
+
+  it("treats success telemetry above maxTurns as max_turns and skips review", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({
+      ...IMPLEMENT_OUTPUTS,
+      telemetry: { ...MAX_TURNS_TELEMETRY, outcome: "success", numTurns: 51 },
+    });
+    const invoke = vi.fn().mockResolvedValue({ stdout: "## Post-mortem\nExceeded configured turns.", exitCode: 0, tokensUsed: 10 });
+
+    const outputs = await feedbackLoopStep.run(
+      makeContextWithExecutor(invoke),
+      { ...BASE_INPUTS, maxTurns: 50, maxIterations: 3 },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("max_turns");
+    expect(outputs.iterations).toBe(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(outputs.finalFeedback).toContain("51 turns used");
   });
 
   it("post-mortem failure is non-fatal", async () => {

@@ -47,6 +47,10 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxJobMinutes: null,
     branchPrefix: null,
     skillsRepo: null,
+    sensitiveAddPatterns: null,
+    sensitiveAllowPatterns: null,
+    autoMerge: false,
+    dependencyTokenScope: null,
     ...overrides,
   };
 }
@@ -73,6 +77,7 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     expect(inputs.run_config).toBeDefined();
     expect(inputs.run_token).toBe("tok-abc");
     expect(inputs.run_progress_token).toBe("prog-xyz");
+    expect("run_publication_token" in inputs).toBe(false);
 
     // Legacy per-field keys must be absent
     expect("issue_id" in inputs).toBe(false);
@@ -91,6 +96,17 @@ describe("buildEnvelopeDispatchInputs — envelope shape (case a)", () => {
     // Provider not included for anthropic
     expect("provider" in inputs).toBe(false);
     expect("aws_region" in inputs).toBe(false);
+  });
+
+  it("includes a dedicated publication token only when explicitly provided", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase: "implementation",
+      runToken: "result-token",
+      runProgressToken: "progress-token",
+      runPublicationToken: "publication-token",
+    });
+
+    expect(inputs.run_publication_token).toBe("publication-token");
   });
 
   it("decodes run_config back to original issue fields and runnerPhase", () => {
@@ -310,6 +326,16 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
     expect("run_progress_token" in inputs).toBe(false);
   });
 
+  it("never includes a publication token for planning", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      runnerPhase: "planning",
+      runToken: "plan-token",
+      runPublicationToken: "must-not-leak",
+    });
+
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+
   it("still includes run_token for callback auth", () => {
     const mapping = makeMapping();
     const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
@@ -318,6 +344,60 @@ describe("buildEnvelopeDispatchInputs — planning phase (case c)", () => {
     });
 
     expect(inputs.run_token).toBe("plan-tok");
+  });
+});
+
+// ---------- Case (c2): dependencyTokenScope dispatch stamping ----------
+
+describe("buildEnvelopeDispatchInputs — dependencyTokenScope stamping", () => {
+  it("stamps dependencyTokenScope in run_config when mapping enables it", () => {
+    const mapping = makeMapping({ dependencyTokenScope: "installation" });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.dependencyTokenScope).toBe("installation");
+  });
+
+  it("omits dependencyTokenScope from run_config when mapping has null", () => {
+    const mapping = makeMapping({ dependencyTokenScope: null });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "implementation",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.dependencyTokenScope).toBeUndefined();
+    expect("dependencyTokenScope" in decoded).toBe(false);
+  });
+
+  it("does not stamp dependencyTokenScope for planning dispatch", () => {
+    const mapping = makeMapping({ dependencyTokenScope: "installation" });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "planning",
+      runToken: "plan-tok",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.dependencyTokenScope).toBeUndefined();
+    expect("dependencyTokenScope" in decoded).toBe(false);
+  });
+
+  it("stamps dependencyTokenScope for gap-analysis dispatch", () => {
+    const mapping = makeMapping({ dependencyTokenScope: "installation" });
+    const inputs = buildEnvelopeDispatchInputs(mapping, baseIssue, {
+      runnerPhase: "gap-analysis",
+      prNumber: "99",
+      runToken: "",
+      runProgressToken: "",
+    });
+
+    const decoded = decodeRunConfig(inputs.run_config!);
+    expect(decoded.dependencyTokenScope).toBe("installation");
   });
 });
 

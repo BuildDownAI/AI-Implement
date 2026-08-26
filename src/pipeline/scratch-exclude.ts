@@ -70,3 +70,10 @@ export function prepareScratchExclusion(workspaceDir: string): void {
     }
   }
 }
+
+/** Apply scratch exclusion only when workspaceDir is a Git repository root. */
+export function prepareScratchExclusionIfGit(workspaceDir: string): void {
+  if (fs.existsSync(path.join(workspaceDir, ".git"))) {
+    prepareScratchExclusion(workspaceDir);
+  }
+}

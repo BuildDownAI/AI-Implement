@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { pushStep } from "../pipeline/steps/push.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { __resetPublicationCredentialForTests } from "../publication-credential.js";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
@@ -29,6 +30,7 @@ const BASE_INPUTS = {
   githubToken: "gh-token",
   branchName: "ai-implement/eng-42-feature",
   baseBranch: "main",
+  baseRef: "main",
 };
 
 function spawnResult(status: number, stdout = "", stderr = ""): ReturnType<typeof spawnSync> {
@@ -50,7 +52,7 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
     if (gitArgs[0] === "rev-parse") return spawnResult(0, `${sha}\n`);
     if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\nA\tsrc/app.test.ts\n");
     if (gitArgs[0] === "ls-remote") {
-      return spawnResult(0, "beadfeed\trefs/heads/ai-implement/eng-42-feature\n");
+      return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
     }
     return spawnResult(0);
   });
@@ -58,8 +60,14 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
 
 describe("pushStep", () => {
   beforeEach(() => {
+    __resetPublicationCredentialForTests();
     vi.clearAllMocks();
     vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    __resetPublicationCredentialForTests();
+    vi.unstubAllEnvs();
   });
 
   it("creates PR and returns prUrl, prNumber, commitSha on success", async () => {
@@ -77,6 +85,282 @@ describe("pushStep", () => {
     expect(outputs.prNumber).toBe(7);
     expect(outputs.branchPushed).toBe(true);
     expect(outputs.commitSha).toBe("abc123");
+  });
+
+  it("uses a freshly vended token for remote lookup, push, and PR creation", async () => {
+    mockGitSuccess("abc123");
+    vi.stubEnv("GITHUB_TOKEN", "gh-token");
+    vi.stubEnv("GH_TOKEN", "gh-token");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresh-token", expires_at: "2026-08-07T01:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+        text: async () => "",
+      } as Response);
+
+    try {
+      await pushStep.run(
+        makeContext(),
+        {
+          ...BASE_INPUTS,
+          orchestratorUrl: "https://orchestrator.example",
+          machineNonce: "machine-nonce",
+        },
+        new NoopStepReporter(),
+      );
+
+      const tokenRequest = vi.mocked(fetch).mock.calls[0];
+      expect(tokenRequest[0]).toBe("https://orchestrator.example/api/token");
+
+      const remoteCalls = vi.mocked(spawnSync).mock.calls.filter(([, args]) =>
+        ["ls-remote", "push"].includes((args as string[])[0]),
+      );
+      expect(remoteCalls).toHaveLength(2);
+      for (const [, args] of remoteCalls) {
+        expect((args as string[]).join(" ")).toContain("fresh-token");
+        expect((args as string[]).join(" ")).not.toContain("gh-token");
+      }
+
+      expect(spawnSync).toHaveBeenCalledWith(
+        "git",
+        [
+          "remote",
+          "set-url",
+          "origin",
+          "https://x-access-token:fresh-token@github.com/acme/app.git",
+        ],
+        expect.objectContaining({ cwd: "/tmp/workspace" }),
+      );
+      expect(process.env.GITHUB_TOKEN).toBe("fresh-token");
+      expect(process.env.GH_TOKEN).toBe("fresh-token");
+
+      const prRequest = vi.mocked(fetch).mock.calls[1];
+      expect(prRequest[1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer fresh-token" }));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("exchanges the process-only publication credential immediately before GHA remote writes", async () => {
+    mockGitSuccess("abc123");
+    vi.stubEnv("GITHUB_TOKEN", "workflow-token");
+    vi.stubEnv("GH_TOKEN", "workflow-token");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+        text: async () => "",
+      } as Response);
+
+    try {
+      await pushStep.run(
+        makeContext({ orchestratorUrl: "", callbackUrl: "https://orchestrator.example" }),
+        {
+          ...BASE_INPUTS,
+          orchestratorUrl: "",
+          machineNonce: "",
+          callbackUrl: "https://orchestrator.example",
+        },
+        new NoopStepReporter(),
+      );
+
+      expect(vi.mocked(fetch).mock.calls[0][0]).toBe(
+        "https://orchestrator.example/api/runner/publication-token",
+      );
+      expect(vi.mocked(fetch).mock.calls[0][1]?.headers).toEqual({
+        Authorization: "Bearer one-use-publication-token",
+      });
+      expect(process.env.RUN_PUBLICATION_TOKEN).toBeUndefined();
+
+      const remoteCalls = vi.mocked(spawnSync).mock.calls.filter(([, args]) =>
+        ["ls-remote", "push"].includes((args as string[])[0]),
+      );
+      expect(remoteCalls).toHaveLength(2);
+      for (const [, args] of remoteCalls) {
+        expect((args as string[]).join(" ")).toContain("fresh-token");
+        expect((args as string[]).join(" ")).not.toContain("one-use-publication-token");
+      }
+      const prRequest = vi.mocked(fetch).mock.calls[1];
+      expect(prRequest[1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer fresh-token" }));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("updates an existing PR branch with a freshly vended token without creating another PR", async () => {
+    mockGitSuccess("abc123");
+    vi.stubEnv("GITHUB_TOKEN", "workflow-token");
+    vi.stubEnv("GH_TOKEN", "workflow-token");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        baseRef: "beadfeed",
+        existingPrNumber: "42",
+        callbackUrl: "https://orchestrator.example",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs).toEqual({
+      prUrl: null,
+      prNumber: 42,
+      branchPushed: true,
+      commitSha: "abc123",
+      draft: false,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["checkout", "feature/existing-pr"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git",
+      ["checkout", "-B", "feature/existing-pr"],
+      expect.anything(),
+    );
+  });
+
+  it("pushes an existing PR gap-fill with the original branch head as the force-with-lease", async () => {
+    mockGitSuccess("abc123");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        baseRef: "beadfeed",
+        existingPrNumber: "42",
+        callbackUrl: "https://orchestrator.example",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prUrl).toBeNull();
+    expect(outputs.prNumber).toBe(42);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining([
+        "push",
+        expect.any(String),
+        "HEAD:refs/heads/feature/existing-pr",
+        "--force-with-lease=refs/heads/feature/existing-pr:beadfeed",
+      ]),
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+  });
+
+  it("refuses to overwrite an existing PR branch that changed during the run", async () => {
+    mockGitSuccess("abc123");
+
+    await expect(pushStep.run(
+      makeContext({ prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        baseRef: "original-pr-head",
+        existingPrNumber: "42",
+      },
+      new NoopStepReporter(),
+    )).rejects.toThrow(/refusing to overwrite concurrent work/);
+
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining(["push"]),
+      expect.anything(),
+    );
+  });
+
+  it("treats an already-satisfied existing PR gap-fill as a clean no-op", async () => {
+    mockGitSuccess("abc123", false);
+
+    const outputs = await pushStep.run(
+      makeContext({ prNumber: "42" }),
+      {
+        ...BASE_INPUTS,
+        branchName: "feature/existing-pr",
+        baseBranch: "feature/existing-pr",
+        existingPrNumber: "42",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs).toEqual({
+      prUrl: null,
+      prNumber: 42,
+      branchPushed: false,
+      commitSha: "abc123",
+      draft: false,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("completes the push with the boot token when credential vending returns 403", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/7", number: 7 }),
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        orchestratorUrl: "https://orchestrator.example",
+        machineNonce: "machine-nonce",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.prNumber).toBe(7);
+    const remoteCalls = vi.mocked(spawnSync).mock.calls.filter(([, args]) =>
+      ["ls-remote", "push"].includes((args as string[])[0]),
+    );
+    expect(remoteCalls).toHaveLength(2);
+    for (const [, args] of remoteCalls) {
+      expect((args as string[]).join(" ")).toContain("gh-token");
+    }
+    const prRequest = vi.mocked(fetch).mock.calls[1];
+    expect(prRequest[1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer gh-token" }));
   });
 
   it("uses the context branch as the PR base when baseBranch input is omitted", async () => {
@@ -632,6 +916,15 @@ describe("pushStep", () => {
     expect(spawnSync).not.toHaveBeenCalled();
   });
 
+  it("fails closed when the immutable clone ref is missing", async () => {
+    const { baseRef: _baseRef, ...missingBaseRef } = BASE_INPUTS;
+
+    await expect(
+      pushStep.run(makeContext(), missingBaseRef, new NoopStepReporter()),
+    ).rejects.toThrow(/Missing immutable base ref/);
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
+
   it("logs a token-redacted push trace at stream log level", async () => {
     const prev = process.env.AI_IMPLEMENT_LOG_LEVEL;
     process.env.AI_IMPLEMENT_LOG_LEVEL = "stream";
@@ -861,6 +1154,53 @@ describe("pushStep — Case A (agent-committed changes)", () => {
     );
   });
 
+  it("uses the immutable clone ref when the agent committed on the checked-out grouped base", async () => {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, "");
+      if (gitArgs[0] === "rev-list") {
+        return spawnResult(0, gitArgs.includes("clone-sha..HEAD") ? "1\n" : "0\n");
+      }
+      if (gitArgs[0] === "diff" && gitArgs[1] === "--diff-filter=d") {
+        return spawnResult(0, "src/app.ts\n");
+      }
+      if (gitArgs[0] === "diff" && gitArgs[1] === "--name-status") {
+        return spawnResult(0, "M\tsrc/app.ts\n");
+      }
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "agent-commit\n");
+      if (gitArgs[0] === "ls-remote") return spawnResult(0, "");
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/21", number: 21 }),
+      text: async () => "",
+    } as Response);
+
+    await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        branchName: "ai-implement/ans-901-field-links",
+        baseBranch: "ai-implement/feature/ans-899",
+        baseRef: "clone-sha",
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["rev-list", "--count", "clone-sha..HEAD"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    const [, request] = vi.mocked(fetch).mock.calls[0];
+    expect(JSON.parse(String(request?.body))).toEqual(expect.objectContaining({
+      head: "ai-implement/ans-901-field-links",
+      base: "ai-implement/feature/ans-899",
+    }));
+  });
+
   it("runs the sensitive-file guard against the committed diff in Case A", async () => {
     vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
       const gitArgs = args as string[];
@@ -1040,5 +1380,49 @@ describe("pushStep — hardening (review findings)", () => {
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(/Push blocked/);
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("pushStep — mounted workspace never pushes", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("returns a no-op result without touching git or GitHub", async () => {
+    const outputs = await pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.prUrl).toBeNull();
+    expect(outputs.prNumber).toBeNull();
+    expect(outputs.branchPushed).toBe(false);
+    expect(outputs.commitSha).toBeNull();
+    expect(outputs.draft).toBe(false);
+    // No git or HTTP calls.
+    expect(spawnSync).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does NOT skip when AI_IMPLEMENT_WORKSPACE_MODE is not mounted", async () => {
+    vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "");
+    // Outside mounted mode the step falls through to normal push logic,
+    // which needs git state. Provide enough for it to throw on "nothing to commit".
+    vi.mocked(spawnSync).mockReturnValue({
+      status: 0,
+      stdout: Buffer.from(""),
+      stderr: Buffer.from(""),
+      pid: 0,
+      output: [],
+      signal: null,
+      error: undefined,
+    });
+
+    await expect(
+      pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(); // normal logic runs, fails on nothing-to-commit
   });
 });

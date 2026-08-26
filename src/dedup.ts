@@ -32,6 +32,18 @@ function ensureDispatchedColumns(): void {
   }
 }
 
+function ensureAdminSessionColumns(): void {
+  if (!db) return;
+  const info = db.prepare("PRAGMA table_info(admin_sessions)").all() as Array<{ name: string }>;
+  const names = new Set(info.map((c) => c.name));
+
+  // SSO sessions carry the signed-in user's identity; access-code sessions leave these NULL.
+  if (!names.has("email")) db.exec("ALTER TABLE admin_sessions ADD COLUMN email TEXT");
+  if (!names.has("sub")) db.exec("ALTER TABLE admin_sessions ADD COLUMN sub TEXT");
+  if (!names.has("provider")) db.exec("ALTER TABLE admin_sessions ADD COLUMN provider TEXT");
+  if (!names.has("name")) db.exec("ALTER TABLE admin_sessions ADD COLUMN name TEXT");
+}
+
 function createRunnerTokensTable(): void {
   if (!db) return;
   db.exec(`
@@ -198,6 +210,9 @@ export function getDb(): Database.Database {
       )
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_status ON comment_gapfill_queue(status, created_at)`);
+    // PR #202 review (minor): countConflictAttempts / hasPendingConflictResolution /
+    // markCommentGapfillRunTerminal all filter by repo+PR — give them an index.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_gapfill_queue_pr ON comment_gapfill_queue(owner, repo, pr_number)`);
     db.exec(`
       CREATE TABLE IF NOT EXISTS workflow_sync_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,7 +231,20 @@ export function getDb(): Database.Database {
         expires_at INTEGER NOT NULL
       )
     `);
+    ensureAdminSessionColumns();
     db.prepare("DELETE FROM admin_sessions WHERE expires_at < ?").run(Date.now());
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS oauth_transactions (
+        state         TEXT PRIMARY KEY,
+        provider      TEXT NOT NULL,
+        code_verifier TEXT NOT NULL,
+        nonce         TEXT NOT NULL,
+        redirect_to   TEXT NOT NULL,
+        created_at    INTEGER NOT NULL,
+        expires_at    INTEGER NOT NULL
+      )
+    `);
+    db.prepare("DELETE FROM oauth_transactions WHERE expires_at < ?").run(Date.now());
     db.exec(`
       CREATE TABLE IF NOT EXISTS reaper_actions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

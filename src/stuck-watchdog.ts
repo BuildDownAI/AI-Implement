@@ -16,89 +16,46 @@ export interface StuckWatchdogConfig {
 }
 
 /**
- * Remediates a stuck GHA job with bounded retry logic (3-attempt budget).
+ * Shared ticket-cleanup core: increment the stuck-attempts counter and either
+ * requeue (within budget) or give-up (over budget). Returns the updated count.
  *
- * Attempts 1-3: cancel run, mark timed_out/stuck_requeued, reset ticket for
- * re-dispatch (clears AI-Working label + dedup entry).
- *
- * Attempt 4+: cancel run, mark timed_out/stuck_giveup, clear AI-Working label
- * only (dedup left intact so the poller won't re-pick it), fire loud
- * notifyStuckGiveUp alert, and post a Linear comment.
- *
- * Cancel happens before dedup is cleared to prevent a race where the next poll
- * cycle re-dispatches before the zombie GHA run is stopped.
+ * Does NOT stop the runner, update job status, or log — all of which vary
+ * between the timeout and failure paths and are handled by each caller.
  */
-export async function remediateStuckJob(
+async function boundedCleanup(
   config: StuckWatchdogConfig,
   provider: TicketingProvider | null,
   job: Job,
+  runUrl: string | null,
   lastRunStatus: string,
-): Promise<void> {
-  if (!job.issueId) return;
-
-  // Cancel the GHA run before resetting dedup — prevents a re-dispatch racing
-  // with a still-live run.
-  if (job.runId && job.repo) {
-    const [owner, repo] = job.repo.split("/");
-    if (owner && repo) {
-      try {
-        const ghToken = await getInstallationToken(
-          config.githubAppId,
-          config.githubAppPrivateKey,
-          owner,
-        );
-        await cancelWorkflowRun(ghToken, owner, repo, job.runId);
-        console.log(`[monitor] Cancelled run ${job.runId} for stuck job ${job.issueIdentifier}`);
-      } catch (err) {
-        console.error(`[monitor] Failed to cancel run ${job.runId} for ${job.issueIdentifier}:`, err);
-      }
-    }
-  }
-
-  const attempts = incrementStuckAttempts(job.issueId);
-  const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
-  const runUrl =
-    job.runId && job.repo
-      ? `https://github.com/${job.repo}/actions/runs/${job.runId}`
-      : null;
+): Promise<number> {
+  const attempts = incrementStuckAttempts(job.issueId!);
 
   if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
-    updateJobStatus(job.id, "timed_out", "stuck_requeued");
-    console.warn(
-      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
-        `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — requeueing`,
-    );
-
     if (provider) {
       try {
-        await provider.clearWorkingState(job.issueId, job.teamKey ?? "");
-        deleteDispatched(job.issueId);
+        await provider.clearWorkingState(job.issueId!, job.teamKey ?? "");
+        deleteDispatched(job.issueId!);
         console.log(`[monitor] Reset ticket ${job.issueIdentifier} for requeue`);
       } catch (err) {
         console.error(`[monitor] Failed to reset ticket ${job.issueIdentifier}:`, err);
       }
     }
   } else {
-    updateJobStatus(job.id, "timed_out", "stuck_giveup");
-    console.warn(
-      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
-        `(attempt ${attempts}) — giving up, needs human`,
-    );
-
     if (provider) {
       try {
-        await provider.clearWorkingState(job.issueId, job.teamKey ?? "");
+        await provider.clearWorkingState(job.issueId!, job.teamKey ?? "");
       } catch (err) {
         console.error(`[monitor] Failed to clear working state for ${job.issueIdentifier}:`, err);
       }
     }
 
-    const identifier = job.issueIdentifier || job.issueId;
+    const identifier = job.issueIdentifier || job.issueId!;
     let issueUrl = `https://linear.app/issue/${identifier}`;
     if (provider) {
       try {
         const issueArg: TicketIssue = {
-          id: job.issueId,
+          id: job.issueId!,
           identifier,
           title: job.issueTitle || "",
           description: null,
@@ -147,7 +104,7 @@ export async function remediateStuckJob(
         `Please investigate and re-label when ready to re-dispatch.`,
       ];
       try {
-        await provider.postComment(job.issueId, lines.join("\n"));
+        await provider.postComment(job.issueId!, lines.join("\n"));
       } catch (err) {
         console.error(
           `[monitor] Failed to post stuck giveup comment for ${job.issueIdentifier}:`,
@@ -155,5 +112,123 @@ export async function remediateStuckJob(
         );
       }
     }
+  }
+
+  return attempts;
+}
+
+/**
+ * Remediates a stuck job with bounded retry logic (3-attempt budget).
+ *
+ * Attempts 1-3: stop the runner, mark timed_out/stuck_requeued, reset ticket
+ * for re-dispatch (clears AI-Working label + dedup entry).
+ *
+ * Attempt 4+: stop the runner, mark timed_out/stuck_giveup, clear AI-Working
+ * label only (dedup left intact so the poller won't re-pick it), fire loud
+ * notifyStuckGiveUp alert, and post a Linear comment.
+ *
+ * Stop happens before dedup is cleared to prevent a race where the next poll
+ * cycle re-dispatches before the zombie runner is stopped.
+ *
+ * @param stopRunner - Optional caller-supplied cleanup callback. For GHA jobs,
+ *   omit this and the helper cancels the workflow run itself. For Fly/local
+ *   jobs, supply a callback that destroys the machine/container and invalidates
+ *   the nonce.
+ */
+export async function remediateStuckJob(
+  config: StuckWatchdogConfig,
+  provider: TicketingProvider | null,
+  job: Job,
+  lastRunStatus: string,
+  stopRunner?: () => Promise<void>,
+): Promise<void> {
+  if (!job.issueId) return;
+
+  // Stop the runner before resetting dedup — prevents a re-dispatch racing
+  // with a still-live runner.
+  if (stopRunner) {
+    try {
+      await stopRunner();
+    } catch (err) {
+      console.error(`[monitor] stopRunner failed for ${job.issueIdentifier}:`, err);
+    }
+  } else if (job.runId && job.repo) {
+    const [owner, repo] = job.repo.split("/");
+    if (owner && repo) {
+      try {
+        const ghToken = await getInstallationToken(
+          config.githubAppId,
+          config.githubAppPrivateKey,
+          owner,
+        );
+        await cancelWorkflowRun(ghToken, owner, repo, job.runId);
+        console.log(`[monitor] Cancelled run ${job.runId} for stuck job ${job.issueIdentifier}`);
+      } catch (err) {
+        console.error(`[monitor] Failed to cancel run ${job.runId} for ${job.issueIdentifier}:`, err);
+      }
+    }
+  }
+
+  const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
+  const runUrl =
+    job.runId && job.repo
+      ? `https://github.com/${job.repo}/actions/runs/${job.runId}`
+      : null;
+
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
+
+  if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
+    updateJobStatus(job.id, "timed_out", "stuck_requeued");
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
+        `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — requeueing`,
+    );
+  } else {
+    updateJobStatus(job.id, "timed_out", "stuck_giveup");
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck after ${elapsedMin}m ` +
+        `(attempt ${attempts}) — giving up, needs human`,
+    );
+  }
+}
+
+/**
+ * Bounded cleanup for a terminal failure where the runner has already stopped
+ * (no cancel step needed — job is already dead). Job status is already "failed"
+ * and is not changed here.
+ *
+ * Attempts 1-3: clear AI-Working + dedup so a later poll (or a human re-label)
+ * can re-dispatch.
+ *
+ * Attempt 4+: clear AI-Working only (dedup stays to prevent re-dispatch), fire
+ * notifyStuckGiveUp, and post a comment. Reuses incrementStuckAttempts so the
+ * budget spans both timeouts and failures for the same issue.
+ */
+export async function remediateFailedJob(
+  config: StuckWatchdogConfig,
+  provider: TicketingProvider | null,
+  job: Job,
+  lastRunStatus: string,
+): Promise<void> {
+  if (!job.issueId) return;
+
+  const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
+  const runUrl =
+    job.runId && job.repo
+      ? `https://github.com/${job.repo}/actions/runs/${job.runId}`
+      : null;
+
+  const attempts = await boundedCleanup(config, provider, job, runUrl, lastRunStatus);
+
+  if (attempts <= STUCK_JOB_MAX_ATTEMPTS) {
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) failed after ${elapsedMin}m ` +
+        `(attempt ${attempts}/${STUCK_JOB_MAX_ATTEMPTS}) — clearing for requeue`,
+    );
+  } else {
+    console.warn(
+      `[monitor] Job ${job.id} (${job.issueIdentifier}) failed after ${elapsedMin}m ` +
+        `(attempt ${attempts}) — giving up, needs human`,
+    );
   }
 }

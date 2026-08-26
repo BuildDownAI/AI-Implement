@@ -213,6 +213,8 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.githubToken).toBe("tok");
     expect(inputs.branch).toBe("main");
     expect(inputs.workspaceDir).toBe("/tmp/repo");
+    expect(inputs.orchestratorUrl).toBe("http://localhost:8080");
+    expect(inputs.machineNonce).toBe("nonce");
   });
 
   it("applies feedback-loop input wiring from clone, install, and ctx.data", () => {
@@ -280,13 +282,18 @@ describe("loadPipelineDefinition", () => {
       readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
     });
 
-    const ctx = makeContext({ issueIdentifier: "ENG-42", issueTitle: "Add profile page" });
+    const ctx = makeContext({
+      issueIdentifier: "ENG-42",
+      issueTitle: "Add profile page",
+      callbackUrl: "https://orchestrator.example/callback",
+    });
     ctx.setOutputs("clone", {
       workspaceDir: "/tmp/repo",
       repoOwner: "acme",
       repoRepo: "api",
       githubToken: "tok",
       branch: "main",
+      clonedRef: "base-sha",
     });
 
     const step = pipeline.steps.find((s) => s.id === "push")!;
@@ -295,8 +302,14 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.repoOwner).toBe("acme");
     expect(inputs.repoRepo).toBe("api");
     expect(inputs.githubToken).toBe("tok");
+    expect(inputs.orchestratorUrl).toBe("http://localhost:8080");
+    expect(inputs.machineNonce).toBe("nonce");
+    expect(inputs.callbackUrl).toBe("https://orchestrator.example/callback");
+    expect(inputs).not.toHaveProperty("publicationToken");
+    expect(inputs.existingPrNumber).toBeUndefined();
     expect(inputs.branchName).toBe("ai-implement/eng-42-add-profile-page");
     expect(inputs.baseBranch).toBe("main");
+    expect(inputs.baseRef).toBe("base-sha");
     expect(inputs.prTitle).toBe("ENG-42: Add profile page");
   });
 
@@ -340,6 +353,11 @@ describe("loadPipelineDefinition", () => {
     ctxMissingPr.setOutputs("feedback-loop", { approved: true });
     ctxMissingPr.setOutputs("push", { branchPushed: true, prNumber: null });
     expect(step.skip?.(ctxMissingPr)).toBe(true);
+
+    const ctxGapFill = makeContext({ prNumber: "42" });
+    ctxGapFill.setOutputs("feedback-loop", { approved: true });
+    ctxGapFill.setOutputs("push", { branchPushed: true, prNumber: 42 });
+    expect(step.skip?.(ctxGapFill)).toBe(true);
   });
 
   it("post-push-review skips when feedback-loop was not approved, even with a valid push", () => {
@@ -487,8 +505,8 @@ describe("loadPipelineDefinition", () => {
     });
   });
 
-  describe("push skip for gap-fill runs", () => {
-    it("skips push when prNumber is set (gap-fill) and feedback-loop was not approved", () => {
+  describe("pipeline-owned push for gap-fill runs", () => {
+    it("skips push when a gap-fill is unapproved", () => {
       const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
         existsSyncImpl: () => false,
         readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
@@ -500,10 +518,53 @@ describe("loadPipelineDefinition", () => {
       expect(push.skip?.(ctx)).toBe(true);
     });
 
-    it("skips push when prNumber is set (gap-fill) even when feedback-loop approved", () => {
-      // Gap-fill runs never own git: Claude commits and pushes to the existing PR
-      // branch itself, so the tree is clean by the time push would run — running it
-      // would throw "Nothing to commit" and turn an approved gap-fill into a failure.
+    it("falls back to the requested context branch when a custom gap-fill clone omits branch output", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: (p) => p.includes("custom"),
+        readFileSyncImpl: (_path, _enc) => CUSTOM_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext({ prNumber: "42", branch: "feature/custom-existing-pr" });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("clone", {
+        workspaceDir: "/tmp/repo",
+        repoOwner: "acme",
+        repoRepo: "api",
+        githubToken: "tok",
+        clonedRef: "pr-head-sha",
+      });
+
+      const inputs = ctx.resolveInputs(push.inputs);
+      expect(inputs.existingPrNumber).toBe("42");
+      expect(inputs.branchName).toBe("feature/custom-existing-pr");
+      expect(inputs.baseBranch).toBe("feature/custom-existing-pr");
+      expect(inputs.baseRef).toBe("pr-head-sha");
+    });
+
+    it("fails clearly when a custom gap-fill clone omits branch output and no context branch exists", () => {
+      const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+        existsSyncImpl: (p) => p.includes("custom"),
+        readFileSyncImpl: (_path, _enc) => CUSTOM_PIPELINE_YAML,
+      });
+
+      const push = pipeline.steps.find((s) => s.id === "push")!;
+      const ctx = makeContext({ prNumber: "42" });
+      ctx.setOutputs("feedback-loop", { approved: true });
+      ctx.setOutputs("clone", {
+        workspaceDir: "/tmp/repo",
+        repoOwner: "acme",
+        repoRepo: "api",
+        githubToken: "tok",
+        clonedRef: "pr-head-sha",
+      });
+
+      expect(() => ctx.resolveInputs(push.inputs)).toThrow(
+        /Missing checked-out branch for gap-fill push/,
+      );
+    });
+
+    it("runs push when a gap-fill is approved", () => {
       const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
         existsSyncImpl: () => false,
         readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
@@ -512,7 +573,7 @@ describe("loadPipelineDefinition", () => {
       const push = pipeline.steps.find((s) => s.id === "push")!;
       const ctx = makeContext({ prNumber: "42" });
       ctx.setOutputs("feedback-loop", { approved: true });
-      expect(push.skip?.(ctx)).toBe(true);
+      expect(push.skip?.(ctx)).toBe(false);
     });
 
     it("does not skip push on an initial run (no prNumber) even when feedback-loop was not approved", () => {

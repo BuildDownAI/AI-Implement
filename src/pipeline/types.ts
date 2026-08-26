@@ -48,6 +48,8 @@ export interface PipelineContextData {
   githubToken?: string;
   /** Autonomous runner: base branch to clone. Implementation branches are derived per issue. */
   branch?: string;
+  /** Autonomous runner: PR base branch for gap-fill runs (where branch holds the PR impl branch). */
+  baseBranch?: string;
   /** Autonomous runner: Claude provider ("anthropic" | "bedrock"), from PROVIDER env. */
   provider?: string;
   /** Autonomous runner: cap on Claude turns per implement pass (from env). */
@@ -69,6 +71,14 @@ export interface PipelineContextData {
   groupingParent?: boolean;
   /** Autonomous runner: WORKFLOW.md hook script paths (relative to repo root). */
   hooks?: { setup?: string; verify?: string; teardown?: string };
+  /** Autonomous runner: callback URL for runner result/progress posts (from runnerCallbackUrl / RUNNER_CALLBACK_URL). */
+  callbackUrl?: string;
+  /** Autonomous runner: per-project dependency-repo read access scope (from run_config envelope). */
+  dependencyTokenScope?: "installation";
+  /** Autonomous runner: short-lived read token minted by the dependency-auth step; set on context rather than returned as a step output so it is never persisted to the step log. */
+  dependencyToken?: string;
+  /** Autonomous runner: expiry timestamp for the dependency token (ISO 8601). */
+  dependencyTokenExpiresAt?: string;
 }
 
 export interface PipelineContext {

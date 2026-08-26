@@ -13,11 +13,41 @@ export const runnersHtml = `
     <div id="runners-error" class="alert fail" hidden></div>
     <div id="runners-mode-banner" class="alert warn" hidden></div>
 
+    <div id="runners-parked-section" hidden>
+      <div class="card" style="border-color:var(--st-warn-dot)">
+        <div class="card-header">
+          <h2 class="card-title">Parked issues</h2>
+          <div class="card-subtitle">Parked by the circuit breaker after repeated dispatch failures. Unpark to allow re-dispatch.</div>
+        </div>
+        <div class="card-body tight">
+          <table class="tbl">
+            <thead><tr><th>Issue</th><th>Repo</th><th>Phase</th><th>Failures</th><th>Last conclusion</th><th>Parked</th><th></th></tr></thead>
+            <tbody id="runners-parked-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <div class="kpi-grid">
       <div class="kpi"><div class="kpi-label">Runner mode</div><div class="kpi-value" id="kpi-runner-mode">—</div><div class="kpi-trend" id="kpi-runner-source"></div></div>
       <div class="kpi"><div class="kpi-label">Live Fly sessions</div><div class="kpi-value" id="kpi-live-sessions">0</div></div>
       <div class="kpi"><div class="kpi-label">Capacity used</div><div class="kpi-value"><span id="kpi-capacity-used">0</span><span class="kpi-unit"> / <span id="kpi-capacity-max">0</span></span></div></div>
       <div class="kpi"><div class="kpi-label">Reaper (24h)</div><div class="kpi-value" id="kpi-reaped">0</div><div class="kpi-trend" id="kpi-reaper-sweep"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header"><h2 class="card-title">Runner mode</h2></div>
+      <div class="card-body">
+        <div id="runner-mode-env-warning" class="warning hidden">&#x26A0; RUNNER_MODE env var is set &#x2014; UI toggle has no effect until it is unset.</div>
+        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+          <span class="seg" id="runner-mode-controls">
+            <button class="btn btn-sm" id="btn-mode-default" data-mode="default" onclick="window.setRunnerMode('default')">Project</button>
+            <button class="btn btn-sm" id="btn-mode-gha" data-mode="gha" onclick="window.setRunnerMode('gha')">GHA</button>
+            <button class="btn btn-sm" id="btn-mode-fly" data-mode="fly" onclick="window.setRunnerMode('fly')">Fly</button>
+            <button class="btn btn-sm" id="btn-mode-shadow" data-mode="shadow" onclick="window.setRunnerMode('shadow')">Shadow</button>
+          </span>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -72,6 +102,10 @@ export const runnersScript = `
     }
   }
 
+  function modeLabel(mode) {
+    return mode === 'default' ? 'Project' : mode;
+  }
+
   function kindForMode(mode) {
     if (mode === 'gha') return 'info';
     if (mode === 'fly') return 'success';
@@ -86,11 +120,12 @@ export const runnersScript = `
     errEl.hidden = true;
     bannerEl.hidden = true;
 
-    const [runnerModeRes, mappingsRes, sessions, reaper] = await Promise.all([
+    const [runnerModeRes, mappingsRes, sessions, reaper, parked] = await Promise.all([
       window.api('/api/runner-mode'),
       window.api('/api/mappings'),
       fetchOk('/api/sessions', null),
       fetchOk('/api/reaper/summary', null),
+      fetchOk('/api/parked', []),
     ]);
 
     if (!runnerModeRes.ok || !mappingsRes.ok) {
@@ -127,14 +162,59 @@ export const runnersScript = `
 
     // Runner mode KPI
     const modeBadgeKind = kindForMode(runnerMode.mode);
-    document.getElementById('kpi-runner-mode').innerHTML = '<span class="badge ' + modeBadgeKind + '"><span class="dot"></span>' + window.esc(runnerMode.mode) + '</span>';
+    document.getElementById('kpi-runner-mode').innerHTML = '<span class="badge ' + modeBadgeKind + '"><span class="dot"></span>' + window.esc(modeLabel(runnerMode.mode)) + '</span>';
     document.getElementById('kpi-runner-source').textContent = '(' + runnerMode.source + ')';
+
+    // Runner mode controls
+    const envWarning = document.getElementById('runner-mode-env-warning');
+    if (envWarning) {
+      if (runnerMode.source === 'env') {
+        envWarning.classList.remove('hidden');
+      } else {
+        envWarning.classList.add('hidden');
+      }
+    }
+    const btns = document.querySelectorAll('#runner-mode-controls .btn');
+    btns.forEach(function (b) {
+      b.classList.toggle('btn-primary', b.dataset.mode === runnerMode.mode);
+      b.disabled = runnerMode.source === 'env';
+    });
 
     if (runnerMode.mode !== 'default') {
       const bannerKind = runnerMode.mode === 'shadow' ? 'warn' : 'info';
+      // AII-306: ineligible mappings are skipped at dispatch under a force — surface them.
+      let ineligibleHtml = '';
+      if (Array.isArray(runnerMode.ineligible) && runnerMode.ineligible.length > 0) {
+        ineligibleHtml = '<div class="alert-desc" style="margin-top:4px"><strong>Skipped (ineligible for this mode):</strong> ' +
+          runnerMode.ineligible.map(function (m) { return window.esc(m.teamKey) + ' — ' + window.esc(m.reason); }).join('; ') +
+          '. These projects queue until the override clears.</div>';
+      }
       bannerEl.className = 'alert ' + bannerKind;
-      bannerEl.innerHTML = '<div style="flex:1"><div class="alert-title">Runner mode override active: ' + window.esc(runnerMode.mode) + '</div><div class="alert-desc">All projects route through ' + window.esc(runnerMode.mode) + ' regardless of their per-project mode.</div></div>';
+      bannerEl.innerHTML = '<div style="flex:1"><div class="alert-title">Runner mode override active: ' + window.esc(runnerMode.mode) + '</div><div class="alert-desc">All projects route through ' + window.esc(runnerMode.mode) + ' regardless of their per-project mode.</div>' + ineligibleHtml + '</div>';
       bannerEl.hidden = false;
+    }
+
+    // Parked issues section
+    const parkedRows = Array.isArray(parked) ? parked : [];
+    const parkedSection = document.getElementById('runners-parked-section');
+    const parkedBody = document.getElementById('runners-parked-body');
+    parkedSection.hidden = parkedRows.length === 0;
+    parkedBody.innerHTML = '';
+    for (const p of parkedRows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td class="mono">' + window.esc(p.issueIdentifier || p.issueId || '—') + '</td>'
+        + '<td class="mono">' + window.esc(p.repo || '—') + '</td>'
+        + '<td class="mono">' + window.esc(p.phase || '—') + '</td>'
+        + '<td class="mono">' + window.esc(String(p.failures)) + '</td>'
+        + '<td class="mono">' + window.esc(p.lastConclusion || '—') + '</td>'
+        + '<td class="mono">' + window.esc(fmtAgo(p.parkedAt)) + '</td>'
+        + '<td></td>';
+      const unparkBtn = document.createElement('button');
+      unparkBtn.className = 'btn btn-sm';
+      unparkBtn.textContent = 'Unpark';
+      unparkBtn.addEventListener('click', function() { window.unparkIssue(p.issueId); });
+      tr.lastElementChild.appendChild(unparkBtn);
+      parkedBody.appendChild(tr);
     }
 
     // Live sessions KPI
@@ -162,10 +242,10 @@ export const runnersScript = `
         const machineId = s.machineId || '';
         const machineTrunc = machineId.length > 12 ? machineId.slice(0, 12) : machineId;
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td class="mono" title="' + window.esc(s.issueTitle || '') + '">' + window.esc(s.issueIdentifier || '—') + '</td>'
+        tr.innerHTML = '<td class="mono" title="' + window.escAttr(s.issueTitle || '') + '">' + window.esc(s.issueIdentifier || '—') + '</td>'
           + '<td class="mono">' + window.esc(s.teamKey || '—') + '</td>'
           + '<td class="mono">' + window.esc(s.repo || '—') + '</td>'
-          + '<td class="mono" title="' + window.esc(machineId) + '">' + window.esc(machineTrunc) + '</td>'
+          + '<td class="mono" title="' + window.escAttr(machineId) + '">' + window.esc(machineTrunc) + '</td>'
           + '<td><span class="badge ' + stateBadgeKind + '">' + window.esc(s.state || '—') + '</span></td>';
         sessionsBody.appendChild(tr);
       }
@@ -212,10 +292,39 @@ export const runnersScript = `
     }
 
     // Subtitle
-    document.getElementById('runners-subtitle').textContent = liveSessions.length + ' live · ' + runnerMode.mode + ' mode';
+    document.getElementById('runners-subtitle').textContent = liveSessions.length + ' live · ' + modeLabel(runnerMode.mode) + ' mode';
+  }
+
+  async function setRunnerMode(mode) {
+    try {
+      await window.api('/api/runner-mode', { method: 'POST', body: JSON.stringify({ mode }) });
+      loadRunners();
+    } catch (err) {
+      console.error('setRunnerMode failed:', err);
+    }
+  }
+
+  async function unparkIssue(issueId) {
+    const errEl = document.getElementById('runners-error');
+    try {
+      const res = await window.api('/api/parked/unpark', { method: 'POST', body: JSON.stringify({ issueId }) });
+      if (res.ok) {
+        loadRunners();
+      } else if (res.status !== 401) {
+        let message = 'Unpark failed';
+        try { const body = await res.json(); message = body.error || message; } catch (e) { /* ignore */ }
+        errEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to unpark issue</div><div class="alert-desc">' + window.esc(message) + '</div></div>';
+        errEl.hidden = false;
+      }
+    } catch (err) {
+      errEl.innerHTML = '<div style="flex:1"><div class="alert-title">Failed to unpark issue</div><div class="alert-desc">' + window.esc(String(err)) + '</div></div>';
+      errEl.hidden = false;
+    }
   }
 
   window.loadRunners = loadRunners;
+  window.setRunnerMode = setRunnerMode;
+  window.unparkIssue = unparkIssue;
   window.registerPage('runners', function () { loadRunners(); setInterval(loadRunners, 30000); });
 })();
 `;

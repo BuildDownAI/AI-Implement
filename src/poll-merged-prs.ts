@@ -7,7 +7,11 @@ import {
   recordReconciliationTombstone,
 } from "./reconciliation.js";
 
-const CANDIDATE_STATUSES = new Set<JobStatus>(["completed", "review_failed"]);
+// AII-264 r6: any terminal row with a recorded PR is a candidate — if the PR merged, the
+// ticket must complete regardless of how the job row was classified (a run declared
+// "failed" whose PR later turns out merged was a monitor misread, not a real failure).
+// Keying by repo+PR (hasReconciliationForPr) makes this idempotent and reset-proof.
+const CANDIDATE_STATUSES = new Set<JobStatus>(["completed", "review_failed", "failed", "timed_out"]);
 
 export interface DetectDeps {
   mappingForRepo: (repo: string) => RepoMapping | undefined;

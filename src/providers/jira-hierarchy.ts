@@ -16,16 +16,21 @@ export type Classification = {
  *   - no children                                   → leaf
  *   - children, none AI-Implement-designated        → waiting-parent (race guard: skip)
  *   - ≥1 designated child, not all terminal         → feature-node-blocked (wait gate: skip)
- *   - ≥1 designated child, all terminal             → feature-node-ready (implement onto own branch)
- * Non-designated children never gate.
+ *   - ≥1 designated child, all terminal,
+ *     but ≥1 non-designated non-terminal child      → waiting-parent (AII-349 race guard:
+ *                                                     operator may still be labeling them)
+ *   - ≥1 designated child, all terminal,
+ *     no active undesignated children               → feature-node-ready (implement onto own branch)
  */
 export function classifyByChildren(children: ChildState[]): Classification {
   if (children.length === 0) return { kind: "leaf" };
   const designated = children.filter((c) => c.designated);
   if (designated.length === 0) return { kind: "waiting-parent" };
-  return designated.every((c) => c.terminal)
-    ? { kind: "feature-node-ready" }
-    : { kind: "feature-node-blocked" };
+  if (!designated.every((c) => c.terminal)) return { kind: "feature-node-blocked" };
+  // All designated children are terminal. Still wait if any undesignated child is active —
+  // the operator may be mid-way through labeling children (AII-349 parent-first window).
+  if (children.some((c) => !c.designated && !c.terminal)) return { kind: "waiting-parent" };
+  return { kind: "feature-node-ready" };
 }
 
 /**
