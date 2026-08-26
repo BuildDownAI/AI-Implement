@@ -1,6 +1,6 @@
 {
   "name": "ai-implement",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Polls Linear for issues labeled AI-Implement and runs Claude Code against them via GitHub Actions or Fly Machines.",
   "license": "Apache-2.0",
   "repository": {
