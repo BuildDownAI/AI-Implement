@@ -86,7 +86,7 @@ export const projectsHtml = `
               <span id="md-jira-jql-status" class="text-tertiary" style="font-size:0.85em"></span>
             </div>
             <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Scope only (e.g. &ldquo;project = TEST&rdquo;). The orchestrator adds the status filter and matches the repo field itself, so don&rsquo;t include status or repo clauses here.
+              Scope only (e.g. &ldquo;project = TEST&rdquo;). The orchestrator adds its own status filter, so never include one here. It also matches the repo field itself, so a repo clause is not needed for selection.
             </div>
           </div>
           <div class="md-field">
@@ -580,20 +580,21 @@ export const projectsScript = `
 
   function detectRepoFilterInJql(jql, repoFieldOverride) {
     // Returns a warning string if the JQL looks like it references the AI-Implement Repo
-    // field. The orchestrator filters candidates by the repo field itself (client-side),
-    // so a repo clause in the JQL is redundant and can silently drop issues when the
-    // field serializes differently than the clause expects.
+    // field. Candidate matching is done client-side, so a JQL "=" clause on the repo field
+    // is unnecessary for selection and can silently drop issues when the field is text-typed
+    // (the "=" won't match the same values readRepoFieldValue does).
     if (/ai[\\s\\-_]?implement[\\s\\-_]?repo/i.test(jql)) {
       return 'JQL appears to reference the AI-Implement Repo field. ' +
-        'The orchestrator already filters issues by the repo field for you - a repo clause ' +
-        'here is redundant and can drop issues when the field is text-typed. Remove it and let ' +
-        'the GitHub Repository (or the Repo Field Value override) do the matching.';
+        'The orchestrator matches the repo field itself for candidate selection, and a JQL "=" ' +
+        'clause can silently drop issues when the field is text-typed. Note: if several mappings ' +
+        'share this JQL, the clause also scopes the in-flight capacity count.';
     }
     if (repoFieldOverride) {
       const idPattern = new RegExp('\\\\b' + repoFieldOverride.replace(/[^a-zA-Z0-9_]/g, '') + '\\\\b');
       if (idPattern.test(jql)) {
         return 'JQL appears to reference customfield ' + repoFieldOverride + ' (your repo field). ' +
-          'The orchestrator already filters by the repo field - remove the repo clause here.';
+          'The orchestrator matches the repo field itself for candidate selection; a JQL "=" clause ' +
+          'here can silently drop issues when the field is text-typed.';
       }
     }
     return null;

@@ -46,7 +46,7 @@ export const stepperHtml = `
               <button type="button" class="btn btn-sm" onclick="stepperValidateJql()">Validate</button>
               <span id="np-jira-jql-status" style="font-size:12px;color:var(--fg-tertiary)"></span>
             </div>
-            <div class="field-hint">Scope only (e.g. &ldquo;project = TEST&rdquo;). The orchestrator adds the status filter and matches the repo field itself, so don&rsquo;t include status or repo clauses here.</div>
+            <div class="field-hint">Scope only (e.g. &ldquo;project = TEST&rdquo;). The orchestrator adds its own status filter, so never include one here. It also matches the repo field itself, so a repo clause is not needed for selection.</div>
           </div>
           <div class="field">
             <label class="field-label">Status Field</label>
