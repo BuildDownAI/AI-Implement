@@ -142,12 +142,14 @@ describe("saveAccessEntries auditing", () => {
   });
 
   it("does not record the binding of an entry that survives a save", () => {
-    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }], null);
+    // keeper holds the admin role throughout, so ada is free to start as a user.
+    const keeper = { kind: "address" as const, value: "keeper@eudoxus.ai", role: "admin" as const };
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper], null);
     access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
-    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }, keeper], null);
 
     const [latest] = audit.listAccessChanges();
-    expect(latest.before).toEqual([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }]);
-    expect(latest.after).toEqual([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }]);
+    expect(latest.before).toEqual([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper]);
+    expect(latest.after).toEqual([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }, keeper]);
   });
 });

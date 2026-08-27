@@ -10,7 +10,7 @@ import { authorize } from "./authorize.js";
 import { putTransaction, takeTransaction } from "./state-store.js";
 import { createSession, revokeSession, getRequestToken, SESSION_TTL_MS } from "../admin-session.js";
 import { serializeSessionCookie, clearSessionCookie } from "../cookies.js";
-import { bindAccessEntry, getEffectiveAllowlist } from "../access-entries.js";
+import { allowlistHasNoAdmin, bindAccessEntry, getEffectiveAllowlist } from "../access-entries.js";
 
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -31,9 +31,13 @@ function safeLocalPath(next: string | null | undefined, fallback = "/admin"): st
   return next;
 }
 
-/** Unauthenticated: which provider buttons to render + whether the (deprecated) access-code box applies. */
+/** Unauthenticated: which provider buttons to render, whether the (deprecated) access-code box applies, and whether signing in will leave you unable to administer anything. */
 export function handleOAuthProviders(res: http.ServerResponse, accessCodeEnabled: boolean): void {
-  json(res, 200, { providers: listConfiguredProviders(), accessCode: accessCodeEnabled });
+  json(res, 200, {
+    providers: listConfiguredProviders(),
+    accessCode: accessCodeEnabled,
+    noAdmin: allowlistHasNoAdmin(),
+  });
 }
 
 /** Start: mint the security values, stash them server-side, redirect the browser to the provider. */

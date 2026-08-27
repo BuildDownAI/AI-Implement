@@ -107,12 +107,13 @@ export const authJs = `
   // Login screen is built from server config: 
   // (which SSO providers exist + whether the deprecated access-code box still applies)
   async function renderLogin() {
-    let providers = [], accessCode = true;
+    let providers = [], accessCode = true, noAdmin = false;
     try {
       const res = await fetch(API + '/api/auth/providers', { credentials: 'include' });
       const data = await res.json();
       providers = data.providers || [];
       accessCode = !!data.accessCode;
+      noAdmin = data.noAdmin === true;
     } catch (e) { /* leave defaults so the access-code fallback stays reachable */ }
 
     document.getElementById('sso-buttons').innerHTML = providers.map(function (p) {
@@ -121,6 +122,7 @@ export const authJs = `
     }).join('');
 
     var hasSso = providers.length > 0;
+    document.getElementById('no-admin-notice').classList.toggle('hidden', !noAdmin);
     document.getElementById('sso-label').classList.toggle('hidden', !hasSso);
     document.getElementById('login-divider').classList.toggle('hidden', !(hasSso && accessCode));
     document.getElementById('access-code-notice').classList.toggle('hidden', !(accessCode && !hasSso));

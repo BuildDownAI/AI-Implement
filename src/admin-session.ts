@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import type http from "node:http";
 import { getDb } from "./dedup.js";
 import { parseCookies, SESSION_COOKIE_NAME } from "./cookies.js";
-import { recheckIdentity, type AccessEntry } from "./access-entries.js";
+import { recheckIdentity, type AccessEntry, type AccessRole } from "./access-entries.js";
 
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -97,7 +97,7 @@ export function accessCodeMatches(submitted: string, configured: string): boolea
 }
 
 export type AdminGate =
-  | { ok: true; identity: SessionIdentity | null; entry: AccessEntry | null }
+  | { ok: true; identity: SessionIdentity | null; entry: AccessEntry | null; role: AccessRole }
   | { ok: false; status: number; error: string };
 
 /** Authenticate a request and confirm the identity is still admitted. */
@@ -106,8 +106,8 @@ export function authenticateAdminRequest(req: http.IncomingMessage): AdminGate {
   const session = resolveSession(token);
   if (!session) return { ok: false, status: 401, error: "Unauthorized" };
 
-  // An access-code session carries no address to re-check against.
-  if (!session.identity) return { ok: true, identity: null, entry: null };
+  // No address to re-check against, and deliberately Admin: the access-code path is local development, and it still cannot edit the allowlist.
+  if (!session.identity) return { ok: true, identity: null, entry: null, role: "admin" };
 
   const recheck = recheckIdentity(session.identity);
   if (recheck.status === "unavailable") {
@@ -118,5 +118,5 @@ export function authenticateAdminRequest(req: http.IncomingMessage): AdminGate {
     if (token) revokeSession(token);
     return { ok: false, status: 401, error: "Unauthorized" };
   }
-  return { ok: true, identity: session.identity, entry: recheck.entry };
+  return { ok: true, identity: session.identity, entry: recheck.entry, role: recheck.entry.role };
 }

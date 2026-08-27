@@ -27,7 +27,7 @@ import {
 } from "./runner-mode.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
-import { createSession, accessCodeMatches, authenticateAdminRequest, type SessionIdentity } from "./admin-session.js";
+import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
 import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
 import type { DeployStart } from "./deploy.js";
@@ -199,6 +199,37 @@ export interface AdminDeps {
   };
 }
 
+/** Authorization for every `/api/` route: authenticate, answer the identity probe, require Admin. Null means the response is already sent. */
+function authorizeApiRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  url: string,
+  method: string,
+): Extract<AdminGate, { ok: true }> | null {
+  const gate = authenticateAdminRequest(req);
+  if (!gate.ok) {
+    json(res, gate.status, { error: gate.error });
+    return null;
+  }
+
+  // Must stay reachable by every authenticated session — the SPA probes it to decide it is signed in.
+  if (url === "/api/session-identity" && method === "GET") {
+    json(res, 200, {
+      email: gate.identity?.email ?? null,
+      name: gate.identity?.name ?? null,
+      provider: gate.identity?.provider ?? null,
+      authMethod: gate.identity ? "sso" : "access-code",
+    });
+    return null;
+  }
+
+  if (gate.role !== "admin") {
+    json(res, 403, { error: "This action requires an admin" });
+    return null;
+  }
+  return gate;
+}
+
 export function handleAdminRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -224,22 +255,8 @@ export function handleAdminRequest(
 
   // All other /api routes require auth
   if (url.startsWith("/api/")) {
-    const gate = authenticateAdminRequest(req);
-    if (!gate.ok) {
-      json(res, gate.status, { error: gate.error });
-      return true;
-    }
-
-    // Must stay reachable by every authenticated session — the SPA probes it to decide it is signed in.
-    if (url === "/api/session-identity" && method === "GET") {
-      json(res, 200, {
-        email: gate.identity?.email ?? null,
-        name: gate.identity?.name ?? null,
-        provider: gate.identity?.provider ?? null,
-        authMethod: gate.identity ? "sso" : "access-code",
-      });
-      return true;
-    }
+    const gate = authorizeApiRequest(req, res, url, method);
+    if (!gate) return true;
 
     if (url === "/api/mappings" && method === "GET") {
       json(res, 200, getMappings());

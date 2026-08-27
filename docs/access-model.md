@@ -28,7 +28,7 @@ Two rules are enforced at write time rather than left to the caller:
 The handover is deliberately operator-driven, never a boot-time migration. Two consequences worth knowing:
 
 - An existing deployment that never opens the Access page behaves exactly as it did before the page existed.
-- If the stored list is emptied, the environment values apply again — a lost volume degrades to the seed rather than locking everyone out.
+- The fallback is a safety net, not a revert. An empty stored table means the environment values apply again, so a lost volume degrades to the seed rather than locking everyone out. Emptying the list deliberately is refused: the self-lockout guard sees a stored list that no longer admits its author.
 
 ## How a request is decided
 
@@ -37,12 +37,14 @@ flowchart TD
     R["Authenticated request<br/>(admin UI or /mcp)"] --> S{"Session or token<br/>valid?"}
     S -- no --> U["401"]
     S -- yes --> A{"Carries an<br/>address?"}
-    A -- "no — access code" --> OK["Allowed<br/>(exempt from re-check)"]
+    A -- "no — access code" --> ADM["Admitted as admin<br/>(exempt from re-check)"]
     A -- yes --> L{"Allowlist<br/>readable?"}
     L -- "never loaded" --> E["503 — not 401,<br/>so nobody is signed out"]
     L -- yes --> M{"Matches an<br/>entry?"}
     M -- no --> D["401, and the<br/>session is revoked"]
-    M -- yes --> OK
+    M -- yes --> R2{"Entry's role"}
+    R2 -- admin --> ADM
+    R2 -- user --> USR["Signed in.<br/>/mcp allowed, /api/ 403"]
 ```
 
 Matching runs in precedence order, and stops at the first hit:
@@ -53,7 +55,21 @@ Matching runs in precedence order, and stops at the first hit:
 | 2 | Address, unbound | The entry's value equals the verified email |
 | 3 | Domain | The email's domain equals the entry's value |
 
-An address entry outranks a domain entry: it is the more specific grant, and the only one that can carry a role. A malformed identifier with no `@` has a domain equal to itself, and is excluded from rule 3 so it cannot match a domain entry.
+An address entry outranks a domain entry: it is the more specific grant, and the only one that can carry `admin`. A malformed identifier with no `@` has a domain equal to itself, and is excluded from rule 3 so it cannot match a domain entry.
+
+## Roles
+
+`admin` may use every admin route. `user` may sign in and reach `/mcp`, and is refused with 403 on every `/api/` route except the identity probe the SPA needs in order to know it is signed in.
+
+**A domain never confers `admin`, at any point — including while the environment seed is in force.** A domain grant asserts only that someone shares a domain with an operator, which an identity provider will issue to anyone it admits there: contractors, service accounts, a departed employee whose account still resolves. Granting administration on that basis turns authorization from a decision about a person into an attribute check, and the audit trail then records who acted while nobody ever decided that person could act. Adding one address is the entire cost of avoiding that.
+
+An access-code session has no entry to take a role from and is treated as `admin`, because the code is a shared secret whose holder already has full access. It is still refused on the Access page, since a change to who gets in must be attributable to someone.
+
+### A seed with no admin
+
+A deployment configured with `OAUTH_ALLOWED_DOMAINS` alone admits everyone as `user`, so signing in succeeds and the whole admin UI answers 403. That is a **misconfiguration, not a lockout** — the recovery command is not involved, and the fix is to set `OAUTH_ALLOWED_EMAILS` and restart.
+
+It is surfaced three ways, because the symptom otherwise looks like a broken UI rather than a setting: a `[main]` warning at boot, a banner on the sign-in page, and this document. A stored list cannot reach that state at all — the last-admin guard refuses a save that would leave it without one.
 
 ## Binding
 
@@ -96,8 +112,11 @@ The Access page renders the recent entries, summarising each as added / removed 
 
 ## Guards on a save
 
-- **Self-lockout** — a save whose resulting list would not admit its own author is refused. The check runs *inside* the transaction and against the real post-write result, so it cannot be fooled by predicting the outcome, and a refusal rolls back the whole save including its audit row.
+- **Self-lockout** — a save whose resulting list would not admit its own author is refused.
+- **Last admin** — a save whose resulting list has entries but no `admin` address is refused, so a stored list can never become unadministrable. An *empty* result is allowed by this guard, since that hands authority back to the environment rather than leaving nobody in charge; in practice the self-lockout guard refuses it first for any signed-in saver.
 - **A signed-in identity is required.** `POST /api/access` answers 403 to a session with no address, because the change could not be attributed to anyone.
+
+Self-lockout and last-admin both run *inside* the transaction and against the real post-write result, so neither can be fooled by predicting the outcome, and a refusal rolls the whole save back including its audit row. The shape rules above — a domain cannot be `admin`, and the 200-entry cap — are checked earlier, before the transaction opens.
 
 ## Recovery from lockout
 
@@ -115,10 +134,10 @@ Adding an address already on the list **promotes** it rather than failing as a d
 
 ## Access-code sessions
 
-The deprecated `ADMIN_ACCESS_CODE` path remains for local development. Such a session carries no address, so it is **exempt from the re-check** — there is nothing to match — and it is **read-only on the Access page**, enforced server-side rather than only hidden in the UI.
+The deprecated `ADMIN_ACCESS_CODE` path remains for local development. Such a session carries no address, so it is **exempt from the re-check** — there is nothing to match — is treated as `admin`, and is **read-only on the Access page**, enforced server-side rather than only hidden in the UI.
 
 It holds no architectural responsibility, which is what keeps the deprecated path deletable.
 
 ## Not yet built
 
-`role` is stored and displayed but **not enforced anywhere** — every authenticated identity still has full administrative access. Admin/User enforcement, per-page grants, and the guard against removing the last admin are separate work.
+**Per-page grants.** A `user` currently reaches `/mcp` and nothing else in the admin UI, so the interface renders for them with every panel refused. Granting individual operational pages — and marking the admin-only elements inside a granted page — is separate work. Credential-bearing pages are never intended to be grantable.

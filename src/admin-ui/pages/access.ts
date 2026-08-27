@@ -62,7 +62,7 @@ export const accessHtml = `
           </div>
           <button class="btn btn-accent btn-sm" onclick="addAccessEntry()" style="align-self:flex-end">+ Add</button>
         </div>
-        <div class="field-hint">Roles are stored now and take effect when the Admin/User split ships.</div>
+        <div class="field-hint">An admin can change anything here. A user can sign in and reach the MCP server, and nothing else yet.</div>
         <div id="access-error" class="error hidden"></div>
       </div>
     </div>

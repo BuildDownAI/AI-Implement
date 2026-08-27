@@ -126,9 +126,10 @@ beforeEach(async () => {
   runnerMode.initSettingsTable();
   accessEntries.initAccessEntriesTable();
   accessAudit.initAccessAuditTable();
-  // Every /api/* request now re-checks the signed-in identity, so the suite needs a list in force.
+  // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
+  // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.
   process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
-  process.env.OAUTH_ALLOWED_EMAILS = "";
+  process.env.OAUTH_ALLOWED_EMAILS = "ada@eudoxus.ai";
   accessEntries.refreshEffectiveAllowlist();
 });
 
@@ -278,7 +279,7 @@ describe("admin access endpoint", () => {
     const payload = JSON.parse(res.body);
     expect(payload.source).toBe("env");
     expect(payload.stored).toEqual([]);
-    expect(payload.env.map((e: { value: string }) => e.value)).toEqual(["eudoxus.ai"]);
+    expect(payload.env.map((e: { value: string }) => e.value)).toEqual(["eudoxus.ai", "ada@eudoxus.ai"]);
     expect(payload.changes).toEqual([]);
   });
 
@@ -320,7 +321,17 @@ describe("admin access endpoint", () => {
 
   it("applies immediately, without waiting for a restart", async () => {
     const token = adminSession.createSession(ada);
-    await request("/api/access", "POST", "secret", body([{ kind: "domain", value: "eudoxus.ai", role: "user" }]), token);
+    // Carries an admin: a stored list with none is refused, so a domain-only save cannot stand in here.
+    await request(
+      "/api/access",
+      "POST",
+      "secret",
+      body([
+        { kind: "domain", value: "eudoxus.ai", role: "user" },
+        { kind: "address", value: "ada@eudoxus.ai", role: "admin" },
+      ]),
+      token,
+    );
     expect(accessEntries.getEffectiveAllowlist()?.source).toBe("db");
   });
 

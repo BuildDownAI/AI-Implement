@@ -270,7 +270,7 @@ Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll dete
 
 SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. The fail-closed allowlist is **database-backed and edited at `/admin#access`** — `OAUTH_ALLOWED_*` seed it and apply until the first save, which hands authority to the stored list permanently.
 
-Three things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`.** An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
+Three things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`** — so a domain-only seed admits everyone and lets nobody administer, a misconfiguration the boot log and the sign-in page both flag. An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
 
 Every authenticated request re-checks against an in-memory list, so a removal ends a session on the next request rather than at token expiry. **Full reference: [docs/access-model.md](docs/access-model.md)** — precedence, the audit trail, and the host command that recovers from lockout.
 

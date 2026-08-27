@@ -165,7 +165,8 @@ describe("authenticateAdminRequest", () => {
   it("admits an access-code session without consulting the list, since it carries no address", () => {
     allow("");
     const token = session.createSession();
-    expect(session.authenticateAdminRequest(withToken(token))).toEqual({ ok: true, identity: null, entry: null });
+    // Admin despite having no entry to take a role from: the access-code path is local development.
+    expect(session.authenticateAdminRequest(withToken(token))).toEqual({ ok: true, identity: null, entry: null, role: "admin" });
   });
 
   it("admits an allowed identity and hands back the entry that matched", () => {
