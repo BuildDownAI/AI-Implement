@@ -19,7 +19,7 @@ When you open your first PR, the CLA bot will comment with a link. The status ch
 
 **Check your employment agreement first.** If you're employed as a developer, it may assign to your employer everything you write — including on your own time and equipment. Section 5.2 of the Individual CLA asks you to represent that you're entitled to grant the licence. If your employer owns your work, we need a Corporate CLA from them instead.
 
-Questions: **[PLACEHOLDER: cla@builddown.ai]**
+Questions: **cla@builddown.ai**
 
 ## Setting up
 

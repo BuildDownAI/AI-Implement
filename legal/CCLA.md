@@ -168,7 +168,7 @@ date of signature.
 ## 8. Updating Schedule A
 
 The Corporation may add or remove Designated Employees by written notice to
-BuildDown, including by email to **[PLACEHOLDER: cla@builddown.ai]**, or by
+BuildDown, including by email to **cla@builddown.ai**, or by
 submitting an updated Schedule A. **Removal of an employee from Schedule A does
 not revoke any license already granted** in respect of Contributions made while
 that employee was designated.
