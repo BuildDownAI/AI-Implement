@@ -64,6 +64,8 @@ describe("kg-refresh", () => {
       fetchDefaultBranch: vi.fn(async () => "main") as never,
       materialize: materialize as never,
       mcpToolCall: mcpToolCall as never,
+      canaryDeadlineMs: 300,
+      canaryRetryMs: 30,
       ...overrides,
     });
   }
@@ -210,6 +212,28 @@ describe("kg-refresh", () => {
     expect(restart).toHaveBeenCalledTimes(2);
     expect(readFileSync(join(current, "graph.trig"), "utf8")).toBe("OLD-OVERLAY");
     expect(existsSync(join(dataRoot, "previous"))).toBe(false);
+  });
+
+  it("the canary tolerates a cold sidecar: passes on a retry within the deadline", async () => {
+    let calls = 0;
+    restart.mockImplementation(async () => {
+      servedStamp = NEW_STAMP;
+      calls = 0;
+    });
+    const flaky = vi.fn(async (_url: string, tool: string) => {
+      if (tool === "kg_hybrid_search") {
+        calls += 1;
+        if (calls < 3) throw new Error("mcp request timeout"); // model still loading
+        return { count: 3, degraded: false, results: [] };
+      }
+      return mcpToolCall("u", tool);
+    });
+    build({ mcpToolCall: flaky as never });
+    await handle.trigger();
+    await waitDone();
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(true);
+    expect(restart).toHaveBeenCalledTimes(1);
   });
 
   it("a stamp that did not move fails the stamp gate and reverts", async () => {

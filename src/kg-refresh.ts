@@ -25,6 +25,10 @@ const SIDECAR_MCP_URL = "http://127.0.0.1:8765/mcp";
  */
 const MIN_FREE_BYTES = 200 * 1024 * 1024;
 
+/** Canary warm-up budget: the sidecar's first semantic query loads the model. */
+const CANARY_DEADLINE_MS = 120_000;
+const CANARY_RETRY_MS = 5_000;
+
 /** Gates evaluated on the serving graph after the swap + restart. */
 export type RefreshGate = "staging" | "answers" | "vectors" | "canary" | "stamp";
 
@@ -72,6 +76,8 @@ interface KgRefreshInput {
   fetchDefaultBranch?: (token: string, owner: string, repo: string) => Promise<string>;
   materialize?: (python: string, cwd: string) => Promise<void>;
   mcpToolCall?: (url: string, tool: string, args: Record<string, unknown>) => Promise<unknown>;
+  canaryDeadlineMs?: number;
+  canaryRetryMs?: number;
 }
 
 /**
@@ -101,6 +107,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const fetchDefaultBranch = input.fetchDefaultBranch ?? defaultFetchDefaultBranch;
   const materialize = input.materialize ?? defaultMaterialize;
   const mcpToolCall = input.mcpToolCall ?? defaultMcpToolCall;
+  const canaryDeadlineMs = input.canaryDeadlineMs ?? CANARY_DEADLINE_MS;
+  const canaryRetryMs = input.canaryRetryMs ?? CANARY_RETRY_MS;
 
   let running = false;
   let lastRefresh: RefreshOutcome | null = null;
@@ -215,21 +223,33 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       return revert(namespace, "vectors", "no vectors in the serving overlay", stampBefore);
     }
 
-    try {
-      const canary = (await mcpToolCall(mcpUrl, "kg_hybrid_search", { query: "knowledge graph", limit: 3 })) as {
-        count?: number;
-        degraded?: boolean;
-      };
-      if (!canary || canary.degraded !== false || (canary.count ?? 0) < 1) {
-        return revert(
-          namespace,
-          "canary",
-          `canary query degraded=${String(canary?.degraded)} count=${String(canary?.count)}`,
-          stampBefore,
-        );
+    // The first semantic query after a restart pays the sidecar's lazy loads:
+    // graph parse plus the fastembed ONNX model, tens of seconds on a 512 MB
+    // machine. Retry within a deadline instead of failing on cold start —
+    // found live on the first production refresh (canary timeout -> revert).
+    {
+      const canaryDeadline = Date.now() + canaryDeadlineMs;
+      let lastErr = "";
+      let passed = false;
+      while (Date.now() < canaryDeadline) {
+        try {
+          const canary = (await mcpToolCall(mcpUrl, "kg_hybrid_search", { query: "knowledge graph", limit: 3 })) as {
+            count?: number;
+            degraded?: boolean;
+          };
+          if (canary && canary.degraded === false && (canary.count ?? 0) >= 1) {
+            passed = true;
+            break;
+          }
+          lastErr = `degraded=${String(canary?.degraded)} count=${String(canary?.count)}`;
+        } catch (err) {
+          lastErr = String(err);
+        }
+        await new Promise((r) => setTimeout(r, canaryRetryMs));
       }
-    } catch (err) {
-      return revert(namespace, "canary", `canary query failed: ${String(err)}`, stampBefore);
+      if (!passed) {
+        return revert(namespace, "canary", `canary query failed after ${canaryDeadlineMs / 1000}s: ${lastErr}`, stampBefore);
+      }
     }
 
     const stampAfter = await readServedStamp(namespace);
@@ -352,12 +372,17 @@ async function defaultMcpToolCall(url: string, tool: string, args: Record<string
 
   await mcpPost(url, session, { jsonrpc: "2.0", method: "notifications/initialized" });
 
-  const call = await mcpPost(url, session, {
-    jsonrpc: "2.0",
-    id: 2,
-    method: "tools/call",
-    params: { name: tool, arguments: args },
-  });
+  const call = await mcpPost(
+    url,
+    session,
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: tool, arguments: args },
+    },
+    30_000,
+  );
   const parsed = call.parsed as { result?: { content?: Array<{ type?: string; text?: string }> }; error?: unknown } | null;
   if (!parsed || parsed.error) throw new Error(`tools/call ${tool} failed: ${JSON.stringify(parsed?.error ?? "no response")}`);
   const text = parsed.result?.content?.find((c) => c.type === "text")?.text;
@@ -369,6 +394,7 @@ function mcpPost(
   url: string,
   sessionId: string | null,
   payload: Record<string, unknown>,
+  timeoutMs = 10_000,
 ): Promise<{ status: number; parsed: unknown; sessionId: string | null }> {
   return new Promise((resolve, reject) => {
     const body = Buffer.from(JSON.stringify(payload));
@@ -382,7 +408,7 @@ function mcpPost(
           "content-length": String(body.length),
           ...(sessionId ? { "mcp-session-id": sessionId } : {}),
         },
-        timeout: 10_000,
+        timeout: timeoutMs,
       },
       (res) => {
         const chunks: Buffer[] = [];
