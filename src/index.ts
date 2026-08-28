@@ -3330,6 +3330,7 @@ async function main(): Promise<void> {
   await sidecar.start();
 
   const config = loadConfig();
+  if (!config.kgSourceRepo) console.log("[kg] KG_SOURCE_REPO not set — knowledge graph disabled");
 
   // Phase 2: per-mapping provider resolution. The registry caches one
   // TicketingProvider per provider id (linear, jira) and resolves on demand

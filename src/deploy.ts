@@ -13,8 +13,8 @@ import type { SelfDeployTarget } from "./deploy-availability.js";
 
 export interface DeployArgsInput {
   app: string;
-  kgToken: string;
-  kgSourceRepo: string;
+  kgToken: string | null;
+  kgSourceRepo: string | null;
   sourceCommit: string;
   sourceRepo: string;
   sourceBranch: string;
@@ -30,7 +30,7 @@ export interface RunDeployInput {
   commit: string;
   githubAppId: string;
   githubAppPrivateKey: string;
-  kgSourceRepo: string;
+  kgSourceRepo: string | null;
   pollIntervalMs: number;
 }
 
@@ -46,10 +46,6 @@ const FLYCTL_SHA256: Record<string, string> = {
 // Only the tail of flyctl's output is kept: flyctl's errors land at the end, the head is apt output.
 const FLYCTL_LOG_TAIL_BYTES = 64 * 1024;
 
-// The KG repository the image clones at build time unless a deployment overrides it.
-// The Dockerfile holds the same default. Keep them in sync.
-export const DEFAULT_KG_SOURCE_REPO = "BuildDownAI/knowledge-graph-ai-implement";
-
 export interface KgSourceRepo {
   owner: string;
   repo: string;
@@ -60,7 +56,10 @@ const GITHUB_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const GITHUB_REPO_RE = /^[A-Za-z0-9._-]+$/;
 
 export function parseKgSourceRepo(value: string | null | undefined): KgSourceRepo {
-  const raw = (value || DEFAULT_KG_SOURCE_REPO).trim();
+  if (!value?.trim()) {
+    throw new Error(`[deploy] KG_SOURCE_REPO must be an owner/repo GitHub repository, got ""`);
+  }
+  const raw = value.trim();
   const parts = raw.split("/");
   if (parts.length !== 2) {
     throw new Error(`[deploy] KG_SOURCE_REPO must be an owner/repo GitHub repository, got "${raw}"`);
@@ -76,13 +75,14 @@ export function parseKgSourceRepo(value: string | null | undefined): KgSourceRep
 
 /**
  * Resolve the configured KG repository without making a typo fatal to the
- * orchestrator. An invalid explicit value disables self-deploy rather than
- * silently switching a project instance back to the default graph.
+ * orchestrator. An absent value returns null (sidecar-less deployment, no warning);
+ * a set-but-malformed value warns and disables self-deploy.
  */
 export function readKgSourceRepo(
   value: string | null | undefined,
   warn: (message: string) => void = console.warn,
 ): string | null {
+  if (!value?.trim()) return null;
   try {
     return parseKgSourceRepo(value).fullName;
   } catch {
@@ -107,17 +107,16 @@ const DRAIN_TIMEOUT_MS = 75 * 60 * 1000;
 */
 export async function runDeploy(input: RunDeployInput): Promise<void> {
   const { app, flyDeployToken, owner, repo, branch, commit, githubAppId, githubAppPrivateKey, kgSourceRepo, pollIntervalMs } = input;
-  const kgSource = parseKgSourceRepo(kgSourceRepo);
-  
+
   setDeployHold();
   try {
     // Setting the hold above is what makes this terminate: new dispatches have stopped,
     // so the in-flight set only shrinks from here.
     await waitForQuiet(DRAIN_TIMEOUT_MS, drainPollMs(pollIntervalMs));
-    
+
     const scratch = await deployScratch();
     const flyctl = await resolveFlyctl(scratch);
-    
+
     const source = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, owner, {
       permissions: { contents: "read" },
       repositories: [repo],
@@ -126,19 +125,24 @@ export async function runDeploy(input: RunDeployInput): Promise<void> {
       await fetchRepoTarball(source.token, owner, repo, commit),
       scratch,
     );
-    
-    const kg = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, kgSource.owner, {
-      permissions: { contents: "read" },
-      repositories: [kgSource.repo],
-    });
-    
+
+    let kgToken: string | null = null;
+    if (kgSourceRepo) {
+      const kgSource = parseKgSourceRepo(kgSourceRepo);
+      const kg = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, kgSource.owner, {
+        permissions: { contents: "read" },
+        repositories: [kgSource.repo],
+      });
+      kgToken = kg.token;
+    }
+
     console.log(`[deploy] deploying ${owner}/${repo}@${commit.slice(0, 7)} to ${app}`);
     await runFlyctl(
       flyctl,
       deployArgs({
         app,
-        kgToken: kg.token,
-        kgSourceRepo: kgSource.fullName,
+        kgToken,
+        kgSourceRepo,
         sourceCommit: commit,
         sourceRepo: `${owner}/${repo}`,
         sourceBranch: branch,
@@ -242,25 +246,33 @@ function runFlyctl(
 }
 
 export function deployArgs(input: DeployArgsInput): string[] {
-  // An empty value is the failure this function exists to prevent: an empty build
-  // secret fail-softs to a sidecar-less image, and an empty stamp leaves the next
-  // version unable to tell what it is running. Fail before flyctl is invoked.
-  for (const [key, value] of Object.entries(input)) {
-    if (!value) throw new Error(`[deploy] refusing to deploy with an empty ${key}`);
+  // An empty stamp leaves the next version unable to tell what it is running.
+  // Fail before flyctl is invoked. KG fields are optional — null means sidecar-less build.
+  for (const key of ["app", "sourceCommit", "sourceRepo", "sourceBranch"] as const) {
+    if (!input[key]) throw new Error(`[deploy] refusing to deploy with an empty ${key}`);
   }
-  
-  return [
-    "deploy",
-    "--remote-only",
-    "--no-cache",
+
+  const args = ["deploy", "--remote-only", "--no-cache"];
+
+  const hasToken = Boolean(input.kgToken);
+  const hasRepo = Boolean(input.kgSourceRepo);
+  if (hasToken !== hasRepo) {
+    throw new Error(`[deploy] kgToken and kgSourceRepo must both be set or both be absent (got token=${hasToken}, repo=${hasRepo})`);
+  }
+  if (input.kgToken && input.kgSourceRepo) {
     // --build-secret takes only NAME=VALUE, so the token rides in argv; execFile runs flyctl without a shell.
-    "--build-secret", `kg_token=${input.kgToken}`,
-    "--build-arg", `KG_SOURCE_REPO=${parseKgSourceRepo(input.kgSourceRepo).fullName}`,
+    args.push("--build-secret", `kg_token=${input.kgToken}`);
+    args.push("--build-arg", `KG_SOURCE_REPO=${parseKgSourceRepo(input.kgSourceRepo).fullName}`);
+  }
+
+  args.push(
     "--build-arg", `SOURCE_COMMIT=${input.sourceCommit}`,
     "--build-arg", `SOURCE_REPO=${input.sourceRepo}`,
     "--build-arg", `SOURCE_BRANCH=${input.sourceBranch}`,
     "--app", input.app,
-  ];
+  );
+
+  return args;
 }
 
 /** flyctl's release assets use `x86_64` where Node reports `x64`. */
@@ -351,7 +363,6 @@ type SelfDeployReady = StartDeployConfig & {
   flyDeployToken: string;
   flyOrchestratorApp: string;
   selfDeployTarget: SelfDeployTarget;
-  kgSourceRepo: string;
 };
 
 /**
@@ -413,8 +424,8 @@ export function makeStartDeploy(
 
 /**
  * Whether this orchestrator can deploy itself: a token with deploy rights, an app to
- * deploy, build stamps naming what to build, and a validated KG source repository.
+ * deploy, and build stamps naming what to build. KG is optional — null means sidecar-less.
  */
 export function canSelfDeploy(config: StartDeployConfig): config is SelfDeployReady {
-  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget && config.kgSourceRepo);
+  return Boolean(config.flyDeployToken && config.flyOrchestratorApp && config.selfDeployTarget);
 }

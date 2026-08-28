@@ -50,14 +50,15 @@ COPY workflows/ ./workflows/
 # GitHub token out of image history and build logs — it is readable only inside
 # the RUN that uses it and is never written to any ENV/ARG.
 #
-# To build WITH the sidecar (requires read access to KG_SOURCE_REPO, default BuildDownAI/knowledge-graph-ai-implement):
-#   docker build --secret id=kg_token,env=GH_TOKEN .
+# To build WITH the sidecar (requires KG_SOURCE_REPO set and read access to it):
+#   docker build --build-arg KG_SOURCE_REPO=owner/repo --secret id=kg_token,env=GH_TOKEN .
 #   fly deploy --remote-only --build-secret kg_token="$(gh auth token)"
 #
 # To build WITHOUT the sidecar (sidecar-less / degraded /mcp 503):
 #   docker build .
 #   fly deploy --remote-only
 #
+# When KG_SOURCE_REPO is unset the build succeeds and logs "building without a knowledge graph".
 # When the secret is absent the build succeeds and logs "sidecar-less build".
 # All other routes remain healthy; only /mcp returns 503.
 #
@@ -68,11 +69,15 @@ COPY workflows/ ./workflows/
 # which exports KG_EMBEDDINGS_DEGRADED=1 and surfaces the fact via GET / and the
 # deploy notification. The || true copy guards below are exempt: they are part of
 # the deliberate sidecar-less mode, not unexpected failures.
-ARG KG_SOURCE_REPO=BuildDownAI/knowledge-graph-ai-implement
+ARG KG_SOURCE_REPO
 ENV KG_SOURCE_REPO=$KG_SOURCE_REPO
 COPY kg/ /app/kg/
 RUN --mount=type=secret,id=kg_token,required=false \
-    kg_owner="${KG_SOURCE_REPO%%/*}" \
+    if [ -z "$KG_SOURCE_REPO" ]; then \
+        echo "[kg] KG_SOURCE_REPO not set — building without a knowledge graph; set it to serve one"; \
+        exit 0; \
+    fi \
+    && kg_owner="${KG_SOURCE_REPO%%/*}" \
     && kg_repo="${KG_SOURCE_REPO#*/}" \
     && if [ "$kg_owner" = "$KG_SOURCE_REPO" ] || [ -z "$kg_owner" ] || [ -z "$kg_repo" ] || [ "$kg_repo" != "${kg_repo%%/*}" ]; then \
         echo "[kg] invalid KG_SOURCE_REPO: $KG_SOURCE_REPO" >&2; exit 1; \

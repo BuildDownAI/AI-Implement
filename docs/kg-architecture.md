@@ -4,8 +4,8 @@ End-to-end shape of the knowledge graph: the two repositories it spans, the tech
 lifecycle stage, and the single fact that governs every operational decision — **the orchestrator
 and the KG are one deployable unit.**
 
-Reference for the configured KG source repository (`BuildDownAI/knowledge-graph-ai-implement` by
-default; override with `KG_SOURCE_REPO` for project-specific graphs), its `kg_ingest/`, `kg_query/`,
+Reference for the configured KG source repository (set via `KG_SOURCE_REPO`; unset builds without a
+sidecar — `/mcp` returns 503), its `kg_ingest/`, `kg_query/`,
 and `snapshot/` directories, the KG stages of `Dockerfile`, `docker-entrypoint.sh`, and
 `src/deploy.ts`. For the `/mcp` endpoint, the OAuth flow, and the ways a build ships degraded, see
 [kg-sidecar.md](kg-sidecar.md). For deploy paths and their flags, see [deployment.md](deployment.md).
