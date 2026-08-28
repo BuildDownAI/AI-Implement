@@ -79,6 +79,14 @@ describe("deployArgs", () => {
     expect(args[0]).toBe("deploy");
   });
 
+  it("rejects asymmetric KG fields (token without repo)", () => {
+    expect(() => deploy.deployArgs({ ...ARGS, kgSourceRepo: null })).toThrow(/kgToken and kgSourceRepo must both be set or both be absent/);
+  });
+
+  it("rejects asymmetric KG fields (repo without token)", () => {
+    expect(() => deploy.deployArgs({ ...ARGS, kgToken: null })).toThrow(/kgToken and kgSourceRepo must both be set or both be absent/);
+  });
+
   it("accepts a configured project-specific KG repo", () => {
     const args = deploy.deployArgs({ ...ARGS, kgSourceRepo: "Answer9-llc/knowledge-graph-answer9-app" });
     expect(args).toContain("KG_SOURCE_REPO=Answer9-llc/knowledge-graph-answer9-app");

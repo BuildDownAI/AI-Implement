@@ -254,6 +254,11 @@ export function deployArgs(input: DeployArgsInput): string[] {
 
   const args = ["deploy", "--remote-only", "--no-cache"];
 
+  const hasToken = Boolean(input.kgToken);
+  const hasRepo = Boolean(input.kgSourceRepo);
+  if (hasToken !== hasRepo) {
+    throw new Error(`[deploy] kgToken and kgSourceRepo must both be set or both be absent (got token=${hasToken}, repo=${hasRepo})`);
+  }
   if (input.kgToken && input.kgSourceRepo) {
     // --build-secret takes only NAME=VALUE, so the token rides in argv; execFile runs flyctl without a shell.
     args.push("--build-secret", `kg_token=${input.kgToken}`);
