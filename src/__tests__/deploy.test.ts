@@ -60,12 +60,23 @@ describe("deployArgs", () => {
     expect(args[args.indexOf("--app") + 1]).toBe("orchestrator");
   });
 
-  it.each(Object.keys(ARGS))("refuses to deploy with an empty %s", (field) => {
-    // An empty secret is the original failure in a new costume: the build succeeds,
-    // ships without a sidecar, and reports success.
-    expect(() => deploy.deployArgs({ ...ARGS, [field]: "" })).toThrow(
-      new RegExp(`empty ${field}`),
-    );
+  it.each(["app", "sourceCommit", "sourceRepo", "sourceBranch"] as const)(
+    "refuses to deploy with an empty %s",
+    (field) => {
+      // An empty stamp leaves the next version unable to tell what it is running.
+      expect(() => deploy.deployArgs({ ...ARGS, [field]: "" })).toThrow(
+        new RegExp(`empty ${field}`),
+      );
+    },
+  );
+
+  it("omits KG build-secret and build-arg when kgToken or kgSourceRepo is absent", () => {
+    // Null KG fields → sidecar-less build; no token leaks into the build context.
+    const args = deploy.deployArgs({ ...ARGS, kgToken: null, kgSourceRepo: null });
+    expect(args).not.toContain("--build-secret");
+    expect(args.some((a) => a.startsWith("KG_SOURCE_REPO="))).toBe(false);
+    expect(args).toContain("SOURCE_COMMIT=abc1234");
+    expect(args[0]).toBe("deploy");
   });
 
   it("accepts a configured project-specific KG repo", () => {
@@ -85,8 +96,17 @@ describe("deployArgs", () => {
 });
 
 describe("readKgSourceRepo", () => {
-  it("uses the backwards-compatible default when the setting is absent", () => {
-    expect(deploy.readKgSourceRepo(undefined)).toBe("BuildDownAI/knowledge-graph-ai-implement");
+  it("returns null when the setting is absent", () => {
+    expect(deploy.readKgSourceRepo(undefined)).toBeNull();
+    expect(deploy.readKgSourceRepo(null)).toBeNull();
+  });
+
+  it("returns null without warning for an absent or empty value", () => {
+    const warn = vi.fn();
+    expect(deploy.readKgSourceRepo(undefined, warn)).toBeNull();
+    expect(deploy.readKgSourceRepo(null, warn)).toBeNull();
+    expect(deploy.readKgSourceRepo("", warn)).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("accepts a valid project-specific repository", () => {
@@ -106,9 +126,11 @@ describe("Dockerfile KG source repo wiring", () => {
   it("persists the KG_SOURCE_REPO build arg into the runtime image for later self-deploys", () => {
     const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
 
-    expect(dockerfile).toContain("ARG KG_SOURCE_REPO=BuildDownAI/knowledge-graph-ai-implement");
+    expect(dockerfile).toMatch(/^ARG KG_SOURCE_REPO\s*$/m);
+    expect(dockerfile).not.toContain("ARG KG_SOURCE_REPO=");
     expect(dockerfile).toContain("ENV KG_SOURCE_REPO=$KG_SOURCE_REPO");
     expect(dockerfile).toContain('[ "$kg_owner" = "$KG_SOURCE_REPO" ]');
+    expect(dockerfile).toContain("KG_SOURCE_REPO not set — building without a knowledge graph");
   });
 });
 
@@ -142,7 +164,7 @@ describe("makeStartDeploy", () => {
     expect(typeof deploy.makeStartDeploy(configured)).toBe("function");
   });
 
-  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget", "kgSourceRepo"] as const)(
+  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget"] as const)(
     "returns undefined when %s is missing, so the route answers 501",
     (field) => {
       // Undefined here is what distinguishes "cannot deploy" from "deploy failed" —
@@ -150,6 +172,12 @@ describe("makeStartDeploy", () => {
       expect(deploy.makeStartDeploy({ ...configured, [field]: null })).toBeUndefined();
     },
   );
+
+  it("returns a starter when kgSourceRepo is null — deploy proceeds without KG", () => {
+    // An operator running a KG-less orchestrator can still self-deploy; the KG token
+    // mint is skipped and the build receives no KG build-arg, producing a sidecar-less image.
+    expect(typeof deploy.makeStartDeploy({ ...configured, kgSourceRepo: null })).toBe("function");
+  });
 
   it("clears the hold when resolving HEAD throws, rather than pausing dispatch forever", async () => {
     const { initSettingsTable } = await import("../runner-mode.js");
@@ -228,16 +256,20 @@ describe("canSelfDeploy", () => {
     expect(deploy.canSelfDeploy(configured)).toBe(true);
   });
 
-  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget", "kgSourceRepo"] as const)(
+  it.each(["flyDeployToken", "flyOrchestratorApp", "selfDeployTarget"] as const)(
     "is false without %s",
     (field) => {
       // The predicate is the single definition of "can this orchestrator deploy itself",
       // asserted directly here rather than only through makeStartDeploy's return. A type
-      // predicate's body is not verified by the compiler, so this table is what holds it
-      // honest — a fourth requirement belongs in it.
+      // predicate's body is not verified by the compiler, so this table is what holds it honest.
       expect(deploy.canSelfDeploy({ ...configured, [field]: null })).toBe(false);
     },
   );
+
+  it("is true when kgSourceRepo is null — KG is optional for self-deploy", () => {
+    // An operator intentionally running without a KG can still self-deploy.
+    expect(deploy.canSelfDeploy({ ...configured, kgSourceRepo: null })).toBe(true);
+  });
 
   it("agrees with whether makeStartDeploy produces a starter", () => {
     // They must never disagree: the route answers 501 on the starter's absence while
