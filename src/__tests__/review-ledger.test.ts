@@ -144,14 +144,17 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
       "No other changes are required.",
     ].join("\n");
 
-    expect(extractGithubActionsClaudeReviewFindings(body, "https://example.com/review")).toEqual([
-      {
-        source: "claude-review-summary",
-        severity: "blocking",
-        body: "Missing regression test for the actual vulnerability that was fixed. The existing test would pass under the vulnerable implementation.",
-        url: "https://example.com/review",
-      },
-    ]);
+    expect(extractGithubActionsClaudeReviewFindings(body, "https://example.com/review")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Missing regression test for the actual vulnerability that was fixed. The existing test would pass under the vulnerable implementation.",
+          url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("accepts an explicit clean verdict when no finding signal is present", () => {
@@ -163,7 +166,7 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
       "No correctness, security, or style issues found.",
     ].join("\n");
 
-    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual([]);
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({ findings: [], findingsUnavailable: false });
   });
 
   it("accepts recognized finding sections that explicitly report no findings", () => {
@@ -179,10 +182,10 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
       "No minor issues found.",
     ].join("\n");
 
-    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual([]);
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({ findings: [], findingsUnavailable: false });
   });
 
-  it("does not treat no-blockers prose as clean when a minor finding follows", () => {
+  it("marks findings as unavailable when review has neither findings nor an explicit clean verdict", () => {
     const body = [
       "**Claude finished the review**",
       "",
@@ -191,16 +194,16 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
       "No blocking issues found. Minor issue: rename this variable for clarity.",
     ].join("\n");
 
-    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual([
-      expect.objectContaining({
-        source: "claude-review-summary",
-        severity: "medium",
-        body: expect.stringContaining("Minor issue"),
-      }),
-    ]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({ findings: [], findingsUnavailable: true });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not be parsed"));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
-  it("fails closed when a completed review has neither findings nor an explicit clean verdict", () => {
+  it("marks findings as unavailable when a completed review has unrecognized structure", () => {
     const body = [
       "**Claude finished the review**",
       "",
@@ -209,12 +212,12 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
       "The implementation follows the surrounding patterns.",
     ].join("\n");
 
-    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual([
-      expect.objectContaining({
-        source: "claude-review-summary",
-        severity: "medium",
-      }),
-    ]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({ findings: [], findingsUnavailable: true });
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -396,20 +399,23 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "github-review",
-        severity: "blocking",
-        body: "Please fix the failing validation.",
-        url: "https://example.com/review-1",
-      },
-      {
-        source: "github-review",
-        severity: "blocking",
-        body: "Also restore the timeout handling.",
-        url: "https://example.com/review-2",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "github-review",
+          severity: "blocking",
+          body: "Please fix the failing validation.",
+          url: "https://example.com/review-1",
+        },
+        {
+          source: "github-review",
+          severity: "blocking",
+          body: "Also restore the timeout handling.",
+          url: "https://example.com/review-2",
+        },
+      ],
+      findingsUnavailable: false,
+    });
     expect(calls[0]).toContain("--paginate");
     expect(calls[0]).toContain("repos/:owner/:repo/pulls/42/reviews?per_page=100");
     expect(calls.some((call) => call[0] === "api" && call[1] === "graphql")).toBe(true);
@@ -445,7 +451,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({ findings: [], findingsUnavailable: false });
   });
 
   it("collects latest comments from unresolved review threads as non-blocking context by default", () => {
@@ -506,16 +512,19 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "github-review-thread",
-        severity: "medium",
-        path: "src/app.ts",
-        line: 27,
-        body: "Latest unresolved note",
-        url: "https://example.com/thread-latest",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "github-review-thread",
+          severity: "medium",
+          path: "src/app.ts",
+          line: 27,
+          body: "Latest unresolved note",
+          url: "https://example.com/thread-latest",
+        },
+      ],
+      findingsUnavailable: false,
+    });
     const graphqlCall = calls.find((call) => call[0] === "api" && call[1] === "graphql");
     expect(graphqlCall?.slice(0, 2)).toEqual(["api", "graphql"]);
     const queryArg = graphqlCall?.find((arg) => arg.startsWith("query="));
@@ -567,16 +576,19 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "github-review-thread",
-        severity: "medium",
-        path: "frontend/components/rubrics/RubricBuilder.tsx",
-        line: 132,
-        body: "Missing client-side validation: empty criterion names.",
-        url: "https://example.com/nit",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "github-review-thread",
+          severity: "medium",
+          path: "frontend/components/rubrics/RubricBuilder.tsx",
+          line: 132,
+          body: "Missing client-side validation: empty criterion names.",
+          url: "https://example.com/nit",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("keeps unresolved threads blocking when the author's latest review is changes-requested", () => {
@@ -622,22 +634,25 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "github-review",
-        severity: "blocking",
-        body: "Please address the inline findings.",
-        url: "https://example.com/cr",
-      },
-      {
-        source: "github-review-thread",
-        severity: "blocking",
-        path: "src/app.ts",
-        line: 27,
-        body: "Validate path params before database access.",
-        url: "https://example.com/blocking-thread",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "github-review",
+          severity: "blocking",
+          body: "Please address the inline findings.",
+          url: "https://example.com/cr",
+        },
+        {
+          source: "github-review-thread",
+          severity: "blocking",
+          path: "src/app.ts",
+          line: 27,
+          body: "Validate path params before database access.",
+          url: "https://example.com/blocking-thread",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("collects blocking bullets from likely Claude issue comments", () => {
@@ -682,14 +697,17 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "claude-review-summary",
-        severity: "blocking",
-        body: "Validate path params before database access.",
-        url: "https://example.com/claude",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Validate path params before database access.",
+          url: "https://example.com/claude",
+        },
+      ],
+      findingsUnavailable: false,
+    });
     expect(calls[1]).toEqual([
       "api",
       "--paginate",
@@ -730,7 +748,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({ findings: [], findingsUnavailable: false });
   });
 
   it("accepts trusted automation authors only when the comment has a Claude review heading", () => {
@@ -770,14 +788,17 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "claude-review-summary",
-        severity: "blocking",
-        body: "Trusted app review blocker.",
-        url: "https://example.com/app-review",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Trusted app review blocker.",
+          url: "https://example.com/app-review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("deduplicates external findings by body while preferring path and line context", () => {
@@ -830,16 +851,19 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "github-review-thread",
-        severity: "medium",
-        path: "src/app.ts",
-        line: 27,
-        body: "Validate path params before database access.",
-        url: "https://example.com/thread",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "github-review-thread",
+          severity: "medium",
+          path: "src/app.ts",
+          line: 27,
+          body: "Validate path params before database access.",
+          url: "https://example.com/thread",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("ignores unresolved review threads that GitHub marks as outdated", () => {
@@ -879,7 +903,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({ findings: [], findingsUnavailable: false });
   });
 
   it("collects unresolved review threads from later GraphQL pages", () => {
@@ -947,16 +971,19 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "github-review-thread",
-        severity: "medium",
-        path: "src/later.ts",
-        line: 88,
-        body: "Later page unresolved finding.",
-        url: "https://example.com/later-thread",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "github-review-thread",
+          severity: "medium",
+          path: "src/later.ts",
+          line: 88,
+          body: "Later page unresolved finding.",
+          url: "https://example.com/later-thread",
+        },
+      ],
+      findingsUnavailable: false,
+    });
     expect(calls.filter((call) => call[0] === "api" && call[1] === "graphql")).toHaveLength(2);
     expect(calls.find((call) => call.includes("after=cursor-1"))).toBeTruthy();
   });
@@ -981,14 +1008,17 @@ describe("collectExternalReviewFindingsFromGh", () => {
     };
 
     expect(() => collectExternalReviewFindingsFromGh(ghSpawn, "42")).not.toThrow();
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "github-review",
-        severity: "blocking",
-        body: "Keep already collected review findings.",
-        url: "https://example.com/review",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "github-review",
+          severity: "blocking",
+          body: "Keep already collected review findings.",
+          url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("accepts a bot-authored comment with a verdict marker and extracts blocking and minor findings", () => {
@@ -1018,22 +1048,25 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "claude-review-summary",
-        severity: "blocking",
-        body: "Fix the null check",
-        path: "src/app.ts",
-        line: 12,
-        url: "https://example.com/verdict-comment",
-      },
-      {
-        source: "claude-review-summary",
-        severity: "minor",
-        body: "Consider extracting a helper",
-        url: "https://example.com/verdict-comment",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Fix the null check",
+          path: "src/app.ts",
+          line: 12,
+          url: "https://example.com/verdict-comment",
+        },
+        {
+          source: "claude-review-summary",
+          severity: "minor",
+          body: "Consider extracting a helper",
+          url: "https://example.com/verdict-comment",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("uses the latest Claude Actions review comment so fixed findings do not remain forever", () => {
@@ -1064,7 +1097,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({ findings: [], findingsUnavailable: false });
   });
 
   it("does not let an unrelated bot verdict supersede the latest Claude review", () => {
@@ -1095,14 +1128,17 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "claude-review-summary",
-        severity: "blocking",
-        body: "Missing regression coverage.",
-        url: "https://example.com/claude-review",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Missing regression coverage.",
+          url: "https://example.com/claude-review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("ignores a human-authored comment that contains a forged verdict marker", () => {
@@ -1132,7 +1168,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({ findings: [], findingsUnavailable: false });
   });
 
   it("ignores a bot-authored comment that has no verdict marker and no trusted-author heading", () => {
@@ -1162,7 +1198,7 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({ findings: [], findingsUnavailable: false });
   });
 
   it("prefers the verdict marker over heading extraction when a trusted author uses both", () => {
@@ -1194,14 +1230,17 @@ describe("collectExternalReviewFindingsFromGh", () => {
       };
     };
 
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "claude-review-summary",
-        severity: "minor",
-        body: "Minor nit",
-        url: "https://example.com/both",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "minor",
+          body: "Minor nit",
+          url: "https://example.com/both",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 
   it("does not throw when ghSpawn throws while collecting external findings", () => {
@@ -1224,14 +1263,17 @@ describe("collectExternalReviewFindingsFromGh", () => {
     };
 
     expect(() => collectExternalReviewFindingsFromGh(ghSpawn, "42")).not.toThrow();
-    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual([
-      {
-        source: "github-review",
-        severity: "blocking",
-        body: "Keep findings collected before a later gh failure.",
-        url: "https://example.com/review",
-      },
-    ]);
+    expect(collectExternalReviewFindingsFromGh(ghSpawn, "42")).toEqual({
+      findings: [
+        {
+          source: "github-review",
+          severity: "blocking",
+          body: "Keep findings collected before a later gh failure.",
+          url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
   });
 });
 

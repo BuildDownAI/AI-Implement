@@ -361,8 +361,8 @@ describe("postPushReviewStep", () => {
     expect(fixPrompt).toContain("Required external review findings");
     expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
-    expect(reviewComment).toContain("External review findings are blocking this PR.");
-    expect(reviewComment).not.toContain("Missing UUID validation on path params.");
+    expect(reviewComment).toContain("Unresolved external review findings:");
+    expect(reviewComment).toContain("Missing UUID validation on path params.");
   });
 
   it("runs a fix pass when a Claude issue comment has blocking findings and internal review approves", async () => {
@@ -421,7 +421,8 @@ describe("postPushReviewStep", () => {
       "repos/:owner/:repo/issues/42/comments?per_page=100",
     ]);
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
-    expect(reviewComment).toContain("External review findings are blocking this PR.");
+    expect(reviewComment).toContain("Unresolved external review findings:");
+    expect(reviewComment).toContain("Validate path params before database access.");
   });
 
   it("does not approve when the GitHub Actions Claude review reports a prose blocking finding", async () => {
@@ -654,7 +655,7 @@ describe("postPushReviewStep", () => {
     const fixPrompt = invoke.mock.calls[1][0].prompt;
     expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
-    expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(0);
+    expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(1);
   });
 
   it("suppresses duplicate feedback that repeats external review findings", async () => {
@@ -699,7 +700,7 @@ describe("postPushReviewStep", () => {
     expect(countOccurrences(fixPrompt, "Missing UUID validation on path params.")).toBe(1);
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
     expect(reviewComment).not.toContain("Reviewer summary:");
-    expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(0);
+    expect(countOccurrences(reviewComment ?? "", "Missing UUID validation on path params.")).toBe(1);
   });
 
   it("does not run a fix pass when approved feedback contains actionable language but issues is empty", async () => {
@@ -1592,7 +1593,8 @@ describe("postPushReviewStep", () => {
     expect(fixPrompt).toContain("Consider extracting this to a helper function");
     expect(fixPrompt).toContain("Rename variable for clarity");
     const reviewComment = ghComments.find((c) => c.includes("Reviewer found issues"));
-    expect(reviewComment).toContain("External review findings are blocking this PR.");
+    expect(reviewComment).toContain("Unresolved external review findings:");
+    expect(reviewComment).toContain("Consider extracting this to a helper function");
     expect(ghComments.some((c) => c.includes("**Merge readiness:** Ready to merge."))).toBe(false);
   });
 
@@ -1635,7 +1637,8 @@ describe("postPushReviewStep", () => {
     expect(fixPrompt).toContain("Required external review findings");
     expect(fixPrompt).toContain("Missing null guard on path param");
     const reviewComment = ghComments.find((c) => c.includes("Reviewer found issues"));
-    expect(reviewComment).toContain("External review findings are blocking this PR.");
+    expect(reviewComment).toContain("Unresolved external review findings:");
+    expect(reviewComment).toContain("Missing null guard on path param");
   });
 
   it("does not include minor external findings in the approval comment when there are none", async () => {
@@ -2174,5 +2177,108 @@ describe("postPushReviewStep", () => {
     expect(sleep).toHaveBeenCalled();
     expect(checkProbes).toBeGreaterThanOrEqual(2);
     expect(out.approved).toBe(true);
+  });
+
+  it("T-1 (AII-436): GH Actions bot clean verdict + green review check + zero findings → approved=true", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "abc123def456" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("abc123def456/check-runs"))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: [{ name: "review", status: "completed", conclusion: "success" }],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return {
+          stdout: JSON.stringify([{
+            user: { login: "github-actions[bot]", type: "Bot" },
+            body: "**Claude finished the review**\n\n### Review complete ✅\n\nNo correctness, security, or style issues found.",
+            html_url: "https://example.com/review-comment",
+          }]),
+          exitCode: 0,
+        };
+      }
+      // GraphQL for review threads
+      return {
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+        exitCode: 0,
+      };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(ghComments.some((c) => c.includes("✅"))).toBe(true);
+    expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(true);
+    // No unavailability note: the clean verdict was parseable
+    expect(ghComments.every((c) => !c.includes("findings could not be parsed"))).toBe(true);
+  });
+
+  it("T-2 (KGB-9): internal approval + failing CI check → Not ready to merge, check named", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "def567abc890" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("def567abc890/check-runs"))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: [
+              { name: "review", status: "completed", conclusion: "success" },
+              { name: "matrix-ubuntu", status: "completed", conclusion: "failure" },
+            ],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      // GraphQL for review threads
+      return {
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+        exitCode: 0,
+      };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    const capComment = ghComments.find((c) => c.includes("Not ready to merge"));
+    expect(capComment).toBeDefined();
+    expect(capComment).toContain("matrix-ubuntu");
   });
 });
