@@ -37,7 +37,7 @@ jobs:
           path-to-signatures: signatures/version1/cla.json
           path-to-document: https://github.com/BuildDownAI/AI-Implement/blob/main/legal/ICLA.md
           branch: cla-signatures
-          allowlist: bot*,dependabot[bot],github-actions[bot],jodwyer,theaboutbox,rigonzal530
+          allowlist: bot*,dependabot[bot],github-actions[bot],ai-implement[bot],jodwyer,theaboutbox,rigonzal530
           custom-notsigned-prcomment: >
             Thanks for the contribution. Before we can merge, please sign our
             Contributor License Agreement — it is a one-time signature that
