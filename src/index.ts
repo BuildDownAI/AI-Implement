@@ -83,6 +83,7 @@ import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
+import { KgSidecar } from "./kg-sidecar.js";
 
 // ---------- Configuration ----------
 
@@ -3321,6 +3322,11 @@ async function main(): Promise<void> {
     console.warn("[main] Cleared a hold left by the previous deployment process, resuming paused dispatches...");
   }
 
+  // Start sidecar before loadConfig() so KG_SIDECAR_URL and KG_EMBEDDINGS_DEGRADED are
+  // in process.env when loadConfig() reads them. Failure is non-fatal (logged, /mcp degraded).
+  const sidecar = new KgSidecar();
+  await sidecar.start();
+
   const config = loadConfig();
 
   // Phase 2: per-mapping provider resolution. The registry caches one
@@ -3414,6 +3420,8 @@ async function main(): Promise<void> {
       postShutdownNotice(config),
       new Promise((resolve) => setTimeout(resolve, SHUTDOWN_BUDGET_MS * 0.3).unref()),
     ]);
+
+    await sidecar.stop();
 
     server.close(() => {
       closeDb();
