@@ -60,6 +60,18 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div class="card" id="kg-refresh-card" hidden>
+      <div class="card-header"><h2 class="card-title">Knowledge graph <span class="badge neutral" id="kg-refresh-badge">—</span></h2></div>
+      <div class="card-body">
+        <div class="kpi-trend" id="kg-refresh-stamp">Served graph stamp: —</div>
+        <div class="kpi-trend text-secondary" id="kg-refresh-last"></div>
+        <div style="margin-top: 12px">
+          <button class="btn btn-sm" id="kg-refresh-btn" onclick="window.triggerKgRefresh()">Refresh graph now</button>
+          <span class="kpi-trend text-secondary" style="margin-left: 8px">Fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause.</span>
+        </div>
+      </div>
+    </div>
+
     <div id="deployments-not-configured" class="alert warn" hidden>
       <div style="flex:1">
         <div class="alert-title">Self-deploy not configured</div>
@@ -419,6 +431,38 @@ export const deploymentsScript = `
   window.triggerDeploy = triggerDeploy;
   window.saveDeployPolicy = saveDeployPolicy;
   window.refreshPolicyDirty = refreshPolicyDirty;
-  window.registerPage('deployments', function () { loadDeployments(); setInterval(loadDeployments, 30000); });
+  async function loadKgStatus() {
+    const card = document.getElementById('kg-refresh-card');
+    try {
+      const res = await window.api('/api/kg/status');
+      if (!res.ok) { card.hidden = true; return; }
+      const data = await res.json();
+      card.hidden = false;
+      const badge = document.getElementById('kg-refresh-badge');
+      if (data.running) setBadge(badge, 'info', 'refreshing');
+      else if (data.kgDegraded) setBadge(badge, 'warn', 'degraded');
+      else setBadge(badge, 'ok', 'serving');
+      document.getElementById('kg-refresh-stamp').textContent =
+        'Served graph stamp: ' + (data.servedStamp || 'baked image graph');
+      const last = data.lastRefresh;
+      document.getElementById('kg-refresh-last').textContent = last
+        ? 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' — ' + last.detail
+        : 'No refresh has run since boot.';
+      document.getElementById('kg-refresh-btn').disabled = !!data.running || !!data.deployHeld;
+    } catch (e) { card.hidden = true; }
+  }
+
+  window.triggerKgRefresh = async function () {
+    const btn = document.getElementById('kg-refresh-btn');
+    btn.disabled = true;
+    try {
+      const res = await window.api('/api/kg/refresh', { method: 'POST' });
+      const body = await res.json();
+      if (!res.ok) { showMessage('warning', 'Refresh refused — ' + (body.error || res.status)); }
+    } catch (err) { showMessage('warning', 'Refresh failed — ' + String(err)); }
+    setTimeout(loadKgStatus, 1000);
+  };
+
+  window.registerPage('deployments', function () { loadDeployments(); loadKgStatus(); setInterval(loadDeployments, 30000); setInterval(loadKgStatus, 15000); });
 })();
 `;

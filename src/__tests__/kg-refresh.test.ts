@@ -1,0 +1,263 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { makeKgRefresh, MATERIALIZE_ARGS, type KgRefreshHandle } from "../kg-refresh.js";
+import { COMPLETION_MARKER } from "../kg-sidecar.js";
+
+const NAMESPACE = "https://kg.test.example/";
+const OLD_STAMP = "2026-08-20T00:10:10+00:00";
+const NEW_STAMP = "2026-08-24T12:00:00+00:00";
+
+function makeTarball(dir: string): Buffer {
+  // extractSource strips one leading component, so wrap in a top-level dir.
+  const wrap = mkdtempSync(join(tmpdir(), "kgtar-"));
+  const top = join(wrap, "repo");
+  mkdirSync(top, { recursive: true });
+  execSync(`cp -R ${dir}/ ${top}/`);
+  const out = join(wrap, "src.tar.gz");
+  execSync(`tar -czf ${out} -C ${wrap} repo`);
+  return readFileSync(out) as Buffer;
+}
+
+describe("kg-refresh", () => {
+  let dataRoot: string;
+  let fixtureRepo: string;
+  let tarball: Buffer;
+  let servedStamp: string;
+  let canary: { count: number; degraded: boolean };
+  let sidecarUp: boolean;
+  let restart: ReturnType<typeof vi.fn>;
+  let materialize: ReturnType<typeof vi.fn>;
+  let handle: KgRefreshHandle;
+  let deployHeld: boolean;
+  let free: number;
+
+  const mcpToolCall = vi.fn(async (_url: string, tool: string) => {
+    if (!sidecarUp) throw new Error("ECONNREFUSED");
+    if (tool === "kg_neighbors") {
+      return {
+        edges: [
+          { predicate_iri: "http://purl.org/dc/terms/modified", neighbor: servedStamp },
+        ],
+      };
+    }
+    if (tool === "kg_hybrid_search") return { count: canary.count, degraded: canary.degraded, results: [] };
+    throw new Error(`unexpected tool ${tool}`);
+  });
+
+  function build(overrides: Record<string, unknown> = {}) {
+    handle = makeKgRefresh({
+      sidecar: { restart: restart as unknown as () => Promise<void> },
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      kgSourceRepo: "TestOrg/test-kg",
+      dataRoot,
+      kgDir: "/nonexistent-kg",
+      sidecarMcpUrl: "http://127.0.0.1:1/mcp",
+      minFreeBytes: 1000,
+      deployHeld: () => deployHeld,
+      freeBytes: () => free,
+      mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
+      fetchTarball: vi.fn(async () => tarball) as never,
+      fetchDefaultBranch: vi.fn(async () => "main") as never,
+      materialize: materialize as never,
+      mcpToolCall: mcpToolCall as never,
+      ...overrides,
+    });
+  }
+
+  async function waitDone(): Promise<void> {
+    for (let i = 0; i < 200; i++) {
+      if (!(await handle.status()).running) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("refresh did not finish");
+  }
+
+  beforeEach(() => {
+    dataRoot = mkdtempSync(join(tmpdir(), "kgroot-"));
+    fixtureRepo = mkdtempSync(join(tmpdir(), "kgrepo-"));
+    writeFileSync(join(fixtureRepo, "sources.yml"), `namespace: ${NAMESPACE}\n`);
+    mkdirSync(join(fixtureRepo, "snapshot"), { recursive: true });
+    tarball = makeTarball(fixtureRepo);
+
+    servedStamp = OLD_STAMP;
+    canary = { count: 3, degraded: false };
+    sidecarUp = true;
+    deployHeld = false;
+    free = 10_000;
+    process.env.KG_SIDECAR_URL = "http://127.0.0.1:1/mcp";
+
+    // A successful restart serves the new graph: stamp flips to the staged one.
+    restart = vi.fn(async () => {
+      servedStamp = NEW_STAMP;
+    });
+    // Materialize produces the loadable form inside the fetched tree (KGB-9 contract).
+    materialize = vi.fn(async (_python: string, cwd: string) => {
+      mkdirSync(join(cwd, "out"), { recursive: true });
+      writeFileSync(join(cwd, "out", "graph.trig"), "@prefix kg: <x> .");
+      writeFileSync(join(cwd, "out", "embeddings.npz"), "vectors");
+    });
+    build();
+  });
+
+  afterEach(() => {
+    rmSync(dataRoot, { recursive: true, force: true });
+    rmSync(fixtureRepo, { recursive: true, force: true });
+    delete process.env.KG_SIDECAR_URL;
+    vi.clearAllMocks();
+  });
+
+  it("returns 202, refreshes, and records the stamp movement", async () => {
+    const r = await handle.trigger();
+    expect(r.status).toBe(202);
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(true);
+    expect(s.lastRefresh?.stampBefore).toBe(OLD_STAMP);
+    expect(s.lastRefresh?.stampAfter).toBe(NEW_STAMP);
+    expect(restart).toHaveBeenCalledTimes(1);
+
+    const current = join(dataRoot, "current");
+    expect(existsSync(join(current, "graph.trig"))).toBe(true);
+    expect(existsSync(join(current, "embeddings.npz"))).toBe(true);
+    expect(existsSync(join(current, COMPLETION_MARKER))).toBe(true);
+    expect(existsSync(join(dataRoot, "fetch"))).toBe(false);
+  });
+
+  it("refuses with 409 while a refresh is running", async () => {
+    let release: (() => void) | undefined;
+    materialize.mockImplementationOnce(async (_p: string, cwd: string) => {
+      mkdirSync(join(cwd, "out"), { recursive: true });
+      writeFileSync(join(cwd, "out", "graph.trig"), "x");
+      writeFileSync(join(cwd, "out", "embeddings.npz"), "y");
+      await new Promise<void>((r) => {
+        release = r;
+      });
+    });
+    const first = await handle.trigger();
+    expect(first.status).toBe(202);
+    const second = await handle.trigger();
+    expect(second.status).toBe(409);
+    expect(second.body.error).toBe("refresh-in-progress");
+    // The blocking materialize starts a few awaits into the async run.
+    for (let i = 0; i < 200 && !release; i++) await new Promise((r) => setTimeout(r, 10));
+    release!();
+    await waitDone();
+  });
+
+  it("refuses with 409 while the deploy hold is set, and does not run", async () => {
+    deployHeld = true;
+    const r = await handle.trigger();
+    expect(r.status).toBe(409);
+    expect(r.body.error).toBe("deploy-in-progress");
+    expect(materialize).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("refuses with 507 below the free-space threshold", async () => {
+    free = 10;
+    const r = await handle.trigger();
+    expect(r.status).toBe(507);
+    expect(materialize).not.toHaveBeenCalled();
+  });
+
+  it("returns 501 with no configured KG source repo", async () => {
+    build({ kgSourceRepo: null });
+    const r = await handle.trigger();
+    expect(r.status).toBe(501);
+  });
+
+  it("a crash during staging leaves current untouched and never restarts", async () => {
+    const current = join(dataRoot, "current");
+    mkdirSync(current, { recursive: true });
+    writeFileSync(join(current, "graph.trig"), "SERVING");
+    writeFileSync(join(current, COMPLETION_MARKER), "ok");
+
+    materialize.mockImplementationOnce(async () => {
+      throw new Error("OOM-killed");
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.gate).toBe("staging");
+    expect(readFileSync(join(current, "graph.trig"), "utf8")).toBe("SERVING");
+    expect(existsSync(join(dataRoot, "staging"))).toBe(false);
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("a failed canary gate reverts to the previous overlay and restarts again", async () => {
+    const current = join(dataRoot, "current");
+    mkdirSync(current, { recursive: true });
+    writeFileSync(join(current, "graph.trig"), "OLD-OVERLAY");
+    writeFileSync(join(current, COMPLETION_MARKER), "ok");
+
+    restart.mockImplementation(async () => {
+      // After the failed swap the canary reports degraded; after revert it recovers.
+      canary = restart.mock.calls.length === 1 ? { count: 0, degraded: true } : { count: 3, degraded: false };
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.gate).toBe("canary");
+    expect(restart).toHaveBeenCalledTimes(2);
+    expect(readFileSync(join(current, "graph.trig"), "utf8")).toBe("OLD-OVERLAY");
+    expect(existsSync(join(dataRoot, "previous"))).toBe(false);
+  });
+
+  it("a stamp that did not move fails the stamp gate and reverts", async () => {
+    restart.mockImplementation(async () => {
+      /* served stamp stays OLD_STAMP */
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.gate).toBe("stamp");
+    // No previous existed: the failed overlay is withdrawn, baked graph serves.
+    expect(existsSync(join(dataRoot, "current"))).toBe(false);
+  });
+
+  it("a sidecar that never comes back fails the answers gate", async () => {
+    restart.mockImplementation(async () => {
+      delete process.env.KG_SIDECAR_URL;
+      sidecarUp = false;
+    });
+    await handle.trigger();
+    await waitDone();
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.gate).toBe("answers");
+  });
+
+  it("retains exactly one previous overlay across successive refreshes", async () => {
+    await handle.trigger();
+    await waitDone();
+    servedStamp = NEW_STAMP;
+    const newer = "2026-08-25T00:00:00+00:00";
+    restart.mockImplementation(async () => {
+      servedStamp = newer;
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(true);
+    expect(s.lastRefresh?.stampAfter).toBe(newer);
+    expect(existsSync(join(dataRoot, "previous"))).toBe(true);
+    expect(existsSync(join(dataRoot, "staging"))).toBe(false);
+  });
+
+  it("never reaches an embedding path: the staging command is materialize, full pass", () => {
+    expect([...MATERIALIZE_ARGS]).toEqual(["-m", "kg_ingest.materialize"]);
+    expect(MATERIALIZE_ARGS.join(" ")).not.toMatch(/embed|cli/);
+  });
+});
