@@ -383,8 +383,21 @@ function suppressDuplicateExternalFeedback(feedback: string, externalFindings: R
   return duplicatesExternalFinding ? "" : feedback;
 }
 
-function externalBlockingCommentBlock(hasExternalBlockers: boolean): string {
-  return hasExternalBlockers ? "\n\nExternal review findings are blocking this PR." : "";
+function findingsUnavailableBlock(unavailable: boolean): string {
+  return unavailable ? "\n\n⚠️ External review findings could not be parsed — verdict from reviewer summary only." : "";
+}
+
+function findFailingCiChecks(
+  ghSpawn: (args: string[]) => SpawnResult,
+  headSha: string,
+  configuredCheckNames: string[] | undefined,
+): string[] {
+  if (!headSha) return [];
+  const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
+  if (res.exitCode !== 0) return [];
+  return parseCheckRuns(res.stdout)
+    .filter((run) => run.conclusion === "failure" && !isExternalReviewCheckName(run.name, configuredCheckNames))
+    .map((run) => run.name);
 }
 
 function shouldCollectExternalReviewFindings(reviewProviders: string[] | undefined): boolean {
@@ -492,18 +505,18 @@ async function waitForExternalReviewCompletion(
     timeoutMs: number;
     configuredCheckNames: string[] | undefined;
   },
-): Promise<ExternalReviewState> {
+): Promise<{ state: ExternalReviewState; headSha: string }> {
   const headSha = resolvePrHeadSha(ghSpawn, prNumber);
-  if (!headSha) return "absent";
+  if (!headSha) return { state: "absent", headSha: "" };
 
   let elapsed = 0;
   for (;;) {
     const state = probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames);
     // "no-real-verdict": every matching check is completed but none produced a reviewer verdict
     // (e.g. cancelled, skipped, timed_out). Fail closed immediately — a cancelled run is not a review.
-    if (state === "no-real-verdict") return "running";
-    if (state !== "running") return state;
-    if (elapsed >= opts.timeoutMs) return "running";
+    if (state === "no-real-verdict") return { state: "running", headSha };
+    if (state !== "running") return { state, headSha };
+    if (elapsed >= opts.timeoutMs) return { state: "running", headSha };
     await opts.sleep(opts.pollMs);
     elapsed += opts.pollMs;
   }
@@ -879,21 +892,30 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // on the PR's current head SHA to reach a terminal state, then read its findings,
       // so merge readiness is decided against the real external verdict rather than the
       // empty snapshot that exists when both reviews start.
-      const externalReviewState: ExternalReviewState = shouldCollectExternalReviewFindings(inputs.reviewProviders)
+      const externalReviewResult = shouldCollectExternalReviewFindings(inputs.reviewProviders)
         ? await waitForExternalReviewCompletion(ghSpawn, prNumber, {
             sleep,
             pollMs: reviewWaitPollMs,
             timeoutMs: reviewWaitTimeoutMs,
             configuredCheckNames: inputs.reviewCheckNames,
           })
-        : "skipped";
+        : { state: "skipped" as ExternalReviewState, headSha: "" };
+      const externalReviewState = externalReviewResult.state;
       const externalReviewPending = externalReviewState === "running";
-      const externalFindings: ReviewLedgerFinding[] = externalReviewState === "skipped"
-        ? []
+      const externalFindingsResult = externalReviewState === "skipped"
+        ? { findings: [] as ReviewLedgerFinding[], findingsUnavailable: false }
         : collectExternalReviewFindingsFromGh(ghSpawn, prNumber);
+      const externalFindings = externalFindingsResult.findings;
+      const findingsUnavailable = externalFindingsResult.findingsUnavailable;
       // Approval is a zero-findings invariant. Severity controls presentation and
       // prioritisation, not whether a reported Claude finding may be silently escaped.
       const hasExternalFindings = externalFindings.length > 0;
+
+      // CI gate: collect failing non-review checks so a red build can never produce
+      // "Ready to merge". Uses the head SHA already resolved by waitForExternalReviewCompletion.
+      const failingCiChecks = (externalReviewState !== "skipped" && externalReviewResult.headSha)
+        ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames)
+        : [];
 
       feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
       let issues = parseReviewIssues(parsed);
@@ -903,6 +925,15 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
+      }
+
+      // Inject failing CI checks as blocking issues so they appear in comments and fix prompts.
+      for (const checkName of failingCiChecks) {
+        issues.push({
+          title: "CI check failing",
+          problem: `CI check '${checkName}' is failing on the current head`,
+          requiredFix: `Fix the underlying defect causing '${checkName}' to fail`,
+        });
       }
 
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
@@ -955,7 +986,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}\n\n**Merge readiness:** Ready to merge.`,
+          `${marker}\n✅ Approved (${iteration} iteration${iteration > 1 ? "s" : ""}).\n\n${feedback}${findingsUnavailableBlock(findingsUnavailable)}\n\n**Merge readiness:** Ready to merge.`,
           marker,
         );
         break;
@@ -972,7 +1003,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         postPrComment(
           ghSpawn,
           prNumber,
-          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalFindings)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+          `${marker}\n⚠️ Reached review cap (${maxIterations} iterations) without approval.${blockingIssuesBlock(issues)}${externalReviewFindingsCommentBlock(externalFindings)}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
           marker,
         );
         break;
@@ -982,7 +1013,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       postPrComment(
         ghSpawn,
         prNumber,
-        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${externalBlockingCommentBlock(hasExternalFindings)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
+        `${feedbackMarker}\n⚠️ Reviewer found issues — starting fix pass ${fixPassLabel(iteration, maxIterations)}...${blockingIssuesBlock(issues)}${externalReviewFindingsCommentBlock(externalFindings)}${findingsUnavailableBlock(findingsUnavailable)}${reviewerSummaryBlock(feedback, issues)}\n\n**Merge readiness:** Not ready to merge.`,
         feedbackMarker,
       );
 

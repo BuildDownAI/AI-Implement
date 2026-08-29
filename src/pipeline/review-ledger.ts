@@ -35,17 +35,18 @@ const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
 
 const GITHUB_ACTIONS_REVIEW_AUTHOR = "github-actions";
 
-export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): ReviewLedgerFinding[] {
+export function collectExternalReviewFindingsFromGh(ghSpawn: GhSpawn, prNumber: string): { findings: ReviewLedgerFinding[]; findingsUnavailable: boolean } {
   const findings: ReviewLedgerFinding[] = [];
+  const out = { findingsUnavailable: false };
 
   // A reviewer's latest formal verdict is authoritative: only reviewers currently in
   // CHANGES_REQUESTED state contribute blocking inline threads. Leftover nit threads from
   // a reviewer who has since approved (or only commented) are surfaced as non-blocking context.
   const blockingReviewerLogins = collectChangesRequestedReviews(ghSpawn, prNumber, findings);
-  collectClaudeIssueComments(ghSpawn, prNumber, findings);
+  collectClaudeIssueComments(ghSpawn, prNumber, findings, out);
   collectUnresolvedReviewThreads(ghSpawn, prNumber, findings, blockingReviewerLogins);
 
-  return dedupeReviewFindings(findings);
+  return { findings: dedupeReviewFindings(findings), findingsUnavailable: out.findingsUnavailable };
 }
 
 /** Normalizes a GitHub login so REST (`claude[bot]`) and GraphQL (`claude`) forms compare equal. */
@@ -228,9 +229,11 @@ function isExplicitlyEmptyFindingSection(body: string): boolean {
  * Parses the live comment shape emitted by anthropics/claude-code-action when it runs
  * under GitHub Actions. The action has repeatedly omitted the requested verdict marker,
  * so a completed external review must not be treated as clean merely because the marker
- * is absent. Recognized finding sections are preserved; ambiguous output fails closed.
+ * is absent. Recognized finding sections are preserved; when the comment cannot be parsed
+ * into structured findings, the caller is signalled via findingsUnavailable rather than
+ * fabricating a synthetic block.
  */
-export function extractGithubActionsClaudeReviewFindings(body: string, url?: string): ReviewLedgerFinding[] {
+export function extractGithubActionsClaudeReviewFindings(body: string, url?: string): { findings: ReviewLedgerFinding[]; findingsUnavailable: boolean } {
   const findings: ReviewLedgerFinding[] = [];
   const lines = body.split(/\r?\n/);
   let severity: ReviewLedgerSeverity | null = null;
@@ -283,17 +286,12 @@ export function extractGithubActionsClaudeReviewFindings(body: string, url?: str
   }
   flush();
 
-  if (findings.length > 0) return findings;
-  if (recognizedSections > 0 && explicitlyEmptySections === recognizedSections) return [];
-  if (hasExplicitCleanVerdict(body) && !hasFindingSignal(body)) return [];
+  if (findings.length > 0) return { findings, findingsUnavailable: false };
+  if (recognizedSections > 0 && explicitlyEmptySections === recognizedSections) return { findings: [], findingsUnavailable: false };
+  if (hasExplicitCleanVerdict(body) && !hasFindingSignal(body)) return { findings: [], findingsUnavailable: false };
 
-  const reviewBody = normalizeText(stripClaudeActionNoise(lines));
-  return [{
-    source: "claude-review-summary",
-    severity: "medium",
-    body: reviewBody || "External Claude review did not provide an explicit clean verdict.",
-    ...(url ? { url } : {}),
-  }];
+  console.warn("[review-ledger] External review comment could not be parsed — treating findings as unavailable");
+  return { findings: [], findingsUnavailable: true };
 }
 
 export function formatReviewLedgerForPrompt(findings: ReviewLedgerFinding[]): string {
@@ -361,7 +359,7 @@ function collectChangesRequestedReviews(ghSpawn: GhSpawn, prNumber: string, find
   return blockingReviewerLogins;
 }
 
-function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[]): void {
+function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings: ReviewLedgerFinding[], out: { findingsUnavailable: boolean }): void {
   const result = safeGhSpawn(ghSpawn, [
     "api",
     "--paginate",
@@ -403,7 +401,9 @@ function collectClaudeIssueComments(ghSpawn: GhSpawn, prNumber: string, findings
     }
 
     if (isGithubActionsClaudeReviewComment(comment)) {
-      findings.push(...extractGithubActionsClaudeReviewFindings(comment.body, url));
+      const ghResult = extractGithubActionsClaudeReviewFindings(comment.body, url);
+      findings.push(...ghResult.findings);
+      if (ghResult.findingsUnavailable) out.findingsUnavailable = true;
       return;
     }
   }
