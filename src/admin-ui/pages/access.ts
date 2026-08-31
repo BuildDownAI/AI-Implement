@@ -99,7 +99,7 @@ export const accessHtml = `
             <option value="admin">admin</option>
           </select>
         </div>
-        <button class="btn btn-sm" onclick="stageAccessEntry()" style="flex:none">${icon("plus", 12)}Add another</button>
+        <button class="btn btn-icon" onclick="stageAccessEntry()" style="flex:none;color:var(--accent)" title="Add another">${icon("plus", 14)}</button>
       </div>
 
       <div style="padding:12px 24px 0"><div id="access-error" class="error hidden"></div></div>
@@ -111,7 +111,7 @@ export const accessHtml = `
 
       <div style="padding:14px 24px;border-top:1px solid var(--border-subtle);display:flex;justify-content:flex-end;gap:8px">
         <button class="btn btn-sm" onclick="closeAddEntry()">Cancel</button>
-        <button class="btn btn-accent btn-sm" onclick="commitStagedEntries()">Stage entries</button>
+        <button class="btn btn-accent btn-sm" onclick="commitStagedEntries()">Add to list</button>
       </div>
     </div>
   </div>

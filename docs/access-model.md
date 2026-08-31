@@ -107,7 +107,7 @@ These markers are **cosmetic only**. Each control calls a route that exact-path 
 
 ### In the SPA
 
-Three behaviours are worth knowing before reading `src/admin-ui/`:
+Three behaviors are worth knowing before reading `src/admin-ui/`:
 
 - **The router does not route until the session identity has resolved.** A page's init runs exactly once, so a page rendered against an unknown role would keep that render for the life of the tab. `auth.js` calls `startRouting()` once the identity is known, and the router ignores every hashchange before that.
 - **Ungranted nav items are hidden, not removed**, and the router treats a hidden item as unreachable — so typing the hash gains nothing over clicking. A `user` granted nothing lands on a page explaining that state rather than a blank panel.
@@ -148,7 +148,7 @@ That second case is why recovery needs no restart. It also means a hand-edit of 
 
 **Grants are not cached, and deliberately so.** They are read from the table on each request that needs them, which is only ever a non-admin's — the admin check short-circuits before the read. A grant therefore takes effect on the next request with no window at all, and the query is confined to the sessions that a cache would have been protecting.
 
-## Failure behaviour
+## Failure behavior
 
 Authorization is **fail-closed**, and the two failure modes are deliberately different:
 
@@ -163,7 +163,7 @@ Every change to the list writes a row to `access_audit`: when, who, which action
 
 The trail has **no retention policy, deliberately** — it grows only when a human changes who can sign in, and pruning is the anti-goal for an audit record. It is scoped to access changes only; the general facility across every mutating admin route is separate, unbuilt work.
 
-The Access page renders the recent entries, summarising each as added / removed / role changed with counts.
+The Access page renders the recent entries, summarizing each as added / removed / role changed with counts.
 
 ## Guards on a save
 
@@ -195,7 +195,7 @@ It holds no architectural responsibility, which is what keeps the deprecated pat
 
 ## Not yet built
 
-**A general audit trail.** `access_audit` covers the sign-in allowlist and nothing else. Every other mutating admin route — runner mode, mappings, secrets, deploy policy, dedup clearing, and page grants themselves — changes behaviour with no record of who did it. The Audit log page's subtitle promises this and currently shows the dispatch dedup ledger.
+**A general audit trail.** `access_audit` covers the sign-in allowlist and nothing else. Every other mutating admin route — runner mode, mappings, secrets, deploy policy, dedup clearing, and page grants themselves — changes behavior with no record of who did it. The Audit log page's subtitle promises this and currently shows the dispatch dedup ledger.
 
 **Per-person grants.** The grant set is global: every `user` on an orchestrator sees the same pages. The table is keyed on the page alone, so distinguishing two users means a schema change, not a setting.
 
