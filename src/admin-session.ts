@@ -63,7 +63,14 @@ export function resolveSession(token: string | undefined): ResolvedSession | nul
     getDb().prepare("DELETE FROM admin_sessions WHERE token = ?").run(token);
     return null;
   }
-  // SSO sets all three; the access-code path sets none.
+  // SSO sets all three; the access-code path sets none. A row with only some of them is neither,
+  // and must not fall through to the identity-less branch — that one is treated as the access-code
+  // path and carries admin, so the ambiguous case would resolve toward privilege.
+  const present = [row.email, row.sub, row.provider].filter(Boolean).length;
+  if (present > 0 && present < 3) {
+    console.warn("[admin-session] session row has a partial identity; treating it as invalid");
+    return null;
+  }
   const identity: SessionIdentity | null =
     row.email && row.sub && row.provider
       ? { email: row.email, sub: row.sub, provider: row.provider, name: row.name }
