@@ -101,7 +101,13 @@ describe("handleOAuthProviders", () => {
     const res = new MockResponse();
     routes.handleOAuthProviders(asRes(res), true);
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ providers: [{ id: "google", label: "Google" }], accessCode: true });
+    // noAdmin rides along so the login page can warn before anyone signs in; allowlistHasNoAdmin's
+    // own states are covered in access-entries.test.ts.
+    expect(JSON.parse(res.body)).toEqual({
+      providers: [{ id: "google", label: "Google" }],
+      accessCode: true,
+      noAdmin: false,
+    });
   });
 });
 

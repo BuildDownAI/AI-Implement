@@ -109,10 +109,13 @@ describe("resolveSession", () => {
     expect(sessionRow(token)).toBeUndefined();
   });
 
-  it("reports no identity when a row carries only some of the identity columns", () => {
+  // A partial row is neither SSO nor access-code. Reporting it as identity-less was harmless while
+  // every session was equally privileged, but that branch is now the access-code path and carries
+  // admin — so the ambiguous case has to be rejected rather than resolve toward privilege.
+  it("rejects a row carrying only some of the identity columns", () => {
     const token = session.createSession({ email: "ada@eudoxus.ai", sub: "google|123", provider: "google" });
     dedup.getDb().prepare("UPDATE admin_sessions SET provider = NULL WHERE token = ?").run(token);
-    expect(session.resolveSession(token)).toEqual({ identity: null });
+    expect(session.resolveSession(token)).toBeNull();
   });
 });
 
@@ -165,7 +168,8 @@ describe("authenticateAdminRequest", () => {
   it("admits an access-code session without consulting the list, since it carries no address", () => {
     allow("");
     const token = session.createSession();
-    expect(session.authenticateAdminRequest(withToken(token))).toEqual({ ok: true, identity: null, entry: null });
+    // Admin despite having no entry to take a role from: the access-code path is local development.
+    expect(session.authenticateAdminRequest(withToken(token))).toEqual({ ok: true, identity: null, entry: null, role: "admin" });
   });
 
   it("admits an allowed identity and hands back the entry that matched", () => {

@@ -1,9 +1,12 @@
+import { icon } from "../icons.js";
+import { GRANT_BLOCKERS, PAGE_GROUPS, PAGE_LABELS } from "../sidebar.js";
+
 export const accessHtml = `
 <section data-page="access" hidden>
   <header class="page-header">
     <div class="page-header-left">
       <h1 class="page-title">Access</h1>
-      <div class="page-subtitle">Who may sign in to this orchestrator</div>
+      <div class="page-subtitle">Who may sign in to this orchestrator, and what they can see</div>
     </div>
     <div class="page-header-actions">
       <span id="access-dirty" class="badge warn hidden" style="margin-right:8px"><span class="dot"></span>unsaved changes</span>
@@ -21,19 +24,29 @@ export const accessHtml = `
       Nobody can sign in. Set <span class="mono">OAUTH_ALLOWED_DOMAINS</span> or <span class="mono">OAUTH_ALLOWED_EMAILS</span> on this app and restart &#x2014; once someone can sign in with SSO, this page takes over from there.
     </div>
 
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+      <button class="card card-action" id="access-editor" onclick="openAddEntry()">
+        <span class="card-action-title">Add an entry${icon("chevronRight", 14)}</span>
+        <span class="field-hint">A domain admits everyone at that domain as a user. Only an email can be an admin, and an email entry overrides the domain for that person.</span>
+      </button>
+      <button class="card card-action" id="grants-section" onclick="openGrantEditor()">
+        <span class="card-action-title">Manage user page access${icon("chevronRight", 14)}</span>
+        <span class="field-hint">Users always reach the MCP server. Choose which admin pages they can open as well &#x2014; the same set applies to every user.</span>
+      </button>
+    </div>
+
     <div class="card">
       <div class="card-header">
         <h2 class="card-title">Sign-in allowlist</h2>
       </div>
-      <div class="card-body">
-        <div class="field-hint" style="margin-bottom:8px">A domain admits everyone at that domain as a user. Only an email can be an admin.</div>
+      <div class="card-body tight">
         <table class="tbl">
           <thead><tr><th>Type</th><th>Email / Domain</th><th>Role</th><th>Added</th><th></th></tr></thead>
           <tbody id="access-body"></tbody>
         </table>
         <div id="access-empty" class="empty hidden">No entries.</div>
 
-        <div id="access-banner" class="alert hidden" style="margin-top:12px">
+        <div id="access-banner" class="alert hidden" style="margin:12px 14px 14px">
           <span class="alert-icon">&#x25CF;</span>
           <div>
             <div class="alert-title" id="access-banner-title"></div>
@@ -41,40 +54,98 @@ export const accessHtml = `
           </div>
         </div>
 
-        <div id="access-editor" style="display:flex;gap:6px;align-items:flex-end;flex-wrap:wrap;margin-top:10px">
-          <div class="field" style="min-width:110px">
-            <label class="field-label">Type</label>
-            <select class="input" id="access-new-kind" onchange="onAccessKindChange()">
-              <option value="address">Email</option>
-              <option value="domain">Domain</option>
-            </select>
-          </div>
-          <div class="field" style="flex:1;min-width:220px">
-            <label class="field-label">Email / Domain</label>
-            <input class="input mono" id="access-new-value" placeholder="name@example.com">
-          </div>
-          <div class="field" style="min-width:110px">
-            <label class="field-label">Role</label>
-            <select class="input" id="access-new-role">
-              <option value="user">user</option>
-              <option value="admin">admin</option>
-            </select>
-          </div>
-          <button class="btn btn-accent btn-sm" onclick="addAccessEntry()" style="align-self:flex-end">+ Add</button>
-        </div>
-        <div class="field-hint">Roles are stored now and take effect when the Admin/User split ships.</div>
-        <div id="access-error" class="error hidden"></div>
       </div>
     </div>
 
     <div class="card">
       <div class="card-header"><h2 class="card-title">Recent access changes</h2></div>
-      <div class="card-body">
+      <div class="card-body tight">
         <table class="tbl">
           <thead><tr><th>When</th><th>Who</th><th>Change</th></tr></thead>
           <tbody id="access-changes-body"></tbody>
         </table>
         <div id="access-changes-empty" class="empty hidden">No changes recorded yet.</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="add-entry-modal" class="modal" hidden>
+    <div class="modal-backdrop" onclick="closeAddEntry()"></div>
+    <div class="modal-card" style="width:560px">
+      <div style="padding:18px 24px 14px;border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <h2 style="font-size:15px;font-weight:600;margin:0">Add to the allowlist</h2>
+          <div style="font-size:12px;color:var(--fg-tertiary);margin-top:2px">Added to the list on this page &#x2014; nothing takes effect until you save.</div>
+        </div>
+        <button class="btn btn-ghost btn-icon" onclick="closeAddEntry()" title="Close">&times;</button>
+      </div>
+
+      <div style="padding:20px 24px 0;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+        <div class="field" style="min-width:110px">
+          <label class="field-label">Type</label>
+          <select class="input" id="access-new-kind" onchange="onAccessKindChange()">
+            <option value="address">Email</option>
+            <option value="domain">Domain</option>
+          </select>
+        </div>
+        <div class="field" style="flex:1;min-width:200px">
+          <label class="field-label">Email / Domain</label>
+          <input class="input mono" id="access-new-value" placeholder="name@example.com" onkeydown="if (event.key === 'Enter') stageAccessEntry()">
+        </div>
+        <div class="field" style="min-width:100px">
+          <label class="field-label">Role</label>
+          <select class="input" id="access-new-role">
+            <option value="user">user</option>
+            <option value="admin">admin</option>
+          </select>
+        </div>
+        <button class="btn btn-icon" onclick="stageAccessEntry()" style="flex:none;color:var(--accent)" title="Add another">${icon("plus", 14)}</button>
+      </div>
+
+      <div style="padding:12px 24px 0"><div id="access-error" class="error hidden"></div></div>
+
+      <div id="access-staged-section" style="padding:16px 24px 4px" hidden>
+        <div class="field-label" id="access-staged-label"></div>
+        <div id="access-staged" style="max-height:172px;overflow-y:auto;margin-top:4px"></div>
+      </div>
+
+      <div style="padding:14px 24px;border-top:1px solid var(--border-subtle);display:flex;justify-content:flex-end;gap:8px">
+        <button class="btn btn-sm" onclick="closeAddEntry()">Cancel</button>
+        <button class="btn btn-accent btn-sm" onclick="commitStagedEntries()">Add to list</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="grant-modal" class="modal" hidden>
+    <div class="modal-backdrop" onclick="closeGrantEditor()"></div>
+    <div class="modal-card" style="display:flex;flex-direction:column;max-height:90vh">
+      <div style="padding:18px 24px 14px;border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <h2 style="font-size:15px;font-weight:600;margin:0">Pages a user can see</h2>
+          <div style="font-size:12px;color:var(--fg-tertiary);margin-top:2px">Admins see everything. A user sees only what is ticked here, plus the MCP server.</div>
+        </div>
+        <button class="btn btn-ghost btn-icon" onclick="closeGrantEditor()" title="Close">&times;</button>
+      </div>
+
+      <div style="padding:20px 24px;flex:1;overflow-y:auto">
+        <div id="grant-list"></div>
+        <details style="margin-top:20px">
+          <summary class="alert warn" style="cursor:pointer;list-style:none">
+            <span class="alert-icon">!</span>
+            <div>
+              <div class="alert-title">Some pages can never be granted</div>
+              <div class="alert-desc">They carry credentials or infrastructure control. Open this to see which, and why.</div>
+            </div>
+          </summary>
+          <div id="grant-blocked" style="margin-top:10px"></div>
+        </details>
+      </div>
+
+      <div style="padding:14px 24px;border-top:1px solid var(--border-subtle);display:flex;align-items:center;gap:8px">
+        <div id="grant-error" class="error hidden" style="flex:1;margin:0"></div>
+        <div style="flex:1"></div>
+        <button class="btn btn-sm" onclick="closeGrantEditor()">Cancel</button>
+        <button class="btn btn-accent btn-sm" onclick="saveGrants()">Save</button>
       </div>
     </div>
   </div>
@@ -214,8 +285,8 @@ export const accessScript = `
    */
   function blockedBecause() {
     if (!state.source) return 'unreadable';
-    // Server-supplied rather than inferred: auth.ts populates the identity asynchronously, and
-    // the router can reach this page first.
+    // Server-supplied rather than inferred: whether a change can be attributed to someone is the
+    // server's rule, and re-deriving it here would let the two drift.
     if (!state.canEdit) return 'access-code';
     if (!state.saved.length && !state.draft.length) return 'seed';
     return null;
@@ -231,6 +302,8 @@ export const accessScript = `
     document.getElementById('access-readonly').classList.toggle('hidden', blocked !== 'access-code');
     document.getElementById('access-seed').classList.toggle('hidden', blocked !== 'seed');
     document.getElementById('access-editor').classList.toggle('hidden', blocked !== null);
+    // Same gate as the allowlist editor: an access-code session has no actor to attribute a grant to.
+    document.getElementById('grants-section').classList.toggle('hidden', blocked !== null);
     document.getElementById('access-save').disabled = blocked !== null || !dirty;
     document.getElementById('access-dirty').classList.toggle('hidden', blocked !== null || !dirty);
   }
@@ -240,6 +313,37 @@ export const accessScript = `
     el.textContent = message || '';
     el.classList.toggle('hidden', !message);
   }
+
+  // Held here rather than in state.draft so Cancel genuinely discards: an entry reaches the page's
+  // list only when the modal is committed.
+  var staged = [];
+
+  function renderStaged() {
+    document.getElementById('access-staged-section').hidden = staged.length === 0;
+    document.getElementById('access-staged-label').textContent =
+      staged.length === 1 ? '1 entry to add' : staged.length + ' entries to add';
+    document.getElementById('access-staged').innerHTML = staged.map(function (e, i) {
+      return '<div class="checkbox-row" style="cursor:default">'
+        + '<span class="text-tertiary" style="flex:none;min-width:48px">' + window.esc(TYPE_LABEL[e.kind] || e.kind) + '</span>'
+        + '<span class="mono" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">' + window.esc(e.value) + '</span>'
+        + '<span class="text-tertiary" style="flex:none">' + window.esc(e.role) + '</span>'
+        + '<button class="btn btn-sm btn-danger" style="flex:none" onclick="unstageAccessEntry(' + i + ')" title="Remove">&times;</button>'
+        + '</div>';
+    }).join('');
+  }
+
+  function openAddEntry() {
+    staged = [];
+    document.getElementById('access-new-value').value = '';
+    showError('');
+    renderStaged();
+    document.getElementById('add-entry-modal').hidden = false;
+    document.getElementById('access-new-value').focus();
+  }
+  window.openAddEntry = openAddEntry;
+
+  function closeAddEntry() { document.getElementById('add-entry-modal').hidden = true; }
+  window.closeAddEntry = closeAddEntry;
 
   function apply(payload) {
     state.source = payload.source;
@@ -265,28 +369,51 @@ export const accessScript = `
   }
   window.onAccessKindChange = onAccessKindChange;
 
-  function addAccessEntry() {
+  /** Validates the form and appends it to the staged list. Returns false without staging on error. */
+  function stageAccessEntry() {
     var kind = document.getElementById('access-new-kind').value;
     var valueEl = document.getElementById('access-new-value');
     var value = valueEl.value.trim().toLowerCase();
     var role = kind === 'domain' ? 'user' : document.getElementById('access-new-role').value;
-    if (!value) return showError(kind === 'domain' ? 'Enter a domain.' : 'Enter an email address.');
+    if (!value) { showError(kind === 'domain' ? 'Enter a domain.' : 'Enter an email address.'); return false; }
     // A hint, not the gate — the server re-checks with the stricter patterns and is authoritative.
     if (kind === 'address' && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(value)) {
-      return showError('"' + value + '" is not an email address.');
+      showError('"' + value + '" is not an email address.');
+      return false;
     }
     if (kind === 'domain' && !/^[^\\s@.]+(\\.[^\\s@.]+)+$/.test(value)) {
-      return showError('"' + value + '" is not a domain.');
+      showError('"' + value + '" is not a domain.');
+      return false;
     }
-    for (var i = 0; i < state.draft.length; i++) {
-      if (state.draft[i].kind === kind && state.draft[i].value === value) return showError(value + ' is already listed.');
+    var listed = state.draft.concat(staged);
+    for (var i = 0; i < listed.length; i++) {
+      if (listed[i].kind === kind && listed[i].value === value) { showError(value + ' is already listed.'); return false; }
     }
-    state.draft.push({ kind: kind, value: value, role: role });
+    staged.push({ kind: kind, value: value, role: role });
     valueEl.value = '';
+    valueEl.focus();
     showError('');
+    renderStaged();
+    return true;
+  }
+  window.stageAccessEntry = stageAccessEntry;
+
+  function unstageAccessEntry(index) {
+    staged.splice(index, 1);
+    renderStaged();
+  }
+  window.unstageAccessEntry = unstageAccessEntry;
+
+  function commitStagedEntries() {
+    // Forgiving on purpose: a value typed and not yet added would otherwise be lost on the click
+    // most people read as "add it". An invalid one reports and blocks the commit.
+    var typed = document.getElementById('access-new-value').value.trim();
+    if ((typed || !staged.length) && !stageAccessEntry()) return;
+    staged.forEach(function (e) { state.draft.push(e); });
+    closeAddEntry();
     render();
   }
-  window.addAccessEntry = addAccessEntry;
+  window.commitStagedEntries = commitStagedEntries;
 
   function removeAccessEntry(index) {
     state.draft.splice(index, 1);
@@ -338,6 +465,108 @@ export const accessScript = `
     apply(payload);
   }
 
-  window.registerPage('access', loadAccess);
+  // Rendered in from sidebar.ts: the client names pages, the server decides which are grantable.
+  var PAGE_LABELS = ${JSON.stringify(PAGE_LABELS)};
+  var PAGE_GROUPS = ${JSON.stringify(PAGE_GROUPS)};
+  var GRANT_BLOCKERS = ${JSON.stringify(GRANT_BLOCKERS)};
+
+  var grants = { granted: [], grantable: [], draft: [] };
+
+  /** Keys in sidebar order, split under their nav group so the modal reads like the sidebar. */
+  function byGroup(keys) {
+    var out = [];
+    keys.forEach(function (key) {
+      var group = PAGE_GROUPS[key] || 'Other';
+      var bucket = out.filter(function (b) { return b.group === group; })[0];
+      if (!bucket) { bucket = { group: group, keys: [] }; out.push(bucket); }
+      bucket.keys.push(key);
+    });
+    return out;
+  }
+
+  function groupLabel(text) {
+    return '<div class="nav-section-label" style="margin:14px 0 2px">' + window.esc(text) + '</div>';
+  }
+
+  function renderGrantEditor() {
+    document.getElementById('grant-list').innerHTML = byGroup(grants.grantable).map(function (b) {
+      return groupLabel(b.group) + b.keys.map(function (key) {
+        var i = grants.grantable.indexOf(key);
+        var on = grants.draft.indexOf(key) !== -1;
+        return '<label class="checkbox-row">'
+          + '<input type="checkbox" style="width:auto"' + (on ? ' checked' : '') + ' onchange="toggleGrant(' + i + ')">'
+          + '<span>' + window.esc(PAGE_LABELS[key] || key) + '</span>'
+          + '</label>';
+      }).join('');
+    }).join('');
+
+    document.getElementById('grant-blocked').innerHTML = byGroup(Object.keys(GRANT_BLOCKERS)).map(function (b) {
+      return groupLabel(b.group) + b.keys.map(function (key) {
+        return '<div class="checkbox-row text-tertiary" style="cursor:default">'
+          + '<span>' + window.esc(PAGE_LABELS[key] || key) + '</span>'
+          + '</div>'
+          + '<div class="kpi-trend text-secondary" style="margin-left:24px">' + window.esc(GRANT_BLOCKERS[key]) + '</div>';
+      }).join('');
+    }).join('');
+  }
+
+  function toggleGrant(index) {
+    var key = grants.grantable[index];
+    var at = grants.draft.indexOf(key);
+    if (at === -1) grants.draft.push(key); else grants.draft.splice(at, 1);
+  }
+  window.toggleGrant = toggleGrant;
+
+  function openGrantEditor() {
+    // Copied on open and discarded on cancel, so closing without saving genuinely reverts.
+    grants.draft = grants.granted.slice();
+    showGrantError('');
+    renderGrantEditor();
+    document.getElementById('grant-modal').hidden = false;
+  }
+  window.openGrantEditor = openGrantEditor;
+
+  function closeGrantEditor() { document.getElementById('grant-modal').hidden = true; }
+  window.closeGrantEditor = closeGrantEditor;
+
+  function showGrantError(message) {
+    var el = document.getElementById('grant-error');
+    el.textContent = message || '';
+    el.classList.toggle('hidden', !message);
+  }
+
+  function applyGrants(payload) {
+    grants.granted = payload.granted || [];
+    grants.grantable = payload.grantable || [];
+  }
+
+  async function saveGrants() {
+    var payload;
+    try {
+      var res = await window.api('/api/access-grants', { method: 'POST', body: JSON.stringify({ pages: grants.draft }) });
+      payload = await res.json();
+      if (!res.ok) return showGrantError(payload.error || 'Grants could not be saved.');
+    } catch (e) {
+      return showGrantError('Grants could not be saved.');
+    }
+    applyGrants(payload);
+    closeGrantEditor();
+  }
+  window.saveGrants = saveGrants;
+
+  async function loadGrants() {
+    try {
+      var res = await window.api('/api/access-grants');
+      if (res.ok) applyGrants(await res.json());
+    } catch (e) { /* the summary stays blank rather than claiming a state it does not know */ }
+  }
+
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Escape') return;
+    if (!document.getElementById('add-entry-modal').hidden) closeAddEntry();
+    else if (!document.getElementById('grant-modal').hidden) closeGrantEditor();
+  });
+
+  window.registerPage('access', function () { loadAccess(); loadGrants(); });
 })();
 `;

@@ -101,7 +101,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Stuck-run recovery | `src/reaper.ts`, `src/stuck-watchdog.ts` | |
 | Per-team dispatch capacity | `src/poll-selection.ts` | |
 | Run classification and autopsy | `src/completion-classification.ts`, `src/run-autopsy.ts` | |
-| Admin SSO / OIDC, sign-in allowlist | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts` | [docs/access-model.md](docs/access-model.md) |
+| Admin SSO / OIDC, roles, page grants | `src/oauth/`, `src/admin-session.ts`, `src/access-entries.ts`, `src/access-page-grants.ts` | [docs/access-model.md](docs/access-model.md) |
 | Admin SPA | `src/admin-ui/` | |
 
 **Diagram convention:** flow diagrams in `docs/`, issue bodies, and PR descriptions are mermaid (validated with `mermaid-cli` before commit); tabular data is a table; ASCII only in this file. Full rule: [docs/README.md](docs/README.md).
@@ -268,13 +268,13 @@ Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll dete
 
 ## Admin UI and auth
 
-SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. The fail-closed allowlist is **database-backed and edited at `/admin#access`** — `OAUTH_ALLOWED_*` seed it and apply until the first save, which hands authority to the stored list permanently.
+SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. The fail-closed allowlist is **database-backed and edited at `/admin#access`** — `OAUTH_ALLOWED_*` seed it and apply until the first save, which hands authority to the stored list permanently. Every entry carries a role: `admin` reaches everything, `user` reaches `/mcp` plus whichever pages have been granted — none, until someone grants some.
 
-Three things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`.** An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
+Four things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`** — so a domain-only seed admits everyone and lets nobody administer, a misconfiguration the boot log and the sign-in page both flag. An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing — and re-pointing a bound entry takes two saves, not one. **Page grants restrict the admin UI, not what a user can read**: `/mcp` is role-blind, so a user granted nothing still reaches every MCP tool. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
 
 Every authenticated request re-checks against an in-memory list, so a removal ends a session on the next request rather than at token expiry. **Full reference: [docs/access-model.md](docs/access-model.md)** — precedence, the audit trail, and the host command that recovers from lockout.
 
-The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — all client JS is concatenated into one inline `<script>` at module load. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the HTML-escaping helpers (below) rather than bare globals. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts`.
+The SPA at `/admin` is composed from string-exporting modules under `src/admin-ui/` with **no client-side build step** — all client JS is concatenated into one inline `<script>` at module load. Each `pages/<name>.ts` exports `<name>Html` and `<name>Script`; the script is an IIFE ending in `window.registerPage('<route>', …)`, and page scripts call `window.api()` and the HTML-escaping helpers (below) rather than bare globals. Adding a page means the module, both strings in `index.ts`, and a route in `sidebar.ts` — and it is ungrantable until listed in `PAGE_ROUTES` (`access-page-grants.ts`), which is deliberate: grantability is declared by naming what a page may read, so a new page and a new endpoint both fail closed.
 
 **HTML escaping — three-way rule** (full rationale: [docs/adr/002-admin-ui-html-escaping.md](docs/adr/002-admin-ui-html-escaping.md)):
 

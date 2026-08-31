@@ -47,11 +47,13 @@ export const auditScript = `
         tr.innerHTML = '<td><span class="mono">' + window.esc(issueLabel) + '</span></td>'
           + '<td>' + dt + '</td>'
           + '<td></td>';
-        const delBtn = document.createElement('button');
-        delBtn.className = 'danger';
-        delBtn.textContent = 'Delete';
-        delBtn.addEventListener('click', function() { delDedup(e.issueId); });
-        tr.lastElementChild.appendChild(delBtn);
+        if (window.isAdmin()) {
+          const delBtn = document.createElement('button');
+          delBtn.className = 'danger';
+          delBtn.textContent = 'Delete';
+          delBtn.addEventListener('click', function() { delDedup(e.issueId); });
+          tr.lastElementChild.appendChild(delBtn);
+        }
         tbody.appendChild(tr);
       }
     } catch (err) {

@@ -22,6 +22,7 @@ import { runnersHtml, runnersScript } from "./pages/runners.js";
 import { reportsHtml, reportsScript } from "./pages/reports.js";
 import { deploymentsHtml, deploymentsScript } from "./pages/deployments.js";
 import { stubsHtml } from "./pages/stubs.js";
+import { noAccessHtml } from "./pages/no-access.js";
 import { drawerHtml, drawerScript } from "./drawer.js";
 import { stepperHtml, stepperScript } from "./stepper.js";
 
@@ -58,6 +59,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${deploymentsHtml}
     ${accessHtml}
     ${stubsHtml}
+    ${noAccessHtml}
   </main>
 </div>`;
 
@@ -67,6 +69,11 @@ const body = `<body>
     <h1 class="login-title">Admin Access</h1>
     <div class="login-box card">
       <div id="auth-error" class="error hidden"></div>
+      <div id="no-admin-notice" class="warning hidden">
+        Nobody can administer this orchestrator. You can sign in, but every admin page will be unavailable.<br>
+        Only a listed <strong>email address</strong> can be an admin &#x2014; a domain admits its members as users.
+        Add one to <span class="mono">OAUTH_ALLOWED_EMAILS</span> and restart.
+      </div>
       <div id="sso-label" class="sso-label hidden">Sign in with your provider</div>
       <div id="sso-buttons"></div>
       <div id="login-divider" class="divider-labeled hidden"><span>or use an access code</span></div>

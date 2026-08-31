@@ -252,6 +252,9 @@ export const pipelinesScript = `
   window.loadLog = loadLog;
 
   function wireRowClicks() {
+    // The job drawer reads the job-steps and mapping endpoints, both Admin-only, so opening it as a
+    // user could only ever report failure. The table itself is the granted read and works.
+    if (!window.isAdmin()) return;
     const tbody = document.getElementById('log-body');
     if (!tbody || tbody.dataset.drawerWired) return;
     tbody.addEventListener('click', function (e) {

@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import type http from "node:http";
 import { getDb } from "./dedup.js";
 import { parseCookies, SESSION_COOKIE_NAME } from "./cookies.js";
-import { recheckIdentity, type AccessEntry } from "./access-entries.js";
+import { recheckIdentity, type AccessEntry, type AccessRole } from "./access-entries.js";
 
 export const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -63,7 +63,14 @@ export function resolveSession(token: string | undefined): ResolvedSession | nul
     getDb().prepare("DELETE FROM admin_sessions WHERE token = ?").run(token);
     return null;
   }
-  // SSO sets all three; the access-code path sets none.
+  // SSO sets all three; the access-code path sets none. A row with only some of them is neither,
+  // and must not fall through to the identity-less branch — that one is treated as the access-code
+  // path and carries admin, so the ambiguous case would resolve toward privilege.
+  const present = [row.email, row.sub, row.provider].filter(Boolean).length;
+  if (present > 0 && present < 3) {
+    console.warn("[admin-session] session row has a partial identity; treating it as invalid");
+    return null;
+  }
   const identity: SessionIdentity | null =
     row.email && row.sub && row.provider
       ? { email: row.email, sub: row.sub, provider: row.provider, name: row.name }
@@ -97,7 +104,7 @@ export function accessCodeMatches(submitted: string, configured: string): boolea
 }
 
 export type AdminGate =
-  | { ok: true; identity: SessionIdentity | null; entry: AccessEntry | null }
+  | { ok: true; identity: SessionIdentity | null; entry: AccessEntry | null; role: AccessRole }
   | { ok: false; status: number; error: string };
 
 /** Authenticate a request and confirm the identity is still admitted. */
@@ -106,8 +113,8 @@ export function authenticateAdminRequest(req: http.IncomingMessage): AdminGate {
   const session = resolveSession(token);
   if (!session) return { ok: false, status: 401, error: "Unauthorized" };
 
-  // An access-code session carries no address to re-check against.
-  if (!session.identity) return { ok: true, identity: null, entry: null };
+  // No address to re-check against, and deliberately Admin: the access-code path is local development, and it still cannot edit the allowlist.
+  if (!session.identity) return { ok: true, identity: null, entry: null, role: "admin" };
 
   const recheck = recheckIdentity(session.identity);
   if (recheck.status === "unavailable") {
@@ -118,5 +125,5 @@ export function authenticateAdminRequest(req: http.IncomingMessage): AdminGate {
     if (token) revokeSession(token);
     return { ok: false, status: 401, error: "Unauthorized" };
   }
-  return { ok: true, identity: session.identity, entry: recheck.entry };
+  return { ok: true, identity: session.identity, entry: recheck.entry, role: recheck.entry.role };
 }

@@ -28,8 +28,9 @@ import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
 import { configureLinearAuth } from "./linear-app-auth.js";
 import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./oauth/providers.js";
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
-import { initAccessEntriesTable } from "./access-entries.js";
+import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
+import { initAccessPageGrantsTable } from "./access-page-grants.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationTokenRequest } from "./publication-token-vending.js";
@@ -161,6 +162,9 @@ function loadConfig(): AppConfig {
   const oauthRedirectBaseUrl = process.env.OAUTH_REDIRECT_BASE_URL || null;
   if (oauthConfigured && !oauthRedirectBaseUrl) {
     console.warn("[main] OAuth providers configured but OAUTH_REDIRECT_BASE_URL not set — SSO redirect URIs can't be built");
+  }
+  if (allowlistHasNoAdmin()) {
+    console.warn("[main] no admin in the sign-in allowlist — /api/ routes will 403; only addresses in OAUTH_ALLOWED_EMAILS can be admin");
   }
 
   const notifyWebhookUrl = process.env.NOTIFY_WEBHOOK_URL || null;
@@ -3317,6 +3321,7 @@ async function main(): Promise<void> {
   initStepLogTable();
   initMcpOAuthTables();
   initAccessAuditTable();
+  initAccessPageGrantsTable();
 
   // A process that died mid-deploy must not leave dispatch paused forever.
   const holdWasSet = clearDeployHold();

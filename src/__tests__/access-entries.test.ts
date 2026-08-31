@@ -91,7 +91,7 @@ describe("saveAccessEntries", () => {
   });
 
   it("trims and lowercases the value, so matching is case-insensitive", () => {
-    access.saveAccessEntries([{ kind: "address", value: "  Ada@Eudoxus.AI  ", role: "user" }], null);
+    access.saveAccessEntries([{ kind: "address", value: "  Ada@Eudoxus.AI  ", role: "admin" }], null);
     expect(access.listAccessEntries()[0].value).toBe("ada@eudoxus.ai");
   });
 
@@ -108,11 +108,13 @@ describe("saveAccessEntries", () => {
   });
 
   it("keeps a surviving entry's binding and provenance while updating its role", () => {
-    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }], "first@eudoxus.ai");
+    // keeper carries the admin role throughout, so ada is free to start as a user.
+    const keeper = { kind: "address" as const, value: "keeper@eudoxus.ai", role: "admin" as const };
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "user" }, keeper], "first@eudoxus.ai");
     access.bindAccessEntry("ada@eudoxus.ai", "google", "google|123");
     dedup.getDb().prepare("UPDATE access_entries SET added_at = ? WHERE value = ?").run(1000, "ada@eudoxus.ai");
 
-    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], "second@eudoxus.ai");
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }, keeper], "second@eudoxus.ai");
 
     const row = rawRow("address", "ada@eudoxus.ai")!;
     expect(row.role).toBe("admin");
@@ -151,6 +153,81 @@ describe("saveAccessEntries", () => {
   });
 });
 
+describe("allowlistHasNoAdmin", () => {
+  beforeEach(() => {
+    delete process.env.OAUTH_ALLOWED_DOMAINS;
+    delete process.env.OAUTH_ALLOWED_EMAILS;
+  });
+
+  it("reports a domain-only env seed, the shape .env.example ships", () => {
+    process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
+    expect(access.allowlistHasNoAdmin()).toBe(true);
+  });
+
+  it("is satisfied by one listed address, since env addresses are admins", () => {
+    process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
+    process.env.OAUTH_ALLOWED_EMAILS = "ada@eudoxus.ai";
+    expect(access.allowlistHasNoAdmin()).toBe(false);
+  });
+
+  it("stays quiet for an empty list, which is a different misconfiguration", () => {
+    // Nobody can sign in at all — pointing the operator at the admin role would misdirect them.
+    expect(access.allowlistHasNoAdmin()).toBe(false);
+  });
+
+  it("stays quiet once a stored list is in force, which the last-admin guard keeps admin-bearing", () => {
+    process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+    expect(access.allowlistHasNoAdmin()).toBe(false);
+  });
+});
+
+describe("saveAccessEntries — the last-admin guard", () => {
+  const ada = { provider: "google", sub: "google|123", email: "ada@eudoxus.ai" };
+
+  it("refuses a save that would leave the stored list with no admin", () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+
+    expect(() =>
+      access.saveAccessEntries([{ kind: "domain", value: "eudoxus.ai", role: "user" }], null),
+    ).toThrow(/nobody able to administer/);
+    expect(access.listAccessEntries().map((e) => e.value)).toEqual(["ada@eudoxus.ai"]);
+  });
+
+  it("allows demoting yourself while another admin remains", () => {
+    access.saveAccessEntries(
+      [
+        { kind: "address", value: "ada@eudoxus.ai", role: "admin" },
+        { kind: "address", value: "cam@eudoxus.ai", role: "admin" },
+      ],
+      null,
+    );
+
+    access.saveAccessEntries(
+      [
+        { kind: "address", value: "ada@eudoxus.ai", role: "user" },
+        { kind: "address", value: "cam@eudoxus.ai", role: "admin" },
+      ],
+      "ada@eudoxus.ai",
+      { mustAdmit: ada },
+    );
+
+    const roles = Object.fromEntries(access.listAccessEntries().map((e) => [e.value, e.role]));
+    expect(roles).toEqual({ "ada@eudoxus.ai": "user", "cam@eudoxus.ai": "admin" });
+  });
+
+  it("refuses emptying the list, so the handover to the database stays one-way", () => {
+    access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
+
+    // The self-lockout guard fires first: it evaluates the stored rows, which an empty save leaves
+    // with nothing to match, regardless of what the environment would fall back to.
+    expect(() => access.saveAccessEntries([], "ada@eudoxus.ai", { mustAdmit: ada })).toThrow(
+      /remove your own access/,
+    );
+    expect(access.listAccessEntries()).toHaveLength(1);
+  });
+});
+
 describe("bindAccessEntry", () => {
   it("records the provider identity an address resolved to", () => {
     access.saveAccessEntries([{ kind: "address", value: "ada@eudoxus.ai", role: "admin" }], null);
@@ -172,7 +249,13 @@ describe("bindAccessEntry", () => {
   });
 
   it("ignores domain entries, which admit many identities and bind to none", () => {
-    access.saveAccessEntries([{ kind: "domain", value: "eudoxus.ai", role: "user" }], null);
+    access.saveAccessEntries(
+      [
+        { kind: "domain", value: "eudoxus.ai", role: "user" },
+        { kind: "address", value: "keeper@eudoxus.ai", role: "admin" },
+      ],
+      null,
+    );
     access.bindAccessEntry("eudoxus.ai", "google", "google|123");
 
     const row = rawRow("domain", "eudoxus.ai")!;

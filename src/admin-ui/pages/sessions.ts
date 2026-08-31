@@ -84,11 +84,13 @@ export const sessionsScript = `
           + '<td>' + window.esc(s.state) + '</td>'
           + '<td>' + duration + '</td>'
           + '<td></td>';
-        const destroyBtn = document.createElement('button');
-        destroyBtn.className = 'sm danger';
-        destroyBtn.textContent = 'Destroy';
-        destroyBtn.addEventListener('click', function() { destroySession(s.machineId); });
-        tr.lastElementChild.appendChild(destroyBtn);
+        if (window.isAdmin()) {
+          const destroyBtn = document.createElement('button');
+          destroyBtn.className = 'sm danger';
+          destroyBtn.textContent = 'Destroy';
+          destroyBtn.addEventListener('click', function() { destroySession(s.machineId); });
+          tr.lastElementChild.appendChild(destroyBtn);
+        }
         tbody.appendChild(tr);
       }
       setLastUpdated('lu-sessions');
