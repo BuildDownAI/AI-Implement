@@ -30,6 +30,7 @@ import { configureOAuthProviders, isOAuthConfigured, providersFromEnv } from "./
 import { handleOAuthCallback, handleOAuthLogout, handleOAuthProviders, handleOAuthStart } from "./oauth/routes.js";
 import { allowlistHasNoAdmin, initAccessEntriesTable } from "./access-entries.js";
 import { initAccessAuditTable } from "./access-audit.js";
+import { initAccessPageGrantsTable } from "./access-page-grants.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationTokenRequest } from "./publication-token-vending.js";
@@ -3320,6 +3321,7 @@ async function main(): Promise<void> {
   initStepLogTable();
   initMcpOAuthTables();
   initAccessAuditTable();
+  initAccessPageGrantsTable();
 
   // A process that died mid-deploy must not leave dispatch paused forever.
   const holdWasSet = clearDeployHold();

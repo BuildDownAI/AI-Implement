@@ -97,10 +97,9 @@ export const authJs = `
   function showAdmin() {
     document.getElementById('login-page').classList.add('hidden');
     document.getElementById('admin-page').classList.remove('hidden');
-    // Re-fire the router so the correct page section is shown and its init runs.
-    // The router's DOMContentLoaded listener already ran by the time login completes,
-    // so it needs an explicit nudge.
-    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    // Releases the router, which ignores every hashchange until this point — a page's init runs
+    // once, and before here the role it renders against is not yet known.
+    window.startRouting();
   }
   window.showAdmin = showAdmin;
 
@@ -156,9 +155,24 @@ export const authJs = `
       return await res.json();
     } catch (e) { return null; }
   }
-  window.getSessionIdentity = function () { return sessionIdentity; };
+  // Withholds admin-only controls inside a page a user can otherwise open. Cosmetic: every such
+  // route is refused at the server gate, so a call site that forgets this yields a 403, not a leak.
+  window.isAdmin = function () { return !!sessionIdentity && sessionIdentity.role === 'admin'; };
+
+  // Hidden rather than removed, so an access-code sign-in later in the same page load restores the
+  // full nav. The router reads visibility, so a hidden page is unreachable by hash as well.
+  function applyNavVisibility(s) {
+    var granted = s.grantedPages || [];
+    document.querySelectorAll('.nav-item').forEach(function (el) {
+      el.hidden = s.role !== 'admin' && granted.indexOf(el.getAttribute('data-route')) === -1;
+    });
+    document.querySelectorAll('.nav-section').forEach(function (sec) {
+      sec.hidden = !sec.querySelector('.nav-item:not([hidden])');
+    });
+  }
 
   function applySessionIdentity(s) {
+    applyNavVisibility(s);
     // The bright slot always carries the most identifying value we have.
     const primary = s.name || s.email || 'Access code';
     const secondary = s.name ? (s.email || '') : '';

@@ -30,6 +30,7 @@ import { listParked, unpark } from "./dispatch-breaker.js";
 import { createSession, accessCodeMatches, authenticateAdminRequest, type AdminGate, type SessionIdentity } from "./admin-session.js";
 import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessEntries, saveAccessEntries } from "./access-entries.js";
 import { listAccessChanges } from "./access-audit.js";
+import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { DeployStart } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
@@ -199,7 +200,18 @@ export interface AdminDeps {
   };
 }
 
-/** Authorization for every `/api/` route: authenticate, answer the identity probe, require Admin. Null means the response is already sent. */
+/**
+ * A granted page reaches its own paths by GET, matched exactly.
+ * Prefix matching is deliberately unsupported: a prefix would also grant sub-paths added under it later, which is the opposite of failing closed.
+ * A parameterized route that ever needs granting must be expressed here explicitly.
+ */
+function grantedRouteAllows(url: string, method: string, grantedPages: string[]): boolean {
+  if (method !== "GET") return false;
+  const path = url.split("?")[0];
+  return grantedPages.some((page) => PAGE_ROUTES[page]?.includes(path));
+}
+
+/** Authorization for every `/api/` route: authenticate, answer the identity probe, then require Admin or a grant. Null means the response is already sent. */
 function authorizeApiRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -219,11 +231,13 @@ function authorizeApiRequest(
       name: gate.identity?.name ?? null,
       provider: gate.identity?.provider ?? null,
       authMethod: gate.identity ? "sso" : "access-code",
+      role: gate.role,
+      grantedPages: listGrantedPages(),
     });
     return null;
   }
 
-  if (gate.role !== "admin") {
+  if (gate.role !== "admin" && !grantedRouteAllows(url, method, listGrantedPages())) {
     json(res, 403, { error: "This action requires an admin" });
     return null;
   }
@@ -514,6 +528,16 @@ export function handleAdminRequest(
 
     if (url === "/api/access" && method === "POST") {
       handlePostAccess(req, res, gate.identity);
+      return true;
+    }
+
+    if (url === "/api/access-grants" && method === "GET") {
+      handleGetAccessGrants(res, gate.identity);
+      return true;
+    }
+
+    if (url === "/api/access-grants" && method === "POST") {
+      handlePostAccessGrants(req, res, gate.identity);
       return true;
     }
 
@@ -1224,6 +1248,52 @@ async function handlePostAccess(
   }
 
   handleGetAccess(res, identity);
+}
+
+function handleGetAccessGrants(res: http.ServerResponse, identity: SessionIdentity | null): void {
+  // Closed to access-code sessions in both directions, not just writes: the deprecated path must
+  // not gain a capability, and a change here needs an actor once grants reach the audit trail.
+  if (!identity) {
+    json(res, 403, { error: "Managing grants requires a signed-in identity" });
+    return;
+  }
+  // Grantable comes from the route table rather than the navigation one: a page is grantable
+  // precisely because someone declared what it may read.
+  json(res, 200, { granted: listGrantedPages(), grantable: Object.keys(PAGE_ROUTES) });
+}
+
+async function handlePostAccessGrants(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: SessionIdentity | null,
+): Promise<void> {
+  // Same rule as the allowlist: widening what non-admins see must be attributable to someone.
+  if (!identity) {
+    json(res, 403, { error: "Editing grants requires a signed-in identity" });
+    return;
+  }
+
+  let body: unknown;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+    return;
+  }
+
+  const pages = (body as { pages?: unknown }).pages;
+  if (!Array.isArray(pages) || pages.some((p) => typeof p !== "string")) {
+    json(res, 400, { error: "pages must be an array of page keys" });
+    return;
+  }
+  const ungrantable = (pages as string[]).filter((p) => !(p in PAGE_ROUTES));
+  if (ungrantable.length > 0) {
+    json(res, 400, { error: `not grantable: ${ungrantable.join(", ")}` });
+    return;
+  }
+
+  savePageGrants(pages as string[], identity.email);
+  handleGetAccessGrants(res, identity);
 }
 
 async function handleListGlobalSecrets(

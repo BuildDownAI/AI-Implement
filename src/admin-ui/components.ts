@@ -283,6 +283,34 @@ export const componentsCss = `
 .card-body { padding: 16px 18px; }
 .card-body.tight { padding: 0; }
 
+/* A card that IS the control — a real <button>, so focus and Enter/Space come with the element. */
+.card-action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  padding: 16px 18px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: background 80ms ease, border-color 80ms ease;
+}
+.card-action:hover { background: var(--bg-active); border-color: var(--accent); }
+.card-action:focus-visible { outline: none; border-color: var(--border-focus); box-shadow: var(--shadow-focus); }
+.card-action-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-primary);
+}
+.card-action-title .svg-icon { margin-left: auto; flex: none; color: var(--accent); }
+.card-action:hover .card-action-title .svg-icon { color: var(--accent-hover); }
+
 /* ── KPI tiles ─────────────────────────────────────────────── */
 .kpi-grid {
   display: grid;

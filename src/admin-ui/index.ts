@@ -22,6 +22,7 @@ import { runnersHtml, runnersScript } from "./pages/runners.js";
 import { reportsHtml, reportsScript } from "./pages/reports.js";
 import { deploymentsHtml, deploymentsScript } from "./pages/deployments.js";
 import { stubsHtml } from "./pages/stubs.js";
+import { noAccessHtml } from "./pages/no-access.js";
 import { drawerHtml, drawerScript } from "./drawer.js";
 import { stepperHtml, stepperScript } from "./stepper.js";
 
@@ -58,6 +59,7 @@ const shell = `<div id="admin-page" class="app-shell hidden">
     ${deploymentsHtml}
     ${accessHtml}
     ${stubsHtml}
+    ${noAccessHtml}
   </main>
 </div>`;
 

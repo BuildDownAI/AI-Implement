@@ -102,6 +102,7 @@ let queue: typeof WorkflowSyncQueueModule;
 let adminSession: typeof AdminSessionModule;
 let accessEntries: typeof AccessEntriesModule;
 let accessAudit: typeof import("../access-audit.js");
+let accessGrants: typeof import("../access-page-grants.js");
 let provider: FakeProvider;
 
 beforeEach(async () => {
@@ -113,6 +114,7 @@ beforeEach(async () => {
   adminSession = await import("../admin-session.js");
   accessEntries = await import("../access-entries.js");
   accessAudit = await import("../access-audit.js");
+  accessGrants = await import("../access-page-grants.js");
   config = await import("../config.js");
   dedup = await import("../dedup.js");
   runnerMode = await import("../runner-mode.js");
@@ -126,6 +128,7 @@ beforeEach(async () => {
   runnerMode.initSettingsTable();
   accessEntries.initAccessEntriesTable();
   accessAudit.initAccessAuditTable();
+  accessGrants.initAccessPageGrantsTable();
   // Every /api/* request re-checks the signed-in identity and requires Admin, and only a listed
   // address can be one — a domain-only list would admit the suite's identity as a user and 403 it.
   process.env.OAUTH_ALLOWED_DOMAINS = "eudoxus.ai";
@@ -376,6 +379,8 @@ describe("admin session-identity endpoint", () => {
       name: null,
       provider: null,
       authMethod: "access-code",
+      role: "admin",
+      grantedPages: [],
     });
   });
 
@@ -393,6 +398,9 @@ describe("admin session-identity endpoint", () => {
       name: "Ada",
       provider: "google",
       authMethod: "sso",
+      // ada is an admin via OAUTH_ALLOWED_EMAILS; grantedPages is what users may see, not what she can.
+      role: "admin",
+      grantedPages: [],
     });
   });
 
@@ -2504,5 +2512,138 @@ describe("POST /api/deploy-policy", () => {
     admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
     await res.done;
     expect(JSON.parse(res.body)).toMatchObject({ autoDeploy: true, notifyAvailable: true });
+  });
+});
+
+describe("per-page grants", () => {
+  /** Admitted by the domain seed, so a `user` rather than an admin. */
+  function userSession(): string {
+    return adminSession.createSession({
+      email: "reader@eudoxus.ai",
+      sub: "google|reader",
+      provider: "google",
+      name: "Reader",
+    });
+  }
+
+  /** Admitted by OAUTH_ALLOWED_EMAILS, so an admin. */
+  function adminSsoSession(): string {
+    return adminSession.createSession({
+      email: "ada@eudoxus.ai",
+      sub: "google|ada",
+      provider: "google",
+      name: "Ada",
+    });
+  }
+
+  describe("enforcement at the gate", () => {
+    it("refuses a user every page while nothing is granted", async () => {
+      const res = await request("/api/dedup", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(403);
+    });
+
+    it("admits a user to a granted page's own path", async () => {
+      accessGrants.savePageGrants(["audit"], "ada@eudoxus.ai");
+      const res = await request("/api/dedup", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("does not carry a grant to another page's path", async () => {
+      accessGrants.savePageGrants(["audit"], "ada@eudoxus.ai");
+      const res = await request("/api/pulls", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(403);
+    });
+
+    // The element-level markers are cosmetic; this is what actually stops the action.
+    it("keeps a granted page read-only — its destructive sub-path stays admin-only", async () => {
+      accessGrants.savePageGrants(["audit"], "ada@eudoxus.ai");
+      const token = userSession();
+      expect((await request("/api/dedup", "GET", "secret", undefined, token)).statusCode).toBe(200);
+      expect((await request("/api/dedup/AII-1", "DELETE", "secret", undefined, token)).statusCode).toBe(403);
+    });
+
+    // Why the Pipelines row click is withheld from users: the drawer it opens reads both of these,
+    // and neither is grantable — the steps route is parameterized, and the mapping payload carries
+    // the runner environment values that make Overview ungrantable in the first place.
+    it("does not reach the job drawer's endpoints with Pipelines granted", async () => {
+      accessGrants.savePageGrants(["jobs"], "ada@eudoxus.ai");
+      const token = userSession();
+      expect((await request("/api/log", "GET", "secret", undefined, token)).statusCode).toBe(200);
+      expect((await request("/api/jobs/1/steps", "GET", "secret", undefined, token)).statusCode).toBe(403);
+      expect((await request("/api/mappings", "GET", "secret", undefined, token)).statusCode).toBe(403);
+    });
+
+    // A grant is matched on the path alone, so a query string must not defeat it.
+    it("matches the path with its query string stripped", async () => {
+      accessGrants.savePageGrants(["reports"], "ada@eudoxus.ai");
+      const res = await request("/api/report?days=30", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("leaves an admin unaffected by what is granted", async () => {
+      accessGrants.savePageGrants([], "ada@eudoxus.ai");
+      const res = await request("/api/mappings", "GET", "secret", undefined, adminSsoSession());
+      expect(res.statusCode).toBe(200);
+    });
+
+    it("reports a user's granted pages on the session probe", async () => {
+      accessGrants.savePageGrants(["audit", "reports"], "ada@eudoxus.ai");
+      const res = await request("/api/session-identity", "GET", "secret", undefined, userSession());
+      expect(JSON.parse(res.body)).toMatchObject({ role: "user", grantedPages: ["audit", "reports"] });
+    });
+  });
+
+  describe("the grants endpoints", () => {
+    it("returns what is granted alongside everything grantable", async () => {
+      accessGrants.savePageGrants(["issues"], "ada@eudoxus.ai");
+      const res = await request("/api/access-grants", "GET", "secret", undefined, adminSsoSession());
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.granted).toEqual(["issues"]);
+      // Grantability comes from the route table, so Access itself can never appear here.
+      expect(body.grantable).toContain("issues");
+      expect(body.grantable).not.toContain("access");
+    });
+
+    it("stores a grant an admin saves", async () => {
+      const token = adminSsoSession();
+      const res = await request("/api/access-grants", "POST", "secret", { pages: ["issues", "pulls"] }, token);
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).granted).toEqual(["issues", "pulls"]);
+      expect(accessGrants.listGrantedPages()).toEqual(["issues", "pulls"]);
+    });
+
+    it("refuses a page key that is not grantable, and stores nothing", async () => {
+      const res = await request("/api/access-grants", "POST", "secret", { pages: ["issues", "settings"] }, adminSsoSession());
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).error).toMatch(/not grantable: settings/);
+      expect(accessGrants.listGrantedPages()).toEqual([]);
+    });
+
+    it("refuses a body that is not a list of page keys", async () => {
+      const res = await request("/api/access-grants", "POST", "secret", { pages: "issues" }, adminSsoSession());
+      expect(res.statusCode).toBe(400);
+    });
+
+    // The deprecated path must gain no capability, and a grant needs an actor to attribute it to.
+    it("closes both directions to an access-code session", async () => {
+      const token = await login("secret");
+      expect((await request("/api/access-grants", "GET", "secret", undefined, token)).statusCode).toBe(403);
+      expect((await request("/api/access-grants", "POST", "secret", { pages: [] }, token)).statusCode).toBe(403);
+    });
+
+    it("is unreachable by a user, since Access is not itself grantable", async () => {
+      accessGrants.savePageGrants(["issues"], "ada@eudoxus.ai");
+      const res = await request("/api/access-grants", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(403);
+    });
+  });
+
+  it("keeps who granted a page and when across a re-save", async () => {
+    accessGrants.savePageGrants(["issues"], "first@eudoxus.ai");
+    const originally = accessGrants.listPageGrants()[0];
+    accessGrants.savePageGrants(["issues", "pulls"], "second@eudoxus.ai");
+    const after = accessGrants.listPageGrants().find((g) => g.page === "issues");
+    expect(after).toEqual(originally);
   });
 });

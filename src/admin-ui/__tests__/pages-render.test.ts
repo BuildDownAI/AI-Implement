@@ -9,6 +9,13 @@ describe("admin HTML", () => {
     }
   });
 
+  // Carries no nav entry, so the route sweep above cannot reach it — and without the section the
+  // router's fallback would show a blank page rather than an explanation.
+  it("contains the no-access fallback section, which has no sidebar route", () => {
+    expect(adminHtml).toContain('data-page="no-access"');
+    expect(SIDEBAR_ROUTES).not.toContain("no-access");
+  });
+
   it("renders the four IA group labels in the sidebar", () => {
     for (const label of ["Work", "Configure", "Platform", "Developer"]) {
       expect(adminHtml).toContain(`>${label}<`);
