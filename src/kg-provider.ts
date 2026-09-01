@@ -215,3 +215,19 @@ export function resolveMemoryProvider(
   }
   throw new UnknownMemoryProviderError(id);
 }
+
+/**
+ * Returns a human-readable reason when `resolveMemoryProvider` would return
+ * `null`, suitable for inclusion in 503 error bodies to make them
+ * operator-actionable. Returns `null` when the provider is configured.
+ */
+export function providerUnconfiguredReason(
+  kgSidecarUrl: string | null,
+  providerId?: string | null,
+): string | null {
+  const id = providerId ?? "sidecar";
+  if (id === "sidecar" && !kgSidecarUrl) {
+    return "sidecar: KG_SIDECAR_URL unset";
+  }
+  return null;
+}

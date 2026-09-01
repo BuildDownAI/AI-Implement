@@ -210,13 +210,14 @@ async function callMcp(
   baseUrl: string | null = BASE_URL,
   method = "POST",
   body?: string,
+  providerDiagnostic?: string | null,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
     tokenValid ? { email: "user@example.com", sub: "sub1", provider: "google" } : null,
   );
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
-  handleMcpRequest(req as never, res as never, provider, baseUrl);
+  handleMcpRequest(req as never, res as never, provider, baseUrl, providerDiagnostic);
   await res.done;
   return { statusCode: res.statusCode, body: res.body, responseHeaders: res.responseHeaders };
 }
@@ -967,7 +968,13 @@ describe("handleMcpRequest", () => {
     it("returns 503 for non-diagnostic requests when sidecar is not configured", async () => {
       const result = await callMcp({ authorization: "Bearer tok" }, true, null);
       expect(result.statusCode).toBe(503);
-      expect(JSON.parse(result.body).error).toContain("sidecar");
+      expect(JSON.parse(result.body).error).toContain("no memory provider");
+    });
+
+    it("includes sidecar diagnostic in 503 when KG_SIDECAR_URL is unset", async () => {
+      const result = await callMcp({ authorization: "Bearer tok" }, true, null, BASE_URL, "POST", undefined, "sidecar: KG_SIDECAR_URL unset");
+      expect(result.statusCode).toBe(503);
+      expect(JSON.parse(result.body).error).toBe("no memory provider is configured (sidecar: KG_SIDECAR_URL unset)");
     });
 
     it("does not proxy when sidecar is null and request is not a diagnostic tool", async () => {

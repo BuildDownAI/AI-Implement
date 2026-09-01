@@ -6,6 +6,7 @@ import {
   SidecarMemoryProvider,
   UnknownMemoryProviderError,
   parseSidecarRpcResponse,
+  providerUnconfiguredReason,
   resolveMemoryProvider,
 } from "../kg-provider.js";
 import type { MemoryProvider, MemoryProviderCapabilities } from "../kg-provider.js";
@@ -309,5 +310,29 @@ describe("resolveMemoryProvider", () => {
 
   it("UnknownMemoryProviderError message names the unknown id", () => {
     expect(() => resolveMemoryProvider(null, "zep")).toThrowError("zep");
+  });
+});
+
+// ---- providerUnconfiguredReason ----
+
+describe("providerUnconfiguredReason", () => {
+  it("returns the diagnostic string when sidecarUrl is null and providerId is omitted", () => {
+    expect(providerUnconfiguredReason(null)).toBe("sidecar: KG_SIDECAR_URL unset");
+  });
+
+  it("returns the diagnostic string when sidecarUrl is null and providerId is null", () => {
+    expect(providerUnconfiguredReason(null, null)).toBe("sidecar: KG_SIDECAR_URL unset");
+  });
+
+  it("returns the diagnostic string when sidecarUrl is null and providerId is 'sidecar'", () => {
+    expect(providerUnconfiguredReason(null, "sidecar")).toBe("sidecar: KG_SIDECAR_URL unset");
+  });
+
+  it("returns null when sidecarUrl is set (provider is configured)", () => {
+    expect(providerUnconfiguredReason("http://127.0.0.1:8765/mcp")).toBeNull();
+  });
+
+  it("returns null when sidecarUrl is set and providerId is 'sidecar'", () => {
+    expect(providerUnconfiguredReason("http://127.0.0.1:8765/mcp", "sidecar")).toBeNull();
   });
 });

@@ -227,6 +227,7 @@ export async function handleMcpRequest(
   res: http.ServerResponse,
   provider: MemoryProvider | null,
   baseUrl: string | null,
+  providerDiagnostic?: string | null,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -312,7 +313,8 @@ export async function handleMcpRequest(
 
     // KG tool call — check provider availability and capability
     if (!provider) {
-      json(res, 503, { error: "no memory provider is configured" });
+      const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
+      json(res, 503, { error: `no memory provider is configured${detail}` });
       return;
     }
     const capKey = KG_TOOL_CAPABILITY[toolName];
@@ -330,7 +332,8 @@ export async function handleMcpRequest(
 
   // Proxy everything else to the provider
   if (!provider) {
-    json(res, 503, { error: "no memory provider is configured" });
+    const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
+    json(res, 503, { error: `no memory provider is configured${detail}` });
     return;
   }
 

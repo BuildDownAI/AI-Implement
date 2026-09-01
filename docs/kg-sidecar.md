@@ -23,7 +23,7 @@ For local development, start the sidecar yourself and set `KG_SIDECAR_URL` in `.
 The endpoint needs **both** `KG_SIDECAR_URL` and `OAUTH_REDIRECT_BASE_URL`, but the two are not equally visible from outside, because the auth gate sits between their checks.
 
 - **`OAUTH_REDIRECT_BASE_URL` unset** — `/mcp` answers **503** to every caller.
-- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. Only an authenticated request that actually needs the sidecar reaches the 503; an authenticated `tools/list` still answers **200**, listing the built-in diagnostic tools alone. The sidecar check sits below both the auth gate and that routing deliberately, so those diagnostics stay reachable on a sidecar-less image.
+- **`KG_SIDECAR_URL` unset** — `/mcp` answers **401** to an unauthenticated caller. Only an authenticated request that actually needs the sidecar reaches the 503; an authenticated `tools/list` still answers **200**, listing the built-in diagnostic tools alone. The sidecar check sits below both the auth gate and that routing deliberately, so those diagnostics stay reachable on a sidecar-less image. When a sidecar-requiring request does hit the 503, the body names the fix: `{"error":"no memory provider is configured (sidecar: KG_SIDECAR_URL unset)"}` — set `KG_SIDECAR_URL` and restart.
 
 **So an unauthenticated probe of `/mcp` cannot distinguish a sidecar-less release from a healthy one — both answer 401.** The public endpoint that can is `/.well-known/oauth-protected-resource`, which 503s when either variable is missing.
 
