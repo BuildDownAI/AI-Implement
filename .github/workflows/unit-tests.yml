@@ -27,5 +27,14 @@ jobs:
       # vitest exits non-zero on test failures AND on unhandled errors
       # (verified on AII-448: 28 unhandled rejections alone produced exit 1
       # while all tests passed — the exact signal this gate exists to catch).
-      - run: npm test
+      #
+      # Ambient Actions vars are scrubbed for the test step: orchestrator code
+      # branches on GITHUB_RUN_ID / GITHUB_ENV / etc., and the suite asserts
+      # the non-CI defaults (first run of this gate proved it: reporter tests
+      # picked up the job's own run id). The suite must see the same env shape
+      # locally and here.
+      - name: npm test (ambient CI vars scrubbed)
+        run: |
+          unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
+          npm test
       - run: npm run typecheck
