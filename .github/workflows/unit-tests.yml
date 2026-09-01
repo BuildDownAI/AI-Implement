@@ -1,0 +1,31 @@
+# Unit-test gate for AI-Implement PRs (AII-449).
+#
+# Named unit-tests.yml deliberately: the claude-*.yml files here are TEMPLATES
+# synced to target repos, and sync-workflow.yml is the sync fallback — this file
+# is neither, and must never be distributed by sync.
+#
+# Operator step after first merge: mark the "unit-tests" check REQUIRED on the
+# testing branch (Settings → Branches). The branch is unprotected today, so the
+# check is advisory until that click.
+name: unit-tests
+
+on:
+  pull_request:
+    branches: [testing, main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # vitest exits non-zero on test failures AND on unhandled errors
+      # (verified on AII-448: 28 unhandled rejections alone produced exit 1
+      # while all tests passed — the exact signal this gate exists to catch).
+      - run: npm test
+      - run: npm run typecheck
