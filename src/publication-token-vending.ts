@@ -65,7 +65,12 @@ export async function handlePublicationTokenRequest(
       input.githubAppPrivateKey,
       owner,
       {
-        permissions: { contents: "write", pull_requests: "write" },
+        // workflows:write is load-bearing (AII-450): the push step refreshes to THIS
+        // credential immediately before pushing, so its permission set — not the
+        // workflow-side mint's — decides what the runner can push. Without it, any
+        // run touching .github/workflows/ dies at push with a buried remote-reject
+        // (three live occurrences before the omission was found).
+        permissions: { contents: "write", pull_requests: "write", workflows: "write" },
         repositories: [repo],
         forceRefresh: true,
       },
