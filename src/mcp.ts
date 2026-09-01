@@ -9,7 +9,6 @@ import { isKgDegraded } from "./deploy-notify.js";
 import { recheckIdentity } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 
-
 interface JsonRpcRequest {
   jsonrpc?: string;
   id?: string | number | null;

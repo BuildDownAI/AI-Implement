@@ -3155,18 +3155,18 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
 
     // MCP well-known metadata endpoints (public — no auth required)
     if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
         return;
       }
       handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
       return;
     }
     if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
         return;
       }
       handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
@@ -3175,9 +3175,9 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
 
     // MCP OAuth routes — dynamic client registration, authorization, token exchange
     if (pathname.startsWith("/mcp/")) {
-      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
         return;
       }
       if (pathname === "/mcp/register" && req.method === "POST") {
