@@ -161,7 +161,7 @@ Minimum with the sidecar is **512 MB**; **1 GB** gives comfortable headroom for 
 
 The orchestrator abstracts KG access behind a `MemoryProvider` interface (defined in `src/kg-provider.ts`). The bundled sidecar is provider `"sidecar"` and is selected by default. An external implementer can build a conforming provider without reading orchestrator source; this section is the authoritative contract.
 
-### The five-tool contract
+### The capability contract
 
 Every `MemoryProvider` maps to up to six MCP tool names. The provider declares which it can serve via a `MemoryProviderCapabilities` object; callers degrade gracefully when a capability flag is `false`.
 
@@ -201,7 +201,7 @@ interface MemoryProvider {
 
 ### Provider selection
 
-The active provider is chosen at boot from the `MEMORY_PROVIDER` environment variable (default: `"sidecar"`). Per-mapping override is stored in the `memory_provider_id` column on the `mappings` table (TEXT, nullable, JSON-ready for future per-phase selection); it is not yet surfaced in the admin UI.
+The active provider is chosen at boot from the `MEMORY_PROVIDER` environment variable (default: `"sidecar"`). Per-mapping override is stored in the `memory_provider_id` column on the `mappings` table (TEXT, nullable, JSON-ready for future per-phase selection); it is not yet surfaced in the admin UI, and is not yet consulted at request time — `handleMcpRequest` uses the single global provider resolved at boot. This is scaffolding for future per-mapping routing.
 
 ### Building a conforming external provider
 

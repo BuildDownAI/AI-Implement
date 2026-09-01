@@ -312,7 +312,7 @@ export async function handleMcpRequest(
 
     // KG tool call — check provider availability and capability
     if (!provider) {
-      json(res, 503, { error: "KG sidecar not configured" });
+      json(res, 503, { error: "no memory provider is configured" });
       return;
     }
     const capKey = KG_TOOL_CAPABILITY[toolName];
@@ -330,7 +330,7 @@ export async function handleMcpRequest(
 
   // Proxy everything else to the provider
   if (!provider) {
-    json(res, 503, { error: "KG sidecar not configured" });
+    json(res, 503, { error: "no memory provider is configured" });
     return;
   }
 
