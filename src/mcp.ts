@@ -1,5 +1,4 @@
 import http from "node:http";
-import https from "node:https";
 import { verifyMcpToken } from "./mcp-oauth.js";
 import { getRunnerMode } from "./runner-mode.js";
 import { getMappings } from "./config.js";
@@ -8,6 +7,7 @@ import { getDb } from "./dedup.js";
 import { getIssueReportCard, getFleetReport } from "./report-card.js";
 import { isKgDegraded } from "./deploy-notify.js";
 import { recheckIdentity } from "./access-entries.js";
+import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -220,162 +220,14 @@ function callDiagnosticTool(name: string, args: Record<string, unknown>): unknow
   }
 }
 
-// ---- Sidecar proxy helpers ----
-
-interface SidecarRpcResponse {
-  result?: { tools?: unknown[] };
-  error?: unknown;
-}
-
-/**
- * Extract the JSON-RPC response from a sidecar reply. The Python MCP SDK's
- * streamable-HTTP transport frames responses as SSE (`event:`/`data:` lines)
- * rather than a bare JSON body, so both encodings must be handled. Returns
- * the first event carrying a `result` (falling back to one carrying an
- * `error`), or null if nothing in the reply is a JSON-RPC response.
- */
-export function parseSidecarRpcResponse(raw: string, contentType: string | undefined): SidecarRpcResponse | null {
-  if (contentType?.includes("text/event-stream")) {
-    let errorReply: SidecarRpcResponse | null = null;
-    // Events are separated by blank lines; one event's data may span several
-    // data: lines, joined with newlines before parsing.
-    for (const event of raw.split(/\r?\n\r?\n/)) {
-      const data = event
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).replace(/^ /, ""))
-        .join("\n");
-      if (!data) continue;
-      try {
-        const parsed = JSON.parse(data) as SidecarRpcResponse;
-        if (!parsed || typeof parsed !== "object") continue;
-        if ("result" in parsed) return parsed;
-        if ("error" in parsed) errorReply ??= parsed;
-      } catch {
-        // keep scanning; other events (pings, notifications) may share the stream
-      }
-    }
-    return errorReply;
-  }
-  try {
-    return JSON.parse(raw) as SidecarRpcResponse;
-  } catch {
-    return null;
-  }
-}
-
-function fetchSidecarToolsList(
-  kgSidecarUrl: string,
-  body: Buffer,
-  reqHeaders: http.IncomingHttpHeaders,
-): Promise<unknown[]> {
-  return new Promise((resolve) => {
-    const target = new URL(kgSidecarUrl);
-    const transport = target.protocol === "https:" ? https : http;
-    const forwardHeaders = { ...reqHeaders };
-    delete forwardHeaders.authorization;
-    delete forwardHeaders.host;
-    delete forwardHeaders["transfer-encoding"];
-    const options: http.RequestOptions = {
-      hostname: target.hostname,
-      port: target.port || (target.protocol === "https:" ? "443" : "80"),
-      path: target.pathname + target.search,
-      method: "POST",
-      headers: { ...forwardHeaders, host: target.host, "content-length": String(body.length) },
-    };
-    const proxyReq = transport.request(options, (proxyRes) => {
-      const chunks: Buffer[] = [];
-      proxyRes.on("data", (chunk: Buffer) => chunks.push(chunk));
-      proxyRes.on("end", () => {
-        const raw = Buffer.concat(chunks).toString();
-        const parsed = parseSidecarRpcResponse(raw, proxyRes.headers["content-type"]);
-        if (!parsed) {
-          console.error(
-            `[mcp] KG sidecar tools/list unparseable (status ${proxyRes.statusCode}, content-type ${proxyRes.headers["content-type"]}): ${raw.slice(0, 200)}`,
-          );
-        } else if (!parsed.result) {
-          console.error(
-            `[mcp] KG sidecar tools/list returned no result (status ${proxyRes.statusCode}): ${JSON.stringify(parsed.error ?? parsed).slice(0, 200)}`,
-          );
-        }
-        resolve(parsed?.result?.tools ?? []);
-      });
-      proxyRes.on("error", () => resolve([]));
-    });
-    proxyReq.on("error", () => resolve([]));
-    proxyReq.write(body);
-    proxyReq.end();
-  });
-}
-
-function proxyBuffered(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  kgSidecarUrl: string,
-  body: Buffer,
-): void {
-  const target = new URL(kgSidecarUrl);
-  const transport = target.protocol === "https:" ? https : http;
-
-  const forwardHeaders = { ...req.headers };
-  delete forwardHeaders.authorization;
-  delete forwardHeaders.host;
-  delete forwardHeaders.cookie;
-  delete forwardHeaders["transfer-encoding"];
-
-  const headers: Record<string, string | string[] | undefined> = {
-    ...forwardHeaders,
-    host: target.host,
-  };
-  if (body.length > 0) {
-    headers["content-length"] = String(body.length);
-  } else {
-    delete headers["content-length"];
-  }
-
-  const options: http.RequestOptions = {
-    hostname: target.hostname,
-    port: target.port || (target.protocol === "https:" ? "443" : "80"),
-    path: target.pathname + target.search,
-    method: req.method,
-    headers,
-  };
-
-  const proxyReq = transport.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers as http.OutgoingHttpHeaders);
-    proxyRes.on("error", (err) => {
-      console.error("[mcp] KG sidecar response error:", err);
-      if (!res.headersSent) {
-        json(res, 502, { error: "KG sidecar error" });
-      } else {
-        res.destroy(err);
-      }
-    });
-    proxyRes.pipe(res);
-  });
-
-  proxyReq.on("error", (err: NodeJS.ErrnoException) => {
-    if (res.headersSent) return;
-    if (err.code === "ECONNREFUSED") {
-      console.error(`[mcp] KG sidecar connection refused at ${kgSidecarUrl}`);
-      json(res, 502, { error: "KG sidecar unavailable: connection refused" });
-    } else {
-      console.error("[mcp] KG sidecar error:", err);
-      json(res, 502, { error: "KG sidecar error" });
-    }
-  });
-
-  if (body.length > 0) proxyReq.write(body);
-  proxyReq.end();
-}
-
 // ---- Main handler ----
 
 export async function handleMcpRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
-  kgSidecarUrl: string | null,
+  provider: MemoryProvider | null,
   baseUrl: string | null,
+  providerDiagnostic?: string | null,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -411,7 +263,7 @@ export async function handleMcpRequest(
     return;
   }
 
-  // Parse JSON-RPC to route diagnostic tools vs sidecar proxy
+  // Parse JSON-RPC to route diagnostic tools vs provider
   let rpc: JsonRpcRequest | null = null;
   if (req.method === "POST" && body.length > 0) {
     try {
@@ -425,10 +277,8 @@ export async function handleMcpRequest(
   }
 
   if (rpc?.method === "tools/list") {
-    // Merge native diagnostic tools with kg_* tools from the sidecar
-    const kgTools = kgSidecarUrl
-      ? await fetchSidecarToolsList(kgSidecarUrl, body, req.headers)
-      : [];
+    // Merge native diagnostic tools with kg_* tools from the provider
+    const kgTools = provider ? await provider.listTools(body, req.headers) : [];
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,
@@ -460,13 +310,32 @@ export async function handleMcpRequest(
       }
       return;
     }
-  }
 
-  // Proxy everything else to the KG sidecar
-  if (!kgSidecarUrl) {
-    json(res, 503, { error: "KG sidecar not configured" });
+    // KG tool call — check provider availability and capability
+    if (!provider) {
+      const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
+      json(res, 503, { error: `no memory provider is configured${detail}` });
+      return;
+    }
+    const capKey = KG_TOOL_CAPABILITY[toolName];
+    if (capKey !== undefined && !provider.capabilities[capKey]) {
+      json(res, 200, {
+        jsonrpc: "2.0",
+        id: rpc.id ?? null,
+        error: { code: -32601, message: `Tool not supported by this memory provider: ${toolName}` },
+      });
+      return;
+    }
+    provider.proxyCall(req, res, body);
     return;
   }
 
-  proxyBuffered(req, res, kgSidecarUrl, body);
+  // Proxy everything else to the provider
+  if (!provider) {
+    const detail = providerDiagnostic ? ` (${providerDiagnostic})` : "";
+    json(res, 503, { error: `no memory provider is configured${detail}` });
+    return;
+  }
+
+  provider.proxyCall(req, res, body);
 }

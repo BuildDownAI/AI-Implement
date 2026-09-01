@@ -1637,6 +1637,7 @@ async function handleUpsertMapping(
       sensitiveAddPatterns,
       sensitiveAllowPatterns,
       dependencyTokenScope,
+      memoryProviderId: existingMapping?.memoryProviderId ?? null,
     };
 
     upsertMapping(body.teamKey, mapping);

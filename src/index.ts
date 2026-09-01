@@ -51,6 +51,7 @@ import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js"
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
+import { resolveMemoryProvider, providerUnconfiguredReason } from "./kg-provider.js";
 import { withRequestErrorBoundary } from "./http-server.js";
 import {
   initMcpOAuthTables,
@@ -122,6 +123,7 @@ interface AppConfig {
   localRunnerOrchestratorUrl: string | null;
   kgSidecarUrl: string | null;
   kgSourceRepo: string | null;
+  memoryProviderId: string | null;
   selfDeployTarget: SelfDeployTarget | null; // build-stamped; null when the image carries no stamps
 }
 
@@ -243,6 +245,7 @@ function loadConfig(): AppConfig {
     localRunnerOrchestratorUrl: process.env.LOCAL_RUNNER_ORCHESTRATOR_URL || null,
     kgSidecarUrl: process.env.KG_SIDECAR_URL || null,
     kgSourceRepo: readKgSourceRepo(process.env.KG_SOURCE_REPO),
+    memoryProviderId: process.env.MEMORY_PROVIDER || null,
     selfDeployTarget: readStampedTarget(process.env),
   };
 }
@@ -2870,6 +2873,8 @@ function onDeployBuildFailure(commit: string, err: unknown): void {
 function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgSidecar): http.Server {
   const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
   const kgRefresh = makeKgRefresh({ sidecar, githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, kgSourceRepo: config.kgSourceRepo });
+  const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
+  const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
 
   const handleRequest: http.RequestListener = (req, res) => {
     const url = req.url || "/";
@@ -3151,18 +3156,18 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
 
     // MCP well-known metadata endpoints (public — no auth required)
     if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
         return;
       }
       handleMcpProtectedResourceMetadata(res, config.oauthRedirectBaseUrl);
       return;
     }
     if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
-      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
         return;
       }
       handleMcpAuthorizationServerMetadata(res, config.oauthRedirectBaseUrl);
@@ -3171,9 +3176,9 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
 
     // MCP OAuth routes — dynamic client registration, authorization, token exchange
     if (pathname.startsWith("/mcp/")) {
-      if (!config.oauthRedirectBaseUrl || !config.kgSidecarUrl) {
+      if (!config.oauthRedirectBaseUrl || !memoryProvider) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL or KG_SIDECAR_URL is unset)" }));
+        res.end(JSON.stringify({ error: "MCP OAuth not configured (OAUTH_REDIRECT_BASE_URL is unset or no memory provider is configured)" }));
         return;
       }
       if (pathname === "/mcp/register" && req.method === "POST") {
@@ -3222,7 +3227,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
 
     // MCP endpoint — OAuth bearer token authenticated
     if (pathname === "/mcp") {
-      handleMcpRequest(req, res, config.kgSidecarUrl, config.oauthRedirectBaseUrl).catch((err) => {
+      handleMcpRequest(req, res, memoryProvider, config.oauthRedirectBaseUrl, memoryProviderDiagnostic).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
