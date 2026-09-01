@@ -115,17 +115,23 @@ export const authJs = `
       noAdmin = data.noAdmin === true;
     } catch (e) { /* leave defaults so the access-code fallback stays reachable */ }
 
-    document.getElementById('sso-buttons').innerHTML = providers.map(function (p) {
+    var ssoButtons = document.getElementById('sso-buttons');
+    if (ssoButtons) ssoButtons.innerHTML = providers.map(function (p) {
       return '<a class="sso-tile" href="' + API + '/api/auth/' + encodeURIComponent(p.id) + '/start">' +
              (PROVIDER_ICONS[p.id] || '') + '<span>' + esc(p.label) + '</span></a>';
     }).join('');
 
     var hasSso = providers.length > 0;
-    document.getElementById('no-admin-notice').classList.toggle('hidden', !noAdmin);
-    document.getElementById('sso-label').classList.toggle('hidden', !hasSso);
-    document.getElementById('login-divider').classList.toggle('hidden', !(hasSso && accessCode));
-    document.getElementById('access-code-notice').classList.toggle('hidden', !(accessCode && !hasSso));
-    document.getElementById('access-code-box').classList.toggle('hidden', !accessCode);
+    var elNoAdmin = document.getElementById('no-admin-notice');
+    var elSsoLabel = document.getElementById('sso-label');
+    var elDivider = document.getElementById('login-divider');
+    var elCodeNotice = document.getElementById('access-code-notice');
+    var elCodeBox = document.getElementById('access-code-box');
+    if (elNoAdmin) elNoAdmin.classList.toggle('hidden', !noAdmin);
+    if (elSsoLabel) elSsoLabel.classList.toggle('hidden', !hasSso);
+    if (elDivider) elDivider.classList.toggle('hidden', !(hasSso && accessCode));
+    if (elCodeNotice) elCodeNotice.classList.toggle('hidden', !(accessCode && !hasSso));
+    if (elCodeBox) elCodeBox.classList.toggle('hidden', !accessCode);
   }
 
   // Generic banner for the callback's ?auth_error=... redirect. The specific reason stays server-side

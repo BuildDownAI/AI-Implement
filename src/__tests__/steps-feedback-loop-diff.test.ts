@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -287,6 +287,38 @@ describe("getDiff index state preservation", () => {
 
 describe("getDiff exclusive temp dir cleanup", () => {
   let repo: string;
+  let workerRoot: string;
+  let savedTmpdir: string | undefined;
+  let savedTemp: string | undefined;
+
+  beforeAll(() => {
+    // Redirect os.tmpdir() to a worker-private subdirectory so concurrent getDiff
+    // calls in other parallel test workers cannot pollute the before/after counts.
+    // Vitest worker threads have independent process.env copies, so this is local.
+    workerRoot = mkdtempSync(join(tmpdir(), "diff-cleanup-worker-"));
+    savedTmpdir = process.env.TMPDIR;
+    savedTemp = process.env.TEMP;
+    process.env.TMPDIR = workerRoot;
+    process.env.TEMP = workerRoot;
+  });
+
+  afterAll(() => {
+    if (savedTmpdir === undefined) {
+      delete process.env.TMPDIR;
+    } else {
+      process.env.TMPDIR = savedTmpdir;
+    }
+    if (savedTemp === undefined) {
+      delete process.env.TEMP;
+    } else {
+      process.env.TEMP = savedTemp;
+    }
+    try {
+      rmSync(workerRoot, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
 
   beforeEach(() => {
     repo = mkdtempSync(join(tmpdir(), "diff-cleanup-test-"));
