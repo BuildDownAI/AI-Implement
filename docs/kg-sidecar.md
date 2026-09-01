@@ -157,6 +157,60 @@ Minimum with the sidecar is **512 MB**; **1 GB** gives comfortable headroom for 
 
 `fly.toml` ships 512 MB as the base default. Adjust per client in `clients/<slug>.toml`.
 
+## Memory provider contract
+
+The orchestrator abstracts KG access behind a `MemoryProvider` interface (defined in `src/kg-provider.ts`). The bundled sidecar is provider `"sidecar"` and is selected by default. An external implementer can build a conforming provider without reading orchestrator source; this section is the authoritative contract.
+
+### The five-tool contract
+
+Every `MemoryProvider` maps to up to six MCP tool names. The provider declares which it can serve via a `MemoryProviderCapabilities` object; callers degrade gracefully when a capability flag is `false`.
+
+| Capability flag | MCP tool names | Degradation when `false` |
+|---|---|---|
+| `hybridSearch` | `kg_hybrid_search`, `kg_search`, `kg_semantic_search` | Tools are absent from `tools/list`; a `tools/call` for any of them returns JSON-RPC error `-32601` (method not found) |
+| `neighbors` | `kg_neighbors` | Same — absent from list, error on call |
+| `path` | `kg_path` | Same |
+| `provenance` | `kg_provenance` | Same |
+| `stalenessStamp` | *(no dedicated tool — served via `kg_neighbors` on the spine IRI)* | Callers that check graph freshness skip the staleness check or treat the result as unknown |
+
+The orchestrator enforces the capability filter: a `tools/call` for a tool whose capability is `false` returns `{ "error": { "code": -32601, ... } }` at HTTP 200 — never a 503 or a proxy error. This is the contract the skills layer relies on for its dual-target degradation rules.
+
+### Interface
+
+```typescript
+interface MemoryProviderCapabilities {
+  hybridSearch: boolean;
+  neighbors: boolean;
+  path: boolean;
+  provenance: boolean;
+  stalenessStamp: boolean;
+}
+
+interface MemoryProvider {
+  readonly id: string;
+  readonly capabilities: MemoryProviderCapabilities;
+  listTools(body: Buffer, headers: http.IncomingHttpHeaders): Promise<unknown[]>;
+  proxyCall(req: http.IncomingMessage, res: http.ServerResponse, body: Buffer): void;
+}
+```
+
+- `id` — unique string identifying the provider (e.g. `"sidecar"`).
+- `capabilities` — declare gaps up front; the orchestrator reads this once per request and filters the advertised tool list accordingly.
+- `listTools` — return the MCP tool-definition objects (same shape as a JSON-RPC `tools/list` result) that this provider can serve. Only tools whose capability flag is `true` should appear here; the orchestrator will not enforce a second filter.
+- `proxyCall` — write an MCP response to `res` for the given request and body. Called only for tools that cleared the capability check. The request has already been auth-checked; strip the `Authorization` header before forwarding to a backing service.
+
+### Provider selection
+
+The active provider is chosen at boot from the `MEMORY_PROVIDER` environment variable (default: `"sidecar"`). Per-mapping override is stored in the `memory_provider_id` column on the `mappings` table (TEXT, nullable, JSON-ready for future per-phase selection); it is not yet surfaced in the admin UI.
+
+### Building a conforming external provider
+
+1. Implement `MemoryProvider` in TypeScript (or any language that can be imported/loaded into the orchestrator process).
+2. Declare your `capabilities` conservatively — `false` for any tool you cannot reliably serve.
+3. In `listTools`, return only tools whose capability is `true`. Returning a tool you cannot serve will result in proxy errors for callers.
+4. In `proxyCall`, handle every tool the capabilities declare as true. If a call reaches `proxyCall` for a tool you cannot handle, write a JSON-RPC error response rather than crashing.
+5. Register the provider in `resolveMemoryProvider()` in `src/kg-provider.ts` and add `MEMORY_PROVIDER=your-id` to `.env.example`.
+
 ## Repository layout
 
 `kg/` holds only a `.gitkeep` placeholder in git — the actual server code and snapshot are cloned at build time and never committed. The directory is excluded from workflow sync and never copied to target repos.

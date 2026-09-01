@@ -11,7 +11,7 @@ import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { COMPLETION_MARKER, KG_DIR } from "./kg-sidecar.js";
 import { isKgDegraded } from "./deploy-notify.js";
-import { parseSidecarRpcResponse } from "./mcp.js";
+import { parseSidecarRpcResponse } from "./kg-provider.js";
 
 const execFile = promisify(execFileCb);
 

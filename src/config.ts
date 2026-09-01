@@ -71,6 +71,8 @@ export interface RepoMapping {
   sensitiveAllowPatterns: string[] | null;
   /** Token scope for dependency access. NULL means off (default); "installation" grants read access to all repos the App can see. */
   dependencyTokenScope: "installation" | null;
+  /** Memory provider ID for this mapping. NULL means use the orchestrator default (sidecar). JSON-ready text column. */
+  memoryProviderId: string | null;
 }
 
 // Seed mappings are only applied on first run (empty DB).
@@ -160,6 +162,9 @@ function ensureMappingsColumns(): void {
   if (!names.has("dependency_token_scope")) {
     db.exec(`ALTER TABLE mappings ADD COLUMN dependency_token_scope TEXT`);
   }
+  if (!names.has("memory_provider_id")) {
+    db.exec(`ALTER TABLE mappings ADD COLUMN memory_provider_id TEXT`);
+  }
 }
 
 export function initMappingsTable(): void {
@@ -193,7 +198,8 @@ export function initMappingsTable(): void {
       skills_repo TEXT,
       sensitive_add_patterns TEXT,
       sensitive_allow_patterns TEXT,
-      dependency_token_scope TEXT
+      dependency_token_scope TEXT,
+      memory_provider_id TEXT
     )
   `);
   ensureMappingsColumns();
@@ -202,10 +208,10 @@ export function initMappingsTable(): void {
   const count = db.prepare("SELECT COUNT(*) as n FROM mappings").get() as { n: number };
   if (count.n === 0 && Object.keys(SEED_MAPPINGS).length > 0) {
     const insert = db.prepare(
-      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     );
     for (const [key, m] of Object.entries(SEED_MAPPINGS)) {
-      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope);
+      insert.run(key, m.owner, m.repo, m.workflowFile, m.defaultBranch, m.maxInProgressAiIssues, m.executionMode, m.sessionMode, m.machineCpus, m.machineMemoryMb, m.planningEnabled ? 1 : 0, m.planningWorkflowFile, m.autoApprovePlans ? 1 : 0, m.autoMerge ? 1 : 0, Object.keys(m.extraEnv).length > 0 ? JSON.stringify(m.extraEnv) : null, m.provider, m.ticketingProvider, JSON.stringify(m.ticketingConfig), m.awsRegion, m.paused ? 1 : 0, m.maxTurns, m.maxIterations, m.maxJobMinutes, m.branchPrefix, m.skillsRepo, m.sensitiveAddPatterns ? JSON.stringify(m.sensitiveAddPatterns) : null, m.sensitiveAllowPatterns ? JSON.stringify(m.sensitiveAllowPatterns) : null, m.dependencyTokenScope, m.memoryProviderId);
     }
     console.log(`[config] Seeded ${Object.keys(SEED_MAPPINGS).length} default mappings`);
   }
@@ -214,7 +220,7 @@ export function initMappingsTable(): void {
 export function getMappings(): Record<string, RepoMapping> {
   const rows = getDb()
     .prepare(
-      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope FROM mappings",
+      "SELECT team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id FROM mappings",
     )
     .all() as Array<{
       team_key: string;
@@ -245,6 +251,7 @@ export function getMappings(): Record<string, RepoMapping> {
       sensitive_add_patterns: string | null;
       sensitive_allow_patterns: string | null;
       dependency_token_scope: string | null;
+      memory_provider_id: string | null;
     }>;
 
   const result: Record<string, RepoMapping> = {};
@@ -287,6 +294,7 @@ export function getMappings(): Record<string, RepoMapping> {
       sensitiveAddPatterns: (() => { try { return row.sensitive_add_patterns ? JSON.parse(row.sensitive_add_patterns) as string[] : null; } catch { return null; } })(),
       sensitiveAllowPatterns: (() => { try { return row.sensitive_allow_patterns ? JSON.parse(row.sensitive_allow_patterns) as string[] : null; } catch { return null; } })(),
       dependencyTokenScope: row.dependency_token_scope as "installation" | null,
+      memoryProviderId: row.memory_provider_id ?? null,
     };
   }
   return result;
@@ -295,7 +303,7 @@ export function getMappings(): Record<string, RepoMapping> {
 export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
   getDb()
     .prepare(
-      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO mappings (team_key, owner, repo, workflow_file, default_branch, max_in_progress_ai_issues, execution_mode, session_mode, machine_cpus, machine_memory_mb, planning_enabled, planning_workflow_file, auto_approve_plans, auto_merge, extra_env, provider, ticketing_provider, ticketing_config, aws_region, paused, max_turns, max_iterations, max_job_minutes, branch_prefix, skills_repo, sensitive_add_patterns, sensitive_allow_patterns, dependency_token_scope, memory_provider_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .run(
       teamKey,
@@ -326,6 +334,7 @@ export function upsertMapping(teamKey: string, mapping: RepoMapping): void {
       mapping.sensitiveAddPatterns ? JSON.stringify(mapping.sensitiveAddPatterns) : null,
       mapping.sensitiveAllowPatterns ? JSON.stringify(mapping.sensitiveAllowPatterns) : null,
       mapping.dependencyTokenScope,
+      mapping.memoryProviderId,
     );
 }
 

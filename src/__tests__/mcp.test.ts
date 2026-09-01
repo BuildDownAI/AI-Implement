@@ -2,6 +2,8 @@ import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleMcpRequest } from "../mcp.js";
+import { SidecarMemoryProvider } from "../kg-provider.js";
+import type { MemoryProvider } from "../kg-provider.js";
 
 vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
@@ -33,6 +35,7 @@ vi.mock("../deploy-notify.js", () => ({
 
 const BASE_URL = "https://orchestrator.example.com";
 const SIDECAR_URL = "http://127.0.0.1:8765/mcp";
+const DEFAULT_PROVIDER = new SidecarMemoryProvider(SIDECAR_URL);
 
 class MockRequest extends PassThrough {
   url = "/mcp";
@@ -203,7 +206,7 @@ function setupSidecarToolsList(tools: unknown[]): void {
 async function callMcp(
   headers: Record<string, string>,
   tokenValid: boolean,
-  sidecarUrl: string | null = SIDECAR_URL,
+  provider: MemoryProvider | null = DEFAULT_PROVIDER,
   baseUrl: string | null = BASE_URL,
   method = "POST",
   body?: string,
@@ -213,7 +216,7 @@ async function callMcp(
   );
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
-  handleMcpRequest(req as never, res as never, sidecarUrl, baseUrl);
+  handleMcpRequest(req as never, res as never, provider, baseUrl);
   await res.done;
   return { statusCode: res.statusCode, body: res.body, responseHeaders: res.responseHeaders };
 }
@@ -221,7 +224,7 @@ async function callMcp(
 describe("handleMcpRequest", () => {
   describe("not configured (missing baseUrl)", () => {
     it("returns 503 when baseUrl is null", async () => {
-      const result = await callMcp({ authorization: "Bearer tok" }, true, SIDECAR_URL, null);
+      const result = await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, null);
       expect(result.statusCode).toBe(503);
       expect(JSON.parse(result.body).error).toContain("OAUTH_REDIRECT_BASE_URL");
     });
@@ -302,7 +305,7 @@ describe("handleMcpRequest", () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
@@ -332,7 +335,7 @@ describe("handleMcpRequest", () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
@@ -360,7 +363,7 @@ describe("handleMcpRequest", () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
@@ -386,7 +389,7 @@ describe("handleMcpRequest", () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
@@ -411,7 +414,7 @@ describe("handleMcpRequest", () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
@@ -432,7 +435,7 @@ describe("handleMcpRequest", () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
@@ -446,7 +449,7 @@ describe("handleMcpRequest", () => {
       const result = await callMcp(
         { authorization: "Bearer tok" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         '{"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}',
@@ -869,6 +872,97 @@ describe("handleMcpRequest", () => {
     });
   });
 
+  describe("tools/call — capability enforcement", () => {
+    it("returns -32601 when a tool is called that the provider's capability flags exclude", async () => {
+      const stubProvider: MemoryProvider = {
+        id: "stub",
+        capabilities: {
+          hybridSearch: true,
+          neighbors: true,
+          path: false,
+          provenance: false,
+          stalenessStamp: false,
+        },
+        listTools: async () => [],
+        proxyCall: () => { /* never reached */ },
+      };
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        stubProvider,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "kg_path", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.error).toBeDefined();
+      expect(parsed.error.code).toBe(-32601);
+      expect(parsed.error.message).toContain("kg_path");
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+
+    it("returns -32601 for kg_provenance when provider has provenance: false", async () => {
+      const stubProvider: MemoryProvider = {
+        id: "stub",
+        capabilities: {
+          hybridSearch: true,
+          neighbors: true,
+          path: false,
+          provenance: false,
+          stalenessStamp: false,
+        },
+        listTools: async () => [],
+        proxyCall: () => { /* never reached */ },
+      };
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        stubProvider,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "kg_provenance", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.error.code).toBe(-32601);
+    });
+
+    it("proxies kg_hybrid_search when provider has hybridSearch: true", async () => {
+      const stubProvider: MemoryProvider = {
+        id: "stub",
+        capabilities: {
+          hybridSearch: true,
+          neighbors: true,
+          path: false,
+          provenance: false,
+          stalenessStamp: false,
+        },
+        listTools: async () => [],
+        proxyCall: (_req, res) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: 9, result: { content: [] } }));
+        },
+      };
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        stubProvider,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "kg_hybrid_search", arguments: { query: "test" } } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+    });
+  });
+
   describe("proxy forwarding (non-diagnostic requests)", () => {
     it("returns 503 for non-diagnostic requests when sidecar is not configured", async () => {
       const result = await callMcp({ authorization: "Bearer tok" }, true, null);
@@ -883,13 +977,13 @@ describe("handleMcpRequest", () => {
 
     it("forwards the request method to the sidecar", async () => {
       const { capturedOpts } = setupProxyMock({});
-      await callMcp({ authorization: "Bearer tok" }, true, SIDECAR_URL, BASE_URL, "GET");
+      await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, BASE_URL, "GET");
       expect(capturedOpts.value?.method).toBe("GET");
     });
 
     it("forwards DELETE method to the sidecar", async () => {
       const { capturedOpts } = setupProxyMock({});
-      await callMcp({ authorization: "Bearer tok" }, true, SIDECAR_URL, BASE_URL, "DELETE");
+      await callMcp({ authorization: "Bearer tok" }, true, DEFAULT_PROVIDER, BASE_URL, "DELETE");
       expect(capturedOpts.value?.method).toBe("DELETE");
     });
 
@@ -920,7 +1014,7 @@ describe("handleMcpRequest", () => {
       await callMcp(
         { authorization: "Bearer tok", "content-type": "application/json" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         "not-json",
@@ -941,7 +1035,7 @@ describe("handleMcpRequest", () => {
       await callMcp(
         { authorization: "Bearer tok", "content-type": "application/json" },
         true,
-        SIDECAR_URL,
+        DEFAULT_PROVIDER,
         BASE_URL,
         "POST",
         kgCall,
@@ -1005,7 +1099,7 @@ describe("handleMcpRequest", () => {
       });
       const req = new MockRequest("GET", { authorization: "Bearer tok" });
       const res = new MockResponse();
-      handleMcpRequest(req as never, res as never, SIDECAR_URL, BASE_URL);
+      handleMcpRequest(req as never, res as never, DEFAULT_PROVIDER, BASE_URL);
       await res.done;
       expect(res.headersSent).toBe(true);
     });
