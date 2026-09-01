@@ -189,6 +189,16 @@ jobs:
         with:
           app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
           private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
+          # Explicit permissions (AII-450). Implicit mode inherits "all installation
+          # permissions", which made a missing scope a push-time mystery — two runs
+          # died pushing a workflow file with a buried remote-rejected error while
+          # every permission surface CLAIMED workflows:write. Explicit scopes make
+          # the mint fail loudly, by name, at mint time instead.
+          permission-contents: write
+          permission-workflows: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-metadata: read
 
       - name: Validate Bedrock inputs
         if: inputs.provider == 'bedrock'
