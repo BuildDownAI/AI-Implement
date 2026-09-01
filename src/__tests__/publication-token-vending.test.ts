@@ -86,7 +86,7 @@ describe("handlePublicationTokenRequest", () => {
       "fake-key",
       "original-owner",
       {
-        permissions: { contents: "write", pull_requests: "write" },
+        permissions: { contents: "write", pull_requests: "write", workflows: "write" },
         repositories: ["original-repo"],
         forceRefresh: true,
       },
