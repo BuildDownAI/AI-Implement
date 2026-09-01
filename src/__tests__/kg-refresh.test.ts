@@ -15,7 +15,9 @@ function makeTarball(dir: string): Buffer {
   const wrap = mkdtempSync(join(tmpdir(), "kgtar-"));
   const top = join(wrap, "repo");
   mkdirSync(top, { recursive: true });
-  execSync(`cp -R ${dir}/ ${top}/`);
+  // `dir/.` copies CONTENTS on both BSD (macOS) and GNU (Linux) cp — a bare
+  // trailing slash nests the directory on GNU, which broke this fixture in CI.
+  execSync(`cp -R ${dir}/. ${top}/`);
   const out = join(wrap, "src.tar.gz");
   execSync(`tar -czf ${out} -C ${wrap} repo`);
   return readFileSync(out) as Buffer;
