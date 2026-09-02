@@ -1,4 +1,4 @@
-import { getScopedInstallationToken } from "./github-app-auth.js";
+import { mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { getRefSha, compareCommits } from "./github.js";
 import type { DeployPolicy } from "./deploy-policy.js";
 
@@ -101,13 +101,16 @@ export function getAvailability(): DeploymentAvailability | null {
 
 export async function refreshAvailability(input: AvailabilityInput): Promise<DeploymentAvailability> {
   const { appId, privateKey, owner, repo, branch, runningCommit } = input;
-  // Scoped to the single repository whose branch this reads. The options match the deploy
-  // path's mint exactly, so the two share one cache entry rather than minting separately.
-  const { token } = await getScopedInstallationToken(appId, privateKey, owner, {
+  // Scoped to the single repository whose branch this reads. Falls back to an App JWT
+  // when the App is not installed on the source repo's owner, enabling public-repo reads.
+  // On the installation path the options match the deploy path's mint exactly, so the
+  // two share one cache entry.
+  const { token } = await mintSourceTokenOrJwt(appId, privateKey, owner, {
     permissions: { contents: "read" },
     repositories: [repo],
   });
-  // null on 404 or unknown ref — a deleted/renamed branch or a tag that doesn't exist.
+  // null on 404 or unknown ref — a deleted/renamed branch, a tag that doesn't exist,
+  // or a private repo that the App JWT cannot access.
   const headCommit = await getRefSha(token, owner, repo, branch);
 
   let isDowngrade: boolean | null = null;

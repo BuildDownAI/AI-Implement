@@ -5,7 +5,7 @@ import type * as GithubModule from "../github.js";
 
 // Both dependencies exist only to reach GitHub; what matters here is what they
 // return, so each is replaced by a spy exposing the functions we call.
-vi.mock("../github-app-auth.js", () => ({ getScopedInstallationToken: vi.fn() }));
+vi.mock("../github-app-auth.js", () => ({ mintSourceTokenOrJwt: vi.fn() }));
 vi.mock("../github.js", () => ({ getRefSha: vi.fn(), compareCommits: vi.fn() }));
 
 const RUNNING = "1111111111111111111111111111111111111111";
@@ -35,9 +35,9 @@ beforeEach(async () => {
   vi.resetModules();
   githubAppAuth = await import("../github-app-auth.js");
   github = await import("../github.js");
-  vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue({
+  vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
     token: "installation-token",
-    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    authMode: "installation",
   });
   vi.mocked(github.compareCommits).mockResolvedValue({ behindBy: 0 });
   availability = await import("../deploy-availability.js");
@@ -160,16 +160,13 @@ describe("refreshAvailability", () => {
     expect(state).toMatchObject({ available: true, runningCommit: RUNNING, headCommit: HEAD });
   });
 
-  it("mints a token scoped to the one repository it reads", async () => {
-    // This runs on every poll cycle, so the broad installation-wide mint it used to make
-    // was the orchestrator's most frequently issued credential and its widest. The option
-    // shape also has to match the deploy path's mint exactly — the cache is keyed on
-    // (owner, permissions, repositories), so an identical shape means one token serves both.
+  it("requests a token scoped to the one repository it reads", async () => {
+    // This runs on every poll cycle — the option shape must stay narrow (one repo, one permission).
     vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
 
     await availability.refreshAvailability(input());
 
-    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith(
+    expect(githubAppAuth.mintSourceTokenOrJwt).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(String),
       "BuildDownAI",
@@ -264,6 +261,43 @@ describe("refreshAvailability", () => {
     const state = await availability.refreshAvailability(input());
 
     expect(state.isDowngrade).toBeNull();
+  });
+});
+
+describe("refreshAvailability — JWT fallback", () => {
+  it("uses the JWT token when the App is not installed on the source owner", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
+      token: "jwt-token",
+      authMode: "jwt",
+    });
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
+
+    const state = await availability.refreshAvailability(input());
+
+    expect(github.getRefSha).toHaveBeenCalledWith("jwt-token", "BuildDownAI", "AI-Implement", "testing");
+    expect(state.available).toBe(true);
+    expect(state.headCommit).toBe(HEAD);
+  });
+
+  it("reports unknown availability when a private repo is inaccessible under JWT", async () => {
+    // GitHub hides private repos from App JWTs behind a 404; getRefSha maps that to null.
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
+      token: "jwt-token",
+      authMode: "jwt",
+    });
+    vi.mocked(github.getRefSha).mockResolvedValue(null);
+
+    const state = await availability.refreshAvailability(input());
+
+    expect(state.available).toBeNull();
+    expect(state.headCommit).toBeNull();
+  });
+
+  it("propagates non-404 mint errors without falling back", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockRejectedValue(new Error("GitHub 500"));
+
+    await expect(availability.refreshAvailability(input())).rejects.toThrow("GitHub 500");
+    expect(availability.getAvailability()).toBeNull();
   });
 });
 

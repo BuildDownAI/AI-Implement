@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { generateKeyPairSync } from "node:crypto";
-import { getInstallationToken, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt, getScopedInstallationToken } from "../github-app-auth.js";
+import { getInstallationToken, refreshInstallationToken, getInstallation, getAppSlug, installationIncludesRepo, clearTokenCache, createAppJwt, getScopedInstallationToken, mintSourceTokenOrJwt } from "../github-app-auth.js";
 
 // Generate a real RSA key pair for tests so JWT signing works correctly
 const { privateKey } = generateKeyPairSync("rsa", {
@@ -558,6 +558,63 @@ describe("getScopedInstallationToken", () => {
 
     const [userInstallUrl] = vi.mocked(fetch).mock.calls[1];
     expect(userInstallUrl).toBe("https://api.github.com/users/my-user/installation");
+  });
+});
+
+describe("mintSourceTokenOrJwt", () => {
+  const futureExpiresAt = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+  it("returns an installation token when the App is installed (auth=installation)", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: true, json: { token: "ghs_installed", expires_at: futureExpiresAt() } },
+    ]));
+
+    const result = await mintSourceTokenOrJwt(APP_ID, privateKey, "my-org", {
+      permissions: { contents: "read" }, repositories: ["my-repo"],
+    });
+
+    expect(result.token).toBe("ghs_installed");
+    expect(result.authMode).toBe("installation");
+  });
+
+  it("falls back to an App JWT when the App is not installed on the owner (404)", async () => {
+    // Both org and user installation endpoints return 404 → not installed → JWT fallback.
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: false, status: 404, text: "Not Found" },
+      { ok: false, status: 404, text: "Not Found" },
+    ]));
+
+    const result = await mintSourceTokenOrJwt(APP_ID, privateKey, "BuildDownAI", {
+      permissions: { contents: "read" }, repositories: ["AI-Implement"],
+    });
+
+    // JWT is a three-part dot-separated token, not a "ghs_…" installation token.
+    expect(result.token).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+    expect(result.authMode).toBe("jwt");
+    // No further network requests after the two 404s.
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("rethrows non-404 mint errors without falling back", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: true, json: { id: 1 } },
+      { ok: false, status: 422, text: "Unprocessable Entity" },
+    ]));
+
+    await expect(
+      mintSourceTokenOrJwt(APP_ID, privateKey, "my-org", { permissions: { contents: "read" } }),
+    ).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("rethrows a 500 from the installation endpoint without falling back", async () => {
+    vi.mocked(fetch).mockImplementation(mockFetch([
+      { ok: false, status: 500, text: "Internal Server Error" },
+    ]));
+
+    await expect(
+      mintSourceTokenOrJwt(APP_ID, privateKey, "my-org"),
+    ).rejects.toMatchObject({ status: 500 });
   });
 });
 

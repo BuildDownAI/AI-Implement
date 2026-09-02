@@ -301,6 +301,7 @@ describe("makeStartDeploy onBuildFailure callback", () => {
 
     vi.doMock("../github-app-auth.js", () => ({
       getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "tok", expiresAt: "" }),
+      mintSourceTokenOrJwt: vi.fn().mockResolvedValue({ token: "tok", authMode: "installation" }),
     }));
     vi.doMock("../github.js", () => ({
       fetchRepoTarball: vi.fn(),
@@ -319,6 +320,26 @@ describe("makeStartDeploy onBuildFailure callback", () => {
     vi.doUnmock("../github-app-auth.js");
     vi.doUnmock("../github.js");
     vi.unstubAllGlobals();
+  });
+
+  it("uses the installation token path by default (auth=installation)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("nope", { status: 404 })));
+
+    const onBuildFailure = vi.fn();
+    const start = localDeploy.makeStartDeploy({
+      flyDeployToken: "fly-token",
+      flyOrchestratorApp: "orchestrator",
+      selfDeployTarget: { owner: "Owner", repo: "Repo", branch: "testing", runningCommit: "abc" },
+      pollIntervalMs: 60_000,
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      kgSourceRepo: null,
+      onBuildFailure,
+    })!;
+
+    const result = await start();
+    // HEAD resolved → started even though runDeploy will fail later at flyctl
+    expect(result).toMatchObject({ started: true, commit: "def5678" });
   });
 
   it("calls onBuildFailure when runDeploy rejects", async () => {
@@ -347,5 +368,107 @@ describe("makeStartDeploy onBuildFailure callback", () => {
     await called;
 
     expect(onBuildFailure).toHaveBeenCalledWith("def5678", expect.any(Error));
+  });
+});
+
+describe("makeStartDeploy — JWT fallback", () => {
+  // Re-setup with JWT auth mode: App not installed on source owner.
+  let localDeploy: typeof DeployModule;
+  let closeDb: () => void;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    process.env.DEDUP_DB_PATH = path.join(os.tmpdir(), `deploy-jwt-${Date.now()}.sqlite`);
+
+    vi.doMock("../github-app-auth.js", () => ({
+      getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "kg-tok", expiresAt: "" }),
+      mintSourceTokenOrJwt: vi.fn().mockResolvedValue({ token: "jwt-tok", authMode: "jwt" }),
+    }));
+    vi.doMock("../github.js", () => ({
+      fetchRepoTarball: vi.fn().mockResolvedValue(Buffer.alloc(0)),
+      getRefSha: vi.fn().mockResolvedValue("def5678"),
+    }));
+
+    localDeploy = await import("../deploy.js");
+    const { initSettingsTable } = await import("../runner-mode.js");
+    initSettingsTable();
+    // dispatch_log is queried by waitForQuiet → getInFlightWork → getInFlightJobs.
+    const log = await import("../log.js");
+    log.initLogTable();
+    const dedup = await import("../dedup.js");
+    closeDb = dedup.closeDb;
+  });
+
+  afterEach(() => {
+    closeDb?.();
+    vi.doUnmock("../github-app-auth.js");
+    vi.doUnmock("../github.js");
+    vi.unstubAllGlobals();
+  });
+
+  it("resolves HEAD and returns started:true when the source uses JWT fallback", async () => {
+    const start = localDeploy.makeStartDeploy({
+      flyDeployToken: "fly-token",
+      flyOrchestratorApp: "orchestrator",
+      selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement", branch: "main", runningCommit: null },
+      pollIntervalMs: 60_000,
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      kgSourceRepo: null,
+      onBuildFailure: vi.fn(),
+    })!;
+
+    const result = await start();
+    expect(result).toMatchObject({ started: true, commit: "def5678" });
+  });
+
+  it("surfaces a fix message via onBuildFailure when tarball fails under JWT (private out-of-installation repo)", async () => {
+    // fetchRepoTarball fails: private repo hidden from App JWT
+    const github = await import("../github.js");
+    vi.mocked(github.fetchRepoTarball).mockRejectedValue(new Error("fetchRepoTarball failed: HTTP 404"));
+
+    let signalCalled = () => {};
+    const called = new Promise<void>((resolve) => { signalCalled = resolve; });
+    let capturedError: unknown;
+    const onBuildFailure = vi.fn((_, err: unknown) => { capturedError = err; signalCalled(); });
+
+    const start = localDeploy.makeStartDeploy({
+      flyDeployToken: "fly-token",
+      flyOrchestratorApp: "orchestrator",
+      selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement", branch: "main", runningCommit: null },
+      pollIntervalMs: 60_000,
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      kgSourceRepo: null,
+      onBuildFailure,
+    })!;
+
+    const result = await start();
+    expect(result).toMatchObject({ started: true, commit: "def5678" });
+
+    await called;
+
+    expect(onBuildFailure).toHaveBeenCalledWith("def5678", expect.any(Error));
+    expect((capturedError as Error).message).toMatch(/Install the App|add the repository to the existing installation/);
+  });
+
+  it("does not fall back when a non-404 mint error occurs — clears the hold and rethrows", async () => {
+    const githubAuth = await import("../github-app-auth.js");
+    vi.mocked(githubAuth.mintSourceTokenOrJwt).mockRejectedValue(new Error("GitHub 422 Unprocessable Entity"));
+
+    const { isDeployHeld } = await import("../deploy-hold.js");
+
+    const start = localDeploy.makeStartDeploy({
+      flyDeployToken: "fly-token",
+      flyOrchestratorApp: "orchestrator",
+      selfDeployTarget: { owner: "BuildDownAI", repo: "AI-Implement", branch: "main", runningCommit: null },
+      pollIntervalMs: 60_000,
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      kgSourceRepo: null,
+    })!;
+
+    await expect(start()).rejects.toThrow("422");
+    expect(isDeployHeld()).toBe(false);
   });
 });
