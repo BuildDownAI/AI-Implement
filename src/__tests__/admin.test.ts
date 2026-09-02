@@ -2718,7 +2718,7 @@ describe("GET /api/deploy-refs", () => {
   it("returns 503 with install message for a private repo outside the installation", async () => {
     const { GitHubApiError: GHError } = await import("../github-errors.js");
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: "app-jwt", authMode: "jwt" });
-    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 403, path: "/repos/foreign-org/private-repo/branches", bodyText: "Not Found" }));
+    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/foreign-org/private-repo/branches", bodyText: "Not Found" }));
     const token = await login("secret");
     const res = await deployRefsRequest("foreign-org/private-repo", token);
     expect(res.statusCode).toBe(503);

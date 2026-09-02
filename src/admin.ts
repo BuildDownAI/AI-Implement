@@ -1043,7 +1043,7 @@ async function handleDeployRefs(
     const { branches, tags } = await listRepoBranchesAndTags(token, owner, repoName);
     json(res, 200, { branches, tags });
   } catch (err) {
-    if (err instanceof GitHubApiError && err.status === 403) {
+    if (err instanceof GitHubApiError && err.status === 404) {
       json(res, 503, { error: "Repository is private and not accessible; install the GitHub App for this owner to grant access" });
       return;
     }

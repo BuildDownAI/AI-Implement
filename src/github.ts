@@ -819,23 +819,6 @@ export async function addCommentReaction(
   });
 }
 
-/** Lists up to 100 branch names for a repo. Returns [] on error. */
-export async function listBranchNames(token: string, owner: string, repo: string): Promise<string[]> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
-  if (!res.ok) return [];
-  const data = (await res.json()) as Array<{ name?: unknown }>;
-  return data.flatMap((b) => (typeof b.name === "string" ? [b.name] : []));
-}
-
-/** Lists up to 100 tag names for a repo. Returns [] on error. */
-export async function listTagNames(token: string, owner: string, repo: string): Promise<string[]> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
-  if (!res.ok) return [];
-  const data = (await res.json()) as Array<{ name?: unknown }>;
-  return data.flatMap((t) => (typeof t.name === "string" ? [t.name] : []));
-}
 
 /** Lists branches and tags for a repo, throwing GitHubApiError on any non-200 response. */
 export async function listRepoBranchesAndTags(
