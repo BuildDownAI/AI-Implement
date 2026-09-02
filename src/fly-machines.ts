@@ -455,6 +455,7 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
       .map((name) => ({ env_var: name.slice(prefix.length), name }));
     if (mappedSecrets.length > 0) {
       machineConfig.processes = [{ secrets: mappedSecrets }];
+      env.AI_IMPLEMENT_FORWARDED_SECRETS = mappedSecrets.map((s) => s.env_var).join(",");
     }
   }
 

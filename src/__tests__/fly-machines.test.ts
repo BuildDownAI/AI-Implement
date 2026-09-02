@@ -573,6 +573,46 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.processes).toBeUndefined();
   });
 
+  it("sets AI_IMPLEMENT_FORWARDED_SECRETS to comma-joined env_var names when secrets match", () => {
+    const result = buildSessionMachineConfig({
+      ...baseInput,
+      teamKey: "ENG",
+      teamSecretNames: ["ENG_DATABASE_URL", "ENG_API_KEY", "OTHER_X"],
+    });
+    expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBe("DATABASE_URL,API_KEY");
+    expect(result.config.processes).toEqual([{
+      secrets: [
+        { env_var: "DATABASE_URL", name: "ENG_DATABASE_URL" },
+        { env_var: "API_KEY", name: "ENG_API_KEY" },
+      ],
+    }]);
+  });
+
+  it("omits AI_IMPLEMENT_FORWARDED_SECRETS when no secrets match team prefix", () => {
+    const result = buildSessionMachineConfig({
+      ...baseInput,
+      teamKey: "ENG",
+      teamSecretNames: ["OTHER_X", "OTHER_Y"],
+    });
+    expect(result.config.env).not.toHaveProperty("AI_IMPLEMENT_FORWARDED_SECRETS");
+    expect(result.config.processes).toBeUndefined();
+  });
+
+  it("omits AI_IMPLEMENT_FORWARDED_SECRETS when teamSecretNames is not provided", () => {
+    const result = buildSessionMachineConfig({ ...baseInput });
+    expect(result.config.env).not.toHaveProperty("AI_IMPLEMENT_FORWARDED_SECRETS");
+  });
+
+  it("overrides extraEnv AI_IMPLEMENT_FORWARDED_SECRETS with computed value", () => {
+    const result = buildSessionMachineConfig({
+      ...baseInput,
+      teamKey: "ENG",
+      teamSecretNames: ["ENG_DATABASE_URL"],
+      extraEnv: { AI_IMPLEMENT_FORWARDED_SECRETS: "SHOULD_BE_OVERRIDDEN" },
+    });
+    expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBe("DATABASE_URL");
+  });
+
   it("passes min_secrets_version when provided", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
