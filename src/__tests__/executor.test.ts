@@ -86,6 +86,28 @@ exit 0
   chmodSync(path, 0o755);
 }
 
+function installForwardedSecretRecordingClaude(): void {
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    result: "ok",
+    num_turns: 1,
+    duration_ms: 1,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const script = `#!/usr/bin/env bash
+printf '%s\n' "\${QA_BASE_URL-unset}" > "${binDir}/qa-base-url.txt"
+printf '%s\n' "\${QA_TOKEN-unset}" > "${binDir}/qa-token.txt"
+printf '%s\n' "\${AI_IMPLEMENT_FORWARDED_SECRETS-unset}" > "${binDir}/ai-implement-forwarded-secrets.txt"
+env > "${binDir}/env-dump.txt"
+printf '%s\n' '${resultLine}'
+exit 0
+`;
+  const path = join(binDir, "claude");
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
 function installModelCredentialRecordingClaude(): void {
   const resultLine = JSON.stringify({
     type: "result",
@@ -364,5 +386,93 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     } finally {
       if (savedApiKey !== undefined) process.env.ANTHROPIC_API_KEY = savedApiKey;
     }
+  });
+
+  it("strips forwarded secrets from model env by key and by value", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "QA_BASE_URL,QA_TOKEN");
+    vi.stubEnv("QA_BASE_URL", "https://qa.example.com");
+    vi.stubEnv("QA_TOKEN", "sentinel-qa-token-abc");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "qa-base-url.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "qa-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "ai-implement-forwarded-secrets.txt"), "utf-8").trim()).toBe("unset");
+    const envDump = readFileSync(join(binDir, "env-dump.txt"), "utf-8");
+    expect(envDump).not.toContain("sentinel-qa-token-abc");
+  });
+
+  it("logs forwarded secret names (not values) at runner start when list is non-empty", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "QA_BASE_URL,QA_TOKEN");
+    vi.stubEnv("QA_BASE_URL", "https://qa.example.com");
+    vi.stubEnv("QA_TOKEN", "sentinel-qa-token-xyz");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    const lines = log.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes("QA_BASE_URL") && l.includes("QA_TOKEN"))).toBe(true);
+    expect(lines.every((l) => !l.includes("sentinel-qa-token-xyz"))).toBe(true);
+    expect(lines.every((l) => !l.includes("https://qa.example.com"))).toBe(true);
+  });
+
+  it("does not log forwarded secrets line when AI_IMPLEMENT_FORWARDED_SECRETS is unset", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    const saved = process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
+    delete process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
+
+    try {
+      await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+      const lines = log.mock.calls.map((c) => String(c[0]));
+      expect(lines.every((l) => !l.includes("forwarded secrets"))).toBe(true);
+    } finally {
+      if (saved !== undefined) process.env.AI_IMPLEMENT_FORWARDED_SECRETS = saved;
+    }
+  });
+
+  it("ignores forwarded secret names absent from the environment", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "DOES_NOT_EXIST_KEY");
+    delete process.env.DOES_NOT_EXIST_KEY;
+
+    await expect(
+      new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" }),
+    ).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("tolerates whitespace and empty entries in AI_IMPLEMENT_FORWARDED_SECRETS", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", " QA_BASE_URL , ,QA_TOKEN ");
+    vi.stubEnv("QA_BASE_URL", "https://qa.example.com");
+    vi.stubEnv("QA_TOKEN", "sentinel-qa-token-ws");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "qa-base-url.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "qa-token.txt"), "utf-8").trim()).toBe("unset");
+    const envDump = readFileSync(join(binDir, "env-dump.txt"), "utf-8");
+    expect(envDump).not.toContain("sentinel-qa-token-ws");
+  });
+
+  it("still strips MODEL_CHILD_CREDENTIAL_KEYS when forwarded secrets are also set", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installEnvironmentRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "QA_TOKEN");
+    vi.stubEnv("QA_TOKEN", "sentinel-qa-forwarded");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "run-progress-token");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "run-publication-token");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "run-progress-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-publication-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-token.txt"), "utf-8").trim()).toBe("unset");
   });
 });

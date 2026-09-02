@@ -16,7 +16,7 @@ afterEach(() => {
   }
   // Clean up env the hook scripts export, so a failing assertion mid-test can't
   // leak a var into other tests sharing this Vitest worker's process.env.
-  for (const k of ["FOO_TEST_VAR", "SIMPLE_TEST_VAR", "MULTI_TEST_VAR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]) {
+  for (const k of ["FOO_TEST_VAR", "SIMPLE_TEST_VAR", "MULTI_TEST_VAR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AI_IMPLEMENT_FORWARDED_SECRETS", "QA_BASE_URL", "QA_TOKEN"]) {
     delete process.env[k];
   }
 });
@@ -53,6 +53,22 @@ describe.skipIf(isWindows)("runHookScript", () => {
     expect(captured).not.toContain("sentinel-oauth-hook");
     // GITHUB_ENV must be present so the hook can export variables
     expect(captured).toContain("GITHUB_ENV=");
+  });
+
+  it("forwarded secrets are present in hook spawn env", () => {
+    const captureFile = join(dir, "hook-env.txt");
+    writeFileSync(join(dir, "setup.sh"), `env > "${captureFile}"\n`);
+    process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "QA_BASE_URL,QA_TOKEN";
+    process.env.QA_BASE_URL = "https://qa.example.com";
+    process.env.QA_TOKEN = "sentinel-qa-token-hook";
+
+    const result = runHookScript("setup", "setup.sh", dir);
+    expect(result.exitCode).toBe(0);
+
+    const captured = readFileSync(captureFile, "utf-8");
+    expect(captured).toContain("sentinel-qa-token-hook");
+    expect(captured).toContain("https://qa.example.com");
+    expect(captured).toContain("AI_IMPLEMENT_FORWARDED_SECRETS=");
   });
 
   it("ignores GHA heredoc multiline values (only KEY=value is supported)", () => {

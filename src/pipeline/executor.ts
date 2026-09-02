@@ -9,7 +9,7 @@ import {
   summaryLine,
   type StreamEvent,
 } from "./claude-stream.js";
-import { modelProcessEnv } from "./process-env.js";
+import { modelProcessEnv, parseForwardedSecrets } from "./process-env.js";
 
 function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
   const current = spawnSync("git", ["remote", "get-url", "origin"], {
@@ -102,6 +102,11 @@ export class ClaudeCliExecutor implements LLMExecutor {
       // limit — MAX_ARG_STRLEN, 128 KiB on Linux — which makes spawn fail with E2BIG.
       // `claude -p` reads the prompt from stdin, so there is no size ceiling.
       args.push("-p");
+
+      const forwarded = parseForwardedSecrets();
+      if (forwarded.length > 0) {
+        console.log(`[runner] forwarded secrets stripped from model env: ${forwarded.join(", ")}`);
+      }
 
       let proc: ChildProcessWithoutNullStreams;
       try {
