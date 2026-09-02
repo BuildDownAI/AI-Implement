@@ -124,9 +124,9 @@ export async function runDeploy(input: RunDeployInput): Promise<void> {
     try {
       tarball = await fetchRepoTarball(sourceToken, owner, repo, commit);
     } catch (err) {
-      if (sourceAuthMode === "jwt") {
-        // JWT path means the App is not installed on the owner. A public repo would have
-        // succeeded; 404 here means the repo is private. Tell the operator what to fix.
+      if (sourceAuthMode === "public") {
+        // Public (unauthenticated) path means the App is not installed on the owner.
+        // A public repo would have succeeded; failure here means the repo is private.
         throw new Error(
           `Source repo '${owner}/${repo}' is not accessible. It may be private and the GitHub App is not installed on '${owner}'. Install the App on that org, or add the repository to the existing installation.`,
         );
@@ -427,9 +427,9 @@ export function makeStartDeploy(
 
       return { started: true, commit: head };
     } catch (err) {
-      // mintSourceTokenOrJwt handles the 404-not-installed case internally via JWT fallback;
-      // only genuine failures (non-404 auth errors, network errors) reach here.
-      // Clear the hold so dispatch resumes rather than stalling.
+      // mintSourceTokenOrJwt handles the 404-not-installed case internally via the public
+      // (unauthenticated) fallback; only genuine failures (non-404 auth errors, network
+      // errors) reach here. Clear the hold so dispatch resumes rather than stalling.
       clearDeployHold();
       throw err;
     }

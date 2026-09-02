@@ -1033,17 +1033,23 @@ async function handleDeployRefs(
     return;
   }
   const [owner, repoName] = parts;
+  // Captured before the try so the catch can distinguish public-mode 404s from
+  // authenticated 404s (which indicate a different failure class).
+  let authMode: "installation" | "public" = "installation";
   try {
-    const { token } = await mintSourceTokenOrJwt(
+    const result = await mintSourceTokenOrJwt(
       config.githubAppId,
       config.githubAppPrivateKey,
       owner,
       { permissions: { contents: "read" }, repositories: [repoName] },
     );
-    const { branches, tags } = await listRepoBranchesAndTags(token, owner, repoName);
+    authMode = result.authMode;
+    const { branches, tags } = await listRepoBranchesAndTags(result.token, owner, repoName);
     json(res, 200, { branches, tags });
   } catch (err) {
-    if (err instanceof GitHubApiError && err.status === 403) {
+    // 403 = authenticated but forbidden; 404 in public mode = private repo hidden behind 404.
+    // Both indicate the App must be installed on the owner to grant access.
+    if (err instanceof GitHubApiError && (err.status === 403 || (err.status === 404 && authMode === "public"))) {
       json(res, 503, { error: "Repository is private and not accessible; install the GitHub App for this owner to grant access" });
       return;
     }

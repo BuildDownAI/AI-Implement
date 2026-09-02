@@ -2706,22 +2706,45 @@ describe("GET /api/deploy-refs", () => {
     expect(mintSourceTokenOrJwtMock).toHaveBeenCalledWith("test-app-id", "test-private-key", "owner", expect.objectContaining({ permissions: { contents: "read" } }));
   });
 
-  it("returns branches and tags via App JWT for a public repo outside the installation", async () => {
-    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "app-jwt", authMode: "jwt" });
+  it("returns branches and tags unauthenticated for a public repo outside the installation (public mode)", async () => {
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: null, authMode: "public" });
     listRepoBranchesAndTagsMock.mockResolvedValue({ branches: ["main"], tags: [] });
     const token = await login("secret");
     const res = await deployRefsRequest("foreign-org/public-repo", token);
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatchObject({ branches: ["main"], tags: [] });
+    // null token must be forwarded — no App JWT reaches the /repos endpoint.
+    expect(listRepoBranchesAndTagsMock).toHaveBeenCalledWith(null, "foreign-org", "public-repo");
   });
 
-  it("returns 503 with install message for a private repo outside the installation", async () => {
+  it("returns 503 with install message when unauthenticated 404 indicates a private repo (public mode)", async () => {
     const { GitHubApiError: GHError } = await import("../github-errors.js");
-    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "app-jwt", authMode: "jwt" });
-    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 403, path: "/repos/foreign-org/private-repo/branches", bodyText: "Not Found" }));
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: null, authMode: "public" });
+    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/foreign-org/private-repo/branches", bodyText: "" }));
     const token = await login("secret");
     const res = await deployRefsRequest("foreign-org/private-repo", token);
     expect(res.statusCode).toBe(503);
     expect((res.body as { error: string }).error).toMatch(/install/i);
+  });
+
+  it("returns 503 with install message on 403 regardless of auth mode", async () => {
+    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
+    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 403, path: "/repos/owner/repo/branches", bodyText: "Forbidden" }));
+    const token = await login("secret");
+    const res = await deployRefsRequest("owner/repo", token);
+    expect(res.statusCode).toBe(503);
+    expect((res.body as { error: string }).error).toMatch(/install/i);
+  });
+
+  it("returns generic 503 on 404 in installation mode (not treated as private-repo indicator)", async () => {
+    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
+    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/owner/repo/branches", bodyText: "" }));
+    const token = await login("secret");
+    const res = await deployRefsRequest("owner/repo", token);
+    expect(res.statusCode).toBe(503);
+    // Generic message — must NOT say "install the GitHub App" (that's the install-specific message).
+    expect((res.body as { error: string }).error).not.toMatch(/install the GitHub App/i);
   });
 });

@@ -371,18 +371,18 @@ describe("makeStartDeploy onBuildFailure callback", () => {
   });
 });
 
-describe("makeStartDeploy — JWT fallback", () => {
-  // Re-setup with JWT auth mode: App not installed on source owner.
+describe("makeStartDeploy — public mode (no App installation on source owner)", () => {
+  // Re-setup with public auth mode: App not installed on source owner; reads are unauthenticated.
   let localDeploy: typeof DeployModule;
   let closeDb: () => void;
 
   beforeEach(async () => {
     vi.resetModules();
-    process.env.DEDUP_DB_PATH = path.join(os.tmpdir(), `deploy-jwt-${Date.now()}.sqlite`);
+    process.env.DEDUP_DB_PATH = path.join(os.tmpdir(), `deploy-public-${Date.now()}.sqlite`);
 
     vi.doMock("../github-app-auth.js", () => ({
       getScopedInstallationToken: vi.fn().mockResolvedValue({ token: "kg-tok", expiresAt: "" }),
-      mintSourceTokenOrJwt: vi.fn().mockResolvedValue({ token: "jwt-tok", authMode: "jwt" }),
+      mintSourceTokenOrJwt: vi.fn().mockResolvedValue({ token: null, authMode: "public" }),
     }));
     vi.doMock("../github.js", () => ({
       fetchRepoTarball: vi.fn().mockResolvedValue(Buffer.alloc(0)),
@@ -406,7 +406,7 @@ describe("makeStartDeploy — JWT fallback", () => {
     vi.unstubAllGlobals();
   });
 
-  it("resolves HEAD and returns started:true when the source uses JWT fallback", async () => {
+  it("resolves HEAD and returns started:true when the source uses public (unauthenticated) fallback", async () => {
     const start = localDeploy.makeStartDeploy({
       flyDeployToken: "fly-token",
       flyOrchestratorApp: "orchestrator",
@@ -422,8 +422,8 @@ describe("makeStartDeploy — JWT fallback", () => {
     expect(result).toMatchObject({ started: true, commit: "def5678" });
   });
 
-  it("surfaces a fix message via onBuildFailure when tarball fails under JWT (private out-of-installation repo)", async () => {
-    // fetchRepoTarball fails: private repo hidden from App JWT
+  it("surfaces a fix message via onBuildFailure when tarball fails in public mode (private out-of-installation repo)", async () => {
+    // fetchRepoTarball fails: private repo returns error when accessed without auth
     const github = await import("../github.js");
     vi.mocked(github.fetchRepoTarball).mockRejectedValue(new Error("fetchRepoTarball failed: HTTP 404"));
 

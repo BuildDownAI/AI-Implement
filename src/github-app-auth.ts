@@ -320,14 +320,15 @@ export async function getAppSlug(appId: string, privateKey: string): Promise<str
 }
 
 export interface SourceTokenResult {
-  token: string;
-  authMode: "installation" | "jwt";
+  token: string | null;
+  authMode: "installation" | "public";
 }
 
 /**
  * Mints a scoped installation token for the given source-repo owner.
- * When the App is not installed on that owner (404 from both endpoints), falls back to an
- * App JWT, which GitHub accepts for reading public repos without an installation scope.
+ * When the App is not installed on that owner (404 from both endpoints), falls back to
+ * unauthenticated (public) reads — no token is returned. GitHub rejects App JWTs on
+ * /repos/... content endpoints; unauthenticated reads work for public repos.
  * Logs which auth path was taken. Any non-404 error from the mint is rethrown unchanged.
  */
 export async function mintSourceTokenOrJwt(
@@ -342,10 +343,9 @@ export async function mintSourceTokenOrJwt(
   } catch (err) {
     if (err instanceof GitHubApiError && err.status === 404) {
       console.log(
-        `[deploy] App not installed on "${owner}"; falling back to App JWT for public fetch (auth=jwt)`,
+        `[deploy] App not installed on "${owner}"; falling back to unauthenticated reads for public repos (auth=public)`,
       );
-      const normalizedKey = privateKey.replace(/\\n/g, "\n");
-      return { token: createAppJwt(appId, normalizedKey), authMode: "jwt" };
+      return { token: null, authMode: "public" };
     }
     throw err;
   }
