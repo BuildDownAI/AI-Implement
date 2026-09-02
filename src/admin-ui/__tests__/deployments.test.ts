@@ -421,6 +421,22 @@ describe("deployments page", () => {
     expect(deploymentsScript).toContain("/api/deploy-refs?repo=");
   });
 
+  it("reads data.defaultBranch from the deploy-refs response", () => {
+    expect(deploymentsScript).toContain("data.defaultBranch");
+  });
+
+  it("uses savedPolicy.watchedRef to determine the pinned watched ref", () => {
+    expect(deploymentsScript).toContain("savedPolicy.watchedRef");
+  });
+
+  it("excludes pinned refs from the remaining branches list to avoid duplication", () => {
+    expect(deploymentsScript).toContain("pinnedSet");
+  });
+
+  it("renders a Pinned optgroup for the default and watched branches", () => {
+    expect(deploymentsScript).toContain('label="Pinned"');
+  });
+
   it("dirty check covers watchedRepo and watchedRef", () => {
     expect(deploymentsScript).toContain("watchedRepoChanged");
     expect(deploymentsScript).toContain("watchedRefChanged");

@@ -844,30 +844,57 @@ export async function listTagNames(token: string, owner: string, repo: string): 
   return data.flatMap((t) => (typeof t.name === "string" ? [t.name] : []));
 }
 
+/** Extracts the next-page URL from a GitHub Link response header, or null if none. */
+function parseLinkNext(header: string | null): string | null {
+  if (!header) return null;
+  for (const part of header.split(",")) {
+    const match = part.match(/<([^>]+)>;\s*rel="next"/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
 /** Lists branches and tags for a repo, throwing GitHubApiError on any non-200 response. */
 export async function listRepoBranchesAndTags(
   token: string | null,
   owner: string,
   repo: string,
 ): Promise<{ branches: string[]; tags: string[] }> {
-  const [branchRes, tagRes] = await Promise.all([
-    fetch(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`, { headers: srcHeaders(token) }),
-    fetch(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, { headers: srcHeaders(token) }),
+  async function fetchAllNames(initialUrl: string, path: string): Promise<string[]> {
+    const names: string[] = [];
+    let url: string | null = initialUrl;
+    while (url) {
+      const res = await fetch(url, { headers: srcHeaders(token) });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new GitHubApiError({ status: res.status, path, bodyText: body });
+      }
+      const data = (await res.json()) as Array<{ name?: unknown }>;
+      names.push(...data.flatMap((item) => (typeof item.name === "string" ? [item.name] : [])));
+      url = parseLinkNext(res.headers.get("link"));
+    }
+    return names;
+  }
+
+  const [branches, tags] = await Promise.all([
+    fetchAllNames(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`, `/repos/${owner}/${repo}/branches`),
+    fetchAllNames(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, `/repos/${owner}/${repo}/tags`),
   ]);
-  if (!branchRes.ok) {
-    const body = await branchRes.text().catch(() => "");
-    throw new GitHubApiError({ status: branchRes.status, path: `/repos/${owner}/${repo}/branches`, bodyText: body });
-  }
-  if (!tagRes.ok) {
-    const body = await tagRes.text().catch(() => "");
-    throw new GitHubApiError({ status: tagRes.status, path: `/repos/${owner}/${repo}/tags`, bodyText: body });
-  }
-  const branchData = (await branchRes.json()) as Array<{ name?: unknown }>;
-  const tagData = (await tagRes.json()) as Array<{ name?: unknown }>;
-  return {
-    branches: branchData.flatMap((b) => (typeof b.name === "string" ? [b.name] : [])),
-    tags: tagData.flatMap((t) => (typeof t.name === "string" ? [t.name] : [])),
-  };
+  return { branches, tags };
+}
+
+/**
+ * Returns the default branch for a repository, or null if the request fails.
+ */
+export async function getRepoDefaultBranch(
+  token: string | null,
+  owner: string,
+  repo: string,
+): Promise<string | null> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: srcHeaders(token) });
+  if (!res.ok) return null;
+  const data = (await res.json()) as { default_branch?: unknown };
+  return typeof data.default_branch === "string" ? data.default_branch : null;
 }
 
 /**

@@ -49,7 +49,7 @@ import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
-import { listRepoBranchesAndTags } from "./github.js";
+import { listRepoBranchesAndTags, getRepoDefaultBranch } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
@@ -1044,8 +1044,11 @@ async function handleDeployRefs(
       { permissions: { contents: "read" }, repositories: [repoName] },
     );
     authMode = result.authMode;
-    const { branches, tags } = await listRepoBranchesAndTags(result.token, owner, repoName);
-    json(res, 200, { branches, tags });
+    const [{ branches, tags }, defaultBranch] = await Promise.all([
+      listRepoBranchesAndTags(result.token, owner, repoName),
+      getRepoDefaultBranch(result.token, owner, repoName),
+    ]);
+    json(res, 200, { branches, tags, defaultBranch });
   } catch (err) {
     // 403 = authenticated but forbidden; 404 in public mode = private repo hidden behind 404.
     // Both indicate the App must be installed on the owner to grant access.
