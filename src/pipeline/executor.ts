@@ -30,6 +30,12 @@ function claudeEnvironment(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
   if (!allowRepositoryWrites) {
     for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
   }
+  // Strip forwarded secrets — hooks see them via process.env, but Claude must not.
+  const forwarded = (env.AI_IMPLEMENT_FORWARDED_SECRETS ?? "")
+    .split(",")
+    .map((k) => k.trim())
+    .filter(Boolean);
+  for (const key of forwarded) delete env[key];
   return env;
 }
 

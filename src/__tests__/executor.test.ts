@@ -77,6 +77,7 @@ printf '%s\n' "\${RUN_PROGRESS_TOKEN-unset}" > "${binDir}/run-progress-token.txt
 printf '%s\n' "\${RUN_PUBLICATION_TOKEN-unset}" > "${binDir}/run-publication-token.txt"
 printf '%s\n' "\${RUN_TOKEN-unset}" > "${binDir}/run-token.txt"
 printf '%s\n' "\${SAFE_EXECUTOR_VAR-unset}" > "${binDir}/safe-executor-var.txt"
+printf '%s\n' "\${MY_FORWARDED_SECRET-unset}" > "${binDir}/my-forwarded-secret.txt"
 git remote get-url origin > "${binDir}/origin-url.txt" 2>/dev/null || true
 printf '%s\n' '${resultLine}'
 exit 0
@@ -285,6 +286,24 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(process.env.RUN_PROGRESS_TOKEN).toBe("run-progress-token");
     expect(process.env.RUN_PUBLICATION_TOKEN).toBe("run-publication-token");
     expect(process.env.RUN_TOKEN).toBe("run-token");
+  });
+
+  it("strips AI_IMPLEMENT_FORWARDED_SECRETS-listed keys from Claude's environment", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installEnvironmentRecordingClaude();
+    vi.stubEnv("MY_FORWARDED_SECRET", "super-secret-value");
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "MY_FORWARDED_SECRET");
+    vi.stubEnv("SAFE_EXECUTOR_VAR", "safe");
+    execFileSync("git", ["init", "-q"], { cwd: binDir });
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/acme/app.git"], { cwd: binDir });
+
+    await new ClaudeCliExecutor(binDir, "summary", true).invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "my-forwarded-secret.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "safe-executor-var.txt"), "utf-8").trim()).toBe("safe");
+    // process.env must be left intact — only the claude subprocess sees the stripped env
+    expect(process.env.MY_FORWARDED_SECRET).toBe("super-secret-value");
+    expect(process.env.AI_IMPLEMENT_FORWARDED_SECRETS).toBe("MY_FORWARDED_SECRET");
   });
 
   it("leaves SSH origins unchanged while withholding environment credentials", async () => {
