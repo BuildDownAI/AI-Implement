@@ -19,10 +19,7 @@ const hoisted = vi.hoisted(() => ({
   getMappings: vi.fn<() => Record<string, RepoMapping>>(() => ({})),
   getInstallationToken: vi.fn<() => Promise<string>>(() => Promise.resolve("fake-token")),
   resolveWorkflowContract: vi.fn<() => Promise<"envelope" | "legacy">>(() => Promise.resolve("envelope")),
-  refreshAvailability: vi.fn<() => Promise<unknown>>(() => Promise.resolve({})),
 }));
-
-vi.mock("../deploy-availability.js", () => ({ refreshAvailability: hoisted.refreshAvailability }));
 
 vi.mock("../config.js", () => ({ getMappings: hoisted.getMappings }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: hoisted.getInstallationToken }));
@@ -133,8 +130,6 @@ beforeEach(async () => {
   hoisted.getMappings.mockReturnValue({});
   hoisted.getInstallationToken.mockResolvedValue("fake-token");
   hoisted.resolveWorkflowContract.mockResolvedValue("envelope");
-  hoisted.refreshAvailability.mockReset();
-  hoisted.refreshAvailability.mockResolvedValue({});
 
   // Reset fetch mock call history and set default implementation
   mockFetch.mockReset();
