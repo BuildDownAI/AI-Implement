@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 import { preflightStep } from "../pipeline/steps/preflight.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -32,6 +32,10 @@ function makeContext(): DefaultPipelineContext {
 describe("preflightStep", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("returns no-op summary when no package.json scripts configured", async () => {
@@ -121,5 +125,30 @@ describe("preflightStep", () => {
 
     expect(typeof outputs.testOutput).toBe("string");
     expect(typeof outputs.testsRun).toBe("number");
+  });
+
+  it("does not pass model credentials to preflight command environment", async () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "sentinel-a");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "sentinel-b");
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p).endsWith("package.json"));
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      JSON.stringify({ scripts: { typecheck: "tsc" } }),
+    );
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    vi.mocked(execSync).mockImplementation((_cmd, opts) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return Buffer.from("");
+    });
+
+    await preflightStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(capturedEnv?.["ANTHROPIC_API_KEY"]).not.toBe("sentinel-a");
+    expect(capturedEnv?.["CLAUDE_CODE_OAUTH_TOKEN"]).not.toBe("sentinel-b");
+    expect(capturedEnv?.PATH).toBeDefined();
   });
 });
