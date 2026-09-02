@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { HttpStepReporter, TokenStepReporter } from "../pipeline/reporter.js";
 import type { Step } from "../pipeline/types.js";
 
@@ -61,6 +61,21 @@ describe("HttpStepReporter", () => {
 });
 
 describe("TokenStepReporter", () => {
+  let savedGithubRunId: string | undefined;
+
+  beforeEach(() => {
+    savedGithubRunId = process.env.GITHUB_RUN_ID;
+    delete process.env.GITHUB_RUN_ID;
+  });
+
+  afterEach(() => {
+    if (savedGithubRunId !== undefined) {
+      process.env.GITHUB_RUN_ID = savedGithubRunId;
+    } else {
+      delete process.env.GITHUB_RUN_ID;
+    }
+  });
+
   it("posts step reports with a bearer progress token", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const reporter = new TokenStepReporter("https://orchestrator.example", "progress-token", {
@@ -83,7 +98,7 @@ describe("TokenStepReporter", () => {
   });
 
   it("includes the GitHub run ID when the workflow provides one", async () => {
-    vi.stubEnv("GITHUB_RUN_ID", "32595525188");
+    process.env.GITHUB_RUN_ID = "32595525188";
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const reporter = new TokenStepReporter("https://orchestrator.example", "progress-token", {
       fetchImpl: async (url, init) => {
@@ -99,6 +114,5 @@ describe("TokenStepReporter", () => {
       step: STEP,
       githubRunId: 32595525188,
     });
-    vi.unstubAllEnvs();
   });
 });

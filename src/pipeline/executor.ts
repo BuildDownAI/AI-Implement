@@ -113,7 +113,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
         proc = spawn("claude", args, {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
-          env: modelProcessEnv(this.allowRepositoryWrites),
+          env: modelProcessEnv(this.allowRepositoryWrites, forwarded),
         });
       } catch (err) {
         try {

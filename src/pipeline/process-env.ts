@@ -55,7 +55,7 @@ export function repoProcessEnv(): NodeJS.ProcessEnv {
  * secrets named in AI_IMPLEMENT_FORWARDED_SECRETS are also stripped — they are
  * available to hooks but must never reach the model process.
  */
-export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
+export function modelProcessEnv(allowRepositoryWrites: boolean, forwardedSecrets?: string[]): NodeJS.ProcessEnv {
   const env = { ...process.env };
   if (env.CLAUDE_CODE_OAUTH_TOKEN) {
     delete env.ANTHROPIC_API_KEY;
@@ -64,7 +64,7 @@ export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessE
   if (!allowRepositoryWrites) {
     for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
   }
-  for (const key of parseForwardedSecrets()) delete env[key];
+  for (const key of (forwardedSecrets ?? parseForwardedSecrets())) delete env[key];
   // The list variable itself must not reach the model — it names what was hidden
   delete env.AI_IMPLEMENT_FORWARDED_SECRETS;
   return env;
