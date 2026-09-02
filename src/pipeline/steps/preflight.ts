@@ -2,6 +2,7 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { repoProcessEnv } from "../process-env.js";
 
 interface PreflightInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -42,7 +43,7 @@ export const preflightStep: StepModule<PreflightInputs, PreflightOutputs> = {
 
     const run = (cmd: string): string => {
       try {
-        const out = execSync(cmd, { cwd: workspaceDir, stdio: "pipe" }).toString();
+        const out = execSync(cmd, { cwd: workspaceDir, stdio: "pipe", env: repoProcessEnv() }).toString();
         return out;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
