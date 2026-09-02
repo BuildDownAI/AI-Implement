@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { clearDeployHold, isDeployHeld, setDeployHold } from "./deploy-hold.js";
-import { getScopedInstallationToken } from "./github-app-auth.js";
+import { getScopedInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { fetchRepoTarball, getRefSha } from "./github.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import type { SelfDeployTarget } from "./deploy-availability.js";
@@ -114,17 +114,29 @@ export async function runDeploy(input: RunDeployInput): Promise<void> {
     // so the in-flight set only shrinks from here.
     await waitForQuiet(DRAIN_TIMEOUT_MS, drainPollMs(pollIntervalMs));
 
+    // Mint and fetch the source before downloading flyctl: auth failures and
+    // inaccessible repos surface here with an actionable message, not after 100 MB of I/O.
+    const { token: sourceToken, authMode: sourceAuthMode } = await mintSourceTokenOrJwt(
+      githubAppId, githubAppPrivateKey, owner,
+      { permissions: { contents: "read" }, repositories: [repo] },
+    );
+    let tarball: Buffer;
+    try {
+      tarball = await fetchRepoTarball(sourceToken, owner, repo, commit);
+    } catch (err) {
+      if (sourceAuthMode === "jwt") {
+        // JWT path means the App is not installed on the owner. A public repo would have
+        // succeeded; 404 here means the repo is private. Tell the operator what to fix.
+        throw new Error(
+          `Source repo '${owner}/${repo}' is not accessible. It may be private and the GitHub App is not installed on '${owner}'. Install the App on that org, or add the repository to the existing installation.`,
+        );
+      }
+      throw err;
+    }
+
     const scratch = await deployScratch();
     const flyctl = await resolveFlyctl(scratch);
-
-    const source = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, owner, {
-      permissions: { contents: "read" },
-      repositories: [repo],
-    });
-    const context = await extractSource(
-      await fetchRepoTarball(source.token, owner, repo, commit),
-      scratch,
-    );
+    const context = await extractSource(tarball, scratch);
 
     let kgToken: string | null = null;
     if (kgSourceRepo) {
@@ -387,11 +399,11 @@ export function makeStartDeploy(
     setDeployHold();
 
     try {
-      const source = await getScopedInstallationToken(config.githubAppId, config.githubAppPrivateKey, target.owner, {
-        permissions: { contents: "read" },
-        repositories: [target.repo],
-      });
-      const head = await getRefSha(source.token, target.owner, target.repo, target.branch);
+      const { token: sourceToken } = await mintSourceTokenOrJwt(
+        config.githubAppId, config.githubAppPrivateKey, target.owner,
+        { permissions: { contents: "read" }, repositories: [target.repo] },
+      );
+      const head = await getRefSha(sourceToken, target.owner, target.repo, target.branch);
       if (!head) {
         clearDeployHold();
         return { started: false, reason: "head-unknown" };
@@ -415,8 +427,9 @@ export function makeStartDeploy(
 
       return { started: true, commit: head };
     } catch (err) {
-      // Only a 404 is soft here,
-      // both calls throw on any other non-OK response, and a hold claimed above would otherwise outlive the request that took it.
+      // mintSourceTokenOrJwt handles the 404-not-installed case internally via JWT fallback;
+      // only genuine failures (non-404 auth errors, network errors) reach here.
+      // Clear the hold so dispatch resumes rather than stalling.
       clearDeployHold();
       throw err;
     }

@@ -319,10 +319,42 @@ export async function getAppSlug(appId: string, privateKey: string): Promise<str
   return cachedAppSlug;
 }
 
+export interface SourceTokenResult {
+  token: string;
+  authMode: "installation" | "jwt";
+}
+
+/**
+ * Mints a scoped installation token for the given source-repo owner.
+ * When the App is not installed on that owner (404 from both endpoints), falls back to an
+ * App JWT, which GitHub accepts for reading public repos without an installation scope.
+ * Logs which auth path was taken. Any non-404 error from the mint is rethrown unchanged.
+ */
+export async function mintSourceTokenOrJwt(
+  appId: string,
+  privateKey: string,
+  owner: string,
+  options?: ScopedTokenOptions,
+): Promise<SourceTokenResult> {
+  try {
+    const { token } = await getScopedInstallationToken(appId, privateKey, owner, options);
+    return { token, authMode: "installation" };
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 404) {
+      console.log(
+        `[deploy] App not installed on "${owner}"; falling back to App JWT for public fetch (auth=jwt)`,
+      );
+      const normalizedKey = privateKey.replace(/\\n/g, "\n");
+      return { token: createAppJwt(appId, normalizedKey), authMode: "jwt" };
+    }
+    throw err;
+  }
+}
+
 /**
  * Returns a cached installation access token for the given owner.
  * Tokens are valid for 1 hour; we cache for 50 minutes.
- * 
+ *
  * Thin caching layer over getInstallation — the hot dispatch path only needs the token.
  */
 export async function getInstallationToken(
