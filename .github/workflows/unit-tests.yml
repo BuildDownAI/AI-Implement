@@ -38,3 +38,4 @@ jobs:
           unset GITHUB_RUN_ID GITHUB_ENV GITHUB_REPOSITORY GITHUB_REF_NAME                 GITHUB_EVENT_NAME GITHUB_SHA GITHUB_ACTIONS GITHUB_ACTION
           npm test
       - run: npm run typecheck
+# AII-450 regression: pipeline workflow-file push verified 2026-09-01
