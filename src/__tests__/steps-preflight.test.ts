@@ -147,8 +147,8 @@ describe("preflightStep", () => {
       new NoopStepReporter(),
     );
 
-    expect(capturedEnv?.["ANTHROPIC_API_KEY"]).not.toBe("sentinel-a");
-    expect(capturedEnv?.["CLAUDE_CODE_OAUTH_TOKEN"]).not.toBe("sentinel-b");
+    expect(capturedEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(capturedEnv).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
     expect(capturedEnv?.PATH).toBeDefined();
   });
 });
