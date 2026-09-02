@@ -41,9 +41,35 @@ vi.mock("../github-install-state.js", () => ({
 const availabilityMock = vi.hoisted(() =>
   vi.fn((): import("../deploy-availability.js").DeploymentAvailability | null => null),
 );
+// refreshAvailability makes a real GitHub API call; mock it so deploy-check tests
+// run without a live App credential.
+const refreshAvailabilityMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<import("../deploy-availability.js").DeploymentAvailability> => ({
+    available: true,
+    checkedAt: 1_700_000_000_000,
+    runningCommit: "abc1234",
+    headCommit: "abc1234",
+    isDowngrade: false,
+  })),
+);
 vi.mock("../deploy-availability.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../deploy-availability.js")>()),
   getAvailability: availabilityMock,
+  refreshAvailability: refreshAvailabilityMock,
+}));
+
+const getScopedInstallationTokenMock = vi.hoisted(() => vi.fn(async () => ({ token: "gh-token" })));
+vi.mock("../github-app-auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github-app-auth.js")>()),
+  getScopedInstallationToken: getScopedInstallationTokenMock,
+}));
+
+const listBranchNamesMock = vi.hoisted(() => vi.fn(async (): Promise<string[]> => ["main", "testing"]));
+const listTagNamesMock = vi.hoisted(() => vi.fn(async (): Promise<string[]> => ["v1.0.0"]));
+vi.mock("../github.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github.js")>()),
+  listBranchNames: listBranchNamesMock,
+  listTagNames: listTagNamesMock,
 }));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
@@ -2463,6 +2489,29 @@ describe("GET /api/deployment-status", () => {
     const body = (await statusRequest(token)).body;
     expect(body.lastDeployOutcome).toMatchObject({ kind: "deployed-ok", commit: "abc1234", timestamp: 1_700_000_000_000 });
   });
+
+  it("includes watchedRepo and watchedRef from the stored policy", async () => {
+    const { setDeployPolicy } = await import("../deploy-policy.js");
+    setDeployPolicy({ watchedRepo: "owner/repo", watchedRef: "feat" });
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.watchedRepo).toBe("owner/repo");
+    expect(res.body.watchedRef).toBe("feat");
+    setDeployPolicy({ watchedRepo: null, watchedRef: null }); // restore
+  });
+
+  it("includes isDowngrade when the availability flags a downgrade", async () => {
+    availabilityMock.mockReturnValue({
+      available: false,
+      checkedAt: 1_700_000_000_000,
+      runningCommit: "def5678",
+      headCommit: "abc1234",
+      isDowngrade: true,
+    });
+    const token = await login("secret");
+    const res = await statusRequest(token);
+    expect(res.body.isDowngrade).toBe(true);
+  });
 });
 
 describe("POST /api/deploy-policy", () => {
@@ -2512,6 +2561,147 @@ describe("POST /api/deploy-policy", () => {
     admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
     await res.done;
     expect(JSON.parse(res.body)).toMatchObject({ autoDeploy: true, notifyAvailable: true });
+  });
+
+  it("rejects a non-string, non-null watchedRepo", async () => {
+    const token = await login("secret");
+    const res = await policyRequest(token, { watchedRepo: 123 });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("rejects a non-string, non-null watchedRef", async () => {
+    const token = await login("secret");
+    const res = await policyRequest(token, { watchedRef: true });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("persists watchedRepo and watchedRef and returns them in the response", async () => {
+    const token = await login("secret");
+    const res = await policyRequest(token, { watchedRepo: "owner/repo", watchedRef: "main" });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ watchedRepo: "owner/repo", watchedRef: "main" });
+  });
+
+  it("accepts null to clear watchedRepo and watchedRef", async () => {
+    const token = await login("secret");
+    await policyRequest(token, { watchedRepo: "owner/repo", watchedRef: "main" });
+    const res = await policyRequest(token, { watchedRepo: null, watchedRef: null });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ watchedRepo: null, watchedRef: null });
+  });
+});
+
+describe("POST /api/deploy-check", () => {
+  const fakeTarget: import("../deploy-availability.js").SelfDeployTarget = {
+    owner: "BuildDownAI",
+    repo: "AI-Implement",
+    branch: "testing",
+    runningCommit: "abc1234",
+  };
+
+  async function checkRequest(
+    token: string,
+    deps: AdminModule.AdminDeps = {},
+  ): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    const req = new MockRequest("/api/deploy-check", "POST", { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), deps);
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
+  }
+
+  beforeEach(() => {
+    refreshAvailabilityMock.mockResolvedValue({
+      available: true,
+      checkedAt: 1_700_000_000_000,
+      runningCommit: "abc1234",
+      headCommit: "abc1234",
+      isDowngrade: false,
+    });
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    const req = new MockRequest("/api/deploy-check", "POST", {});
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await res.done;
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 503 when no deploy target is configured", async () => {
+    const token = await login("secret");
+    const res = await checkRequest(token, {});
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("returns the refreshed availability when the check succeeds", async () => {
+    const token = await login("secret");
+    const res = await checkRequest(token, { selfDeployTarget: fakeTarget });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.available).toBe(true);
+    expect(res.body.checkedAt).toBe(1_700_000_000_000);
+  });
+
+  it("returns 500 when the availability check throws", async () => {
+    refreshAvailabilityMock.mockRejectedValueOnce(new Error("GitHub 503"));
+    const token = await login("secret");
+    const res = await checkRequest(token, { selfDeployTarget: fakeTarget });
+    expect(res.statusCode).toBe(500);
+  });
+});
+
+describe("GET /api/deploy-refs", () => {
+  async function refsRequest(
+    token: string,
+    repo?: string,
+  ): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    const url = repo ? `/api/deploy-refs?repo=${encodeURIComponent(repo)}` : "/api/deploy-refs";
+    const req = new MockRequest(url, "GET", { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
+  }
+
+  beforeEach(() => {
+    getScopedInstallationTokenMock.mockResolvedValue({ token: "gh-token" });
+    listBranchNamesMock.mockResolvedValue(["main", "testing"]);
+    listTagNamesMock.mockResolvedValue(["v1.0.0"]);
+  });
+
+  it("rejects an unauthenticated request", async () => {
+    const req = new MockRequest("/api/deploy-refs", "GET", {});
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), {});
+    await res.done;
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 400 when the repo parameter is missing", async () => {
+    const token = await login("secret");
+    const res = await refsRequest(token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 400 when repo is not in owner/repo format", async () => {
+    const token = await login("secret");
+    const res = await refsRequest(token, "not-a-valid-repo");
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns branches and tags from GitHub for a valid repo", async () => {
+    const token = await login("secret");
+    const res = await refsRequest(token, "owner/repo");
+    expect(res.statusCode).toBe(200);
+    expect(res.body.branches).toEqual(["main", "testing"]);
+    expect(res.body.tags).toEqual(["v1.0.0"]);
+  });
+
+  it("returns 503 when GitHub is unreachable", async () => {
+    getScopedInstallationTokenMock.mockRejectedValueOnce(new Error("no App installation"));
+    const token = await login("secret");
+    const res = await refsRequest(token, "owner/repo");
+    expect(res.statusCode).toBe(503);
   });
 });
 
