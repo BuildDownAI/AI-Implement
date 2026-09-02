@@ -740,11 +740,11 @@ async function reportInvalidStructuredReview(
 }
 
 function isPrMergedOrLocked(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): boolean {
-  const result = ghSpawn(["pr", "view", prNumber, "--json", "state,locked"]);
+  const result = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
   if (result.exitCode !== 0) return false;
   try {
-    const data = JSON.parse(result.stdout) as { state?: string; locked?: boolean };
-    return data.state === "merged" || data.locked === true;
+    const data = JSON.parse(result.stdout) as { merged?: boolean; locked?: boolean };
+    return data.merged === true || data.locked === true;
   } catch {
     return false;
   }

@@ -2284,8 +2284,8 @@ describe("postPushReviewStep", () => {
 
   it("exits cleanly with approved=true and pr_merged when PR is already merged at loop start", async () => {
     const ghSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "pr" && args[1] === "view" && args[3] === "--json") {
-        return { stdout: '{"state":"merged","locked":false}', exitCode: 0 };
+      if (args[0] === "api" && args[1]?.includes("/pulls/")) {
+        return { stdout: '{"merged":true,"locked":false}', exitCode: 0 };
       }
       return { stdout: "", exitCode: 0 };
     });
@@ -2308,8 +2308,8 @@ describe("postPushReviewStep", () => {
 
   it("exits cleanly with approved=true and pr_merged when PR is locked", async () => {
     const ghSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "pr" && args[1] === "view" && args[3] === "--json") {
-        return { stdout: '{"state":"open","locked":true}', exitCode: 0 };
+      if (args[0] === "api" && args[1]?.includes("/pulls/")) {
+        return { stdout: '{"merged":false,"locked":true}', exitCode: 0 };
       }
       return { stdout: "", exitCode: 0 };
     });
@@ -2330,10 +2330,10 @@ describe("postPushReviewStep", () => {
     expect(gitSpawn).not.toHaveBeenCalled();
   });
 
-  it("continues normally when gh pr view fails (fail-open)", async () => {
+  it("continues normally when gh api call fails (fail-open)", async () => {
     const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "pr" && args[1] === "view" && args[3] === "--json") {
+      if (args[0] === "api" && args[1]?.includes("/pulls/")) {
         return { stdout: "", exitCode: 1 };
       }
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -2356,8 +2356,8 @@ describe("postPushReviewStep", () => {
   it("proceeds normally when PR is open and unlocked (regression guard)", async () => {
     const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "pr" && args[1] === "view" && args[3] === "--json") {
-        return { stdout: '{"state":"open","locked":false}', exitCode: 0 };
+      if (args[0] === "api" && args[1]?.includes("/pulls/")) {
+        return { stdout: '{"merged":false,"locked":false}', exitCode: 0 };
       }
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       return { stdout: "", exitCode: 0 };

@@ -221,23 +221,23 @@ export function getClaimedRunIds(): Set<number> {
   return new Set(rows.map((r) => r.run_id));
 }
 
+/** Returns true when a job with status 'dispatched' or 'running' exists whose pr_url
+ *  matches the given owner/repo/prNumber. Used by the auto-merge guard to defer merging
+ *  a child PR while its runner is still active (AII-471). */
+export function hasInFlightJobForPr(owner: string, repo: string, prNumber: number): boolean {
+  const prUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}`;
+  const row = getDb()
+    .prepare("SELECT COUNT(*) as count FROM dispatch_log WHERE status IN ('dispatched', 'running') AND pr_url = ?")
+    .get(prUrl) as { count: number };
+  return row.count > 0;
+}
+
 /**
  * Counts prior dispatches for an issue. When `phase` is given, only the
  * matching phase family is counted: planning dispatches number independently
  * from work dispatches (implementation + gap-analysis), so the routine
  * planning→implementation handoff is attempt #1, not a "re-dispatch #2".
  */
-/** Returns true when a job with status 'dispatched' or 'running' exists whose pr_url
- *  matches the given owner/repo/prNumber. Used by the auto-merge guard to defer merging
- *  a child PR while its runner is still active (AII-471). */
-export function hasInFlightJobForPr(owner: string, repo: string, prNumber: number): boolean {
-  const pattern = `%/${owner}/${repo}/pull/${prNumber}%`;
-  const row = getDb()
-    .prepare("SELECT COUNT(*) as count FROM dispatch_log WHERE status IN ('dispatched', 'running') AND pr_url LIKE ?")
-    .get(pattern) as { count: number };
-  return row.count > 0;
-}
-
 export function countPriorDispatches(issueId: string, phase?: string): { count: number; lastDispatchedAt: number | null } {
   const phaseClause =
     phase === undefined ? "" : phase === "planning" ? " AND phase = 'planning'" : " AND phase != 'planning'";
