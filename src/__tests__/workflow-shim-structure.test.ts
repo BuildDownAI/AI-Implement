@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
+import { GITHUB_WRITE_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
 const IMPLEMENT_WORKFLOWS = [
   "workflows/claude-implement.yml",
@@ -135,6 +136,21 @@ describe("GHA workflow shims", () => {
       expect(JSON.stringify(forwardStep)).toContain("toJSON(secrets)");
       expect(JSON.stringify(nonForwardSteps)).not.toContain("toJSON(secrets)");
       expect((yaml.match(/toJSON\(secrets\)/g) ?? []).length).toBe(1);
+    });
+
+    it(`${f} forward step reserved-name list covers all GITHUB_WRITE_CREDENTIAL_KEYS entries`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      expect(forwardStep).toBeDefined();
+      const forwardScript: string = forwardStep.run;
+      const reservedLine = forwardScript.match(/reserved="([^"]+)"/)?.[1] ?? "";
+      const reservedNames = reservedLine.split(" ");
+      for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) {
+        expect(reservedNames).toContain(key);
+      }
     });
 
     it(`${f} forward step reserved-name list covers all secrets the template reads`, () => {
