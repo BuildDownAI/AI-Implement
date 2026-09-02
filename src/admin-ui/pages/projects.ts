@@ -31,7 +31,7 @@ export const projectsHtml = `
         <button class="btn btn-sm" style="margin-left:auto" onclick="document.getElementById('secrets-panel').classList.add('hidden')">&#215;</button>
       </div>
       <div class="card-body">
-        <div class="warning">&#9888; Secrets are shared across all machines for this team. Values are write-only and cannot be read back through the API.</div>
+        <div class="warning">&#9888; Secrets are shared across all machines for this team, values are write-only. Secrets reach setup, verify, and dependency install only; the agent never sees them.</div>
         <table class="tbl">
           <thead>
             <tr><th>Name (suffix)</th><th>Status</th><th></th></tr>
