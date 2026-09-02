@@ -818,3 +818,55 @@ export async function addCommentReaction(
     message: `addCommentReaction(${commentId}, ${content}) failed: HTTP ${res.status}: ${body}`,
   });
 }
+
+/** Lists up to 100 branch names for a repo. Returns [] on error. */
+export async function listBranchNames(token: string, owner: string, repo: string): Promise<string[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) return [];
+  const data = (await res.json()) as Array<{ name?: unknown }>;
+  return data.flatMap((b) => (typeof b.name === "string" ? [b.name] : []));
+}
+
+/** Lists up to 100 tag names for a repo. Returns [] on error. */
+export async function listTagNames(token: string, owner: string, repo: string): Promise<string[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) return [];
+  const data = (await res.json()) as Array<{ name?: unknown }>;
+  return data.flatMap((t) => (typeof t.name === "string" ? [t.name] : []));
+}
+
+/**
+ * Resolves a branch name, tag name, or commit SHA to its commit SHA.
+ * Returns null when the ref does not exist or the lookup fails.
+ * Uses the commits list endpoint, which accepts branches, tags, and SHAs as `sha`.
+ */
+export async function getRefSha(token: string, owner: string, repo: string, ref: string): Promise<string | null> {
+  const url =
+    `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(ref)}&per_page=1`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  // 404 = repo not found, 422 = invalid ref
+  if (!res.ok) return null;
+  const data = (await res.json()) as Array<{ sha?: unknown }>;
+  const sha = data[0]?.sha;
+  return typeof sha === "string" ? sha : null;
+}
+
+/**
+ * Returns how many commits `head` is behind `base`. Null on 404 or other failure.
+ * Uses the GitHub compare API: `behind_by > 0` means head is missing commits from base.
+ */
+export async function compareCommits(
+  token: string,
+  owner: string,
+  repo: string,
+  base: string,
+  head: string,
+): Promise<{ behindBy: number } | null> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
+  const res = await fetch(url, { headers: ghHeaders(token) });
+  if (!res.ok) return null;
+  const data = (await res.json()) as { behind_by?: unknown };
+  return { behindBy: typeof data.behind_by === "number" ? data.behind_by : 0 };
+}

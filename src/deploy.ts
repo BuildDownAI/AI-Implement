@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { clearDeployHold, isDeployHeld, setDeployHold } from "./deploy-hold.js";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { fetchRepoTarball, getBranchSha } from "./github.js";
+import { fetchRepoTarball, getRefSha } from "./github.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import type { SelfDeployTarget } from "./deploy-availability.js";
 
@@ -371,14 +371,15 @@ type SelfDeployReady = StartDeployConfig & {
  */
 export function makeStartDeploy(
   config: StartDeployConfig,
-): (() => Promise<DeployStart>) | undefined {
+): ((targetOverride?: SelfDeployTarget) => Promise<DeployStart>) | undefined {
   if (!canSelfDeploy(config)) return undefined;
 
-  const target = config.selfDeployTarget;
+  const fallbackTarget = config.selfDeployTarget;
   const app = config.flyOrchestratorApp;
   const flyDeployToken = config.flyDeployToken;
 
-  return async () => {
+  return async (targetOverride?: SelfDeployTarget) => {
+    const target = targetOverride ?? fallbackTarget;
     // Claim before any await: the check and the set have to be atomic. With the awaits
     // below sitting between them, two triggers arriving together would both pass the
     // check, and the loser's cleanup would clear the hold out from under the winner.
@@ -390,7 +391,7 @@ export function makeStartDeploy(
         permissions: { contents: "read" },
         repositories: [target.repo],
       });
-      const head = await getBranchSha(source.token, target.owner, target.repo, target.branch);
+      const head = await getRefSha(source.token, target.owner, target.repo, target.branch);
       if (!head) {
         clearDeployHold();
         return { started: false, reason: "head-unknown" };

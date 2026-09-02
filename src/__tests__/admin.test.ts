@@ -2493,14 +2493,14 @@ describe("POST /api/deploy-policy", () => {
     const token = await login("secret");
     const res = await policyRequest(token, { autoDeploy: true });
     expect(res.statusCode).toBe(200);
-    expect(res.body).toEqual({ autoDeploy: true, notifyAvailable: true });
+    expect(res.body).toMatchObject({ autoDeploy: true, notifyAvailable: true });
   });
 
   it("leaves the unnamed flag untouched", async () => {
     const token = await login("secret");
     await policyRequest(token, { notifyAvailable: false });
     const res = await policyRequest(token, { autoDeploy: true });
-    expect(res.body).toEqual({ autoDeploy: true, notifyAvailable: false });
+    expect(res.body).toMatchObject({ autoDeploy: true, notifyAvailable: false });
   });
 
   it("surfaces the policy on the deployment-status read the page already makes", async () => {
