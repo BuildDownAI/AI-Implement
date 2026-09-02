@@ -22,6 +22,11 @@ export const preflightStep: StepModule<PreflightInputs, PreflightOutputs> = {
     _reporter: StepReporter,
   ): Promise<PreflightOutputs> {
     const { workspaceDir } = inputs;
+    console.warn(
+      "[preflight] Repository code and task documents are executed directly. " +
+        "This runner does not isolate repository commands from the model process or the host environment — " +
+        "only use with trusted repositories and task documents.",
+    );
     const pm = String(inputs.packageManager ?? "npm");
     const runCmd = pm === "yarn" ? "yarn" : pm === "pnpm" ? "pnpm run" : "npm run";
 

@@ -9,29 +9,7 @@ import {
   summaryLine,
   type StreamEvent,
 } from "./claude-stream.js";
-
-const GITHUB_WRITE_CREDENTIAL_KEYS = [
-  "GITHUB_TOKEN",
-  "GH_TOKEN",
-  "GITHUB_ENTERPRISE_TOKEN",
-  "GH_ENTERPRISE_TOKEN",
-  "GIT_PASSWORD",
-] as const;
-
-const MODEL_CHILD_CREDENTIAL_KEYS = [
-  "RUN_PROGRESS_TOKEN",
-  "RUN_PUBLICATION_TOKEN",
-  "RUN_TOKEN",
-] as const;
-
-function claudeEnvironment(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  for (const key of MODEL_CHILD_CREDENTIAL_KEYS) delete env[key];
-  if (!allowRepositoryWrites) {
-    for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
-  }
-  return env;
-}
+import { modelProcessEnv } from "./process-env.js";
 
 function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
   const current = spawnSync("git", ["remote", "get-url", "origin"], {
@@ -130,7 +108,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
         proc = spawn("claude", args, {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
-          env: claudeEnvironment(this.allowRepositoryWrites),
+          env: modelProcessEnv(this.allowRepositoryWrites),
         });
       } catch (err) {
         try {

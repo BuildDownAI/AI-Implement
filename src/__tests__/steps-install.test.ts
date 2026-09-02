@@ -346,4 +346,22 @@ describe("installStep", () => {
     expect(outputs.installMethod).toBe("skipped: no package.json");
     expect(spawn).not.toHaveBeenCalled();
   });
+
+  it("does not pass model credentials to the install command environment", async () => {
+    mockRootPackageJson();
+    vi.stubEnv("ANTHROPIC_API_KEY", "sentinel-api-key");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "sentinel-oauth-token");
+
+    await installStep.run(
+      makeContext(),
+      { workspaceDir: "/tmp/test" },
+      new NoopStepReporter(),
+    );
+
+    expect(spawn).toHaveBeenCalledOnce();
+    const spawnOptions = vi.mocked(spawn).mock.calls[0][2];
+    expect(spawnOptions?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+    expect(spawnOptions?.env).not.toHaveProperty("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(spawnOptions?.env?.PATH).toBeDefined();
+  });
 });

@@ -86,6 +86,26 @@ exit 0
   chmodSync(path, 0o755);
 }
 
+function installModelCredentialRecordingClaude(): void {
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    result: "ok",
+    num_turns: 1,
+    duration_ms: 1,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const script = `#!/usr/bin/env bash
+printf '%s\n' "\${ANTHROPIC_API_KEY-unset}" > "${binDir}/anthropic-api-key.txt"
+printf '%s\n' "\${CLAUDE_CODE_OAUTH_TOKEN-unset}" > "${binDir}/claude-oauth-token.txt"
+printf '%s\n' '${resultLine}'
+exit 0
+`;
+  const path = join(binDir, "claude");
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
 const SUCCESS_LINES = [
   JSON.stringify({ type: "system", subtype: "init", model: "claude-x", cwd: "/workspace" }),
   JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pnpm check" } }] } }),
@@ -300,5 +320,49 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(readFileSync(join(binDir, "github-token.txt"), "utf-8").trim()).toBe("unset");
     expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe(sshOrigin);
     expect(execFileSync("git", ["remote", "get-url", "origin"], { cwd: binDir, encoding: "utf-8" }).trim()).toBe(sshOrigin);
+  });
+
+  it("OAuth-wins: when both model credentials are set, only OAuth token reaches Claude", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installModelCredentialRecordingClaude();
+    vi.stubEnv("ANTHROPIC_API_KEY", "sentinel-api-key");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "sentinel-oauth-token");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "claude-oauth-token.txt"), "utf-8").trim()).toBe("sentinel-oauth-token");
+    expect(readFileSync(join(binDir, "anthropic-api-key.txt"), "utf-8").trim()).toBe("unset");
+  });
+
+  it("API key only: API key reaches Claude when OAuth token is absent", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installModelCredentialRecordingClaude();
+    vi.stubEnv("ANTHROPIC_API_KEY", "sentinel-api-key");
+    const savedOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
+    try {
+      await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+      expect(readFileSync(join(binDir, "anthropic-api-key.txt"), "utf-8").trim()).toBe("sentinel-api-key");
+      expect(readFileSync(join(binDir, "claude-oauth-token.txt"), "utf-8").trim()).toBe("unset");
+    } finally {
+      if (savedOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOAuth;
+    }
+  });
+
+  it("OAuth only: OAuth token reaches Claude when API key is absent", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installModelCredentialRecordingClaude();
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "sentinel-oauth-token");
+    const savedApiKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+
+    try {
+      await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+      expect(readFileSync(join(binDir, "claude-oauth-token.txt"), "utf-8").trim()).toBe("sentinel-oauth-token");
+      expect(readFileSync(join(binDir, "anthropic-api-key.txt"), "utf-8").trim()).toBe("unset");
+    } finally {
+      if (savedApiKey !== undefined) process.env.ANTHROPIC_API_KEY = savedApiKey;
+    }
   });
 });

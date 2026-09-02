@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { repoProcessEnv } from "../process-env.js";
 
 export interface HookResult {
   exitCode: number;
@@ -42,7 +43,7 @@ export function runHookScript(
     // env merge below must complete before the next step's Claude invocation).
     const proc = spawnSync("bash", ["-euo", "pipefail", resolved], {
       cwd: workspaceDir,
-      env: { ...process.env, GITHUB_ENV: githubEnvFile },
+      env: { ...repoProcessEnv(), GITHUB_ENV: githubEnvFile },
       stdio: ["ignore", "inherit", "inherit"],
     });
 
