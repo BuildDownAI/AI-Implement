@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { HttpStepReporter, TokenStepReporter } from "../pipeline/reporter.js";
 import type { Step } from "../pipeline/types.js";
 
@@ -61,6 +61,14 @@ describe("HttpStepReporter", () => {
 });
 
 describe("TokenStepReporter", () => {
+  beforeEach(() => {
+    delete process.env.GITHUB_RUN_ID;
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("posts step reports with a bearer progress token", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const reporter = new TokenStepReporter("https://orchestrator.example", "progress-token", {
@@ -99,6 +107,5 @@ describe("TokenStepReporter", () => {
       step: STEP,
       githubRunId: 32595525188,
     });
-    vi.unstubAllEnvs();
   });
 });
