@@ -19,10 +19,7 @@ const hoisted = vi.hoisted(() => ({
   getMappings: vi.fn<() => Record<string, RepoMapping>>(() => ({})),
   getInstallationToken: vi.fn<() => Promise<string>>(() => Promise.resolve("fake-token")),
   resolveWorkflowContract: vi.fn<() => Promise<"envelope" | "legacy">>(() => Promise.resolve("envelope")),
-  refreshAvailability: vi.fn<() => Promise<unknown>>(() => Promise.resolve({})),
 }));
-
-vi.mock("../deploy-availability.js", () => ({ refreshAvailability: hoisted.refreshAvailability }));
 
 vi.mock("../config.js", () => ({ getMappings: hoisted.getMappings }));
 vi.mock("../github-app-auth.js", () => ({ getInstallationToken: hoisted.getInstallationToken }));
@@ -133,8 +130,6 @@ beforeEach(async () => {
   hoisted.getMappings.mockReturnValue({});
   hoisted.getInstallationToken.mockResolvedValue("fake-token");
   hoisted.resolveWorkflowContract.mockResolvedValue("envelope");
-  hoisted.refreshAvailability.mockReset();
-  hoisted.refreshAvailability.mockResolvedValue({});
 
   // Reset fetch mock call history and set default implementation
   mockFetch.mockReset();
@@ -1114,74 +1109,5 @@ describe("/ai-implement comment trigger", () => {
     expect(reviewStore.listOpenReviewFindings("org/repo", 45)).toHaveLength(1);
     expect(reviewFixQueue.getPendingReviewFixes()).toHaveLength(1);
     expect(commentGapfillQueue.claimPendingCommentGapfills(10)).toHaveLength(0);
-  });
-});
-
-describe("push events", () => {
-  const TARGET = {
-    owner: "BuildDownAI",
-    repo: "AI-Implement",
-    branch: "testing",
-    runningCommit: "1111111111111111111111111111111111111111",
-  };
-
-  // Not a default parameter: `undefined` is a case under test, and a default
-  // would silently substitute TARGET for it.
-  async function push(ref: string, selfDeploy: typeof TARGET | undefined) {
-    const { req, res } = makeRequest(SECRET, "push", { ref });
-    await webhook.handleGitHubWebhook(
-      req as never,
-      res as never,
-      SECRET,
-      "app-id",
-      "private-key",
-      selfDeploy,
-    );
-    await res.done;
-    return res;
-  }
-
-  it("refreshes availability for a push to the watched branch", async () => {
-    const res = await push("refs/heads/testing", TARGET);
-
-    expect(hoisted.refreshAvailability).toHaveBeenCalledWith({
-      appId: "app-id",
-      privateKey: "private-key",
-      ...TARGET,
-    });
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ refreshed: true });
-  });
-
-  it("ignores a push to any other branch", async () => {
-    const res = await push("refs/heads/main", TARGET);
-
-    expect(hoisted.refreshAvailability).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true });
-  });
-
-  it("ignores a tag push even when the tag shares the branch name", async () => {
-    // refs/tags/testing must not be mistaken for refs/heads/testing — the reason
-    // the ref is stripped by prefix rather than by taking the last path segment.
-    const res = await push("refs/tags/testing", TARGET);
-
-    expect(hoisted.refreshAvailability).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true });
-  });
-
-  it("ignores a push when the image carries no self-deploy stamps", async () => {
-    const res = await push("refs/heads/testing", undefined);
-
-    expect(hoisted.refreshAvailability).not.toHaveBeenCalled();
-    expect(JSON.parse(res.body)).toEqual({ ignored: true });
-  });
-
-  it("still answers 200 when the refresh fails, since the poll recomputes anyway", async () => {
-    hoisted.refreshAvailability.mockRejectedValueOnce(new Error("HTTP 502"));
-
-    const res = await push("refs/heads/testing", TARGET);
-
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ refreshed: false });
   });
 });

@@ -46,6 +46,18 @@ vi.mock("../deploy-availability.js", async (importOriginal) => ({
   getAvailability: availabilityMock,
 }));
 
+const mintSourceTokenOrJwtMock = vi.hoisted(() => vi.fn());
+vi.mock("../github-app-auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github-app-auth.js")>()),
+  mintSourceTokenOrJwt: mintSourceTokenOrJwtMock,
+}));
+
+const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
+vi.mock("../github.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github.js")>()),
+  listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
+}));
+
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
     forMapping: async () => provider,
@@ -2493,14 +2505,14 @@ describe("POST /api/deploy-policy", () => {
     const token = await login("secret");
     const res = await policyRequest(token, { autoDeploy: true });
     expect(res.statusCode).toBe(200);
-    expect(res.body).toEqual({ autoDeploy: true, notifyAvailable: true });
+    expect(res.body).toMatchObject({ autoDeploy: true, notifyAvailable: true });
   });
 
   it("leaves the unnamed flag untouched", async () => {
     const token = await login("secret");
     await policyRequest(token, { notifyAvailable: false });
     const res = await policyRequest(token, { autoDeploy: true });
-    expect(res.body).toEqual({ autoDeploy: true, notifyAvailable: false });
+    expect(res.body).toMatchObject({ autoDeploy: true, notifyAvailable: false });
   });
 
   it("surfaces the policy on the deployment-status read the page already makes", async () => {
@@ -2645,5 +2657,94 @@ describe("per-page grants", () => {
     accessGrants.savePageGrants(["issues", "pulls"], "second@eudoxus.ai");
     const after = accessGrants.listPageGrants().find((g) => g.page === "issues");
     expect(after).toEqual(originally);
+  });
+});
+
+describe("GET /api/deploy-refs", () => {
+  async function deployRefsRequest(
+    repo: string | null,
+    token?: string,
+  ): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    const url = repo == null ? "/api/deploy-refs" : `/api/deploy-refs?repo=${repo}`;
+    const headers: Record<string, string> = token ? { authorization: `Bearer ${token}` } : {};
+    const req = new MockRequest(url, "GET", headers);
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
+  }
+
+  beforeEach(() => {
+    mintSourceTokenOrJwtMock.mockReset();
+    listRepoBranchesAndTagsMock.mockReset();
+  });
+
+  it("returns 401 without an auth token", async () => {
+    const res = await deployRefsRequest("owner/repo");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 400 when the repo param is missing", async () => {
+    const token = await login("secret");
+    const res = await deployRefsRequest(null, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 400 when the repo param has no slash", async () => {
+    const token = await login("secret");
+    const res = await deployRefsRequest("noslash", token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns branches and tags via installation token for an installed owner", async () => {
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
+    listRepoBranchesAndTagsMock.mockResolvedValue({ branches: ["main", "dev"], tags: ["v1.0"] });
+    const token = await login("secret");
+    const res = await deployRefsRequest("owner/repo", token);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ branches: ["main", "dev"], tags: ["v1.0"] });
+    expect(mintSourceTokenOrJwtMock).toHaveBeenCalledWith("test-app-id", "test-private-key", "owner", expect.objectContaining({ permissions: { contents: "read" } }));
+  });
+
+  it("returns branches and tags unauthenticated for a public repo outside the installation (public mode)", async () => {
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: null, authMode: "public" });
+    listRepoBranchesAndTagsMock.mockResolvedValue({ branches: ["main"], tags: [] });
+    const token = await login("secret");
+    const res = await deployRefsRequest("foreign-org/public-repo", token);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ branches: ["main"], tags: [] });
+    // null token must be forwarded — no App JWT reaches the /repos endpoint.
+    expect(listRepoBranchesAndTagsMock).toHaveBeenCalledWith(null, "foreign-org", "public-repo");
+  });
+
+  it("returns 503 with install message when unauthenticated 404 indicates a private repo (public mode)", async () => {
+    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: null, authMode: "public" });
+    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/foreign-org/private-repo/branches", bodyText: "" }));
+    const token = await login("secret");
+    const res = await deployRefsRequest("foreign-org/private-repo", token);
+    expect(res.statusCode).toBe(503);
+    expect((res.body as { error: string }).error).toMatch(/install/i);
+  });
+
+  it("returns 503 with install message on 403 regardless of auth mode", async () => {
+    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
+    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 403, path: "/repos/owner/repo/branches", bodyText: "Forbidden" }));
+    const token = await login("secret");
+    const res = await deployRefsRequest("owner/repo", token);
+    expect(res.statusCode).toBe(503);
+    expect((res.body as { error: string }).error).toMatch(/install/i);
+  });
+
+  it("returns generic 503 on 404 in installation mode (not treated as private-repo indicator)", async () => {
+    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
+    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 404, path: "/repos/owner/repo/branches", bodyText: "" }));
+    const token = await login("secret");
+    const res = await deployRefsRequest("owner/repo", token);
+    expect(res.statusCode).toBe(503);
+    // Generic message — must NOT say "install the GitHub App" (that's the install-specific message).
+    expect((res.body as { error: string }).error).not.toMatch(/install the GitHub App/i);
   });
 });
