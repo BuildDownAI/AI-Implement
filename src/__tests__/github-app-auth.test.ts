@@ -578,8 +578,9 @@ describe("mintSourceTokenOrJwt", () => {
     expect(result.authMode).toBe("installation");
   });
 
-  it("falls back to an App JWT when the App is not installed on the owner (404)", async () => {
-    // Both org and user installation endpoints return 404 → not installed → JWT fallback.
+  it("falls back to unauthenticated (public) mode when the App is not installed on the owner (404)", async () => {
+    // Both org and user installation endpoints return 404 → not installed → public fallback.
+    // App JWTs are rejected by GitHub on /repos/... content endpoints; no token is returned.
     vi.mocked(fetch).mockImplementation(mockFetch([
       { ok: false, status: 404, text: "Not Found" },
       { ok: false, status: 404, text: "Not Found" },
@@ -589,10 +590,9 @@ describe("mintSourceTokenOrJwt", () => {
       permissions: { contents: "read" }, repositories: ["AI-Implement"],
     });
 
-    // JWT is a three-part dot-separated token, not a "ghs_…" installation token.
-    expect(result.token).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
-    expect(result.authMode).toBe("jwt");
-    // No further network requests after the two 404s.
+    expect(result.token).toBeNull();
+    expect(result.authMode).toBe("public");
+    // No further network requests after the two 404s — no JWT mint, no token exchange.
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 

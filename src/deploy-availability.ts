@@ -94,6 +94,12 @@ export function decideAvailability(
 }
 
 let current: DeploymentAvailability | null = null;
+// ETag from the last public-mode poll; paired with the SHA it was received with.
+// Sent as If-None-Match on subsequent polls so 304s do not consume the unauthenticated
+// rate limit (60 req/hour per IP) when the branch tip is stable.
+let etag: string | null = null;
+let etagSha: string | null = null;
+
 /** Last computed availability, or null before the first poll of this process. */
 export function getAvailability(): DeploymentAvailability | null {
   return current;
@@ -101,21 +107,48 @@ export function getAvailability(): DeploymentAvailability | null {
 
 export async function refreshAvailability(input: AvailabilityInput): Promise<DeploymentAvailability> {
   const { appId, privateKey, owner, repo, branch, runningCommit } = input;
-  // Scoped to the single repository whose branch this reads. Falls back to an App JWT
+  // Scoped to the single repository whose branch this reads. Falls back to unauthenticated
   // when the App is not installed on the source repo's owner, enabling public-repo reads.
   // On the installation path the options match the deploy path's mint exactly, so the
   // two share one cache entry.
-  const { token } = await mintSourceTokenOrJwt(appId, privateKey, owner, {
+  const sourceAuth = await mintSourceTokenOrJwt(appId, privateKey, owner, {
     permissions: { contents: "read" },
     repositories: [repo],
   });
-  // null on 404 or unknown ref — a deleted/renamed branch, a tag that doesn't exist,
-  // or a private repo that the App JWT cannot access.
-  const headCommit = await getRefSha(token, owner, repo, branch);
+
+  let headCommit: string | null;
+  if (sourceAuth.authMode === "public") {
+    // Unauthenticated reads are 60/hour per IP. Send If-None-Match so 304s do not
+    // consume the budget when the branch tip is stable between polls.
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "ai-implement",
+    };
+    if (etag) headers["If-None-Match"] = etag;
+    const url = `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(branch)}&per_page=1`;
+    const refRes = await fetch(url, { headers });
+    if (refRes.status === 304) {
+      headCommit = etagSha; // branch tip unchanged; reuse cached SHA without a rate-limit hit
+    } else if (refRes.ok) {
+      const newEtag = refRes.headers.get("ETag");
+      if (newEtag) etag = newEtag;
+      const data = (await refRes.json()) as Array<{ sha?: unknown }>;
+      const sha = data[0]?.sha;
+      headCommit = typeof sha === "string" ? sha : null;
+      if (headCommit) etagSha = headCommit;
+    } else {
+      // 404 = private repo or missing branch; private repos not accessible without install.
+      headCommit = null;
+    }
+  } else {
+    // null on 404 or unknown ref — a deleted/renamed branch or a tag that doesn't exist.
+    headCommit = await getRefSha(sourceAuth.token, owner, repo, branch);
+  }
 
   let isDowngrade: boolean | null = null;
   if (runningCommit && headCommit) {
-    const comparison = await compareCommits(token, owner, repo, runningCommit, headCommit);
+    const comparison = await compareCommits(sourceAuth.token, owner, repo, runningCommit, headCommit);
     isDowngrade = comparison !== null ? comparison.behindBy > 0 : null;
   }
 

@@ -198,7 +198,7 @@ describe("refreshAvailability", () => {
     expect(state.available).toBeNull();
   });
 
-  it("looks up the head of the configured owner, repo and branch", async () => {
+  it("looks up the head of the configured owner, repo and branch via getRefSha (installation path)", async () => {
     vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
 
     await availability.refreshAvailability(input());
@@ -264,28 +264,44 @@ describe("refreshAvailability", () => {
   });
 });
 
-describe("refreshAvailability — JWT fallback", () => {
-  it("uses the JWT token when the App is not installed on the source owner", async () => {
+// Mocked tests cannot detect the credential defect class (JWT-vs-null / header presence).
+// Live verification: the deploy-refs smoke on the feature branch confirms unauthenticated
+// reads succeed for public repos and 401s do not appear.
+describe("refreshAvailability — public mode (no App installation)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reads the branch head unauthenticated when the App is not installed on the source owner", async () => {
     vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
-      token: "jwt-token",
-      authMode: "jwt",
+      token: null,
+      authMode: "public",
     });
-    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([{ sha: HEAD }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    ));
 
     const state = await availability.refreshAvailability(input());
 
-    expect(github.getRefSha).toHaveBeenCalledWith("jwt-token", "BuildDownAI", "AI-Implement", "testing");
+    // No Authorization header is sent in public mode — this is the load-bearing fix.
+    const [, opts] = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
+    expect((opts?.headers as Record<string, string>)?.["Authorization"]).toBeUndefined();
+    // getRefSha is bypassed in public mode; the direct fetch above handles the lookup.
+    expect(github.getRefSha).not.toHaveBeenCalled();
     expect(state.available).toBe(true);
     expect(state.headCommit).toBe(HEAD);
   });
 
-  it("reports unknown availability when a private repo is inaccessible under JWT", async () => {
-    // GitHub hides private repos from App JWTs behind a 404; getRefSha maps that to null.
+  it("reports unknown availability when a private repo returns 404 in public mode", async () => {
+    // GitHub hides private repos behind 404 on unauthenticated reads.
     vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
-      token: "jwt-token",
-      authMode: "jwt",
+      token: null,
+      authMode: "public",
     });
-    vi.mocked(github.getRefSha).mockResolvedValue(null);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 404 })));
 
     const state = await availability.refreshAvailability(input());
 
@@ -298,6 +314,57 @@ describe("refreshAvailability — JWT fallback", () => {
 
     await expect(availability.refreshAvailability(input())).rejects.toThrow("GitHub 500");
     expect(availability.getAvailability()).toBeNull();
+  });
+
+  it("sends no If-None-Match on the first poll (no prior ETag)", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
+      token: null,
+      authMode: "public",
+    });
+    let capturedHeaders: Record<string, string> | undefined;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((_url: string, opts: RequestInit) => {
+      capturedHeaders = opts?.headers as Record<string, string>;
+      return Promise.resolve(new Response(JSON.stringify([{ sha: HEAD }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+    }));
+
+    await availability.refreshAvailability(input());
+
+    expect(capturedHeaders?.["If-None-Match"]).toBeUndefined();
+  });
+
+  it("stores the ETag from the first poll and sends If-None-Match on the second; 304 reuses the cached SHA", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
+      token: null,
+      authMode: "public",
+    });
+
+    let secondCallHeaders: Record<string, string> | undefined;
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify([{ sha: HEAD }]), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "ETag": '"v1"' },
+        }),
+      )
+      .mockImplementationOnce((_url: string, opts: RequestInit) => {
+        secondCallHeaders = opts?.headers as Record<string, string>;
+        // Response constructor rejects 304; use a plain conforming object instead.
+        return Promise.resolve({ status: 304, ok: false, headers: { get: () => null } } as unknown as Response);
+      }),
+    );
+
+    // First poll — fetches branch head and stores ETag.
+    const state1 = await availability.refreshAvailability(input());
+    expect(state1.headCommit).toBe(HEAD);
+
+    // Second poll — sends If-None-Match; 304 response reuses the cached SHA.
+    const state2 = await availability.refreshAvailability(input());
+    expect(secondCallHeaders?.["If-None-Match"]).toBe('"v1"');
+    expect(state2.headCommit).toBe(HEAD);
+    expect(state2.available).toBe(true);
   });
 });
 

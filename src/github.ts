@@ -75,6 +75,13 @@ function ghHeaders(token: string): Record<string, string> {
   return { ...GH_HEADERS, Authorization: `Bearer ${token}` };
 }
 
+// Unauthenticated reads (token: null) are limited to 60 req/hour per IP by GitHub.
+// Use only for public source-repo reads where no App installation covers the owner.
+function srcHeaders(token: string | null): Record<string, string> {
+  if (token === null) return { ...GH_HEADERS };
+  return { ...GH_HEADERS, Authorization: `Bearer ${token}` };
+}
+
 /**
  * Returns the provider-related dispatch inputs for a mapping. Only adds
  * fields when the mapping opts into Bedrock — mappings that stay on the
@@ -338,13 +345,13 @@ export async function getBranchSha(
  * Downloads a repository tree at `ref` as a gzipped tarball.
  */
 export async function fetchRepoTarball(
-  token: string,
+  token: string | null,
   owner: string,
   repo: string,
   ref: string,
 ): Promise<Buffer> {
   const url = `https://api.github.com/repos/${owner}/${repo}/tarball/${ref}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: srcHeaders(token) });
   if (!res.ok) {
     throw new Error(`fetchRepoTarball failed: HTTP ${res.status}`);
   }
@@ -839,13 +846,13 @@ export async function listTagNames(token: string, owner: string, repo: string): 
 
 /** Lists branches and tags for a repo, throwing GitHubApiError on any non-200 response. */
 export async function listRepoBranchesAndTags(
-  token: string,
+  token: string | null,
   owner: string,
   repo: string,
 ): Promise<{ branches: string[]; tags: string[] }> {
   const [branchRes, tagRes] = await Promise.all([
-    fetch(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`, { headers: ghHeaders(token) }),
-    fetch(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, { headers: ghHeaders(token) }),
+    fetch(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`, { headers: srcHeaders(token) }),
+    fetch(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, { headers: srcHeaders(token) }),
   ]);
   if (!branchRes.ok) {
     const body = await branchRes.text().catch(() => "");
@@ -868,10 +875,10 @@ export async function listRepoBranchesAndTags(
  * Returns null when the ref does not exist or the lookup fails.
  * Uses the commits list endpoint, which accepts branches, tags, and SHAs as `sha`.
  */
-export async function getRefSha(token: string, owner: string, repo: string, ref: string): Promise<string | null> {
+export async function getRefSha(token: string | null, owner: string, repo: string, ref: string): Promise<string | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(ref)}&per_page=1`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: srcHeaders(token) });
   // 404 = repo not found, 422 = invalid ref
   if (!res.ok) return null;
   const data = (await res.json()) as Array<{ sha?: unknown }>;
@@ -884,14 +891,14 @@ export async function getRefSha(token: string, owner: string, repo: string, ref:
  * Uses the GitHub compare API: `behind_by > 0` means head is missing commits from base.
  */
 export async function compareCommits(
-  token: string,
+  token: string | null,
   owner: string,
   repo: string,
   base: string,
   head: string,
 ): Promise<{ behindBy: number } | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: srcHeaders(token) });
   if (!res.ok) return null;
   const data = (await res.json()) as { behind_by?: unknown };
   return { behindBy: typeof data.behind_by === "number" ? data.behind_by : 0 };
