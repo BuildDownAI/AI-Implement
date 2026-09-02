@@ -47,8 +47,9 @@ import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
-import { getInstallationToken, getScopedInstallationToken } from "./github-app-auth.js";
-import { listBranchNames, listTagNames } from "./github.js";
+import { getInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
+import { GitHubApiError } from "./github-errors.js";
+import { listRepoBranchesAndTags } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
@@ -1033,18 +1034,19 @@ async function handleDeployRefs(
   }
   const [owner, repoName] = parts;
   try {
-    const { token } = await getScopedInstallationToken(
+    const { token } = await mintSourceTokenOrJwt(
       config.githubAppId,
       config.githubAppPrivateKey,
       owner,
       { permissions: { contents: "read" }, repositories: [repoName] },
     );
-    const [branches, tags] = await Promise.all([
-      listBranchNames(token, owner, repoName),
-      listTagNames(token, owner, repoName),
-    ]);
+    const { branches, tags } = await listRepoBranchesAndTags(token, owner, repoName);
     json(res, 200, { branches, tags });
   } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 403) {
+      json(res, 503, { error: "Repository is private and not accessible; install the GitHub App for this owner to grant access" });
+      return;
+    }
     console.error("[admin] deploy-refs failed:", err);
     json(res, 503, { error: "Could not reach GitHub — check App installation for this repo" });
   }

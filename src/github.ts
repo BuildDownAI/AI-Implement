@@ -837,6 +837,32 @@ export async function listTagNames(token: string, owner: string, repo: string): 
   return data.flatMap((t) => (typeof t.name === "string" ? [t.name] : []));
 }
 
+/** Lists branches and tags for a repo, throwing GitHubApiError on any non-200 response. */
+export async function listRepoBranchesAndTags(
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<{ branches: string[]; tags: string[] }> {
+  const [branchRes, tagRes] = await Promise.all([
+    fetch(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`, { headers: ghHeaders(token) }),
+    fetch(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, { headers: ghHeaders(token) }),
+  ]);
+  if (!branchRes.ok) {
+    const body = await branchRes.text().catch(() => "");
+    throw new GitHubApiError({ status: branchRes.status, path: `/repos/${owner}/${repo}/branches`, bodyText: body });
+  }
+  if (!tagRes.ok) {
+    const body = await tagRes.text().catch(() => "");
+    throw new GitHubApiError({ status: tagRes.status, path: `/repos/${owner}/${repo}/tags`, bodyText: body });
+  }
+  const branchData = (await branchRes.json()) as Array<{ name?: unknown }>;
+  const tagData = (await tagRes.json()) as Array<{ name?: unknown }>;
+  return {
+    branches: branchData.flatMap((b) => (typeof b.name === "string" ? [b.name] : [])),
+    tags: tagData.flatMap((t) => (typeof t.name === "string" ? [t.name] : [])),
+  };
+}
+
 /**
  * Resolves a branch name, tag name, or commit SHA to its commit SHA.
  * Returns null when the ref does not exist or the lookup fails.
