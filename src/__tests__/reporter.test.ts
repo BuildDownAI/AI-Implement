@@ -62,6 +62,7 @@ describe("HttpStepReporter", () => {
 
 describe("TokenStepReporter", () => {
   it("posts step reports with a bearer progress token", async () => {
+    vi.stubEnv("GITHUB_RUN_ID", "");
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const reporter = new TokenStepReporter("https://orchestrator.example", "progress-token", {
       fetchImpl: async (url, init) => {
@@ -80,6 +81,7 @@ describe("TokenStepReporter", () => {
       Authorization: "Bearer progress-token",
     });
     expect(JSON.parse(String(calls[0].init.body))).toEqual({ step: STEP });
+    vi.unstubAllEnvs();
   });
 
   it("includes the GitHub run ID when the workflow provides one", async () => {
