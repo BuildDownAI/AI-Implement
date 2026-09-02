@@ -138,6 +138,7 @@ describe("decideAvailabilityAction", () => {
     held: false,
     policy: { autoDeploy: false, notifyAvailable: true },
     lastActedCommit: null as string | null,
+    isDowngrade: null as boolean | null,
   });
 
   it("deploys when automatic deploying is on and the commit is new", () => {
@@ -184,6 +185,30 @@ describe("decideAvailabilityAction", () => {
     // Announcing a deployment that is already being built is noise, not news.
     const input = { ...base(), held: true };
     expect(policy.decideAvailabilityAction(input)).toBe("none");
+  });
+
+  it("notifies instead of deploying when isDowngrade is true and autoDeploy is on", () => {
+    // A backward-moving ref (force-push, re-pointed tag) must not be auto-deployed.
+    // The admin should decide whether to proceed.
+    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true }, isDowngrade: true };
+    expect(policy.decideAvailabilityAction(input)).toBe("notify");
+  });
+
+  it("does nothing on a downgrade when notifyAvailable is also off", () => {
+    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: false }, isDowngrade: true };
+    expect(policy.decideAvailabilityAction(input)).toBe("none");
+  });
+
+  it("deploys when isDowngrade is false with autoDeploy on", () => {
+    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true }, isDowngrade: false };
+    expect(policy.decideAvailabilityAction(input)).toBe("deploy");
+  });
+
+  it("deploys when isDowngrade is null (unknown) with autoDeploy on", () => {
+    // Unknown downgrade state must not block deployment — the guard is only for
+    // a confirmed downgrade.
+    const input = { ...base(), policy: { autoDeploy: true, notifyAvailable: true }, isDowngrade: null };
+    expect(policy.decideAvailabilityAction(input)).toBe("deploy");
   });
 });
 

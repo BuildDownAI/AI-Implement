@@ -847,14 +847,23 @@ export async function getRefSha(token: string, owner: string, repo: string, ref:
     `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(ref)}&per_page=1`;
   const res = await fetch(url, { headers: ghHeaders(token) });
   // 404 = repo not found, 422 = invalid ref
-  if (!res.ok) return null;
+  if (res.status === 404 || res.status === 422) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new GitHubApiError({
+      status: res.status,
+      path: `/repos/${owner}/${repo}/commits`,
+      bodyText: body,
+      message: `getRefSha(${ref}) failed: HTTP ${res.status}: ${body}`,
+    });
+  }
   const data = (await res.json()) as Array<{ sha?: unknown }>;
   const sha = data[0]?.sha;
   return typeof sha === "string" ? sha : null;
 }
 
 /**
- * Returns how many commits `head` is behind `base`. Null on 404 or other failure.
+ * Returns how many commits `head` is behind `base`. Null on 404 or unknown shape.
  * Uses the GitHub compare API: `behind_by > 0` means head is missing commits from base.
  */
 export async function compareCommits(
@@ -866,7 +875,17 @@ export async function compareCommits(
 ): Promise<{ behindBy: number } | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
   const res = await fetch(url, { headers: ghHeaders(token) });
-  if (!res.ok) return null;
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new GitHubApiError({
+      status: res.status,
+      path: `/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`,
+      bodyText: body,
+      message: `compareCommits(${base}...${head}) failed: HTTP ${res.status}: ${body}`,
+    });
+  }
   const data = (await res.json()) as { behind_by?: unknown };
-  return { behindBy: typeof data.behind_by === "number" ? data.behind_by : 0 };
+  if (typeof data.behind_by !== "number") return null;
+  return { behindBy: data.behind_by };
 }

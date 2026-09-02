@@ -26,6 +26,7 @@ export interface AvailabilityDecisionInput {
   held: boolean;
   policy: DeployPolicy;
   lastActedCommit: string | null;
+  isDowngrade: boolean | null;
 }
 
 /**
@@ -33,7 +34,7 @@ export interface AvailabilityDecisionInput {
  * poll loop's only job is to gather them and carry out the verdict.
  */
 export function decideAvailabilityAction(input: AvailabilityDecisionInput): AvailabilityAction {
-  const { configured, available, headCommit, held, policy, lastActedCommit } = input;
+  const { configured, available, headCommit, held, policy, lastActedCommit, isDowngrade } = input;
 
   // Nothing is actionable on an orchestrator that cannot deploy itself
   if (!configured) return "none";
@@ -50,6 +51,11 @@ export function decideAvailabilityAction(input: AvailabilityDecisionInput): Avai
   // the automatic attempt that a failing build must not repeat every cycle, and the
   // notice that must not repeat every poll. A new push is what re-arms either.
   if (headCommit === lastActedCommit) return "none";
+
+  // A downgrade (the watched ref moved behind the running commit) suppresses
+  // automatic deployment — fall back to notify so an admin can decide whether to
+  // proceed. autoDeploy is intentionally skipped here even when it is on.
+  if (isDowngrade === true) return policy.notifyAvailable ? "notify" : "none";
 
   if (policy.autoDeploy) return "deploy";
   return policy.notifyAvailable ? "notify" : "none";

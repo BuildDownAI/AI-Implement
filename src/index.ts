@@ -310,6 +310,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
         held: isDeployHeld(),
         policy: getDeployPolicy(),
         lastActedCommit: getLastActedCommit(),
+        isDowngrade: availability?.isDowngrade ?? null,
       });
 
       if (action !== "none" && head) {
