@@ -16,9 +16,13 @@ vi.mock("../comment-gapfill-queue.js", () => ({
   countConflictAttempts: vi.fn(),
   enqueueConflictResolution: vi.fn(),
 }));
+vi.mock("../log.js", () => ({
+  hasInFlightJobForPr: vi.fn(() => false),
+}));
 
 import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest } from "../github.js";
 import { hasPendingConflictResolution, countConflictAttempts, enqueueConflictResolution } from "../comment-gapfill-queue.js";
+import { hasInFlightJobForPr } from "../log.js";
 
 function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   return {
@@ -55,6 +59,7 @@ beforeEach(() => {
   vi.mocked(hasPendingConflictResolution).mockReturnValue(false);
   vi.mocked(countConflictAttempts).mockReturnValue(0);
   vi.mocked(enqueueConflictResolution).mockReturnValue(1);
+  vi.mocked(hasInFlightJobForPr).mockReturnValue(false);
 });
 
 describe("isGroupingBranch", () => {
@@ -292,5 +297,39 @@ describe("cap-exhausted notify-once (AII-277 Finding 4)", () => {
     }
     expect(notify).toHaveBeenCalledTimes(1);
     expect(vi.mocked(enqueueConflictResolution)).not.toHaveBeenCalled();
+  });
+});
+
+describe("in-flight job guard (AII-471)", () => {
+  it("defers merge and does not call mergePullRequest when a run is still in flight", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+    vi.mocked(hasInFlightJobForPr).mockReturnValue(true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await runGroupingBranchAutoMerge([mapping()], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    expect(log.mock.calls.some((c) => String(c[0]).includes("in flight"))).toBe(true);
+    log.mockRestore();
+  });
+
+  it("merges normally when no run is in flight (regression guard)", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+    vi.mocked(hasInFlightJobForPr).mockReturnValue(false);
+    await runGroupingBranchAutoMerge([mapping()], deps());
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith(
+      "tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge",
+    );
+  });
+
+  it("defers the in-flight PR and still processes other PRs in the same repo", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([
+      pr({ number: 5, headSha: "sha5", base: "ai-implement/feature/aii-200-feat" }),
+      pr({ number: 6, headSha: "sha6", base: "ai-implement/feature/aii-201-feat" }),
+    ]);
+    vi.mocked(hasInFlightJobForPr).mockImplementation((_owner, _repo, prNumber) => prNumber === 5);
+    await runGroupingBranchAutoMerge([mapping()], deps());
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith(
+      "tok", "BuildDownAI", "AI-Implement", 6, "sha6", "merge",
+    );
   });
 });

@@ -2281,4 +2281,98 @@ describe("postPushReviewStep", () => {
     expect(capComment).toBeDefined();
     expect(capComment).toContain("matrix-ubuntu");
   });
+
+  it("exits cleanly with approved=true and pr_merged when PR is already merged at loop start", async () => {
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args[3] === "--json") {
+        return { stdout: '{"state":"merged","locked":false}', exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 }));
+    const ctx = makeCtx(invoke);
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("pr_merged");
+    expect(out.iterations).toBe(1);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(gitSpawn).not.toHaveBeenCalled();
+  });
+
+  it("exits cleanly with approved=true and pr_merged when PR is locked", async () => {
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args[3] === "--json") {
+        return { stdout: '{"state":"open","locked":true}', exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 }));
+    const ctx = makeCtx(invoke);
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("pr_merged");
+    expect(out.iterations).toBe(1);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(gitSpawn).not.toHaveBeenCalled();
+  });
+
+  it("continues normally when gh pr view fails (fail-open)", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args[3] === "--json") {
+        return { stdout: "", exitCode: 1 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("approved");
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
+  it("proceeds normally when PR is open and unlocked (regression guard)", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args[3] === "--json") {
+        return { stdout: '{"state":"open","locked":false}', exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
+    const ctx = makeCtx(invoke);
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("approved");
+    expect(invoke).toHaveBeenCalledOnce();
+  });
 });

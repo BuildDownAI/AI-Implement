@@ -34,6 +34,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
 type ExternalReviewState = "skipped" | "absent" | "running" | "completed";
 type PostPushReviewTerminationReason =
   | "approved"
+  | "pr_merged"
   | "iterations_exhausted"
   | "review_failed"
   | "invalid_review"
@@ -738,6 +739,17 @@ async function reportInvalidStructuredReview(
   );
 }
 
+function isPrMergedOrLocked(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): boolean {
+  const result = ghSpawn(["pr", "view", prNumber, "--json", "state,locked"]);
+  if (result.exitCode !== 0) return false;
+  try {
+    const data = JSON.parse(result.stdout) as { state?: string; locked?: boolean };
+    return data.state === "merged" || data.locked === true;
+  } catch {
+    return false;
+  }
+}
+
 export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReviewOutputs> = {
   async run(context, inputs, reporter) {
     const ghSpawn = inputs.ghSpawn ?? makeDefaultGhSpawn(inputs.workspaceDir);
@@ -768,6 +780,13 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
     while (iteration < maxIterations && !approved) {
       iteration++;
+
+      if (isPrMergedOrLocked(ghSpawn, prNumber)) {
+        console.log(`[post-push-review] PR #${prNumber} is merged or locked — exiting cleanly`);
+        approved = true;
+        terminationReason = "pr_merged";
+        break;
+      }
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
