@@ -256,9 +256,12 @@ export const deploymentsScript = `
         html += '</optgroup>';
       }
       if (data.tags && data.tags.length) {
-        html += '<optgroup label="Tags">';
-        for (const t of data.tags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
-        html += '</optgroup>';
+        const remainingTags = data.tags.filter(function(t) { return !pinnedSet.has(t); });
+        if (remainingTags.length) {
+          html += '<optgroup label="Tags">';
+          for (const t of remainingTags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
+          html += '</optgroup>';
+        }
       }
       if (data.branches && data.branches.length) {
         const remaining = data.branches.filter(function(b) { return !pinnedSet.has(b); }).sort();

@@ -433,6 +433,11 @@ describe("deployments page", () => {
     expect(deploymentsScript).toContain("pinnedSet");
   });
 
+  it("filters the Tags optgroup against pinnedSet so a watched tag is not duplicated", () => {
+    expect(deploymentsScript).toContain("data.tags.filter(function(t) { return !pinnedSet.has(t); })");
+    expect(deploymentsScript).toContain("remainingTags.length");
+  });
+
   it("renders a Pinned optgroup for the default and watched branches", () => {
     expect(deploymentsScript).toContain('label="Pinned"');
   });

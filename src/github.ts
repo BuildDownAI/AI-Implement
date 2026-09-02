@@ -845,7 +845,7 @@ export async function listTagNames(token: string, owner: string, repo: string): 
 }
 
 /** Extracts the next-page URL from a GitHub Link response header, or null if none. */
-function parseLinkNext(header: string | null): string | null {
+export function parseLinkNext(header: string | null): string | null {
   if (!header) return null;
   for (const part of header.split(",")) {
     const match = part.match(/<([^>]+)>;\s*rel="next"/);
