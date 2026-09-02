@@ -46,6 +46,18 @@ vi.mock("../deploy-availability.js", async (importOriginal) => ({
   getAvailability: availabilityMock,
 }));
 
+const mintSourceTokenOrJwtMock = vi.hoisted(() => vi.fn());
+vi.mock("../github-app-auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github-app-auth.js")>()),
+  mintSourceTokenOrJwt: mintSourceTokenOrJwtMock,
+}));
+
+const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
+vi.mock("../github.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../github.js")>()),
+  listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
+}));
+
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
     forMapping: async () => provider,
@@ -2645,5 +2657,71 @@ describe("per-page grants", () => {
     accessGrants.savePageGrants(["issues", "pulls"], "second@eudoxus.ai");
     const after = accessGrants.listPageGrants().find((g) => g.page === "issues");
     expect(after).toEqual(originally);
+  });
+});
+
+describe("GET /api/deploy-refs", () => {
+  async function deployRefsRequest(
+    repo: string | null,
+    token?: string,
+  ): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+    const url = repo == null ? "/api/deploy-refs" : `/api/deploy-refs?repo=${repo}`;
+    const headers: Record<string, string> = token ? { authorization: `Bearer ${token}` } : {};
+    const req = new MockRequest(url, "GET", headers);
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body ? JSON.parse(res.body) : {} };
+  }
+
+  beforeEach(() => {
+    mintSourceTokenOrJwtMock.mockReset();
+    listRepoBranchesAndTagsMock.mockReset();
+  });
+
+  it("returns 401 without an auth token", async () => {
+    const res = await deployRefsRequest("owner/repo");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 400 when the repo param is missing", async () => {
+    const token = await login("secret");
+    const res = await deployRefsRequest(null, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns 400 when the repo param has no slash", async () => {
+    const token = await login("secret");
+    const res = await deployRefsRequest("noslash", token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("returns branches and tags via installation token for an installed owner", async () => {
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
+    listRepoBranchesAndTagsMock.mockResolvedValue({ branches: ["main", "dev"], tags: ["v1.0"] });
+    const token = await login("secret");
+    const res = await deployRefsRequest("owner/repo", token);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ branches: ["main", "dev"], tags: ["v1.0"] });
+    expect(mintSourceTokenOrJwtMock).toHaveBeenCalledWith("test-app-id", "test-private-key", "owner", expect.objectContaining({ permissions: { contents: "read" } }));
+  });
+
+  it("returns branches and tags via App JWT for a public repo outside the installation", async () => {
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "app-jwt", authMode: "jwt" });
+    listRepoBranchesAndTagsMock.mockResolvedValue({ branches: ["main"], tags: [] });
+    const token = await login("secret");
+    const res = await deployRefsRequest("foreign-org/public-repo", token);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatchObject({ branches: ["main"], tags: [] });
+  });
+
+  it("returns 503 with install message for a private repo outside the installation", async () => {
+    const { GitHubApiError: GHError } = await import("../github-errors.js");
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "app-jwt", authMode: "jwt" });
+    listRepoBranchesAndTagsMock.mockRejectedValue(new GHError({ status: 403, path: "/repos/foreign-org/private-repo/branches", bodyText: "Not Found" }));
+    const token = await login("secret");
+    const res = await deployRefsRequest("foreign-org/private-repo", token);
+    expect(res.statusCode).toBe(503);
+    expect((res.body as { error: string }).error).toMatch(/install/i);
   });
 });
