@@ -304,7 +304,7 @@ describe("makeStartDeploy onBuildFailure callback", () => {
     }));
     vi.doMock("../github.js", () => ({
       fetchRepoTarball: vi.fn(),
-      getBranchSha: vi.fn().mockResolvedValue("def5678"),
+      getRefSha: vi.fn().mockResolvedValue("def5678"),
     }));
 
     localDeploy = await import("../deploy.js");

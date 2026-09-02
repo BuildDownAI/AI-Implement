@@ -1,5 +1,6 @@
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { getBranchSha } from "./github.js";
+import { getRefSha, compareCommits } from "./github.js";
+import type { DeployPolicy } from "./deploy-policy.js";
 
 declare global {
   namespace NodeJS {
@@ -16,6 +17,7 @@ export interface DeploymentAvailability {
   runningCommit: string | null;
   headCommit: string | null;
   checkedAt: number;
+  isDowngrade: boolean | null; // null when either commit is unknown or comparison failed.
 }
 
 /** Where to look for a new deployment, separate from how we authenticate to look. */
@@ -62,6 +64,27 @@ export function readStampedTarget(
   return { owner, repo, branch, runningCommit: stamp(env.AI_IMPLEMENT_SOURCE_COMMIT) };
 }
 
+/**
+ * Returns the deploy target to use for availability checks and "Deploy now".
+ * When both watchedRepo and watchedRef are set, the override takes precedence over stamps.
+ * Falls back to the stamped target on malformed input or missing fields.
+ */
+export function resolveDeployTarget(
+  stamped: SelfDeployTarget | null,
+  policy: Pick<DeployPolicy, "watchedRepo" | "watchedRef">,
+): SelfDeployTarget | null {
+  const { watchedRepo, watchedRef } = policy;
+  if (watchedRepo && watchedRef) {
+    const parts = watchedRepo.split("/");
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      const [owner, repo] = parts;
+      return { owner, repo, branch: watchedRef, runningCommit: stamped?.runningCommit ?? null };
+    }
+    // Malformed watchedRepo — fall through to stamps
+  }
+  return stamped;
+}
+
 export function decideAvailability(
   runningCommit: DeploymentAvailability["runningCommit"],
   headCommit: DeploymentAvailability["headCommit"],
@@ -84,14 +107,21 @@ export async function refreshAvailability(input: AvailabilityInput): Promise<Dep
     permissions: { contents: "read" },
     repositories: [repo],
   });
-  // null on 404 — a deleted or renamed branch reads as unknown, not as up to date.
-  const headCommit = await getBranchSha(token, owner, repo, branch);
+  // null on 404 or unknown ref — a deleted/renamed branch or a tag that doesn't exist.
+  const headCommit = await getRefSha(token, owner, repo, branch);
+
+  let isDowngrade: boolean | null = null;
+  if (runningCommit && headCommit) {
+    const comparison = await compareCommits(token, owner, repo, runningCommit, headCommit);
+    isDowngrade = comparison !== null ? comparison.behindBy > 0 : null;
+  }
 
   current = {
     available: decideAvailability(runningCommit, headCommit),
     runningCommit,
     headCommit,
     checkedAt: Date.now(),
+    isDowngrade,
   };
 
   return current;

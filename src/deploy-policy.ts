@@ -3,6 +3,8 @@ import { getDb } from "./dedup.js";
 const AUTO_DEPLOY_KEY = "deploy_auto";
 const NOTIFY_AVAILABLE_KEY = "deploy_notify_available";
 const LAST_ACTED_COMMIT_KEY = "deploy_last_acted_commit";
+const WATCHED_REPO_KEY = "deploy_watched_repo";
+const WATCHED_REF_KEY = "deploy_watched_ref";
 
 export type AvailabilityAction = "deploy" | "notify" | "none";
 
@@ -11,6 +13,10 @@ export interface DeployPolicy {
   autoDeploy: boolean;
   /** Opt-out — announce an available deployment. On unless explicitly disabled. */
   notifyAvailable: boolean;
+  /** Override the stamped source repo (owner/repo). Null uses the build stamp. */
+  watchedRepo: string | null;
+  /** Override the stamped source branch or tag. Null uses the build stamp. */
+  watchedRef: string | null;
 }
 
 export interface AvailabilityDecisionInput {
@@ -66,10 +72,23 @@ function readFlag(key: string, whenAbsent: boolean): boolean {
   }
 }
 
+function readString(key: string): string | null {
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function getDeployPolicy(): DeployPolicy {
   return {
     autoDeploy: readFlag(AUTO_DEPLOY_KEY, false),
     notifyAvailable: readFlag(NOTIFY_AVAILABLE_KEY, true),
+    watchedRepo: readString(WATCHED_REPO_KEY),
+    watchedRef: readString(WATCHED_REF_KEY),
   };
 }
 
@@ -89,9 +108,19 @@ export function getLastActedCommit(): string | null {
 
 /** Patch rather than replace, so toggling one flag cannot clobber the other. */
 export function setDeployPolicy(patch: Partial<DeployPolicy>): void {
-  const write = getDb().prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+  const db = getDb();
+  const write = db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+  const del = db.prepare("DELETE FROM settings WHERE key = ?");
   if (patch.autoDeploy !== undefined) write.run(AUTO_DEPLOY_KEY, patch.autoDeploy ? "1" : "0");
   if (patch.notifyAvailable !== undefined) write.run(NOTIFY_AVAILABLE_KEY, patch.notifyAvailable ? "1" : "0");
+  if (patch.watchedRepo !== undefined) {
+    if (patch.watchedRepo === null) del.run(WATCHED_REPO_KEY);
+    else write.run(WATCHED_REPO_KEY, patch.watchedRepo);
+  }
+  if (patch.watchedRef !== undefined) {
+    if (patch.watchedRef === null) del.run(WATCHED_REF_KEY);
+    else write.run(WATCHED_REF_KEY, patch.watchedRef);
+  }
 }
 
 export function setLastActedCommit(sha: string): void {

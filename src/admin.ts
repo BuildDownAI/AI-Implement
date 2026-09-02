@@ -33,7 +33,7 @@ import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { DeployStart } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
-import { getAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import { getAvailability, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
 import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
 import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
@@ -47,7 +47,8 @@ import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
-import { getInstallationToken } from "./github-app-auth.js";
+import { getInstallationToken, getScopedInstallationToken } from "./github-app-auth.js";
+import { listBranchNames, listTagNames } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
@@ -191,7 +192,7 @@ export interface AdminConfig {
 
 export interface AdminDeps {
   /** Starts a self-deploy. Absent when the orchestrator is not configured to deploy itself. */
-  startDeploy?: () => Promise<DeployStart>;
+  startDeploy?: (targetOverride?: SelfDeployTarget) => Promise<DeployStart>;
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
@@ -313,7 +314,8 @@ export function handleAdminRequest(
 
     if (url === "/api/deployment-status" && method === "GET") {
       const availability = getAvailability();
-      const target = deps.selfDeployTarget ?? null;
+      const policy = getDeployPolicy();
+      const target = resolveDeployTarget(deps.selfDeployTarget ?? null, policy);
       json(res, 200, {
         configured: !!deps.startDeploy,
         available: availability?.available ?? null,
@@ -323,9 +325,10 @@ export function handleAdminRequest(
         checkedAt: availability?.checkedAt ?? null,
         runningCommit: availability?.runningCommit ?? null,
         headCommit: availability?.headCommit ?? null,
+        isDowngrade: availability?.isDowngrade ?? null,
         repo: target ? `${target.owner}/${target.repo}` : null,
         branch: target?.branch ?? null,
-        ...getDeployPolicy(),
+        ...policy,
         // a notice with no webhook goes nowhere, and automatic deploying will not act on a commit it has already announced.
         notifyConfigured: Boolean(config.notifyWebhookUrl),
         lastActedCommit: getLastActedCommit(),
@@ -336,6 +339,16 @@ export function handleAdminRequest(
 
     if (url === "/api/deploy-policy" && method === "POST") {
       handleSetDeployPolicy(req, res);
+      return true;
+    }
+
+    if (url.startsWith("/api/deploy-refs") && method === "GET") {
+      handleDeployRefs(req, res, config);
+      return true;
+    }
+
+    if (url === "/api/deploy-check" && method === "POST") {
+      handleDeployCheck(res, config, deps);
       return true;
     }
 
@@ -956,7 +969,8 @@ async function handleDeployTrigger(
     return;
   }
   try {
-    const result = await deps.startDeploy();
+    const resolvedTarget = resolveDeployTarget(deps.selfDeployTarget ?? null, getDeployPolicy());
+    const result = await deps.startDeploy(resolvedTarget ?? undefined);
     if (!result.started) {
       json(res, result.reason === "deploy-in-progress" ? 409 : 503, { error: result.reason });
       return;
@@ -985,11 +999,77 @@ async function handleSetDeployPolicy(
       }
       patch[key] = body[key];
     }
+    for (const key of ["watchedRepo", "watchedRef"] as const) {
+      if (body[key] === undefined) continue;
+      if (body[key] !== null && typeof body[key] !== "string") {
+        json(res, 400, { error: `${key} must be a string or null` });
+        return;
+      }
+      patch[key] = body[key] as string | null;
+    }
     setDeployPolicy(patch);
     json(res, 200, getDeployPolicy());
   } catch (err) {
     console.error("[admin] deploy policy update failed:", err);
     json(res, 500, { error: "Internal server error" });
+  }
+}
+
+async function handleDeployRefs(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+): Promise<void> {
+  const parsedUrl = new URL(req.url || "/", "http://localhost");
+  const repo = parsedUrl.searchParams.get("repo");
+  if (!repo) {
+    json(res, 400, { error: "repo query parameter is required (owner/repo)" });
+    return;
+  }
+  const parts = repo.split("/");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    json(res, 400, { error: "repo must be in owner/repo format" });
+    return;
+  }
+  const [owner, repoName] = parts;
+  try {
+    const { token } = await getScopedInstallationToken(
+      config.githubAppId,
+      config.githubAppPrivateKey,
+      owner,
+      { permissions: { contents: "read" }, repositories: [repoName] },
+    );
+    const [branches, tags] = await Promise.all([
+      listBranchNames(token, owner, repoName),
+      listTagNames(token, owner, repoName),
+    ]);
+    json(res, 200, { branches, tags });
+  } catch (err) {
+    console.error("[admin] deploy-refs failed:", err);
+    json(res, 503, { error: "Could not reach GitHub — check App installation for this repo" });
+  }
+}
+
+async function handleDeployCheck(
+  res: http.ServerResponse,
+  config: AdminConfig,
+  deps: AdminDeps,
+): Promise<void> {
+  const target = resolveDeployTarget(deps.selfDeployTarget ?? null, getDeployPolicy());
+  if (!target) {
+    json(res, 503, { error: "Self-deploy target is not configured" });
+    return;
+  }
+  try {
+    const availability = await refreshAvailability({
+      ...target,
+      appId: config.githubAppId,
+      privateKey: config.githubAppPrivateKey,
+    });
+    json(res, 200, availability);
+  } catch (err) {
+    console.error("[admin] deploy-check failed:", err);
+    json(res, 500, { error: "Availability check failed" });
   }
 }
 

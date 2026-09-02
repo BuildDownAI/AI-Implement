@@ -30,11 +30,44 @@ export const deploymentsHtml = `
       </div>
     </div>
 
+    <div id="deployments-watched-source" class="card" hidden style="margin-top: 16px">
+      <div class="card-body" style="padding: 12px 16px">
+        <div class="kpi-label" style="margin-bottom: 4px">Watching</div>
+        <div id="deployments-watched-source-value" style="font-size: 14px; font-family: var(--font-mono)">—</div>
+        <div id="deployments-downgrade-warn" class="kpi-trend" style="color: var(--color-warn); margin-top: 4px" hidden>
+          ⚠ This ref is behind the running commit — deploying it is a downgrade.
+        </div>
+        <div style="margin-top: 8px">
+          <button class="btn btn-sm" id="deployments-check-now-btn" onclick="window.checkNow()">Check now</button>
+        </div>
+      </div>
+    </div>
+
     <div class="alert" id="deployments-outcome-alert" hidden></div>
 
     <div class="card" id="deployments-policy" hidden>
       <div class="card-header"><h2 class="card-title">When a deployment becomes available...</h2></div>
       <div class="card-body">
+        <div style="margin-bottom: 16px">
+          <div class="kpi-label" style="margin-bottom: 6px">Watched source</div>
+          <div style="display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap">
+            <div style="flex: 1; min-width: 200px">
+              <input type="text" class="input" id="deployments-watched-repo" placeholder="owner/repo"
+                style="width: 100%; box-sizing: border-box"
+                oninput="window.refreshPolicyDirty()"
+                onblur="window.loadDeployRefs()">
+              <div class="kpi-trend text-secondary" style="margin-top: 4px">Leave blank to use the build stamp</div>
+            </div>
+            <div style="flex: 1; min-width: 160px">
+              <select class="input" id="deployments-watched-ref" style="width: 100%; box-sizing: border-box"
+                onchange="window.refreshPolicyDirty()">
+                <option value="">— select a ref —</option>
+              </select>
+              <div class="kpi-trend text-secondary" style="margin-top: 4px" id="deployments-ref-hint"></div>
+            </div>
+          </div>
+        </div>
+
         <label class="checkbox-row">
           <input type="checkbox" id="deployments-auto" onchange="window.refreshPolicyDirty()">
           <span>Deploy it automatically</span>
@@ -95,7 +128,7 @@ export const deploymentsScript = `
     const d = Math.floor(h / 24);
     return d + 'd ago';
   }
-  
+
   // Duration since a start, not distance from now — deliberately not fmtAgo, whose
   // "Xm ago" wording reads wrong for something still running.
   function fmtElapsed(startedAt) {
@@ -108,7 +141,7 @@ export const deploymentsScript = `
   function short(sha) { return sha ? sha.slice(0, 7) : ''; }
 
   function plural(count, noun) {
-    return count + '\u00a0' + noun + (count === 1 ? '' : 's');
+    return count + '\\u00a0' + noun + (count === 1 ? '' : 's');
   }
 
   // Every badge in the app carries a .dot child: .badge .dot sizes it, .badge.<kind> .dot
@@ -179,11 +212,53 @@ export const deploymentsScript = `
     // a stored true and leave Save lit forever.
     const notifyEl = document.getElementById('deployments-notify');
     const notifyChanged = !notifyEl.disabled && notifyEl.checked !== savedPolicy.notifyAvailable;
-    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged;
+    const watchedRepoChanged = document.getElementById('deployments-watched-repo').value !== (savedPolicy.watchedRepo || '');
+    const watchedRefChanged = document.getElementById('deployments-watched-ref').value !== (savedPolicy.watchedRef || '');
+    return document.getElementById('deployments-auto').checked !== savedPolicy.autoDeploy || notifyChanged || watchedRepoChanged || watchedRefChanged;
   }
 
   function refreshPolicyDirty() {
     document.getElementById('deployments-policy-save').disabled = !policyDirty();
+  }
+
+  async function loadDeployRefs() {
+    const repo = document.getElementById('deployments-watched-repo').value.trim();
+    const refSel = document.getElementById('deployments-watched-ref');
+    const hintEl = document.getElementById('deployments-ref-hint');
+    if (!repo) {
+      refSel.innerHTML = '<option value="">— select a ref —</option>';
+      hintEl.textContent = '';
+      return;
+    }
+    hintEl.textContent = 'Loading refs…';
+    try {
+      const res = await window.api('/api/deploy-refs?repo=' + encodeURIComponent(repo));
+      if (!res.ok) {
+        const body = await res.json().catch(function () { return {}; });
+        hintEl.textContent = body.error || 'Could not load refs';
+        return;
+      }
+      const data = await res.json();
+      const prev = refSel.value;
+      let html = '<option value="">— select a ref —</option>';
+      if (data.branches && data.branches.length) {
+        html += '<optgroup label="Branches">';
+        for (const b of data.branches) html += '<option value="' + window.escAttr(b) + '">' + window.esc(b) + '</option>';
+        html += '</optgroup>';
+      }
+      if (data.tags && data.tags.length) {
+        html += '<optgroup label="Tags">';
+        for (const t of data.tags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
+        html += '</optgroup>';
+      }
+      refSel.innerHTML = html;
+      // Restore previous selection if it still exists in the new list
+      if (prev) refSel.value = prev;
+      hintEl.textContent = '';
+    } catch (err) {
+      hintEl.textContent = 'Failed to load refs — ' + String(err);
+    }
+    refreshPolicyDirty();
   }
 
   async function loadDeployments() {
@@ -227,16 +302,48 @@ export const deploymentsScript = `
     // deploy itself, where the banner below is the whole story.
     document.getElementById('deployments-policy').hidden = !configured;
 
+    // Watched-source field: always visible when configured; shows resolved repo + ref.
+    const watchedSourceCard = document.getElementById('deployments-watched-source');
+    watchedSourceCard.hidden = !configured;
+    if (configured) {
+      const sourceRepo = data.repo || '';
+      const sourceBranch = data.branch || '';
+      const sourceText = [sourceRepo, sourceBranch].filter(Boolean).join(' · ') || '(not configured)';
+      document.getElementById('deployments-watched-source-value').textContent = sourceText;
+      document.getElementById('deployments-downgrade-warn').hidden = data.isDowngrade !== true;
+    }
+
     const autoEl = document.getElementById('deployments-auto');
     const notifyEl = document.getElementById('deployments-notify');
+    const watchedRepoEl = document.getElementById('deployments-watched-repo');
+    const watchedRefEl = document.getElementById('deployments-watched-ref');
 
     // Computed against the *previous* server state, before it is replaced below — the
     // poll must not overwrite a checkbox that is ticked and not yet saved.
     if (!policyDirty()) {
       autoEl.checked = !!data.autoDeploy;
       notifyEl.checked = !!data.notifyAvailable;
+      watchedRepoEl.value = data.watchedRepo || '';
+      // Seed the ref selector with the saved value; the options are loaded on blur.
+      const savedRef = data.watchedRef || '';
+      if (watchedRefEl.value !== savedRef) {
+        // Add a placeholder option for the saved ref if it is not already in the list
+        const existing = watchedRefEl.querySelector('option[value="' + CSS.escape(savedRef) + '"]');
+        if (savedRef && !existing) {
+          const opt = document.createElement('option');
+          opt.value = savedRef;
+          opt.textContent = savedRef;
+          watchedRefEl.appendChild(opt);
+        }
+        watchedRefEl.value = savedRef;
+      }
     }
-    savedPolicy = { autoDeploy: !!data.autoDeploy, notifyAvailable: !!data.notifyAvailable };
+    savedPolicy = {
+      autoDeploy: !!data.autoDeploy,
+      notifyAvailable: !!data.notifyAvailable,
+      watchedRepo: data.watchedRepo || '',
+      watchedRef: data.watchedRef || '',
+    };
     refreshPolicyDirty();
 
     // Nothing can be announced without somewhere to announce to, so the control says so
@@ -253,7 +360,7 @@ export const deploymentsScript = `
     document.getElementById('deployments-auto-hint').textContent = autoHint(data, available, held);
     document.getElementById('deployments-notify-hint').textContent = notifyHint(data);
 
-    // Deploy status is only meaningful once a deploy is under way, so the whole tile appears with the hold 
+    // Deploy status is only meaningful once a deploy is under way, so the whole tile appears with the hold
     const statusKpi = document.getElementById('deployments-status-kpi');
     const statusBadge = document.getElementById('kpi-deploy-status-badge');
     const statusEl = document.getElementById('kpi-deploy-status');
@@ -288,7 +395,7 @@ export const deploymentsScript = `
     const outcomeMeta = document.getElementById('kpi-deploy-outcome-meta');
     if (!outcome) {
       setBadge(outcomeBadge, 'neutral', 'None yet');
-      outcomeCommit.textContent = '\u2014';
+      outcomeCommit.textContent = '\\u2014';
       outcomeWhen.textContent = '';
       outcomeMeta.textContent = 'No self-deploy has completed on this orchestrator.';
     } else {
@@ -306,7 +413,7 @@ export const deploymentsScript = `
       // A build failure names the commit it tried, not the one running, so this can
       // legitimately differ from the tile beside it. Only that case says so — for the
       // other two the commit here and the running one are the same value.
-      outcomeCommit.innerHTML = commitLink(data.repo, outcome.commit) || '\u2014';
+      outcomeCommit.innerHTML = commitLink(data.repo, outcome.commit) || '\\u2014';
       outcomeWhen.textContent = outcome.timestamp ? fmtAgo(outcome.timestamp) : '';
       outcomeMeta.textContent = outcome.kind === 'build-failed' ? 'attempted — never released' : '';
     }
@@ -331,7 +438,7 @@ export const deploymentsScript = `
       // stored copy would outlive a rotating log and be served on every status poll.
       // Naming where the output is beats reproducing it somewhere it should not be.
       outcomeAlert.innerHTML =
-        '<div class="alert-icon">' + (degraded ? '!' : '\u00d7') + '</div>'
+        '<div class="alert-icon">' + (degraded ? '!' : '\\u00d7') + '</div>'
         + '<div style="flex:1">'
         + '<div class="alert-title">' + window.esc(title) + '</div>'
         + '<div class="alert-desc">' + window.esc(explain) + '</div>'
@@ -407,19 +514,23 @@ export const deploymentsScript = `
 
   async function saveDeployPolicy() {
     clearMessage();
-    // Sends only the two flags, and re-renders from the response rather than the
-    // checkbox state — the server's view is what decides whether the other flag is
-    // still meaningful, and an optimistic update would show a hint that is not true yet.
+    // Sends only the flags and override fields present, and re-renders from the response
+    // rather than the form state — the server's view decides whether flags are meaningful,
+    // and an optimistic update would show a hint that is not true yet.
     // Omits the announcement flag while it is unavailable, so saving cannot overwrite a
-    // stored preference with the forced-unchecked display. The endpoint takes a patch
-    // precisely so one control can stay out of a write.
+    // stored preference with the forced-unchecked display.
     const notifyEl = document.getElementById('deployments-notify');
+    const watchedRepoEl = document.getElementById('deployments-watched-repo');
+    const watchedRefEl = document.getElementById('deployments-watched-ref');
     const patch = { autoDeploy: document.getElementById('deployments-auto').checked };
     if (!notifyEl.disabled) patch.notifyAvailable = notifyEl.checked;
+    // Send null to clear the override when the field is blank.
+    patch.watchedRepo = watchedRepoEl.value.trim() || null;
+    patch.watchedRef = watchedRefEl.value || null;
     try {
       const res = await window.api('/api/deploy-policy', { method: 'POST', body: JSON.stringify(patch) });
       if (!res.ok && res.status !== 401) {
-        showMessage('error', 'Could not save the deployment policy — the toggles may not reflect what is stored.');
+        showMessage('error', 'Could not save the deployment policy — the settings may not reflect what is stored.');
       }
     } catch (err) {
       showMessage('error', 'Could not save the deployment policy — ' + String(err));
@@ -427,10 +538,31 @@ export const deploymentsScript = `
     loadDeployments();
   }
 
+  async function checkNow() {
+    const btn = document.getElementById('deployments-check-now-btn');
+    btn.disabled = true;
+    clearMessage();
+    try {
+      const res = await window.api('/api/deploy-check', { method: 'POST' });
+      if (!res.ok) {
+        const body = await res.json().catch(function () { return {}; });
+        showMessage('warning', 'Check failed — ' + (body.error || res.status));
+      }
+    } catch (err) {
+      showMessage('warning', 'Check failed — ' + String(err));
+    } finally {
+      btn.disabled = false;
+      loadDeployments();
+    }
+  }
+
   window.loadDeployments = loadDeployments;
   window.triggerDeploy = triggerDeploy;
   window.saveDeployPolicy = saveDeployPolicy;
   window.refreshPolicyDirty = refreshPolicyDirty;
+  window.loadDeployRefs = loadDeployRefs;
+  window.checkNow = checkNow;
+
   async function loadKgStatus() {
     const card = document.getElementById('kg-refresh-card');
     try {

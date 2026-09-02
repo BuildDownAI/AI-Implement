@@ -31,7 +31,17 @@ describe("getDeployPolicy", () => {
     // The whole feature's safety rests on the first half: an orchestrator that has
     // never been configured must not deploy itself. The second half is the one a
     // refactor silently inverts, because "absent means false" is the reflex.
-    expect(policy.getDeployPolicy()).toEqual({ autoDeploy: false, notifyAvailable: true });
+    expect(policy.getDeployPolicy()).toEqual({
+      autoDeploy: false,
+      notifyAvailable: true,
+      watchedRepo: null,
+      watchedRef: null,
+    });
+  });
+
+  it("defaults watchedRepo and watchedRef to null when absent", () => {
+    expect(policy.getDeployPolicy().watchedRepo).toBeNull();
+    expect(policy.getDeployPolicy().watchedRef).toBeNull();
   });
 
   it("distinguishes an explicit off from an absent key", () => {
@@ -61,13 +71,60 @@ describe("setDeployPolicy", () => {
     policy.setDeployPolicy({ autoDeploy: true, notifyAvailable: false });
     policy.setDeployPolicy({ autoDeploy: false });
 
-    expect(policy.getDeployPolicy()).toEqual({ autoDeploy: false, notifyAvailable: false });
+    expect(policy.getDeployPolicy()).toEqual({
+      autoDeploy: false,
+      notifyAvailable: false,
+      watchedRepo: null,
+      watchedRef: null,
+    });
   });
 
   it("is a no-op when the patch names nothing", () => {
     policy.setDeployPolicy({ autoDeploy: true });
     policy.setDeployPolicy({});
     expect(policy.getDeployPolicy().autoDeploy).toBe(true);
+  });
+
+  it("persists watchedRepo and reads it back", () => {
+    policy.setDeployPolicy({ watchedRepo: "owner/repo" });
+    expect(policy.getDeployPolicy().watchedRepo).toBe("owner/repo");
+  });
+
+  it("persists watchedRef and reads it back", () => {
+    policy.setDeployPolicy({ watchedRef: "main" });
+    expect(policy.getDeployPolicy().watchedRef).toBe("main");
+  });
+
+  it("clears watchedRepo when set to null", () => {
+    policy.setDeployPolicy({ watchedRepo: "owner/repo" });
+    policy.setDeployPolicy({ watchedRepo: null });
+    expect(policy.getDeployPolicy().watchedRepo).toBeNull();
+  });
+
+  it("clears watchedRef when set to null", () => {
+    policy.setDeployPolicy({ watchedRef: "main" });
+    policy.setDeployPolicy({ watchedRef: null });
+    expect(policy.getDeployPolicy().watchedRef).toBeNull();
+  });
+
+  it("patching watchedRef does not clobber watchedRepo", () => {
+    policy.setDeployPolicy({ watchedRepo: "owner/repo" });
+    policy.setDeployPolicy({ watchedRef: "main" });
+    expect(policy.getDeployPolicy().watchedRepo).toBe("owner/repo");
+    expect(policy.getDeployPolicy().watchedRef).toBe("main");
+  });
+
+  it("patching autoDeploy does not clobber watchedRepo", () => {
+    policy.setDeployPolicy({ watchedRepo: "owner/repo" });
+    policy.setDeployPolicy({ autoDeploy: true });
+    expect(policy.getDeployPolicy().watchedRepo).toBe("owner/repo");
+  });
+
+  it("round-trips both watched fields in one patch", () => {
+    policy.setDeployPolicy({ watchedRepo: "BuildDownAI/AI-Implement", watchedRef: "v1.0" });
+    const p = policy.getDeployPolicy();
+    expect(p.watchedRepo).toBe("BuildDownAI/AI-Implement");
+    expect(p.watchedRef).toBe("v1.0");
   });
 });
 
