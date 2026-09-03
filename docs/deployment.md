@@ -172,10 +172,13 @@ Classic Fly app secrets are **app-wide**: Fly injects every classic secret into 
 The runner entrypoint (`session/entrypoint.sh`, via `remap_team_secrets` in `session/lib.sh`) is the isolation boundary. When `AI_IMPLEMENT_TEAM_SECRET_PREFIX` is set, the entrypoint runs before the `su -p coder` handoff and:
 
 1. Remaps each own-team secret (`<TEAM>_<NAME>`) to its unprefixed form (`<NAME>`), making it available to setup hooks and the agent.
-2. Unsets every other-team secret from the environment, so machines dispatched for one team cannot read another team's secrets even though Fly injected them.
-3. Sets `AI_IMPLEMENT_FORWARDED_SECRETS` to a comma-joined list of the bare names exposed (e.g., `QA_PROBE,DB_URL`).
+2. Unsets foreign-team secrets — names from other team mappings that are listed in `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` — so machines dispatched for one team cannot read another team's secrets even though Fly injected them.
+3. Leaves global machine secrets (secrets with no team prefix, set on the sessions app for shared use) untouched — they pass through unchanged and are visible to every machine.
+4. Sets `AI_IMPLEMENT_FORWARDED_SECRETS` to a comma-joined list of the bare names exposed (e.g., `QA_PROBE,DB_URL`).
 
-`buildSessionMachineConfig` (in `src/fly-machines.ts`) passes `AI_IMPLEMENT_TEAM_SECRET_PREFIX=<TEAM>_` and `AI_IMPLEMENT_ALL_SECRET_NAMES=<comma-joined full list>` in the machine's env so the entrypoint knows which names to process. Because `AI_IMPLEMENT_ALL_SECRET_NAMES` carries the unfiltered list of every secret name on the sessions app, a machine can see the *names* (not values) of secrets belonging to other teams — this is a low-severity info disclosure inherent to the unset-everything-else isolation approach.
+`buildSessionMachineConfig` (in `src/fly-machines.ts`) passes two env vars so the entrypoint knows which names to process:
+- `AI_IMPLEMENT_TEAM_SECRET_PREFIX=<TEAM>_`: the own-team prefix; the entrypoint scans the environment for vars with this prefix and remaps them.
+- `AI_IMPLEMENT_FOREIGN_SECRET_NAMES=<comma-joined list>`: names that start with another team's prefix; the entrypoint unsets these. Global secrets are absent from this list and pass through unchanged.
 
 If a team secret's bare name (the part after the team prefix) matches a reserved orchestrator variable — `GITHUB_*`, `ISSUE_*`, `AI_IMPLEMENT_*`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `SESSION_TOKEN`, `MACHINE_NONCE`, `RUN_TOKEN`, `ORCHESTRATOR_URL`, `RUNNER_CALLBACK_URL`, `WORKSPACE_DIR`, `PATH`, or `HOME` — the entrypoint logs a warning and skips the export rather than overwriting the orchestrator-issued value. The same names are rejected at the admin UI level by `handleSetSecret` in `src/admin.ts`, so well-formed deployments never reach that guard.
 

@@ -414,7 +414,7 @@ describe("session/lib.sh remap_team_secrets", () => {
     return { status: r.status, stdout: r.stdout, stderr: r.stderr };
   }
 
-  it("remaps own-team secrets to unprefixed names and unsets cross-team secrets", () => {
+  it("remaps own-team secrets to unprefixed names and unsets foreign-team secrets via FOREIGN_SECRET_NAMES", () => {
     const { status, stdout, stderr } = runRemapScript(
       [
         "source session/lib.sh",
@@ -426,7 +426,7 @@ describe("session/lib.sh remap_team_secrets", () => {
       ].join("\n"),
       {
         AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
-        AI_IMPLEMENT_ALL_SECRET_NAMES: "SAN_QA_PROBE,ENG_OTHER",
+        AI_IMPLEMENT_FOREIGN_SECRET_NAMES: "ENG_OTHER",
         SAN_QA_PROBE: "secret-value",
         ENG_OTHER: "other-value",
       },
@@ -435,6 +435,35 @@ describe("session/lib.sh remap_team_secrets", () => {
     expect(stdout).toContain("QA_PROBE=secret-value");
     expect(stdout).toContain("SAN_QA_PROBE=UNSET");
     expect(stdout).toContain("ENG_OTHER=UNSET");
+    expect(stdout).toContain("FORWARDED=QA_PROBE");
+  });
+
+  it("global machine secrets pass through unchanged when not in own-team or foreign-team lists", () => {
+    // SAN_QA_PROBE=own-team, ENG_DB_URL=foreign, NPM_TOKEN=global
+    const { status, stdout, stderr } = runRemapScript(
+      [
+        "source session/lib.sh",
+        "remap_team_secrets",
+        'echo "QA_PROBE=${QA_PROBE:-UNSET}"',
+        'echo "SAN_QA_PROBE=${SAN_QA_PROBE:-UNSET}"',
+        'echo "ENG_DB_URL=${ENG_DB_URL:-UNSET}"',
+        'echo "NPM_TOKEN=${NPM_TOKEN:-UNSET}"',
+        'echo "FORWARDED=${AI_IMPLEMENT_FORWARDED_SECRETS-NOT_SET}"',
+      ].join("\n"),
+      {
+        AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+        AI_IMPLEMENT_FOREIGN_SECRET_NAMES: "ENG_DB_URL",
+        SAN_QA_PROBE: "secret-value",
+        ENG_DB_URL: "foreign-value",
+        NPM_TOKEN: "global-value",
+      },
+    );
+    expect(status, stderr).toBe(0);
+    expect(stdout).toContain("QA_PROBE=secret-value");
+    expect(stdout).toContain("SAN_QA_PROBE=UNSET");
+    expect(stdout).toContain("ENG_DB_URL=UNSET");
+    // Global secret is untouched
+    expect(stdout).toContain("NPM_TOKEN=global-value");
     expect(stdout).toContain("FORWARDED=QA_PROBE");
   });
 
@@ -447,7 +476,7 @@ describe("session/lib.sh remap_team_secrets", () => {
         'echo "FORWARDED=${AI_IMPLEMENT_FORWARDED_SECRETS-NOT_SET}"',
       ].join("\n"),
       {
-        AI_IMPLEMENT_ALL_SECRET_NAMES: "SAN_QA_PROBE",
+        AI_IMPLEMENT_FOREIGN_SECRET_NAMES: "SAN_QA_PROBE",
         SAN_QA_PROBE: "secret-value",
       },
     );
@@ -456,7 +485,7 @@ describe("session/lib.sh remap_team_secrets", () => {
     expect(stdout).toContain("FORWARDED=NOT_SET");
   });
 
-  it("unsets cross-team secrets and sets empty AI_IMPLEMENT_FORWARDED_SECRETS when no own-team names match", () => {
+  it("unsets foreign-team secrets and sets empty AI_IMPLEMENT_FORWARDED_SECRETS when no own-team vars are present", () => {
     const { status, stdout } = runRemapScript(
       [
         "source session/lib.sh",
@@ -466,7 +495,7 @@ describe("session/lib.sh remap_team_secrets", () => {
       ].join("\n"),
       {
         AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
-        AI_IMPLEMENT_ALL_SECRET_NAMES: "ENG_OTHER",
+        AI_IMPLEMENT_FOREIGN_SECRET_NAMES: "ENG_OTHER",
         ENG_OTHER: "other-value",
       },
     );
@@ -491,7 +520,6 @@ describe("session/lib.sh remap_team_secrets", () => {
       ].join("\n"),
       {
         AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
-        AI_IMPLEMENT_ALL_SECRET_NAMES: "SAN_GITHUB_TOKEN,SAN_QA_PROBE",
         SAN_GITHUB_TOKEN: "attacker-token",
         SAN_QA_PROBE: "probe-value",
         GITHUB_TOKEN: "original-orchestrator-token",

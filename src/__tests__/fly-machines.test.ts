@@ -533,36 +533,55 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.metadata!.orchestrator_app).toBeUndefined();
   });
 
-  it("injects AI_IMPLEMENT_TEAM_SECRET_PREFIX and AI_IMPLEMENT_ALL_SECRET_NAMES when teamKey and secrets are provided", () => {
+  it("separates foreign secrets from global secrets: own remapped, foreign listed for unset, global absent", () => {
+    // SAN_QA_PROBE = own-team (prefix SAN_), ENG_DB_URL = foreign (team ENG), NPM_TOKEN = global (no team prefix)
     const result = buildSessionMachineConfig({
       ...baseInput,
-      teamKey: "ENG",
-      teamSecretNames: ["ENG_DATABASE_URL", "ENG_STRIPE_KEY", "OTHER_TEAM_SECRET"],
+      teamKey: "SAN",
+      allTeamKeys: ["SAN", "ENG"],
+      teamSecretNames: ["SAN_QA_PROBE", "ENG_DB_URL", "NPM_TOKEN"],
     });
-    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
-    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBe("ENG_DATABASE_URL,ENG_STRIPE_KEY,OTHER_TEAM_SECRET");
-    expect(result.config.processes).toBeUndefined();
-  });
-
-  it("omits team secret env vars when teamSecretNames is empty", () => {
-    const result = buildSessionMachineConfig({
-      ...baseInput,
-      teamKey: "ENG",
-      teamSecretNames: [],
-    });
-    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("SAN_");
+    // Foreign: ENG_DB_URL (starts with ENG_). Global NPM_TOKEN is absent from both lists.
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBe("ENG_DB_URL");
     expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBeUndefined();
     expect(result.config.processes).toBeUndefined();
   });
 
-  it("injects team secret env vars even when no names match the team prefix (entrypoint filters)", () => {
+  it("omits FOREIGN_SECRET_NAMES when teamSecretNames is empty", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamKey: "ENG",
-      teamSecretNames: ["OTHER_TEAM_SECRET", "ANOTHER_VAR"],
+      allTeamKeys: ["ENG", "SAN"],
+      teamSecretNames: [],
+    });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBeUndefined();
+    expect(result.config.processes).toBeUndefined();
+  });
+
+  it("omits FOREIGN_SECRET_NAMES when all secret names belong to own team (no cross-team names)", () => {
+    const result = buildSessionMachineConfig({
+      ...baseInput,
+      teamKey: "ENG",
+      allTeamKeys: ["ENG", "SAN"],
+      teamSecretNames: ["ENG_DATABASE_URL", "ENG_STRIPE_KEY"],
     });
     expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
-    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBe("OTHER_TEAM_SECRET,ANOTHER_VAR");
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBeUndefined();
+    expect(result.config.processes).toBeUndefined();
+  });
+
+  it("lists only cross-team names in FOREIGN_SECRET_NAMES when no own-team names are present", () => {
+    const result = buildSessionMachineConfig({
+      ...baseInput,
+      teamKey: "ENG",
+      allTeamKeys: ["ENG", "SAN"],
+      teamSecretNames: ["SAN_QA_PROBE"],
+    });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBe("SAN_QA_PROBE");
     expect(result.config.processes).toBeUndefined();
   });
 
@@ -570,8 +589,10 @@ describe("buildSessionMachineConfig", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamSecretNames: ["ENG_DATABASE_URL"],
+      allTeamKeys: ["ENG"],
     });
     expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBeUndefined();
     expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBeUndefined();
     expect(result.config.processes).toBeUndefined();
   });

@@ -93,41 +93,53 @@ _remap_is_reserved() {
 # non-GA named-secrets feature and has no effect on classic secrets (confirmed
 # 2026-09-03, probe SAN-22 on ai-implement-testing-sessions).
 #
-# Reads AI_IMPLEMENT_TEAM_SECRET_PREFIX (e.g. "SAN_") and
-# AI_IMPLEMENT_ALL_SECRET_NAMES (comma-joined list of all secret names on
-# the sessions app, e.g. "SAN_QA_PROBE,ENG_OTHER").
+# Reads:
+#   AI_IMPLEMENT_TEAM_SECRET_PREFIX  — own-team prefix, e.g. "SAN_"
+#   AI_IMPLEMENT_FOREIGN_SECRET_NAMES — comma-joined names from other teams,
+#       e.g. "ENG_DB_URL,QA_OTHER". Global machine secrets (no team prefix)
+#       are absent from this list and pass through unchanged.
 #
 # Effect (runs before su -p coder handoff):
-#   - Own-team names (prefix match): export <BARE>=<value>; unset <TEAM>_<BARE>
-#     Exception: reserved names (_remap_is_reserved) are unset but not exported.
-#   - Other-team names: unset (cross-team isolation)
+#   - Own-team names (prefix match via env scan): export <BARE>=<value>;
+#     unset <TEAM>_<BARE>. Reserved names (_remap_is_reserved) are unset
+#     but not exported.
+#   - Foreign-team names (AI_IMPLEMENT_FOREIGN_SECRET_NAMES): unset.
+#   - Global secrets (not in either category): untouched.
 #   - Exports AI_IMPLEMENT_FORWARDED_SECRETS=<comma-joined bare names>
 #     Format: "QA_PROBE,DB_URL" — names only, no values. Empty when none.
 remap_team_secrets() {
   local prefix="${AI_IMPLEMENT_TEAM_SECRET_PREFIX:-}"
-  local all_names="${AI_IMPLEMENT_ALL_SECRET_NAMES:-}"
-  if [ -z "$prefix" ] || [ -z "$all_names" ]; then return 0; fi
+  if [ -z "$prefix" ]; then return 0; fi
 
   local forwarded="" _bare _val _sname
-  local -a _names=()
-  IFS=',' read -ra _names <<< "$all_names"
-  for _sname in "${_names[@]}"; do
+  # Remap own-team secrets: scan the environment for vars with the own-team
+  # prefix, export them under their bare name, and unset the prefixed form.
+  while IFS= read -r _sname; do
     [ -z "$_sname" ] && continue
-    if [[ "$_sname" == "${prefix}"* ]]; then
-      _bare="${_sname#"${prefix}"}"
-      if _remap_is_reserved "$_bare"; then
-        log "WARNING: Skipping reserved secret name ${_bare} (stored as ${_sname}) — would overwrite orchestrator-managed env var"
-        unset "${_sname}"
-        continue
-      fi
-      _val="${!_sname:-}"
-      export "${_bare}=${_val}"
+    _bare="${_sname#"${prefix}"}"
+    if _remap_is_reserved "$_bare"; then
+      log "WARNING: Skipping reserved secret name ${_bare} (stored as ${_sname}) — would overwrite orchestrator-managed env var"
       unset "${_sname}"
-      forwarded="${forwarded:+${forwarded},}${_bare}"
-    else
-      unset "${_sname}"
+      continue
     fi
-  done
+    _val="${!_sname:-}"
+    export "${_bare}=${_val}"
+    unset "${_sname}"
+    forwarded="${forwarded:+${forwarded},}${_bare}"
+  done < <(compgen -v | grep "^${prefix}" || true)
+
+  # Unset foreign-team secrets. Global secrets (no team prefix) are not listed
+  # here and pass through unchanged.
+  local foreign_names="${AI_IMPLEMENT_FOREIGN_SECRET_NAMES:-}"
+  if [ -n "$foreign_names" ]; then
+    local -a _fnames=()
+    IFS=',' read -ra _fnames <<< "$foreign_names"
+    for _sname in "${_fnames[@]}"; do
+      [ -z "$_sname" ] && continue
+      unset "${_sname}" 2>/dev/null || true
+    done
+  fi
+
   export AI_IMPLEMENT_FORWARDED_SECRETS="$forwarded"
   log "Remapped team secrets (prefix=${prefix}): ${forwarded:-none}"
 }
