@@ -12,30 +12,6 @@ import { ClaudeCliExecutor } from "../pipeline/executor.js";
 
 let binDir: string;
 
-function installFakeClaude(stdoutLines: string[], code = 0): void {
-  const script = `#!/usr/bin/env bash
-cat <<'JSONL'
-${stdoutLines.join("\n")}
-JSONL
-exit ${code}
-`;
-  const path = join(binDir, "claude");
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
-}
-
-// A fake `claude` that writes a message to stderr (e.g. an auth/model error)
-// and exits non-zero, with no JSONL on stdout.
-function installFakeClaudeStderr(message: string, code = 1): void {
-  const script = `#!/usr/bin/env bash
-printf '%s\\n' '${message.replace(/'/g, `'\\''`)}' >&2
-exit ${code}
-`;
-  const path = join(binDir, "claude");
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
-}
-
 // A fake `claude` that records the argv it was invoked with and whatever arrived
 // on stdin, then emits a single valid result line so the stream executor settles
 // cleanly. This exercises the actual spawn + stdio plumbing — the only thing that
@@ -105,27 +81,10 @@ afterEach(() => {
   rmSync(binDir, { recursive: true, force: true });
 });
 
-function installFakeClaudeNoTrailingNewline(stdoutLines: string[], code = 0): void {
-  // Emit every line but the last via a quoted heredoc, then the final line with
-  // `printf '%s'` so there is NO trailing newline — exercises the close-handler
-  // flush. Quoted heredoc + single-quoted printf arg means `$`/backtick in JSON
-  // values are never interpreted by the shell.
-  const lines = [...stdoutLines];
-  const last = (lines.pop() ?? "").replace(/'/g, `'\\''`);
-  const head = lines.length ? `cat <<'JSONL'\n${lines.join("\n")}\nJSONL\n` : "";
-  const script = `#!/usr/bin/env bash
-${head}printf '%s' '${last}'
-exit ${code}
-`;
-  const path = join(binDir, "claude");
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
-}
-
 // Builds a fake ChildProcess whose stdout emits the given content string, then
 // closes with exitCode. Content is pushed asynchronously so all event listeners
 // are registered before data arrives, matching real child process ordering.
-function makeTestProcess(stdoutContent: string, exitCode: number): ChildProcessWithoutNullStreams {
+function makeTestProcess(stdoutContent: string, exitCode: number, stderrContent = ""): ChildProcessWithoutNullStreams {
   const stdout = new PassThrough();
   const stderr = new PassThrough();
   const stdin = new PassThrough();
@@ -134,6 +93,7 @@ function makeTestProcess(stdoutContent: string, exitCode: number): ChildProcessW
   setImmediate(() => {
     stdout.push(stdoutContent);
     stdout.push(null);
+    if (stderrContent) stderr.push(stderrContent);
     stderr.push(null);
     setImmediate(() => ee.emit("close", exitCode));
   });
@@ -156,9 +116,10 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   });
 
   it("does NOT print per-event lines at summary level, but prints the summary", async () => {
-    installFakeClaude(SUCCESS_LINES, 0);
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    const fakeSpawn = () => fakeProc;
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
 
     const lines = log.mock.calls.map((c) => String(c[0]));
     expect(lines.some((l) => l.startsWith("[claude] result="))).toBe(true);
@@ -166,9 +127,10 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   });
 
   it("prints per-event lines at stream level", async () => {
-    installFakeClaude(SUCCESS_LINES, 0);
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    const fakeSpawn = () => fakeProc;
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    await new ClaudeCliExecutor("/tmp", "stream").invoke({ prompt: "p", model: "m" });
+    await new ClaudeCliExecutor("/tmp", "stream", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
 
     const lines = log.mock.calls.map((c) => String(c[0]));
     expect(lines.some((l) => l.includes("tool Bash pnpm check"))).toBe(true);
@@ -177,8 +139,9 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
 
   it("propagates a non-zero exit code and degrades telemetry to unknown", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    installFakeClaude(["not even json"], 1);
-    const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    const fakeProc = makeTestProcess("not even json\n", 1);
+    const fakeSpawn = () => fakeProc;
+    const result = await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
     expect(result.exitCode).toBe(1);
     expect(result.telemetry?.outcome).toBe("unknown");
     expect(result.stdout).toBe("");
@@ -202,8 +165,9 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   it("surfaces non-empty CLI stderr via console.error and returns it", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    installFakeClaudeStderr("Authentication failed: invalid API key", 1);
-    const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    const fakeProc = makeTestProcess("", 1, "Authentication failed: invalid API key\n");
+    const fakeSpawn = () => fakeProc;
+    const result = await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("Authentication failed");
