@@ -7,11 +7,15 @@
 # Operator step after first merge: mark the "unit-tests" check REQUIRED on the
 # testing branch (Settings → Branches). The branch is unprotected today, so the
 # check is advisory until that click.
+#
+# Grouping branches (ai-implement/feature/**, ai-implement/multi-issue/**) are
+# listed so child PRs in feature-branch grouping runs get the unit-test check
+# before their changes merge into the feature branch (AII-467).
 name: unit-tests
 
 on:
   pull_request:
-    branches: [testing, main]
+    branches: [testing, main, "ai-implement/feature/**", "ai-implement/multi-issue/**"]
 
 jobs:
   unit-tests:

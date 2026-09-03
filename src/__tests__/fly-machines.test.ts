@@ -533,85 +533,73 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.metadata!.orchestrator_app).toBeUndefined();
   });
 
-  it("maps team-prefixed secrets with prefix stripped", () => {
+  it("separates foreign secrets from global secrets: own remapped, foreign listed for unset, global absent", () => {
+    // SAN_QA_PROBE = own-team (prefix SAN_), ENG_DB_URL = foreign (team ENG), NPM_TOKEN = global (no team prefix)
     const result = buildSessionMachineConfig({
       ...baseInput,
-      teamKey: "ENG",
-      teamSecretNames: ["ENG_DATABASE_URL", "ENG_STRIPE_KEY", "OTHER_TEAM_SECRET"],
+      teamKey: "SAN",
+      allTeamKeys: ["SAN", "ENG"],
+      teamSecretNames: ["SAN_QA_PROBE", "ENG_DB_URL", "NPM_TOKEN"],
     });
-    expect(result.config.processes).toEqual([{
-      secrets: [
-        { env_var: "DATABASE_URL", name: "ENG_DATABASE_URL" },
-        { env_var: "STRIPE_KEY", name: "ENG_STRIPE_KEY" },
-      ],
-    }]);
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("SAN_");
+    // Foreign: ENG_DB_URL (starts with ENG_). Global NPM_TOKEN is absent from both lists.
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBe("ENG_DB_URL");
+    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBeUndefined();
+    expect(result.config.processes).toBeUndefined();
   });
 
-  it("omits process-level secrets when teamSecretNames is empty", () => {
+  it("omits FOREIGN_SECRET_NAMES when teamSecretNames is empty", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamKey: "ENG",
+      allTeamKeys: ["ENG", "SAN"],
       teamSecretNames: [],
     });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBeUndefined();
     expect(result.config.processes).toBeUndefined();
   });
 
-  it("omits process-level secrets when no names match the team prefix", () => {
+  it("omits FOREIGN_SECRET_NAMES when all secret names belong to own team (no cross-team names)", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamKey: "ENG",
-      teamSecretNames: ["OTHER_TEAM_SECRET", "ANOTHER_VAR"],
+      allTeamKeys: ["ENG", "SAN"],
+      teamSecretNames: ["ENG_DATABASE_URL", "ENG_STRIPE_KEY"],
     });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBeUndefined();
     expect(result.config.processes).toBeUndefined();
   });
 
-  it("omits process-level secrets when teamKey is not provided", () => {
+  it("lists only cross-team names in FOREIGN_SECRET_NAMES when no own-team names are present", () => {
+    const result = buildSessionMachineConfig({
+      ...baseInput,
+      teamKey: "ENG",
+      allTeamKeys: ["ENG", "SAN"],
+      teamSecretNames: ["SAN_QA_PROBE"],
+    });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBe("SAN_QA_PROBE");
+    expect(result.config.processes).toBeUndefined();
+  });
+
+  it("omits team secret env vars when teamKey is not provided", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamSecretNames: ["ENG_DATABASE_URL"],
+      allTeamKeys: ["ENG"],
     });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_FOREIGN_SECRET_NAMES).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBeUndefined();
     expect(result.config.processes).toBeUndefined();
   });
 
-  it("sets AI_IMPLEMENT_FORWARDED_SECRETS to comma-joined env_var names when secrets match", () => {
-    const result = buildSessionMachineConfig({
-      ...baseInput,
-      teamKey: "ENG",
-      teamSecretNames: ["ENG_DATABASE_URL", "ENG_API_KEY", "OTHER_X"],
-    });
-    expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBe("DATABASE_URL,API_KEY");
-    expect(result.config.processes).toEqual([{
-      secrets: [
-        { env_var: "DATABASE_URL", name: "ENG_DATABASE_URL" },
-        { env_var: "API_KEY", name: "ENG_API_KEY" },
-      ],
-    }]);
-  });
 
-  it("omits AI_IMPLEMENT_FORWARDED_SECRETS when no secrets match team prefix", () => {
-    const result = buildSessionMachineConfig({
-      ...baseInput,
-      teamKey: "ENG",
-      teamSecretNames: ["OTHER_X", "OTHER_Y"],
-    });
-    expect(result.config.env).not.toHaveProperty("AI_IMPLEMENT_FORWARDED_SECRETS");
-    expect(result.config.processes).toBeUndefined();
-  });
 
-  it("omits AI_IMPLEMENT_FORWARDED_SECRETS when teamSecretNames is not provided", () => {
-    const result = buildSessionMachineConfig({ ...baseInput });
-    expect(result.config.env).not.toHaveProperty("AI_IMPLEMENT_FORWARDED_SECRETS");
-  });
 
-  it("overrides extraEnv AI_IMPLEMENT_FORWARDED_SECRETS with computed value", () => {
-    const result = buildSessionMachineConfig({
-      ...baseInput,
-      teamKey: "ENG",
-      teamSecretNames: ["ENG_DATABASE_URL"],
-      extraEnv: { AI_IMPLEMENT_FORWARDED_SECRETS: "SHOULD_BE_OVERRIDDEN" },
-    });
-    expect(result.config.env!.AI_IMPLEMENT_FORWARDED_SECRETS).toBe("DATABASE_URL");
-  });
 
   it("passes min_secrets_version when provided", () => {
     const result = buildSessionMachineConfig({

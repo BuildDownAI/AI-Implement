@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags } from "../github.js";
 import { decodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -685,5 +685,78 @@ describe("fetchRepoTarball", () => {
     // Returning empty bytes would extract to an empty build context and fail much later.
     vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404 } as Response);
     await expect(fetchRepoTarball("tok", "Owner", "Repo", "nope")).rejects.toThrow(/HTTP 404/);
+  });
+});
+
+describe("parseLinkNext", () => {
+  it("returns null for a null header", () => {
+    expect(parseLinkNext(null)).toBeNull();
+  });
+
+  it("returns null when only rel='prev' is present", () => {
+    expect(parseLinkNext('<https://api.github.com/repos/o/r/branches?page=1>; rel="prev"')).toBeNull();
+  });
+
+  it("returns the URL for a header containing rel='next'", () => {
+    const header = '<https://api.github.com/repos/o/r/branches?page=2>; rel="next"';
+    expect(parseLinkNext(header)).toBe("https://api.github.com/repos/o/r/branches?page=2");
+  });
+
+  it("extracts rel='next' when the header contains multiple relations", () => {
+    const header =
+      '<https://api.github.com/repos/o/r/branches?page=1>; rel="prev", ' +
+      '<https://api.github.com/repos/o/r/branches?page=3>; rel="next"';
+    expect(parseLinkNext(header)).toBe("https://api.github.com/repos/o/r/branches?page=3");
+  });
+});
+
+describe("listRepoBranchesAndTags pagination", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  function makePage(names: string[], nextUrl: string | null): Response {
+    const link = nextUrl ? `<${nextUrl}>; rel="next"` : null;
+    return {
+      ok: true,
+      json: async () => names.map((name) => ({ name })),
+      headers: { get: (h: string) => (h === "link" ? link : null) },
+    } as unknown as Response;
+  }
+
+  it("follows Link rel=next and accumulates all branches across pages", async () => {
+    const page1Names = Array.from({ length: 100 }, (_, i) => `branch-${String(i).padStart(3, "0")}`);
+    const page2Names = Array.from({ length: 22 }, (_, i) => `branch-${String(i + 100).padStart(3, "0")}`);
+
+    // branches and tags start in parallel, so call order is: branches-page1, tags-page1, branches-page2
+    vi.stubGlobal(
+      "fetch",
+      vi.fn()
+        .mockResolvedValueOnce(
+          makePage(page1Names, "https://api.github.com/repos/o/r/branches?page=2"),
+        )
+        // tags: single page, no next (starts concurrently with branches)
+        .mockResolvedValueOnce(makePage([], null))
+        // branches page 2
+        .mockResolvedValueOnce(makePage(page2Names, null)),
+    );
+
+    const result = await listRepoBranchesAndTags("tok", "o", "r");
+    expect(result.branches).toHaveLength(122);
+    expect(result.branches[0]).toBe("branch-000");
+    expect(result.branches[99]).toBe("branch-099");
+    expect(result.branches[121]).toBe("branch-121");
+  });
+
+  it("returns a single page of results when there is no Link header", async () => {
+    const names = ["main", "dev"];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn()
+        .mockResolvedValueOnce(makePage(names, null))
+        .mockResolvedValueOnce(makePage(["v1.0"], null)),
+    );
+
+    const result = await listRepoBranchesAndTags("tok", "o", "r");
+    expect(result.branches).toEqual(["main", "dev"]);
+    expect(result.tags).toEqual(["v1.0"]);
   });
 });

@@ -109,6 +109,7 @@ interface IssueCommentPayload {
 
 interface PushPayload {
   ref?: string;
+  repository?: { full_name?: string };
 }
 
 const TRUSTED_REVIEW_COMMENT_AUTHORS = new Set([
@@ -151,6 +152,9 @@ function findMatchingDispatch(repo: string, branch?: string, prUrl?: string, prN
  *
  * Security: validates the X-Hub-Signature-256 HMAC-SHA256 header against
  * GITHUB_WEBHOOK_SECRET before processing any payload.
+ *
+ * Push events: requires the GitHub App to be subscribed to `push` events for
+ * push-triggered availability refresh to fire.
  */
 export async function handleGitHubWebhook(
   req: http.IncomingMessage,
@@ -405,7 +409,14 @@ async function handlePushWebhook(
   selfDeploy: SelfDeployTarget | undefined,
 ): Promise<void> {
   const branch = payload.ref?.replace(/^refs\/heads\//, "");
-  if (!selfDeploy || !appId || !privateKey || branch !== selfDeploy.branch) {
+  const repoFullName = payload.repository?.full_name;
+  if (
+    !selfDeploy ||
+    !appId ||
+    !privateKey ||
+    branch !== selfDeploy.branch ||
+    repoFullName !== `${selfDeploy.owner}/${selfDeploy.repo}`
+  ) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;

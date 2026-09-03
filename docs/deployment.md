@@ -36,6 +36,10 @@ Four things must be true, and they are not all reported the same way:
 - **An admin auth method is configured** — SSO providers or `ADMIN_ACCESS_CODE`. Every `/api/` route answers 503 otherwise, this one included.
 - **The GitHub App installation can read this repository.** Its token is minted at `contents: read`, scoped to the source repo. If `KG_SOURCE_REPO` is set, the installation must also cover that repository; an unset value builds sidecar-less without requiring that second grant — the orchestrator boots normally, but `/mcp` returns 503. The Docker build arg is baked into the image as a non-secret environment value so later self-deploys keep using the same graph repo unless a runtime env override changes it.
 
+The **Watched source** fields in `/admin#deployments` — owner/repo and ref — can shadow the build stamps. When both are set, the configured repo and ref take precedence over `AI_IMPLEMENT_SOURCE_REPO` and `AI_IMPLEMENT_SOURCE_BRANCH` for availability checks and deploys; clearing either restores the stamped values. A ref selector populated from the repository's branches and tags appears on blur.
+
+When the configured ref's HEAD is behind the running commit by any number of commits, the watched-source card shows: *⚠ This ref is behind the running commit — deploying it is a downgrade.* The comparison uses the GitHub compare API; when either commit is unknown, no warning appears rather than a speculative one.
+
 The first two and the app name collapse into a single `501`, which says the orchestrator cannot deploy itself without saying which piece is missing. The third is a different 503, raised at the `/api/` gate before this route is reached. The fourth is **not checked up front** — a token that cannot read a repository surfaces as a failed build, after the hold has already been taken and released.
 
 The app it deploys is never configured: Fly injects `FLY_APP_NAME` into every machine, so an orchestrator can only ever deploy itself.
@@ -48,6 +52,18 @@ The app it deploys is never configured: Fly injects `FLY_APP_NAME` into every ma
 - **The hold is taken by the poll that notices the commit**, before the build starts, so nothing is dispatched into a version that is about to be replaced.
 
 Switching it on does not reach back for a commit that has already been announced; that one needs the manual trigger. The trigger itself applies no availability check, so it will rebuild and re-release a commit that is already running — which is how a degraded release gets repaired.
+
+### Availability watch
+
+Three layers detect that a new commit is available on the watched ref, in descending order of latency:
+
+| Layer | Trigger | Requirements |
+|---|---|---|
+| Push webhook | GitHub delivers a `push` event to `/api/github/webhook` on each commit to the watched ref | App subscribed to `push` events; `GITHUB_WEBHOOK_SECRET` set; publicly reachable orchestrator |
+| **Check now** | Button in the watched-source card on `/admin#deployments` | Admin session |
+| Poll | Every poll cycle | Nothing — always active |
+
+The push webhook matches only the stamped source repository (the one baked into the image at build time). If `watchedRepo` points at a repository where the App is not installed, no `push` events arrive from it and only the poll and **Check now** layers apply.
 
 ### Manual deploy — cold start and recovery
 
@@ -102,6 +118,17 @@ A Fly app can watch a branch and deploy on push, with no workflow involved. Fly 
 
 **This path cannot carry the sidecar, and that is why self-deploy exists.** An integration deploy has no hook for a BuildKit build secret — no pre-deploy command, nowhere to pass `--build-secret`, no `fly.toml` key for one — so every push-triggered release ships a sidecar-less image whose `/mcp` answers 503, silently overwriting a good manual deploy. Leaving auto-deploy enabled on an app that serves `/mcp` will undo a working deploy on the next merge.
 
+### Using a public source repository
+
+When `watchedRepo` in `/admin#deployments` points at a repository the GitHub App is not installed on, availability checks and deploy fetches fall back to an App JWT. GitHub accepts App JWTs for reading public repositories without an installation scope, so a public upstream fork can be watched and deployed without installing the App on the upstream organisation.
+
+Two caveats apply:
+
+- **Deploys whatever upstream pushes.** The source tarball is fetched from the configured upstream ref, not from your fork, so the resulting image is built entirely from upstream code. Any `custom/` steps in your fork are absent from the image.
+- **No push webhook.** The App is not installed on the upstream repository, so GitHub delivers no `push` events from it. Only the poll loop and **Check now** detect new commits on the upstream ref.
+
+A private upstream repository that the App cannot read fails at tarball fetch time with a message naming the missing installation rather than silently building a stale image.
+
 ## Client instances
 
 Each client is a separate Fly app described by a file in `clients/<slug>.toml`. Copy `clients/example-client.toml` to start, or use the guided helper:
@@ -135,6 +162,25 @@ fly secrets set KEY=value --app <app_name>   # set secrets
 fly logs --app <app_name>                    # tail logs
 fly ssh console --app <app_name>             # shell into the machine
 ```
+
+### Per-project secrets (Fly)
+
+Secrets set through the admin UI Secrets panel are stored as classic Fly app secrets on the **shared sessions app**, prefixed with the team key — for example, a secret named `QA_PROBE` on the `SAN` mapping is stored as `SAN_QA_PROBE`.
+
+Classic Fly app secrets are **app-wide**: Fly injects every classic secret into every machine on the sessions app under its stored name, regardless of which team that machine belongs to. The Fly Machines API `processes[].secrets` field with `env_var` remap only applies to the non-GA named-secrets feature and has no effect on classic secrets.
+
+The runner entrypoint (`session/entrypoint.sh`, via `remap_team_secrets` in `session/lib.sh`) is the isolation boundary. When `AI_IMPLEMENT_TEAM_SECRET_PREFIX` is set, the entrypoint runs before the `su -p coder` handoff and:
+
+1. Remaps each own-team secret (`<TEAM>_<NAME>`) to its unprefixed form (`<NAME>`), making it available to setup hooks and the agent.
+2. Unsets foreign-team secrets — names from other team mappings that are listed in `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` — so machines dispatched for one team cannot read another team's secrets even though Fly injected them.
+3. Leaves global machine secrets (secrets with no team prefix, set on the sessions app for shared use) untouched — they pass through unchanged and are visible to every machine.
+4. Sets `AI_IMPLEMENT_FORWARDED_SECRETS` to a comma-joined list of the bare names exposed (e.g., `QA_PROBE,DB_URL`).
+
+`buildSessionMachineConfig` (in `src/fly-machines.ts`) passes two env vars so the entrypoint knows which names to process:
+- `AI_IMPLEMENT_TEAM_SECRET_PREFIX=<TEAM>_`: the own-team prefix; the entrypoint scans the environment for vars with this prefix and remaps them.
+- `AI_IMPLEMENT_FOREIGN_SECRET_NAMES=<comma-joined list>`: names that start with another team's prefix; the entrypoint unsets these. Global secrets are absent from this list and pass through unchanged.
+
+If a team secret's bare name (the part after the team prefix) matches a reserved orchestrator variable — `GITHUB_*`, `ISSUE_*`, `AI_IMPLEMENT_*`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `SESSION_TOKEN`, `MACHINE_NONCE`, `RUN_TOKEN`, `ORCHESTRATOR_URL`, `RUNNER_CALLBACK_URL`, `WORKSPACE_DIR`, `PATH`, or `HOME` — the entrypoint logs a warning and skips the export rather than overwriting the orchestrator-issued value. The same names are rejected at the admin UI level by `handleSetSecret` in `src/admin.ts`, so well-formed deployments never reach that guard.
 
 ## Using AWS Bedrock
 

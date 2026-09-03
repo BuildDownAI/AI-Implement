@@ -24,6 +24,11 @@ describe("deployments page", () => {
       "deployments-cta",
       "deployments-deploy-btn",
       "deployments-not-configured",
+      "deployments-watched-source",
+      "deployments-watched-repo",
+      "deployments-watched-ref",
+      "deployments-check-now-btn",
+      "deployments-downgrade-warn",
     ]) {
       expect(deploymentsHtml).toContain(`id="${id}"`);
     }
@@ -406,6 +411,100 @@ describe("deployments page", () => {
   it("calls /api/deployment-status to retrieve lastDeployOutcome", () => {
     // The outcome is a field on the existing endpoint — no second request needed.
     expect(deploymentsScript).toContain("lastDeployOutcome");
+  });
+
+  it("posts to /api/deploy-check for the check-now button", () => {
+    expect(deploymentsScript).toContain("window.api('/api/deploy-check', { method: 'POST' })");
+  });
+
+  it("calls /api/deploy-refs to populate the ref selector", () => {
+    expect(deploymentsScript).toContain("/api/deploy-refs?repo=");
+  });
+
+  it("reads data.defaultBranch from the deploy-refs response", () => {
+    expect(deploymentsScript).toContain("data.defaultBranch");
+  });
+
+  it("uses savedPolicy.watchedRef to determine the pinned watched ref", () => {
+    expect(deploymentsScript).toContain("savedPolicy.watchedRef");
+  });
+
+  it("excludes shown refs from the remaining branches list to avoid duplication", () => {
+    expect(deploymentsScript).toContain("shownSet");
+  });
+
+  it("filters the Tags optgroup against shownSet so a watched tag is not duplicated", () => {
+    expect(deploymentsScript).toContain("data.tags.filter(function(t) { return !shownSet.has(t); })");
+    expect(deploymentsScript).toContain("remainingTags.length");
+  });
+
+  it("renders Current and Default optgroups for the watched and default refs", () => {
+    expect(deploymentsScript).toContain('label="Current"');
+    expect(deploymentsScript).toContain('label="Default"');
+  });
+
+  it("sets the watched-repo placeholder from the effective watched source", () => {
+    expect(deploymentsScript).toContain("watchedRepoEl.placeholder = data.watchedRepo || data.repo || 'owner/repo'");
+  });
+
+  it("tracks the stamped branch at module scope and updates it on each status poll", () => {
+    expect(deploymentsScript).toContain("let stampedBranch = null");
+    expect(deploymentsScript).toContain("stampedBranch = data.branch || null");
+  });
+
+  it("renders four optgroups in order: Current, Default, Tags, Branches", () => {
+    const idxCurrent = deploymentsScript.indexOf('label="Current"');
+    const idxDefault = deploymentsScript.indexOf('label="Default"');
+    const idxTags = deploymentsScript.indexOf('label="Tags"');
+    const idxBranches = deploymentsScript.indexOf('label="Branches"');
+    expect(idxCurrent).toBeGreaterThan(-1);
+    expect(idxCurrent).toBeLessThan(idxDefault);
+    expect(idxDefault).toBeLessThan(idxTags);
+    expect(idxTags).toBeLessThan(idxBranches);
+  });
+
+  it("omits the Default group when it equals the Current ref", () => {
+    expect(deploymentsScript).toContain("!shownSet.has(defaultBranch)");
+  });
+
+  it("derives currentRef from savedPolicy.watchedRef or stampedBranch", () => {
+    expect(deploymentsScript).toContain("savedPolicy.watchedRef ? savedPolicy.watchedRef : stampedBranch");
+  });
+
+  it("dirty check covers watchedRepo and watchedRef", () => {
+    expect(deploymentsScript).toContain("watchedRepoChanged");
+    expect(deploymentsScript).toContain("watchedRefChanged");
+    expect(deploymentsScript).toContain("savedPolicy.watchedRepo");
+    expect(deploymentsScript).toContain("savedPolicy.watchedRef");
+  });
+
+  it("seeds savedPolicy with watchedRepo and watchedRef from the status response", () => {
+    expect(deploymentsScript).toContain("watchedRepo: data.watchedRepo");
+    expect(deploymentsScript).toContain("watchedRef: data.watchedRef");
+  });
+
+  it("shows the downgrade warning when data.isDowngrade is strictly true", () => {
+    expect(deploymentsScript).toContain("data.isDowngrade !== true");
+  });
+
+  it("loads refs when the repo field loses focus", () => {
+    expect(deploymentsHtml).toContain('onblur="window.loadDeployRefs()"');
+    expect(deploymentsScript).toContain("window.loadDeployRefs = loadDeployRefs");
+  });
+
+  it("sends watchedRepo and watchedRef in the policy save patch", () => {
+    expect(deploymentsScript).toContain("patch.watchedRepo");
+    expect(deploymentsScript).toContain("patch.watchedRef");
+  });
+
+  it("uses escAttr on ref and branch values in attribute contexts", () => {
+    expect(deploymentsScript).toContain("window.escAttr(b)");
+    expect(deploymentsScript).toContain("window.escAttr(t)");
+  });
+
+  it("uses esc on ref and branch values in text/innerHTML contexts", () => {
+    expect(deploymentsScript).toContain("window.esc(b)");
+    expect(deploymentsScript).toContain("window.esc(t)");
   });
 });
 

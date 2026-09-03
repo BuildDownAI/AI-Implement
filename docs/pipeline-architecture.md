@@ -61,7 +61,7 @@ The dispatch side declares which secrets are present by naming them in `AI_IMPLE
 Two producers set `AI_IMPLEMENT_FORWARDED_SECRETS`:
 
 - **GHA**: the "Forward repository secrets" step in `workflows/claude-implement.yml` reads the repository secret names listed in the `AI_IMPLEMENT_FORWARD_SECRETS` Actions variable, validates each name, exposes each secret value into the runner env, and writes the confirmed names to `AI_IMPLEMENT_FORWARDED_SECRETS` for the remainder of the job.
-- **Fly**: `src/fly-machines.ts` maps per-project secrets stored in the Fly Secrets panel to environment variable names (stripping the per-team prefix) and sets `AI_IMPLEMENT_FORWARDED_SECRETS` in the machine launch config.
+- **Fly**: the orchestrator passes `AI_IMPLEMENT_TEAM_SECRET_PREFIX` and `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` in the machine env (`buildSessionMachineConfig` in `src/fly-machines.ts`). The runner entrypoint (`remap_team_secrets` in `session/lib.sh`, run before the `su -p coder` hand-off) remaps this team's `<TEAM>_<NAME>` secrets to their bare names, unsets other teams' names, and exports `AI_IMPLEMENT_FORWARDED_SECRETS`. Fly injects classic app secrets app-wide under their stored names, so this entrypoint pass is the isolation boundary — see `docs/deployment.md` § "Per-project secrets (Fly)".
 
 One consumer: `src/pipeline/process-env.ts`. `parseForwardedSecrets()` reads the list; `modelProcessEnv()` deletes each named key before Claude Code starts. `repoProcessEnv()` — used for hooks and dependency install — leaves forwarded secrets in place.
 

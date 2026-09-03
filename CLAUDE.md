@@ -170,6 +170,8 @@ Only the non-obvious ones are worth restating:
 
 Adding or renaming a variable means updating `.env.example` in the same change; it is the operator's only discovery surface.
 
+A change that adds or alters an architectural feature must update the matching `docs/` reference in the same change; a new pattern with no existing home in `docs/` gets one.
+
 ## Adding a new target repo
 
 1. Add the mapping at `/admin` via the **New project** stepper. On the Source step, **Check installation** probes whether the App is installed and can see the repo, linking straight to the fix — install the App, or add the repo to an existing install. The check is advisory; you can save regardless.

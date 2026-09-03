@@ -4,9 +4,9 @@ import type * as GithubAppAuthModule from "../github-app-auth.js";
 import type * as GithubModule from "../github.js";
 
 // Both dependencies exist only to reach GitHub; what matters here is what they
-// return, so each is replaced by a spy exposing the single function we call.
-vi.mock("../github-app-auth.js", () => ({ getScopedInstallationToken: vi.fn() }));
-vi.mock("../github.js", () => ({ getBranchSha: vi.fn() }));
+// return, so each is replaced by a spy exposing the functions we call.
+vi.mock("../github-app-auth.js", () => ({ mintSourceTokenOrJwt: vi.fn() }));
+vi.mock("../github.js", () => ({ getRefSha: vi.fn(), compareCommits: vi.fn() }));
 
 const RUNNING = "1111111111111111111111111111111111111111";
 const HEAD = "2222222222222222222222222222222222222222";
@@ -35,10 +35,11 @@ beforeEach(async () => {
   vi.resetModules();
   githubAppAuth = await import("../github-app-auth.js");
   github = await import("../github.js");
-  vi.mocked(githubAppAuth.getScopedInstallationToken).mockResolvedValue({
+  vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
     token: "installation-token",
-    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    authMode: "installation",
   });
+  vi.mocked(github.compareCommits).mockResolvedValue({ behindBy: 0 });
   availability = await import("../deploy-availability.js");
 });
 
@@ -111,25 +112,61 @@ describe("readStampedTarget", () => {
   });
 });
 
+describe("resolveDeployTarget", () => {
+  const stamped: DeployAvailabilityModule.SelfDeployTarget = {
+    owner: "A",
+    repo: "B",
+    branch: "testing",
+    runningCommit: RUNNING,
+  };
+
+  it("returns the override target when both watchedRepo and watchedRef are set", () => {
+    const result = availability.resolveDeployTarget(stamped, { watchedRepo: "C/D", watchedRef: "v2" });
+    expect(result).toEqual({ owner: "C", repo: "D", branch: "v2", runningCommit: RUNNING });
+  });
+
+  it("returns the stamped target when both override fields are null", () => {
+    expect(availability.resolveDeployTarget(stamped, { watchedRepo: null, watchedRef: null })).toBe(stamped);
+  });
+
+  it("returns a target with null runningCommit when stamped is null but override is set", () => {
+    const result = availability.resolveDeployTarget(null, { watchedRepo: "C/D", watchedRef: "v2" });
+    expect(result).toEqual({ owner: "C", repo: "D", branch: "v2", runningCommit: null });
+  });
+
+  it("falls through to stamps when watchedRepo is malformed (no slash)", () => {
+    expect(availability.resolveDeployTarget(stamped, { watchedRepo: "noslash", watchedRef: "main" })).toBe(stamped);
+  });
+
+  it("falls through to stamps when only watchedRepo is set", () => {
+    expect(availability.resolveDeployTarget(stamped, { watchedRepo: "C/D", watchedRef: null })).toBe(stamped);
+  });
+
+  it("falls through to stamps when only watchedRef is set", () => {
+    expect(availability.resolveDeployTarget(stamped, { watchedRepo: null, watchedRef: "main" })).toBe(stamped);
+  });
+
+  it("returns null when stamped is null and no override is set", () => {
+    expect(availability.resolveDeployTarget(null, { watchedRepo: null, watchedRef: null })).toBeNull();
+  });
+});
+
 describe("refreshAvailability", () => {
   it("reports an available deployment when the branch has moved", async () => {
-    vi.mocked(github.getBranchSha).mockResolvedValue(HEAD);
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
 
     const state = await availability.refreshAvailability(input());
 
     expect(state).toMatchObject({ available: true, runningCommit: RUNNING, headCommit: HEAD });
   });
 
-  it("mints a token scoped to the one repository it reads", async () => {
-    // This runs on every poll cycle, so the broad installation-wide mint it used to make
-    // was the orchestrator's most frequently issued credential and its widest. The option
-    // shape also has to match the deploy path's mint exactly — the cache is keyed on
-    // (owner, permissions, repositories), so an identical shape means one token serves both.
-    vi.mocked(github.getBranchSha).mockResolvedValue(HEAD);
+  it("requests a token scoped to the one repository it reads", async () => {
+    // This runs on every poll cycle — the option shape must stay narrow (one repo, one permission).
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
 
     await availability.refreshAvailability(input());
 
-    expect(githubAppAuth.getScopedInstallationToken).toHaveBeenCalledWith(
+    expect(githubAppAuth.mintSourceTokenOrJwt).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(String),
       "BuildDownAI",
@@ -138,14 +175,14 @@ describe("refreshAvailability", () => {
   });
 
   it("reports up to date when the running commit is the branch head", async () => {
-    vi.mocked(github.getBranchSha).mockResolvedValue(RUNNING);
+    vi.mocked(github.getRefSha).mockResolvedValue(RUNNING);
 
     expect((await availability.refreshAvailability(input())).available).toBe(false);
   });
 
   it("reports unknown rather than up to date when the branch is missing", async () => {
-    // getBranchSha resolves null on a 404 — a deleted or renamed branch.
-    vi.mocked(github.getBranchSha).mockResolvedValue(null);
+    // getRefSha resolves null on a 404 — a deleted or renamed branch.
+    vi.mocked(github.getRefSha).mockResolvedValue(null);
 
     const state = await availability.refreshAvailability(input());
 
@@ -154,24 +191,180 @@ describe("refreshAvailability", () => {
   });
 
   it("reports unknown when the image carries no source commit", async () => {
-    vi.mocked(github.getBranchSha).mockResolvedValue(HEAD);
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
 
     const state = await availability.refreshAvailability(input({ runningCommit: null }));
 
     expect(state.available).toBeNull();
   });
 
-  it("looks up the head of the configured owner, repo and branch", async () => {
-    vi.mocked(github.getBranchSha).mockResolvedValue(HEAD);
+  it("looks up the head of the configured owner, repo and branch via getRefSha (installation path)", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
 
     await availability.refreshAvailability(input());
 
-    expect(github.getBranchSha).toHaveBeenCalledWith(
+    expect(github.getRefSha).toHaveBeenCalledWith(
       "installation-token",
       "BuildDownAI",
       "AI-Implement",
       "testing",
     );
+  });
+
+  it("sets isDowngrade true when the selected ref is behind the running commit", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
+    vi.mocked(github.compareCommits).mockResolvedValue({ behindBy: 3 });
+
+    const state = await availability.refreshAvailability(input());
+
+    expect(state.isDowngrade).toBe(true);
+    expect(github.compareCommits).toHaveBeenCalledWith(
+      "installation-token",
+      "BuildDownAI",
+      "AI-Implement",
+      RUNNING,
+      HEAD,
+    );
+  });
+
+  it("sets isDowngrade false when the selected ref is not behind", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
+    vi.mocked(github.compareCommits).mockResolvedValue({ behindBy: 0 });
+
+    const state = await availability.refreshAvailability(input());
+
+    expect(state.isDowngrade).toBe(false);
+  });
+
+  it("sets isDowngrade null when runningCommit is null (compare not called)", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
+
+    const state = await availability.refreshAvailability(input({ runningCommit: null }));
+
+    expect(state.isDowngrade).toBeNull();
+    expect(github.compareCommits).not.toHaveBeenCalled();
+  });
+
+  it("sets isDowngrade null when headCommit is null (compare not called)", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(null);
+
+    const state = await availability.refreshAvailability(input());
+
+    expect(state.isDowngrade).toBeNull();
+    expect(github.compareCommits).not.toHaveBeenCalled();
+  });
+
+  it("sets isDowngrade null when compareCommits returns null", async () => {
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
+    vi.mocked(github.compareCommits).mockResolvedValue(null);
+
+    const state = await availability.refreshAvailability(input());
+
+    expect(state.isDowngrade).toBeNull();
+  });
+});
+
+// Mocked tests cannot detect the credential defect class (JWT-vs-null / header presence).
+// Live verification: the deploy-refs smoke on the feature branch confirms unauthenticated
+// reads succeed for public repos and 401s do not appear.
+describe("refreshAvailability — public mode (no App installation)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reads the branch head unauthenticated when the App is not installed on the source owner", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
+      token: null,
+      authMode: "public",
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify([{ sha: HEAD }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    ));
+
+    const state = await availability.refreshAvailability(input());
+
+    // No Authorization header is sent in public mode — this is the load-bearing fix.
+    const [, opts] = vi.mocked(fetch).mock.calls[0] as [string, RequestInit];
+    expect((opts?.headers as Record<string, string>)?.["Authorization"]).toBeUndefined();
+    // getRefSha is bypassed in public mode; the direct fetch above handles the lookup.
+    expect(github.getRefSha).not.toHaveBeenCalled();
+    expect(state.available).toBe(true);
+    expect(state.headCommit).toBe(HEAD);
+  });
+
+  it("reports unknown availability when a private repo returns 404 in public mode", async () => {
+    // GitHub hides private repos behind 404 on unauthenticated reads.
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
+      token: null,
+      authMode: "public",
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 404 })));
+
+    const state = await availability.refreshAvailability(input());
+
+    expect(state.available).toBeNull();
+    expect(state.headCommit).toBeNull();
+  });
+
+  it("propagates non-404 mint errors without falling back", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockRejectedValue(new Error("GitHub 500"));
+
+    await expect(availability.refreshAvailability(input())).rejects.toThrow("GitHub 500");
+    expect(availability.getAvailability()).toBeNull();
+  });
+
+  it("sends no If-None-Match on the first poll (no prior ETag)", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
+      token: null,
+      authMode: "public",
+    });
+    let capturedHeaders: Record<string, string> | undefined;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((_url: string, opts: RequestInit) => {
+      capturedHeaders = opts?.headers as Record<string, string>;
+      return Promise.resolve(new Response(JSON.stringify([{ sha: HEAD }]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+    }));
+
+    await availability.refreshAvailability(input());
+
+    expect(capturedHeaders?.["If-None-Match"]).toBeUndefined();
+  });
+
+  it("stores the ETag from the first poll and sends If-None-Match on the second; 304 reuses the cached SHA", async () => {
+    vi.mocked(githubAppAuth.mintSourceTokenOrJwt).mockResolvedValue({
+      token: null,
+      authMode: "public",
+    });
+
+    let secondCallHeaders: Record<string, string> | undefined;
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify([{ sha: HEAD }]), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "ETag": '"v1"' },
+        }),
+      )
+      .mockImplementationOnce((_url: string, opts: RequestInit) => {
+        secondCallHeaders = opts?.headers as Record<string, string>;
+        // Response constructor rejects 304; use a plain conforming object instead.
+        return Promise.resolve({ status: 304, ok: false, headers: { get: () => null } } as unknown as Response);
+      }),
+    );
+
+    // First poll — fetches branch head and stores ETag.
+    const state1 = await availability.refreshAvailability(input());
+    expect(state1.headCommit).toBe(HEAD);
+
+    // Second poll — sends If-None-Match; 304 response reuses the cached SHA.
+    const state2 = await availability.refreshAvailability(input());
+    expect(secondCallHeaders?.["If-None-Match"]).toBe('"v1"');
+    expect(state2.headCommit).toBe(HEAD);
+    expect(state2.available).toBe(true);
   });
 });
 
@@ -181,7 +374,7 @@ describe("getAvailability", () => {
   });
 
   it("returns the most recent result once refreshed", async () => {
-    vi.mocked(github.getBranchSha).mockResolvedValue(HEAD);
+    vi.mocked(github.getRefSha).mockResolvedValue(HEAD);
 
     const state = await availability.refreshAvailability(input());
 
@@ -189,7 +382,7 @@ describe("getAvailability", () => {
   });
 
   it("stays null when the lookup throws, and the error reaches the caller", async () => {
-    vi.mocked(github.getBranchSha).mockRejectedValue(new Error("HTTP 502"));
+    vi.mocked(github.getRefSha).mockRejectedValue(new Error("HTTP 502"));
 
     await expect(availability.refreshAvailability(input())).rejects.toThrow("HTTP 502");
     expect(availability.getAvailability()).toBeNull();

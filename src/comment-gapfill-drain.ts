@@ -209,6 +209,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           memoryMb: mapping.machineMemoryMb,
           teamKey: scopeKey,
           teamSecretNames: allSecretNames,
+          allTeamKeys: Object.keys(teamRepoMap),
           minSecretsVersion: minSecretsVersion ?? undefined,
           orchestratorUrl: opts.runnerCallbackBaseUrl ?? undefined,
           runnerCallbackUrl: runnerCallbackUrl || undefined,

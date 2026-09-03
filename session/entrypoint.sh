@@ -98,6 +98,9 @@ fi
 cp /root/.gitconfig /home/coder/.gitconfig 2>/dev/null || true
 chown coder:coder /home/coder/.gitconfig 2>/dev/null || true
 
+# ── 5.5. Remap per-team Fly secrets ─────────────────────────────────────────
+remap_team_secrets
+
 # ── 6. Invoke TS pipeline ────────────────────────────────────────────────────
 export WORKSPACE_DIR
 RUNNER_PHASE="${RUNNER_PHASE:-implementation}"

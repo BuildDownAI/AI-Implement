@@ -14,7 +14,7 @@ import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { notify, notifyCompletion, notifyText } from "./notify.js";
 import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
-import { refreshAvailability, readStampedTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
+import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, makeStartDeploy, readKgSourceRepo } from "./deploy.js";
@@ -281,28 +281,30 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
 
   // Independent of tracker providers so self-deploy still works on an orchestrator with none configured.
   // Best-effort — never blocks the poll.
-  if (config.selfDeployTarget) {
+  const resolvedPollTarget = resolveDeployTarget(config.selfDeployTarget, getDeployPolicy());
+  if (resolvedPollTarget) {
     try {
       await refreshAvailability({
         appId: config.githubAppId,
         privateKey: config.githubAppPrivateKey,
-        ...config.selfDeployTarget,
+        ...resolvedPollTarget,
       });
     } catch (err) {
       console.error("[deploy] availability check failed:", err);
     }
-    
+
     // Act on what the refresh above found.
     try {
       // A factory over config with no state of its own, so building one per tick is
       // free and behaves identically to the server's — the hold that actually
       // serializes deploys lives in SQLite, not in this closure.
-      const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
+      const resolvedConfig = { ...config, selfDeployTarget: resolvedPollTarget };
+      const startDeploy = makeStartDeploy({ ...resolvedConfig, onBuildFailure: onDeployBuildFailure });
       const availability = getAvailability();
       const head = availability?.headCommit ?? null;
 
       const action = decideAvailabilityAction({
-        configured: canSelfDeploy(config),
+        configured: canSelfDeploy(resolvedConfig),
         available: availability?.available ?? null,
         headCommit: head,
         held: isDeployHeld(),
@@ -1092,6 +1094,7 @@ async function dispatchPlanning(
             memoryMb: mapping.machineMemoryMb,
             teamKey: issue.scopeKey,
             teamSecretNames: allSecretNames,
+            allTeamKeys: Object.keys(getMappings()),
             minSecretsVersion: minSecretsVersion ?? undefined,
             orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -1532,6 +1535,7 @@ async function dispatchFlyMachine(
         memoryMb: mapping.machineMemoryMb,
         teamKey: issue.scopeKey,
         teamSecretNames: allSecretNames,
+        allTeamKeys: Object.keys(getMappings()),
         minSecretsVersion: minSecretsVersion ?? undefined,
         orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
