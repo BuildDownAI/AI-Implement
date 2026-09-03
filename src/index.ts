@@ -99,6 +99,7 @@ interface AppConfig {
   adminAccessCode: string | null;
   oauthRedirectBaseUrl: string | null;
   pollIntervalMs: number;
+  pollCycleTimeoutMs: number;
   healthPort: number;
   // Fly Machines (optional — only needed if any mapping uses fly-machines mode)
   flySessionsToken: string | null;
@@ -217,6 +218,7 @@ function loadConfig(): AppConfig {
     adminAccessCode,
     oauthRedirectBaseUrl,
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
+    pollCycleTimeoutMs: Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000,
     healthPort: parseInt(process.env.PORT || "8080", 10),
     flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
     flySessionsApp: (() => {
@@ -279,7 +281,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   const { cycleId, started } = cycle;
   console.log(`[poll] Starting poll cycle #${cycleId}`);
 
-  const timeoutMs = Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000;
+  const timeoutMs = config.pollCycleTimeoutMs;
 
   await runWithDeadline(
     cycleId,
