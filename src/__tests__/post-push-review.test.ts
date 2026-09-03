@@ -2281,4 +2281,219 @@ describe("postPushReviewStep", () => {
     expect(capComment).toBeDefined();
     expect(capComment).toContain("matrix-ubuntu");
   });
+
+  it("T-3 (AII-436 regression): unstructured GH Actions approval text → approved with findingsUnavailable note, not blocked", async () => {
+    // AII-436: The GH Actions bot posted an approving comment with no structured finding
+    // sections and no "no issues found" phrasing. Old code fabricated a finding and blocked
+    // approval. New code flags findingsUnavailable and shows a note instead.
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef42" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("deadbeef42/check-runs"))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: [{ name: "review", status: "completed", conclusion: "success" }],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        // Unstructured approval: no "no issues found", no structured sections — exact AII-436 shape.
+        return {
+          stdout: JSON.stringify([{
+            user: { login: "github-actions[bot]", type: "Bot" },
+            body: "**Claude finished the review**\n\n### Code Review\n\nAll four acceptance criteria are satisfied and the implementation is correct end-to-end.",
+            html_url: "https://example.com/review-comment",
+          }]),
+          exitCode: 0,
+        };
+      }
+      return {
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+        exitCode: 0,
+      };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    const approvalComment = ghComments.find((c) => c.includes("✅"));
+    expect(approvalComment).toBeDefined();
+    expect(approvalComment).toContain("Ready to merge");
+    // The unavailability note must appear so the operator knows findings were not parsed.
+    expect(approvalComment).toContain("findings could not be parsed");
+    // Must NOT contain a "findings are blocking" banner — that would be a false block.
+    expect(approvalComment).not.toContain("External review findings are blocking");
+  });
+
+  it("T-4: 'Not ready to merge' comment lists concrete external findings, not just a banner", async () => {
+    // Criterion 3: any Not-ready comment must enumerate the concrete blocking findings.
+    // Regression: old externalBlockingCommentBlock posted a banner with no findings listed.
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef43" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("deadbeef43/check-runs"))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: [{ name: "review", status: "completed", conclusion: "success" }],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        // External reviewer submitted CHANGES_REQUESTED with a concrete finding body.
+        return {
+          stdout: JSON.stringify([{
+            state: "CHANGES_REQUESTED",
+            body: "Eager createVersion accumulates orphan drafts on every call.",
+            user: { login: "claude-code[bot]" },
+            html_url: "https://example.com/review",
+          }]),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      return {
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+        exitCode: 0,
+      };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    const notReadyComment = ghComments.find((c) => c.includes("Not ready to merge"));
+    expect(notReadyComment).toBeDefined();
+    // The finding body text must appear in the comment — not just a banner.
+    expect(notReadyComment).toContain("Eager createVersion accumulates orphan drafts on every call.");
+  });
+
+  it("T-5: CI gate does not block when all non-review checks pass", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef44" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("deadbeef44/check-runs"))) {
+        return {
+          stdout: JSON.stringify({
+            check_runs: [
+              { name: "review", status: "completed", conclusion: "success" },
+              { name: "build", status: "completed", conclusion: "success" },
+              { name: "test", status: "completed", conclusion: "success" },
+            ],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      return {
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+        exitCode: 0,
+      };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+  });
+
+  it("T-6: CI gate excludes the external review check's own failure — not double-counted as a CI blocker", async () => {
+    // When the external review check concludes "failure" (reviewer found issues), the CI gate
+    // must not also report it as a failing CI check. The external review path handles it.
+    const reviewerJson = JSON.stringify({
+      approved: false,
+      blocking_issues: [{ title: "Bug", problem: "Null ref in foo method", required_fix: "Guard against null." }],
+      score: 3,
+      progress_delta: 0,
+      feedback: "Fix the null ref.",
+    });
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef45" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("deadbeef45/check-runs"))) {
+        // The external review check itself concluded "failure" — reviewer found issues.
+        return {
+          stdout: JSON.stringify({
+            check_runs: [{ name: "review", status: "completed", conclusion: "failure" }],
+          }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      return {
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+        exitCode: 0,
+      };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    const notReadyComment = ghComments.find((c) => c.includes("Not ready to merge"));
+    expect(notReadyComment).toBeDefined();
+    // The external review check failure must NOT appear as a CI check blocker.
+    expect(notReadyComment).not.toContain("CI check 'review' is failing");
+    // Only the internal reviewer's issue should appear.
+    expect(notReadyComment).toContain("Null ref in foo method");
+  });
 });
