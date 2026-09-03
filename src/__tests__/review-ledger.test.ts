@@ -271,6 +271,7 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
       "- Nothing blocking, but test coverage for the edge case is missing",
       "- No concerns, however the error message leaks internal paths",
       "- No issues found, though the migration is irreversible",
+      "- No blocking issues, although the lock ordering is inconsistent",
     ];
     for (const bullet of variants) {
       const body = ["**Claude finished the review**", "", "### Blocking", "", bullet].join("\n");
