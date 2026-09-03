@@ -182,6 +182,26 @@ The runner entrypoint (`session/entrypoint.sh`, via `remap_team_secrets` in `ses
 
 If a team secret's bare name (the part after the team prefix) matches a reserved orchestrator variable — `GITHUB_*`, `ISSUE_*`, `AI_IMPLEMENT_*`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `SESSION_TOKEN`, `MACHINE_NONCE`, `RUN_TOKEN`, `ORCHESTRATOR_URL`, `RUNNER_CALLBACK_URL`, `WORKSPACE_DIR`, `PATH`, or `HOME` — the entrypoint logs a warning and skips the export rather than overwriting the orchestrator-issued value. The same names are rejected at the admin UI level by `handleSetSecret` in `src/admin.ts`, so well-formed deployments never reach that guard.
 
+### Process-level secrets (AII-491 spike)
+
+Setting `FLY_PROCESS_LEVEL_SECRETS` to `true` switches `buildSessionMachineConfig` to a stricter isolation mode. Instead of setting `AI_IMPLEMENT_TEAM_SECRET_PREFIX` / `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` and relying on the entrypoint filter, the machine config sets `processes[0].ignore_app_secrets: true` and enumerates only the secrets the machine should receive in `processes[0].secrets`:
+
+- Own-team secrets (`<TEAM>_<NAME>`) → `{ env_var: "<NAME>", name: "<TEAM>_<NAME>" }` (remapped to bare form)
+- Foreign-team secrets → excluded entirely
+- Global secrets (no team prefix) → `{ env_var: "<NAME>" }` (passed through unchanged)
+
+The entrypoint remap/filter logic remains active in both modes but is a no-op when the flag is on, since the machine already receives bare names with foreign names absent.
+
+**This flag is off by default.** Ship it behind the flag, run one probe, then decide:
+
+| Probe result | Action |
+|---|---|
+| `QA_PROBE` present; `SAN_QA_PROBE` + `AII_PROBE_FOREIGN` absent | Fly honours the list ✅ — leave flag on; file follow-up to make it default |
+| `SAN_QA_PROBE` + `AII_PROBE_FOREIGN` still present | `processes` not applied — add `entrypoint: ["/opt/ai-implement/entrypoint.sh"]` to `processes[0]` and retry |
+| No `QA_`, `SAN_`, `AII_` vars present | `ignore_app_secrets` applied but the list did not resolve — turn flag off; entrypoint filter remains the boundary |
+
+The dispatch log line (written only when the flag is on) lists the requested secret *names* (never values) so the outcome can be read from the orchestrator log as well as the probe hook report.
+
 ## Using AWS Bedrock
 
 To run a target repo against Bedrock instead of the Anthropic API, use the **GitHub Actions execution mode**. Bedrock is not supported on Fly Machines or local Docker: those backends have no equivalent of GitHub's OIDC role assumption, and the runner entrypoint rejects `provider=bedrock` outside GHA mode outright.

@@ -273,6 +273,10 @@ export async function setAppSecrets(
 ): Promise<number | null> {
   const secretInputs = Object.entries(secrets).map(([key, value]) => ({ key, value }));
 
+  // Always returns null: the GraphQL response is discarded (typed as unknown) so
+  // release.version — which would populate min_secrets_version — is never read.
+  // setFlySecretsMinVersion would store that version; getFlySecretsMinVersion would
+  // return it — but neither is called here, so callers always receive undefined.
   await flyGraphQL<unknown>(token, `
     mutation SetSecrets($input: SetSecretsInput!) {
       setSecrets(input: $input) { release { version } }
@@ -382,6 +386,7 @@ export interface SessionMachineInput {
   teamKey?: string;
   teamSecretNames?: string[]; // full prefixed secret names from the Fly app (e.g. ["ENG_DATABASE_URL"])
   allTeamKeys?: string[]; // all known team keys across all mappings, used to identify foreign secrets
+  flyProcessLevelSecrets?: boolean; // when true, use processes[].secrets + ignore_app_secrets (see FLY_PROCESS_LEVEL_SECRETS)
   minSecretsVersion?: number;
   orchestratorUrl?: string;
   runnerCallbackUrl?: string;
@@ -449,19 +454,50 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     },
   };
 
-  // Classic Fly app secrets are app-wide: every machine on the sessions app
-  // receives every classic secret under its stored name (e.g. SAN_QA_PROBE).
-  // The Machines API processes[].secrets env_var remap applies only to the
-  // non-GA named-secrets feature and has no effect on classic secrets (confirmed
-  // 2026-09-03, probe SAN-22; see https://fly.io/docs/machines/api/machines-resource/).
+  // Secret isolation — two modes:
   //
-  // The runner entrypoint (remap_team_secrets in session/lib.sh) handles isolation:
-  //   - AI_IMPLEMENT_TEAM_SECRET_PREFIX: own-team prefix; entrypoint remaps any env var
-  //     whose name starts with this prefix to its unprefixed form and unsets the prefixed form.
-  //   - AI_IMPLEMENT_FOREIGN_SECRET_NAMES: comma-joined names that start with another team's
-  //     prefix; entrypoint unsets these. Global secrets (no team prefix) are omitted here
-  //     and pass through the entrypoint unchanged.
-  if (input.teamKey && input.teamSecretNames?.length) {
+  // Flag OFF (default): entrypoint-filter mode (AII-488).
+  //   Classic Fly app secrets are app-wide; every machine receives every classic secret.
+  //   The Machines API processes[].secrets env_var remap applies only to the non-GA
+  //   named-secrets feature and has no effect on classic secrets (confirmed 2026-09-03,
+  //   probe SAN-22; see https://fly.io/docs/machines/api/machines-resource/).
+  //   Two env vars tell the runner entrypoint (remap_team_secrets in session/lib.sh) what to do:
+  //     AI_IMPLEMENT_TEAM_SECRET_PREFIX: own-team prefix; entrypoint remaps prefixed vars to bare form.
+  //     AI_IMPLEMENT_FOREIGN_SECRET_NAMES: comma-joined foreign names; entrypoint unsets these.
+  //   Global secrets (no team prefix) pass through unchanged.
+  //
+  // Flag ON (FLY_PROCESS_LEVEL_SECRETS): process-level secrets mode (AII-491 spike).
+  //   Populates processes[0].ignore_app_secrets=true so the machine receives only the
+  //   explicitly listed secrets — keeping foreign secrets out at the Fly boundary, not inside
+  //   the machine. The entrypoint remap/filter logic remains but is a no-op: it sees bare names
+  //   and finds nothing to unset.
+  //   Spike outcomes (recorded on AII-491):
+  //     - QA_PROBE present, SAN_QA_PROBE and AII_PROBE_FOREIGN absent → Fly honours the list. ✅
+  //     - SAN_QA_PROBE and AII_PROBE_FOREIGN present → processes not applied; add explicit entrypoint.
+  //     - Nothing present → ignore_app_secrets applied but secrets list did not resolve; turn flag off.
+  // Note: a falsy teamKey (e.g. Jira issues with an empty scopeKey) falls through both branches,
+  // so the machine receives all classic app secrets regardless of the flag. This matches flag-off
+  // behaviour for the same case and is not a regression, but the flag does not close this gap.
+  if (input.flyProcessLevelSecrets && input.teamKey && input.teamSecretNames !== undefined) {
+    const ownPrefix = `${input.teamKey.toUpperCase()}_`;
+    const allPrefixes = (input.allTeamKeys ?? []).map((k) => `${k.toUpperCase()}_`);
+    const processSecrets: MachineSecret[] = [];
+    for (const name of input.teamSecretNames) {
+      if (name.startsWith(ownPrefix)) {
+        // Own-team secret: remap from prefixed stored name to bare env var
+        processSecrets.push({ env_var: name.slice(ownPrefix.length), name });
+      } else if (allPrefixes.some((p) => name.startsWith(p))) {
+        // Foreign-team secret: exclude entirely
+      } else {
+        // Global secret (no team prefix): pass through under its stored name
+        processSecrets.push({ env_var: name });
+      }
+    }
+    machineConfig.processes = [{
+      ignore_app_secrets: true,
+      secrets: processSecrets,
+    }];
+  } else if (input.teamKey && input.teamSecretNames?.length) {
     const ownPrefix = `${input.teamKey.toUpperCase()}_`;
     env.AI_IMPLEMENT_TEAM_SECRET_PREFIX = ownPrefix;
 
