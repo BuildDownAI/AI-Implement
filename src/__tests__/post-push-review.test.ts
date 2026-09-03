@@ -2326,4 +2326,35 @@ describe("postPushReviewStep", () => {
       ),
     ).rejects.toThrow("gh pr comment failed");
   });
+
+  it("surfaces genuine LLM failure when operator closes PR while failure comment is being posted (priorLlmFailure=true)", async () => {
+    // Sequence: (1) start-marker comment succeeds, (2) LLM reviewer exits non-zero,
+    // (3) failure-comment post is blocked by a locked PR → OperatorCancelledError.
+    // Expected: step returns review_failed (not operator_cancelled), does NOT throw.
+    let prCommentCalls = 0;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        prCommentCalls++;
+        // First pr comment is the start-marker; let it succeed.
+        if (prCommentCalls === 1) return { stdout: "", exitCode: 0 };
+        // Second pr comment is the failure notice — operator has closed the PR.
+        return { stdout: "", stderr: "GraphQL: Issue is locked (addComment)", exitCode: 1 };
+      }
+      if (args[0] === "pr" && args[1] === "view") {
+        return { stdout: JSON.stringify({ state: "CLOSED", merged: false }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    // LLM reviewer fails (non-zero exit).
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 1, tokensUsed: 0 })));
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { report: vi.fn(async () => undefined) },
+    );
+    // Genuine failure must surface — not masked by the operator-cancel benign event.
+    expect(out.terminationReason).toBe("review_failed");
+    expect(out.approved).toBe(false);
+  });
 });
