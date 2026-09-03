@@ -10,7 +10,9 @@ export interface RunConfigV1 {
   issue: { id: string; identifier: string; title: string; description: string };
   prNumber?: string;
   baseBranch?: string;
-  runnerPhase?: "implementation" | "gap-analysis" | "planning";
+  runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
+  /** KG source repo (owner/repo) to clone as workspace for kg-refresh runs. */
+  kgSourceRepo?: string;
   branchPrefix?: string;
   skillsRepo?: string;
   runnerCallbackUrl?: string;
@@ -91,7 +93,7 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
-    profiles, planningContext, groupingParent, dependencyTokenScope } = cfg;
+    profiles, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -107,5 +109,6 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (planningContext !== undefined) out.planningContext = planningContext;
   if (groupingParent !== undefined) out.groupingParent = groupingParent;
   if (dependencyTokenScope !== undefined) out.dependencyTokenScope = dependencyTokenScope;
+  if (kgSourceRepo !== undefined) out.kgSourceRepo = kgSourceRepo;
   return out;
 }

@@ -1,0 +1,10 @@
+id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+  - id: feedback-loop
+    type: custom
+    moduleId: feedback-loop
+  - id: kg-snapshot-push
+    type: custom
+    moduleId: kg-snapshot-push

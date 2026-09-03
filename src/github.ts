@@ -192,7 +192,7 @@ export function profilesRunnerEnv(issue: { profiles?: string[] }): Record<string
 }
 
 export interface EnvelopeDispatchOpts {
-  runnerPhase: "implementation" | "gap-analysis" | "planning";
+  runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   baseBranch?: string;
   runnerCallbackUrl?: string;
   runToken?: string;
@@ -252,7 +252,7 @@ export function buildEnvelopeDispatchInputs(
     run_config: encodeRunConfig(runConfig),
     run_token: opts.runToken ?? "",
     ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
-    ...(opts.runnerPhase !== "planning" && opts.runPublicationToken !== undefined
+    ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" && opts.runPublicationToken !== undefined
       ? { run_publication_token: opts.runPublicationToken }
       : {}),
     ...providerDispatchFields(mapping),
