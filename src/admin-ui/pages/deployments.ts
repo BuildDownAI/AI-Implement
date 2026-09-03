@@ -240,16 +240,36 @@ export const deploymentsScript = `
       }
       const data = await res.json();
       const prev = refSel.value;
+      const defaultBranch = data.defaultBranch || null;
+      const watchedRef = savedPolicy && savedPolicy.watchedRef ? savedPolicy.watchedRef : null;
+
+      // Build the pinned group: default branch first, then watched ref if different.
+      const pinned = [];
+      if (defaultBranch) pinned.push(defaultBranch);
+      if (watchedRef && watchedRef !== defaultBranch) pinned.push(watchedRef);
+      const pinnedSet = new Set(pinned);
+
       let html = '<option value="">— select a ref —</option>';
-      if (data.branches && data.branches.length) {
-        html += '<optgroup label="Branches">';
-        for (const b of data.branches) html += '<option value="' + window.escAttr(b) + '">' + window.esc(b) + '</option>';
+      if (pinned.length) {
+        html += '<optgroup label="Pinned">';
+        for (const p of pinned) html += '<option value="' + window.escAttr(p) + '">' + window.esc(p) + '</option>';
         html += '</optgroup>';
       }
       if (data.tags && data.tags.length) {
-        html += '<optgroup label="Tags">';
-        for (const t of data.tags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
-        html += '</optgroup>';
+        const remainingTags = data.tags.filter(function(t) { return !pinnedSet.has(t); });
+        if (remainingTags.length) {
+          html += '<optgroup label="Tags">';
+          for (const t of remainingTags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
+          html += '</optgroup>';
+        }
+      }
+      if (data.branches && data.branches.length) {
+        const remaining = data.branches.filter(function(b) { return !pinnedSet.has(b); }).sort();
+        if (remaining.length) {
+          html += '<optgroup label="Branches">';
+          for (const b of remaining) html += '<option value="' + window.escAttr(b) + '">' + window.esc(b) + '</option>';
+          html += '</optgroup>';
+        }
       }
       refSel.innerHTML = html;
       // Restore previous selection if it still exists in the new list
