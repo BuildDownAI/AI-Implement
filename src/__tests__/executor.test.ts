@@ -4,11 +4,13 @@ const isWindows = process.platform === "win32";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { PassThrough } from "node:stream";
+import { EventEmitter } from "node:events";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 
 let binDir: string;
-let originalPath: string | undefined;
 
 function installFakeClaude(stdoutLines: string[], code = 0): void {
   const script = `#!/usr/bin/env bash
@@ -94,15 +96,13 @@ const SUCCESS_LINES = [
 
 beforeEach(() => {
   binDir = mkdtempSync(join(tmpdir(), "fakebin-"));
-  originalPath = process.env.PATH;
-  process.env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
+  vi.stubEnv("PATH", `${binDir}:${process.env.PATH ?? ""}`);
 });
 
 afterEach(() => {
-  process.env.PATH = originalPath;
-  rmSync(binDir, { recursive: true, force: true });
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  rmSync(binDir, { recursive: true, force: true });
 });
 
 function installFakeClaudeNoTrailingNewline(stdoutLines: string[], code = 0): void {
@@ -122,11 +122,30 @@ exit ${code}
   chmodSync(path, 0o755);
 }
 
+// Builds a fake ChildProcess whose stdout emits the given content string, then
+// closes with exitCode. Content is pushed asynchronously so all event listeners
+// are registered before data arrives, matching real child process ordering.
+function makeTestProcess(stdoutContent: string, exitCode: number): ChildProcessWithoutNullStreams {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const stdin = new PassThrough();
+  const ee = new EventEmitter();
+  const proc = Object.assign(ee, { stdout, stderr, stdin }) as unknown as ChildProcessWithoutNullStreams;
+  setImmediate(() => {
+    stdout.push(stdoutContent);
+    stdout.push(null);
+    stderr.push(null);
+    setImmediate(() => ee.emit("close", exitCode));
+  });
+  return proc;
+}
+
 describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   it("returns the result event's text as stdout (compat) plus telemetry", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    installFakeClaude(SUCCESS_LINES, 0);
-    const exec = new ClaudeCliExecutor("/tmp", "summary");
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    const fakeSpawn = () => fakeProc;
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn);
     const result = await exec.invoke({ prompt: "do it", model: "claude-x" });
 
     expect(result.stdout).toBe("Done implementing.");
@@ -167,8 +186,14 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
 
   it("parses a final line that has no trailing newline", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    installFakeClaudeNoTrailingNewline(SUCCESS_LINES, 0);
-    const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n"), 0);
+    const fakeSpawn = () => fakeProc;
+    const result = await new ClaudeCliExecutor(
+      "/tmp",
+      "summary",
+      false,
+      fakeSpawn as unknown as typeof spawn,
+    ).invoke({ prompt: "p", model: "m" });
     expect(result.stdout).toBe("Done implementing.");
     expect(result.telemetry?.outcome).toBe("success");
     expect(result.telemetry?.numTurns).toBe(4);
