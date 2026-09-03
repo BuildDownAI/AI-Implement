@@ -55,7 +55,7 @@ export GH_TOKEN="$GITHUB_TOKEN"
 
 # ── 4. Git config + clone ────────────────────────────────────────────────────
 if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then
-  if [ -n "${GITHUB_REF_NAME:-}" ]; then
+  if [ -z "${_kg_r:-}" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
     GITHUB_DEFAULT_BRANCH="${GITHUB_REF_NAME}"
   else
     GITHUB_DEFAULT_BRANCH="$(gh api "repos/${GITHUB_OWNER}/${GITHUB_REPO}" --jq ".default_branch")"

@@ -512,7 +512,6 @@ describe("applyWiring for kg-snapshot-push", () => {
 // ── runKgRefresh() happy and failure paths ────────────────────────────────────
 
 import { runKgRefresh } from "../pipeline/kg-refresh-run.js";
-import { PipelineRunner } from "../pipeline/runner.js";
 import type { StepModule } from "../pipeline/types.js";
 
 function makeStepModule(outputs: Record<string, unknown> = {}, throwErr?: Error): StepModule {
@@ -548,40 +547,28 @@ describe("runKgRefresh", () => {
   });
 
   it("returns exitCode 0 when all steps succeed", async () => {
-    const mockRunner = new PipelineRunner();
-    mockRunner.register("clone", makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }));
-    mockRunner.register("feedback-loop", makeStepModule({ approved: false }));
-    mockRunner.register("kg-snapshot-push", makeStepModule({ snapshotPushed: true, commitSha: "sha123" }));
-
     const result = await runKgRefresh({
       workspaceDir: tmpDir,
-      llmExecutor: { invoke: async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 }) },
-      reporter: { report: async () => undefined },
-    });
-
-    // The pipeline is loaded from the real file, but we override the runner
-    // by injecting it. Since runKgRefresh creates its own runner internally,
-    // we test the exit code path using a real no-op executor.
-    // The actual pipeline step invocation hits the runner's module registry.
-    // This test exercises the success path via the real runner with mocks.
-    expect([0, 1]).toContain(result.exitCode);
-  });
-
-  it("returns exitCode 1 and calls postRunnerResult on KG_SNAPSHOT_MISSING", async () => {
-    const postSpy = vi.fn().mockResolvedValue(undefined);
-    // Simulate a run where kg-snapshot-push throws KgSnapshotMissingError
-    const result = await runKgRefresh({
-      workspaceDir: tmpDir,
-      llmExecutor: {
-        invoke: async () => {
-          throw new (await import("../pipeline/steps/kg-snapshot-push.js")).KgSnapshotMissingError("no parts");
-        },
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
-      fetchImpl: postSpy as unknown as typeof fetch,
     });
-    // Without a callback URL configured the postRunnerResult short-circuits,
-    // but the exitCode must be 1 since the feedback-loop executor threw.
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("returns exitCode 1 when kg-snapshot-push throws KG_SNAPSHOT_MISSING", async () => {
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: makeStepModule({}, new KgSnapshotMissingError("no parts")),
+      },
+      reporter: { report: async () => undefined },
+    });
     expect(result.exitCode).toBe(1);
   });
 

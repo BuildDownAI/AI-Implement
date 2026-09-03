@@ -12,7 +12,7 @@ import { cloneStep } from "./steps/clone.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError } from "./steps/kg-snapshot-push.js";
 import { ClaudeCliExecutor } from "./executor.js";
-import type { LLMExecutor, StepReporter } from "./types.js";
+import type { LLMExecutor, StepReporter, StepModule } from "./types.js";
 
 const PACKAGE_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
 
@@ -21,6 +21,11 @@ export interface RunKgRefreshOptions {
   reporter?: StepReporter;
   llmExecutor?: LLMExecutor;
   fetchImpl?: typeof fetch;
+  stepsOverride?: {
+    clone?: StepModule;
+    feedbackLoop?: StepModule;
+    kgSnapshotPush?: StepModule;
+  };
 }
 
 export interface RunKgRefreshResult {
@@ -158,9 +163,9 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
 
   const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
   const runner = new PipelineRunner();
-  runner.register("clone", cloneStep);
-  runner.register("feedback-loop", feedbackLoopStep);
-  runner.register("kg-snapshot-push", kgSnapshotPushStep);
+  runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
+  runner.register("feedback-loop", opts.stepsOverride?.feedbackLoop ?? feedbackLoopStep);
+  runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
 
   const reporter: StepReporter = opts.reporter ?? new NoopStepReporter();
 
