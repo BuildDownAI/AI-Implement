@@ -23,6 +23,29 @@ export type TicketingMappingConfig = LinearMappingConfig | JiraMappingConfig;
 export const DEFAULT_TICKETING_CONFIG: LinearMappingConfig = { kind: "linear" };
 
 /**
+ * Normalizes a `*FieldOverride` value from untrusted JSON: anything that is not a
+ * non-blank string becomes null, and a non-blank string is trimmed.
+ *
+ * Without this, a blank-but-present override survives validation and is then read
+ * as a literal Jira field id by resolveCustomFieldIds (src/providers/jira-fields.ts):
+ * - `""` is not nullish, so `overrides.statusOverride ?? lookup(STATUS_FIELD_NAME)`
+ *   yields `""` instead of falling back to discovery by name; profilesFieldId's
+ *   `=== null` guard is likewise skipped.
+ * - `"   "` is truthy, so the all-overrides-set short-circuit returns early and
+ *   listFields() is never called at all.
+ * Both leave the provider querying an empty or whitespace field id.
+ *
+ * The admin UI already normalizes with `|| null` at both call sites, so this closes
+ * the API path and puts the rule at the validation boundary rather than in two
+ * callers that have to remember it.
+ */
+function normalizeFieldOverride(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/**
  * Validates that the parsed JSON is a valid TicketingMappingConfig matching
  * the expected provider. Throws on mismatch.
  */
@@ -50,9 +73,9 @@ export function validateTicketingConfig(provider: ProviderId, value: unknown): T
       kind: "jira",
       jql: obj.jql,
       repoFieldValue: obj.repoFieldValue,
-      statusFieldOverride: typeof obj.statusFieldOverride === "string" ? obj.statusFieldOverride : null,
-      repoFieldOverride: typeof obj.repoFieldOverride === "string" ? obj.repoFieldOverride : null,
-      profilesFieldOverride: typeof obj.profilesFieldOverride === "string" ? obj.profilesFieldOverride : null,
+      statusFieldOverride: normalizeFieldOverride(obj.statusFieldOverride),
+      repoFieldOverride: normalizeFieldOverride(obj.repoFieldOverride),
+      profilesFieldOverride: normalizeFieldOverride(obj.profilesFieldOverride),
     };
   }
   throw new Error(`Unknown provider for ticketingConfig: ${provider}`);
