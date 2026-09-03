@@ -598,13 +598,16 @@ export const deploymentsScript = `
       const badge = document.getElementById('kg-refresh-badge');
       if (data.running) setBadge(badge, 'info', 'refreshing');
       else if (data.kgDegraded) setBadge(badge, 'warn', 'degraded');
+      else if (data.lastRefresh?.gate === 'ingest-needed') setBadge(badge, 'ok', 'up-to-date');
       else setBadge(badge, 'ok', 'serving');
       document.getElementById('kg-refresh-stamp').textContent =
         'Served graph stamp: ' + (data.servedStamp || 'baked image graph');
       const last = data.lastRefresh;
-      document.getElementById('kg-refresh-last').textContent = last
-        ? 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' — ' + last.detail
-        : 'No refresh has run since boot.';
+      document.getElementById('kg-refresh-last').textContent = !last
+        ? 'No refresh has run since boot.'
+        : last.gate === 'ingest-needed'
+        ? 'Last refresh: ' + last.detail
+        : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' — ' + last.detail;
       document.getElementById('kg-refresh-btn').disabled = !!data.running || !!data.deployHeld;
     } catch (e) { card.hidden = true; }
   }

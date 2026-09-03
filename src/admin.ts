@@ -57,6 +57,7 @@ import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
+import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import picomatch from "picomatch";
 
@@ -198,7 +199,7 @@ export interface AdminDeps {
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
     trigger(): Promise<{ status: number; body: Record<string, unknown> }>;
-    status(): Promise<unknown>;
+    status(): Promise<KgRefreshStatus>;
   };
 }
 
@@ -307,7 +308,7 @@ export function handleAdminRequest(
         return true;
       }
       deps.kgRefresh.status().then(
-        (body) => json(res, 200, body as Record<string, unknown>),
+        (body) => json(res, 200, body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;
