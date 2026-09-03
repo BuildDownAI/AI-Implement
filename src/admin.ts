@@ -1143,6 +1143,13 @@ async function handleSetSecret(
     json(res, 400, { error: "name must contain only letters, digits, and underscores" });
     return;
   }
+  // Keep project secrets from overwriting orchestrator-managed env vars set by
+  // buildSessionMachineConfig. Mirrors the _remap_is_reserved check in session/lib.sh.
+  if (/^(GITHUB_|ISSUE_|AI_IMPLEMENT_)/.test(secretSuffix) ||
+      /^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE|RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME)$/.test(secretSuffix)) {
+    json(res, 400, { error: "name is reserved and cannot be used as a project secret" });
+    return;
+  }
   try {
     const fullName = `${teamKey.toUpperCase()}_${secretSuffix}`;
     const minSecretsVersion = await setAppSecrets(

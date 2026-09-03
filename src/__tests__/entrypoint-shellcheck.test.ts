@@ -475,6 +475,41 @@ describe("session/lib.sh remap_team_secrets", () => {
     // AI_IMPLEMENT_FORWARDED_SECRETS is exported (set to empty), not absent
     expect(stdout).not.toContain("FORWARDED=NOT_SET");
   });
+
+  it("skips reserved names with a warning and does not add them to FORWARDED", () => {
+    const { status, stdout, stderr } = runRemapScript(
+      [
+        "source session/lib.sh",
+        "remap_team_secrets",
+        // GITHUB_TOKEN should NOT be overwritten (remains the original value)
+        'echo "GITHUB_TOKEN=${GITHUB_TOKEN:-UNSET}"',
+        // SAN_GITHUB_TOKEN should be unset (prefixed form cleaned up)
+        'echo "SAN_GITHUB_TOKEN=${SAN_GITHUB_TOKEN:-UNSET}"',
+        // Safe secret should still be remapped normally
+        'echo "QA_PROBE=${QA_PROBE:-UNSET}"',
+        'echo "FORWARDED=${AI_IMPLEMENT_FORWARDED_SECRETS-NOT_SET}"',
+      ].join("\n"),
+      {
+        AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+        AI_IMPLEMENT_ALL_SECRET_NAMES: "SAN_GITHUB_TOKEN,SAN_QA_PROBE",
+        SAN_GITHUB_TOKEN: "attacker-token",
+        SAN_QA_PROBE: "probe-value",
+        GITHUB_TOKEN: "original-orchestrator-token",
+      },
+    );
+    expect(status, stderr).toBe(0);
+    // Reserved name must not overwrite the orchestrator value
+    expect(stdout).toContain("GITHUB_TOKEN=original-orchestrator-token");
+    // Prefixed form is still cleaned up
+    expect(stdout).toContain("SAN_GITHUB_TOKEN=UNSET");
+    // Safe secret is remapped normally
+    expect(stdout).toContain("QA_PROBE=probe-value");
+    // Reserved name is excluded from FORWARDED
+    expect(stdout).toContain("FORWARDED=QA_PROBE");
+    // Warning is logged (log() writes to stdout)
+    expect(stdout).toContain("WARNING");
+    expect(stdout).toContain("GITHUB_TOKEN");
+  });
 });
 
 // ─── session/lib.sh verify_workspace_writable ─────────────────────────────────

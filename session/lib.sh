@@ -72,6 +72,19 @@ verify_workspace_writable() {
   fail "Cannot write to bind-mounted workspace $workspace_dir (owner $ws_uid:$ws_gid, coder UID $coder_uid GID $coder_gid). Verify AI_IMPLEMENT_HOST_UID/AI_IMPLEMENT_HOST_GID match the host directory owner. On macOS Docker Desktop, confirm file sharing is enabled — the mount may be read-only."
 }
 
+# Returns 0 (true) if the bare secret name would overwrite an orchestrator-
+# owned environment variable and must not be exported by remap_team_secrets.
+# Matches all GITHUB_*, ISSUE_*, and AI_IMPLEMENT_* prefixes plus the exact
+# orchestrator vars set by buildSessionMachineConfig in src/fly-machines.ts.
+_remap_is_reserved() {
+  case "$1" in
+    GITHUB_*|ISSUE_*|AI_IMPLEMENT_*) return 0 ;;
+    ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE) return 0 ;;
+    RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME) return 0 ;;
+  esac
+  return 1
+}
+
 # Remap per-project Fly secrets to their unprefixed runner-visible names.
 #
 # Classic Fly app secrets are app-wide: every machine on the sessions app
@@ -86,6 +99,7 @@ verify_workspace_writable() {
 #
 # Effect (runs before su -p coder handoff):
 #   - Own-team names (prefix match): export <BARE>=<value>; unset <TEAM>_<BARE>
+#     Exception: reserved names (_remap_is_reserved) are unset but not exported.
 #   - Other-team names: unset (cross-team isolation)
 #   - Exports AI_IMPLEMENT_FORWARDED_SECRETS=<comma-joined bare names>
 #     Format: "QA_PROBE,DB_URL" — names only, no values. Empty when none.
@@ -101,6 +115,11 @@ remap_team_secrets() {
     [ -z "$_sname" ] && continue
     if [[ "$_sname" == "${prefix}"* ]]; then
       _bare="${_sname#"${prefix}"}"
+      if _remap_is_reserved "$_bare"; then
+        log "WARNING: Skipping reserved secret name ${_bare} (stored as ${_sname}) — would overwrite orchestrator-managed env var"
+        unset "${_sname}"
+        continue
+      fi
       _val="${!_sname:-}"
       export "${_bare}=${_val}"
       unset "${_sname}"

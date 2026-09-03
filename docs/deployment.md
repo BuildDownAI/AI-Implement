@@ -175,7 +175,9 @@ The runner entrypoint (`session/entrypoint.sh`, via `remap_team_secrets` in `ses
 2. Unsets every other-team secret from the environment, so machines dispatched for one team cannot read another team's secrets even though Fly injected them.
 3. Sets `AI_IMPLEMENT_FORWARDED_SECRETS` to a comma-joined list of the bare names exposed (e.g., `QA_PROBE,DB_URL`).
 
-`buildSessionMachineConfig` (in `src/fly-machines.ts`) passes `AI_IMPLEMENT_TEAM_SECRET_PREFIX=<TEAM>_` and `AI_IMPLEMENT_ALL_SECRET_NAMES=<comma-joined full list>` in the machine's env so the entrypoint knows which names to process.
+`buildSessionMachineConfig` (in `src/fly-machines.ts`) passes `AI_IMPLEMENT_TEAM_SECRET_PREFIX=<TEAM>_` and `AI_IMPLEMENT_ALL_SECRET_NAMES=<comma-joined full list>` in the machine's env so the entrypoint knows which names to process. Because `AI_IMPLEMENT_ALL_SECRET_NAMES` carries the unfiltered list of every secret name on the sessions app, a machine can see the *names* (not values) of secrets belonging to other teams — this is a low-severity info disclosure inherent to the unset-everything-else isolation approach.
+
+If a team secret's bare name (the part after the team prefix) matches a reserved orchestrator variable — `GITHUB_*`, `ISSUE_*`, `AI_IMPLEMENT_*`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `SESSION_TOKEN`, `MACHINE_NONCE`, `RUN_TOKEN`, `ORCHESTRATOR_URL`, `RUNNER_CALLBACK_URL`, `WORKSPACE_DIR`, `PATH`, or `HOME` — the entrypoint logs a warning and skips the export rather than overwriting the orchestrator-issued value. The same names are rejected at the admin UI level by `handleSetSecret` in `src/admin.ts`, so well-formed deployments never reach that guard.
 
 ## Using AWS Bedrock
 
