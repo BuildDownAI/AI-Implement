@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
+import { GITHUB_WRITE_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
 const IMPLEMENT_WORKFLOWS = [
   "workflows/claude-implement.yml",
@@ -109,32 +110,92 @@ describe("GHA workflow shims", () => {
   }
 
   // The AII-458 forward-secrets step used `${{ toJSON(secrets) }}`, which GitHub's
-  // malicious-workflow scanner flags — gating every dispatch and taking the pipeline
-  // down fleet-wide (AII-502). It is reverted from all synced workflows until a
-  // scanner-safe design lands. These guards keep the flagged pattern out.
+  // malicious-workflow scanner flags — gating every dispatch behind manual approval and
+  // taking the pipeline down fleet-wide (AII-502). The scanner-safe replacement reads ONE
+  // literal secret (AI_IMPLEMENT_FORWARDED_ENV, KEY=VALUE lines). These guards keep the
+  // flagged pattern out for good and pin the replacement's contract.
   for (const f of SYNCED_WORKFLOW_FILES) {
+    const forwardStepOf = (): { yaml: string; forwardStep: any; containerJob: any } => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      return { yaml, forwardStep, containerJob };
+    };
+
     it(`${f} never uses toJSON(secrets) (trips GitHub's malicious-workflow scanner)`, () => {
       const yaml = readFileSync(f, "utf-8");
       expect(yaml).not.toContain("toJSON(secrets)");
     });
 
-    it(`${f} has no "Forward repository secrets" step`, () => {
-      const doc = parse(readFileSync(f, "utf-8")) as any;
-      const jobs = Object.values(doc.jobs) as any[];
-      const containerJob = jobs.find((j: any) => j.container);
-      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
-      expect(forwardStep).toBeUndefined();
+    it(`${f} never indexes the secrets context dynamically`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).not.toMatch(/secrets\s*\[/);
     });
 
-    it(`${f} does not expose SECRETS_JSON or AI_IMPLEMENT_FORWARDED_SECRETS in the pipeline step env block`, () => {
-      const doc = parse(readFileSync(f, "utf-8")) as any;
-      const jobs = Object.values(doc.jobs) as any[];
-      const containerJob = jobs.find((j: any) => j.container);
+    it(`${f} has a "Forward repository secrets" step`, () => {
+      expect(forwardStepOf().forwardStep).toBeDefined();
+    });
+
+    it(`${f} forward step reads exactly one literal secret: AI_IMPLEMENT_FORWARDED_ENV`, () => {
+      const { forwardStep } = forwardStepOf();
+      const refs = [...JSON.stringify(forwardStep).matchAll(/secrets\.([A-Z_][A-Z0-9_]*)/g)].map((m) => m[1]);
+      expect(refs).toEqual(["AI_IMPLEMENT_FORWARDED_ENV"]);
+    });
+
+    it(`${f} forward step precedes the pipeline step and follows the mask step`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const pipelineStepName = f.includes("plan") ? "Run planning" : "Run pipeline";
+      expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Forward repository secrets"));
+      expect(yaml.indexOf("Forward repository secrets")).toBeLessThan(yaml.indexOf(pipelineStepName));
+    });
+
+    it(`${f} forward step reserved-name list covers all GITHUB_WRITE_CREDENTIAL_KEYS entries`, () => {
+      const { forwardStep } = forwardStepOf();
+      const reservedLine = (forwardStep.run as string).match(/reserved="([^"]+)"/)?.[1] ?? "";
+      const reservedNames = reservedLine.split(" ");
+      for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) {
+        expect(reservedNames).toContain(key);
+      }
+    });
+
+    it(`${f} forward step reserved-name list covers all secrets the template reads`, () => {
+      const { yaml, forwardStep } = forwardStepOf();
+      const forwardScript: string = forwardStep.run;
+      const secretRefs = [...yaml.matchAll(/secrets\.([A-Z_][A-Z0-9_]*)/g)]
+        .map((m) => m[1])
+        .filter((name) => name !== "AI_IMPLEMENT_FORWARDED_ENV");
+      expect(secretRefs.length).toBeGreaterThan(0);
+      for (const name of secretRefs) {
+        expect(forwardScript).toContain(name);
+      }
+    });
+
+    it(`${f} forward step rejects the RUN_ and AI_IMPLEMENT_ prefixes`, () => {
+      const { forwardStep } = forwardStepOf();
+      expect(forwardStep.run).toContain('"$name" == RUN_*');
+      expect(forwardStep.run).toContain('"$name" == AI_IMPLEMENT_*');
+    });
+
+    it(`${f} documents AI_IMPLEMENT_FORWARDED_ENV in the header comment`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain("AI_IMPLEMENT_FORWARDED_ENV");
+      expect(yaml).toContain("hooks");
+    });
+
+    it(`${f} does not expose FORWARDED_ENV or AI_IMPLEMENT_FORWARDED_SECRETS in the pipeline step env block`, () => {
+      const { containerJob } = forwardStepOf();
       const pipelineStep = containerJob.steps.find(
         (s: any) => s.name === "Run pipeline" || s.name === "Run planning",
       );
-      expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("SECRETS_JSON");
+      expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("FORWARDED_ENV");
       expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("AI_IMPLEMENT_FORWARDED_SECRETS");
+    });
+
+    it(`${f} forward step declares shell: bash`, () => {
+      const { forwardStep } = forwardStepOf();
+      expect(forwardStep.shell).toBe("bash");
     });
   }
 
