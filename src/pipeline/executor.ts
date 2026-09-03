@@ -84,6 +84,8 @@ export class ClaudeCliExecutor implements LLMExecutor {
     private readonly workspaceDir: string,
     private readonly logLevel: LogLevel = "summary",
     private readonly allowRepositoryWrites = false,
+    /** Injectable spawn for testing. */
+    private readonly spawnImpl: typeof spawn = spawn,
   ) {}
 
   invoke(params: {
@@ -127,11 +129,11 @@ export class ClaudeCliExecutor implements LLMExecutor {
 
       let proc: ChildProcessWithoutNullStreams;
       try {
-        proc = spawn("claude", args, {
+        proc = this.spawnImpl("claude", args, {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
           env: claudeEnvironment(this.allowRepositoryWrites),
-        });
+        }) as ChildProcessWithoutNullStreams;
       } catch (err) {
         try {
           restoreProtectedOrigin();
