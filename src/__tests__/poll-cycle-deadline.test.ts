@@ -219,6 +219,26 @@ describe("static: every fetch passes a signal", () => {
     expect(missing).toEqual([]);
   });
 
+  it("every fetch in github-app-auth.ts passes a signal", () => {
+    const missing = fetchLinesWithoutSignal(path.join(srcDir, "github-app-auth.ts"));
+    expect(missing).toEqual([]);
+  });
+
+  it("every fetch in linear-app-auth.ts passes a signal", () => {
+    const missing = fetchLinesWithoutSignal(path.join(srcDir, "linear-app-auth.ts"));
+    expect(missing).toEqual([]);
+  });
+
+  it("every fetch in providers/jira-client.ts passes a signal", () => {
+    const missing = fetchLinesWithoutSignal(path.join(srcDir, "providers/jira-client.ts"));
+    expect(missing).toEqual([]);
+  });
+
+  it("every fetch in index.ts passes a signal", () => {
+    const missing = fetchLinesWithoutSignal(path.join(srcDir, "index.ts"));
+    expect(missing).toEqual([]);
+  });
+
   it("merge-up.ts has no direct fetch calls", () => {
     const content = readFileSync(path.join(srcDir, "merge-up.ts"), "utf8");
     expect(content).not.toMatch(/await fetch\(/);
