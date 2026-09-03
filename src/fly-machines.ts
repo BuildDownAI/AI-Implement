@@ -275,8 +275,8 @@ export async function setAppSecrets(
 
   // Always returns null: the GraphQL response is discarded (typed as unknown) so
   // release.version — which would populate min_secrets_version — is never read.
-  // Callers that pass min_secrets_version to buildSessionMachineConfig will always
-  // receive undefined from getFlySecretsMinVersion(), which calls this function.
+  // setFlySecretsMinVersion would store that version; getFlySecretsMinVersion would
+  // return it — but neither is called here, so callers always receive undefined.
   await flyGraphQL<unknown>(token, `
     mutation SetSecrets($input: SetSecretsInput!) {
       setSecrets(input: $input) { release { version } }
