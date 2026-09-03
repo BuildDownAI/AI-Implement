@@ -87,6 +87,7 @@ import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import { makeKgRefresh } from "./kg-refresh.js";
+import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 
 // ---------- Configuration ----------
 
@@ -254,9 +255,6 @@ function loadConfig(): AppConfig {
 
 // ---------- Polling logic ----------
 
-let pollCount = 0;
-let pollInProgress = false;
-
 type DispatchableIssue = TicketIssue;
 
 /**
@@ -273,13 +271,21 @@ function isGroupingParentDispatch(issue: DispatchableIssue): boolean {
 }
 
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
-  if (pollInProgress) {
+  const cycle = beginCycle();
+  if (!cycle) {
     console.log(`[poll] Skipping poll cycle — previous poll still running`);
     return;
   }
-  pollInProgress = true;
-  try {
-  console.log(`[poll] Starting poll cycle #${++pollCount}`);
+  const { cycleId, started } = cycle;
+  console.log(`[poll] Starting poll cycle #${cycleId}`);
+
+  const timeoutMs = Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000;
+
+  await runWithDeadline(
+    cycleId,
+    started,
+    timeoutMs,
+    async () => {
 
   // Independent of tracker providers so self-deploy still works on an orchestrator with none configured.
   // Best-effort — never blocks the poll.
@@ -536,6 +542,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     }
 
     for (const issue of readyToDispatch) {
+      if (!isCurrentCycle(cycleId)) {
+        console.warn(`[poll] Cycle #${cycleId} abandoned — skipping dispatch for ${issue.identifier}`);
+        break;
+      }
       try {
         const mapping = teamRepoMap[issue.scopeKey]!;
         const issueProvider = await registry.forMapping(mapping);
@@ -704,10 +714,19 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
   // Crash-recovery safety net for workflow syncs. (NOT the primary trigger. the admin handlers fire runWorkflowSync immediately on save) 
   // this only re-runs jobs that lost their runner to a restart or a wedge.
   await processPendingWorkflowSyncs(config);
-
-  } finally {
-    pollInProgress = false;
-  }
+  },
+  (id, elapsed) => {
+    console.warn(
+      `[poll] Cycle #${id} deadline reached after ${elapsed}s — abandoning, next tick will start a new cycle`,
+    );
+    if (config.notifyWebhookUrl) {
+      notifyText(
+        config.notifyWebhookUrl,
+        `[poll] Cycle #${id} abandoned after ${elapsed}s — next tick will start a fresh cycle`,
+      ).catch((err) => console.error("[poll] Failed to send deadline notification:", err));
+    }
+  },
+  );
 }
 
 // ---------- Dispatch breaker ----------
@@ -2900,7 +2919,14 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     // Health check
     if (url === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", polls: pollCount, kgDegraded: isKgDegraded() }));
+      const { pollCount: polls, lastPollStartedAt, lastPollFinishedAt } = getPollStats();
+      res.end(JSON.stringify({
+        status: "ok",
+        polls,
+        kgDegraded: isKgDegraded(),
+        lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
+        lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
+      }));
       return;
     }
 
