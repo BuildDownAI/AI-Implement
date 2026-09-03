@@ -182,6 +182,15 @@ describe("GHA workflow shims", () => {
       expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("SECRETS_JSON");
       expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("AI_IMPLEMENT_FORWARDED_SECRETS");
     });
+
+    it(`${f} forward step declares shell: bash`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      expect(forwardStep).toBeDefined();
+      expect(forwardStep.shell).toBe("bash");
+    });
   }
 
   for (const f of FILES) {
