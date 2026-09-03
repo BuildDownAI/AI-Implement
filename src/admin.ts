@@ -308,7 +308,7 @@ export function handleAdminRequest(
         return true;
       }
       deps.kgRefresh.status().then(
-        (body) => json(res, 200, body as unknown as Record<string, unknown>),
+        (body) => json(res, 200, body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;

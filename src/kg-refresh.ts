@@ -192,7 +192,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       // Pre-check: if the source repo has no newer snapshot commit, skip the full cycle.
       // Guard requires both sides known; either null falls through so the stamp gate handles it.
       const snapshotCommitDate = await fetchSnapshotCommitDate(token, repo.owner, repo.repo, branch);
-      if (snapshotCommitDate !== null && stampBefore !== null && snapshotCommitDate <= stampBefore) {
+      if (snapshotCommitDate !== null && stampBefore !== null && Date.parse(snapshotCommitDate) <= Date.parse(stampBefore)) {
         await rm(fetchDir, { recursive: true, force: true });
         const outcome: RefreshOutcome = {
           ok: false,

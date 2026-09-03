@@ -9,8 +9,12 @@ import { COMPLETION_MARKER } from "../kg-sidecar.js";
 const NAMESPACE = "https://kg.test.example/";
 const OLD_STAMP = "2026-08-20T00:10:10+00:00";
 const NEW_STAMP = "2026-08-24T12:00:00+00:00";
+// GitHub API always returns Z-suffix; the graph dcterms:modified uses +00:00.
+// Use Z-suffixed constants wherever fetchSnapshotCommitDate is mocked.
+const OLD_STAMP_Z = "2026-08-20T00:10:10Z"; // same instant as OLD_STAMP
+const NEW_STAMP_Z = "2026-08-24T12:00:00Z"; // same instant as NEW_STAMP
 // Always newer than any stamp produced in tests — default for fetchSnapshotCommitDate.
-const FUTURE_STAMP = "2099-01-01T00:00:00+00:00";
+const FUTURE_STAMP_Z = "2099-01-01T00:00:00Z";
 
 function makeTarball(dir: string): Buffer {
   // extractSource strips one leading component, so wrap in a top-level dir.
@@ -67,7 +71,7 @@ describe("kg-refresh", () => {
       fetchTarball: vi.fn(async () => tarball) as never,
       fetchDefaultBranch: vi.fn(async () => "main") as never,
       // Default: always newer than any served stamp in these tests.
-      fetchSnapshotCommitDate: vi.fn(async () => FUTURE_STAMP) as never,
+      fetchSnapshotCommitDate: vi.fn(async () => FUTURE_STAMP_Z) as never,
       materialize: materialize as never,
       mcpToolCall: mcpToolCall as never,
       canaryDeadlineMs: 300,
@@ -292,7 +296,7 @@ describe("kg-refresh", () => {
   });
 
   it("returns ingest-needed when the source snapshot commit is not newer than the served stamp", async () => {
-    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP) });
+    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) });
     await handle.trigger();
     await waitDone();
 
@@ -308,7 +312,7 @@ describe("kg-refresh", () => {
 
   it("returns ingest-needed when the source snapshot commit date equals the served stamp (boundary)", async () => {
     // snapshotCommitDate <= stampBefore: equal counts as not newer
-    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP) });
+    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) });
     await handle.trigger();
     await waitDone();
 
@@ -335,7 +339,7 @@ describe("kg-refresh", () => {
       throw new Error(`unexpected tool ${tool}`);
     });
     // fetchSnapshotCommitDate returns a non-null date, but stampBefore is null → guard does not fire
-    build({ mcpToolCall: noEdgeMcp as never, fetchSnapshotCommitDate: vi.fn(async () => NEW_STAMP) });
+    build({ mcpToolCall: noEdgeMcp as never, fetchSnapshotCommitDate: vi.fn(async () => NEW_STAMP_Z) });
     await handle.trigger();
     await waitDone();
 
@@ -359,8 +363,19 @@ describe("kg-refresh", () => {
     expect(restart).not.toHaveBeenCalled();
   });
 
+  it("returns ingest-needed when snapshotCommitDate uses Z-suffix and stampBefore uses +00:00 (mixed format, same instant)", async () => {
+    // GitHub returns Z; the graph's dcterms:modified uses +00:00. Date.parse handles both.
+    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.gate).toBe("ingest-needed");
+    expect(materialize).not.toHaveBeenCalled();
+  });
+
   it("GET /api/kg/status reflects ingest-needed gate and running=false after trigger resolves", async () => {
-    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP) });
+    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) });
     await handle.trigger();
     await waitDone();
 
