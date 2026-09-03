@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -291,18 +291,28 @@ describe("getDiff exclusive temp dir cleanup", () => {
   let savedTmpdir: string | undefined;
   let savedTemp: string | undefined;
 
-  beforeAll(() => {
-    // Redirect os.tmpdir() to a worker-private subdirectory so concurrent getDiff
-    // calls in other parallel test workers cannot pollute the before/after counts.
-    // Vitest worker threads have independent process.env copies, so this is local.
-    workerRoot = mkdtempSync(join(tmpdir(), "diff-cleanup-worker-"));
+  beforeEach(() => {
+    // Each test gets its own private tmpdir so concurrent getDiff calls in other
+    // parallel worker processes cannot pollute the before/after dir counts.
+    // The redirect is per-process (pool: 'forks' in vitest.config.ts ensures it),
+    // so this assignment is invisible to other test-file processes.
+    const realTmpdir = tmpdir();
+    workerRoot = mkdtempSync(join(realTmpdir, "diff-cleanup-worker-"));
     savedTmpdir = process.env.TMPDIR;
     savedTemp = process.env.TEMP;
     process.env.TMPDIR = workerRoot;
     process.env.TEMP = workerRoot;
+
+    repo = mkdtempSync(join(tmpdir(), "diff-cleanup-test-"));
+    spawnSync("git", ["init", "-q", repo], { stdio: ["ignore", "pipe", "pipe"] });
+    spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+    spawnSync("git", ["config", "user.name", "t"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+    writeFileSync(join(repo, "seed.ts"), "export const s = 0;\n");
+    spawnSync("git", ["add", "-A"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
+    spawnSync("git", ["commit", "-qm", "seed"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
   });
 
-  afterAll(() => {
+  afterEach(() => {
     if (savedTmpdir === undefined) {
       delete process.env.TMPDIR;
     } else {
@@ -315,24 +325,6 @@ describe("getDiff exclusive temp dir cleanup", () => {
     }
     try {
       rmSync(workerRoot, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-  });
-
-  beforeEach(() => {
-    repo = mkdtempSync(join(tmpdir(), "diff-cleanup-test-"));
-    spawnSync("git", ["init", "-q", repo], { stdio: ["ignore", "pipe", "pipe"] });
-    spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
-    spawnSync("git", ["config", "user.name", "t"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
-    writeFileSync(join(repo, "seed.ts"), "export const s = 0;\n");
-    spawnSync("git", ["add", "-A"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
-    spawnSync("git", ["commit", "-qm", "seed"], { cwd: repo, stdio: ["ignore", "pipe", "pipe"] });
-  });
-
-  afterEach(() => {
-    try {
-      rmSync(repo, { recursive: true, force: true });
     } catch {
       // ignore
     }
