@@ -194,10 +194,12 @@ jobs:
             echo "::add-mask::${{ inputs.run_progress_token }}"
           fi
 
+      # Container jobs default to sh -e; this step uses bash syntax and requires shell: bash.
       - name: Forward repository secrets
         env:
           SECRETS_JSON: ${{ toJSON(secrets) }}
           FORWARD_SECRETS: ${{ vars.AI_IMPLEMENT_FORWARD_SECRETS }}
+        shell: bash
         run: |
           set -euo pipefail
           if [ -z "${FORWARD_SECRETS:-}" ]; then
