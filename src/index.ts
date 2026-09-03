@@ -230,7 +230,7 @@ function loadConfig(): AppConfig {
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     flyDeployToken: process.env.FLY_DEPLOY_TOKEN || null,
-    flyProcessLevelSecrets: !!process.env.FLY_PROCESS_LEVEL_SECRETS,
+    flyProcessLevelSecrets: process.env.FLY_PROCESS_LEVEL_SECRETS === "true",
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
     sessionImage: defaultRunner.image,
     sessionImageStatus: defaultRunner.sessionImageStatus,

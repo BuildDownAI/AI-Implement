@@ -475,6 +475,9 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
   //     - QA_PROBE present, SAN_QA_PROBE and AII_PROBE_FOREIGN absent → Fly honours the list. ✅
   //     - SAN_QA_PROBE and AII_PROBE_FOREIGN present → processes not applied; add explicit entrypoint.
   //     - Nothing present → ignore_app_secrets applied but secrets list did not resolve; turn flag off.
+  // Note: a falsy teamKey (e.g. Jira issues with an empty scopeKey) falls through both branches,
+  // so the machine receives all classic app secrets regardless of the flag. This matches flag-off
+  // behaviour for the same case and is not a regression, but the flag does not close this gap.
   if (input.flyProcessLevelSecrets && input.teamKey && input.teamSecretNames !== undefined) {
     const ownPrefix = `${input.teamKey.toUpperCase()}_`;
     const allPrefixes = (input.allTeamKeys ?? []).map((k) => `${k.toUpperCase()}_`);

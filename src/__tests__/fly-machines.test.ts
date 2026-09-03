@@ -842,6 +842,19 @@ describe("buildSessionMachineConfig", () => {
       expect(result.config.processes![0].ignore_app_secrets).toBe(true);
       expect(result.config.processes![0].secrets).toEqual([]);
     });
+
+    it("flag on: teamSecretNames [] (fetch-failure fallback) → fail-closed: ignore_app_secrets true, secrets empty", () => {
+      const result = buildSessionMachineConfig({
+        ...baseInput,
+        teamKey: "SAN",
+        allTeamKeys: ["SAN", "AII"],
+        teamSecretNames: [],
+        flyProcessLevelSecrets: true,
+      });
+      expect(result.config.processes).toBeDefined();
+      expect(result.config.processes![0].ignore_app_secrets).toBe(true);
+      expect(result.config.processes![0].secrets).toEqual([]);
+    });
   });
 
   it("smoke test: metadata has all required keys with correct types", () => {
