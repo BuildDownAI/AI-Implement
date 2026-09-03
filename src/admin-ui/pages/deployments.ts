@@ -602,9 +602,11 @@ export const deploymentsScript = `
       document.getElementById('kg-refresh-stamp').textContent =
         'Served graph stamp: ' + (data.servedStamp || 'baked image graph');
       const last = data.lastRefresh;
-      document.getElementById('kg-refresh-last').textContent = last
-        ? 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' — ' + last.detail
-        : 'No refresh has run since boot.';
+      document.getElementById('kg-refresh-last').textContent = !last
+        ? 'No refresh has run since boot.'
+        : last.gate === 'ingest-needed'
+        ? 'Last refresh: ' + last.detail
+        : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' — ' + last.detail;
       document.getElementById('kg-refresh-btn').disabled = !!data.running || !!data.deployHeld;
     } catch (e) { card.hidden = true; }
   }

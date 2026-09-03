@@ -9,6 +9,8 @@ import { COMPLETION_MARKER } from "../kg-sidecar.js";
 const NAMESPACE = "https://kg.test.example/";
 const OLD_STAMP = "2026-08-20T00:10:10+00:00";
 const NEW_STAMP = "2026-08-24T12:00:00+00:00";
+// Always newer than any stamp produced in tests — default for fetchSnapshotCommitDate.
+const FUTURE_STAMP = "2099-01-01T00:00:00+00:00";
 
 function makeTarball(dir: string): Buffer {
   // extractSource strips one leading component, so wrap in a top-level dir.
@@ -64,6 +66,8 @@ describe("kg-refresh", () => {
       mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
       fetchTarball: vi.fn(async () => tarball) as never,
       fetchDefaultBranch: vi.fn(async () => "main") as never,
+      // Default: always newer than any served stamp in these tests.
+      fetchSnapshotCommitDate: vi.fn(async () => FUTURE_STAMP) as never,
       materialize: materialize as never,
       mcpToolCall: mcpToolCall as never,
       canaryDeadlineMs: 300,
@@ -285,5 +289,83 @@ describe("kg-refresh", () => {
   it("never reaches an embedding path: the staging command is materialize, full pass", () => {
     expect([...MATERIALIZE_ARGS]).toEqual(["-m", "kg_ingest.materialize"]);
     expect(MATERIALIZE_ARGS.join(" ")).not.toMatch(/embed|cli/);
+  });
+
+  it("returns ingest-needed when the source snapshot commit is not newer than the served stamp", async () => {
+    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP) });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.gate).toBe("ingest-needed");
+    expect(s.lastRefresh?.stampBefore).toBe(OLD_STAMP);
+    expect(s.lastRefresh?.stampAfter).toBe(OLD_STAMP);
+    expect(materialize).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+    expect(existsSync(join(dataRoot, "fetch"))).toBe(false);
+  });
+
+  it("returns ingest-needed when the source snapshot commit date equals the served stamp (boundary)", async () => {
+    // snapshotCommitDate <= stampBefore: equal counts as not newer
+    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP) });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.gate).toBe("ingest-needed");
+    expect(materialize).not.toHaveBeenCalled();
+  });
+
+  it("falls through to a full refresh when fetchSnapshotCommitDate returns null", async () => {
+    build({ fetchSnapshotCommitDate: vi.fn(async () => null) });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(true);
+    expect(materialize).toHaveBeenCalled();
+    expect(restart).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls through to a full refresh when stampBefore is null (readServedStamp returns null)", async () => {
+    const noEdgeMcp = vi.fn(async (_url: string, tool: string) => {
+      if (tool === "kg_neighbors") return { edges: [] };
+      if (tool === "kg_hybrid_search") return { count: 3, degraded: false, results: [] };
+      throw new Error(`unexpected tool ${tool}`);
+    });
+    // fetchSnapshotCommitDate returns a non-null date, but stampBefore is null → guard does not fire
+    build({ mcpToolCall: noEdgeMcp as never, fetchSnapshotCommitDate: vi.fn(async () => NEW_STAMP) });
+    await handle.trigger();
+    await waitDone();
+
+    // materialize ran — no early exit from the ingest-needed guard
+    expect(materialize).toHaveBeenCalled();
+  });
+
+  it("absorbs a fetchSnapshotCommitDate throw as a staging failure, not ingest-needed", async () => {
+    build({
+      fetchSnapshotCommitDate: vi.fn(async () => {
+        throw new Error("network timeout");
+      }),
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.gate).toBe("staging");
+    expect(materialize).not.toHaveBeenCalled();
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("GET /api/kg/status reflects ingest-needed gate and running=false after trigger resolves", async () => {
+    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP) });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.running).toBe(false);
+    expect(s.lastRefresh?.gate).toBe("ingest-needed");
   });
 });
