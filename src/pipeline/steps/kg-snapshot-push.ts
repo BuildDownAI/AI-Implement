@@ -21,8 +21,6 @@ export class KgSnapshotStaleError extends Error {
 
 interface KgSnapshotPushInputs extends Record<string, unknown> {
   workspaceDir: string;
-  repoOwner: string;
-  repoRepo: string;
   githubToken: string;
   /** Default branch to push to directly (no PR, no feature branch). */
   defaultBranch: string;

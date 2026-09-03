@@ -166,8 +166,6 @@ describe("kgSnapshotPushStep", () => {
   function makeInputs(overrides: Record<string, unknown> = {}) {
     return {
       workspaceDir: tmpDir,
-      repoOwner: "org",
-      repoRepo: "kg-repo",
       githubToken: "fake-token",
       defaultBranch: "main",
       clonedRef: resolveHead(tmpDir),
@@ -341,6 +339,130 @@ describe("kgSnapshotPushStep", () => {
     expect(result.snapshotPushed).toBe(false);
     expect(result.commitSha).toBeNull();
   });
+
+  it("fails with KG_SNAPSHOT_MISSING when current stamp has unrecognised format", async () => {
+    initGitRepo(tmpDir);
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    // Not ISO 8601: date only, no time component
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-03");
+
+    const ctx = makeContext();
+    const err = await kgSnapshotPushStep
+      .run(ctx, makeInputs({ clonedRef }), noopReporter)
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotMissingError);
+    expect(err.message).toContain("unrecognised format");
+  });
+
+  it("pushes snapshot and returns snapshotPushed=true against a local bare remote", async () => {
+    const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare-"));
+    try {
+      execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+
+      initGitRepo(tmpDir);
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+
+      mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+      writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-03T10:00:00Z");
+
+      const ctx = makeContext();
+      const result = await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, defaultBranch: "main" }),
+        noopReporter,
+      );
+      expect(result.snapshotPushed).toBe(true);
+      expect(typeof result.commitSha).toBe("string");
+    } finally {
+      rmSync(bareDir, { recursive: true, force: true });
+    }
+  });
+
+  it("--force-with-lease rejects a push when the remote advanced concurrently", async () => {
+    const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare2-"));
+    // Derive a non-existing path for the clone so git clone creates it fresh.
+    const otherDir = `${bareDir}-other`;
+    try {
+      execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+      // Point HEAD to main so that clones default to the main branch.
+      execSync("git symbolic-ref HEAD refs/heads/main", { cwd: bareDir, stdio: "ignore" });
+
+      initGitRepo(tmpDir);
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+
+      // Simulate a concurrent commit landing on origin after we cloned.
+      execSync(`git clone "${bareDir}" "${otherDir}"`, { stdio: "ignore" });
+      execSync("git config user.name other", { cwd: otherDir, stdio: "ignore" });
+      execSync("git config user.email other@example.com", { cwd: otherDir, stdio: "ignore" });
+      writeFileSync(join(otherDir, "concurrent.txt"), "concurrent\n");
+      execSync("git add concurrent.txt", { cwd: otherDir, stdio: "ignore" });
+      execSync("git commit -m concurrent", { cwd: otherDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: otherDir, stdio: "ignore" });
+
+      // Now origin/main is ahead of our refs/remotes/origin/main tracking ref.
+      mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+      writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-03T10:00:00Z");
+
+      const ctx = makeContext();
+      await expect(
+        kgSnapshotPushStep.run(
+          ctx,
+          makeInputs({ clonedRef, defaultBranch: "main" }),
+          noopReporter,
+        ),
+      ).rejects.toThrow(/git push failed/);
+    } finally {
+      rmSync(bareDir, { recursive: true, force: true });
+      if (existsSync(otherDir)) rmSync(otherDir, { recursive: true, force: true });
+    }
+  });
+
+  it("warns but accepts push when previous stamp has unrecognised format", async () => {
+    const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare3-"));
+    try {
+      execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+
+      initGitRepo(tmpDir);
+      // Commit old snapshot with a malformed stamp so the previous-stamp path is exercised.
+      mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "not-iso-format");
+      execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+      execSync("git commit -m 'old snapshot'", { cwd: tmpDir, stdio: "ignore" });
+
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+
+      // New snapshot with valid stamp and new parts.
+      mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+      writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-03T10:00:00Z");
+
+      const ctx = makeContext();
+      const result = await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, defaultBranch: "main" }),
+        noopReporter,
+      );
+      // Stale check is skipped (warned); push should succeed.
+      expect(result.snapshotPushed).toBe(true);
+    } finally {
+      rmSync(bareDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ── pipeline-loader wiring for kg-snapshot-push ───────────────────────────────
@@ -381,8 +503,6 @@ describe("applyWiring for kg-snapshot-push", () => {
 
     const inputs = ctx.resolveInputs(step!.inputs);
     expect(inputs.workspaceDir).toBe("/ws");
-    expect(inputs.repoOwner).toBe("org");
-    expect(inputs.repoRepo).toBe("repo");
     expect(inputs.githubToken).toBe("tok");
     expect(inputs.clonedRef).toBe("abc123");
     expect(inputs.defaultBranch).toBe("main");
