@@ -224,9 +224,9 @@ describe("session/entrypoint.sh", () => {
     expect(r.status, r.stderr?.toString()).toBe(0);
   });
 
-  it("is under 116 lines (bootstrap, not monolith)", () => {
+  it("is under 120 lines (bootstrap, not monolith)", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
-    expect(content.split("\n").length).toBeLessThan(116);
+    expect(content.split("\n").length).toBeLessThan(120);
   });
 
   it("exec's the phase-selected TS runner as the final step", () => {
@@ -384,6 +384,96 @@ describe("session/lib.sh", () => {
     const r = spawnSync("shellcheck", ["session/lib.sh"], { stdio: ["ignore", "pipe", "pipe"] });
     if (r.error?.code === "ENOENT") return;
     expect(r.status, r.stderr?.toString()).toBe(0);
+  });
+
+  it("defines remap_team_secrets", () => {
+    const content = readFileSync("session/lib.sh", "utf-8");
+    expect(content).toMatch(/^remap_team_secrets\(\)/m);
+  });
+});
+
+describe("session/entrypoint.sh remap_team_secrets integration", () => {
+  it("calls remap_team_secrets before the su -p coder handoff", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    expect(content).toContain("remap_team_secrets");
+    const remapIdx = content.indexOf("remap_team_secrets");
+    const suIdx = content.indexOf("su -p coder");
+    expect(remapIdx).toBeGreaterThan(-1);
+    expect(remapIdx).toBeLessThan(suIdx);
+  });
+});
+
+// ─── session/lib.sh remap_team_secrets ───────────────────────────────────────
+
+describe("session/lib.sh remap_team_secrets", () => {
+  function runRemapScript(script: string, testEnv: Record<string, string>): { status: number | null; stdout: string; stderr: string } {
+    const r = spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: { ...process.env, ...testEnv },
+    });
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+  }
+
+  it("remaps own-team secrets to unprefixed names and unsets cross-team secrets", () => {
+    const { status, stdout, stderr } = runRemapScript(
+      [
+        "source session/lib.sh",
+        "remap_team_secrets",
+        'echo "QA_PROBE=${QA_PROBE:-UNSET}"',
+        'echo "SAN_QA_PROBE=${SAN_QA_PROBE:-UNSET}"',
+        'echo "ENG_OTHER=${ENG_OTHER:-UNSET}"',
+        'echo "FORWARDED=${AI_IMPLEMENT_FORWARDED_SECRETS-NOT_SET}"',
+      ].join("\n"),
+      {
+        AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+        AI_IMPLEMENT_ALL_SECRET_NAMES: "SAN_QA_PROBE,ENG_OTHER",
+        SAN_QA_PROBE: "secret-value",
+        ENG_OTHER: "other-value",
+      },
+    );
+    expect(status, stderr).toBe(0);
+    expect(stdout).toContain("QA_PROBE=secret-value");
+    expect(stdout).toContain("SAN_QA_PROBE=UNSET");
+    expect(stdout).toContain("ENG_OTHER=UNSET");
+    expect(stdout).toContain("FORWARDED=QA_PROBE");
+  });
+
+  it("is a no-op when AI_IMPLEMENT_TEAM_SECRET_PREFIX is absent", () => {
+    const { status, stdout } = runRemapScript(
+      [
+        "source session/lib.sh",
+        "remap_team_secrets",
+        'echo "SAN_QA_PROBE=${SAN_QA_PROBE:-UNSET}"',
+        'echo "FORWARDED=${AI_IMPLEMENT_FORWARDED_SECRETS-NOT_SET}"',
+      ].join("\n"),
+      {
+        AI_IMPLEMENT_ALL_SECRET_NAMES: "SAN_QA_PROBE",
+        SAN_QA_PROBE: "secret-value",
+      },
+    );
+    expect(status).toBe(0);
+    expect(stdout).toContain("SAN_QA_PROBE=secret-value");
+    expect(stdout).toContain("FORWARDED=NOT_SET");
+  });
+
+  it("unsets cross-team secrets and sets empty AI_IMPLEMENT_FORWARDED_SECRETS when no own-team names match", () => {
+    const { status, stdout } = runRemapScript(
+      [
+        "source session/lib.sh",
+        "remap_team_secrets",
+        'echo "ENG_OTHER=${ENG_OTHER:-UNSET}"',
+        'echo "FORWARDED=${AI_IMPLEMENT_FORWARDED_SECRETS-NOT_SET}"',
+      ].join("\n"),
+      {
+        AI_IMPLEMENT_TEAM_SECRET_PREFIX: "SAN_",
+        AI_IMPLEMENT_ALL_SECRET_NAMES: "ENG_OTHER",
+        ENG_OTHER: "other-value",
+      },
+    );
+    expect(status).toBe(0);
+    expect(stdout).toContain("ENG_OTHER=UNSET");
+    // AI_IMPLEMENT_FORWARDED_SECRETS is exported (set to empty), not absent
+    expect(stdout).not.toContain("FORWARDED=NOT_SET");
   });
 });
 

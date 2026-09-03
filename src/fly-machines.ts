@@ -448,14 +448,16 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     },
   };
 
+  // Classic Fly app secrets are app-wide: every machine on the sessions app
+  // receives every classic secret under its stored name (e.g. SAN_QA_PROBE).
+  // The Machines API processes[].secrets env_var remap applies only to the
+  // non-GA named-secrets feature and has no effect on classic secrets (confirmed
+  // 2026-09-03, probe SAN-22; see https://fly.io/docs/machines/api/machines-resource/).
+  // The runner entrypoint reads these two env vars to remap own-team secrets to
+  // their unprefixed forms and unset cross-team secrets before su -p coder.
   if (input.teamKey && input.teamSecretNames?.length) {
-    const prefix = `${input.teamKey.toUpperCase()}_`;
-    const mappedSecrets = input.teamSecretNames
-      .filter((name) => name.startsWith(prefix))
-      .map((name) => ({ env_var: name.slice(prefix.length), name }));
-    if (mappedSecrets.length > 0) {
-      machineConfig.processes = [{ secrets: mappedSecrets }];
-    }
+    env.AI_IMPLEMENT_TEAM_SECRET_PREFIX = `${input.teamKey.toUpperCase()}_`;
+    env.AI_IMPLEMENT_ALL_SECRET_NAMES = input.teamSecretNames.join(",");
   }
 
   return {

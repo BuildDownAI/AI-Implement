@@ -533,43 +533,46 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.metadata!.orchestrator_app).toBeUndefined();
   });
 
-  it("maps team-prefixed secrets with prefix stripped", () => {
+  it("injects AI_IMPLEMENT_TEAM_SECRET_PREFIX and AI_IMPLEMENT_ALL_SECRET_NAMES when teamKey and secrets are provided", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamKey: "ENG",
       teamSecretNames: ["ENG_DATABASE_URL", "ENG_STRIPE_KEY", "OTHER_TEAM_SECRET"],
     });
-    expect(result.config.processes).toEqual([{
-      secrets: [
-        { env_var: "DATABASE_URL", name: "ENG_DATABASE_URL" },
-        { env_var: "STRIPE_KEY", name: "ENG_STRIPE_KEY" },
-      ],
-    }]);
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
+    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBe("ENG_DATABASE_URL,ENG_STRIPE_KEY,OTHER_TEAM_SECRET");
+    expect(result.config.processes).toBeUndefined();
   });
 
-  it("omits process-level secrets when teamSecretNames is empty", () => {
+  it("omits team secret env vars when teamSecretNames is empty", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamKey: "ENG",
       teamSecretNames: [],
     });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBeUndefined();
     expect(result.config.processes).toBeUndefined();
   });
 
-  it("omits process-level secrets when no names match the team prefix", () => {
+  it("injects team secret env vars even when no names match the team prefix (entrypoint filters)", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamKey: "ENG",
       teamSecretNames: ["OTHER_TEAM_SECRET", "ANOTHER_VAR"],
     });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBe("ENG_");
+    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBe("OTHER_TEAM_SECRET,ANOTHER_VAR");
     expect(result.config.processes).toBeUndefined();
   });
 
-  it("omits process-level secrets when teamKey is not provided", () => {
+  it("omits team secret env vars when teamKey is not provided", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,
       teamSecretNames: ["ENG_DATABASE_URL"],
     });
+    expect(result.config.env!.AI_IMPLEMENT_TEAM_SECRET_PREFIX).toBeUndefined();
+    expect(result.config.env!.AI_IMPLEMENT_ALL_SECRET_NAMES).toBeUndefined();
     expect(result.config.processes).toBeUndefined();
   });
 

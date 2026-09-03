@@ -163,6 +163,20 @@ fly logs --app <app_name>                    # tail logs
 fly ssh console --app <app_name>             # shell into the machine
 ```
 
+### Per-project secrets (Fly)
+
+Secrets set through the admin UI Secrets panel are stored as classic Fly app secrets on the **shared sessions app**, prefixed with the team key — for example, a secret named `QA_PROBE` on the `SAN` mapping is stored as `SAN_QA_PROBE`.
+
+Classic Fly app secrets are **app-wide**: Fly injects every classic secret into every machine on the sessions app under its stored name, regardless of which team that machine belongs to. The Fly Machines API `processes[].secrets` field with `env_var` remap only applies to the non-GA named-secrets feature and has no effect on classic secrets.
+
+The runner entrypoint (`session/entrypoint.sh`, via `remap_team_secrets` in `session/lib.sh`) is the isolation boundary. When `AI_IMPLEMENT_TEAM_SECRET_PREFIX` is set, the entrypoint runs before the `su -p coder` handoff and:
+
+1. Remaps each own-team secret (`<TEAM>_<NAME>`) to its unprefixed form (`<NAME>`), making it available to setup hooks and the agent.
+2. Unsets every other-team secret from the environment, so machines dispatched for one team cannot read another team's secrets even though Fly injected them.
+3. Sets `AI_IMPLEMENT_FORWARDED_SECRETS` to a comma-joined list of the bare names exposed (e.g., `QA_PROBE,DB_URL`).
+
+`buildSessionMachineConfig` (in `src/fly-machines.ts`) passes `AI_IMPLEMENT_TEAM_SECRET_PREFIX=<TEAM>_` and `AI_IMPLEMENT_ALL_SECRET_NAMES=<comma-joined full list>` in the machine's env so the entrypoint knows which names to process.
+
 ## Using AWS Bedrock
 
 To run a target repo against Bedrock instead of the Anthropic API, use the **GitHub Actions execution mode**. Bedrock is not supported on Fly Machines or local Docker: those backends have no equivalent of GitHub's OIDC role assumption, and the runner entrypoint rejects `provider=bedrock` outside GHA mode outright.

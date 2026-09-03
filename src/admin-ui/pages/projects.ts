@@ -31,7 +31,7 @@ export const projectsHtml = `
         <button class="btn btn-sm" style="margin-left:auto" onclick="document.getElementById('secrets-panel').classList.add('hidden')">&#215;</button>
       </div>
       <div class="card-body">
-        <div class="warning">&#9888; Secrets are shared across all machines for this team. Values are write-only and cannot be read back through the API.</div>
+        <div class="warning">&#9888; Secrets are stored on the shared sessions app and injected into every machine on that app by Fly. The runner entrypoint filters them: each machine sees only its own team&#x27;s secrets under their unprefixed names, and other teams&#x27; secrets are unset before the agent starts. Values are write-only and cannot be read back through the API.</div>
         <table class="tbl">
           <thead>
             <tr><th>Name (suffix)</th><th>Status</th><th></th></tr>

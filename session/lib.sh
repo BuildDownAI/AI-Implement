@@ -71,3 +71,44 @@ verify_workspace_writable() {
   fi
   fail "Cannot write to bind-mounted workspace $workspace_dir (owner $ws_uid:$ws_gid, coder UID $coder_uid GID $coder_gid). Verify AI_IMPLEMENT_HOST_UID/AI_IMPLEMENT_HOST_GID match the host directory owner. On macOS Docker Desktop, confirm file sharing is enabled — the mount may be read-only."
 }
+
+# Remap per-project Fly secrets to their unprefixed runner-visible names.
+#
+# Classic Fly app secrets are app-wide: every machine on the sessions app
+# receives every classic secret under its stored name (e.g. SAN_QA_PROBE).
+# The Machines API processes[].secrets env_var remap applies only to the
+# non-GA named-secrets feature and has no effect on classic secrets (confirmed
+# 2026-09-03, probe SAN-22 on ai-implement-testing-sessions).
+#
+# Reads AI_IMPLEMENT_TEAM_SECRET_PREFIX (e.g. "SAN_") and
+# AI_IMPLEMENT_ALL_SECRET_NAMES (comma-joined list of all secret names on
+# the sessions app, e.g. "SAN_QA_PROBE,ENG_OTHER").
+#
+# Effect (runs before su -p coder handoff):
+#   - Own-team names (prefix match): export <BARE>=<value>; unset <TEAM>_<BARE>
+#   - Other-team names: unset (cross-team isolation)
+#   - Exports AI_IMPLEMENT_FORWARDED_SECRETS=<comma-joined bare names>
+#     Format: "QA_PROBE,DB_URL" — names only, no values. Empty when none.
+remap_team_secrets() {
+  local prefix="${AI_IMPLEMENT_TEAM_SECRET_PREFIX:-}"
+  local all_names="${AI_IMPLEMENT_ALL_SECRET_NAMES:-}"
+  if [ -z "$prefix" ] || [ -z "$all_names" ]; then return 0; fi
+
+  local forwarded="" _bare _val _sname
+  local -a _names=()
+  IFS=',' read -ra _names <<< "$all_names"
+  for _sname in "${_names[@]}"; do
+    [ -z "$_sname" ] && continue
+    if [[ "$_sname" == "${prefix}"* ]]; then
+      _bare="${_sname#"${prefix}"}"
+      _val="${!_sname:-}"
+      export "${_bare}=${_val}"
+      unset "${_sname}"
+      forwarded="${forwarded:+${forwarded},}${_bare}"
+    else
+      unset "${_sname}"
+    fi
+  done
+  export AI_IMPLEMENT_FORWARDED_SECRETS="$forwarded"
+  log "Remapped team secrets (prefix=${prefix}): ${forwarded:-none}"
+}
