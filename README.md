@@ -324,7 +324,7 @@ Go to the orchestrator's admin UI → **Projects** → **+ New project**. The st
 - **Runner** — `github-actions` (zero infrastructure) or `fly-machines`.
 - **Provider** — `anthropic` or `bedrock` (see [CLAUDE.md](CLAUDE.md) for Bedrock setup), plus planning toggles.
 - **Capacity** — max parallel AI issues (default 3, keep low while evaluating).
-- **Secrets** — optionally seed per-project secrets now (write-only; you can add more later from the Projects page). Secrets reach setup and verify hooks in every execution mode but are stripped from the model process — the agent never sees them. GHA-mode repos forward repository secrets via the `AI_IMPLEMENT_FORWARD_SECRETS` Actions variable (set it to a comma-separated list of secret names and re-sync).
+- **Secrets** — optionally seed per-project secrets now (write-only; you can add more later from the Projects page). Secrets reach setup and verify hooks in every execution mode but are stripped from the model process — the agent never sees them. GHA-mode repos forward hook secrets via the `AI_IMPLEMENT_FORWARDED_ENV` Actions **secret** — set it to `KEY=VALUE` lines, one per line, and re-sync.
 
 **Save.** The mapping persists immediately and the workflow sync runs in the background: the project row shows **"Syncing…"**, then **"Workflows synced — PR opened ↗"** — or reverts with an alert naming the failure. Per-run caps (Max Turns, Max Iterations, Job Timeout) are editable later via **Edit** on the project row.
 
