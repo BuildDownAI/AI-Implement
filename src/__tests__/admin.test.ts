@@ -1522,6 +1522,26 @@ describe("admin secrets", () => {
     expect(JSON.parse(res.body).error).toContain("not found");
   });
 
+  it("POST secrets returns 400 for reserved bare name GITHUB_TOKEN", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const res = await requestFly("/api/mappings/ENG/secrets", "POST", token, { name: "GITHUB_TOKEN", value: "evil" });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("reserved");
+  });
+
+  it("POST secrets returns 400 for reserved bare names with GITHUB_ prefix", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+
+    for (const name of ["GITHUB_OWNER", "ISSUE_ID", "AI_IMPLEMENT_TEAM", "ORCHESTRATOR_URL", "RUN_TOKEN", "ANTHROPIC_API_KEY"]) {
+      const res = await requestFly("/api/mappings/ENG/secrets", "POST", token, { name, value: "x" });
+      expect(res.statusCode, `expected 400 for reserved name ${name}`).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("reserved");
+    }
+  });
+
   it("POST secrets returns 400 for malformed JSON", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);

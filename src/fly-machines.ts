@@ -381,6 +381,7 @@ export interface SessionMachineInput {
   memoryMb?: number;
   teamKey?: string;
   teamSecretNames?: string[]; // full prefixed secret names from the Fly app (e.g. ["ENG_DATABASE_URL"])
+  allTeamKeys?: string[]; // all known team keys across all mappings, used to identify foreign secrets
   minSecretsVersion?: number;
   orchestratorUrl?: string;
   runnerCallbackUrl?: string;
@@ -448,13 +449,30 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
     },
   };
 
+  // Classic Fly app secrets are app-wide: every machine on the sessions app
+  // receives every classic secret under its stored name (e.g. SAN_QA_PROBE).
+  // The Machines API processes[].secrets env_var remap applies only to the
+  // non-GA named-secrets feature and has no effect on classic secrets (confirmed
+  // 2026-09-03, probe SAN-22; see https://fly.io/docs/machines/api/machines-resource/).
+  //
+  // The runner entrypoint (remap_team_secrets in session/lib.sh) handles isolation:
+  //   - AI_IMPLEMENT_TEAM_SECRET_PREFIX: own-team prefix; entrypoint remaps any env var
+  //     whose name starts with this prefix to its unprefixed form and unsets the prefixed form.
+  //   - AI_IMPLEMENT_FOREIGN_SECRET_NAMES: comma-joined names that start with another team's
+  //     prefix; entrypoint unsets these. Global secrets (no team prefix) are omitted here
+  //     and pass through the entrypoint unchanged.
   if (input.teamKey && input.teamSecretNames?.length) {
-    const prefix = `${input.teamKey.toUpperCase()}_`;
-    const mappedSecrets = input.teamSecretNames
-      .filter((name) => name.startsWith(prefix))
-      .map((name) => ({ env_var: name.slice(prefix.length), name }));
-    if (mappedSecrets.length > 0) {
-      machineConfig.processes = [{ secrets: mappedSecrets }];
+    const ownPrefix = `${input.teamKey.toUpperCase()}_`;
+    env.AI_IMPLEMENT_TEAM_SECRET_PREFIX = ownPrefix;
+
+    if (input.allTeamKeys?.length) {
+      const foreignNames = input.teamSecretNames.filter((name) => {
+        if (name.startsWith(ownPrefix)) return false;
+        return input.allTeamKeys!.some((k) => name.startsWith(`${k.toUpperCase()}_`));
+      });
+      if (foreignNames.length > 0) {
+        env.AI_IMPLEMENT_FOREIGN_SECRET_NAMES = foreignNames.join(",");
+      }
     }
   }
 

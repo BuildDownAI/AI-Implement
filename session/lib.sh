@@ -71,3 +71,75 @@ verify_workspace_writable() {
   fi
   fail "Cannot write to bind-mounted workspace $workspace_dir (owner $ws_uid:$ws_gid, coder UID $coder_uid GID $coder_gid). Verify AI_IMPLEMENT_HOST_UID/AI_IMPLEMENT_HOST_GID match the host directory owner. On macOS Docker Desktop, confirm file sharing is enabled — the mount may be read-only."
 }
+
+# Returns 0 (true) if the bare secret name would overwrite an orchestrator-
+# owned environment variable and must not be exported by remap_team_secrets.
+# Matches all GITHUB_*, ISSUE_*, and AI_IMPLEMENT_* prefixes plus the exact
+# orchestrator vars set by buildSessionMachineConfig in src/fly-machines.ts.
+_remap_is_reserved() {
+  case "$1" in
+    GITHUB_*|ISSUE_*|AI_IMPLEMENT_*) return 0 ;;
+    ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE) return 0 ;;
+    RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME) return 0 ;;
+  esac
+  return 1
+}
+
+# Remap per-project Fly secrets to their unprefixed runner-visible names.
+#
+# Classic Fly app secrets are app-wide: every machine on the sessions app
+# receives every classic secret under its stored name (e.g. SAN_QA_PROBE).
+# The Machines API processes[].secrets env_var remap applies only to the
+# non-GA named-secrets feature and has no effect on classic secrets (confirmed
+# 2026-09-03, probe SAN-22 on ai-implement-testing-sessions).
+#
+# Reads:
+#   AI_IMPLEMENT_TEAM_SECRET_PREFIX  — own-team prefix, e.g. "SAN_"
+#   AI_IMPLEMENT_FOREIGN_SECRET_NAMES — comma-joined names from other teams,
+#       e.g. "ENG_DB_URL,QA_OTHER". Global machine secrets (no team prefix)
+#       are absent from this list and pass through unchanged.
+#
+# Effect (runs before su -p coder handoff):
+#   - Own-team names (prefix match via env scan): export <BARE>=<value>;
+#     unset <TEAM>_<BARE>. Reserved names (_remap_is_reserved) are unset
+#     but not exported.
+#   - Foreign-team names (AI_IMPLEMENT_FOREIGN_SECRET_NAMES): unset.
+#   - Global secrets (not in either category): untouched.
+#   - Exports AI_IMPLEMENT_FORWARDED_SECRETS=<comma-joined bare names>
+#     Format: "QA_PROBE,DB_URL" — names only, no values. Empty when none.
+remap_team_secrets() {
+  local prefix="${AI_IMPLEMENT_TEAM_SECRET_PREFIX:-}"
+  if [ -z "$prefix" ]; then return 0; fi
+
+  local forwarded="" _bare _val _sname
+  # Remap own-team secrets: scan the environment for vars with the own-team
+  # prefix, export them under their bare name, and unset the prefixed form.
+  while IFS= read -r _sname; do
+    [ -z "$_sname" ] && continue
+    _bare="${_sname#"${prefix}"}"
+    if _remap_is_reserved "$_bare"; then
+      log "WARNING: Skipping reserved secret name ${_bare} (stored as ${_sname}) — would overwrite orchestrator-managed env var"
+      unset "${_sname}"
+      continue
+    fi
+    _val="${!_sname:-}"
+    export "${_bare}=${_val}"
+    unset "${_sname}"
+    forwarded="${forwarded:+${forwarded},}${_bare}"
+  done < <(compgen -v | grep "^${prefix}" || true)
+
+  # Unset foreign-team secrets. Global secrets (no team prefix) are not listed
+  # here and pass through unchanged.
+  local foreign_names="${AI_IMPLEMENT_FOREIGN_SECRET_NAMES:-}"
+  if [ -n "$foreign_names" ]; then
+    local -a _fnames=()
+    IFS=',' read -ra _fnames <<< "$foreign_names"
+    for _sname in "${_fnames[@]}"; do
+      [ -z "$_sname" ] && continue
+      unset "${_sname}" 2>/dev/null || true
+    done
+  fi
+
+  export AI_IMPLEMENT_FORWARDED_SECRETS="$forwarded"
+  log "Remapped team secrets (prefix=${prefix}): ${forwarded:-none}"
+}
