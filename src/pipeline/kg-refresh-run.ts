@@ -147,7 +147,9 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       provider,
       maxTurns,
       // kg-refresh always runs a single feedback-loop pass — the ingest either
-      // succeeds or fails; there is no review rail to cycle through.
+      // succeeds or fails; there is no review rail to cycle through. maxIterations: 1
+      // caps the loop, and the snapshot-push step (not the reviewer's verdict) is
+      // what determines success or failure for this run kind.
       maxIterations: 1,
       callbackUrl: callbackUrl ?? undefined,
     },
@@ -181,12 +183,10 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     return { exitCode: 1 };
   }
 
-  const pushOutputs = context.getOutputs("kg-snapshot-push");
   await postRunnerResult({
     phase: "kg-refresh",
     workspaceDir,
     outcome: "success",
-    ...(typeof pushOutputs.commitSha === "string" ? { prUrl: undefined } : {}),
     callbackUrl,
     fetchImpl: opts.fetchImpl,
   });

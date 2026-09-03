@@ -2,6 +2,9 @@ id: kg-refresh
 steps:
   - id: clone
     type: clone
+  # feedback-loop drives the ingest via Claude (maxIterations: 1 enforced in
+  # kg-refresh-run.ts). The LLM review verdict is deliberately not consulted —
+  # success or failure is decided by kg-snapshot-push via artifact validation.
   - id: feedback-loop
     type: custom
     moduleId: feedback-loop
