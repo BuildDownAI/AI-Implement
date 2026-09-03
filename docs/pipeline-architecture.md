@@ -54,6 +54,17 @@ Two consequences worth internalising:
 
 **A gap-fill run never pushes from the pipeline.** `push` is skipped whenever `prNumber` is set, because the agent commits and pushes to the existing PR branch itself. This is why gap-fill and initial runs need different instructions in `WORKFLOW.md`.
 
+## Hook environment and forwarded secrets
+
+The dispatch side declares which secrets are present by naming them in `AI_IMPLEMENT_FORWARDED_SECRETS` (a comma-separated list of environment variable names). `setup`, `verify`, `teardown`, and `dependency-auth` all run as repo-owned processes that inherit the full runner env and therefore see those values. `modelProcessEnv()` in `src/pipeline/process-env.ts` strips each named key — and the `AI_IMPLEMENT_FORWARDED_SECRETS` list variable itself — before starting Claude Code, so the model and any processes it spawns never see them.
+
+Two producers set `AI_IMPLEMENT_FORWARDED_SECRETS`:
+
+- **GHA**: the "Forward repository secrets" step in `workflows/claude-implement.yml` reads the repository secret names listed in the `AI_IMPLEMENT_FORWARD_SECRETS` Actions variable, validates each name, exposes each secret value into the runner env, and writes the confirmed names to `AI_IMPLEMENT_FORWARDED_SECRETS` for the remainder of the job.
+- **Fly**: `src/fly-machines.ts` maps per-project secrets stored in the Fly Secrets panel to environment variable names (stripping the per-team prefix) and sets `AI_IMPLEMENT_FORWARDED_SECRETS` in the machine launch config.
+
+One consumer: `src/pipeline/process-env.ts`. `parseForwardedSecrets()` reads the list; `modelProcessEnv()` deletes each named key before Claude Code starts. `repoProcessEnv()` — used for hooks and dependency install — leaves forwarded secrets in place.
+
 ## How steps get their inputs
 
 This is the least obvious part of the design, and the easiest thing to get wrong when extending it.
