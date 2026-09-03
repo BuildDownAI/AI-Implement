@@ -204,6 +204,7 @@ export const deploymentsScript = `
   // What the server last told us. Kept so an edit can be detected, and so the 30s poll
   // does not silently revert a checkbox someone has ticked but not yet saved.
   let savedPolicy = null;
+  let stampedBranch = null;
 
   function policyDirty() {
     if (!savedPolicy) return false;
@@ -241,22 +242,24 @@ export const deploymentsScript = `
       const data = await res.json();
       const prev = refSel.value;
       const defaultBranch = data.defaultBranch || null;
-      const watchedRef = savedPolicy && savedPolicy.watchedRef ? savedPolicy.watchedRef : null;
-
-      // Build the pinned group: default branch first, then watched ref if different.
-      const pinned = [];
-      if (defaultBranch) pinned.push(defaultBranch);
-      if (watchedRef && watchedRef !== defaultBranch) pinned.push(watchedRef);
-      const pinnedSet = new Set(pinned);
+      const currentRef = savedPolicy && savedPolicy.watchedRef ? savedPolicy.watchedRef : stampedBranch;
+      const shownSet = new Set();
 
       let html = '<option value="">— select a ref —</option>';
-      if (pinned.length) {
-        html += '<optgroup label="Pinned">';
-        for (const p of pinned) html += '<option value="' + window.escAttr(p) + '">' + window.esc(p) + '</option>';
+      if (currentRef) {
+        shownSet.add(currentRef);
+        html += '<optgroup label="Current">';
+        html += '<option value="' + window.escAttr(currentRef) + '">' + window.esc(currentRef) + '</option>';
+        html += '</optgroup>';
+      }
+      if (defaultBranch && !shownSet.has(defaultBranch)) {
+        shownSet.add(defaultBranch);
+        html += '<optgroup label="Default">';
+        html += '<option value="' + window.escAttr(defaultBranch) + '">' + window.esc(defaultBranch) + '</option>';
         html += '</optgroup>';
       }
       if (data.tags && data.tags.length) {
-        const remainingTags = data.tags.filter(function(t) { return !pinnedSet.has(t); });
+        const remainingTags = data.tags.filter(function(t) { return !shownSet.has(t); });
         if (remainingTags.length) {
           html += '<optgroup label="Tags">';
           for (const t of remainingTags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
@@ -264,7 +267,7 @@ export const deploymentsScript = `
         }
       }
       if (data.branches && data.branches.length) {
-        const remaining = data.branches.filter(function(b) { return !pinnedSet.has(b); }).sort();
+        const remaining = data.branches.filter(function(b) { return !shownSet.has(b); }).sort();
         if (remaining.length) {
           html += '<optgroup label="Branches">';
           for (const b of remaining) html += '<option value="' + window.escAttr(b) + '">' + window.esc(b) + '</option>';
@@ -358,6 +361,8 @@ export const deploymentsScript = `
         watchedRefEl.value = savedRef;
       }
     }
+    watchedRepoEl.placeholder = data.watchedRepo || data.repo || 'owner/repo';
+    stampedBranch = data.branch || null;
     savedPolicy = {
       autoDeploy: !!data.autoDeploy,
       notifyAvailable: !!data.notifyAvailable,

@@ -429,17 +429,46 @@ describe("deployments page", () => {
     expect(deploymentsScript).toContain("savedPolicy.watchedRef");
   });
 
-  it("excludes pinned refs from the remaining branches list to avoid duplication", () => {
-    expect(deploymentsScript).toContain("pinnedSet");
+  it("excludes shown refs from the remaining branches list to avoid duplication", () => {
+    expect(deploymentsScript).toContain("shownSet");
   });
 
-  it("filters the Tags optgroup against pinnedSet so a watched tag is not duplicated", () => {
-    expect(deploymentsScript).toContain("data.tags.filter(function(t) { return !pinnedSet.has(t); })");
+  it("filters the Tags optgroup against shownSet so a watched tag is not duplicated", () => {
+    expect(deploymentsScript).toContain("data.tags.filter(function(t) { return !shownSet.has(t); })");
     expect(deploymentsScript).toContain("remainingTags.length");
   });
 
-  it("renders a Pinned optgroup for the default and watched branches", () => {
-    expect(deploymentsScript).toContain('label="Pinned"');
+  it("renders Current and Default optgroups for the watched and default refs", () => {
+    expect(deploymentsScript).toContain('label="Current"');
+    expect(deploymentsScript).toContain('label="Default"');
+  });
+
+  it("sets the watched-repo placeholder from the effective watched source", () => {
+    expect(deploymentsScript).toContain("watchedRepoEl.placeholder = data.watchedRepo || data.repo || 'owner/repo'");
+  });
+
+  it("tracks the stamped branch at module scope and updates it on each status poll", () => {
+    expect(deploymentsScript).toContain("let stampedBranch = null");
+    expect(deploymentsScript).toContain("stampedBranch = data.branch || null");
+  });
+
+  it("renders four optgroups in order: Current, Default, Tags, Branches", () => {
+    const idxCurrent = deploymentsScript.indexOf('label="Current"');
+    const idxDefault = deploymentsScript.indexOf('label="Default"');
+    const idxTags = deploymentsScript.indexOf('label="Tags"');
+    const idxBranches = deploymentsScript.indexOf('label="Branches"');
+    expect(idxCurrent).toBeGreaterThan(-1);
+    expect(idxCurrent).toBeLessThan(idxDefault);
+    expect(idxDefault).toBeLessThan(idxTags);
+    expect(idxTags).toBeLessThan(idxBranches);
+  });
+
+  it("omits the Default group when it equals the Current ref", () => {
+    expect(deploymentsScript).toContain("!shownSet.has(defaultBranch)");
+  });
+
+  it("derives currentRef from savedPolicy.watchedRef or stampedBranch", () => {
+    expect(deploymentsScript).toContain("savedPolicy.watchedRef ? savedPolicy.watchedRef : stampedBranch");
   });
 
   it("dirty check covers watchedRepo and watchedRef", () => {
