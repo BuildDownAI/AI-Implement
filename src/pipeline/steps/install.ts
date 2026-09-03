@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { repoProcessEnv } from "../process-env.js";
 
 interface RepoModels {
   implement?: string;
@@ -142,7 +143,7 @@ export const installStep: StepModule<InstallInputs, InstallOutputs> = {
       const proc = spawn(cmd!, cmdArgs, {
         cwd: workspaceDir,
         stdio: "inherit",
-        env: { ...process.env },
+        env: repoProcessEnv(),
       });
       proc.on("close", (code) => {
         if (code === 0) resolve();

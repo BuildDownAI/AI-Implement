@@ -14,6 +14,7 @@
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
+#   AI_IMPLEMENT_FORWARD_SECRETS                 - Comma-separated list of repository secret names to forward to the runner environment. Forwarded secrets reach setup and verify hooks only, never the agent (enforced by the runner).
 #
 # Private runner images: the plan job pulls the runner image as its container.
 # When that image is private on GHCR the pull is authenticated with GITHUB_TOKEN via
@@ -191,6 +192,58 @@ jobs:
           fi
           if [ -n "${{ inputs.run_progress_token }}" ]; then
             echo "::add-mask::${{ inputs.run_progress_token }}"
+          fi
+
+      # Container jobs default to sh -e; this step uses bash syntax and requires shell: bash.
+      - name: Forward repository secrets
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          FORWARD_SECRETS: ${{ vars.AI_IMPLEMENT_FORWARD_SECRETS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${FORWARD_SECRETS:-}" ]; then
+            exit 0
+          fi
+          reserved="GITHUB_TOKEN AI_IMPLEMENT_APP_ID AI_IMPLEMENT_PRIVATE_KEY ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN AWS_BEDROCK_ROLE_ARN GH_TOKEN GITHUB_ENTERPRISE_TOKEN GH_ENTERPRISE_TOKEN GIT_PASSWORD"
+          validated=""
+          IFS=',' read -ra names <<< "$FORWARD_SECRETS"
+          for raw in "${names[@]}"; do
+            name="$(echo "$raw" | xargs)"
+            [ -z "$name" ] && continue
+            if ! [[ "$name" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+              echo "::error::AI_IMPLEMENT_FORWARD_SECRETS: \"$name\" does not match the required format ^[A-Z][A-Z0-9_]*\$."
+              exit 1
+            fi
+            for r in $reserved; do
+              if [ "$name" = "$r" ]; then
+                echo "::error::AI_IMPLEMENT_FORWARD_SECRETS: \"$name\" is a reserved secret name and cannot be forwarded."
+                exit 1
+              fi
+            done
+            if [[ "$name" == RUN_* ]] || [[ "$name" == AI_IMPLEMENT_* ]]; then
+              echo "::error::AI_IMPLEMENT_FORWARD_SECRETS: \"$name\" uses a reserved prefix (RUN_ or AI_IMPLEMENT_) and cannot be forwarded."
+              exit 1
+            fi
+            if ! echo "$SECRETS_JSON" | jq -e --arg k "$name" 'has($k)' > /dev/null 2>&1; then
+              echo "::error::AI_IMPLEMENT_FORWARD_SECRETS: secret \"$name\" is not set in this repository."
+              exit 1
+            fi
+            val="$(echo "$SECRETS_JSON" | jq -r --arg k "$name" '.[$k]')"
+            if [ -z "$val" ] || [ "$val" = "null" ]; then
+              echo "::error::AI_IMPLEMENT_FORWARD_SECRETS: secret \"$name\" is not set in this repository."
+              exit 1
+            fi
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::add-mask::$line"
+            done <<< "$val"
+            delim="$(openssl rand -hex 16)"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$val" "$delim" >> "$GITHUB_ENV"
+            validated="${validated:+${validated},}${name}"
+          done
+          if [ -n "$validated" ]; then
+            echo "AI_IMPLEMENT_FORWARDED_SECRETS=${validated}" >> "$GITHUB_ENV"
+            echo "::notice::Forwarding repository secrets to runner environment: ${validated}"
           fi
 
       - name: Run planning

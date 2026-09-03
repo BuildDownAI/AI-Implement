@@ -597,6 +597,10 @@ describe("buildSessionMachineConfig", () => {
     expect(result.config.processes).toBeUndefined();
   });
 
+
+
+
+
   it("passes min_secrets_version when provided", () => {
     const result = buildSessionMachineConfig({
       ...baseInput,

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
+import { GITHUB_WRITE_CREDENTIAL_KEYS } from "../pipeline/process-env.js";
 
 const IMPLEMENT_WORKFLOWS = [
   "workflows/claude-implement.yml",
@@ -105,6 +106,90 @@ describe("GHA workflow shims", () => {
       for (const ref of actionRefs) {
         expect(ref).toMatch(/@[0-9a-f]{40}$/);
       }
+    });
+  }
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} has a "Forward repository secrets" step`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      expect(forwardStep).toBeDefined();
+    });
+
+    it(`${f} forward step precedes the pipeline step and follows the mask step`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const pipelineStepName = f.includes("plan") ? "Run planning" : "Run pipeline";
+      expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Forward repository secrets"));
+      expect(yaml.indexOf("Forward repository secrets")).toBeLessThan(yaml.indexOf(pipelineStepName));
+    });
+
+    it(`${f} uses toJSON(secrets) only inside the forward step`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      const nonForwardSteps = containerJob.steps.filter((s: any) => s.name !== "Forward repository secrets");
+      expect(JSON.stringify(forwardStep)).toContain("toJSON(secrets)");
+      expect(JSON.stringify(nonForwardSteps)).not.toContain("toJSON(secrets)");
+      expect((yaml.match(/toJSON\(secrets\)/g) ?? []).length).toBe(1);
+    });
+
+    it(`${f} forward step reserved-name list covers all GITHUB_WRITE_CREDENTIAL_KEYS entries`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      expect(forwardStep).toBeDefined();
+      const forwardScript: string = forwardStep.run;
+      const reservedLine = forwardScript.match(/reserved="([^"]+)"/)?.[1] ?? "";
+      const reservedNames = reservedLine.split(" ");
+      for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) {
+        expect(reservedNames).toContain(key);
+      }
+    });
+
+    it(`${f} forward step reserved-name list covers all secrets the template reads`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      const forwardScript: string = forwardStep.run;
+      const secretRefs = [...yaml.matchAll(/secrets\.([A-Z_][A-Z0-9_]*)/g)].map((m) => m[1]);
+      for (const name of secretRefs) {
+        expect(forwardScript).toContain(name);
+      }
+    });
+
+    it(`${f} documents AI_IMPLEMENT_FORWARD_SECRETS in the header comment`, () => {
+      const yaml = readFileSync(f, "utf-8");
+      expect(yaml).toContain("AI_IMPLEMENT_FORWARD_SECRETS");
+      expect(yaml).toContain("hooks");
+    });
+
+    it(`${f} does not expose SECRETS_JSON or AI_IMPLEMENT_FORWARDED_SECRETS in the pipeline step env block`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const pipelineStep = containerJob.steps.find(
+        (s: any) => s.name === "Run pipeline" || s.name === "Run planning",
+      );
+      expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("SECRETS_JSON");
+      expect(JSON.stringify(pipelineStep.env ?? {})).not.toContain("AI_IMPLEMENT_FORWARDED_SECRETS");
+    });
+
+    it(`${f} forward step declares shell: bash`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const forwardStep = containerJob.steps.find((s: any) => s.name === "Forward repository secrets");
+      expect(forwardStep).toBeDefined();
+      expect(forwardStep.shell).toBe("bash");
     });
   }
 
