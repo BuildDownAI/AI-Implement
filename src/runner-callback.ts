@@ -278,33 +278,54 @@ export async function handleRunnerResult(
         warn("markPlanningFailed", err);
       }
     } else if (input.body.phase === "implementation") {
-      try {
-        await provider.markImplementationFailed(
-          claims.issueId,
-          mappingTeamKey,
-          formatFailureComment(input.body.failureCode, input.body.failureReason, input.body.prUrl),
-        );
-      } catch (err) {
-        warn("markImplementationFailed", err);
-      }
-      const job = getJobByDispatchId(claims.dispatchId);
-      if (job) {
-        // A coded unapproved failure still carries a draft PR — link it on the
-        // job row so the admin UI and merge-detection can see it.
-        if (typeof input.body.prUrl === "string" && input.body.prUrl) {
-          updateJobPrUrl(job.id, input.body.prUrl);
+      const isOperatorCancelled = input.body.failureCode === "OPERATOR_CANCELLED";
+
+      if (isOperatorCancelled) {
+        // The operator closed the PR mid-run. Treat as a benign terminal: reset the
+        // ticket state (remove AI-Working label) without posting a failure comment,
+        // and skip retry remediation. The one informational notice fires later via
+        // the notification loop in index.ts.
+        try {
+          await provider.clearWorkingState(claims.issueId, mappingTeamKey);
+        } catch (err) {
+          warn("clearWorkingState(operator_cancelled)", err);
         }
-        // Skip bounded cleanup for coded failures that already pushed a draft PR
-        // (REVIEW_UNAPPROVED / MAX_TURNS_EXHAUSTED): clearing AI-Working + dedup
-        // would re-queue an issue that already has an open draft PR, contradicting
-        // the "leave for human" intent. Mirror the Fly/local monitor's isDraftPr guard.
-        if (input.watchdogConfig && !input.body.prUrl) {
-          await remediateFailedJob(
-            input.watchdogConfig,
-            provider,
-            job,
-            input.body.failureCode ?? input.body.failureReason ?? "failure",
+        const job = getJobByDispatchId(claims.dispatchId);
+        if (job) {
+          updateJobStatus(job.id, "failed", "operator_cancelled");
+          console.log(
+            `[runner-callback] PR closed by operator — job ${job.id} (${claims.issueId}) marked operator_cancelled`,
           );
+        }
+      } else {
+        try {
+          await provider.markImplementationFailed(
+            claims.issueId,
+            mappingTeamKey,
+            formatFailureComment(input.body.failureCode, input.body.failureReason, input.body.prUrl),
+          );
+        } catch (err) {
+          warn("markImplementationFailed", err);
+        }
+        const job = getJobByDispatchId(claims.dispatchId);
+        if (job) {
+          // A coded unapproved failure still carries a draft PR — link it on the
+          // job row so the admin UI and merge-detection can see it.
+          if (typeof input.body.prUrl === "string" && input.body.prUrl) {
+            updateJobPrUrl(job.id, input.body.prUrl);
+          }
+          // Skip bounded cleanup for coded failures that already pushed a draft PR
+          // (REVIEW_UNAPPROVED / MAX_TURNS_EXHAUSTED): clearing AI-Working + dedup
+          // would re-queue an issue that already has an open draft PR, contradicting
+          // the "leave for human" intent. Mirror the Fly/local monitor's isDraftPr guard.
+          if (input.watchdogConfig && !input.body.prUrl) {
+            await remediateFailedJob(
+              input.watchdogConfig,
+              provider,
+              job,
+              input.body.failureCode ?? input.body.failureReason ?? "failure",
+            );
+          }
         }
       }
     }

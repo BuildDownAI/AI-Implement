@@ -14,6 +14,7 @@ import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
+import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
@@ -648,7 +649,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       phase: runnerPhase,
       outcome: "failure",
       failureReason: err instanceof Error ? err.message : String(err),
-      failureCode: err instanceof SensitiveFilesError ? err.code : undefined,
+      failureCode: err instanceof SensitiveFilesError ? err.code
+        : err instanceof OperatorCancelledError ? err.code
+        : undefined,
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });

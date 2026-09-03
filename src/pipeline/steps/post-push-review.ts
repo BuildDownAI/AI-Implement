@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { OperatorCancelledError } from "../operator-cancelled.js";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
@@ -39,7 +40,8 @@ type PostPushReviewTerminationReason =
   | "invalid_review"
   | "external_review_pending"
   | "fix_failed"
-  | "no_changes";
+  | "no_changes"
+  | "operator_cancelled";
 
 interface PostPushReviewOutputs extends Record<string, unknown> {
   approved: boolean;
@@ -669,6 +671,22 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
 
   const created = ghSpawn(["pr", "comment", prNumber, "--body", body]);
   if (created.exitCode !== 0) {
+    // "issue is locked" is the GitHub error when a closed PR's timeline is locked.
+    // Verify the PR is closed-and-not-merged before treating as operator cancellation,
+    // rather than a transient error.
+    if ((created.stderr ?? "").toLowerCase().includes("issue is locked")) {
+      const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
+      if (prView.exitCode === 0) {
+        try {
+          const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
+          if (prState.state === "CLOSED" && !prState.merged) {
+            throw new OperatorCancelledError(prNumber);
+          }
+        } catch (e) {
+          if (e instanceof OperatorCancelledError) throw e;
+        }
+      }
+    }
     throw new Error(`gh pr comment failed: ${resultMessage(created)}`);
   }
 }
@@ -752,12 +770,6 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     const reviewWaitTimeoutMs = inputs.reviewWaitTimeoutMs ?? DEFAULT_REVIEW_WAIT_TIMEOUT_MS;
 
     const startMarker = "<!-- ai-implement post-push status=start -->";
-    postPrComment(
-      ghSpawn,
-      prNumber,
-      `${startMarker}\n🔍 Running post-implementation review...`,
-      startMarker,
-    );
 
     let iteration = 0;
     let approved = false;
@@ -765,6 +777,18 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let forcePushed = 0;
     let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     const reviewHistory: ReviewFinding[] = [];
+    // Set to true when a real LLM failure (non-zero exit) occurs. An OperatorCancelledError
+    // thrown afterward while posting the failure comment is suppressed so the genuine
+    // failure conclusion surfaces rather than being masked by the benign operator cancel.
+    let priorLlmFailure = false;
+
+    try {
+    postPrComment(
+      ghSpawn,
+      prNumber,
+      `${startMarker}\n🔍 Running post-implementation review...`,
+      startMarker,
+    );
 
     while (iteration < maxIterations && !approved) {
       iteration++;
@@ -829,6 +853,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         tools: READ_ONLY_ALLOWED_TOOLS,
       });
       if (reviewResult.exitCode !== 0) {
+        priorLlmFailure = true;
         terminationReason = "review_failed";
         const failure = `Reviewer LLM failed (${llmResultMessage(reviewResult)})`;
         feedback = compactErrorMessage(failure);
@@ -1056,6 +1081,7 @@ ${externalReviewFindingsBlock(externalFindings)}
 
       const fixResult = await context.llmExecutor.invoke({ prompt: fixPrompt, model, maxTurns: FIX_MAX_TURNS });
       if (fixResult.exitCode !== 0) {
+        priorLlmFailure = true;
         terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);
         const marker = `<!-- ai-implement post-push iter=${iteration} fix-failed -->`;
@@ -1126,6 +1152,24 @@ ${externalReviewFindingsBlock(externalFindings)}
         `${marker}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}\n\n**Merge readiness:** Awaiting follow-up review.`,
         marker,
       );
+    }
+    } catch (err) {
+      if (err instanceof OperatorCancelledError) {
+        if (priorLlmFailure) {
+          // A real LLM failure already set terminationReason — return that conclusion
+          // so the genuine failure surfaces rather than being masked by the operator cancel.
+          console.warn(
+            `[post-push-review] PR #${prNumber} was closed by operator while posting failure comment — ` +
+              `genuine failure surfaces as ${terminationReason}`,
+          );
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason };
+        }
+        // No prior genuine failure — the operator cancel is the sole anomaly.
+        terminationReason = "operator_cancelled";
+        console.warn(`[post-push-review] PR #${prNumber} was closed by operator — surfacing as OPERATOR_CANCELLED`);
+        throw err;
+      }
+      throw err;
     }
 
     return {

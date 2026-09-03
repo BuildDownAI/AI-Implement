@@ -40,6 +40,8 @@ export function classifyCompletion(job: Job): Classification | null {
   }
 
   // status === "failed"
+  if (job.conclusion === "operator_cancelled") return null; // closed by operator — benign
+
   const exit = job.conclusion?.startsWith("exit_") ? job.conclusion.slice(5) : null;
   const detail =
     exit && exit !== "0"

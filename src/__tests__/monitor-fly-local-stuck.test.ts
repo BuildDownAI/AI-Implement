@@ -14,6 +14,7 @@ vi.mock("../log.js", () => ({
   incrementStuckAttempts: vi.fn(),
   updateJobStatus: vi.fn(),
   resetStuckAttempts: vi.fn(),
+  getJobById: vi.fn().mockReturnValue(null),
 }));
 
 vi.mock("../dedup.js", () => ({

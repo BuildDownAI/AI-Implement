@@ -2468,11 +2468,13 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
           recordDispatchSuccess(job.issueId, breakerPhase);
         } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
           const breakerConclusion = job.conclusion ?? job.status;
-          // Don't fire the trip notification for stuck conclusions — stuck_giveup already
-          // fires notifyStuckGiveUp; we still record the failure so the counter advances.
+          // Don't fire the trip notification for stuck or benign-terminal conclusions —
+          // stuck_giveup already fires notifyStuckGiveUp; operator_cancelled is benign;
+          // we still record the failure so the counter advances in all three cases.
           const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
+          const isBenignTerminal = job.conclusion === "operator_cancelled";
           const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
-          if (br.tripped && !isStuck) {
+          if (br.tripped && !isStuck && !isBenignTerminal) {
             pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
           }
         }
@@ -2482,6 +2484,26 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
       // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
       // requeue that will produce its own dispatch notice on the next cycle.
       if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
+        markJobNotified(job.id);
+        continue;
+      }
+
+      // Operator-cancelled: one informational notice, no failure/stuck/parked triple.
+      if (job.conclusion === "operator_cancelled") {
+        if (config.notifyWebhookUrl) {
+          const identifier = job.issueIdentifier || job.issueId;
+          const prNum = job.prUrl ? job.prUrl.match(/\/pull\/(\d+)/)?.[1] : undefined;
+          const prRef = prNum ? ` (PR #${prNum})` : "";
+          try {
+            await notifyText(
+              config.notifyWebhookUrl,
+              `ℹ️ AI-Implement run cancelled by operator${prRef} — ${identifier}. PR was closed mid-run; ticket reset to pre-run state.`,
+            );
+          } catch (err) {
+            console.error(`[monitor] Failed to send operator-cancelled notice for job ${job.id}:`, err);
+          }
+        }
+        console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) operator_cancelled — benign terminal, one informational notice sent`);
         markJobNotified(job.id);
         continue;
       }

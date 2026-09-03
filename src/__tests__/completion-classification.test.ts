@@ -40,6 +40,20 @@ describe("classifyCompletion", () => {
     );
   });
 
+  it("returns null for an operator-cancelled run (benign terminal — no tracker comment noise)", () => {
+    expect(classifyCompletion(makeJob("failed", "implementation", "operator_cancelled"))).toBeNull();
+    expect(classifyCompletion(makeJob("failed", "planning", "operator_cancelled"))).toBeNull();
+  });
+
+  it("still classifies a real failure even when a PR was later closed (close does not flip conclusion)", () => {
+    // The operator_cancelled conclusion is only written by handleRunnerResult when the runner
+    // explicitly reports it. A job whose conclusion is exit_1 stays exit_1 regardless of
+    // whether the PR was subsequently closed — the DB invariant guarantees this.
+    const c = classifyCompletion(makeJob("failed", "implementation", "exit_1"));
+    expect(c).not.toBeNull();
+    expect(c?.summary).toContain("Implementation");
+  });
+
   it("is phase-aware on failure", () => {
     expect(classifyCompletion(makeJob("failed", "planning", "exit_1"))?.summary).toContain("Planning");
     expect(classifyCompletion(makeJob("failed", "implementation", "exit_1"))?.summary).toContain("Implementation");
