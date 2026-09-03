@@ -265,6 +265,20 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
     }
   });
 
+  it("treats hedge-then-caveat bullets ('No issues, but X') as genuine findings, not non-findings", () => {
+    const variants = [
+      "- No obvious issues, but the retry logic doesn't handle rate limiting correctly.",
+      "- Nothing blocking, but test coverage for the edge case is missing",
+      "- No concerns, however the error message leaks internal paths",
+      "- No issues found, though the migration is irreversible",
+    ];
+    for (const bullet of variants) {
+      const body = ["**Claude finished the review**", "", "### Blocking", "", bullet].join("\n");
+      const result = extractGithubActionsClaudeReviewFindings(body, "https://example.com/review");
+      expect(result.findings, `should be a real finding: ${bullet}`).toHaveLength(1);
+    }
+  });
+
   it("still extracts genuine defect bullets under a findings section (no over-exclusion)", () => {
     const body = [
       "**Claude finished the review**",

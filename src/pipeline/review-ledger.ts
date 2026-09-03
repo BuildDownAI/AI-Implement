@@ -229,8 +229,12 @@ function isExplicitlyEmptyFindingSection(body: string): boolean {
 // so a start-anchored denylist of absence-of-concern and resolution phrases is used instead
 // of an allowlist. Anchoring prevents false positives: "No null check is performed" does not
 // match because "check" is not in the concern-noun set.
+// Bullets using hedge-then-caveat phrasing ("No issues, but X is missing") contain a real
+// finding after the conjunction and must NOT be classified as non-findings; bail out early
+// when a contrastive conjunction follows the hedge prefix.
 function isNonFindingBullet(text: string): boolean {
   const lc = normalizeText(text).toLowerCase();
+  if (/\b(?:but|however|though|although)\b/.test(lc)) return false;
   if (/^no\s+(?:\w+\s+)*(?:concerns?|issues?|findings?|problems?|blocking)(?:\s|$|[,;—–-])/i.test(lc)) return true;
   if (/^nothing\s+blocking\b/i.test(lc)) return true;
   if (/^cleanly\s+resolved\b/i.test(lc)) return true;
