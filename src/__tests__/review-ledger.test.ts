@@ -219,6 +219,95 @@ describe("extractGithubActionsClaudeReviewFindings", () => {
       warn.mockRestore();
     }
   });
+
+  it("treats the PR #371 absence-of-concern bullet as a non-finding (regression)", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Review: PR #371",
+      "",
+      "### Issues",
+      "",
+      "1. - No security concerns — token/header handling is unchanged from the existing srcHeaders pattern.",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({ findings: [], findingsUnavailable: false });
+  });
+
+  it("treats absence-of-concern bullets as non-findings", () => {
+    const variants = [
+      "- No security concerns — explanation",
+      "- No issues found",
+      "- Nothing blocking in this change",
+      "- No correctness concerns",
+    ];
+    for (const bullet of variants) {
+      const body = ["**Claude finished the review**", "", "### Issues", "", bullet].join("\n");
+      expect(extractGithubActionsClaudeReviewFindings(body), `should be non-finding: ${bullet}`).toEqual({
+        findings: [],
+        findingsUnavailable: false,
+      });
+    }
+  });
+
+  it("treats resolution and approval bullets as non-findings", () => {
+    const variants = [
+      "- cleanly resolved",
+      "- Both blocking issues from review 1 are resolved",
+      "- Matches the spec",
+    ];
+    for (const bullet of variants) {
+      const body = ["**Claude finished the review**", "", "### Issues", "", bullet].join("\n");
+      expect(extractGithubActionsClaudeReviewFindings(body), `should be non-finding: ${bullet}`).toEqual({
+        findings: [],
+        findingsUnavailable: false,
+      });
+    }
+  });
+
+  it("still extracts genuine defect bullets under a findings section (no over-exclusion)", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Blocking",
+      "",
+      "- Missing null check on the return value from getUser()",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body, "https://example.com/review")).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Missing null check on the return value from getUser()",
+          url: "https://example.com/review",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
+
+  it("in a mixed section keeps genuine defect bullets and drops non-finding bullets", () => {
+    const body = [
+      "**Claude finished the review**",
+      "",
+      "### Blocking",
+      "",
+      "- No security concerns — token handling is unchanged",
+      "- Missing null guard on line 42",
+    ].join("\n");
+
+    expect(extractGithubActionsClaudeReviewFindings(body)).toEqual({
+      findings: [
+        {
+          source: "claude-review-summary",
+          severity: "blocking",
+          body: "Missing null guard on line 42",
+        },
+      ],
+      findingsUnavailable: false,
+    });
+  });
 });
 
 describe("extractVerdictMarkerFindings", () => {
