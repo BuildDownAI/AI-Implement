@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import { OperatorCancelledError } from "../pipeline/operator-cancelled.js";
 
 function makeCtx(execMock: any) {
   return {
@@ -2280,5 +2281,49 @@ describe("postPushReviewStep", () => {
     const capComment = ghComments.find((c) => c.includes("Not ready to merge"));
     expect(capComment).toBeDefined();
     expect(capComment).toContain("matrix-ubuntu");
+  });
+
+  it("throws OperatorCancelledError when gh pr comment fails with 'issue is locked' and PR is closed-not-merged", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        return { stdout: "", stderr: "GraphQL: Issue is locked (addComment)", exitCode: 1 };
+      }
+      if (args[0] === "pr" && args[1] === "view") {
+        return { stdout: JSON.stringify({ state: "CLOSED", merged: false }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    await expect(
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { report: vi.fn(async () => undefined) },
+      ),
+    ).rejects.toThrow(OperatorCancelledError);
+  });
+
+  it("falls through to generic error when 'issue is locked' but PR is merged", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        return { stdout: "", stderr: "GraphQL: Issue is locked (addComment)", exitCode: 1 };
+      }
+      if (args[0] === "pr" && args[1] === "view") {
+        return { stdout: JSON.stringify({ state: "CLOSED", merged: true }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    await expect(
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { report: vi.fn(async () => undefined) },
+      ),
+    ).rejects.toThrow("gh pr comment failed");
   });
 });

@@ -344,6 +344,42 @@ describe("handleRunnerResult — implementation", () => {
       calls.find((c) => c.method === "markImplementationFailed")?.args,
     ).toEqual(["i", "ENG", "tests fail"]);
   });
+
+  it("calls clearWorkingState and marks job operator_cancelled on OPERATOR_CANCELLED failureCode", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "OPERATOR_CANCELLED",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+    expect(res.status).toBe(200);
+    const calls = fake.recordedCalls();
+    expect(calls.find((c) => c.method === "clearWorkingState")).toBeDefined();
+    expect(calls.find((c) => c.method === "markImplementationFailed")).toBeUndefined();
+    expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
+  });
 });
 
 describe("handleRunnerProgress", () => {
