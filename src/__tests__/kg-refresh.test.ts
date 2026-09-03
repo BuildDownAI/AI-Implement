@@ -310,9 +310,10 @@ describe("kg-refresh", () => {
     expect(existsSync(join(dataRoot, "fetch"))).toBe(false);
   });
 
-  it("returns ingest-needed when the source snapshot commit date equals the served stamp (boundary)", async () => {
-    // snapshotCommitDate <= stampBefore: equal counts as not newer
-    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) });
+  it("returns ingest-needed when the snapshot commit is strictly older than the served stamp", async () => {
+    // snapshotCommitDate < stampBefore: strictly older is also not newer
+    const olderStamp = "2026-08-01T00:00:00Z";
+    build({ fetchSnapshotCommitDate: vi.fn(async () => olderStamp) });
     await handle.trigger();
     await waitDone();
 
@@ -363,9 +364,12 @@ describe("kg-refresh", () => {
     expect(restart).not.toHaveBeenCalled();
   });
 
-  it("returns ingest-needed when snapshotCommitDate uses Z-suffix and stampBefore uses +00:00 (mixed format, same instant)", async () => {
-    // GitHub returns Z; the graph's dcterms:modified uses +00:00. Date.parse handles both.
-    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) });
+  it("returns ingest-needed when snapshotCommitDate (Z-suffix) is strictly older than served stamp (+00:00) (mixed format, different instants)", async () => {
+    // GitHub returns Z; the graph's dcterms:modified uses +00:00. Verify Date.parse
+    // normalises both so a strictly-older Z-suffix is correctly identified as not newer
+    // even when the two timestamps use different timezone representations.
+    servedStamp = NEW_STAMP; // sidecar serves a newer +00:00-format stamp
+    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) }); // snapshot is older, Z format
     await handle.trigger();
     await waitDone();
 

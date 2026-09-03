@@ -598,6 +598,7 @@ export const deploymentsScript = `
       const badge = document.getElementById('kg-refresh-badge');
       if (data.running) setBadge(badge, 'info', 'refreshing');
       else if (data.kgDegraded) setBadge(badge, 'warn', 'degraded');
+      else if (data.lastRefresh?.gate === 'ingest-needed') setBadge(badge, 'ok', 'up-to-date');
       else setBadge(badge, 'ok', 'serving');
       document.getElementById('kg-refresh-stamp').textContent =
         'Served graph stamp: ' + (data.servedStamp || 'baked image graph');
