@@ -9,6 +9,7 @@ import { PipelineRunner } from "./runner.js";
 import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
+import { fetchTrackerDataStep } from "./steps/fetch-tracker-data.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError } from "./steps/kg-snapshot-push.js";
 import { ClaudeCliExecutor } from "./executor.js";
@@ -23,6 +24,7 @@ export interface RunKgRefreshOptions {
   fetchImpl?: typeof fetch;
   stepsOverride?: {
     clone?: StepModule;
+    fetchTrackerData?: StepModule;
     feedbackLoop?: StepModule;
     kgSnapshotPush?: StepModule;
   };
@@ -164,6 +166,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
   const runner = new PipelineRunner();
   runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
+  runner.register("fetch-tracker-data", opts.stepsOverride?.fetchTrackerData ?? fetchTrackerDataStep);
   runner.register("feedback-loop", opts.stepsOverride?.feedbackLoop ?? feedbackLoopStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
 

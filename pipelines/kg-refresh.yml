@@ -2,6 +2,12 @@ id: kg-refresh
 steps:
   - id: clone
     type: clone
+  # fetch-tracker-data runs after clone (workspace exists) and before feedback-loop,
+  # under repoProcessEnv() so RUN_PROGRESS_TOKEN is intact. The agent must not run
+  # the script itself — modelProcessEnv() strips RUN_PROGRESS_TOKEN before Claude starts.
+  - id: fetch-tracker-data
+    type: custom
+    moduleId: fetch-tracker-data
   # feedback-loop drives the ingest via Claude (maxIterations: 1 enforced in
   # kg-refresh-run.ts). The LLM review verdict is deliberately not consulted —
   # success or failure is decided by kg-snapshot-push via artifact validation.

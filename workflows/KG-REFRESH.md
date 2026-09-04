@@ -34,17 +34,12 @@ Compare the current `sources.yml` against the live set of repos and teams:
 
 If `sources.yml` does not exist or the repo has no such file, skip this step and note it in the run report.
 
-### 2.5. Fetch tracker data
+### 2.5. Tracker data
 
-Run the tracker-data fetch helper to pull Linear issue and comment data from the orchestrator:
+The pipeline runs `/app/session/fetch-kg-tracker-data.sh` before this feedback loop begins, writing Linear issue and comment data to `tracker-data.json` in the workspace. The script uses `RUNNER_CALLBACK_URL` and `RUN_PROGRESS_TOKEN` from the run environment. When those variables are absent (local `bd-kg-refresh` skill runs) or the orchestrator returns 503 (Linear not configured), no file is written and this step is a no-op.
 
-```bash
-/app/session/fetch-kg-tracker-data.sh tracker-data.json
-```
-
-The script reads `RUNNER_CALLBACK_URL` and `RUN_PROGRESS_TOKEN` from the environment. When those variables are absent (local `bd-kg-refresh` skill runs) it exits 0 without writing any file — this step is a no-op in that case and local ingest behaviour is unchanged.
-
-If the script exits non-zero, record the error in the run report and stop; do not proceed to the ingest.
+- If `tracker-data.json` exists in your workspace, proceed to the capability check below.
+- If `tracker-data.json` is absent, skip to step 3.
 
 If `tracker-data.json` was written, check whether the ingest binary supports the `--tracker-data` flag before step 3:
 

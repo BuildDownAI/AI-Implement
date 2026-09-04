@@ -466,7 +466,7 @@ describe("kgSnapshotPushStep", () => {
   });
 });
 
-// ── pipeline-loader wiring for kg-snapshot-push ───────────────────────────────
+// ── pipeline-loader wiring for kg-refresh steps ──────────────────────────────
 
 import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
 
@@ -474,6 +474,9 @@ const KG_REFRESH_PIPELINE_YAML = `id: kg-refresh
 steps:
   - id: clone
     type: clone
+  - id: fetch-tracker-data
+    type: custom
+    moduleId: fetch-tracker-data
   - id: feedback-loop
     type: custom
     moduleId: feedback-loop
@@ -481,6 +484,39 @@ steps:
     type: custom
     moduleId: kg-snapshot-push
 `;
+
+describe("applyWiring for fetch-tracker-data", () => {
+  it("wires workspaceDir from clone outputs", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "fetch-tracker-data");
+    expect(step).toBeDefined();
+    expect(step!.inputs).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/ws" });
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.workspaceDir).toBe("/ws");
+  });
+
+  it("fetch-tracker-data appears between clone and feedback-loop", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
+    });
+
+    const ids = pipeline.steps.map((s) => s.id);
+    const cloneIdx = ids.indexOf("clone");
+    const fetchIdx = ids.indexOf("fetch-tracker-data");
+    const loopIdx = ids.indexOf("feedback-loop");
+    expect(fetchIdx).toBeGreaterThan(cloneIdx);
+    expect(fetchIdx).toBeLessThan(loopIdx);
+  });
+});
 
 describe("applyWiring for kg-snapshot-push", () => {
   it("wires inputs from clone outputs", () => {
@@ -552,6 +588,7 @@ describe("runKgRefresh", () => {
       workspaceDir: tmpDir,
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        fetchTrackerData: makeStepModule({}),
         feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
@@ -565,6 +602,7 @@ describe("runKgRefresh", () => {
       workspaceDir: tmpDir,
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        fetchTrackerData: makeStepModule({}),
         feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({}, new KgSnapshotMissingError("no parts")),
       },
@@ -621,5 +659,14 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
     const playbook = readFileSync(playbookPath, "utf-8");
     expect(playbook).toContain("RUNNER_CALLBACK_URL");
     expect(playbook).toContain("RUN_PROGRESS_TOKEN");
+  });
+
+  it("says the pipeline pre-fetches the data rather than asking the agent to run the script", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    // The pipeline step runs fetch-kg-tracker-data.sh before the feedback loop;
+    // the agent must not be instructed to invoke it directly (RUN_PROGRESS_TOKEN
+    // is stripped from the model process by modelProcessEnv()).
+    expect(playbook).toMatch(/pipeline runs.*fetch-kg-tracker-data\.sh|pipeline.*pre-fetches/i);
+    expect(playbook).not.toMatch(/^run.*fetch-kg-tracker-data\.sh/im);
   });
 });

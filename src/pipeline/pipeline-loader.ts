@@ -258,6 +258,14 @@ function applyWiring(step: YamlStep): StepDefinition {
         },
       };
 
+    case "fetch-tracker-data":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+        }),
+      };
+
     case "kg-snapshot-push":
       return {
         ...step,
