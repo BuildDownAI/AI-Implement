@@ -2684,6 +2684,14 @@ describe("per-page grants", () => {
       expect((await request("/api/mappings", "GET", "secret", undefined, token)).statusCode).toBe(403);
     });
 
+    // The machine-logs route is parameterized and intentionally absent from PAGE_ROUTES so a user
+    // granted only "jobs" (or any other page) cannot reach it — catching a future accidental widening.
+    it("does not reach the machine logs endpoint with any page granted", async () => {
+      accessGrants.savePageGrants(["jobs"], "ada@eudoxus.ai");
+      const token = userSession();
+      expect((await request("/api/sessions/machine-abc/logs", "GET", "secret", undefined, token)).statusCode).toBe(403);
+    });
+
     // A grant is matched on the path alone, so a query string must not defeat it.
     it("matches the path with its query string stripped", async () => {
       accessGrants.savePageGrants(["reports"], "ada@eudoxus.ai");
