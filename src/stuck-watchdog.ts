@@ -143,7 +143,10 @@ export async function remediateStuckJob(
   stopRunner?: () => Promise<void>,
 ): Promise<void> {
   if (!job.issueId) return;
-  if (job.conclusion === "operator_cancelled") return; // closed by operator — no retry, no alert
+  // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
+  // after the monitor tick started reading the job, so the passed-in job may be stale.
+  const freshConclusionStuck = getJobById(job.id)?.conclusion;
+  if (job.conclusion === "operator_cancelled" || freshConclusionStuck === "operator_cancelled") return;
 
   // Stop the runner before resetting dedup — prevents a re-dispatch racing
   // with a still-live runner.

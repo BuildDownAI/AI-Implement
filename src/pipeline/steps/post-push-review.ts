@@ -642,6 +642,24 @@ function summarizeHeadChanges(gitSpawn: (args: string[]) => SpawnResult): string
   return formatGitNameStatusSummary(show.stdout);
 }
 
+/**
+ * Proactively checks if the PR is closed-and-not-merged and throws OperatorCancelledError
+ * if so. Called at step start and before any push to detect operator cancellation without
+ * relying on the PR being locked (which is opt-in on GitHub).
+ */
+function probeIfPrClosed(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
+  const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
+  if (prView.exitCode !== 0) return; // fail open — transient errors don't cancel the run
+  try {
+    const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
+    if (prState.state === "CLOSED" && !prState.merged) {
+      throw new OperatorCancelledError(prNumber);
+    }
+  } catch (e) {
+    if (e instanceof OperatorCancelledError) throw e;
+  }
+}
+
 function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
   if (marker) {
     const list = ghSpawn([
@@ -783,6 +801,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let priorLlmFailure = false;
 
     try {
+    probeIfPrClosed(ghSpawn, prNumber);
     postPrComment(
       ghSpawn,
       prNumber,
@@ -1134,6 +1153,7 @@ ${externalReviewFindingsBlock(externalFindings)}
       // A fix pass can run long enough to outlive the token minted by pushStep.
       // Re-vend at the actual write boundary; transient vending failures retain
       // the latest token already present in the environment and origin URL.
+      probeIfPrClosed(ghSpawn, prNumber);
       await refreshCredentialsBeforePush(context, inputs);
       const expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
       const push = gitSpawn([

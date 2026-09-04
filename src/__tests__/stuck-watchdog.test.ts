@@ -101,6 +101,20 @@ describe("remediateStuckJob — operator_cancelled guard", () => {
     expect(provider.clearWorkingState).not.toHaveBeenCalled();
   });
 
+  it("returns immediately when fresh DB conclusion is operator_cancelled (race: callback fired mid-tick)", async () => {
+    // job.conclusion is null (read before callback), but DB was updated during the tick
+    vi.mocked(getJobById).mockReturnValue(makeJob({ conclusion: "operator_cancelled" }));
+    const provider = makeProvider();
+    const job = makeJob({ conclusion: null });
+
+    await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+  });
+
   it("still remediates when job.conclusion is null (normal stuck path)", async () => {
     vi.mocked(incrementStuckAttempts).mockReturnValue(1);
     const provider = makeProvider();
