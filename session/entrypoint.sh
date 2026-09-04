@@ -111,7 +111,7 @@ case "$RUNNER_PHASE" in
   planning) RUNNER_ENTRY="run-planning.js" ;;
   local-planning) RUNNER_ENTRY="run-local-planning.js" ;;
   full) RUNNER_ENTRY="run-local-full-loop.js" ;;
-  kg-refresh) RUNNER_ENTRY="pipeline/kg-refresh-run.js" ;;
+  kg-refresh) RUNNER_ENTRY="pipeline/kg-refresh-run.js"; [ "$WORKSPACE_MODE" != "mounted" ] && setup_kg_push_credential ;;
   *) RUNNER_ENTRY="run-autonomous.js" ;;
 esac
 log "Invoking TS pipeline (node /app/dist/$RUNNER_ENTRY, phase=$RUNNER_PHASE)..."

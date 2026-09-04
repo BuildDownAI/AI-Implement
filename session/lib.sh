@@ -143,3 +143,22 @@ remap_team_secrets() {
   export AI_IMPLEMENT_FORWARDED_SECRETS="$forwarded"
   log "Remapped team secrets (prefix=${prefix}): ${forwarded:-none}"
 }
+
+# Install the kg-push git credential helper for kg-refresh runs.
+# Call this after the coder gitconfig has been written (step 5 copy).
+# Sets GIT_KG_PUSH_TOKEN_FILE, registers the helper in coder's gitconfig,
+# and removes the embedded token from the origin remote URL so the helper
+# is consulted on git push.
+setup_kg_push_credential() {
+  local token_file="/tmp/ai-implement-kg-push-$$.json"
+  export GIT_KG_PUSH_TOKEN_FILE="$token_file"
+  # Create an empty file owned by coder so the helper can read and update it.
+  touch "$token_file" || true
+  chown coder:coder "$token_file" || true
+  chmod 600 "$token_file" || true
+  # Register helper in coder's gitconfig (root's copy was already written at step 5).
+  git config --file /home/coder/.gitconfig credential.https://github.com.helper /opt/ai-implement/git-credential-helper-kg-push.sh
+  # Remove the embedded token from origin so git consults the helper for push.
+  # shellcheck disable=SC2153
+  git -C "$WORKSPACE_DIR" remote set-url origin "https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}.git"
+}

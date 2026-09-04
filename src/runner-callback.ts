@@ -7,6 +7,7 @@ import { upsertStepRecord } from "./step-log.js";
 import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
 import { renderClassification, TROUBLESHOOTING_URL, type Classification } from "./completion-classification.js";
+import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 
 export type RunnerPhase = "planning" | "implementation" | "gap-analysis" | "kg-refresh";
 
@@ -392,6 +393,86 @@ export async function handleRunnerProgress(
 
   upsertStepRecord(job.id, stepOrError);
   return { status: 200, body: { acknowledged: true } };
+}
+
+export interface HandleKgTrackerDataInput {
+  authorization: string | undefined;
+  secret: string;
+  /** Pagination cursor from the previous page (null/undefined for the first page). */
+  cursor: string | null | undefined;
+}
+
+/**
+ * Returns a paginated page of Linear issues (with their comments) for the team
+ * associated with the run's mapping.
+ *
+ * Callable only by kg-refresh runs — any other phase gets 403. The orchestrator
+ * performs the Linear read with its own credential; the runner receives data
+ * only and never a credential.
+ */
+export async function handleKgTrackerDataRequest(
+  input: HandleKgTrackerDataInput,
+): Promise<HandleRunnerResultOutput> {
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) return bad(401, "missing_bearer");
+
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
+  if (!verified.ok) return bad(401, verified.reason);
+
+  if (verified.claims.phase !== "kg-refresh") return bad(403, "Unauthorized");
+
+  if (!isLinearAuthConfigured()) {
+    return { status: 503, body: { error: "Tracker not configured" } };
+  }
+
+  const teamKey = verified.mappingTeamKey;
+  const FIRST = 50;
+
+  try {
+    const response = await withLinearToken((token) =>
+      fetch("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          query: `query($teamKey: String!, $first: Int!, $after: String) {
+            team(key: $teamKey) {
+              issues(first: $first, after: $after, orderBy: updatedAt) {
+                nodes {
+                  id identifier title description
+                  state { name type }
+                  comments(first: 100) { nodes { body createdAt } }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }`,
+          variables: { teamKey, first: FIRST, after: input.cursor ?? null },
+        }),
+      })
+    );
+
+    if (!response.ok) {
+      console.error(`[kg-tracker-data] Linear API returned ${response.status}`);
+      return { status: 502, body: { error: "Upstream tracker error" } };
+    }
+
+    const data = (await response.json()) as {
+      data?: { team?: { issues?: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } } };
+      errors?: Array<{ message: string }>;
+    };
+
+    if (data.errors?.length) {
+      console.error("[kg-tracker-data] Linear GraphQL errors:", data.errors);
+      return { status: 502, body: { error: "Upstream tracker error" } };
+    }
+
+    const issues = data.data?.team?.issues?.nodes ?? [];
+    const pageInfo = data.data?.team?.issues?.pageInfo ?? { hasNextPage: false, endCursor: null };
+    return { status: 200, body: { issues, pageInfo } };
+  } catch (err) {
+    console.error("[kg-tracker-data] Failed to fetch tracker data:", err);
+    return { status: 500, body: { error: "Failed to fetch tracker data" } };
+  }
 }
 
 /**
