@@ -6,6 +6,7 @@ import {
 import {
   countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
 } from "./comment-gapfill-queue.js";
+import { hasInFlightJobForPr } from "./log.js";
 
 export interface AutoMergeDeps {
   githubAppId: string;
@@ -85,6 +86,10 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
       if (checks === "failure") { console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: checks failed`); continue; }
       if (await hasChangesRequestedReview(token, owner, repo, pr.number)) {
         console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: changes requested`);
+        continue;
+      }
+      if (hasInFlightJobForPr(owner, repo, pr.number)) {
+        console.log(`[auto-merge] Deferring merge of PR #${pr.number} -> ${pr.base}: run still in flight`);
         continue;
       }
       const result = await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");

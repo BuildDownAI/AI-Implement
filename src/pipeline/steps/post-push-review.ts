@@ -35,6 +35,7 @@ interface PostPushReviewInputs extends Record<string, unknown> {
 type ExternalReviewState = "skipped" | "absent" | "running" | "completed";
 type PostPushReviewTerminationReason =
   | "approved"
+  | "pr_merged"
   | "iterations_exhausted"
   | "review_failed"
   | "invalid_review"
@@ -774,6 +775,17 @@ async function reportInvalidStructuredReview(
   );
 }
 
+function isPrMerged(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): boolean {
+  const result = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
+  if (result.exitCode !== 0) return false;
+  try {
+    const data = JSON.parse(result.stdout) as { merged?: boolean };
+    return data.merged === true;
+  } catch {
+    return false;
+  }
+}
+
 export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReviewOutputs> = {
   async run(context, inputs, reporter) {
     const ghSpawn = inputs.ghSpawn ?? makeDefaultGhSpawn(inputs.workspaceDir);
@@ -802,6 +814,13 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
     try {
     probeIfPrClosed(ghSpawn, prNumber);
+    // A PR merged under the run before its first comment (a manual merge, or a defer that did not
+    // hold) must not fail on the locked conversation: the merged-only benign exit applies at step
+    // entry too, not only at the top of each iteration (review finding).
+    if (isPrMerged(ghSpawn, prNumber)) {
+      console.log(`[post-push-review] PR #${prNumber} was already merged at step entry — exiting cleanly`);
+      return { approved: true, iterations: 0, finalFeedback: "", forcePushedRevisions: 0, terminationReason: "pr_merged" };
+    }
     postPrComment(
       ghSpawn,
       prNumber,
@@ -813,6 +832,13 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       iteration++;
       // Probe at the top of every pass: an operator may close the PR between iterations that never push.
       probeIfPrClosed(ghSpawn, prNumber);
+
+      if (isPrMerged(ghSpawn, prNumber)) {
+        console.log(`[post-push-review] PR #${prNumber} was merged under the run — exiting cleanly (a closed or locked PR is probeIfPrClosed's job)`);
+        approved = true;
+        terminationReason = "pr_merged";
+        break;
+      }
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
