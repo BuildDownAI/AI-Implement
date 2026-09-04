@@ -6,6 +6,7 @@ declare global {
       RUNNER_MODE?: string;
       RUNNER_CALLBACK_BASE_URL?: string;
       PORT?: string;
+      FLY_PROCESS_LEVEL_SECRETS?: string;
     }
   }
 }
@@ -173,4 +174,51 @@ export function setFlySecretsMinVersion(version: number): void {
   getDb()
     .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
     .run(FLY_SECRETS_MIN_VERSION_SETTING_KEY, String(version));
+}
+
+export interface FlyProcessLevelSecretsStatus {
+  enabled: boolean;
+  source: "env" | "db" | "default";
+}
+
+const FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY = "fly_process_level_secrets";
+
+/**
+ * Returns true if val is one of the accepted truthy values (true, 1, yes; case-insensitive).
+ * Anything else, including undefined or empty string, returns false.
+ */
+export function parseFlyProcessLevelSecretsEnv(val: string | undefined): boolean {
+  if (!val) return false;
+  return ["true", "1", "yes"].includes(val.toLowerCase());
+}
+
+/**
+ * Returns the effective Fly process-level secrets setting.
+ * Priority: FLY_PROCESS_LEVEL_SECRETS env var (truthy values only) > DB setting > default (false).
+ */
+export function getFlyProcessLevelSecrets(): FlyProcessLevelSecretsStatus {
+  if (parseFlyProcessLevelSecretsEnv(process.env.FLY_PROCESS_LEVEL_SECRETS)) {
+    return { enabled: true, source: "env" };
+  }
+
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY) as { value: string } | undefined;
+
+    if (row) {
+      return { enabled: row.value === "true", source: "db" };
+    }
+  } catch {
+    // DB unavailable — fall through to default
+  }
+
+  return { enabled: false, source: "default" };
+}
+
+/** Persists the Fly process-level secrets setting to the DB. Env var override is unaffected. */
+export function setFlyProcessLevelSecrets(enabled: boolean): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    .run(FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY, String(enabled));
 }

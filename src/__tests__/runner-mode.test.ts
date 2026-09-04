@@ -13,6 +13,7 @@ beforeEach(async () => {
   dbPath = path.join(os.tmpdir(), `runner-mode-test-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`);
   process.env.DEDUP_DB_PATH = dbPath;
   delete process.env.RUNNER_MODE;
+  delete process.env.FLY_PROCESS_LEVEL_SECRETS;
   // Fresh module imports each test so DB singleton is reset
   const { vi } = await import("vitest");
   vi.resetModules();
@@ -24,6 +25,7 @@ beforeEach(async () => {
 afterEach(() => {
   dedup.closeDb();
   delete process.env.RUNNER_MODE;
+  delete process.env.FLY_PROCESS_LEVEL_SECRETS;
   try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
@@ -150,6 +152,87 @@ describe("runner-mode", () => {
       });
 
       expect(runnerMode.getFlySecretsMinVersion()).toBeNull();
+    });
+  });
+
+  describe("parseFlyProcessLevelSecretsEnv", () => {
+    it("accepts truthy values", () => {
+      for (const val of ["true", "1", "yes", "TRUE", "YES", "True", "YES"]) {
+        expect(runnerMode.parseFlyProcessLevelSecretsEnv(val)).toBe(true);
+      }
+    });
+
+    it("rejects non-truthy and absent values", () => {
+      for (const val of [undefined, "", "false", "0", "no", "anything-else", " "]) {
+        expect(runnerMode.parseFlyProcessLevelSecretsEnv(val)).toBe(false);
+      }
+    });
+  });
+
+  describe("getFlyProcessLevelSecrets / setFlyProcessLevelSecrets", () => {
+    it("returns disabled default when neither env var nor DB entry is present", () => {
+      const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
+      expect(enabled).toBe(false);
+      expect(source).toBe("default");
+    });
+
+    it("stores true and retrieves from DB", () => {
+      runnerMode.setFlyProcessLevelSecrets(true);
+      const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
+      expect(enabled).toBe(true);
+      expect(source).toBe("db");
+    });
+
+    it("stores false and retrieves from DB", () => {
+      runnerMode.setFlyProcessLevelSecrets(false);
+      const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
+      expect(enabled).toBe(false);
+      expect(source).toBe("db");
+    });
+
+    it("overwrites a previous DB setting", () => {
+      runnerMode.setFlyProcessLevelSecrets(true);
+      runnerMode.setFlyProcessLevelSecrets(false);
+      const { enabled } = runnerMode.getFlyProcessLevelSecrets();
+      expect(enabled).toBe(false);
+    });
+
+    it("env var wins over DB when set to truthy value", () => {
+      runnerMode.setFlyProcessLevelSecrets(false);
+      process.env.FLY_PROCESS_LEVEL_SECRETS = "1";
+      const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
+      expect(enabled).toBe(true);
+      expect(source).toBe("env");
+    });
+
+    it.each(["true", "1", "yes", "TRUE", "YES"])(
+      "env var value %s is truthy → source: env, enabled: true",
+      (val) => {
+        process.env.FLY_PROCESS_LEVEL_SECRETS = val;
+        const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
+        expect(enabled).toBe(true);
+        expect(source).toBe("env");
+      },
+    );
+
+    it.each(["false", "", "no", "0", " "])(
+      "env var value %j is treated as not set, falls through to DB/default",
+      (val) => {
+        process.env.FLY_PROCESS_LEVEL_SECRETS = val;
+        const { source } = runnerMode.getFlyProcessLevelSecrets();
+        expect(source).not.toBe("env");
+      },
+    );
+
+    it("returns default when DB is unavailable", () => {
+      dedup.closeDb();
+      vi.spyOn(dedup, "getDb").mockImplementation(() => {
+        throw new Error("db unavailable");
+      });
+
+      const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
+      expect(enabled).toBe(false);
+      expect(source).toBe("default");
     });
   });
 

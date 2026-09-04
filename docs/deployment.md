@@ -184,7 +184,9 @@ If a team secret's bare name (the part after the team prefix) matches a reserved
 
 ### Process-level secrets (AII-491 spike)
 
-Setting `FLY_PROCESS_LEVEL_SECRETS` to `true` switches `buildSessionMachineConfig` to a stricter isolation mode. Instead of setting `AI_IMPLEMENT_TEAM_SECRET_PREFIX` / `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` and relying on the entrypoint filter, the machine config sets `processes[0].ignore_app_secrets: true` and enumerates only the secrets the machine should receive in `processes[0].secrets`:
+The process-level secrets setting is controlled via the **Runners page** in the admin UI (`/admin#runners`), under the runner-mode controls. The setting is persisted in the `settings` table and takes effect on the next dispatch without a restart. `FLY_PROCESS_LEVEL_SECRETS` remains as an environment variable override: when set to a truthy value (`true`, `1`, or `yes`, case-insensitive), it wins over the UI setting at runtime and the Runners page shows the toggle disabled with an override warning. Anything else, including empty, means the env var is not set and the UI setting applies.
+
+Setting this to enabled switches `buildSessionMachineConfig` to a stricter isolation mode. Instead of setting `AI_IMPLEMENT_TEAM_SECRET_PREFIX` / `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` and relying on the entrypoint filter, the machine config sets `processes[0].ignore_app_secrets: true` and enumerates only the secrets the machine should receive in `processes[0].secrets`:
 
 - Own-team secrets (`<TEAM>_<NAME>`) → `{ env_var: "<NAME>", name: "<TEAM>_<NAME>" }` (remapped to bare form)
 - Foreign-team secrets → excluded entirely

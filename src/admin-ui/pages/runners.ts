@@ -51,6 +51,20 @@ export const runnersHtml = `
     </div>
 
     <div class="card">
+      <div class="card-header"><h2 class="card-title">Fly process-level secrets</h2></div>
+      <div class="card-body">
+        <div id="fly-process-level-secrets-env-warning" class="warning hidden">&#x26A0; FLY_PROCESS_LEVEL_SECRETS env var is set &#x2014; UI toggle has no effect until it is unset.</div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="fly-process-level-secrets-toggle" onchange="window.setFlyProcessLevelSecrets(this.checked)">
+            <span>Enable</span>
+          </label>
+        </div>
+        <div class="card-subtitle" style="margin-top:8px">Fly builds machines with <code>ignore_app_secrets</code> and an explicit secret list; off means the runner entrypoint filters secrets after Fly injects them.</div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header">
         <h2 class="card-title">Fly Machines — live sessions</h2>
         <div class="card-subtitle"><a href="#sessions" class="text-accent">Manage on Sessions page →</a></div>
@@ -149,6 +163,7 @@ export const runnersScript = `
 
     const runnerMode = await runnerModeRes.json();
     const mappings = await mappingsRes.json();
+    const flySecrets = runnerMode.flyProcessLevelSecrets || { enabled: false, source: 'default' };
 
     const liveSessions = Array.isArray(sessions) ? sessions : [];
     const mapEntries = Object.entries(mappings).sort((a, b) => a[0].localeCompare(b[0]));
@@ -179,6 +194,21 @@ export const runnersScript = `
       b.classList.toggle('btn-primary', b.dataset.mode === runnerMode.mode);
       b.disabled = runnerMode.source === 'env';
     });
+
+    // Fly process-level secrets toggle
+    const flySecretsToggle = document.getElementById('fly-process-level-secrets-toggle');
+    const flySecretsWarning = document.getElementById('fly-process-level-secrets-env-warning');
+    if (flySecretsToggle) {
+      flySecretsToggle.checked = flySecrets.enabled;
+      flySecretsToggle.disabled = flySecrets.source === 'env';
+    }
+    if (flySecretsWarning) {
+      if (flySecrets.source === 'env') {
+        flySecretsWarning.classList.remove('hidden');
+      } else {
+        flySecretsWarning.classList.add('hidden');
+      }
+    }
 
     if (runnerMode.mode !== 'default') {
       const bannerKind = runnerMode.mode === 'shadow' ? 'warn' : 'info';
@@ -304,6 +334,15 @@ export const runnersScript = `
     }
   }
 
+  async function setFlyProcessLevelSecrets(enabled) {
+    try {
+      await window.api('/api/runner-mode', { method: 'POST', body: JSON.stringify({ flyProcessLevelSecrets: enabled }) });
+      loadRunners();
+    } catch (err) {
+      console.error('setFlyProcessLevelSecrets failed:', err);
+    }
+  }
+
   async function unparkIssue(issueId) {
     const errEl = document.getElementById('runners-error');
     try {
@@ -324,6 +363,7 @@ export const runnersScript = `
 
   window.loadRunners = loadRunners;
   window.setRunnerMode = setRunnerMode;
+  window.setFlyProcessLevelSecrets = setFlyProcessLevelSecrets;
   window.unparkIssue = unparkIssue;
   window.registerPage('runners', function () { loadRunners(); setInterval(loadRunners, 30000); });
 })();

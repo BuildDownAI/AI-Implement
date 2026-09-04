@@ -2,7 +2,7 @@ import type { RepoMapping } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
 import { getLatestDispatchForPr, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications } from "./log.js";
-import { resolveExecutionPath, getFlySecretsMinVersion, type RunnerMode } from "./runner-mode.js";
+import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { buildEnvelopeDispatchInputs, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv } from "./github.js";
 import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
@@ -34,7 +34,6 @@ export interface DrainCommentGapfillsInput {
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   sessionImage: string;
-  flyProcessLevelSecrets: boolean;
 }
 
 function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapabilities {
@@ -211,7 +210,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           teamKey: scopeKey,
           teamSecretNames: allSecretNames,
           allTeamKeys: Object.keys(teamRepoMap),
-          flyProcessLevelSecrets: opts.flyProcessLevelSecrets,
+          flyProcessLevelSecrets: getFlyProcessLevelSecrets().enabled,
           minSecretsVersion: minSecretsVersion ?? undefined,
           orchestratorUrl: opts.runnerCallbackBaseUrl ?? undefined,
           runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -229,7 +228,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             return Object.keys(merged).length > 0 ? merged : undefined;
           })(),
         });
-        if (opts.flyProcessLevelSecrets) {
+        if (getFlyProcessLevelSecrets().enabled) {
           const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
           console.log(`[comment-gapfill] process-level secrets for ${prLog.issueIdentifier ?? prLog.issueId}: [${secretNames.join(", ")}]`);
         }
