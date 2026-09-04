@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -2943,6 +2943,7 @@ async function dispatchKgRefreshRun(
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
+  const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
   const sessionToken = generateSessionToken();
   const machineNonce = generateMachineNonce();
   const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig };
@@ -2956,7 +2957,7 @@ async function dispatchKgRefreshRun(
       issueDescription: "",
       owner: repo.owner,
       repo: repo.repo,
-      defaultBranch: "main",
+      defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
       githubToken: ghToken,
@@ -2985,7 +2986,7 @@ async function dispatchKgRefreshRun(
       issueDescription: "",
       owner: repo.owner,
       repo: repo.repo,
-      defaultBranch: "main",
+      defaultBranch,
       anthropicApiKey: config.anthropicApiKey ?? undefined,
       claudeOAuthToken: config.claudeOAuthToken ?? undefined,
       githubToken: ghToken,

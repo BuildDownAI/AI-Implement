@@ -570,7 +570,7 @@ describe("kg refresh card", () => {
   });
 
   it("shows a 409 deploy-held warning distinct from refresh-in-progress", () => {
-    expect(deploymentsScript).toContain("body.error === 'deploy-held'");
+    expect(deploymentsScript).toContain("body.error === 'deploy-in-progress'");
     expect(deploymentsScript).toContain("A deploy is in progress");
     expect(deploymentsScript).toContain("A refresh is already in progress.");
   });

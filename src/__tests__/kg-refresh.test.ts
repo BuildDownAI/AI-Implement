@@ -657,26 +657,27 @@ describe("kg-refresh", () => {
     });
 
     it("live TTL watchdog expires ingest-running without restart", async () => {
-      // Simulate a runner that never reports back by dispatching and then fast-forwarding
-      // past the TTL in a separate handle that was constructed with a stale ingest-running.
-      const staleStart = Date.now() - (4 * 60 * 60 * 1000 + 1000); // 1s past TTL
+      // Build a handle that restores running=true from persisted state within TTL.
+      const startedAt = Date.now() - 30_000; // 30s ago, well within 4h TTL
       buildDispatch({
-        loadStage: () => ({ stage: "ingest-running" as KgRefreshStage, startedAt: staleStart }),
+        loadStage: () => ({ stage: "ingest-running" as KgRefreshStage, startedAt }),
       });
-      // Within-TTL check restores running. But staleStart is beyond the 4h TTL, so
-      // it should have been cleared at construction. Use a fresh build with a just-expired
-      // start time to test the live path instead.
-      // Build a fresh handle with in-memory dispatch so ingestStartedAt is set.
-      buildDispatch();
-      await handle.trigger();
-      await waitForStage("ingest-running");
-      // Directly invoke trigger() again; running is true but TTL not elapsed — 409.
-      const second = await handle.trigger();
-      expect(second.status).toBe(409);
-      // The live TTL path is exercised by the constructor-TTL test above;
-      // assert the watchdog fires when ingestStartedAt is old enough.
-      // (Full real-clock test is impractical; the logic path is covered by the two
-      // construction tests and the explicit watchdog code path.)
+      // Advance Date.now past the TTL so the in-trigger watchdog fires.
+      const advancedNow = startedAt + 4 * 60 * 60 * 1000 + 1000;
+      const spy = vi.spyOn(Date, "now").mockReturnValue(advancedNow);
+      try {
+        // trigger() should detect TTL expiry, clear the lock, and dispatch a new run.
+        const r = await handle.trigger();
+        expect(r.status).toBe(202);
+        // The dispatch is async — wait for it to land before asserting.
+        await waitForStage("ingest-running");
+        expect(dispatchRun).toHaveBeenCalledOnce();
+        const s = await handle.status();
+        expect(s.stage).toBe("ingest-running");
+        expect(s.running).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 });

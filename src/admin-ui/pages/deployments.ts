@@ -648,7 +648,7 @@ export const deploymentsScript = `
         const body = await res.json().catch(function () { return {}; });
         if (res.status === 422 && body.precondition === 'callback-unconfigured') {
           showMessage('warning', 'Refresh requires a configured runner callback \u2014 set RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET on the orchestrator.');
-        } else if (res.status === 409 && body.error === 'deploy-held') {
+        } else if (res.status === 409 && body.error === 'deploy-in-progress') {
           showMessage('warning', 'A deploy is in progress \u2014 try again after it completes.');
         } else if (res.status === 409) {
           showMessage('warning', 'A refresh is already in progress.');
