@@ -789,6 +789,37 @@ describe("handleMcpRequest", () => {
       expect(data[0].elapsedSeconds).toBeGreaterThanOrEqual(60);
     });
 
+    it("list_in_flight_jobs tolerates null issueIdentifier for kg-refresh rows", async () => {
+      const now = Date.now();
+      (logMock.getInFlightJobs as ReturnType<typeof vi.fn>).mockReturnValue([
+        {
+          id: 42,
+          issueIdentifier: null,
+          issueTitle: null,
+          repo: null,
+          phase: "kg-refresh",
+          status: "dispatched",
+          dispatchedAt: now - 30_000,
+        },
+      ]);
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "list_in_flight_jobs", arguments: {} } }),
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data).toHaveLength(1);
+      expect(data[0].issueIdentifier).toBeNull();
+      expect(data[0].phase).toBe("kg-refresh");
+      expect(data[0].elapsedSeconds).toBeGreaterThanOrEqual(30);
+    });
+
     it("handles get_issue_dispatch_status for an in-flight issue", async () => {
       const now = Date.now();
       (dedupMock.getDb as ReturnType<typeof vi.fn>).mockReturnValue({

@@ -3012,7 +3012,7 @@ async function handleKgRefreshOutcome(
 async function dispatchKgRefreshRun(
   config: AppConfig,
   opts: { runToken: string; dispatchId: string; runConfig: string },
-): Promise<void> {
+): Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
@@ -3044,8 +3044,9 @@ async function dispatchKgRefreshRun(
       expectedTtlSeconds: 4 * 60 * 60,
       extraEnv,
     });
-    await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
+    const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
     console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
+    return { machineId: machine.id, machineNonce, logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${machine.id}` };
   } else if (config.localRunnerImage) {
     const localOrchestratorUrl =
       config.localRunnerOrchestratorUrl ??
@@ -3072,6 +3073,7 @@ async function dispatchKgRefreshRun(
       extraEnv,
     });
     console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${opts.dispatchId})`);
+    return { machineNonce };
   } else {
     throw new Error(
       "No execution backend configured for kg-refresh dispatch: " +
@@ -3092,6 +3094,21 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     dispatchRun: (opts) => dispatchKgRefreshRun(config, opts),
     onOutcome: (outcome, data) => {
       void handleKgRefreshOutcome(config, registry, outcome, data);
+    },
+    appendJobLog: (opts) => {
+      const jobId = appendLog({
+        issueId: "kg-refresh",
+        phase: "kg-refresh",
+        dispatchId: opts.dispatchId,
+        machineNonce: opts.machineNonce,
+        machineId: opts.machineId,
+        executionMode: config.flySessionsToken && config.flySessionsApp ? "fly-machines" : "local-docker",
+      });
+      if (opts.logsUrl) updateJobPrUrl(jobId, opts.logsUrl);
+      return jobId;
+    },
+    closeJobLog: (jobId, status) => {
+      updateJobStatus(jobId, status);
     },
   });
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
