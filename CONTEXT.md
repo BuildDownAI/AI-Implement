@@ -71,3 +71,9 @@ A test target is the deployed environment a recipe runs against. The first test 
 A preview environment is a deployment of one PR branch, reachable before merge, used as a test target and torn down after use. In AI-Implement a preview environment is one Fly machine in the standing previews app (ADR 012).
 
 **Not to be confused with:** The testing orchestrator, which is the standing post-merge environment.
+
+## Reference repository
+
+A reference repository is a second repository that a run clones read-only at dispatch, so the agent can check a claim against real source. A project mapping declares each one with a workspace path and an optional ref.
+
+**Not to be confused with:** The knowledge graph, which serves prose — issues, decisions, and documentation — and holds no source code. Also not a sibling repository, which Dependency Token Scope makes readable so a dependency install can resolve private packages.

@@ -1008,6 +1008,85 @@ describe("admin mappings", () => {
     expect(JSON.parse(create.body).skillsRepo).toBe("https://GitHub.com/acme/skills.git");
   });
 
+  it("persists referenceRepos and expands shorthand at storage time", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RR1", owner: "org", repo: "app",
+      referenceRepos: [
+        { repo: "acme/docs", path: "docs-source", ref: "v1.1.0" },
+        { repo: "https://github.com/acme/api", path: "api-source" },
+      ],
+    }, token);
+    expect(create.statusCode).toBe(202);
+
+    const list = await request("/api/mappings", "GET", "secret", undefined, token);
+    expect(JSON.parse(list.body).RR1.referenceRepos).toEqual([
+      { repo: "https://github.com/acme/docs", path: "docs-source", ref: "v1.1.0" },
+      { repo: "https://github.com/acme/api", path: "api-source" },
+    ]);
+  });
+
+  it("stores an entry with no ref and reads it back without one", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RR2", owner: "org", repo: "app",
+      referenceRepos: [{ repo: "acme/docs", path: "docs-source" }],
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).referenceRepos[0]).not.toHaveProperty("ref");
+  });
+
+  it("treats an empty referenceRepos list as null", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RR3", owner: "org", repo: "app", referenceRepos: [],
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).referenceRepos).toBeNull();
+  });
+
+  // Regression guard: an absent field must store null, not undefined. A mapping saved
+  // before this setting existed is the same case, and every downstream consumer
+  // conditionally spreads on it.
+  it("stores null when referenceRepos is absent from the request", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RR4", owner: "org", repo: "app",
+    }, token);
+    expect(create.statusCode).toBe(202);
+    expect(JSON.parse(create.body).referenceRepos).toBeNull();
+  });
+
+  it.each([
+    ["a non-array", "RRBAD1", "acme/docs"],
+    ["a non-GitHub host", "RRBAD2", [{ repo: "https://gitlab.com/acme/docs", path: "x" }]],
+    ["an absolute path", "RRBAD3", [{ repo: "acme/docs", path: "/etc" }]],
+    ["a traversal path", "RRBAD4", [{ repo: "acme/docs", path: "../outside" }]],
+    ["a path inside .git", "RRBAD5", [{ repo: "acme/docs", path: ".git/hooks" }]],
+    ["two entries sharing a path", "RRBAD6", [
+      { repo: "acme/a", path: "same" },
+      { repo: "acme/b", path: "same" },
+    ]],
+    ["an entry missing its path", "RRBAD7", [{ repo: "acme/docs" }]],
+  ])("rejects referenceRepos with %s", async (_label, teamKey, value) => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey, owner: "org", repo: "app", referenceRepos: value,
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("referenceRepos");
+  });
+
+  it("rejects more than ten referenceRepos entries", async () => {
+    const token = await login("secret");
+    const res = await request("/api/mappings", "POST", "secret", {
+      teamKey: "RRMANY", owner: "org", repo: "app",
+      referenceRepos: Array.from({ length: 11 }, (_, i) => ({ repo: "acme/docs", path: `p${i}` })),
+    }, token);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("referenceRepos");
+  });
+
   it("clears skillsRepo when an existing mapping is updated to null", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {
