@@ -206,19 +206,26 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   let running = false;
   let lastRefresh: RefreshOutcome | null = null;
   let stage: KgRefreshStage = "idle";
+  /** Timestamp of the ingest dispatch, tracked for the live TTL watchdog in trigger(). */
+  let ingestStartedAt: number | null = null;
 
   // Restore persisted state on construction (crash recovery).
-  // If a previous ingest-running is within TTL, restore it; otherwise clear.
   const persisted = loadStageFn();
   if (persisted && persisted.stage === "ingest-running") {
     const ageMs = Date.now() - persisted.startedAt;
     if (ageMs < KG_REFRESH_TTL_MS) {
       running = true;
       stage = "ingest-running";
+      ingestStartedAt = persisted.startedAt;
     } else {
       // TTL expired — clear the stale lock so a new dispatch can proceed.
       persistStageFn("idle", Date.now());
     }
+  } else if (persisted && (persisted.stage === "snapshot-landed" || persisted.stage === "staging")) {
+    // Orchestrator restarted during the local rail. The runner token was already consumed,
+    // so no callback will arrive to resume. Fail fast so the operator can retry.
+    persistStageFn("failed", Date.now());
+    stage = "failed";
   }
 
   const currentDir = join(dataRoot, "current");
@@ -415,6 +422,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
    */
   async function runRefreshAndSettle(): Promise<void> {
     stage = "staging";
+    persistStageFn("staging", Date.now());
     const outcome = await runRefresh().catch((err): RefreshOutcome => ({
       ok: false,
       at: Date.now(),
@@ -431,6 +439,23 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
   return {
     async trigger() {
+      // Self-heal: if a dispatched runner never reported back and the TTL has elapsed
+      // in the live process, expire the lock so the operator can trigger a new refresh.
+      if (running && stage === "ingest-running" && ingestStartedAt !== null &&
+          Date.now() - ingestStartedAt >= KG_REFRESH_TTL_MS) {
+        lastRefresh = {
+          ok: false,
+          at: Date.now(),
+          gate: "staging",
+          detail: "ingest runner timed out — no callback received within TTL",
+          stampBefore: null,
+          stampAfter: null,
+        };
+        running = false;
+        stage = "failed";
+        ingestStartedAt = null;
+        persistStageFn("failed", Date.now());
+      }
       if (running) return { status: 409, body: { error: "refresh-in-progress" } };
       if (deployHeld()) {
         return { status: 409, body: { error: "deploy-in-progress", detail: "a deploy holds the machine; refresh refused" } };
@@ -499,7 +524,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
             await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
             stage = "ingest-running";
-            persistStageFn("ingest-running", Date.now());
+            ingestStartedAt = Date.now();
+            persistStageFn("ingest-running", ingestStartedAt);
             console.log(`[kg-refresh] dispatched kg-refresh runner (dispatchId=${dispatchId})`);
             // running stays true — onRunnerComplete clears it when the runner reports back
           } else {
@@ -528,6 +554,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     },
 
     onRunnerComplete(runnerOutcome, data) {
+      // Past the ingest phase — clear the live TTL watchdog.
+      ingestStartedAt = null;
       if (!running) {
         // Orchestrator may have restarted between dispatch and callback.
         // Re-enter the critical section to process the result.
@@ -551,7 +579,25 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         return;
       }
 
-      // Runner succeeded. Verify the snapshot commit is visible (git-cache lag).
+      // Runner succeeded. Guard against a null kgSourceRepo (e.g. env var cleared after
+      // the token was minted) before calling parseKgSourceRepo, which throws on null.
+      if (!input.kgSourceRepo) {
+        lastRefresh = {
+          ok: false,
+          at: Date.now(),
+          gate: "staging",
+          detail: "kg source repo not configured — cannot verify snapshot commit",
+          stampBefore: null,
+          stampAfter: null,
+        };
+        running = false;
+        stage = "failed";
+        persistStageFn("failed", Date.now());
+        console.error("[kg-refresh] runner callback received but kgSourceRepo is null");
+        return;
+      }
+
+      // Verify the snapshot commit is visible (git-cache lag).
       const repo = parseKgSourceRepo(input.kgSourceRepo);
       const snapshotCommit = data.snapshotCommit;
 
@@ -592,6 +638,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         }
 
         stage = "snapshot-landed";
+        persistStageFn("snapshot-landed", Date.now());
         console.log(`[kg-refresh] snapshot commit confirmed, triggering local rail`);
 
         // The runner has pushed a new snapshot commit. Run the local rail to

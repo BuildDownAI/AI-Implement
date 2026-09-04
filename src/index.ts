@@ -3015,9 +3015,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     kgSourceRepo: config.kgSourceRepo,
     runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
     runnerTokenSecret: config.runnerTokenSecret,
-    dispatchRun: config.runnerCallbackBaseUrl && config.runnerTokenSecret
-      ? (opts) => dispatchKgRefreshRun(config, opts)
-      : undefined,
+    dispatchRun: (opts) => dispatchKgRefreshRun(config, opts),
   });
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);

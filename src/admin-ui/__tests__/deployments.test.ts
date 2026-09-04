@@ -508,6 +508,74 @@ describe("deployments page", () => {
   });
 });
 
+describe("kg refresh card", () => {
+  it("declares the kg-refresh element ids", () => {
+    for (const id of ["kg-refresh-card", "kg-refresh-badge", "kg-refresh-stamp", "kg-refresh-last", "kg-refresh-btn"]) {
+      expect(deploymentsHtml).toContain(`id="${id}"`);
+    }
+  });
+
+  it("calls /api/kg/status for status", () => {
+    expect(deploymentsScript).toContain("/api/kg/status");
+  });
+
+  it("exposes triggerKgRefresh", () => {
+    expect(deploymentsScript).toContain("window.triggerKgRefresh");
+  });
+
+  it("posts to /api/kg/refresh for the refresh trigger", () => {
+    expect(deploymentsScript).toContain("window.api('/api/kg/refresh', { method: 'POST' })");
+  });
+
+  it("maps every stage to a badge via setBadge", () => {
+    // Each new stage must pass through setBadge — a textContent write drops the dot span.
+    for (const [kind, label] of [
+      ["running", "checking"],
+      ["running", "running"],   // ingest-running
+      ["running", "landing"],   // snapshot-landed
+      ["running", "staging"],
+      ["ok", "serving"],
+      ["warn", "reverted"],
+      ["fail", "failed"],
+      ["warn", "degraded"],     // kgDegraded fallback
+      ["neutral", "stale"],     // ingest-needed fallback
+    ] as const) {
+      expect(deploymentsScript).toContain(`, '${kind}', '${label}')`);
+    }
+  });
+
+  it("emits stage-specific progress text for each in-progress stage", () => {
+    expect(deploymentsScript).toContain("Checking KG source repo for a newer snapshot");
+    expect(deploymentsScript).toContain("Runner job dispatched");
+    expect(deploymentsScript).toContain("waiting for snapshot commit");
+    expect(deploymentsScript).toContain("Snapshot commit confirmed");
+    expect(deploymentsScript).toContain("starting local staging");
+    expect(deploymentsScript).toContain("Staging new graph overlay");
+  });
+
+  it("falls back to running:true for older responses without a stage field", () => {
+    // Older orchestrators omit stage; the UI must not crash or show an empty badge.
+    expect(deploymentsScript).toContain("data.stage || (data.running ? 'checking' : 'idle')");
+  });
+
+  it("disables the refresh button while running or deploy-held", () => {
+    expect(deploymentsScript).toContain("!!data.running || !!data.deployHeld");
+  });
+
+  it("shows the 422 callback-unconfigured message as a warning, not an error", () => {
+    // The 422 is an expected configuration gap, not a server fault.
+    expect(deploymentsScript).toContain("res.status === 422 && body.precondition === 'callback-unconfigured'");
+    expect(deploymentsScript).toContain("RUNNER_CALLBACK_BASE_URL");
+    expect(deploymentsScript).toContain("RUNNER_TOKEN_SECRET");
+  });
+
+  it("shows a 409 deploy-held warning distinct from refresh-in-progress", () => {
+    expect(deploymentsScript).toContain("body.error === 'deploy-held'");
+    expect(deploymentsScript).toContain("A deploy is in progress");
+    expect(deploymentsScript).toContain("A refresh is already in progress.");
+  });
+});
+
 describe("fmtElapsed", () => {
   // The page ships as one concatenated script string, so its helpers are only reachable
   // by extraction. Worth the reach here: the interesting behaviour is the 60s and 60m
