@@ -134,6 +134,20 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     // paths (e.g. ai-output/) uncommittable before any downstream `git add`.
     prepareScratchExclusion(workspaceDir);
 
+    // Set workspace-local git identity so every commit made in the feedback
+    // loop — including agent merge commits — carries the bot identity rather
+    // than a platform fallback. Scoped to .git/config (no --global) so HOME
+    // lookup cannot override it. Push.ts sets the same identity again before
+    // its own commit as a second line of defence; these calls are fail-soft.
+    spawnSync("git", ["config", "user.name", "ai-implement[bot]"], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    spawnSync("git", ["config", "user.email", "ai-implement[bot]@users.noreply.github.com"], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
     const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
       cwd: workspaceDir,
       stdio: ["ignore", "pipe", "pipe"],
