@@ -779,7 +779,7 @@ describe("buildSessionMachineConfig", () => {
   });
 
   describe("flyProcessLevelSecrets flag", () => {
-    it("flag off: output is byte-identical to today (no processes, AI_IMPLEMENT_* env vars set)", () => {
+    it("flag off (explicit false): output is byte-identical to today (no processes, AI_IMPLEMENT_* env vars set)", () => {
       const result = buildSessionMachineConfig({
         ...baseInput,
         teamKey: "SAN",

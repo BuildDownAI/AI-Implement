@@ -214,7 +214,7 @@ Editable per mapping; blank means the default.
 | Sensitive Add / Allow Globs | none | Extends or un-blocks the push step's blocklist; **allow always wins** |
 | Dependency Token Scope | off | `installation` lets the run read private sibling repos during dependency install |
 
-**Secrets** seeded via the Projects-row action stop at the hooks — they are stripped from the model process and the agent never sees them. **Extra Env** entries are passed through to the model process and are visible to the agent.
+**Secrets** seeded via the Projects-row action stop at the hooks — they are stripped from the model process and the agent never sees them. On Fly, they are also excluded at the Fly boundary by default (process-level mode). **Extra Env** entries are passed through to the model process and are visible to the agent.
 
 Caps apply to re-dispatches, not just initial runs. Branch prefix affects only the initial run — gap-fill commits to the existing PR branch. Sensitive-file globs travel **exclusively** in the envelope, so a repo must be on envelope generation before setting them.
 

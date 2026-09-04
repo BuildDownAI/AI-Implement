@@ -60,7 +60,7 @@ export const runnersHtml = `
             <span>Enable</span>
           </label>
         </div>
-        <div class="card-subtitle" style="margin-top:8px">Fly builds machines with <code>ignore_app_secrets</code> and an explicit secret list; off means the runner entrypoint filters secrets after Fly injects them.</div>
+        <div class="card-subtitle" style="margin-top:8px">Process-level mode is on by default; disabling it falls back to the runner entrypoint filtering secrets after Fly injects them.</div>
       </div>
     </div>
 
