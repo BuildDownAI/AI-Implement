@@ -44,7 +44,7 @@ import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
 import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
-import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
+import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -523,6 +523,13 @@ export function handleAdminRequest(
       return true;
     }
 
+    const machineLogsMatch = /^\/api\/sessions\/([^/]+)\/logs$/.exec(url);
+    if (machineLogsMatch && method === "GET") {
+      const machineId = decodeURIComponent(machineLogsMatch[1]);
+      handleGetMachineLogs(req, res, config, machineId);
+      return true;
+    }
+
     if (url.startsWith("/api/sessions/") && method === "DELETE") {
       const machineId = decodeURIComponent(url.slice("/api/sessions/".length));
       handleDestroySession(req, res, config, registry, machineId);
@@ -918,6 +925,30 @@ async function handleDestroySession(
   }
 
   json(res, 200, { destroyed: true });
+}
+
+async function handleGetMachineLogs(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+  machineId: string,
+): Promise<void> {
+  if (!config.flySessionsToken || !config.flySessionsApp) {
+    json(res, 503, { error: "Fly sessions config not set" });
+    return;
+  }
+
+  try {
+    const logs = await fetchMachineLogs(config.flySessionsToken, config.flySessionsApp, machineId, 200);
+    json(res, 200, { logs });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("(404)")) {
+      json(res, 404, { error: "Logs no longer available" });
+    } else {
+      json(res, 500, { error: msg });
+    }
+  }
 }
 
 async function handleAuth(
