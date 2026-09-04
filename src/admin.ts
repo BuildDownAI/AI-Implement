@@ -24,6 +24,9 @@ import {
   isRunnerMode,
   setFlySecretsMinVersion,
   checkForcedPathEligibility,
+  getFlyProcessLevelSecrets,
+  setFlyProcessLevelSecrets,
+  type RunnerMode,
 } from "./runner-mode.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
 import { listParked, unpark } from "./dispatch-breaker.js";
@@ -506,7 +509,7 @@ export function handleAdminRequest(
         .map(([teamKey, m]) => ({ teamKey, ...checkForcedPathEligibility(status.mode, m, Boolean(config.flySessionsApp)) }))
         .filter((e) => !e.eligible)
         .map((e) => ({ teamKey: e.teamKey, reason: e.reason }));
-      json(res, 200, { ...status, ineligible });
+      json(res, 200, { ...status, ineligible, flyProcessLevelSecrets: getFlyProcessLevelSecrets() });
       return true;
     }
 
@@ -754,37 +757,71 @@ async function handleSetRunnerMode(
   config: AdminConfig,
 ): Promise<void> {
   try {
-    const body = JSON.parse(await readBody(req)) as { mode?: string };
-    if (!isRunnerMode(body.mode)) {
+    const body = JSON.parse(await readBody(req)) as { mode?: string; flyProcessLevelSecrets?: boolean };
+    const hasMode = body.mode !== undefined;
+    const hasFlySecrets = body.flyProcessLevelSecrets !== undefined;
+
+    if (!hasMode && !hasFlySecrets) {
       json(res, 400, { error: `mode must be one of: ${VALID_RUNNER_MODES.join(", ")}` });
       return;
     }
-    const previous = getRunnerMode();
-    setRunnerMode(body.mode);
-    const status = getRunnerMode();
-    // AII-306: swap observability — an execution-mode change is an operational
-    // event, not a quiet preference. Log it and fire the notify hook best-effort.
-    if (previous.mode !== status.mode) {
-      console.log(`[admin] Runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`);
-      if (config.notifyWebhookUrl) {
-        notifyText(
-          config.notifyWebhookUrl,
-          `⚙️ AI-Implement runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`,
-        ).catch((err) => console.error("[admin] runner-mode notify failed:", err));
+
+    if (hasMode && !isRunnerMode(body.mode)) {
+      json(res, 400, { error: `mode must be one of: ${VALID_RUNNER_MODES.join(", ")}` });
+      return;
+    }
+
+    if (hasMode) {
+      const previous = getRunnerMode();
+      setRunnerMode(body.mode as RunnerMode);
+      const status = getRunnerMode();
+      // AII-306: swap observability — an execution-mode change is an operational
+      // event, not a quiet preference. Log it and fire the notify hook best-effort.
+      if (previous.mode !== status.mode) {
+        console.log(`[admin] Runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`);
+        if (config.notifyWebhookUrl) {
+          notifyText(
+            config.notifyWebhookUrl,
+            `⚙️ AI-Implement runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`,
+          ).catch((err) => console.error("[admin] runner-mode notify failed:", err));
+        }
       }
     }
-    // The DB write succeeded but the RUNNER_MODE env var still wins at
-    // runtime. Return 409 so direct API callers (not the UI, which already
-    // disables the buttons) can tell their write was overridden.
-    if (status.source === "env") {
+
+    if (hasFlySecrets) {
+      const previousSecrets = getFlyProcessLevelSecrets();
+      setFlyProcessLevelSecrets(body.flyProcessLevelSecrets!);
+      const secretsStatus = getFlyProcessLevelSecrets();
+      if (previousSecrets.enabled !== secretsStatus.enabled) {
+        console.log(`[admin] Fly process-level secrets changed: ${previousSecrets.enabled} → ${secretsStatus.enabled} (via admin API)`);
+        if (config.notifyWebhookUrl) {
+          notifyText(
+            config.notifyWebhookUrl,
+            `⚙️ AI-Implement Fly process-level secrets changed: ${previousSecrets.enabled} → ${secretsStatus.enabled} (via admin API)`,
+          ).catch((err) => console.error("[admin] fly-process-level-secrets notify failed:", err));
+        }
+      }
+    }
+
+    const modeStatus = getRunnerMode();
+    const secretsStatus = getFlyProcessLevelSecrets();
+
+    // The DB write succeeded but an env var still wins at runtime. Return 409
+    // so direct API callers can tell their write was overridden.
+    if ((hasMode && modeStatus.source === "env") || (hasFlySecrets && secretsStatus.source === "env")) {
+      const modeConflict = hasMode && modeStatus.source === "env";
       json(res, 409, {
-        error: "RUNNER_MODE env var is set; persisted to DB but has no effect at runtime until the env var is unset",
-        persisted: body.mode,
-        ...status,
+        error: modeConflict
+          ? "RUNNER_MODE env var is set; persisted to DB but has no effect at runtime until the env var is unset"
+          : "FLY_PROCESS_LEVEL_SECRETS env var is set; persisted to DB but has no effect at runtime until the env var is unset",
+        ...(hasMode ? { persisted: body.mode } : {}),
+        ...modeStatus,
+        flyProcessLevelSecrets: secretsStatus,
       });
       return;
     }
-    json(res, 200, status);
+
+    json(res, 200, { ...modeStatus, flyProcessLevelSecrets: secretsStatus });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }

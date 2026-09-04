@@ -39,7 +39,7 @@ import { postStatusComment } from "./status-events.js";
 import { classifyCompletion, renderClassification } from "./completion-classification.js";
 import { createMachine, getMachine, listMachines, destroyMachine, generateSessionToken, generateMachineNonce, buildSessionMachineConfig, listAppSecrets, fetchMachineLogs, updateMachineMetadata, readMachineExitCode } from "./fly-machines.js";
 import { safeDestroyMachine, sweepOrphanedMachines, SWEEP_MACHINE_MAX_AGE_MS } from "./reaper.js";
-import { getRunnerMode, getFlySecretsMinVersion, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
+import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, initSettingsTable, resolveExecutionPath, resolvePlanningExecutionPath, resolveRunnerCallbackBaseUrl, checkForcedPathEligibility } from "./runner-mode.js";
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
@@ -108,7 +108,6 @@ interface AppConfig {
   flySessionsRegion: string | null;
   flyOrchestratorApp: string | null;
   flyDeployToken: string | null;
-  flyProcessLevelSecrets: boolean;
   tenantId: string | null;
   sessionImage: string;
   /** Deprecation state of SESSION_IMAGE, used for the startup warning. */
@@ -234,7 +233,6 @@ function loadConfig(): AppConfig {
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     flyDeployToken: process.env.FLY_DEPLOY_TOKEN || null,
-    flyProcessLevelSecrets: process.env.FLY_PROCESS_LEVEL_SECRETS === "true",
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
     sessionImage: defaultRunner.image,
     sessionImageStatus: defaultRunner.sessionImageStatus,
@@ -710,7 +708,6 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       anthropicApiKey: config.anthropicApiKey,
       claudeOAuthToken: config.claudeOAuthToken,
       sessionImage: config.sessionImage,
-      flyProcessLevelSecrets: config.flyProcessLevelSecrets,
     });
   }
 
@@ -1120,7 +1117,7 @@ async function dispatchPlanning(
             teamKey: issue.scopeKey,
             teamSecretNames: allSecretNames,
             allTeamKeys: Object.keys(getMappings()),
-            flyProcessLevelSecrets: config.flyProcessLevelSecrets,
+            flyProcessLevelSecrets: getFlyProcessLevelSecrets().enabled,
             minSecretsVersion: minSecretsVersion ?? undefined,
             orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -1133,7 +1130,7 @@ async function dispatchPlanning(
               return Object.keys(merged).length > 0 ? merged : undefined;
             })(),
           });
-          if (config.flyProcessLevelSecrets) {
+          if (getFlyProcessLevelSecrets().enabled) {
             const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
             console.log(`[poll] process-level secrets for ${issue.identifier} planning: [${secretNames.join(", ")}]`);
           }
@@ -1566,7 +1563,7 @@ async function dispatchFlyMachine(
         teamKey: issue.scopeKey,
         teamSecretNames: allSecretNames,
         allTeamKeys: Object.keys(getMappings()),
-        flyProcessLevelSecrets: config.flyProcessLevelSecrets,
+        flyProcessLevelSecrets: getFlyProcessLevelSecrets().enabled,
         minSecretsVersion: minSecretsVersion ?? undefined,
         orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -1579,7 +1576,7 @@ async function dispatchFlyMachine(
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
-      if (config.flyProcessLevelSecrets) {
+      if (getFlyProcessLevelSecrets().enabled) {
         const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
         console.log(`[poll] process-level secrets for ${issue.identifier}: [${secretNames.join(", ")}]`);
       }
