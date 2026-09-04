@@ -107,6 +107,11 @@ export interface KgRefreshHandle {
     outcome: "success" | "failure",
     data: { snapshotCommit?: string; failureCode?: string; failureReason?: string },
   ): void;
+  /**
+   * Called by the reaper when the runner machine is found absent from the registry.
+   * A no-op when stage is not "ingest-running" (idempotent; safe to call after TTL or callback).
+   */
+  onMachineLost(): void;
 }
 
 interface KgRefreshInput {
@@ -491,34 +496,40 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     if (savedJobId !== null) input.closeJobLog?.(savedJobId, outcome.ok ? "completed" : "failed");
   }
 
+  /** Shared terminal path for lost/timed-out ingest runners. No-op when stage ≠ ingest-running. */
+  function failIngestRunner(reason: string): void {
+    if (stage !== "ingest-running") return;
+    lastRefresh = {
+      ok: false,
+      at: Date.now(),
+      gate: "staging",
+      detail: reason,
+      stampBefore: null,
+      stampAfter: null,
+    };
+    running = false;
+    stage = "failed";
+    ingestStartedAt = null;
+    persistStageFn("failed", Date.now());
+    const savedJobId = currentJobId;
+    currentJobId = null;
+    const savedId = currentDispatchId;
+    currentDispatchId = null;
+    void input.onOutcome?.("failure", {
+      failureReason: reason,
+      dispatchId: savedId ?? undefined,
+      timedOut: true,
+    });
+    if (savedJobId !== null) input.closeJobLog?.(savedJobId, "timed_out");
+  }
+
   return {
     async trigger() {
       // Self-heal: if a dispatched runner never reported back and the TTL has elapsed
       // in the live process, expire the lock so the operator can trigger a new refresh.
       if (running && stage === "ingest-running" && ingestStartedAt !== null &&
           Date.now() - ingestStartedAt >= KG_REFRESH_TTL_MS) {
-        lastRefresh = {
-          ok: false,
-          at: Date.now(),
-          gate: "staging",
-          detail: "ingest runner timed out — no callback received within TTL",
-          stampBefore: null,
-          stampAfter: null,
-        };
-        running = false;
-        stage = "failed";
-        ingestStartedAt = null;
-        persistStageFn("failed", Date.now());
-        const savedJobId = currentJobId;
-        currentJobId = null;
-        const savedId = currentDispatchId;
-        currentDispatchId = null;
-        void input.onOutcome?.("failure", {
-          failureReason: "ingest runner timed out — no callback received within TTL",
-          dispatchId: savedId ?? undefined,
-          timedOut: true,
-        });
-        if (savedJobId !== null) input.closeJobLog?.(savedJobId, "timed_out");
+        failIngestRunner("ingest runner timed out — no callback received within TTL");
       }
       if (running) return { status: 409, body: { error: "refresh-in-progress" } };
       if (deployHeld()) {
@@ -798,6 +809,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         lastRefresh,
         stage,
       };
+    },
+
+    onMachineLost() {
+      if (stage !== "ingest-running") return;
+      console.log("[kg-refresh] machine absent — reaper closed the ingest runner job");
+      failIngestRunner("ingest runner machine absent — closed by reaper sweep");
     },
   };
 }

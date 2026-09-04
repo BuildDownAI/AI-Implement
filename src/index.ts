@@ -92,6 +92,9 @@ import { makeKgRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 
+/** Set by startServer(); read by poll() to wire the reaper's kg-refresh failure callback. */
+let activeKgRefresh: KgRefreshHandle | null = null;
+
 // ---------- Configuration ----------
 
 interface AppConfig {
@@ -665,6 +668,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     },
     findPrForIssue: async (repo, issueIdentifier) =>
       (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
+    failKgRefreshMachine: () => { activeKgRefresh?.onMachineLost(); },
   });
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
@@ -3111,6 +3115,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
       updateJobStatus(jobId, status);
     },
   });
+  activeKgRefresh = kgRefresh;
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
 
