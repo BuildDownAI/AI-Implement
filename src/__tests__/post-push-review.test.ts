@@ -2660,7 +2660,7 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
   });
 
-  it("exits cleanly with approved=true and pr_merged when PR is already merged at loop start", async () => {
+  it("exits cleanly with approved=true and pr_merged when PR is already merged at step entry", async () => {
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args[1]?.includes("/pulls/")) {
         return { stdout: '{"merged":true,"locked":false}', exitCode: 0 };
@@ -2679,7 +2679,7 @@ describe("postPushReviewStep", () => {
 
     expect(out.approved).toBe(true);
     expect(out.terminationReason).toBe("pr_merged");
-    expect(out.iterations).toBe(1);
+    expect(out.iterations).toBe(0);
     expect(invoke).not.toHaveBeenCalled();
     expect(gitSpawn).not.toHaveBeenCalled();
   });
@@ -2754,5 +2754,80 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(true);
     expect(out.terminationReason).toBe("approved");
     expect(invoke).toHaveBeenCalledOnce();
+  });
+  it("returns pr_merged at step entry when the PR was merged before the first status comment (locked conversation)", async () => {
+    // The step's first write is the start-marker comment, before the loop. A PR merged and
+    // locked in that window must exit as the benign pr_merged terminal, not fail on
+    // "issue is locked" — the exact bug this issue fixes (review finding).
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "api" && args[1]?.includes("/pulls/")) {
+        return { stdout: '{"merged":true,"locked":true}', exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "view") {
+        return { stdout: JSON.stringify({ state: "MERGED", merged: true }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        // Any comment would fail: the merged PR's conversation is locked.
+        return { stdout: "", stderr: "GraphQL: Issue is locked (addComment)", exitCode: 1 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 }));
+    const ctx = makeCtx(invoke);
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("pr_merged");
+    expect(out.iterations).toBe(0);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(ghSpawn.mock.calls.some((c) => c[0] === "pr" && c[1] === "comment")).toBe(false);
+  });
+  it("exits with pr_merged at the top of the next iteration when the PR is merged during a fix pass", async () => {
+    // The in-loop guard: the PR is open at entry and through the first review and fix pass, then
+    // merged under the run before the second iteration starts (an orchestrator defer that did not
+    // hold). The top-of-iteration check exits benign instead of reviewing a merged PR.
+    const approvedWithIssues = JSON.stringify({
+      approved: true,
+      issues: ["Escape quoted user input"],
+      feedback: "Minor issue worth addressing.",
+      score: 8,
+      progress_delta: 0,
+    });
+    let invokeCount = 0;
+    const gitSpawn = vi.fn((args: string[]) => {
+      // The fix pass produces a change, so the loop continues to a second iteration.
+      if (args[0] === "status") return { stdout: " M src/example.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "feature-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/feature-branch\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tsrc/example.ts\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42") {
+        // Open until the review and the fix pass have both run; merged from then on.
+        return { stdout: JSON.stringify({ merged: invokeCount >= 2, locked: false, head: { sha: "deadbeef44" } }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => {
+      invokeCount++;
+      return { stdout: approvedWithIssues, exitCode: 0, tokensUsed: 100 };
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("pr_merged");
+    expect(out.iterations).toBe(2);
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 });

@@ -814,6 +814,13 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
     try {
     probeIfPrClosed(ghSpawn, prNumber);
+    // A PR merged under the run before its first comment (a manual merge, or a defer that did not
+    // hold) must not fail on the locked conversation: the merged-only benign exit applies at step
+    // entry too, not only at the top of each iteration (review finding).
+    if (isPrMerged(ghSpawn, prNumber)) {
+      console.log(`[post-push-review] PR #${prNumber} was already merged at step entry — exiting cleanly`);
+      return { approved: true, iterations: 0, finalFeedback: "", forcePushedRevisions: 0, terminationReason: "pr_merged" };
+    }
     postPrComment(
       ghSpawn,
       prNumber,
