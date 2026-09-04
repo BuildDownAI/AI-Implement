@@ -1008,6 +1008,18 @@ describe("admin mappings", () => {
     expect(JSON.parse(create.body).skillsRepo).toBe("https://GitHub.com/acme/skills.git");
   });
 
+  // Previously accepted, then broken at clone time: install-skills injects its own token by
+  // replacing the https:// prefix, which on a value already carrying userinfo yields a
+  // malformed remote and a silent no-op.
+  it("rejects a skillsRepo URL that embeds a credential", async () => {
+    const token = await login("secret");
+    const create = await request("/api/mappings", "POST", "secret", {
+      teamKey: "SR9", owner: "org", repo: "app", skillsRepo: "https://user:tok@github.com/acme/skills",
+    }, token);
+    expect(create.statusCode).toBe(400);
+    expect(JSON.parse(create.body).error).toContain("skillsRepo");
+  });
+
   it("persists referenceRepos and expands shorthand at storage time", async () => {
     const token = await login("secret");
     const create = await request("/api/mappings", "POST", "secret", {
@@ -1068,6 +1080,8 @@ describe("admin mappings", () => {
       { repo: "acme/b", path: "same" },
     ]],
     ["an entry missing its path", "RRBAD7", [{ repo: "acme/docs" }]],
+    ["a credential embedded in the URL", "RRBAD8", [{ repo: "https://user:tok@github.com/acme/docs", path: "x" }]],
+    ["a backslash path separator", "RRBAD9", [{ repo: "acme/docs", path: "vendor\\upstream" }]],
   ])("rejects referenceRepos with %s", async (_label, teamKey, value) => {
     const token = await login("secret");
     const res = await request("/api/mappings", "POST", "secret", {

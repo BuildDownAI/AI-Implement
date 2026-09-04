@@ -24,12 +24,38 @@ describe("normalizeGitHubRepo", () => {
     ["an unparseable URL", "https://"],
     ["a bare word", "docs"],
     ["three path segments", "acme/docs/extra"],
+    ["a URL embedding a token", "https://x-access-token:ghs_SECRET@github.com/acme/docs"],
+    ["a URL embedding a bare username", "https://someone@github.com/acme/docs"],
   ])("rejects %s", (_label, value) => {
     expect(() => normalizeGitHubRepo(value, "referenceRepos")).toThrow(/referenceRepos/);
   });
 
   it("names the caller's field in the error, so one function serves two settings", () => {
     expect(() => normalizeGitHubRepo("git@github.com:a/b.git", "skillsRepo")).toThrow(/skillsRepo/);
+  });
+
+  it("distinguishes an embedded credential from a bad host", () => {
+    expect(() => normalizeGitHubRepo("https://user:tok@github.com/acme/docs", "referenceRepos"))
+      .toThrow(/must not embed a username or token/);
+  });
+
+  // The message reaches an admin API response and the logs behind it.
+  it("does not echo the credential back in the error", () => {
+    let message = "";
+    try {
+      normalizeGitHubRepo("https://x-access-token:ghs_SUPERSECRET@github.com/acme/docs", "referenceRepos");
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/must not embed/);
+    expect(message).not.toContain("ghs_SUPERSECRET");
+  });
+
+  // Userinfo precedes the host, so an @ later in the URL is not a credential.
+  it("accepts an @ in the path", () => {
+    expect(normalizeGitHubRepo("https://github.com/acme/docs@v1", "referenceRepos")).toBe(
+      "https://github.com/acme/docs@v1",
+    );
   });
 });
 
@@ -126,8 +152,16 @@ describe("normalizeReferenceRepos path rules", () => {
     ["whitespace only", "   "],
     ["the git directory", ".git"],
     ["a path inside the git directory", ".git/hooks"],
+    ["a backslash separator", "vendor\\upstream"],
+    ["a backslash traversal attempt", "vendor\\..\\..\\etc"],
   ])("rejects %s", (_label, value) => {
     expect(withPath(value)).toThrow();
+  });
+
+  // Backslash cannot traverse on the runner, so this is a typo guard rather than a
+  // security control — the message should say so.
+  it("tells the operator to use forward slashes", () => {
+    expect(withPath("vendor\\upstream")).toThrow(/must use forward slashes/);
   });
 
   it("rejects a path over 256 characters", () => {

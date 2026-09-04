@@ -73,15 +73,22 @@ export function normalizeGitHubRepo(raw: string, field: string): string {
   const v = raw.trim();
   if (REPO_SHORTHAND.test(v)) return `https://github.com/${v}`;
   let host: string | null = null;
+  let hasUserinfo = false;
   if (/^https:\/\/[^\s]+$/.test(v)) {
     try {
-      host = new URL(v).hostname.toLowerCase();
+      const parsed = new URL(v);
+      host = parsed.hostname.toLowerCase();
+      hasUserinfo = parsed.username !== "" || parsed.password !== "";
     } catch {
       host = null;
     }
   }
   if (host !== "github.com") {
     throw new Error(`${field} must be 'owner/repo' shorthand or an https://github.com/... URL (the runner clones with a GitHub token, so other hosts and SSH git@ URLs are not supported)`);
+  }
+  // A token here would survive into the clone's remote.origin.url, in a directory that persists for the whole run and that the agent is pointed at.
+  if (hasUserinfo) {
+    throw new Error(`${field} must not embed a username or token in the URL; the runner supplies its own credential at clone time`);
   }
   return v;
 }
@@ -95,6 +102,10 @@ function normalizePath(raw: string): string {
   }
   if (path.posix.isAbsolute(v) || /^[A-Za-z]:/.test(v)) {
     throw new Error(`path "${v}" must be relative to the workspace`);
+  }
+  // Not a traversal vector here — backslash is a literal filename character on the runner.
+  if (v.includes("\\")) {
+    throw new Error(`path "${v}" must use forward slashes`);
   }
 
   const normalized = path.posix.normalize(v).replace(/\/+$/, "");
