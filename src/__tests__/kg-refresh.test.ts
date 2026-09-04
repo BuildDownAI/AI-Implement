@@ -522,7 +522,7 @@ describe("kg-refresh", () => {
     }
 
     function buildDispatch(overrides: Record<string, unknown> = {}) {
-      dispatchRun = vi.fn(async () => {});
+      dispatchRun = vi.fn(async () => ({ machineNonce: "test-nonce" }));
       mintRunTokenFn = vi.fn(() => ({ token: "run-tok", dispatchId: "disp-1" }));
       fetchCommitVisible = vi.fn(async () => true);
       stageStore = null;
@@ -856,6 +856,146 @@ describe("kg-refresh", () => {
       const timedOutCall = onOutcome.mock.calls.find(([outcome]) => outcome === "failure");
       expect(timedOutCall).toBeDefined();
       expect(timedOutCall![1]).toMatchObject({ timedOut: true });
+    });
+
+    // ---- AII-517: appendJobLog / closeJobLog --------------------------------
+
+    it("appendJobLog called after successful dispatch with machineNonce from dispatchRun", async () => {
+      const appendJobLog = vi.fn(() => 42);
+      buildDispatch({
+        dispatchRun: vi.fn(async () => ({ machineNonce: "nonce-abc", machineId: "m-1", logsUrl: "https://fly.io/apps/a/machines/m-1" })),
+        appendJobLog,
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(appendJobLog).toHaveBeenCalledOnce();
+      expect(appendJobLog).toHaveBeenCalledWith({
+        dispatchId: "disp-1",
+        machineNonce: "nonce-abc",
+        machineId: "m-1",
+        logsUrl: "https://fly.io/apps/a/machines/m-1",
+      });
+    });
+
+    it("appendJobLog not called when dispatchRun is not configured", async () => {
+      const appendJobLog = vi.fn(() => 42);
+      // Build a handle where outcome is not ingest-needed (different snapshot SHA → local rail)
+      handle = makeKgRefresh({
+        sidecar: { restart: restart as unknown as () => Promise<void> },
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        dataRoot,
+        kgDir: "/nonexistent-kg",
+        sidecarMcpUrl: "http://127.0.0.1:1/mcp",
+        minFreeBytes: 1000,
+        deployHeld: () => deployHeld,
+        freeBytes: () => free,
+        mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
+        fetchTarball: vi.fn(async () => tarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        fetchSnapshotCommitSha: vi.fn(async () => "new-sha") as never,
+        persistSnapshotSha: vi.fn() as never,
+        loadSnapshotSha: vi.fn().mockReturnValue(null) as never,
+        materialize: materialize as never,
+        mcpToolCall: mcpToolCall as never,
+        canaryDeadlineMs: 300,
+        canaryRetryMs: 30,
+        appendJobLog,
+      });
+      await handle.trigger();
+      await waitDone();
+      expect(appendJobLog).not.toHaveBeenCalled();
+    });
+
+    it("closeJobLog called with timed_out on live TTL expiry", async () => {
+      // Live TTL: the process dispatched (appendJobLog called, currentJobId set),
+      // then the TTL elapses in the same process without a restart.
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 77);
+      // Always return the recorded SHA so both triggers go through the dispatch path.
+      buildDispatch({
+        appendJobLog,
+        closeJobLog,
+        fetchSnapshotCommitSha: vi.fn().mockResolvedValue(SNAPSHOT_SHA),
+      });
+
+      // First trigger — dispatches the runner; appendJobLog is called with jobId 77.
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(appendJobLog).toHaveBeenCalledOnce();
+
+      // Advance Date.now past TTL so the watchdog inside the second trigger() fires.
+      const advancedNow = Date.now() + 4 * 60 * 60 * 1000 + 1000;
+      const spy = vi.spyOn(Date, "now").mockReturnValue(advancedNow);
+      try {
+        // Second trigger — watchdog fires for job 77, then a new dispatch begins.
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        expect(closeJobLog).toHaveBeenCalledWith(77, "timed_out");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("closeJobLog called with failed on onRunnerComplete runner failure", async () => {
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 88);
+      buildDispatch({ appendJobLog, closeJobLog });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", { failureCode: "TIMEOUT", failureReason: "job timed out" });
+      await waitDone();
+      expect(closeJobLog).toHaveBeenCalledWith(88, "failed");
+    });
+
+    it("closeJobLog called with completed on KG_SNAPSHOT_STALE", async () => {
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 99);
+      buildDispatch({ appendJobLog, closeJobLog });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", { failureCode: "KG_SNAPSHOT_STALE" });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(closeJobLog).toHaveBeenCalledWith(99, "completed");
+    });
+
+    it("closeJobLog called with completed when rail succeeds after onRunnerComplete success", async () => {
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 100);
+      buildDispatch({ appendJobLog, closeJobLog });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", {});
+      await waitDone();
+      expect(closeJobLog).toHaveBeenCalledWith(100, "completed");
+    });
+
+    it("closeJobLog called with failed when rail fails after onRunnerComplete success", async () => {
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 101);
+      buildDispatch({
+        appendJobLog,
+        closeJobLog,
+        // mcpToolCall that fails the canary gate
+        mcpToolCall: vi.fn(async (_url: string, tool: string) => {
+          if (tool === "kg_hybrid_search") return { degraded: true, count: 0 };
+          return {};
+        }),
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", {});
+      await waitDone();
+      expect(closeJobLog).toHaveBeenCalledWith(101, "failed");
+    });
+
+    it("dispatch still succeeds when appendJobLog is not provided", async () => {
+      buildDispatch({ appendJobLog: undefined });
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      await waitForStage("ingest-running");
+      expect(dispatchRun).toHaveBeenCalledOnce();
     });
   });
 });

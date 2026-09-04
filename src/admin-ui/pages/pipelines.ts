@@ -149,8 +149,9 @@ export const pipelinesScript = `
           + (runnerMode ? ' <span style="color:var(--fg-tertiary);font-size:0.85em">(' + window.esc(runnerMode) + ')</span>' : '');
       }
       function phaseBadge(phase) {
-        const p = phase === 'planning' ? 'plan' : 'impl';
-        return makeBadge(p === 'plan' ? 'info' : 'neutral', p);
+        if (phase === 'planning') return makeBadge('info', 'plan');
+        if (phase === 'kg-refresh') return makeBadge('info', 'kg');
+        return makeBadge('neutral', 'impl');
       }
 
       // Group planning + implement phases that belong to the same job:
@@ -230,6 +231,7 @@ export const pipelinesScript = `
           const imageCell = entry.sessionImage
             ? '<td class="mono" title="' + window.escAttr(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
+          const linkText = entry.phase === 'kg-refresh' ? 'Logs \u2197' : 'View';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
             + '<td class="mono">' + issueLabel + '</td>'
@@ -239,7 +241,7 @@ export const pipelinesScript = `
             + '<td>' + runnerCell + '</td>'
             + imageCell
             + '<td>' + statusBadge(entry.status) + '</td>'
-            + '<td>' + (entry.prUrl ? '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">View</a>' : '—') + '</td>';
+            + '<td>' + (entry.prUrl ? '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">' + linkText + '</a>' : '—') + '</td>';
         }
         tbody.appendChild(tr);
       }
