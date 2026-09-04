@@ -34,6 +34,26 @@ Compare the current `sources.yml` against the live set of repos and teams:
 
 If `sources.yml` does not exist or the repo has no such file, skip this step and note it in the run report.
 
+### 2.5. Fetch tracker data
+
+Run the tracker-data fetch helper to pull Linear issue and comment data from the orchestrator:
+
+```bash
+/app/session/fetch-kg-tracker-data.sh tracker-data.json
+```
+
+The script reads `RUNNER_CALLBACK_URL` and `RUN_PROGRESS_TOKEN` from the environment. When those variables are absent (local `bd-kg-refresh` skill runs) it exits 0 without writing any file — this step is a no-op in that case and local ingest behaviour is unchanged.
+
+If the script exits non-zero, record the error in the run report and stop; do not proceed to the ingest.
+
+If `tracker-data.json` was written, check whether the ingest binary supports the `--tracker-data` flag before step 3:
+
+```bash
+python -m kg_ingest --help 2>&1 | grep -q -- '--tracker-data' && TRACKER_DATA_SUPPORTED=true || TRACKER_DATA_SUPPORTED=false
+```
+
+Adjust the command if the repo uses a different ingest entry point (e.g. `python scripts/ingest.py --help`).
+
 ### 3. Run the ingest
 
 Execute the ingest as the repo documents it (check `README.md`, `Makefile`, or a `scripts/` directory). Typical invocation:
@@ -43,6 +63,8 @@ python scripts/ingest.py        # or
 make ingest                     # or
 python -m kg_ingest             # adapt to this repo
 ```
+
+If `tracker-data.json` exists in the workspace (written by step 2.5) and `$TRACKER_DATA_SUPPORTED` is `true`, append `--tracker-data tracker-data.json` to the ingest invocation. This supplies Linear issue data fetched via the orchestrator proxy so the ingest does not need a direct tracker credential.
 
 Follow any additional instructions in a `WORKFLOW.md` in the workspace if one exists.
 

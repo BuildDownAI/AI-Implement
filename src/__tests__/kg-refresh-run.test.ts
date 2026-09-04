@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { encodeRunConfig, decodeRunConfig } from "../run-config.js";
 import { buildEnvelopeDispatchInputs } from "../github.js";
@@ -540,7 +541,7 @@ describe("runKgRefresh", () => {
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
     // Restore env
-    for (const k of ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN", "GITHUB_DEFAULT_BRANCH", "WORKSPACE_DIR", "RUN_TOKEN", "RUNNER_CALLBACK_URL", "AI_IMPLEMENT_RUN_CONFIG"]) {
+    for (const k of ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN", "GITHUB_DEFAULT_BRANCH", "WORKSPACE_DIR", "RUN_TOKEN", "RUNNER_CALLBACK_URL", "RUN_PROGRESS_TOKEN", "AI_IMPLEMENT_RUN_CONFIG"]) {
       if (originalEnv[k] === undefined) delete process.env[k];
       else process.env[k] = originalEnv[k];
     }
@@ -582,5 +583,43 @@ describe("runKgRefresh", () => {
     const decoded = decodeRunConfig(encoded);
     expect(decoded.runnerPhase).toBe("kg-refresh");
     expect(decoded.kgSourceRepo).toBe("BuildDownAI/knowledge-graph-ai-implement");
+  });
+});
+
+// ── KG-REFRESH.md playbook — tracker-data step ────────────────────────────────
+
+describe("KG-REFRESH.md playbook — tracker-data step", () => {
+  const playbookPath = join(
+    fileURLToPath(new URL(".", import.meta.url)),
+    "..",
+    "..",
+    "workflows",
+    "KG-REFRESH.md",
+  );
+
+  it("references the fetch-kg-tracker-data.sh helper script", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    expect(playbook).toContain("fetch-kg-tracker-data.sh");
+  });
+
+  it("specifies tracker-data.json as the output file", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    expect(playbook).toContain("tracker-data.json");
+  });
+
+  it("documents the --tracker-data flag for the ingest invocation", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    expect(playbook).toContain("--tracker-data");
+  });
+
+  it("includes a capability check before passing --tracker-data to the ingest", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    expect(playbook).toContain("TRACKER_DATA_SUPPORTED");
+  });
+
+  it("documents the 503 / absent-env no-op behaviour", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    expect(playbook).toContain("RUNNER_CALLBACK_URL");
+    expect(playbook).toContain("RUN_PROGRESS_TOKEN");
   });
 });
