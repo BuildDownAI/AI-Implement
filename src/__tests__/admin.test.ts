@@ -23,6 +23,12 @@ vi.mock("../notify.js", async (importOriginal) => ({
   notifyText: notifyTextMock,
 }));
 
+const fetchMachineLogsMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
+vi.mock("../fly-machines.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../fly-machines.js")>()),
+  fetchMachineLogs: fetchMachineLogsMock,
+}));
+
 vi.mock("../workflow-sync.js", () => ({
   syncWorkflowTemplates: vi.fn(),
   classifySyncError: (err: unknown) => ({
@@ -1791,6 +1797,77 @@ describe("admin sessions", () => {
   });
 
   it("returns 503 on destroy when Fly config is not set", async () => {
+    const token = await login("secret");
+    const res = await request("/api/sessions/machine-abc", "DELETE", "secret", undefined, token);
+    expect(res.statusCode).toBe(503);
+  });
+});
+
+describe("admin machine logs", () => {
+  function flyLogsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
+    return {
+      adminAccessCode: "secret",
+      flySessionsToken: "fly-token",
+      flySessionsApp: "test-sessions-app",
+      flySessionsRegion: null,
+      githubAppId: "test-app-id",
+      githubAppPrivateKey: "test-private-key",
+    };
+  }
+
+  async function requestWithFlyConfig(url: string, method: string, token: string): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest(url, method, { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, flyLogsConfig(), makeFakeRegistry(provider));
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  beforeEach(() => { fetchMachineLogsMock.mockReset(); });
+
+  it("returns 401 without auth", async () => {
+    const res = await request("/api/sessions/machine-abc/logs", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 503 when Fly config is not set", async () => {
+    const token = await login("secret");
+    const res = await request("/api/sessions/machine-abc/logs", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("returns 200 with log text on success", async () => {
+    fetchMachineLogsMock.mockResolvedValueOnce("line1\nline2");
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ logs: "line1\nline2" });
+  });
+
+  it("passes lastN=200 to fetchMachineLogs", async () => {
+    fetchMachineLogsMock.mockResolvedValueOnce("");
+    const token = await login("secret");
+    await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(fetchMachineLogsMock).toHaveBeenCalledWith("fly-token", "test-sessions-app", "machine-abc", 200);
+  });
+
+  it("returns 404 with unavailable message when Fly returns 404", async () => {
+    fetchMachineLogsMock.mockRejectedValueOnce(new Error("Failed to fetch logs for machine machine-abc (404): not found"));
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body).error).toBe("Logs no longer available");
+  });
+
+  it("returns 500 on unexpected Fly API error", async () => {
+    fetchMachineLogsMock.mockRejectedValueOnce(new Error("network timeout"));
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(500);
+    expect(JSON.parse(res.body).error).toBe("network timeout");
+  });
+
+  it("DELETE /api/sessions/:machineId still routes after logs route is added", async () => {
     const token = await login("secret");
     const res = await request("/api/sessions/machine-abc", "DELETE", "secret", undefined, token);
     expect(res.statusCode).toBe(503);
