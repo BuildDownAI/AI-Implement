@@ -160,6 +160,18 @@ interface KgRefreshInput {
    * Default: reads from the DB settings table; returns null when absent or unreadable.
    */
   loadStage?: () => { stage: KgRefreshStage; startedAt: number } | null;
+
+  // ---- Outcome reporting (AII-496) ----
+
+  /**
+   * Called once on every terminal outcome (success, no-new-data, failure).
+   * Drives tracker comment posting and webhook notification in index.ts.
+   * KG_SNAPSHOT_STALE maps to "no-new-data" (benign); all other runner failures map to "failure".
+   */
+  onOutcome?: (
+    outcome: "success" | "no-new-data" | "failure",
+    data: { failureCode?: string; failureReason?: string; dispatchId?: string },
+  ) => void | Promise<void>;
 }
 
 /**
@@ -208,6 +220,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   let stage: KgRefreshStage = "idle";
   /** Timestamp of the ingest dispatch, tracked for the live TTL watchdog in trigger(). */
   let ingestStartedAt: number | null = null;
+  /** dispatchId of the in-flight runner job; cleared on every terminal outcome. */
+  let currentDispatchId: string | null = null;
 
   // Restore persisted state on construction (crash recovery).
   const persisted = loadStageFn();
@@ -435,6 +449,14 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     running = false;
     stage = outcomeToStage(outcome);
     persistStageFn(stage, Date.now());
+
+    const savedId = currentDispatchId;
+    currentDispatchId = null;
+    if (outcome.ok) {
+      void input.onOutcome?.("success", { dispatchId: savedId ?? undefined });
+    } else {
+      void input.onOutcome?.("failure", { failureReason: outcome.detail, dispatchId: savedId ?? undefined });
+    }
   }
 
   return {
@@ -455,6 +477,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         stage = "failed";
         ingestStartedAt = null;
         persistStageFn("failed", Date.now());
+        const savedId = currentDispatchId;
+        currentDispatchId = null;
+        void input.onOutcome?.("failure", {
+          failureReason: "ingest runner timed out — no callback received within TTL",
+          dispatchId: savedId ?? undefined,
+        });
       }
       if (running) return { status: 409, body: { error: "refresh-in-progress" } };
       if (deployHeld()) {
@@ -523,6 +551,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             };
 
             await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
+            currentDispatchId = dispatchId;
             stage = "ingest-running";
             ingestStartedAt = Date.now();
             persistStageFn("ingest-running", ingestStartedAt);
@@ -534,6 +563,13 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             running = false;
             stage = outcomeToStage(outcome);
             persistStageFn(stage, Date.now());
+            if (outcome.ok) {
+              void input.onOutcome?.("success", {});
+            } else if (outcome.gate === "ingest-needed") {
+              void input.onOutcome?.("no-new-data", {});
+            } else {
+              void input.onOutcome?.("failure", { failureReason: outcome.detail });
+            }
           }
         } catch (err) {
           lastRefresh = {
@@ -547,6 +583,9 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           running = false;
           stage = "failed";
           persistStageFn("failed", Date.now());
+          const savedId = currentDispatchId;
+          currentDispatchId = null;
+          void input.onOutcome?.("failure", { failureReason: String(err), dispatchId: savedId ?? undefined });
         }
       })();
 
@@ -563,6 +602,27 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       }
 
       if (runnerOutcome === "failure") {
+        // KG_SNAPSHOT_STALE = "graph is current" benign outcome — treat as no-new-data, not failure.
+        if (data.failureCode === "KG_SNAPSHOT_STALE") {
+          lastRefresh = {
+            ok: true,
+            at: Date.now(),
+            gate: "ingest-needed",
+            detail: "graph is current — runner found no new data to ingest",
+            stampBefore: null,
+            stampAfter: null,
+          };
+          running = false;
+          stage = "idle";
+          ingestStartedAt = null;
+          persistStageFn("idle", Date.now());
+          console.log("[kg-refresh] runner reported KG_SNAPSHOT_STALE — graph is current");
+          const savedId = currentDispatchId;
+          currentDispatchId = null;
+          void input.onOutcome?.("no-new-data", { failureCode: "KG_SNAPSHOT_STALE", dispatchId: savedId ?? undefined });
+          return;
+        }
+
         const detail = data.failureCode ?? data.failureReason ?? "runner reported failure";
         lastRefresh = {
           ok: false,
@@ -574,8 +634,16 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         };
         running = false;
         stage = "failed";
+        ingestStartedAt = null;
         persistStageFn("failed", Date.now());
         console.error(`[kg-refresh] runner failed: ${detail}`);
+        const savedIdF = currentDispatchId;
+        currentDispatchId = null;
+        void input.onOutcome?.("failure", {
+          failureCode: data.failureCode,
+          failureReason: data.failureReason,
+          dispatchId: savedIdF ?? undefined,
+        });
         return;
       }
 
@@ -592,8 +660,15 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         };
         running = false;
         stage = "failed";
+        ingestStartedAt = null;
         persistStageFn("failed", Date.now());
         console.error("[kg-refresh] runner callback received but kgSourceRepo is null");
+        const savedIdN = currentDispatchId;
+        currentDispatchId = null;
+        void input.onOutcome?.("failure", {
+          failureReason: "kg source repo not configured — cannot verify snapshot commit",
+          dispatchId: savedIdN ?? undefined,
+        });
         return;
       }
 
@@ -633,6 +708,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             stage = "failed";
             persistStageFn("failed", Date.now());
             console.error(`[kg-refresh] snapshot commit ${snapshotCommit} not visible after retry`);
+            const savedIdV = currentDispatchId;
+            currentDispatchId = null;
+            void input.onOutcome?.("failure", {
+              failureReason: `snapshot commit ${snapshotCommit} not visible in source repo after retry`,
+              dispatchId: savedIdV ?? undefined,
+            });
             return;
           }
         }

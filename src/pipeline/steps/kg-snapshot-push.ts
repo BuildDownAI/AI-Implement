@@ -38,6 +38,7 @@ interface KgStats {
   vectors?: number;
   docPages?: number;
   durationSec?: number;
+  notes?: string[];
 }
 
 /**
@@ -118,6 +119,9 @@ function buildCommitMessage(stats: KgStats | null): string {
       .filter(Boolean)
       .join(" ");
     if (line) parts.push("", line);
+    if (stats.notes && stats.notes.length > 0) {
+      parts.push("", stats.notes.join("\n"));
+    }
   }
   return parts.join("\n");
 }

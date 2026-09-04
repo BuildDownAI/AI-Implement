@@ -17,11 +17,13 @@ export interface Classification {
  * Keyed on job.status + phase (uniform across execution modes); conclusion only refines detail.
  */
 export function classifyCompletion(job: Job): Classification | null {
-  const phase = job.phase === "planning" ? "Planning" : "Implementation";
-
   if (job.status === "completed") return null;
 
+  // KG_SNAPSHOT_STALE = "graph is current" benign terminal for kg-refresh — not a failure.
+  if (job.phase === "kg-refresh" && job.conclusion === "KG_SNAPSHOT_STALE") return null;
+
   if (job.status === "review_failed") {
+    const phase = job.phase === "planning" ? "Planning" : "Implementation";
     return {
       summary: `${phase} opened a PR, but the automated review flagged it.`,
       remediation: "Review the gap-analysis feedback on the PR before merging.",
@@ -31,6 +33,13 @@ export function classifyCompletion(job: Job): Classification | null {
 
   if (job.status === "timed_out") {
     if (job.conclusion === "issue_completed_sweep") return null; // issue already done — benign
+    if (job.phase === "kg-refresh") {
+      return {
+        summary: "KG Refresh hit the time limit.",
+        docsUrl: TROUBLESHOOTING_URL,
+      };
+    }
+    const phase = job.phase === "planning" ? "Planning" : "Implementation";
     const maxAge = job.conclusion === "machine_max_age_sweep";
     return {
       summary: `${phase} hit the time limit${maxAge ? " (max session age)" : ""}.`,
@@ -42,6 +51,17 @@ export function classifyCompletion(job: Job): Classification | null {
   // status === "failed"
   if (job.conclusion === "operator_cancelled") return null; // closed by operator — benign
 
+  if (job.phase === "kg-refresh") {
+    const exit = job.conclusion?.startsWith("exit_") ? job.conclusion.slice(5) : null;
+    const detail = exit && exit !== "0" ? `The runner exited with code ${exit}.` : undefined;
+    return {
+      summary: "KG Refresh failed.",
+      detail,
+      docsUrl: TROUBLESHOOTING_URL,
+    };
+  }
+
+  const phase = job.phase === "planning" ? "Planning" : "Implementation";
   const exit = job.conclusion?.startsWith("exit_") ? job.conclusion.slice(5) : null;
   const detail =
     exit && exit !== "0"

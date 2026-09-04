@@ -143,6 +143,8 @@ export async function remediateStuckJob(
   stopRunner?: () => Promise<void>,
 ): Promise<void> {
   if (!job.issueId) return;
+  // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
+  if (job.phase === "kg-refresh") return;
   // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusionStuck = getJobById(job.id)?.conclusion;
@@ -215,6 +217,8 @@ export async function remediateFailedJob(
   lastRunStatus: string,
 ): Promise<void> {
   if (!job.issueId) return;
+  // kg-refresh jobs have their own outcome rail — never re-arm or clear dedup for them.
+  if (job.phase === "kg-refresh") return;
   // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
   // after the monitor tick started reading the job, so the passed-in job may be stale.
   const freshConclusion = getJobById(job.id)?.conclusion;

@@ -87,6 +87,37 @@ beforeEach(() => {
   vi.mocked(getJobById).mockReturnValue(makeJob({ conclusion: null }));
 });
 
+describe("remediateStuckJob — kg-refresh guard", () => {
+  it("returns immediately for a kg-refresh phase job — no runner cancel, no retry, no dedup clear", async () => {
+    const provider = makeProvider();
+    const job = makeJob({ phase: "kg-refresh" });
+
+    await remediateStuckJob(mockConfig, provider, job, "in_progress");
+
+    expect(cancelWorkflowRun).not.toHaveBeenCalled();
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+  });
+});
+
+describe("remediateFailedJob — kg-refresh guard", () => {
+  it("returns immediately for a kg-refresh phase job — no dedup clear, no alert, no comment", async () => {
+    const provider = makeProvider();
+    const job = makeJob({ phase: "kg-refresh" });
+
+    await remediateFailedJob(mockConfig, provider, job, "failure");
+
+    expect(incrementStuckAttempts).not.toHaveBeenCalled();
+    expect(deleteDispatched).not.toHaveBeenCalled();
+    expect(notifyStuckGiveUp).not.toHaveBeenCalled();
+    expect(provider.clearWorkingState).not.toHaveBeenCalled();
+    expect(provider.postComment).not.toHaveBeenCalled();
+  });
+});
+
 describe("remediateStuckJob — operator_cancelled guard", () => {
   it("returns immediately when job.conclusion is operator_cancelled — no runner cancel, no retry", async () => {
     const provider = makeProvider();
