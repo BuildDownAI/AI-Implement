@@ -52,7 +52,7 @@ Two consequences worth internalising:
 
 **`preflight` does not gate the push.** It is skipped unless the review already approved, and `push` runs regardless of what it found. It records `typecheck`/`lint`/`test` results; it does not block a pull request on them. Work that fails preflight still ships.
 
-**A gap-fill run never pushes from the pipeline.** `push` is skipped whenever `prNumber` is set, because the agent commits and pushes to the existing PR branch itself. This is why gap-fill and initial runs need different instructions in `WORKFLOW.md`.
+**The pipeline owns all repository writes.** `push` runs for both initial and gap-fill runs: an initial run creates the implementation branch and opens a PR, while a gap-fill run commits any remaining uncommitted changes and force-pushes to the existing PR branch. `WORKFLOW.md` must instruct the agent to leave changes uncommitted in both modes — the pipeline always handles the commit and push.
 
 ## Hook environment and forwarded secrets
 

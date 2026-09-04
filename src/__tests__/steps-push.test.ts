@@ -1491,7 +1491,7 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
       json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
     } as Response);
     vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     await pushStep.run(
       makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
@@ -1516,6 +1516,7 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
       expect.arrayContaining(["--force-with-lease=refs/heads/feature/existing-pr:ff400c5"]),
       expect.anything(),
     );
+    consoleSpy.mockRestore();
   });
 
   it("refuses genuinely foreign push when remote SHA is not reachable from HEAD (merge-base exit 1)", async () => {
@@ -1566,5 +1567,28 @@ describe("pushStep — push guard: adopt agent push vs refuse foreign work", () 
       ([, args]) => (args as string[])[0] === "merge-base",
     );
     expect(mergeBaseCalls).toHaveLength(0);
+  });
+
+  it("calls merge-base with --is-ancestor <remoteSha> HEAD in that exact order", async () => {
+    mockGapFillWithRemoteSha("246b3fe", 0);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
+      new NoopStepReporter(),
+    );
+
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["merge-base", "--is-ancestor", "246b3fe", "HEAD"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    consoleSpy.mockRestore();
   });
 });
