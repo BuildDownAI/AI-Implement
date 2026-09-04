@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -17,7 +17,7 @@ import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, 
 import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
-import { canSelfDeploy, makeStartDeploy, readKgSourceRepo } from "./deploy.js";
+import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
@@ -88,6 +88,7 @@ import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import { makeKgRefresh } from "./kg-refresh.js";
+import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 
 // ---------- Configuration ----------
@@ -2932,9 +2933,88 @@ function onDeployBuildFailure(commit: string, err: unknown): void {
   recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
 }
 
+async function dispatchKgRefreshRun(
+  config: AppConfig,
+  opts: { runToken: string; dispatchId: string; runConfig: string },
+): Promise<void> {
+  if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
+  const repo = parseKgSourceRepo(config.kgSourceRepo);
+  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
+  const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+  const sessionToken = generateSessionToken();
+  const machineNonce = generateMachineNonce();
+  const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig };
+
+  if (config.flySessionsToken && config.flySessionsApp) {
+    const machineConfig = buildSessionMachineConfig({
+      image: config.sessionImage,
+      issueId: "kg-refresh",
+      issueIdentifier: "KG-REFRESH",
+      issueTitle: "KG ingest",
+      issueDescription: "",
+      owner: repo.owner,
+      repo: repo.repo,
+      defaultBranch,
+      anthropicApiKey: config.anthropicApiKey ?? undefined,
+      claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+      githubToken: ghToken,
+      sessionToken,
+      machineNonce,
+      phase: "kg-refresh",
+      orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
+      runnerCallbackUrl: config.runnerCallbackBaseUrl ? `${config.runnerCallbackBaseUrl}/api/runner/result` : undefined,
+      runToken: opts.runToken,
+      orchestratorApp: process.env.FLY_APP_NAME,
+      expectedTtlSeconds: 4 * 60 * 60,
+      extraEnv,
+    });
+    await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
+    console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
+  } else if (config.localRunnerImage) {
+    const localOrchestratorUrl =
+      config.localRunnerOrchestratorUrl ??
+      config.runnerCallbackBaseUrl ??
+      `http://host.docker.internal:${config.healthPort}`;
+    await startLocalRunnerContainer({
+      image: config.localRunnerImage,
+      issueId: "kg-refresh",
+      issueIdentifier: "KG-REFRESH",
+      issueTitle: "KG ingest",
+      issueDescription: "",
+      owner: repo.owner,
+      repo: repo.repo,
+      defaultBranch,
+      anthropicApiKey: config.anthropicApiKey ?? undefined,
+      claudeOAuthToken: config.claudeOAuthToken ?? undefined,
+      githubToken: ghToken,
+      sessionToken,
+      machineNonce,
+      phase: "kg-refresh",
+      orchestratorUrl: localOrchestratorUrl,
+      runnerCallbackUrl: config.runnerCallbackBaseUrl ? `${config.runnerCallbackBaseUrl}/api/runner/result` : undefined,
+      runToken: opts.runToken,
+      extraEnv,
+    });
+    console.log(`[kg-refresh] dispatched via local Docker (dispatchId=${opts.dispatchId})`);
+  } else {
+    throw new Error(
+      "No execution backend configured for kg-refresh dispatch: " +
+      "set FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP (Fly) or LOCAL_RUNNER_IMAGE (local Docker)",
+    );
+  }
+}
+
 function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgSidecar): http.Server {
   const startDeploy = makeStartDeploy({ ...config, onBuildFailure: onDeployBuildFailure });
-  const kgRefresh = makeKgRefresh({ sidecar, githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, kgSourceRepo: config.kgSourceRepo });
+  const kgRefresh: KgRefreshHandle = makeKgRefresh({
+    sidecar,
+    githubAppId: config.githubAppId,
+    githubAppPrivateKey: config.githubAppPrivateKey,
+    kgSourceRepo: config.kgSourceRepo,
+    runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
+    runnerTokenSecret: config.runnerTokenSecret,
+    dispatchRun: (opts) => dispatchKgRefreshRun(config, opts),
+  });
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
 
@@ -3166,6 +3246,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
             notifyType: config.notifyType,
             notifyWebhookUrl: config.notifyWebhookUrl,
           },
+          onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));

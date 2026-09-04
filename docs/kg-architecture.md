@@ -199,14 +199,38 @@ or these steps by hand.
 1. Reconcile scope, ingest, and commit + push the snapshot — steps 1–5 below, unchanged.
 2. **Trigger the refresh**: `POST /api/kg/refresh` with an admin session token (or the
    Deployments page's "Refresh graph now"). `202` = accepted; `409` = a refresh or a deploy is
-   already in progress — the trigger refuses while the deploy hold is set. The orchestrator
-   fetches the configured `KG_SOURCE_REPO`, stages under `/data/kg/staging` (materialize with
-   the image's venv — nothing embeds), writes the completion marker last, swaps by rename, and
-   restarts the sidecar.
+   already in progress; `422` = runner callback not configured (see below). The orchestrator
+   first checks whether the source repo already has a newer snapshot:
+   - **If a newer snapshot exists**: fetches `KG_SOURCE_REPO`, stages under `/data/kg/staging`
+     (materialize with the image's venv — nothing embeds), writes the completion marker last,
+     swaps by rename, and restarts the sidecar.
+   - **If no newer snapshot** (AII-495): dispatches a `kg-refresh` Claude runner job to ingest
+     and push a new snapshot. Requires `RUNNER_CALLBACK_BASE_URL` and `RUNNER_TOKEN_SECRET`;
+     without them the trigger returns `422 callback-unconfigured`. The stage advances from
+     `ingest-running` to `snapshot-landed` when the runner reports back, then the local rail
+     runs as above.
 3. **The four gates run on the serving graph**: the sidecar answers; the vectors are present;
    a canary query returns non-empty with `degraded: false`; and the served age stamp is
    strictly newer than before the swap. Any failure reverts to the previous overlay and
    restarts again. `GET /api/kg/status` reports the outcome and the gate that fired.
+
+`GET /api/kg/status` exposes a `stage` field with fine-grained lifecycle states:
+
+| Stage | Meaning |
+|---|---|
+| `idle` | No refresh in progress |
+| `checking` | Refresh triggered; comparing snapshot dates |
+| `ingest-running` | Runner job dispatched; waiting for callback |
+| `snapshot-landed` | Callback received; snapshot commit verified |
+| `staging` | Local rail running (fetch → materialize → swap) |
+| `serving` | Rail succeeded; sidecar serving new graph |
+| `reverted` | Gate failed; rolled back to previous overlay |
+| `failed` | Terminal failure (ingest, snapshot verification, or staging) |
+
+Stage is persisted to the DB so a restart mid-rail fails fast (stage → `failed`) rather than
+blocking all future refreshes for the remainder of the 4-hour ingest TTL. A live process that
+dispatched a runner and received no callback within the TTL self-heals at the next `POST
+/api/kg/refresh` call.
 
 **Redeploy remains the fallback** — an orchestrator predating the rail (the route answers 404),
 or a change that touches the sidecar's code rather than its data, still refreshes by deploy:
@@ -228,14 +252,12 @@ or a change that touches the sidecar's code rather than its data, still refreshe
 Steps 5 to 7 exist entirely because of the monolith. In a two-service design the data would be
 reloadable on its own; here it rides a release, so the release has to be sequenced and verified.
 
-## Planned: decoupling the refresh (AII-424)
+## Refresh rail implementation (AII-426, AII-495)
 
-[AII-424](https://linear.app/eudoxus/issue/AII-424) plans a refresh path that does not ride a
-release: fetch the newest committed snapshot, stage it on the volume, swap atomically, restart
-the sidecar, verify, revert on failure. Six children across three repositories (KGB-9, KGB-10,
-KGA-3, KGA-4, AII-425, AII-426), all staged and undesignated as of 2026-08-24. Until they land,
-the process above is the only refresh path. This section records the target design so the doc
-reads correctly during the transition.
+[AII-426](https://linear.app/eudoxus/issue/AII-426) shipped the local refresh rail; the "Planned"
+tracking issue was [AII-424](https://linear.app/eudoxus/issue/AII-424). AII-495 extended it with
+runner dispatch for the ingest step. The six children (KGB-9, KGB-10, KGA-3, KGA-4, AII-425,
+AII-426) are all landed. The redeploy path remains for code changes or sidecar updates.
 
 
 ```mermaid
@@ -311,11 +333,16 @@ the start. No new top-level function, no new route branch.
 AII-493 adds a `kg-refresh` Claude runner that follows the ingest playbook autonomously — cloning the
 KG source repository, running the ingest scripts, and pushing the snapshot. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
-long-lived credential to the runner.
+long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
+when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
+`RunConfigV1` with `runnerPhase: "kg-refresh"`, and dispatches via Fly Machines or local Docker.
+When the runner completes, it calls `POST /api/runner/result` which routes to `onRunnerComplete` in
+`src/kg-refresh.ts`. If a `snapshotCommit` SHA is included, the orchestrator verifies the commit is
+visible via the GitHub API (one retry for git-cache lag) before starting the local staging rail.
 
-Both endpoints require a `kg-refresh`-phase progress token (multi-use, `consume: false`); any other
-phase or a missing/invalid token receives `403 Unauthorized` with no distinguishing body. The
-orchestrator performs all external writes with its own credentials; the runner receives only the
+Both callback endpoints require a `kg-refresh`-phase progress token (multi-use, `consume: false`);
+any other phase or a missing/invalid token receives `403 Unauthorized` with no distinguishing body.
+The orchestrator performs all external writes with its own credentials; the runner receives only the
 minted token or the requested data.
 
 | Endpoint | Method | Purpose |
@@ -354,3 +381,4 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | Docs ingestion | KGB-2 through KGB-5, KGA-2, BDS-38 | Crawl, section chunks, citable anchors |
 | Scaling | KGB-8, AII-422 | Bounded-memory embedding, and a receipt when it still fails |
 | Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: Claude runner follows the ingest playbook; runner-callback endpoints vend scoped push token and tracker data |
+| Runner dispatch + stage machine | AII-495 | `POST /api/kg/refresh` dispatches the runner when ingest is needed; persisted stage machine (idle → checking → ingest-running → snapshot-landed → staging → terminal) survives restarts; live TTL watchdog; `/admin#deployments` stage badges |

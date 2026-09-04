@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { makeKgRefresh, MATERIALIZE_ARGS, type KgRefreshHandle } from "../kg-refresh.js";
+import { makeKgRefresh, MATERIALIZE_ARGS, type KgRefreshHandle, type KgRefreshStage } from "../kg-refresh.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -386,5 +386,298 @@ describe("kg-refresh", () => {
     const s = await handle.status();
     expect(s.running).toBe(false);
     expect(s.lastRefresh?.gate).toBe("ingest-needed");
+  });
+
+  // ---- AII-495: dispatch-path tests ----------------------------------------
+
+  describe("dispatch path", () => {
+    let dispatchRun: ReturnType<typeof vi.fn>;
+    let mintRunTokenFn: ReturnType<typeof vi.fn>;
+    let fetchCommitVisible: ReturnType<typeof vi.fn>;
+    let stageStore: { stage: KgRefreshStage; startedAt: number } | null;
+    let persistedStages: Array<{ stage: KgRefreshStage; startedAt: number }>;
+
+    // fetchSnapshotCommitDate: old on first call (→ ingest-needed → dispatch),
+    // new on subsequent calls (→ rail proceeds after runner pushes commit).
+    function makeSnapshotDateMock() {
+      return vi.fn()
+        .mockResolvedValueOnce(OLD_STAMP_Z)
+        .mockResolvedValue(FUTURE_STAMP_Z);
+    }
+
+    function buildDispatch(overrides: Record<string, unknown> = {}) {
+      dispatchRun = vi.fn(async () => {});
+      mintRunTokenFn = vi.fn(() => ({ token: "run-tok", dispatchId: "disp-1" }));
+      fetchCommitVisible = vi.fn(async () => true);
+      stageStore = null;
+      persistedStages = [];
+      handle = makeKgRefresh({
+        sidecar: { restart: restart as unknown as () => Promise<void> },
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        dataRoot,
+        kgDir: "/nonexistent-kg",
+        sidecarMcpUrl: "http://127.0.0.1:1/mcp",
+        minFreeBytes: 1000,
+        deployHeld: () => deployHeld,
+        freeBytes: () => free,
+        mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
+        fetchTarball: vi.fn(async () => tarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        fetchSnapshotCommitDate: makeSnapshotDateMock() as never,
+        materialize: materialize as never,
+        mcpToolCall: mcpToolCall as never,
+        canaryDeadlineMs: 300,
+        canaryRetryMs: 30,
+        runnerCallbackBaseUrl: "http://localhost:8080",
+        runnerTokenSecret: "secret",
+        mintRunTokenFn: mintRunTokenFn as never,
+        dispatchRun: dispatchRun as never,
+        fetchCommitVisible: fetchCommitVisible as never,
+        snapshotCommitRetryMs: 0,
+        persistStage: (s: KgRefreshStage, t: number) => {
+          stageStore = { stage: s, startedAt: t };
+          persistedStages.push({ stage: s, startedAt: t });
+        },
+        loadStage: () => stageStore,
+        ...overrides,
+      });
+    }
+
+    async function waitForStage(targetStage: KgRefreshStage): Promise<void> {
+      for (let i = 0; i < 200; i++) {
+        if ((await handle.status()).stage === targetStage) return;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error(`stage never reached ${targetStage}`);
+    }
+
+    it("returns 422 when dispatchRun configured but runnerCallbackBaseUrl missing", async () => {
+      buildDispatch({ runnerCallbackBaseUrl: null });
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      expect((r.body as { precondition?: string }).precondition).toBe("callback-unconfigured");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("returns 422 when dispatchRun configured but runnerTokenSecret missing", async () => {
+      buildDispatch({ runnerTokenSecret: null });
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      expect((r.body as { precondition?: string }).precondition).toBe("callback-unconfigured");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("dispatches runner when ingest-needed and dispatchRun configured", async () => {
+      buildDispatch();
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      await waitForStage("ingest-running");
+      expect(dispatchRun).toHaveBeenCalledOnce();
+      const call = dispatchRun.mock.calls[0][0] as { runToken: string; dispatchId: string; runConfig: string };
+      expect(call.runToken).toBe("run-tok");
+      expect(call.dispatchId).toBe("disp-1");
+      expect(call.runConfig).toBeTruthy();
+      expect((await handle.status()).running).toBe(true);
+    });
+
+    it("stage transitions checking → ingest-running when dispatch fires", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect((await handle.status()).stage).toBe("ingest-running");
+    });
+
+    it("second trigger during ingest-running returns 409 refresh-in-progress", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      const second = await handle.trigger();
+      expect(second.status).toBe(409);
+      expect(second.body.error).toBe("refresh-in-progress");
+    });
+
+    it("onRunnerComplete failure sets stage to failed and clears running", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", { failureCode: "TIMEOUT", failureReason: "job timed out" });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.running).toBe(false);
+    });
+
+    it("onRunnerComplete success with snapshotCommit verifies commit then runs rail", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", { snapshotCommit: "abc123" });
+      await waitDone();
+      expect(fetchCommitVisible).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", "abc123");
+      const s = await handle.status();
+      expect(s.lastRefresh?.ok).toBe(true);
+      expect(s.stage).toBe("serving");
+    });
+
+    it("onRunnerComplete success without snapshotCommit skips commit check and runs rail", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", {});
+      await waitDone();
+      expect(fetchCommitVisible).not.toHaveBeenCalled();
+      const s = await handle.status();
+      expect(s.lastRefresh?.ok).toBe(true);
+      expect(s.stage).toBe("serving");
+    });
+
+    it("git-cache retry: commit visible on second check proceeds to rail", async () => {
+      let visibleCalls = 0;
+      buildDispatch({
+        fetchCommitVisible: vi.fn(async () => {
+          visibleCalls += 1;
+          return visibleCalls >= 2; // false first, true second
+        }) as never,
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", { snapshotCommit: "abc123" });
+      await waitDone();
+      expect(visibleCalls).toBe(2);
+      const s = await handle.status();
+      expect(s.lastRefresh?.ok).toBe(true);
+      expect(s.stage).toBe("serving");
+    });
+
+    it("git-cache fails after both attempts: stage set to failed", async () => {
+      buildDispatch({
+        fetchCommitVisible: vi.fn(async () => false) as never,
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", { snapshotCommit: "abc123" });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.lastRefresh?.ok).toBe(false);
+    });
+
+    it("persistStage called with ingest-running when runner dispatched", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(persistedStages.some((e) => e.stage === "ingest-running")).toBe(true);
+    });
+
+    it("status() stage field reflects lifecycle: idle → ingest-running → serving", async () => {
+      buildDispatch();
+      expect((await handle.status()).stage).toBe("idle");
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect((await handle.status()).stage).toBe("ingest-running");
+      handle.onRunnerComplete("success", {});
+      await waitDone();
+      expect((await handle.status()).stage).toBe("serving");
+    });
+
+    it("TTL expiry on construction clears stale ingest-running lock", async () => {
+      const staleTime = Date.now() - 5 * 60 * 60 * 1000; // 5h ago > 4h TTL
+      buildDispatch({
+        loadStage: () => ({ stage: "ingest-running" as KgRefreshStage, startedAt: staleTime }),
+      });
+      const s = await handle.status();
+      expect(s.running).toBe(false);
+      expect(s.stage).toBe("idle");
+    });
+
+    it("within-TTL ingest-running on construction restores running=true", async () => {
+      const recentTime = Date.now() - 30 * 1000; // 30s ago — well within 4h TTL
+      buildDispatch({
+        loadStage: () => ({ stage: "ingest-running" as KgRefreshStage, startedAt: recentTime }),
+      });
+      const s = await handle.status();
+      expect(s.running).toBe(true);
+      expect(s.stage).toBe("ingest-running");
+    });
+
+    it("staging on construction fails fast so a restart clears the dead lock", async () => {
+      // If the orchestrator crashed during the local rail, the persisted stage is
+      // "staging". The runner token is already consumed; no callback will arrive.
+      // The constructor must clear this to "failed" immediately.
+      buildDispatch({
+        loadStage: () => ({ stage: "staging" as KgRefreshStage, startedAt: Date.now() - 60_000 }),
+      });
+      const s = await handle.status();
+      expect(s.running).toBe(false);
+      expect(s.stage).toBe("failed");
+    });
+
+    it("snapshot-landed on construction fails fast", async () => {
+      buildDispatch({
+        loadStage: () => ({ stage: "snapshot-landed" as KgRefreshStage, startedAt: Date.now() - 60_000 }),
+      });
+      const s = await handle.status();
+      expect(s.running).toBe(false);
+      expect(s.stage).toBe("failed");
+    });
+
+    it("persistStage called with snapshot-landed before staging rail", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", { snapshotCommit: "abc123" });
+      await waitDone();
+      expect(persistedStages.some((e) => e.stage === "snapshot-landed")).toBe(true);
+    });
+
+    it("persistStage called with staging when rail starts", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", {});
+      await waitDone();
+      expect(persistedStages.some((e) => e.stage === "staging")).toBe(true);
+    });
+
+    it("onRunnerComplete with null kgSourceRepo sets stage to failed", async () => {
+      buildDispatch({ kgSourceRepo: null });
+      // Trigger without kgSourceRepo fails at the 501 check, so set running directly
+      // by restoring an ingest-running state within TTL.
+      buildDispatch({
+        kgSourceRepo: null,
+        loadStage: () => ({ stage: "ingest-running" as KgRefreshStage, startedAt: Date.now() - 30_000 }),
+      });
+      handle.onRunnerComplete("success", { snapshotCommit: "abc123" });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.running).toBe(false);
+    });
+
+    it("live TTL watchdog expires ingest-running without restart", async () => {
+      // Build a handle that restores running=true from persisted state within TTL.
+      const startedAt = Date.now() - 30_000; // 30s ago, well within 4h TTL
+      buildDispatch({
+        loadStage: () => ({ stage: "ingest-running" as KgRefreshStage, startedAt }),
+      });
+      // Advance Date.now past the TTL so the in-trigger watchdog fires.
+      const advancedNow = startedAt + 4 * 60 * 60 * 1000 + 1000;
+      const spy = vi.spyOn(Date, "now").mockReturnValue(advancedNow);
+      try {
+        // trigger() should detect TTL expiry, clear the lock, and dispatch a new run.
+        const r = await handle.trigger();
+        expect(r.status).toBe(202);
+        // The dispatch is async — wait for it to land before asserting.
+        await waitForStage("ingest-running");
+        expect(dispatchRun).toHaveBeenCalledOnce();
+        const s = await handle.status();
+        expect(s.stage).toBe("ingest-running");
+        expect(s.running).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 });
