@@ -6,10 +6,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as TokenVendingModule from "../token-vending.js";
 import type * as LogModule from "../log.js";
 import type * as DedupModule from "../dedup.js";
+import type * as RunnerTokensModule from "../runner-tokens.js";
+import type * as KgPushTokenModule from "../kg-push-token-vending.js";
+import type * as RunnerCallbackModule from "../runner-callback.js";
 
 vi.mock("../github-app-auth.js", () => ({
   getScopedInstallationToken: vi.fn(),
   clearTokenCache: vi.fn(),
+}));
+
+vi.mock("../linear-app-auth.js", () => ({
+  isLinearAuthConfigured: vi.fn(),
+  withLinearToken: vi.fn(),
 }));
 
 class MockRequest extends EventEmitter {
@@ -52,8 +60,15 @@ let dbPath: string;
 let tokenVending: typeof TokenVendingModule;
 let log: typeof LogModule;
 let dedup: typeof DedupModule;
+let runnerTokens: typeof RunnerTokensModule;
+let kgPushToken: typeof KgPushTokenModule;
+let runnerCallback: typeof RunnerCallbackModule;
 
 let mockGetScopedInstallationToken: ReturnType<typeof vi.fn>;
+let mockIsLinearAuthConfigured: ReturnType<typeof vi.fn>;
+let mockWithLinearToken: ReturnType<typeof vi.fn>;
+
+const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
 beforeEach(async () => {
   vi.resetModules();
@@ -61,9 +76,15 @@ beforeEach(async () => {
   process.env.DEDUP_DB_PATH = dbPath;
   dedup = await import("../dedup.js");
   log = await import("../log.js");
+  runnerTokens = await import("../runner-tokens.js");
   tokenVending = await import("../token-vending.js");
+  kgPushToken = await import("../kg-push-token-vending.js");
+  runnerCallback = await import("../runner-callback.js");
   const ghAuth = await import("../github-app-auth.js");
   mockGetScopedInstallationToken = vi.mocked(ghAuth.getScopedInstallationToken);
+  const linearAuth = await import("../linear-app-auth.js");
+  mockIsLinearAuthConfigured = vi.mocked(linearAuth.isLinearAuthConfigured);
+  mockWithLinearToken = vi.mocked(linearAuth.withLinearToken);
   log.initLogTable();
 });
 
@@ -184,5 +205,312 @@ describe("getJobByNonce", () => {
 
   it("returns null for unknown nonce", () => {
     expect(log.getJobByNonce("nonexistent")).toBeNull();
+  });
+});
+
+// ── handleKgPushTokenRequest ──────────────────────────────────────────────────
+
+function mintKgProgressToken(): string {
+  const { token } = runnerTokens.mintRunToken({
+    issueId: "kg-issue-1",
+    mappingTeamKey: "AII",
+    phase: "kg-refresh",
+    audience: "progress",
+    ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+    secret: SECRET,
+  });
+  return token;
+}
+
+async function callKgPushTokenHandler(opts: {
+  authorization?: string;
+  kgSourceRepo?: string | null;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  return kgPushToken.handleKgPushTokenRequest({
+    authorization: opts.authorization,
+    secret: SECRET,
+    githubAppId: "app-id",
+    githubAppPrivateKey: "fake-key",
+    kgSourceRepo: opts.kgSourceRepo !== undefined ? opts.kgSourceRepo : "acme/kg-repo",
+  });
+}
+
+describe("handleKgPushTokenRequest", () => {
+  it("returns 200 with token and expires_at for a valid kg-refresh progress token", async () => {
+    const token = mintKgProgressToken();
+    const expiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    mockGetScopedInstallationToken.mockResolvedValueOnce({ token: "ghs_push_token", expiresAt: expiry });
+
+    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(200);
+    expect(result.body.token).toBe("ghs_push_token");
+    expect(result.body.expires_at).toBe(expiry);
+  });
+
+  it("passes explicit contents:write permission scoped to the kg repo only", async () => {
+    const token = mintKgProgressToken();
+    mockGetScopedInstallationToken.mockResolvedValueOnce({ token: "ghs_tok", expiresAt: "2030-01-01T00:00:00Z" });
+
+    await callKgPushTokenHandler({ authorization: `Bearer ${token}`, kgSourceRepo: "acme/kg-repo" });
+
+    expect(mockGetScopedInstallationToken).toHaveBeenCalledWith(
+      "app-id",
+      "fake-key",
+      "acme",
+      { permissions: { contents: "write" }, repositories: ["kg-repo"], forceRefresh: true },
+    );
+    const opts = mockGetScopedInstallationToken.mock.calls[0][3] as Record<string, unknown>;
+    const repos = opts.repositories as string[];
+    expect(repos.length).toBeGreaterThan(0);
+  });
+
+  it("always passes forceRefresh: true so the credential helper receives a full-lifetime token", async () => {
+    const token = mintKgProgressToken();
+    mockGetScopedInstallationToken.mockResolvedValueOnce({ token: "ghs_tok", expiresAt: "2030-01-01T00:00:00Z" });
+
+    await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
+
+    const opts = mockGetScopedInstallationToken.mock.calls[0][3] as Record<string, unknown>;
+    expect(opts.forceRefresh).toBe(true);
+  });
+
+  it("progress token is multi-use — second call with the same token still succeeds", async () => {
+    const token = mintKgProgressToken();
+    mockGetScopedInstallationToken.mockResolvedValue({ token: "ghs_tok", expiresAt: "2030-01-01T00:00:00Z" });
+
+    const first = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
+    const second = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+  });
+
+  it("returns 403 for a non-kg-refresh phase token", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "AII",
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 403 for a result-audience token (wrong audience)", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "issue-1",
+      mappingTeamKey: "AII",
+      phase: "kg-refresh",
+      audience: "result",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 403 when Authorization header is missing", async () => {
+    const result = await callKgPushTokenHandler({ authorization: undefined });
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 403 when kgSourceRepo is not configured", async () => {
+    const token = mintKgProgressToken();
+    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}`, kgSourceRepo: null });
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 500 when the GitHub API fails", async () => {
+    const token = mintKgProgressToken();
+    mockGetScopedInstallationToken.mockRejectedValueOnce(new Error("GitHub API error"));
+
+    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(500);
+    expect(result.body).toEqual({ error: "Failed to mint token" });
+  });
+
+  it("all auth/authz failure modes return byte-identical 403 body", async () => {
+    const expectedBody = { error: "Unauthorized" };
+    const kgToken = mintKgProgressToken();
+    const { token: implToken } = runnerTokens.mintRunToken({
+      issueId: "i2",
+      mappingTeamKey: "AII",
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const cases = await Promise.all([
+      callKgPushTokenHandler({ authorization: undefined }),
+      callKgPushTokenHandler({ authorization: "" }),
+      callKgPushTokenHandler({ authorization: "Bearer bad.token" }),
+      callKgPushTokenHandler({ authorization: `Bearer ${implToken}` }),
+      callKgPushTokenHandler({ authorization: `Bearer ${kgToken}`, kgSourceRepo: null }),
+    ]);
+
+    for (const result of cases) {
+      expect(result.status).toBe(403);
+      expect(result.body).toEqual(expectedBody);
+    }
+  });
+});
+
+// ── handleKgTrackerDataRequest ────────────────────────────────────────────────
+
+describe("handleKgTrackerDataRequest", () => {
+  async function callTrackerData(opts: {
+    authorization?: string;
+    cursor?: string | null;
+  }): Promise<{ status: number; body: Record<string, unknown> }> {
+    return runnerCallback.handleKgTrackerDataRequest({
+      authorization: opts.authorization,
+      secret: SECRET,
+      cursor: opts.cursor,
+    });
+  }
+
+  const MOCK_ISSUES = [{ id: "issue-1", identifier: "AII-1", title: "Test issue" }];
+  const MOCK_PAGE_INFO = { hasNextPage: false, endCursor: null };
+
+  function makeLinearOkResponse(
+    issues = MOCK_ISSUES,
+    pageInfo = MOCK_PAGE_INFO,
+  ): Response {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: { issues: { nodes: issues, pageInfo } },
+      }),
+    } as unknown as Response;
+  }
+
+  it("returns 403 when Authorization header is missing", async () => {
+    const result = await callTrackerData({ authorization: undefined });
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 403 for an invalid or malformed token", async () => {
+    const result = await callTrackerData({ authorization: "Bearer not.a.valid.token" });
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 403 for a non-kg-refresh phase token", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "impl-issue-tracker",
+      mappingTeamKey: "AII",
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const result = await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 503 when Linear is not configured", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValueOnce(false);
+
+    const result = await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(503);
+    expect(result.body).toEqual({ error: "Tracker not configured" });
+  });
+
+  it("returns 200 with issues and pageInfo on the happy path", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
+    mockWithLinearToken.mockResolvedValueOnce(makeLinearOkResponse());
+
+    const result = await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(200);
+    expect(result.body.issues).toEqual(MOCK_ISSUES);
+    expect(result.body.pageInfo).toEqual(MOCK_PAGE_INFO);
+  });
+
+  it("is multi-use — the same progress token can fetch multiple pages", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValue(true);
+    mockWithLinearToken.mockResolvedValue(makeLinearOkResponse());
+
+    const first = await callTrackerData({ authorization: `Bearer ${token}` });
+    const second = await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+  });
+
+  it("passes the cursor to the upstream Linear query", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
+
+    let capturedVariables: Record<string, unknown> | null = null;
+    mockWithLinearToken.mockImplementationOnce(
+      async (cb: (token: string) => Promise<Response>) => {
+        const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: {
+              issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+            },
+          }),
+        } as unknown as Response);
+        const resp = await cb("fake-linear-token");
+        const rawBody = fetchSpy.mock.calls[0]?.[1]?.body;
+        capturedVariables = (JSON.parse(rawBody as string) as Record<string, unknown>)
+          .variables as Record<string, unknown>;
+        fetchSpy.mockRestore();
+        return resp;
+      },
+    );
+
+    await callTrackerData({ authorization: `Bearer ${token}`, cursor: "cursor-xyz" });
+
+    expect(capturedVariables!["after"]).toBe("cursor-xyz");
+    expect(capturedVariables!["teamKey"]).toBe("AII");
+  });
+
+  it("returns 502 when the Linear API returns a non-OK HTTP status", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
+    mockWithLinearToken.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({}),
+    } as unknown as Response);
+
+    const result = await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(502);
+  });
+
+  it("returns 500 when the upstream fetch throws", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
+    mockWithLinearToken.mockRejectedValueOnce(new Error("Network error"));
+
+    const result = await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(result.status).toBe(500);
   });
 });

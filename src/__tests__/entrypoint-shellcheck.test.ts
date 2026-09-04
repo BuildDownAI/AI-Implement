@@ -211,6 +211,128 @@ describe("session/git-credential-helper.sh", () => {
   });
 });
 
+// ─── session/git-credential-helper-kg-push.sh ────────────────────────────────
+
+describe("session/git-credential-helper-kg-push.sh", () => {
+  it("passes shellcheck cleanly", () => {
+    const r = spawnSync("shellcheck", ["session/git-credential-helper-kg-push.sh"], { stdio: ["ignore", "pipe", "pipe"] });
+    if (r.error?.code === "ENOENT") return;
+    expect(r.status).toBe(0);
+  });
+
+  it("exits 0 without credentials when GIT_KG_PUSH_TOKEN_FILE is unset", () => {
+    const r = spawnSync("bash", ["session/git-credential-helper-kg-push.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\n\n",
+      env: { ...process.env, GIT_KG_PUSH_TOKEN_FILE: "" },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toBe("");
+  });
+
+  it("exits 0 without credentials for non-github.com hosts", () => {
+    const r = spawnSync("bash", ["session/git-credential-helper-kg-push.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=gitlab.com\n\n",
+      env: { ...process.env, GIT_KG_PUSH_TOKEN_FILE: "" },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toBe("");
+  });
+
+  it("exits 0 without credentials for store/erase operations", () => {
+    for (const op of ["store", "erase"]) {
+      const r = spawnSync("bash", ["session/git-credential-helper-kg-push.sh", op], {
+        stdio: ["pipe", "pipe", "pipe"],
+        input: "protocol=https\nhost=github.com\n\n",
+        env: { ...process.env },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.toString()).toBe("");
+    }
+  });
+
+  it("returns credentials from a fresh token file without contacting the server", () => {
+    const dir = mkdtempSync(join(tmpdir(), "kg-push-test-"));
+    const tokenFile = join(dir, "token.json");
+    try {
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      writeFileSync(tokenFile, JSON.stringify({ token: "ghs_push_tok", expires_at: expiresAt }));
+
+      const r = spawnSync("bash", ["session/git-credential-helper-kg-push.sh", "get"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        input: "protocol=https\nhost=github.com\n\n",
+        env: { ...process.env, GIT_KG_PUSH_TOKEN_FILE: tokenFile },
+      });
+      expect(r.status).toBe(0);
+      expect(r.stdout.toString()).toContain("username=x-access-token");
+      expect(r.stdout.toString()).toContain("password=ghs_push_tok");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("re-fetches from /api/runner/kg-push-token when token expires within 10 minutes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kg-push-test-"));
+    const tokenFile = join(dir, "token.json");
+
+    let requestedUrl: string | undefined;
+    const server = http.createServer((req, res) => {
+      requestedUrl = req.url;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ token: "ghs_refreshed", expires_at: new Date(Date.now() + 55 * 60 * 1000).toISOString() }));
+    });
+
+    try {
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const port = (server.address() as AddressInfo).port;
+
+      const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      writeFileSync(tokenFile, JSON.stringify({ token: "ghs_stale", expires_at: expiresAt }));
+
+      const stdout = await new Promise<string>((resolve, reject) => {
+        const child = spawn("bash", ["session/git-credential-helper-kg-push.sh", "get"], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: {
+            ...process.env,
+            GIT_KG_PUSH_TOKEN_FILE: tokenFile,
+            RUNNER_CALLBACK_URL: `http://127.0.0.1:${port}///`,
+            RUN_PROGRESS_TOKEN: "progress-tok",
+          },
+        });
+        child.stdin.write("protocol=https\nhost=github.com\n\n");
+        child.stdin.end();
+        let out = "";
+        child.stdout.on("data", (d: Buffer) => (out += d.toString()));
+        child.on("close", (code) => {
+          if (code !== 0) reject(new Error(`helper exited ${code}`));
+          else resolve(out);
+        });
+        child.on("error", reject);
+        setTimeout(() => reject(new Error("helper timed out")), 15000);
+      });
+
+      expect(requestedUrl).toBe("/api/runner/kg-push-token");
+      expect(stdout).toContain("password=ghs_refreshed");
+      const cached = JSON.parse(readFileSync(tokenFile, "utf-8")) as { token: string };
+      expect(cached.token).toBe("ghs_refreshed");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 0 and returns empty credentials when GIT_KG_PUSH_TOKEN_FILE is unset but host matches", () => {
+    const r = spawnSync("bash", ["session/git-credential-helper-kg-push.sh", "get"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      input: "protocol=https\nhost=github.com\n\n",
+      env: { ...process.env },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.toString()).toBe("");
+  });
+});
+
 // ─── session/entrypoint.sh ───────────────────────────────────────────────────
 
 describe("session/entrypoint.sh", () => {

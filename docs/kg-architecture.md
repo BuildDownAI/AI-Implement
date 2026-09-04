@@ -306,6 +306,28 @@ the start. No new top-level function, no new route branch.
   `exec` chain, the orchestrator owns forwarding, reaping, and a bounded kill — a child must
   never outlive shutdown or block it.
 
+## kg-refresh run kind
+
+AII-493 adds a `kg-refresh` Claude runner that follows the ingest playbook autonomously — cloning the
+KG source repository, running the ingest scripts, and pushing the snapshot. AII-494 adds the two
+runner-callback endpoints that give this run kind its privileged access without ever vending a
+long-lived credential to the runner.
+
+Both endpoints require a `kg-refresh`-phase progress token (multi-use, `consume: false`); any other
+phase or a missing/invalid token receives `403 Unauthorized` with no distinguishing body. The
+orchestrator performs all external writes with its own credentials; the runner receives only the
+minted token or the requested data.
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/runner/kg-push-token` | POST | Vends a short-lived GitHub installation token with `contents: write` scoped to the single KG source repo. `forceRefresh: true` ensures the credential helper always receives a full-lifetime token. |
+| `/api/runner/kg-tracker-data` | POST | Returns one paginated page (50 issues) of Linear issues for the run's team, including comments. The orchestrator performs the read; no Linear credential ever leaves the orchestrator. |
+
+The git credential helper (`session/git-credential-helper-kg-push.sh`) re-mints on expiry using
+the same progress token. `stripEmbeddedTokenFromOrigin` in `kg-snapshot-push.ts` re-strips the
+token from the remote URL right before push to counter `refreshRunnerGithubCredentials`
+re-embedding it after clone.
+
 ## Failure history
 
 Each of these shipped a degraded or blocked deploy, and each is now covered by a guard.
@@ -331,3 +353,4 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | Deploy ownership | AII-353, AII-355 | Self-deploy, source stamps, availability |
 | Docs ingestion | KGB-2 through KGB-5, KGA-2, BDS-38 | Crawl, section chunks, citable anchors |
 | Scaling | KGB-8, AII-422 | Bounded-memory embedding, and a receipt when it still fails |
+| Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: Claude runner follows the ingest playbook; runner-callback endpoints vend scoped push token and tracker data |
