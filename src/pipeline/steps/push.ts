@@ -194,12 +194,22 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     const remoteBranchSha = await span("git-ls-remote", async () =>
       resolveRemoteBranchSha(workspaceDir, remote, branchName, activeGithubToken),
     );
+    let expectedRemoteSha: string | null;
     if (existingPrNumber && remoteBranchSha !== baseRef) {
-      throw new Error(
-        `Existing PR branch changed during the run (expected ${baseRef}, found ${remoteBranchSha ?? "missing"}); refusing to overwrite concurrent work`,
-      );
+      if (remoteBranchSha !== null && isAncestorOf(workspaceDir, remoteBranchSha, "HEAD")) {
+        // The run's own agent pushed from this workspace. Adopt the new remote
+        // tip so the force-with-lease succeeds — baseRef is behind and would
+        // fail immediately.
+        console.error(`[push] remote branch advanced by agent push (${baseRef} → ${remoteBranchSha}); adopting`);
+        expectedRemoteSha = remoteBranchSha;
+      } else {
+        throw new Error(
+          `Existing PR branch changed during the run (expected ${baseRef}, found ${remoteBranchSha ?? "missing"}); refusing to overwrite concurrent work`,
+        );
+      }
+    } else {
+      expectedRemoteSha = existingPrNumber ? baseRef : remoteBranchSha;
     }
-    const expectedRemoteSha = existingPrNumber ? baseRef : remoteBranchSha;
     const tracePush = process.env.AI_IMPLEMENT_LOG_LEVEL === "stream";
     const { args: pushArgs, env: pushEnv } = buildGitPushInvocation(
       remote,
@@ -560,4 +570,17 @@ function resolveRemoteBranchSha(
 function sleepSync(ms: number): void {
   if (process.env.NODE_ENV === "test") return;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Returns true when `ancestorSha` is reachable from `ref` in the local clone.
+ * Used by the push guard to distinguish the run's own agent push (reachable
+ * from HEAD) from genuinely concurrent foreign work (not reachable).
+ */
+function isAncestorOf(dir: string, ancestorSha: string, ref: string): boolean {
+  const result = spawnSync("git", ["merge-base", "--is-ancestor", ancestorSha, ref], {
+    cwd: dir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return result.status === 0;
 }

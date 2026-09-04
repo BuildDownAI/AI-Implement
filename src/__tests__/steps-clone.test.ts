@@ -72,8 +72,10 @@ describe("cloneStep", () => {
 
   it("performs a fresh clone and returns cloneMethod=fresh when .git does not exist", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
-    // clone succeeds, rev-parse returns sha
+    // clone, git config user.name, git config user.email, rev-parse
     mockSpawn([
+      { status: 0 },
+      { status: 0 },
       { status: 0 },
       { status: 0, stdout: "abc123\n" },
     ]);
@@ -89,8 +91,10 @@ describe("cloneStep", () => {
 
   it("performs incremental fetch when .git already exists", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    // fetch succeeds, reset succeeds, rev-parse returns sha
+    // fetch, reset, git config user.name, git config user.email, rev-parse
     mockSpawn([
+      { status: 0 },
+      { status: 0 },
       { status: 0 },
       { status: 0 },
       { status: 0, stdout: "def456\n" },
@@ -122,7 +126,10 @@ describe("cloneStep", () => {
 
   it("throws when rev-parse fails", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
+    // clone, config user.name, config user.email, rev-parse (fails)
     mockSpawn([
+      { status: 0 },
+      { status: 0 },
       { status: 0 },
       { status: 128, stderr: "fatal: not a git repo" },
     ]);
@@ -134,7 +141,7 @@ describe("cloneStep", () => {
 
   it("seeds scratch exclusion for the workspace on a fresh clone", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
-    mockSpawn([{ status: 0 }, { status: 0, stdout: "sha1\n" }]);
+    mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha1\n" }]);
 
     await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -143,7 +150,7 @@ describe("cloneStep", () => {
 
   it("seeds scratch exclusion for the workspace on an incremental fetch", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
-    mockSpawn([{ status: 0 }, { status: 0 }, { status: 0, stdout: "sha2\n" }]);
+    mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha2\n" }]);
 
     await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -152,7 +159,7 @@ describe("cloneStep", () => {
 
   it("passes through repoOwner, repoRepo, branch, githubToken in outputs", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
-    mockSpawn([{ status: 0 }, { status: 0, stdout: "sha1\n" }]);
+    mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha1\n" }]);
 
     const outputs = await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
 
@@ -170,6 +177,8 @@ describe("cloneStep", () => {
       json: async () => ({ token: "fresh-token" }),
     } as Response));
     mockSpawn([
+      { status: 0 },
+      { status: 0 },
       { status: 0 },
       { status: 0, stdout: "sha1\n" },
       { status: 0 },
@@ -204,6 +213,8 @@ describe("cloneStep", () => {
     } as Response));
     mockSpawn([
       { status: 0 },
+      { status: 0 },
+      { status: 0 },
       { status: 0, stdout: "sha1\n" },
       { status: 0 },
     ]);
@@ -230,11 +241,13 @@ describe("cloneStep", () => {
   describe("PR-targeted (gap-fill) runs: base branch fetch", () => {
     it("fetches base branch after clone and verifies merge-base on a fresh clone", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
-      // clone, fetch-base, merge-base (ok), rev-parse
+      // clone, fetch-base, merge-base (ok), config user.name, config user.email, rev-parse
       mockSpawn([
         { status: 0 },
         { status: 0 },
         { status: 0, stdout: "deadbeef\n" },
+        { status: 0 },
+        { status: 0 },
         { status: 0, stdout: "abc123\n" },
       ]);
 
@@ -249,12 +262,14 @@ describe("cloneStep", () => {
 
     it("fetches base branch after incremental fetch and verifies merge-base", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(true);
-      // fetch-branch, reset, fetch-base, merge-base (ok), rev-parse
+      // fetch-branch, reset, fetch-base, merge-base (ok), config user.name, config user.email, rev-parse
       mockSpawn([
         { status: 0 },
         { status: 0 },
         { status: 0 },
         { status: 0, stdout: "deadbeef\n" },
+        { status: 0 },
+        { status: 0 },
         { status: 0, stdout: "def456\n" },
       ]);
 
@@ -268,11 +283,13 @@ describe("cloneStep", () => {
 
     it("runs git fetch --unshallow when merge-base finds no common ancestor", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
-      // clone, fetch-base, merge-base (fail), unshallow, rev-parse
+      // clone, fetch-base, merge-base (fail), unshallow, config user.name, config user.email, rev-parse
       mockSpawn([
         { status: 0 },
         { status: 0 },
         { status: 1, stderr: "fatal: Not a valid commit name" },
+        { status: 0 },
+        { status: 0 },
         { status: 0 },
         { status: 0, stdout: "abc123\n" },
       ]);
@@ -286,10 +303,13 @@ describe("cloneStep", () => {
 
     it("logs and continues when base-branch fetch fails (fail soft)", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
-      // clone, fetch-base (fail), rev-parse — merge-base and unshallow are NOT called
+      // clone, fetch-base (fail), config user.name, config user.email, rev-parse
+      // merge-base and unshallow are NOT called
       mockSpawn([
         { status: 0 },
         { status: 128, stderr: "fatal: secret-token could not read Username" },
+        { status: 0 },
+        { status: 0 },
         { status: 0, stdout: "abc123\n" },
       ]);
 
@@ -297,18 +317,20 @@ describe("cloneStep", () => {
 
       expect(outputs.clonedRef).toBe("abc123");
       const calls = vi.mocked(spawnSync).mock.calls;
-      // Only 3 calls total: clone, fetch-base, rev-parse (no merge-base or unshallow)
-      expect(calls.length).toBe(3);
+      // 5 calls: clone, fetch-base, config×2, rev-parse (no merge-base or unshallow)
+      expect(calls.length).toBe(5);
     });
 
     it("logs and continues when unshallow also fails (fail soft)", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
-      // clone, fetch-base, merge-base (fail), unshallow (fail), rev-parse
+      // clone, fetch-base, merge-base (fail), unshallow (fail), config user.name, config user.email, rev-parse
       mockSpawn([
         { status: 0 },
         { status: 0 },
         { status: 1 },
         { status: 1, stderr: "fatal: server does not support shallow requests" },
+        { status: 0 },
+        { status: 0 },
         { status: 0, stdout: "abc123\n" },
       ]);
 
@@ -319,8 +341,10 @@ describe("cloneStep", () => {
 
     it("does not fetch base branch when prNumber is absent", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
-      // clone, rev-parse only
+      // clone, config user.name, config user.email, rev-parse
       mockSpawn([
+        { status: 0 },
+        { status: 0 },
         { status: 0 },
         { status: 0, stdout: "abc123\n" },
       ]);
@@ -328,13 +352,16 @@ describe("cloneStep", () => {
       await cloneStep.run(makeContext(), { ...BASE_INPUTS, baseBranch: "main" }, new NoopStepReporter());
 
       const calls = vi.mocked(spawnSync).mock.calls;
-      expect(calls.length).toBe(2);
-      expect(calls[1][1]).toEqual(["rev-parse", "HEAD"]);
+      expect(calls.length).toBe(4);
+      expect(calls[3][1]).toEqual(["rev-parse", "HEAD"]);
     });
 
     it("does not fetch base branch when baseBranch is absent", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, config user.name, config user.email, rev-parse
       mockSpawn([
+        { status: 0 },
+        { status: 0 },
         { status: 0 },
         { status: 0, stdout: "abc123\n" },
       ]);
@@ -342,14 +369,17 @@ describe("cloneStep", () => {
       await cloneStep.run(makeContext(), { ...BASE_INPUTS, prNumber: "42" }, new NoopStepReporter());
 
       const calls = vi.mocked(spawnSync).mock.calls;
-      expect(calls.length).toBe(2);
+      expect(calls.length).toBe(4);
     });
 
     it("redacts token in base-branch fetch error message", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, fetch-base (fail), config user.name, config user.email, rev-parse
       mockSpawn([
         { status: 0 },
         { status: 128, stderr: "fatal: secret-token auth failed" },
+        { status: 0 },
+        { status: 0 },
         { status: 0, stdout: "abc123\n" },
       ]);
 
@@ -359,6 +389,44 @@ describe("cloneStep", () => {
       expect(errorMsg).toContain("[clone] base-branch fetch failed");
       expect(errorMsg).not.toContain("secret-token");
       consoleSpy.mockRestore();
+    });
+  });
+
+  describe("workspace-local git identity", () => {
+    it("sets user.name and user.email without --global after a fresh clone", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "sha1\n" }]);
+
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[1][1]).toEqual(["config", "user.name", "ai-implement[bot]"]);
+      expect(calls[1][2]).toEqual(expect.objectContaining({ cwd: "/tmp/workspace" }));
+      expect(calls[2][1]).toEqual(["config", "user.email", "ai-implement[bot]@users.noreply.github.com"]);
+      expect(calls[2][2]).toEqual(expect.objectContaining({ cwd: "/tmp/workspace" }));
+      // Neither config call should include --global
+      expect((calls[1][1] as string[]).join(" ")).not.toContain("--global");
+      expect((calls[2][1] as string[]).join(" ")).not.toContain("--global");
+    });
+
+    it("sets workspace-local git identity in gap-fill (PR-targeted) runs", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, fetch-base, merge-base, config user.name, config user.email, rev-parse
+      mockSpawn([
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "deadbeef\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "abc123\n" },
+      ]);
+
+      await cloneStep.run(makeContext(), PR_INPUTS, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      // After clone(0), fetch-base(1), merge-base(2), identity calls are at indices 3 and 4
+      expect(calls[3][1]).toEqual(["config", "user.name", "ai-implement[bot]"]);
+      expect(calls[4][1]).toEqual(["config", "user.email", "ai-implement[bot]@users.noreply.github.com"]);
     });
   });
 

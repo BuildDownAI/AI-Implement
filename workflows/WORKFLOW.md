@@ -151,9 +151,12 @@ that pathway is handled by the orchestrator's runner-callback.
 ## Gap-fill instructions _(only when PR_NUMBER is set)_
 
 You are adding missing work to existing PR #${PR_NUMBER}.
-**Do NOT create a new branch or PR. Do NOT commit or push.** Review the gap
-analysis comment on the PR to understand what is still missing, then leave your file changes unstaged and uncommitted. The AI-Implement pipeline will
-commit and push them to the existing PR branch after review passes.
+**Do NOT create a new branch or PR. Do NOT run `git push`.** Review the gap
+analysis comment on the PR to understand what is still missing. Local commits
+— including a merge commit when resolving conflicts with the base branch — are
+fine; the pipeline pushes when the agent is done. Leave any remaining file
+changes unstaged and uncommitted — the AI-Implement pipeline will commit and
+push them to the existing PR branch after review passes.
 
 After making the changes, write a short note about what you addressed to
 `ai-output/comments/01-gap-fill-summary.md`. The orchestrator reads this

@@ -54,6 +54,7 @@ function mockGitSuccess(sha = "deadbeef", dirty = true) {
     if (gitArgs[0] === "ls-remote") {
       return spawnResult(0, `beadfeed\t${gitArgs.at(-1)}\n`);
     }
+    if (gitArgs[0] === "merge-base") return spawnResult(1); // not an ancestor (foreign work)
     return spawnResult(0);
   });
 }
@@ -1424,5 +1425,170 @@ describe("pushStep — mounted workspace never pushes", () => {
     await expect(
       pushStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter()),
     ).rejects.toThrow(); // normal logic runs, fails on nothing-to-commit
+  });
+});
+
+// ---- Push guard: adopt own agent push vs refuse foreign work ----
+
+describe("pushStep — push guard: adopt agent push vs refuse foreign work", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  function mockGapFillWithRemoteSha(remoteSha: string, mergeBaseExitCode: number) {
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") {
+        return spawnResult(0, `${remoteSha}\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "merge-base") return spawnResult(mergeBaseExitCode);
+      return spawnResult(0);
+    });
+  }
+
+  const GAP_FILL_INPUTS = {
+    ...BASE_INPUTS,
+    branchName: "feature/existing-pr",
+    baseBranch: "feature/existing-pr",
+    baseRef: "ff400c5",
+    existingPrNumber: "42",
+  };
+
+  it("adopts agent push when remote SHA is reachable from HEAD (merge-base exit 0)", async () => {
+    mockGapFillWithRemoteSha("246b3fe", 0);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const outputs = await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.branchPushed).toBe(true);
+    expect(outputs.prNumber).toBe(42);
+    // Guard logged the adoption
+    expect(consoleSpy.mock.calls.some(([msg]) => String(msg).includes("adopting"))).toBe(true);
+    consoleSpy.mockRestore();
+  });
+
+  it("uses the adopted remote SHA (not baseRef) in the force-with-lease arg when adopting", async () => {
+    mockGapFillWithRemoteSha("246b3fe", 0);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
+      new NoopStepReporter(),
+    );
+
+    // Force-with-lease must reference 246b3fe (the adopted remote tip), not ff400c5 (baseRef).
+    // Using baseRef as the lease would fail because the remote is already ahead of it.
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining([
+        "push",
+        expect.any(String),
+        "HEAD:refs/heads/feature/existing-pr",
+        "--force-with-lease=refs/heads/feature/existing-pr:246b3fe",
+      ]),
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining(["--force-with-lease=refs/heads/feature/existing-pr:ff400c5"]),
+      expect.anything(),
+    );
+    consoleSpy.mockRestore();
+  });
+
+  it("refuses genuinely foreign push when remote SHA is not reachable from HEAD (merge-base exit 1)", async () => {
+    mockGapFillWithRemoteSha("foreignsha", 1);
+
+    await expect(
+      pushStep.run(makeContext({ prNumber: "42" }), GAP_FILL_INPUTS, new NoopStepReporter()),
+    ).rejects.toThrow(/refusing to overwrite concurrent work/);
+
+    expect(spawnSync).not.toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining(["push"]),
+      expect.anything(),
+    );
+  });
+
+  it("does not call merge-base when remote SHA already matches baseRef (fast-path)", async () => {
+    // When remoteBranchSha === baseRef the guard is skipped entirely.
+    vi.mocked(spawnSync).mockImplementation((_cmd, args) => {
+      const gitArgs = args as string[];
+      if (gitArgs[0] === "status") return spawnResult(0, " M src/app.ts\n");
+      if (gitArgs[0] === "rev-parse") return spawnResult(0, "abc123\n");
+      if (gitArgs[0] === "show") return spawnResult(0, "M\tsrc/app.ts\n");
+      if (gitArgs[0] === "ls-remote") {
+        // remote SHA matches baseRef — no mismatch
+        return spawnResult(0, `ff400c5\t${gitArgs.at(-1)}\n`);
+      }
+      if (gitArgs[0] === "merge-base") {
+        throw new Error("merge-base must not be called when SHAs match");
+      }
+      return spawnResult(0);
+    });
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+
+    const result = await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
+      new NoopStepReporter(),
+    );
+
+    // Reaching here means merge-base was never called (the mock would have thrown).
+    expect(result.branchPushed).toBe(true);
+    const mergeBaseCalls = vi.mocked(spawnSync).mock.calls.filter(
+      ([, args]) => (args as string[])[0] === "merge-base",
+    );
+    expect(mergeBaseCalls).toHaveLength(0);
+  });
+
+  it("calls merge-base with --is-ancestor <remoteSha> HEAD in that exact order", async () => {
+    mockGapFillWithRemoteSha("246b3fe", 0);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 200,
+      json: async () => ({ token: "fresh-token", expires_at: "2030-01-01T00:00:00Z" }),
+    } as Response);
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "one-use-publication-token");
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await pushStep.run(
+      makeContext({ callbackUrl: "https://orchestrator.example", prNumber: "42" }),
+      { ...GAP_FILL_INPUTS, callbackUrl: "https://orchestrator.example" },
+      new NoopStepReporter(),
+    );
+
+    expect(spawnSync).toHaveBeenCalledWith(
+      "git",
+      ["merge-base", "--is-ancestor", "246b3fe", "HEAD"],
+      expect.objectContaining({ cwd: "/tmp/workspace" }),
+    );
+    consoleSpy.mockRestore();
   });
 });
