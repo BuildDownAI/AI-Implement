@@ -43,6 +43,9 @@ const SNAPSHOT_COMMIT_RETRY_MS = 5_000;
 /** DB settings key for persisting ingest stage across restarts. */
 const KG_STAGE_SETTINGS_KEY = "kg_refresh_stage";
 
+/** DB settings key for persisting the staged snapshot head commit SHA across restarts. */
+const KG_SNAPSHOT_SHA_SETTINGS_KEY = "kg_refresh_snapshot_sha";
+
 /**
  * Gates evaluated during refresh. `"staging"` fires before any swap; `"ingest-needed"` fires
  * before staging when the source snapshot is not newer than the served stamp (informational,
@@ -123,8 +126,12 @@ interface KgRefreshInput {
   mintToken?: typeof getScopedInstallationToken;
   fetchTarball?: typeof fetchRepoTarball;
   fetchDefaultBranch?: (token: string, owner: string, repo: string) => Promise<string>;
-  /** Returns the committer date of the latest commit touching `snapshot/` on the default branch, or null on failure. */
-  fetchSnapshotCommitDate?: (token: string, owner: string, repo: string, branch: string) => Promise<string | null>;
+  /** Returns the head commit SHA of the latest commit touching `snapshot/` on the default branch, or null on failure. */
+  fetchSnapshotCommitSha?: (token: string, owner: string, repo: string, branch: string) => Promise<string | null>;
+  /** Persist the head `snapshot/` commit SHA after the rail stages a snapshot. Injectable for tests. */
+  persistSnapshotSha?: (sha: string) => void;
+  /** Load the persisted `snapshot/` commit SHA. Injectable for tests; returns null when absent. */
+  loadSnapshotSha?: () => string | null;
   materialize?: (python: string, cwd: string) => Promise<void>;
   mcpToolCall?: (url: string, tool: string, args: Record<string, unknown>) => Promise<unknown>;
   canaryDeadlineMs?: number;
@@ -206,7 +213,9 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const mintToken = input.mintToken ?? getScopedInstallationToken;
   const fetchTarball = input.fetchTarball ?? fetchRepoTarball;
   const fetchDefaultBranch = input.fetchDefaultBranch ?? defaultFetchDefaultBranch;
-  const fetchSnapshotCommitDate = input.fetchSnapshotCommitDate ?? defaultFetchSnapshotCommitDate;
+  const fetchSnapshotCommitSha = input.fetchSnapshotCommitSha ?? defaultFetchSnapshotCommitSha;
+  const persistSnapshotShaFn = input.persistSnapshotSha ?? defaultPersistSnapshotSha;
+  const loadSnapshotShaFn = input.loadSnapshotSha ?? defaultLoadSnapshotSha;
   const materialize = input.materialize ?? defaultMaterialize;
   const mcpToolCall = input.mcpToolCall ?? defaultMcpToolCall;
   const canaryDeadlineMs = input.canaryDeadlineMs ?? CANARY_DEADLINE_MS;
@@ -298,6 +307,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     const repo = parseKgSourceRepo(input.kgSourceRepo);
     let stampBefore: string | null = null;
     let namespace: string | null = null;
+    let snapshotCommitSha: string | null = null;
+    let wasFirstRun = false;
 
     // ---- fetch (no swap yet; any failure here leaves current untouched) ----
     try {
@@ -313,10 +324,13 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       namespace = await readNamespace(source);
       stampBefore = await readServedStamp(namespace);
 
-      // Pre-check: if the source repo has no newer snapshot commit, skip the full cycle.
-      // Guard requires both sides known; either null falls through so the stamp gate handles it.
-      const snapshotCommitDate = await fetchSnapshotCommitDate(token, repo.owner, repo.repo, branch);
-      if (snapshotCommitDate !== null && stampBefore !== null && Date.parse(snapshotCommitDate) <= Date.parse(stampBefore)) {
+      // Pre-check: if the source repo's snapshot/ head SHA matches the last-recorded SHA
+      // (set whenever the rail staged this exact snapshot), no new data has landed and we
+      // can skip the full rail cycle. A null SHA falls through so the stamp gate handles it.
+      snapshotCommitSha = await fetchSnapshotCommitSha(token, repo.owner, repo.repo, branch);
+      const recordedSha = loadSnapshotShaFn();
+      wasFirstRun = recordedSha === null;
+      if (snapshotCommitSha !== null && snapshotCommitSha === recordedSha) {
         await rm(fetchDir, { recursive: true, force: true });
         const outcome: RefreshOutcome = {
           ok: false,
@@ -402,15 +416,21 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
     const stampAfter = await readServedStamp(namespace);
     if (!stampAfter || (stampBefore !== null && stampAfter <= stampBefore)) {
+      if (snapshotCommitSha !== null) persistSnapshotShaFn(snapshotCommitSha);
+      const coldStartHint =
+        wasFirstRun && snapshotCommitSha !== null
+          ? "; snapshot recorded — click Refresh again to dispatch an ingest"
+          : "";
       return revert(
         namespace,
         "stamp",
-        `served stamp ${stampAfter ?? "unknown"} is not newer than ${stampBefore ?? "unknown"}`,
+        `served stamp ${stampAfter ?? "unknown"} is not newer than ${stampBefore ?? "unknown"}${coldStartHint}`,
         stampBefore,
       );
     }
 
     await rm(fetchDir, { recursive: true, force: true });
+    if (snapshotCommitSha !== null) persistSnapshotShaFn(snapshotCommitSha);
     const outcome: RefreshOutcome = {
       ok: true,
       at: Date.now(),
@@ -763,16 +783,37 @@ async function defaultFetchDefaultBranch(token: string, owner: string, repo: str
   return data.default_branch || "main";
 }
 
-async function defaultFetchSnapshotCommitDate(token: string, owner: string, repo: string, branch: string): Promise<string | null> {
+async function defaultFetchSnapshotCommitSha(token: string, owner: string, repo: string, branch: string): Promise<string | null> {
   try {
     const res = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/commits?sha=${branch}&path=snapshot/&per_page=1`,
       { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } },
     );
     if (!res.ok) return null;
-    const data = (await res.json()) as Array<{ commit?: { committer?: { date?: string }; author?: { date?: string } } }>;
+    const data = (await res.json()) as Array<{ sha?: string; commit?: { committer?: { date?: string }; author?: { date?: string } } }>;
     if (!Array.isArray(data) || data.length === 0) return null;
-    return data[0].commit?.committer?.date ?? data[0].commit?.author?.date ?? null;
+    return data[0].sha ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function defaultPersistSnapshotSha(sha: string): void {
+  try {
+    getDb()
+      .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+      .run(KG_SNAPSHOT_SHA_SETTINGS_KEY, sha);
+  } catch {
+    // DB unavailable — SHA will be lost on restart, which is acceptable.
+  }
+}
+
+function defaultLoadSnapshotSha(): string | null {
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(KG_SNAPSHOT_SHA_SETTINGS_KEY) as { value: string } | undefined;
+    return row?.value ?? null;
   } catch {
     return null;
   }

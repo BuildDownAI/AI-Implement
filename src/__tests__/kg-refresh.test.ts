@@ -9,12 +9,9 @@ import { COMPLETION_MARKER } from "../kg-sidecar.js";
 const NAMESPACE = "https://kg.test.example/";
 const OLD_STAMP = "2026-08-20T00:10:10+00:00";
 const NEW_STAMP = "2026-08-24T12:00:00+00:00";
-// GitHub API always returns Z-suffix; the graph dcterms:modified uses +00:00.
-// Use Z-suffixed constants wherever fetchSnapshotCommitDate is mocked.
-const OLD_STAMP_Z = "2026-08-20T00:10:10Z"; // same instant as OLD_STAMP
-const NEW_STAMP_Z = "2026-08-24T12:00:00Z"; // same instant as NEW_STAMP
-// Always newer than any stamp produced in tests — default for fetchSnapshotCommitDate.
-const FUTURE_STAMP_Z = "2099-01-01T00:00:00Z";
+// SHA constants for fetchSnapshotCommitSha mocks.
+const SNAPSHOT_SHA = "abc123def456abc123def456abc123def456abc1";
+const NEW_SNAPSHOT_SHA = "999newsha000999newsha000999newsha000999n";
 
 function makeTarball(dir: string): Buffer {
   // extractSource strips one leading component, so wrap in a top-level dir.
@@ -70,8 +67,10 @@ describe("kg-refresh", () => {
       mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
       fetchTarball: vi.fn(async () => tarball) as never,
       fetchDefaultBranch: vi.fn(async () => "main") as never,
-      // Default: always newer than any served stamp in these tests.
-      fetchSnapshotCommitDate: vi.fn(async () => FUTURE_STAMP_Z) as never,
+      // Default: SHA differs from null recorded SHA → falls through to the rail.
+      fetchSnapshotCommitSha: vi.fn(async () => SNAPSHOT_SHA) as never,
+      persistSnapshotSha: vi.fn() as never,
+      loadSnapshotSha: vi.fn(() => null) as never,
       materialize: materialize as never,
       mcpToolCall: mcpToolCall as never,
       canaryDeadlineMs: 300,
@@ -295,8 +294,11 @@ describe("kg-refresh", () => {
     expect(MATERIALIZE_ARGS.join(" ")).not.toMatch(/embed|cli/);
   });
 
-  it("returns ingest-needed when the source snapshot commit is not newer than the served stamp", async () => {
-    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) });
+  it("returns ingest-needed when the snapshot SHA matches the recorded SHA", async () => {
+    build({
+      fetchSnapshotCommitSha: vi.fn(async () => SNAPSHOT_SHA) as never,
+      loadSnapshotSha: vi.fn(() => SNAPSHOT_SHA) as never,
+    });
     await handle.trigger();
     await waitDone();
 
@@ -310,20 +312,21 @@ describe("kg-refresh", () => {
     expect(existsSync(join(dataRoot, "fetch"))).toBe(false);
   });
 
-  it("returns ingest-needed when the snapshot commit is strictly older than the served stamp", async () => {
-    // snapshotCommitDate < stampBefore: strictly older is also not newer
-    const olderStamp = "2026-08-01T00:00:00Z";
-    build({ fetchSnapshotCommitDate: vi.fn(async () => olderStamp) });
+  it("runs the rail when the snapshot SHA differs from the recorded SHA", async () => {
+    build({
+      fetchSnapshotCommitSha: vi.fn(async () => NEW_SNAPSHOT_SHA) as never,
+      loadSnapshotSha: vi.fn(() => SNAPSHOT_SHA) as never,
+    });
     await handle.trigger();
     await waitDone();
 
     const s = await handle.status();
-    expect(s.lastRefresh?.gate).toBe("ingest-needed");
-    expect(materialize).not.toHaveBeenCalled();
+    expect(s.lastRefresh?.ok).toBe(true);
+    expect(materialize).toHaveBeenCalled();
   });
 
-  it("falls through to a full refresh when fetchSnapshotCommitDate returns null", async () => {
-    build({ fetchSnapshotCommitDate: vi.fn(async () => null) });
+  it("falls through to a full refresh when fetchSnapshotCommitSha returns null", async () => {
+    build({ fetchSnapshotCommitSha: vi.fn(async () => null) as never });
     await handle.trigger();
     await waitDone();
 
@@ -333,14 +336,28 @@ describe("kg-refresh", () => {
     expect(restart).toHaveBeenCalledTimes(1);
   });
 
+  it("falls through to a full refresh when no recorded SHA (cold start)", async () => {
+    build({
+      fetchSnapshotCommitSha: vi.fn(async () => SNAPSHOT_SHA) as never,
+      loadSnapshotSha: vi.fn(() => null) as never,
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    // SHA check does not fire (no recorded SHA) → rail runs
+    expect(s.lastRefresh?.gate).not.toBe("ingest-needed");
+    expect(materialize).toHaveBeenCalled();
+  });
+
   it("falls through to a full refresh when stampBefore is null (readServedStamp returns null)", async () => {
     const noEdgeMcp = vi.fn(async (_url: string, tool: string) => {
       if (tool === "kg_neighbors") return { edges: [] };
       if (tool === "kg_hybrid_search") return { count: 3, degraded: false, results: [] };
       throw new Error(`unexpected tool ${tool}`);
     });
-    // fetchSnapshotCommitDate returns a non-null date, but stampBefore is null → guard does not fire
-    build({ mcpToolCall: noEdgeMcp as never, fetchSnapshotCommitDate: vi.fn(async () => NEW_STAMP_Z) });
+    // SHA differs from recorded → SHA check does not fire → stampBefore is null → guard does not fire
+    build({ mcpToolCall: noEdgeMcp as never, fetchSnapshotCommitSha: vi.fn(async () => NEW_SNAPSHOT_SHA) as never });
     await handle.trigger();
     await waitDone();
 
@@ -348,11 +365,11 @@ describe("kg-refresh", () => {
     expect(materialize).toHaveBeenCalled();
   });
 
-  it("absorbs a fetchSnapshotCommitDate throw as a staging failure, not ingest-needed", async () => {
+  it("absorbs a fetchSnapshotCommitSha throw as a staging failure, not ingest-needed", async () => {
     build({
-      fetchSnapshotCommitDate: vi.fn(async () => {
+      fetchSnapshotCommitSha: vi.fn(async () => {
         throw new Error("network timeout");
-      }),
+      }) as never,
     });
     await handle.trigger();
     await waitDone();
@@ -364,28 +381,127 @@ describe("kg-refresh", () => {
     expect(restart).not.toHaveBeenCalled();
   });
 
-  it("returns ingest-needed when snapshotCommitDate (Z-suffix) is strictly older than served stamp (+00:00) (mixed format, different instants)", async () => {
-    // GitHub returns Z; the graph's dcterms:modified uses +00:00. Verify Date.parse
-    // normalises both so a strictly-older Z-suffix is correctly identified as not newer
-    // even when the two timestamps use different timezone representations.
-    servedStamp = NEW_STAMP; // sidecar serves a newer +00:00-format stamp
-    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) }); // snapshot is older, Z format
-    await handle.trigger();
-    await waitDone();
-
-    const s = await handle.status();
-    expect(s.lastRefresh?.gate).toBe("ingest-needed");
-    expect(materialize).not.toHaveBeenCalled();
-  });
-
   it("GET /api/kg/status reflects ingest-needed gate and running=false after trigger resolves", async () => {
-    build({ fetchSnapshotCommitDate: vi.fn(async () => OLD_STAMP_Z) });
+    build({
+      fetchSnapshotCommitSha: vi.fn(async () => SNAPSHOT_SHA) as never,
+      loadSnapshotSha: vi.fn(() => SNAPSHOT_SHA) as never,
+    });
     await handle.trigger();
     await waitDone();
 
     const s = await handle.status();
     expect(s.running).toBe(false);
     expect(s.lastRefresh?.gate).toBe("ingest-needed");
+  });
+
+  it("success path persists the snapshot SHA", async () => {
+    const persistSnapshotSha = vi.fn();
+    build({
+      fetchSnapshotCommitSha: vi.fn(async () => NEW_SNAPSHOT_SHA) as never,
+      loadSnapshotSha: vi.fn(() => null) as never,
+      persistSnapshotSha: persistSnapshotSha as never,
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(true);
+    expect(persistSnapshotSha).toHaveBeenCalledOnce();
+    expect(persistSnapshotSha).toHaveBeenCalledWith(NEW_SNAPSHOT_SHA);
+  });
+
+  it("stamp-revert path persists the snapshot SHA", async () => {
+    const persistSnapshotSha = vi.fn();
+    restart.mockImplementation(async () => {
+      /* served stamp stays OLD_STAMP */
+    });
+    build({
+      fetchSnapshotCommitSha: vi.fn(async () => NEW_SNAPSHOT_SHA) as never,
+      loadSnapshotSha: vi.fn(() => SNAPSHOT_SHA) as never,
+      persistSnapshotSha: persistSnapshotSha as never,
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.gate).toBe("stamp");
+    expect(persistSnapshotSha).toHaveBeenCalledOnce();
+    expect(persistSnapshotSha).toHaveBeenCalledWith(NEW_SNAPSHOT_SHA);
+  });
+
+  it("cold-start stamp-revert includes hint in detail", async () => {
+    const persistSnapshotSha = vi.fn();
+    restart.mockImplementation(async () => {
+      /* served stamp stays OLD_STAMP */
+    });
+    // loadSnapshotSha returns null (cold start: no recorded SHA)
+    build({
+      fetchSnapshotCommitSha: vi.fn(async () => SNAPSHOT_SHA) as never,
+      loadSnapshotSha: vi.fn(() => null) as never,
+      persistSnapshotSha: persistSnapshotSha as never,
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.gate).toBe("stamp");
+    expect(s.lastRefresh?.detail).toContain("snapshot recorded");
+    expect(s.lastRefresh?.detail).toContain("click Refresh again");
+    expect(persistSnapshotSha).toHaveBeenCalledWith(SNAPSHOT_SHA);
+  });
+
+  it("canary-revert does NOT persist the snapshot SHA", async () => {
+    const persistSnapshotSha = vi.fn();
+    const current = join(dataRoot, "current");
+    mkdirSync(current, { recursive: true });
+    writeFileSync(join(current, "graph.trig"), "OLD-OVERLAY");
+    writeFileSync(join(current, COMPLETION_MARKER), "ok");
+
+    restart.mockImplementation(async () => {
+      canary = restart.mock.calls.length === 1 ? { count: 0, degraded: true } : { count: 3, degraded: false };
+    });
+    build({
+      persistSnapshotSha: persistSnapshotSha as never,
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.gate).toBe("canary");
+    expect(persistSnapshotSha).not.toHaveBeenCalled();
+  });
+
+  it("answers-revert does NOT persist the snapshot SHA", async () => {
+    const persistSnapshotSha = vi.fn();
+    restart.mockImplementation(async () => {
+      delete process.env.KG_SIDECAR_URL;
+      sidecarUp = false;
+    });
+    build({
+      persistSnapshotSha: persistSnapshotSha as never,
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.gate).toBe("answers");
+    expect(persistSnapshotSha).not.toHaveBeenCalled();
+  });
+
+  it("staging failure does NOT persist the snapshot SHA", async () => {
+    const persistSnapshotSha = vi.fn();
+    materialize.mockImplementationOnce(async () => {
+      throw new Error("OOM-killed");
+    });
+    build({
+      persistSnapshotSha: persistSnapshotSha as never,
+    });
+    await handle.trigger();
+    await waitDone();
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.gate).toBe("staging");
+    expect(persistSnapshotSha).not.toHaveBeenCalled();
   });
 
   // ---- AII-495: dispatch-path tests ----------------------------------------
@@ -397,12 +513,12 @@ describe("kg-refresh", () => {
     let stageStore: { stage: KgRefreshStage; startedAt: number } | null;
     let persistedStages: Array<{ stage: KgRefreshStage; startedAt: number }>;
 
-    // fetchSnapshotCommitDate: old on first call (→ ingest-needed → dispatch),
-    // new on subsequent calls (→ rail proceeds after runner pushes commit).
-    function makeSnapshotDateMock() {
+    // fetchSnapshotCommitSha: matches recorded SHA on first call (→ ingest-needed → dispatch),
+    // returns a new SHA on subsequent calls (→ rail proceeds after runner pushes commit).
+    function makeSnapshotShaMock() {
       return vi.fn()
-        .mockResolvedValueOnce(OLD_STAMP_Z)
-        .mockResolvedValue(FUTURE_STAMP_Z);
+        .mockResolvedValueOnce(SNAPSHOT_SHA)
+        .mockResolvedValue(NEW_SNAPSHOT_SHA);
     }
 
     function buildDispatch(overrides: Record<string, unknown> = {}) {
@@ -425,7 +541,9 @@ describe("kg-refresh", () => {
         mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
         fetchTarball: vi.fn(async () => tarball) as never,
         fetchDefaultBranch: vi.fn(async () => "main") as never,
-        fetchSnapshotCommitDate: makeSnapshotDateMock() as never,
+        fetchSnapshotCommitSha: makeSnapshotShaMock() as never,
+        persistSnapshotSha: vi.fn() as never,
+        loadSnapshotSha: vi.fn().mockReturnValue(SNAPSHOT_SHA) as never,
         materialize: materialize as never,
         mcpToolCall: mcpToolCall as never,
         canaryDeadlineMs: 300,
