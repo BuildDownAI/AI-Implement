@@ -163,7 +163,7 @@ export const runnersScript = `
 
     const runnerMode = await runnerModeRes.json();
     const mappings = await mappingsRes.json();
-    const flySecrets = runnerMode.flyProcessLevelSecrets || { enabled: false, source: 'default' };
+    const flySecrets = runnerMode.flyProcessLevelSecrets || { enabled: true, source: 'default' };
 
     const liveSessions = Array.isArray(sessions) ? sessions : [];
     const mapEntries = Object.entries(mappings).sort((a, b) => a[0].localeCompare(b[0]));
