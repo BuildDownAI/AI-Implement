@@ -10,6 +10,7 @@ import type {
 import { MissingProviderConfigError } from "./types.js";
 import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-planning-fetch.js";
 import { isLinearAuthConfigured, withLinearToken } from "../linear-app-auth.js";
+import { defaultFetchSignal } from "../github.js";
 import { parseIssueConfig } from "../issue-config.js";
 
 interface GraphQLResponse<T> {
@@ -126,6 +127,7 @@ export class LinearProvider implements TicketingProvider {
           Authorization: `Bearer ${token}`
         },
         body: JSON.stringify({ query, variables }),
+        signal: defaultFetchSignal(),
       }),
     );
 
