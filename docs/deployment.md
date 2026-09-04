@@ -190,7 +190,7 @@ Setting `FLY_PROCESS_LEVEL_SECRETS` to `true` switches `buildSessionMachineConfi
 - Foreign-team secrets → excluded entirely
 - Global secrets (no team prefix) → `{ env_var: "<NAME>" }` (passed through unchanged)
 
-The entrypoint remap/filter logic remains active in both modes but is a no-op when the flag is on, since the machine already receives bare names with foreign names absent.
+The entrypoint remap/filter logic remains active in both modes but is a no-op when the flag is on, since the machine already receives bare names with foreign names absent. The orchestrator also sets `AI_IMPLEMENT_FORWARDED_SECRETS` to the comma-joined bare names of the own-team secrets in `processes[0].secrets`, so `modelProcessEnv()` strips them from the agent's environment before Claude Code starts.
 
 **This flag is off by default.** Ship it behind the flag, run one probe, then decide:
 
