@@ -811,6 +811,8 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
     while (iteration < maxIterations && !approved) {
       iteration++;
+      // Probe at the top of every pass: an operator may close the PR between iterations that never push.
+      probeIfPrClosed(ghSpawn, prNumber);
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
@@ -979,6 +981,13 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           requiredFix: `Fix the underlying defect causing '${checkName}' to fail`,
         });
       }
+
+      // A close that lands while the reviewer call is in flight must not become an approved or
+
+      // fix-pass exit — the approved exit on a last iteration never pushes, so nothing else would catch it.
+
+      probeIfPrClosed(ghSpawn, prNumber);
+
 
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
       // external review check did not finish within the wait budget. Do not auto-approve
