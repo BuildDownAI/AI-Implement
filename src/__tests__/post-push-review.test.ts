@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
+import { OperatorCancelledError } from "../pipeline/operator-cancelled.js";
 
 function makeCtx(execMock: any) {
   return {
@@ -2495,5 +2496,167 @@ describe("postPushReviewStep", () => {
     expect(notReadyComment).not.toContain("CI check 'review' is failing");
     // Only the internal reviewer's issue should appear.
     expect(notReadyComment).toContain("Null ref in foo method");
+  });
+
+  it("throws OperatorCancelledError when gh pr comment fails with 'issue is locked' and PR is closed-not-merged", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        return { stdout: "", stderr: "GraphQL: Issue is locked (addComment)", exitCode: 1 };
+      }
+      if (args[0] === "pr" && args[1] === "view") {
+        return { stdout: JSON.stringify({ state: "CLOSED", merged: false }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    await expect(
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { report: vi.fn(async () => undefined) },
+      ),
+    ).rejects.toThrow(OperatorCancelledError);
+  });
+
+  it("falls through to generic error when 'issue is locked' but PR is merged", async () => {
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        return { stdout: "", stderr: "GraphQL: Issue is locked (addComment)", exitCode: 1 };
+      }
+      if (args[0] === "pr" && args[1] === "view") {
+        return { stdout: JSON.stringify({ state: "CLOSED", merged: true }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    await expect(
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { report: vi.fn(async () => undefined) },
+      ),
+    ).rejects.toThrow("gh pr comment failed");
+  });
+
+  it("surfaces genuine LLM failure when operator closes PR while failure comment is being posted (priorLlmFailure=true)", async () => {
+    // Sequence: (1) proactive check sees PR open, (2) start-marker comment succeeds,
+    // (3) LLM reviewer exits non-zero, (4) failure-comment post is blocked by a locked PR.
+    // Expected: step returns review_failed (not operator_cancelled), does NOT throw.
+    let prCommentCalls = 0;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        prCommentCalls++;
+        // First pr comment is the start-marker; let it succeed.
+        if (prCommentCalls === 1) return { stdout: "", exitCode: 0 };
+        // Second pr comment is the failure notice — operator has closed the PR.
+        return { stdout: "", stderr: "GraphQL: Issue is locked (addComment)", exitCode: 1 };
+      }
+      if (args[0] === "pr" && args[1] === "view") {
+        // Proactive check at step start sees the PR as open. Subsequent calls (inside
+        // the locked-issue handler) see it as closed — modelling the operator closing it
+        // after the step started but before the failure comment was posted.
+        // The per-iteration probe runs before the reviewer, so the flip must happen on the failure
+        // notice (the second comment), i.e. after the genuine LLM failure — not on the start marker.
+        return prCommentCalls >= 2
+          ? { stdout: JSON.stringify({ state: "CLOSED", merged: false }), exitCode: 0 }
+          : { stdout: JSON.stringify({ state: "OPEN", merged: false }), exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    // LLM reviewer fails (non-zero exit).
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 1, tokensUsed: 0 })));
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+      { report: vi.fn(async () => undefined) },
+    );
+    // Genuine failure must surface — not masked by the operator-cancel benign event.
+    expect(out.terminationReason).toBe("review_failed");
+    expect(out.approved).toBe(false);
+  });
+
+  it("throws OperatorCancelledError via proactive check when PR is closed-not-merged at step start (gh pr comment would succeed)", async () => {
+    // Detection must not depend on the PR being locked. When the PR is already closed at
+    // step start, probeIfPrClosed fires before any comment attempt and throws, even if
+    // the PR still accepts comments (locking is an opt-in GitHub setting).
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view") {
+        return { stdout: JSON.stringify({ state: "CLOSED", merged: false }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        // Comment would succeed — proactive check fires before any comment is attempted.
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 })));
+    await expect(
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { report: vi.fn(async () => undefined) },
+      ),
+    ).rejects.toThrow(OperatorCancelledError);
+  });
+  it("throws OperatorCancelledError when the operator closes the PR while the reviewer is in flight and the reviewer approves", async () => {
+    // The most common exit is "approved", and on its last iteration it never pushes. A close
+    // that lands while the reviewer LLM call is running must not become a reported success:
+    // the probe after the reviewer returns (and at the top of each iteration) catches it.
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const ghComments: string[] = [];
+    let reviewerRan = false;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "view") {
+        // Open at step start and at the top of the iteration; closed once the reviewer has run.
+        return reviewerRan
+          ? { stdout: JSON.stringify({ state: "CLOSED", merged: false }), exitCode: 0 }
+          : { stdout: JSON.stringify({ state: "OPEN", merged: false }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "comment") {
+        // Closed but not locked: comments still succeed, so nothing else would catch it.
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef44" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("deadbeef44/check-runs"))) {
+        return {
+          stdout: JSON.stringify({ check_runs: [{ name: "review", status: "completed", conclusion: "success" }] }),
+          exitCode: 0,
+        };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
+        return { stdout: "[]", exitCode: 0 };
+      }
+      return {
+        stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+        exitCode: 0,
+      };
+    });
+    const ctx = makeCtx(
+      vi.fn(async () => {
+        reviewerRan = true;
+        return { stdout: reviewerJson, exitCode: 0, tokensUsed: 100 };
+      }),
+    );
+    await expect(
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: async () => {} },
+        { report: vi.fn(async () => undefined) },
+      ),
+    ).rejects.toThrow(OperatorCancelledError);
+    // No approval was ever posted on the closed PR.
+    expect(ghComments.some((c) => c.includes("Ready to merge"))).toBe(false);
   });
 });

@@ -2467,13 +2467,18 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
         if (job.status === "completed") {
           recordDispatchSuccess(job.issueId, breakerPhase);
         } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
-          const breakerConclusion = job.conclusion ?? job.status;
-          // Don't fire the trip notification for stuck conclusions — stuck_giveup already
-          // fires notifyStuckGiveUp; we still record the failure so the counter advances.
-          const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
-          const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
-          if (br.tripped && !isStuck) {
-            pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+          // Skip the breaker entirely for operator_cancelled — it was a human decision,
+          // not a system failure. Recording it could park the issue and permanently
+          // suppress future genuine-failure alerts even after the breaker trips from
+          // accumulated operator-cancel events (alreadyParked stays true forever).
+          if (job.conclusion !== "operator_cancelled") {
+            const breakerConclusion = job.conclusion ?? job.status;
+            // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
+            const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
+            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+            if (br.tripped && !isStuck) {
+              pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+            }
           }
         }
       }
@@ -2482,6 +2487,26 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
       // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
       // requeue that will produce its own dispatch notice on the next cycle.
       if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
+        markJobNotified(job.id);
+        continue;
+      }
+
+      // Operator-cancelled: one informational notice, no failure/stuck/parked triple.
+      if (job.conclusion === "operator_cancelled") {
+        if (config.notifyWebhookUrl) {
+          const identifier = job.issueIdentifier || job.issueId;
+          const prNum = job.prUrl ? job.prUrl.match(/\/pull\/(\d+)/)?.[1] : undefined;
+          const prRef = prNum ? ` (PR #${prNum})` : "";
+          try {
+            await notifyText(
+              config.notifyWebhookUrl,
+              `ℹ️ AI-Implement run cancelled by operator${prRef} — ${identifier}. PR was closed mid-run; ticket label cleared — issue excluded from automatic re-dispatch.`,
+            );
+          } catch (err) {
+            console.error(`[monitor] Failed to send operator-cancelled notice for job ${job.id}:`, err);
+          }
+        }
+        console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) operator_cancelled — benign terminal, one informational notice sent`);
         markJobNotified(job.id);
         continue;
       }

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { OperatorCancelledError } from "../operator-cancelled.js";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
@@ -39,7 +40,8 @@ type PostPushReviewTerminationReason =
   | "invalid_review"
   | "external_review_pending"
   | "fix_failed"
-  | "no_changes";
+  | "no_changes"
+  | "operator_cancelled";
 
 interface PostPushReviewOutputs extends Record<string, unknown> {
   approved: boolean;
@@ -640,6 +642,24 @@ function summarizeHeadChanges(gitSpawn: (args: string[]) => SpawnResult): string
   return formatGitNameStatusSummary(show.stdout);
 }
 
+/**
+ * Proactively checks if the PR is closed-and-not-merged and throws OperatorCancelledError
+ * if so. Called at step start and before any push to detect operator cancellation without
+ * relying on the PR being locked (which is opt-in on GitHub).
+ */
+function probeIfPrClosed(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
+  const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
+  if (prView.exitCode !== 0) return; // fail open — transient errors don't cancel the run
+  try {
+    const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
+    if (prState.state === "CLOSED" && !prState.merged) {
+      throw new OperatorCancelledError(prNumber);
+    }
+  } catch (e) {
+    if (e instanceof OperatorCancelledError) throw e;
+  }
+}
+
 function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
   if (marker) {
     const list = ghSpawn([
@@ -669,6 +689,22 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
 
   const created = ghSpawn(["pr", "comment", prNumber, "--body", body]);
   if (created.exitCode !== 0) {
+    // "issue is locked" is the GitHub error when a closed PR's timeline is locked.
+    // Verify the PR is closed-and-not-merged before treating as operator cancellation,
+    // rather than a transient error.
+    if ((created.stderr ?? "").toLowerCase().includes("issue is locked")) {
+      const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
+      if (prView.exitCode === 0) {
+        try {
+          const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
+          if (prState.state === "CLOSED" && !prState.merged) {
+            throw new OperatorCancelledError(prNumber);
+          }
+        } catch (e) {
+          if (e instanceof OperatorCancelledError) throw e;
+        }
+      }
+    }
     throw new Error(`gh pr comment failed: ${resultMessage(created)}`);
   }
 }
@@ -752,12 +788,6 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     const reviewWaitTimeoutMs = inputs.reviewWaitTimeoutMs ?? DEFAULT_REVIEW_WAIT_TIMEOUT_MS;
 
     const startMarker = "<!-- ai-implement post-push status=start -->";
-    postPrComment(
-      ghSpawn,
-      prNumber,
-      `${startMarker}\n🔍 Running post-implementation review...`,
-      startMarker,
-    );
 
     let iteration = 0;
     let approved = false;
@@ -765,9 +795,24 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let forcePushed = 0;
     let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     const reviewHistory: ReviewFinding[] = [];
+    // Set to true when a real LLM failure (non-zero exit) occurs. An OperatorCancelledError
+    // thrown afterward while posting the failure comment is suppressed so the genuine
+    // failure conclusion surfaces rather than being masked by the benign operator cancel.
+    let priorLlmFailure = false;
+
+    try {
+    probeIfPrClosed(ghSpawn, prNumber);
+    postPrComment(
+      ghSpawn,
+      prNumber,
+      `${startMarker}\n🔍 Running post-implementation review...`,
+      startMarker,
+    );
 
     while (iteration < maxIterations && !approved) {
       iteration++;
+      // Probe at the top of every pass: an operator may close the PR between iterations that never push.
+      probeIfPrClosed(ghSpawn, prNumber);
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
@@ -829,6 +874,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         tools: READ_ONLY_ALLOWED_TOOLS,
       });
       if (reviewResult.exitCode !== 0) {
+        priorLlmFailure = true;
         terminationReason = "review_failed";
         const failure = `Reviewer LLM failed (${llmResultMessage(reviewResult)})`;
         feedback = compactErrorMessage(failure);
@@ -935,6 +981,13 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           requiredFix: `Fix the underlying defect causing '${checkName}' to fail`,
         });
       }
+
+      // A close that lands while the reviewer call is in flight must not become an approved or
+
+      // fix-pass exit — the approved exit on a last iteration never pushes, so nothing else would catch it.
+
+      probeIfPrClosed(ghSpawn, prNumber);
+
 
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
       // external review check did not finish within the wait budget. Do not auto-approve
@@ -1056,6 +1109,7 @@ ${externalReviewFindingsBlock(externalFindings)}
 
       const fixResult = await context.llmExecutor.invoke({ prompt: fixPrompt, model, maxTurns: FIX_MAX_TURNS });
       if (fixResult.exitCode !== 0) {
+        priorLlmFailure = true;
         terminationReason = "fix_failed";
         const failure = compactErrorMessage(`Fix-pass LLM failed (${llmResultMessage(fixResult)})`);
         const marker = `<!-- ai-implement post-push iter=${iteration} fix-failed -->`;
@@ -1108,6 +1162,7 @@ ${externalReviewFindingsBlock(externalFindings)}
       // A fix pass can run long enough to outlive the token minted by pushStep.
       // Re-vend at the actual write boundary; transient vending failures retain
       // the latest token already present in the environment and origin URL.
+      probeIfPrClosed(ghSpawn, prNumber);
       await refreshCredentialsBeforePush(context, inputs);
       const expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
       const push = gitSpawn([
@@ -1126,6 +1181,24 @@ ${externalReviewFindingsBlock(externalFindings)}
         `${marker}\n✅ Fix pass ${fixPassLabel(iteration, maxIterations)} completed and pushed changes.${commitLabel}${fixSummaryBlock}${changesBlock}\n\n**Merge readiness:** Awaiting follow-up review.`,
         marker,
       );
+    }
+    } catch (err) {
+      if (err instanceof OperatorCancelledError) {
+        if (priorLlmFailure) {
+          // A real LLM failure already set terminationReason — return that conclusion
+          // so the genuine failure surfaces rather than being masked by the operator cancel.
+          console.warn(
+            `[post-push-review] PR #${prNumber} was closed by operator while posting failure comment — ` +
+              `genuine failure surfaces as ${terminationReason}`,
+          );
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason };
+        }
+        // No prior genuine failure — the operator cancel is the sole anomaly.
+        terminationReason = "operator_cancelled";
+        console.warn(`[post-push-review] PR #${prNumber} was closed by operator — surfacing as OPERATOR_CANCELLED`);
+        throw err;
+      }
+      throw err;
     }
 
     return {

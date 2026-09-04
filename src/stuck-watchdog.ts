@@ -1,7 +1,7 @@
 import type { TicketingProvider, TicketIssue } from "./providers/types.js";
 import type { Job } from "./log.js";
 import { cancelWorkflowRun } from "./github.js";
-import { incrementStuckAttempts, updateJobStatus } from "./log.js";
+import { incrementStuckAttempts, updateJobStatus, getJobById } from "./log.js";
 import { deleteDispatched } from "./dedup.js";
 import { notifyStuckGiveUp } from "./notify.js";
 import { getInstallationToken } from "./github-app-auth.js";
@@ -143,6 +143,10 @@ export async function remediateStuckJob(
   stopRunner?: () => Promise<void>,
 ): Promise<void> {
   if (!job.issueId) return;
+  // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
+  // after the monitor tick started reading the job, so the passed-in job may be stale.
+  const freshConclusionStuck = getJobById(job.id)?.conclusion;
+  if (job.conclusion === "operator_cancelled" || freshConclusionStuck === "operator_cancelled") return;
 
   // Stop the runner before resetting dedup — prevents a re-dispatch racing
   // with a still-live runner.
@@ -211,6 +215,10 @@ export async function remediateFailedJob(
   lastRunStatus: string,
 ): Promise<void> {
   if (!job.issueId) return;
+  // Re-read conclusion from DB: the runner callback may have set "operator_cancelled"
+  // after the monitor tick started reading the job, so the passed-in job may be stale.
+  const freshConclusion = getJobById(job.id)?.conclusion;
+  if (job.conclusion === "operator_cancelled" || freshConclusion === "operator_cancelled") return;
 
   const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
   const runUrl =

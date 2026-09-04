@@ -334,10 +334,15 @@ export function updateJobStatus(
   // COALESCE keeps a pr_url recorded earlier (e.g. by the runner callback) when the
   // caller has none — the GHA monitor often can't resolve a PR for dispatch runs and
   // must not wipe the link on completion.
+  // CASE preserves benign-terminal conclusions written by the runner callback (e.g.,
+  // "operator_cancelled") so a subsequent monitor update cannot overwrite them with a
+  // coarser execution-layer conclusion (e.g., "failure").
   getDb()
     .prepare(
       `UPDATE dispatch_log
-       SET status = ?, conclusion = ?, pr_url = COALESCE(?, pr_url), completed_at = ?,
+       SET status = ?,
+           conclusion = CASE WHEN conclusion IN ('operator_cancelled') THEN conclusion ELSE ? END,
+           pr_url = COALESCE(?, pr_url), completed_at = ?,
            machine_nonce = CASE WHEN ? = 1 THEN NULL ELSE machine_nonce END
        WHERE id = ?`,
     )
