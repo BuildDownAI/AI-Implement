@@ -858,6 +858,99 @@ describe("kg-refresh", () => {
       expect(timedOutCall![1]).toMatchObject({ timedOut: true });
     });
 
+    // ---- AII-522: onMachineLost ------------------------------------------------
+
+    it("onMachineLost sets stage=failed and clears running when stage=ingest-running", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.running).toBe(false);
+    });
+
+    it("onMachineLost calls onOutcome with failure and timedOut=true", async () => {
+      const onOutcome = vi.fn();
+      buildDispatch({ onOutcome });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      const failCall = onOutcome.mock.calls.find(([outcome]) => outcome === "failure");
+      expect(failCall).toBeDefined();
+      expect(failCall![1]).toMatchObject({ timedOut: true });
+    });
+
+    it("onMachineLost calls closeJobLog with timed_out", async () => {
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 55);
+      buildDispatch({ appendJobLog, closeJobLog });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(closeJobLog).toHaveBeenCalledWith(55, "timed_out");
+    });
+
+    it("onMachineLost logs the machine-absent message", async () => {
+      const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(consoleSpy).toHaveBeenCalledWith(
+        "[kg-refresh] machine absent — reaper closed the ingest runner job",
+      );
+    });
+
+    it("onMachineLost is a no-op when stage is not ingest-running", async () => {
+      const onOutcome = vi.fn();
+      buildDispatch({ onOutcome });
+      // idle stage at construction — no dispatch triggered
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(onOutcome).not.toHaveBeenCalled();
+      const s = await handle.status();
+      expect(s.stage).toBe("idle");
+    });
+
+    it("onMachineLost is idempotent — second call is no-op", async () => {
+      const onOutcome = vi.fn();
+      buildDispatch({ onOutcome });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      handle.onMachineLost(); // second call
+      await waitDone();
+      const failureCalls = onOutcome.mock.calls.filter(([outcome]) => outcome === "failure");
+      expect(failureCalls).toHaveLength(1);
+    });
+
+    it("TTL expiry still produces timed_out status (shared path regression pin)", async () => {
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 77);
+      buildDispatch({
+        appendJobLog,
+        closeJobLog,
+        fetchSnapshotCommitSha: vi.fn().mockResolvedValue(SNAPSHOT_SHA),
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(appendJobLog).toHaveBeenCalledOnce();
+      const advancedNow = Date.now() + 4 * 60 * 60 * 1000 + 1000;
+      const spy = vi.spyOn(Date, "now").mockReturnValue(advancedNow);
+      try {
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        expect(closeJobLog).toHaveBeenCalledWith(77, "timed_out");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     // ---- AII-517: appendJobLog / closeJobLog --------------------------------
 
     it("appendJobLog called after successful dispatch with machineNonce from dispatchRun", async () => {

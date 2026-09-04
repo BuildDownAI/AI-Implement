@@ -1,5 +1,5 @@
 import { listMachines, destroyMachine } from "./fly-machines.js";
-import { getJobByMachineId, updateJobStatus, invalidateNonce } from "./log.js";
+import { getJobByMachineId, updateJobStatus, invalidateNonce, getInFlightKgRefreshJobs } from "./log.js";
 import type { IssueLifecycleState } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import type { RepoMapping } from "./config.js";
@@ -26,6 +26,8 @@ export interface ReaperHelpers {
   resetTicket: (job: Job) => Promise<void>;
   postSessionLogs: (job: Job, context: string) => Promise<void>;
   findPrForIssue: (repo: string | null, issueIdentifier: string | null) => Promise<string | null>;
+  /** Called for each kg-refresh job whose machine is absent from the Fly registry. */
+  failKgRefreshMachine?: (job: Job) => void;
 }
 
 export interface DestroyContext {
@@ -73,6 +75,42 @@ export async function safeDestroyMachine(
 }
 
 /**
+ * Inverse sweep for issue-less kg-refresh job rows: finds rows in phase
+ * "kg-refresh" whose machine is absent from the active Fly machine set and
+ * closes them through the shared terminal path in KgRefreshHandle.
+ *
+ * Called at the end of sweepOrphanedMachines with the already-fetched machine set.
+ */
+async function sweepOrphanedKgRefreshJobs(
+  config: ReaperConfig,
+  helpers: ReaperHelpers,
+  activeMachineIds: Set<string>,
+): Promise<void> {
+  const jobs = getInFlightKgRefreshJobs();
+  for (const job of jobs) {
+    if (!job.machineId) continue; // no-machine backend (local Docker) — skip
+    if (activeMachineIds.has(job.machineId)) continue; // machine alive — no action
+
+    const ageSeconds = Math.floor((Date.now() - job.dispatchedAt) / 1000);
+    console.log(
+      `[reaper] rule=kg-refresh-machine-absent machine=${job.machineId} job=${job.id} age_s=${ageSeconds} dry_run=${config.reaperDryRun}`,
+    );
+    recordReaperAction({
+      ruleMatched: "kg-refresh-machine-absent",
+      machineId: job.machineId,
+      tenantId: null,
+      issueIdentifier: null,
+      ageSeconds,
+      dryRun: config.reaperDryRun,
+    });
+
+    if (!config.reaperDryRun) {
+      helpers.failKgRefreshMachine?.(job);
+    }
+  }
+}
+
+/**
  * Per-poll cleanup sweep: lists all Fly machines and destroys any that are
  * orphaned (no dispatch log entry), belong to a completed/failed job, exceed
  * the max session age, or whose Linear issue has reached a terminal state.
@@ -96,6 +134,7 @@ export async function sweepOrphanedMachines(
   }
 
   if (machines.length === 0) {
+    await sweepOrphanedKgRefreshJobs(config, helpers, new Set());
     lastSweepAt = Date.now();
     return;
   }
@@ -254,6 +293,12 @@ export async function sweepOrphanedMachines(
       }
     }
   }
+
+  // Inverse sweep: find kg-refresh job rows whose machine is gone from the registry.
+  const activeMachineIds = new Set(
+    machines.filter((m) => m.state !== "destroyed").map((m) => m.id),
+  );
+  await sweepOrphanedKgRefreshJobs(config, helpers, activeMachineIds);
 
   lastSweepAt = Date.now();
 

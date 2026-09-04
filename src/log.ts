@@ -416,6 +416,17 @@ export function getInFlightJobs(): Job[] {
   );
 }
 
+/** Returns all kg-refresh jobs in a non-terminal state (for the reaper's inverse sweep). */
+export function getInFlightKgRefreshJobs(): Job[] {
+  return mapRows(
+    getDb()
+      .prepare(
+        "SELECT * FROM dispatch_log WHERE phase = 'kg-refresh' AND status IN ('dispatched', 'running') ORDER BY dispatched_at ASC",
+      )
+      .all() as RawRow[],
+  );
+}
+
 export function getInFlightIssueIds(): Set<string> {
   const rows = getDb()
     .prepare(
