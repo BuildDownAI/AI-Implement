@@ -393,19 +393,21 @@ describe("handleKgTrackerDataRequest", () => {
       ok: true,
       status: 200,
       json: async () => ({
-        data: { team: { issues: { nodes: issues, pageInfo } } },
+        data: { issues: { nodes: issues, pageInfo } },
       }),
     } as unknown as Response;
   }
 
-  it("returns 401 when Authorization header is missing", async () => {
+  it("returns 403 when Authorization header is missing", async () => {
     const result = await callTrackerData({ authorization: undefined });
-    expect(result.status).toBe(401);
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
   });
 
-  it("returns 401 for an invalid or malformed token", async () => {
+  it("returns 403 for an invalid or malformed token", async () => {
     const result = await callTrackerData({ authorization: "Bearer not.a.valid.token" });
-    expect(result.status).toBe(401);
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
   });
 
   it("returns 403 for a non-kg-refresh phase token", async () => {
@@ -469,7 +471,7 @@ describe("handleKgTrackerDataRequest", () => {
           ok: true,
           json: async () => ({
             data: {
-              team: { issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } },
+              issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
             },
           }),
         } as unknown as Response);
@@ -485,6 +487,7 @@ describe("handleKgTrackerDataRequest", () => {
     await callTrackerData({ authorization: `Bearer ${token}`, cursor: "cursor-xyz" });
 
     expect(capturedVariables!["after"]).toBe("cursor-xyz");
+    expect(capturedVariables!["teamKey"]).toBe("AII");
   });
 
   it("returns 502 when the Linear API returns a non-OK HTTP status", async () => {

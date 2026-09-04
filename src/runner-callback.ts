@@ -414,10 +414,16 @@ export async function handleKgTrackerDataRequest(
   input: HandleKgTrackerDataInput,
 ): Promise<HandleRunnerResultOutput> {
   const bearerToken = parseBearerToken(input.authorization);
-  if (!bearerToken) return bad(401, "missing_bearer");
+  if (!bearerToken) {
+    console.warn("[kg-tracker-data] Missing or malformed Authorization header");
+    return bad(403, "Unauthorized");
+  }
 
   const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
-  if (!verified.ok) return bad(401, verified.reason);
+  if (!verified.ok) {
+    console.warn(`[kg-tracker-data] Token verification failed: ${verified.reason}`);
+    return bad(403, "Unauthorized");
+  }
 
   if (verified.claims.phase !== "kg-refresh") return bad(403, "Unauthorized");
 
@@ -435,15 +441,13 @@ export async function handleKgTrackerDataRequest(
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           query: `query($teamKey: String!, $first: Int!, $after: String) {
-            team(key: $teamKey) {
-              issues(first: $first, after: $after, orderBy: updatedAt) {
-                nodes {
-                  id identifier title description
-                  state { name type }
-                  comments(first: 100) { nodes { body createdAt } }
-                }
-                pageInfo { hasNextPage endCursor }
+            issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
+              nodes {
+                id identifier title description
+                state { name type }
+                comments(first: 100) { nodes { body createdAt } }
               }
+              pageInfo { hasNextPage endCursor }
             }
           }`,
           variables: { teamKey, first: FIRST, after: input.cursor ?? null },
@@ -457,7 +461,7 @@ export async function handleKgTrackerDataRequest(
     }
 
     const data = (await response.json()) as {
-      data?: { team?: { issues?: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } } };
+      data?: { issues?: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } };
       errors?: Array<{ message: string }>;
     };
 
@@ -466,8 +470,8 @@ export async function handleKgTrackerDataRequest(
       return { status: 502, body: { error: "Upstream tracker error" } };
     }
 
-    const issues = data.data?.team?.issues?.nodes ?? [];
-    const pageInfo = data.data?.team?.issues?.pageInfo ?? { hasNextPage: false, endCursor: null };
+    const issues = data.data?.issues?.nodes ?? [];
+    const pageInfo = data.data?.issues?.pageInfo ?? { hasNextPage: false, endCursor: null };
     return { status: 200, body: { issues, pageInfo } };
   } catch (err) {
     console.error("[kg-tracker-data] Failed to fetch tracker data:", err);
