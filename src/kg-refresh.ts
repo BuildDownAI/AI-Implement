@@ -12,6 +12,11 @@ import { isDeployHeld } from "./deploy-hold.js";
 import { COMPLETION_MARKER, KG_DIR } from "./kg-sidecar.js";
 import { isKgDegraded } from "./deploy-notify.js";
 import { parseSidecarRpcResponse } from "./kg-provider.js";
+import { mintRunToken } from "./runner-tokens.js";
+import type { MintInput, MintOutput } from "./runner-tokens.js";
+import { encodeRunConfig } from "./run-config.js";
+import type { RunConfigV1 } from "./run-config.js";
+import { getDb } from "./dedup.js";
 
 const execFile = promisify(execFileCb);
 
@@ -28,6 +33,15 @@ const MIN_FREE_BYTES = 200 * 1024 * 1024;
 /** Canary warm-up budget: the sidecar's first semantic query loads the model. */
 const CANARY_DEADLINE_MS = 120_000;
 const CANARY_RETRY_MS = 5_000;
+
+/** TTL for the ingest-running stage: matches the GHA job timeout ceiling. */
+const KG_REFRESH_TTL_MS = 4 * 60 * 60 * 1000;
+
+/** Delay between snapshot-commit visibility retries (git-cache lag). */
+const SNAPSHOT_COMMIT_RETRY_MS = 5_000;
+
+/** DB settings key for persisting ingest stage across restarts. */
+const KG_STAGE_SETTINGS_KEY = "kg_refresh_stage";
 
 /**
  * Gates evaluated during refresh. `"staging"` fires before any swap; `"ingest-needed"` fires
@@ -46,12 +60,35 @@ export interface RefreshOutcome {
   stampAfter: string | null;
 }
 
+/**
+ * Stage of the refresh lifecycle. Surfaces in GET /api/kg/status.
+ *
+ * checking         → runRefresh() is in progress
+ * ingest-running   → kg-refresh runner dispatched, waiting for callback
+ * snapshot-landed  → runner callback received, snapshot commit verified
+ * staging          → local rail is running (fetch→stage→swap→verify)
+ * serving          → rail succeeded; sidecar is serving the new graph
+ * reverted         → rail failed and reverted to the previous overlay
+ * failed           → terminal failure (staging, ingest, or snapshot verification)
+ * idle             → no refresh in progress
+ */
+export type KgRefreshStage =
+  | "idle"
+  | "checking"
+  | "ingest-running"
+  | "snapshot-landed"
+  | "staging"
+  | "serving"
+  | "reverted"
+  | "failed";
+
 export interface KgRefreshStatus {
   running: boolean;
   deployHeld: boolean;
   kgDegraded: boolean;
   servedStamp: string | null;
   lastRefresh: RefreshOutcome | null;
+  stage: KgRefreshStage;
 }
 
 export interface KgRefreshHandle {
@@ -59,6 +96,14 @@ export interface KgRefreshHandle {
   trigger(): Promise<{ status: number; body: Record<string, unknown> }>;
   /** GET /api/kg/status behind admin auth. */
   status(): Promise<KgRefreshStatus>;
+  /**
+   * Called by handleRunnerResult when a kg-refresh runner job completes.
+   * Verifies the snapshot commit landed, then triggers the local staging rail.
+   */
+  onRunnerComplete(
+    outcome: "success" | "failure",
+    data: { snapshotCommit?: string; failureCode?: string; failureReason?: string },
+  ): void;
 }
 
 interface KgRefreshInput {
@@ -84,6 +129,37 @@ interface KgRefreshInput {
   mcpToolCall?: (url: string, tool: string, args: Record<string, unknown>) => Promise<unknown>;
   canaryDeadlineMs?: number;
   canaryRetryMs?: number;
+
+  // ---- Dispatch-path deps (AII-495) ----
+
+  /** Callback base URL for the runner to report back. Required for dispatch. */
+  runnerCallbackBaseUrl?: string | null;
+  /** Token secret for minting run tokens. Required for dispatch. */
+  runnerTokenSecret?: string | null;
+  /** Mint a run token. Injectable for tests; defaults to mintRunToken from runner-tokens.ts. */
+  mintRunTokenFn?: (input: MintInput) => MintOutput;
+  /**
+   * Dispatch a kg-refresh runner job. When provided, trigger() dispatches instead of
+   * returning ingest-needed. opts.runConfig is the base64-encoded RunConfigV1.
+   */
+  dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string }) => Promise<void>;
+  /**
+   * Check whether a commit SHA is visible via the GitHub API (for git-cache retry).
+   * Returns true if the commit exists and is reachable.
+   */
+  fetchCommitVisible?: (token: string, owner: string, repo: string, sha: string) => Promise<boolean>;
+  /** Delay between snapshot-commit visibility retries (default: 5000ms). */
+  snapshotCommitRetryMs?: number;
+  /**
+   * Persist stage + start time to durable storage. Injectable for tests.
+   * Default: writes to the DB settings table.
+   */
+  persistStage?: (stage: KgRefreshStage, startedAt: number) => void;
+  /**
+   * Load persisted stage. Injectable for tests.
+   * Default: reads from the DB settings table; returns null when absent or unreadable.
+   */
+  loadStage?: () => { stage: KgRefreshStage; startedAt: number } | null;
 }
 
 /**
@@ -91,6 +167,11 @@ interface KgRefreshInput {
  * snapshot, stage it on the volume, swap atomically, restart the sidecar, and
  * verify the SERVING graph with four gates — reverting to the previous overlay
  * on any failure. Never touches the deploy hold; refuses while one is set.
+ *
+ * AII-495 extension: when runRefresh() returns ingest-needed and dispatchRun is
+ * configured, trigger() dispatches a kg-refresh runner job instead of returning
+ * the ingest-needed status. The runner pushes a new snapshot commit, calls back,
+ * and onRunnerComplete() verifies the commit then triggers the local rail.
  *
  * Memory discipline: the graph is never parsed in this process. Staging runs the
  * image's own materialize (venv, no fastembed import per KGB-9), and validation
@@ -116,9 +197,29 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const mcpToolCall = input.mcpToolCall ?? defaultMcpToolCall;
   const canaryDeadlineMs = input.canaryDeadlineMs ?? CANARY_DEADLINE_MS;
   const canaryRetryMs = input.canaryRetryMs ?? CANARY_RETRY_MS;
+  const mintRunTokenFn = input.mintRunTokenFn ?? mintRunToken;
+  const fetchCommitVisible = input.fetchCommitVisible ?? defaultFetchCommitVisible;
+  const snapshotCommitRetryMs = input.snapshotCommitRetryMs ?? SNAPSHOT_COMMIT_RETRY_MS;
+  const persistStageFn = input.persistStage ?? defaultPersistStage;
+  const loadStageFn = input.loadStage ?? defaultLoadStage;
 
   let running = false;
   let lastRefresh: RefreshOutcome | null = null;
+  let stage: KgRefreshStage = "idle";
+
+  // Restore persisted state on construction (crash recovery).
+  // If a previous ingest-running is within TTL, restore it; otherwise clear.
+  const persisted = loadStageFn();
+  if (persisted && persisted.stage === "ingest-running") {
+    const ageMs = Date.now() - persisted.startedAt;
+    if (ageMs < KG_REFRESH_TTL_MS) {
+      running = true;
+      stage = "ingest-running";
+    } else {
+      // TTL expired — clear the stale lock so a new dispatch can proceed.
+      persistStageFn("idle", Date.now());
+    }
+  }
 
   const currentDir = join(dataRoot, "current");
   const previousDir = join(dataRoot, "previous");
@@ -298,6 +399,36 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     return outcome;
   }
 
+  /** Derive the terminal stage from a completed refresh outcome. */
+  function outcomeToStage(outcome: RefreshOutcome): KgRefreshStage {
+    if (outcome.ok) return "serving";
+    if (!outcome.gate || outcome.gate === "staging") return "failed";
+    if (outcome.gate === "ingest-needed") return "idle";
+    // answers/vectors/canary/stamp all result in a revert
+    return "reverted";
+  }
+
+  /**
+   * Run the local refresh rail, updating `stage` as it progresses.
+   * Called both from the ingest-not-needed path in trigger() and from
+   * onRunnerComplete() after the runner pushes a new snapshot commit.
+   */
+  async function runRefreshAndSettle(): Promise<void> {
+    stage = "staging";
+    const outcome = await runRefresh().catch((err): RefreshOutcome => ({
+      ok: false,
+      at: Date.now(),
+      gate: "staging",
+      detail: `unexpected: ${String(err)}`,
+      stampBefore: null,
+      stampAfter: null,
+    }));
+    lastRefresh = outcome;
+    running = false;
+    stage = outcomeToStage(outcome);
+    persistStageFn(stage, Date.now());
+  }
+
   return {
     async trigger() {
       if (running) return { status: 409, body: { error: "refresh-in-progress" } };
@@ -307,6 +438,26 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       if (input.kgSourceRepo === null) {
         return { status: 501, body: { error: "kg-source-repo-not-configured" } };
       }
+
+      // Precondition check for the dispatch path: runner callback must be configured.
+      // Only enforced when a dispatch backend is wired up (input.dispatchRun is defined).
+      if (input.dispatchRun !== undefined) {
+        const missing = [
+          input.runnerCallbackBaseUrl ? null : "RUNNER_CALLBACK_BASE_URL",
+          input.runnerTokenSecret ? null : "RUNNER_TOKEN_SECRET",
+        ].filter((n): n is string => n !== null);
+        if (missing.length > 0) {
+          return {
+            status: 422,
+            body: {
+              error: "callback-unconfigured",
+              precondition: "callback-unconfigured",
+              detail: `runner dispatch requires ${missing.join(" and ")} to be set — dispatching without it would stall the refresh with no way to report completion`,
+            },
+          };
+        }
+      }
+
       try {
         if (freeBytes(dataRoot) < minFree) {
           return { status: 507, body: { error: "insufficient-storage", detail: `less than ${minFree} bytes free on the volume` } };
@@ -316,20 +467,137 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       }
 
       running = true;
-      void runRefresh()
-        .catch((err): RefreshOutcome => ({
+      stage = "checking";
+
+      void (async () => {
+        try {
+          // Run the check-and-refresh cycle. If the source repo already has a
+          // newer snapshot, runRefresh() stages it locally and returns success.
+          // If not, it returns ingest-needed — and with dispatch configured we
+          // fire the runner to produce a new snapshot.
+          const outcome = await runRefresh();
+
+          if (outcome.gate === "ingest-needed" && input.dispatchRun && input.runnerCallbackBaseUrl && input.runnerTokenSecret) {
+            // Source repo doesn't have a newer snapshot yet. Dispatch the runner.
+            const runnerCallbackUrl = `${input.runnerCallbackBaseUrl}/api/runner/result`;
+            const { token: runToken, dispatchId } = mintRunTokenFn({
+              issueId: "kg-refresh",
+              mappingTeamKey: "",
+              phase: "kg-refresh",
+              audience: "result",
+              ttlSeconds: KG_REFRESH_TTL_MS / 1000,
+              secret: input.runnerTokenSecret,
+            });
+
+            const runConfig: RunConfigV1 = {
+              v: 1,
+              issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
+              runnerPhase: "kg-refresh",
+              kgSourceRepo: input.kgSourceRepo ?? undefined,
+              runnerCallbackUrl,
+            };
+
+            await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
+            stage = "ingest-running";
+            persistStageFn("ingest-running", Date.now());
+            console.log(`[kg-refresh] dispatched kg-refresh runner (dispatchId=${dispatchId})`);
+            // running stays true — onRunnerComplete clears it when the runner reports back
+          } else {
+            // Local refresh completed (success, failure, or ingest-needed without dispatch).
+            lastRefresh = outcome;
+            running = false;
+            stage = outcomeToStage(outcome);
+            persistStageFn(stage, Date.now());
+          }
+        } catch (err) {
+          lastRefresh = {
+            ok: false,
+            at: Date.now(),
+            gate: "staging",
+            detail: `unexpected: ${String(err)}`,
+            stampBefore: null,
+            stampAfter: null,
+          };
+          running = false;
+          stage = "failed";
+          persistStageFn("failed", Date.now());
+        }
+      })();
+
+      return { status: 202, body: { refreshing: true } };
+    },
+
+    onRunnerComplete(runnerOutcome, data) {
+      if (!running) {
+        // Orchestrator may have restarted between dispatch and callback.
+        // Re-enter the critical section to process the result.
+        running = true;
+      }
+
+      if (runnerOutcome === "failure") {
+        const detail = data.failureCode ?? data.failureReason ?? "runner reported failure";
+        lastRefresh = {
           ok: false,
           at: Date.now(),
           gate: "staging",
-          detail: `unexpected: ${String(err)}`,
+          detail: `ingest runner failed: ${detail}`,
           stampBefore: null,
           stampAfter: null,
-        }))
-        .then((outcome) => {
-          lastRefresh = outcome;
-          running = false;
-        });
-      return { status: 202, body: { refreshing: true } };
+        };
+        running = false;
+        stage = "failed";
+        persistStageFn("failed", Date.now());
+        console.error(`[kg-refresh] runner failed: ${detail}`);
+        return;
+      }
+
+      // Runner succeeded. Verify the snapshot commit is visible (git-cache lag).
+      const repo = parseKgSourceRepo(input.kgSourceRepo);
+      const snapshotCommit = data.snapshotCommit;
+
+      void (async () => {
+        if (snapshotCommit) {
+          // Mint a read token for the source repo to verify commit visibility.
+          let visible = false;
+          try {
+            const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
+              permissions: { contents: "read" },
+              repositories: [repo.repo],
+            });
+            visible = await fetchCommitVisible(token, repo.owner, repo.repo, snapshotCommit);
+            if (!visible) {
+              // One retry after a short delay for git-cache lag (bd-kg-refresh Step 7).
+              await new Promise((r) => setTimeout(r, snapshotCommitRetryMs));
+              visible = await fetchCommitVisible(token, repo.owner, repo.repo, snapshotCommit);
+            }
+          } catch (err) {
+            console.error(`[kg-refresh] snapshot commit visibility check failed: ${String(err)}`);
+          }
+
+          if (!visible) {
+            lastRefresh = {
+              ok: false,
+              at: Date.now(),
+              gate: "staging",
+              detail: `snapshot commit ${snapshotCommit} not visible in source repo after retry`,
+              stampBefore: null,
+              stampAfter: null,
+            };
+            running = false;
+            stage = "failed";
+            persistStageFn("failed", Date.now());
+            console.error(`[kg-refresh] snapshot commit ${snapshotCommit} not visible after retry`);
+            return;
+          }
+        }
+
+        stage = "snapshot-landed";
+        console.log(`[kg-refresh] snapshot commit confirmed, triggering local rail`);
+
+        // The runner has pushed a new snapshot commit. Run the local rail to
+        // fetch it, stage it, and serve it.
+        await runRefreshAndSettle();
+      })();
     },
 
     async status() {
@@ -339,6 +607,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         kgDegraded: isKgDegraded(),
         servedStamp: lastRefresh?.stampAfter ?? null,
         lastRefresh,
+        stage,
       };
     },
   };
@@ -369,6 +638,40 @@ async function defaultFetchSnapshotCommitDate(token: string, owner: string, repo
     const data = (await res.json()) as Array<{ commit?: { committer?: { date?: string }; author?: { date?: string } } }>;
     if (!Array.isArray(data) || data.length === 0) return null;
     return data[0].commit?.committer?.date ?? data[0].commit?.author?.date ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function defaultFetchCommitVisible(token: string, owner: string, repo: string, sha: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/commits/${sha}`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function defaultPersistStage(stage: KgRefreshStage, startedAt: number): void {
+  try {
+    getDb()
+      .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+      .run(KG_STAGE_SETTINGS_KEY, JSON.stringify({ stage, startedAt }));
+  } catch {
+    // DB unavailable — stage will be lost on restart, which is acceptable.
+  }
+}
+
+function defaultLoadStage(): { stage: KgRefreshStage; startedAt: number } | null {
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(KG_STAGE_SETTINGS_KEY) as { value: string } | undefined;
+    if (!row) return null;
+    return JSON.parse(row.value) as { stage: KgRefreshStage; startedAt: number };
   } catch {
     return null;
   }

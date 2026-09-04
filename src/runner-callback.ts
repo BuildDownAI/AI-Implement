@@ -64,6 +64,12 @@ export interface RunnerResultBody {
    *  Allows a successful callback without prUrl; the orchestrator finalizes the issue
    *  directly so merge-up.ts can open the feature→base roll-up PR. */
   noWork?: boolean;
+  /**
+   * SHA of the snapshot commit pushed by a kg-refresh runner. Used by the
+   * orchestrator to verify the commit is visible before triggering the local rail.
+   * Only present for phase=kg-refresh.
+   */
+  snapshotCommit?: string;
 }
 
 export interface HandleRunnerResultInput {
@@ -73,6 +79,14 @@ export interface HandleRunnerResultInput {
   resolveProvider: (mappingTeamKey: string) => Promise<TicketingProvider | null>;
   /** When provided, bounded failure cleanup (remediateFailedJob) runs after markImplementationFailed. */
   watchdogConfig?: StuckWatchdogConfig;
+  /**
+   * Called when a kg-refresh runner job completes. Wired to KgRefreshHandle.onRunnerComplete
+   * in index.ts. When absent, kg-refresh callbacks are acknowledged without further action.
+   */
+  onKgRefreshRunnerComplete?: (
+    outcome: "success" | "failure",
+    data: { snapshotCommit?: string; failureCode?: string; failureReason?: string },
+  ) => void;
 }
 
 export interface HandleRunnerResultOutput {
@@ -232,6 +246,17 @@ export async function handleRunnerResult(
 
   const { claims, mappingTeamKey } = verified;
   if (claims.phase !== input.body.phase) return bad(400, "phase_mismatch");
+
+  // kg-refresh runs have no mapping and no tracker issue to update.
+  // Route the callback directly to the refresh rail and return early.
+  if (input.body.phase === "kg-refresh") {
+    input.onKgRefreshRunnerComplete?.(input.body.outcome, {
+      snapshotCommit: input.body.snapshotCommit,
+      failureCode: input.body.failureCode,
+      failureReason: input.body.failureReason,
+    });
+    return { status: 200, body: { acknowledged: true } };
+  }
 
   if (
     input.body.outcome === "success" &&

@@ -596,18 +596,45 @@ export const deploymentsScript = `
       const data = await res.json();
       card.hidden = false;
       const badge = document.getElementById('kg-refresh-badge');
-      if (data.running) setBadge(badge, 'info', 'refreshing');
-      else if (data.kgDegraded) setBadge(badge, 'warn', 'degraded');
-      else if (data.lastRefresh?.gate === 'ingest-needed') setBadge(badge, 'ok', 'up-to-date');
-      else setBadge(badge, 'ok', 'serving');
+      // Use the stage field for fine-grained badge states; fall back to running for
+      // older orchestrator responses that lack it.
+      const stage = data.stage || (data.running ? 'checking' : 'idle');
+      if (stage === 'checking') {
+        setBadge(badge, 'running', 'checking');
+      } else if (stage === 'ingest-running') {
+        setBadge(badge, 'running', 'running');
+      } else if (stage === 'snapshot-landed') {
+        setBadge(badge, 'running', 'landing');
+      } else if (stage === 'staging') {
+        setBadge(badge, 'running', 'staging');
+      } else if (stage === 'serving') {
+        setBadge(badge, 'ok', 'serving');
+      } else if (stage === 'reverted') {
+        setBadge(badge, 'warn', 'reverted');
+      } else if (stage === 'failed') {
+        setBadge(badge, 'fail', 'failed');
+      } else if (data.kgDegraded) {
+        setBadge(badge, 'warn', 'degraded');
+      } else if (data.lastRefresh?.gate === 'ingest-needed') {
+        setBadge(badge, 'neutral', 'stale');
+      } else {
+        setBadge(badge, 'ok', 'serving');
+      }
       document.getElementById('kg-refresh-stamp').textContent =
         'Served graph stamp: ' + (data.servedStamp || 'baked image graph');
+      // Stage-specific in-progress text, otherwise show last-refresh summary.
+      let progressText = '';
+      if (stage === 'checking') progressText = 'Checking KG source repo for a newer snapshot\u2026';
+      else if (stage === 'ingest-running') progressText = 'Runner job dispatched \u2014 waiting for snapshot commit\u2026';
+      else if (stage === 'snapshot-landed') progressText = 'Snapshot commit confirmed \u2014 starting local staging\u2026';
+      else if (stage === 'staging') progressText = 'Staging new graph overlay\u2026';
       const last = data.lastRefresh;
-      document.getElementById('kg-refresh-last').textContent = !last
+      const lastText = !last
         ? 'No refresh has run since boot.'
         : last.gate === 'ingest-needed'
         ? 'Last refresh: ' + last.detail
-        : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' — ' + last.detail;
+        : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' \u2014 ' + last.detail;
+      document.getElementById('kg-refresh-last').textContent = progressText || lastText;
       document.getElementById('kg-refresh-btn').disabled = !!data.running || !!data.deployHeld;
     } catch (e) { card.hidden = true; }
   }
@@ -617,9 +644,19 @@ export const deploymentsScript = `
     btn.disabled = true;
     try {
       const res = await window.api('/api/kg/refresh', { method: 'POST' });
-      const body = await res.json();
-      if (!res.ok) { showMessage('warning', 'Refresh refused — ' + (body.error || res.status)); }
-    } catch (err) { showMessage('warning', 'Refresh failed — ' + String(err)); }
+      if (!res.ok) {
+        const body = await res.json().catch(function () { return {}; });
+        if (res.status === 422 && body.precondition === 'callback-unconfigured') {
+          showMessage('warning', 'Refresh requires a configured runner callback \u2014 set RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET on the orchestrator.');
+        } else if (res.status === 409 && body.error === 'deploy-held') {
+          showMessage('warning', 'A deploy is in progress \u2014 try again after it completes.');
+        } else if (res.status === 409) {
+          showMessage('warning', 'A refresh is already in progress.');
+        } else {
+          showMessage('warning', 'Refresh refused \u2014 ' + (body.error || String(res.status)));
+        }
+      }
+    } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
     setTimeout(loadKgStatus, 1000);
   };
 
