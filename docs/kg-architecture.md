@@ -200,11 +200,11 @@ or these steps by hand.
 2. **Trigger the refresh**: `POST /api/kg/refresh` with an admin session token (or the
    Deployments page's "Refresh graph now"). `202` = accepted; `409` = a refresh or a deploy is
    already in progress; `422` = runner callback not configured (see below). The orchestrator
-   first checks whether the source repo already has a newer snapshot:
-   - **If a newer snapshot exists**: fetches `KG_SOURCE_REPO`, stages under `/data/kg/staging`
-     (materialize with the image's venv — nothing embeds), writes the completion marker last,
-     swaps by rename, and restarts the sidecar.
-   - **If no newer snapshot** (AII-495): dispatches a `kg-refresh` Claude runner job to ingest
+   first checks whether the source repo snapshot SHA matches the last recorded SHA:
+   - **If the SHA differs** (new snapshot available): fetches `KG_SOURCE_REPO`, stages under
+     `/data/kg/staging` (materialize with the image's venv — nothing embeds), writes the
+     completion marker last, swaps by rename, and restarts the sidecar.
+   - **If the SHA matches** (AII-495): dispatches a `kg-refresh` Claude runner job to ingest
      and push a new snapshot. Requires `RUNNER_CALLBACK_BASE_URL` and `RUNNER_TOKEN_SECRET`;
      without them the trigger returns `422 callback-unconfigured`. The stage advances from
      `ingest-running` to `snapshot-landed` when the runner reports back, then the local rail
@@ -219,7 +219,7 @@ or these steps by hand.
 | Stage | Meaning |
 |---|---|
 | `idle` | No refresh in progress |
-| `checking` | Refresh triggered; comparing snapshot dates |
+| `checking` | Refresh triggered; comparing snapshot SHA against last recorded |
 | `ingest-running` | Runner job dispatched; waiting for callback |
 | `snapshot-landed` | Callback received; snapshot commit verified |
 | `staging` | Local rail running (fetch → materialize → swap) |

@@ -547,10 +547,10 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
       void (async () => {
         try {
-          // Run the check-and-refresh cycle. If the source repo already has a
-          // newer snapshot, runRefresh() stages it locally and returns success.
-          // If not, it returns ingest-needed — and with dispatch configured we
-          // fire the runner to produce a new snapshot.
+          // Run the check-and-refresh cycle. If the source repo snapshot SHA
+          // differs from the last recorded SHA, runRefresh() stages it locally
+          // and returns success. If the SHA matches, it returns ingest-needed —
+          // and with dispatch configured we fire the runner to produce a new snapshot.
           const outcome = await runRefresh();
 
           if (outcome.gate === "ingest-needed" && input.dispatchRun && input.runnerCallbackBaseUrl && input.runnerTokenSecret) {
