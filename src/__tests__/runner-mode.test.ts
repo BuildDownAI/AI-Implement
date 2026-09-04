@@ -162,17 +162,27 @@ describe("runner-mode", () => {
       }
     });
 
-    it("rejects non-truthy and absent values", () => {
-      for (const val of [undefined, "", "false", "0", "no", "anything-else", " "]) {
+    it("returns false for explicit falsy values", () => {
+      for (const val of ["false", "0", "no", "FALSE", "No", "NO"]) {
         expect(runnerMode.parseFlyProcessLevelSecretsEnv(val)).toBe(false);
       }
+    });
+
+    it("returns undefined for absent or empty values", () => {
+      for (const val of [undefined, "", " "]) {
+        expect(runnerMode.parseFlyProcessLevelSecretsEnv(val)).toBeUndefined();
+      }
+    });
+
+    it("returns undefined for unrecognised values", () => {
+      expect(runnerMode.parseFlyProcessLevelSecretsEnv("anything-else")).toBeUndefined();
     });
   });
 
   describe("getFlyProcessLevelSecrets / setFlyProcessLevelSecrets", () => {
-    it("returns disabled default when neither env var nor DB entry is present", () => {
+    it("returns enabled default when neither env var nor DB entry is present", () => {
       const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
-      expect(enabled).toBe(false);
+      expect(enabled).toBe(true);
       expect(source).toBe("default");
     });
 
@@ -215,8 +225,18 @@ describe("runner-mode", () => {
       },
     );
 
-    it.each(["false", "", "no", "0", " "])(
-      "env var value %j is treated as not set, falls through to DB/default",
+    it.each(["false", "0", "no"])(
+      "env var value %j is an explicit off → source: env, enabled: false",
+      (val) => {
+        process.env.FLY_PROCESS_LEVEL_SECRETS = val;
+        const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
+        expect(enabled).toBe(false);
+        expect(source).toBe("env");
+      },
+    );
+
+    it.each(["", " "])(
+      "env var value %j is blank, falls through to DB/default",
       (val) => {
         process.env.FLY_PROCESS_LEVEL_SECRETS = val;
         const { source } = runnerMode.getFlyProcessLevelSecrets();
@@ -224,14 +244,14 @@ describe("runner-mode", () => {
       },
     );
 
-    it("returns default when DB is unavailable", () => {
+    it("returns enabled default when DB is unavailable", () => {
       dedup.closeDb();
       vi.spyOn(dedup, "getDb").mockImplementation(() => {
         throw new Error("db unavailable");
       });
 
       const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
-      expect(enabled).toBe(false);
+      expect(enabled).toBe(true);
       expect(source).toBe("default");
     });
   });

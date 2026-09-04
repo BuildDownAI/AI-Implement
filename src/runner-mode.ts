@@ -184,21 +184,25 @@ export interface FlyProcessLevelSecretsStatus {
 const FLY_PROCESS_LEVEL_SECRETS_SETTING_KEY = "fly_process_level_secrets";
 
 /**
- * Returns true if val is one of the accepted truthy values (true, 1, yes; case-insensitive).
- * Anything else, including undefined or empty string, returns false.
+ * Returns true/false for recognised values (true/1/yes or false/0/no, case-insensitive),
+ * or undefined when the var is absent, empty, or whitespace-only (treat as unset).
  */
-export function parseFlyProcessLevelSecretsEnv(val: string | undefined): boolean {
-  if (!val) return false;
-  return ["true", "1", "yes"].includes(val.toLowerCase());
+export function parseFlyProcessLevelSecretsEnv(val: string | undefined): boolean | undefined {
+  if (!val || !val.trim()) return undefined;
+  if (["true", "1", "yes"].includes(val.toLowerCase())) return true;
+  if (["false", "0", "no"].includes(val.toLowerCase())) return false;
+  return undefined;
 }
 
 /**
  * Returns the effective Fly process-level secrets setting.
- * Priority: FLY_PROCESS_LEVEL_SECRETS env var (truthy values only) > DB setting > default (false).
+ * Priority: FLY_PROCESS_LEVEL_SECRETS env var > DB setting > default (true).
+ * An explicit false/0/no env value is treated as a set override, not a fall-through.
  */
 export function getFlyProcessLevelSecrets(): FlyProcessLevelSecretsStatus {
-  if (parseFlyProcessLevelSecretsEnv(process.env.FLY_PROCESS_LEVEL_SECRETS)) {
-    return { enabled: true, source: "env" };
+  const envVal = parseFlyProcessLevelSecretsEnv(process.env.FLY_PROCESS_LEVEL_SECRETS);
+  if (envVal !== undefined) {
+    return { enabled: envVal, source: "env" };
   }
 
   try {
@@ -213,7 +217,7 @@ export function getFlyProcessLevelSecrets(): FlyProcessLevelSecretsStatus {
     // DB unavailable — fall through to default
   }
 
-  return { enabled: false, source: "default" };
+  return { enabled: true, source: "default" };
 }
 
 /** Persists the Fly process-level secrets setting to the DB. Env var override is unaffected. */
