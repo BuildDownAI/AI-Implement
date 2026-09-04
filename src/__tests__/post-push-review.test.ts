@@ -2685,27 +2685,29 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not treat a locked-but-unmerged PR as merged (closed/locked belongs to the AII-453 probe)", async () => {
+    // A locked conversation on an OPEN, unmerged PR is not the merge race: the merged-only
+    // guard must fall through to the normal review path. A locked PR that is CLOSED and
+    // unmerged is an operator cancel, which probeIfPrClosed classifies as OPERATOR_CANCELLED.
+    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args[1]?.includes("/pulls/")) {
         return { stdout: '{"merged":false,"locked":true}', exitCode: 0 };
       }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
-    const invoke = vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 }));
+    const invoke = vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 }));
     const ctx = makeCtx(invoke);
-    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
 
     const out = await postPushReviewStep.run(
       ctx,
-      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, ghSpawn, gitSpawn },
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
       { report: vi.fn(async () => undefined) },
     );
 
     expect(out.approved).toBe(true);
     expect(out.terminationReason).toBe("approved");
-    expect(out.iterations).toBe(1);
-    expect(invoke).not.toHaveBeenCalled();
-    expect(gitSpawn).not.toHaveBeenCalled();
+    expect(invoke).toHaveBeenCalledOnce();
   });
 
   it("continues normally when gh api call fails (fail-open)", async () => {

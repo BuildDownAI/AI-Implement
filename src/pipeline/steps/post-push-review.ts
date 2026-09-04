@@ -775,12 +775,12 @@ async function reportInvalidStructuredReview(
   );
 }
 
-function isPrMergedOrLocked(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): boolean {
+function isPrMerged(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): boolean {
   const result = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
   if (result.exitCode !== 0) return false;
   try {
-    const data = JSON.parse(result.stdout) as { merged?: boolean; locked?: boolean };
-    return data.merged === true || data.locked === true;
+    const data = JSON.parse(result.stdout) as { merged?: boolean };
+    return data.merged === true;
   } catch {
     return false;
   }
@@ -826,8 +826,8 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
       // Probe at the top of every pass: an operator may close the PR between iterations that never push.
       probeIfPrClosed(ghSpawn, prNumber);
 
-      if (isPrMergedOrLocked(ghSpawn, prNumber)) {
-        console.log(`[post-push-review] PR #${prNumber} is merged or locked — exiting cleanly`);
+      if (isPrMerged(ghSpawn, prNumber)) {
+        console.log(`[post-push-review] PR #${prNumber} was merged under the run — exiting cleanly (a closed or locked PR is probeIfPrClosed's job)`);
         approved = true;
         terminationReason = "pr_merged";
         break;
