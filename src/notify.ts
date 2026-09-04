@@ -674,6 +674,105 @@ async function notifyReaperBurstTeams(
   }
 }
 
+// ---------- KG-refresh outcome notifications ----------
+
+export interface KgRefreshOutcomeNotification {
+  outcome: "success" | "no-new-data" | "failure";
+  /** Human-readable failure summary (from classifyCompletion). */
+  summary?: string;
+  /** Short failure detail — failure code or reason. */
+  detail?: string;
+}
+
+export async function notifyKgRefreshOutcome(
+  type: string,
+  webhookUrl: string,
+  n: KgRefreshOutcomeNotification,
+): Promise<void> {
+  switch (type.toLowerCase()) {
+    case "teams":
+      return notifyKgRefreshOutcomeTeams(webhookUrl, n);
+    case "slack":
+    default:
+      return notifyKgRefreshOutcomeSlack(webhookUrl, n);
+  }
+}
+
+function kgRefreshOutcomeLabel(outcome: KgRefreshOutcomeNotification["outcome"]): { emoji: string; teamsIcon: string; label: string } {
+  switch (outcome) {
+    case "success":
+      return { emoji: ":white_check_mark:", teamsIcon: "&#x2705;", label: "KG Refresh succeeded" };
+    case "no-new-data":
+      return { emoji: ":white_check_mark:", teamsIcon: "&#x2705;", label: "KG Refresh: graph is current" };
+    case "failure":
+      return { emoji: ":x:", teamsIcon: "&#x274C;", label: "KG Refresh failed" };
+  }
+}
+
+async function notifyKgRefreshOutcomeSlack(webhookUrl: string, n: KgRefreshOutcomeNotification): Promise<void> {
+  const { emoji, label } = kgRefreshOutcomeLabel(n.outcome);
+  let text = `${emoji} *${label}*`;
+  if (n.outcome === "no-new-data") text += " — no new data to ingest";
+  if (n.summary) text += `\n${n.summary}`;
+  if (n.detail) text += `\n${n.detail}`;
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      blocks: [{ type: "section", text: { type: "mrkdwn", text } }],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Slack webhook failed: ${res.status} — ${body}`);
+  }
+}
+
+async function notifyKgRefreshOutcomeTeams(webhookUrl: string, n: KgRefreshOutcomeNotification): Promise<void> {
+  const { teamsIcon, label } = kgRefreshOutcomeLabel(n.outcome);
+
+  const bodyBlocks: unknown[] = [
+    { type: "TextBlock", text: `${teamsIcon} ${label}`, weight: "Bolder", size: "Medium" },
+  ];
+  if (n.outcome === "no-new-data") {
+    bodyBlocks.push({ type: "TextBlock", text: "No new data to ingest — graph is already current.", wrap: true });
+  }
+  if (n.summary || n.detail) {
+    const parts: string[] = [];
+    if (n.summary) parts.push(n.summary);
+    if (n.detail) parts.push(n.detail);
+    bodyBlocks.push({ type: "TextBlock", text: parts.join("\n\n"), wrap: true });
+  }
+
+  const card = {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        content: {
+          $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: bodyBlocks,
+        },
+      },
+    ],
+  };
+
+  const res = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(card),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Teams webhook failed: ${res.status} — ${body}`);
+  }
+}
+
 // ---------- Plain-text notification (best-effort; used where no issue context is available) ----------
 
 /** Posts a plain { text } payload — supported by both Slack and Teams incoming webhooks. */

@@ -32,6 +32,21 @@ export const settingsHtml = `
     </div>
 
     <div class="card">
+      <div class="card-header"><h2 class="card-title">KG Refresh</h2></div>
+      <div class="card-body">
+        <div class="field">
+          <label>Failure Report Issue</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-kg-report-issue" placeholder="e.g. AII-496" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="saveKgRefreshReportIssue()">Save</button>
+          </div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:3px">Linear issue identifier that receives a comment on each kg-refresh failure. Leave blank to skip the comment.</div>
+        </div>
+        <div id="settings-kg-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header"><h2 class="card-title">Global Machine Secrets</h2></div>
       <div class="card-body">
         <p class="text-secondary" style="margin-bottom:12px">Secrets stored on the Fly sessions app and injected into every machine as environment variables. Values are write-only &#x2014; set them here instead of using the Fly CLI.</p>
@@ -73,6 +88,8 @@ export const settingsScript = `
       const envWarn = document.getElementById('settings-env-warning');
       appInput.value = appInfo.dbValue || '';
       regionInput.value = regionInfo.dbValue || '';
+      const kgReportInput = document.getElementById('settings-kg-report-issue');
+      kgReportInput.value = (data.kgRefreshReportIssue && data.kgRefreshReportIssue.value) || '';
       const overridden = appInfo.overriddenByEnv || regionInfo.overriddenByEnv;
       envWarn.classList.toggle('hidden', !overridden);
       const srcText = appInfo.runtimeValue
@@ -95,6 +112,22 @@ export const settingsScript = `
     await saveSettings({ flySessionsRegion: val });
   }
   window.saveSessionsRegion = saveSessionsRegion;
+
+  async function saveKgRefreshReportIssue() {
+    const val = document.getElementById('settings-kg-report-issue').value.trim() || null;
+    const errEl = document.getElementById('settings-kg-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ kgRefreshReportIssue: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+  window.saveKgRefreshReportIssue = saveKgRefreshReportIssue;
 
   async function saveSettings(payload) {
     const errEl = document.getElementById('settings-error');

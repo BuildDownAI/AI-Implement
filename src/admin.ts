@@ -1267,6 +1267,9 @@ function handleGetSettings(
       envValue: envRegion,
       overriddenByEnv: envRegion !== null,
     },
+    kgRefreshReportIssue: {
+      value: dbSettings.kgRefreshReportIssue,
+    },
   });
 }
 
@@ -1275,7 +1278,7 @@ async function handlePostSettings(
   res: http.ServerResponse,
   config: AdminConfig,
 ): Promise<void> {
-  let body: { flySessionsApp?: string | null; flySessionsRegion?: string | null };
+  let body: { flySessionsApp?: string | null; flySessionsRegion?: string | null; kgRefreshReportIssue?: string | null };
   try {
     const parsed = JSON.parse(await readBody(req));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -1300,6 +1303,12 @@ async function handlePostSettings(
       : null;
     setOrchestratorSetting("flySessionsRegion", val);
   }
+  if ("kgRefreshReportIssue" in body) {
+    const val = typeof body.kgRefreshReportIssue === "string" && body.kgRefreshReportIssue.trim()
+      ? body.kgRefreshReportIssue.trim()
+      : null;
+    setOrchestratorSetting("kgRefreshReportIssue", val);
+  }
 
   const dbSettings = getOrchestratorSettings();
   const envApp = process.env.FLY_SESSIONS_APP || null;
@@ -1321,6 +1330,9 @@ async function handlePostSettings(
       dbValue: dbSettings.flySessionsRegion,
       envValue: envRegion,
       overriddenByEnv: envRegion !== null,
+    },
+    kgRefreshReportIssue: {
+      value: dbSettings.kgRefreshReportIssue,
     },
     restartRequired,
   });

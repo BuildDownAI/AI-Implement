@@ -74,11 +74,12 @@ Write `ai-output/kg-stats.json` with counts from the ingest:
   "quads": <number of RDF quads ingested>,
   "vectors": <number of embedding vectors in embeddings.npz>,
   "docPages": <number of documentation pages processed (0 if none)>,
-  "durationSec": <total ingest wall-clock seconds as a number>
+  "durationSec": <total ingest wall-clock seconds as a number>,
+  "notes": ["<optional: one string per docs-site question or notable finding>"]
 }
 ```
 
-All four fields are required. Use 0 for docPages when the ingest does not process documentation.
+All four numeric fields are required. Use 0 for docPages when the ingest does not process documentation. The `notes` array is optional — include it only when you have docs-site questions (from step 2) or other notable findings worth recording. The pipeline embeds these notes in the snapshot commit message so they are KG-visible after the next refresh.
 
 ### 7. Write the run report
 

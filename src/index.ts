@@ -12,7 +12,8 @@ import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
 import type { TicketingProvider, IssueLifecycleState, FeatureNodeRollUp } from "./providers/types.js";
 import type { TicketIssue } from "./providers/types.js";
 import { rememberCandidates, resolveInFlightSiblings, selectIssuesToDispatch, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
-import { notify, notifyCompletion, notifyText } from "./notify.js";
+import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./notify.js";
+import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
 import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
@@ -2933,6 +2934,81 @@ function onDeployBuildFailure(commit: string, err: unknown): void {
   recordDeployOutcome({ kind: "build-failed", commit, timestamp: Date.now(), detail: String(err) });
 }
 
+async function handleKgRefreshOutcome(
+  config: AppConfig,
+  registry: ProviderRegistry,
+  outcome: "success" | "no-new-data" | "failure",
+  data: { failureCode?: string; failureReason?: string; dispatchId?: string; timedOut?: boolean },
+): Promise<void> {
+  // One notification per outcome.
+  if (config.notifyWebhookUrl) {
+    try {
+      const notif: KgRefreshOutcomeNotification = { outcome };
+      if (outcome === "failure") {
+        const syntheticJob = {
+          status: data.timedOut ? "timed_out" : "failed",
+          phase: "kg-refresh",
+          conclusion: data.failureCode ?? null,
+          prUrl: null,
+        } as unknown as Job;
+        const classification = classifyCompletion(syntheticJob);
+        if (classification?.summary) notif.summary = classification.summary;
+        if (data.failureCode) notif.detail = `Failure code: ${data.failureCode}`;
+        else if (data.failureReason) notif.detail = data.failureReason;
+      }
+      await notifyKgRefreshOutcome(config.notifyType, config.notifyWebhookUrl, notif);
+    } catch (err) {
+      console.error("[kg-refresh] Failed to send outcome notification:", err);
+    }
+  }
+
+  if (outcome !== "failure") return;
+
+  const reportIssue = getOrchestratorSettings().kgRefreshReportIssue;
+  if (!reportIssue) return;
+
+  try {
+    const mappings = getMappings();
+    // Sort by project key for stable selection when multiple Linear mappings exist.
+    const linearMapping = Object.entries(mappings)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .find(([, m]) => m.ticketingProvider === "linear")?.[1];
+    if (!linearMapping) {
+      console.warn("[kg-refresh] kg_refresh_report_issue is set but no Linear mapping is configured — skipping failure comment");
+      return;
+    }
+
+    const provider = await registry.forMapping(linearMapping);
+    const reportTicket = await provider.findByKey(reportIssue);
+    if (!reportTicket) {
+      console.warn(`[kg-refresh] Could not find report issue ${reportIssue} — skipping failure comment`);
+      return;
+    }
+
+    const syntheticJob = {
+      status: data.timedOut ? "timed_out" : "failed",
+      phase: "kg-refresh",
+      conclusion: data.failureCode ?? null,
+      prUrl: null,
+    } as unknown as Job;
+    const classification = classifyCompletion(syntheticJob);
+
+    const commentParts: string[] = [];
+    if (classification) {
+      commentParts.push(renderClassification(classification));
+    } else {
+      commentParts.push("KG Refresh failed.");
+    }
+    if (data.failureCode) commentParts.push(`Failure code: \`${data.failureCode}\``);
+    else if (data.failureReason) commentParts.push(`Reason: ${data.failureReason}`);
+    if (data.dispatchId) commentParts.push(`Dispatch ID: \`${data.dispatchId}\``);
+
+    await provider.postComment(reportTicket.id, commentParts.join("\n\n"));
+  } catch (err) {
+    console.error("[kg-refresh] Failed to post failure comment to report issue:", err);
+  }
+}
+
 async function dispatchKgRefreshRun(
   config: AppConfig,
   opts: { runToken: string; dispatchId: string; runConfig: string },
@@ -3014,6 +3090,9 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
     runnerTokenSecret: config.runnerTokenSecret,
     dispatchRun: (opts) => dispatchKgRefreshRun(config, opts),
+    onOutcome: (outcome, data) => {
+      void handleKgRefreshOutcome(config, registry, outcome, data);
+    },
   });
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);

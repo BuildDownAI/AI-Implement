@@ -70,6 +70,42 @@ describe("classifyCompletion", () => {
   });
 });
 
+describe("kg-refresh phase", () => {
+  it("returns null for a completed kg-refresh run", () => {
+    expect(classifyCompletion(makeJob("completed", "kg-refresh", "exit_0"))).toBeNull();
+  });
+
+  it("returns null for KG_SNAPSHOT_STALE — graph is current, benign no-new-data (mirrors operator_cancelled precedent)", () => {
+    expect(classifyCompletion(makeJob("failed", "kg-refresh", "KG_SNAPSHOT_STALE"))).toBeNull();
+  });
+
+  it("classifies a runner failure with a KG Refresh label", () => {
+    const c = classifyCompletion(makeJob("failed", "kg-refresh", "exit_1"));
+    expect(c).not.toBeNull();
+    expect(c?.summary).toContain("KG Refresh");
+  });
+
+  it("surfaces the exit code in the failure detail", () => {
+    expect(classifyCompletion(makeJob("failed", "kg-refresh", "exit_137"))?.detail).toContain("137");
+  });
+
+  it("classifies a kg-refresh timeout as hitting the time limit", () => {
+    const c = classifyCompletion(makeJob("timed_out", "kg-refresh", "container_timeout"));
+    expect(c?.summary).toContain("KG Refresh");
+    expect(c?.summary).toContain("time limit");
+  });
+
+  it("returns null for a benign issue_completed_sweep on kg-refresh", () => {
+    expect(classifyCompletion(makeJob("timed_out", "kg-refresh", "issue_completed_sweep"))).toBeNull();
+  });
+
+  it("classifies KG_SNAPSHOT_MISSING as a failure, not no-new-data", () => {
+    const c = classifyCompletion(makeJob("failed", "kg-refresh", "KG_SNAPSHOT_MISSING"));
+    expect(c).not.toBeNull();
+    expect(c?.summary).toContain("KG Refresh");
+  });
+});
+
 describe("renderClassification", () => {
   it("renders summary, detail, remediation, and the docs link as markdown", () => {
     const md = renderClassification({

@@ -29,7 +29,7 @@ afterEach(() => {
 describe("getOrchestratorSettings", () => {
   it("returns nulls when no DB entries exist", () => {
     const result = settings.getOrchestratorSettings();
-    expect(result).toEqual({ flySessionsApp: null, flySessionsRegion: null });
+    expect(result).toEqual({ flySessionsApp: null, flySessionsRegion: null, kgRefreshReportIssue: null });
   });
 
   it("returns nulls gracefully when table does not exist yet", async () => {
@@ -39,7 +39,7 @@ describe("getOrchestratorSettings", () => {
     const dedup2 = await import("../dedup.js");
     const settings2 = await import("../orchestrator-settings.js");
     const result = settings2.getOrchestratorSettings();
-    expect(result).toEqual({ flySessionsApp: null, flySessionsRegion: null });
+    expect(result).toEqual({ flySessionsApp: null, flySessionsRegion: null, kgRefreshReportIssue: null });
     dedup2.closeDb();
     try { fs.unlinkSync(dbPath2); } catch { /* ignore */ }
   });
