@@ -39,6 +39,8 @@ function mapping(overrides: Partial<RepoMapping> & Pick<RepoMapping, "owner" | "
     sensitiveAddPatterns: null,
     sensitiveAllowPatterns: null,
     dependencyTokenScope: null,
+    memoryProviderId: null,
+    referenceRepos: null,
     ...overrides,
   };
 }
@@ -594,6 +596,65 @@ describe("config", () => {
     expect(all.SAP.sensitiveAllowPatterns).toEqual([".env", ".env.*"]);
     expect(all.SAP_NULL.sensitiveAddPatterns).toBeNull();
     expect(all.SAP_NULL.sensitiveAllowPatterns).toBeNull();
+  });
+
+  it("round-trips referenceRepos, preserving order and the optional ref", () => {
+    config.initMappingsTable();
+    config.upsertMapping("RR", mapping({
+      owner: "org", repo: "repo",
+      referenceRepos: [
+        { repo: "https://github.com/acme/docs", path: "docs-source", ref: "v1.1.0" },
+        { repo: "https://github.com/acme/api", path: "api-source" },
+      ],
+    }));
+    config.upsertMapping("RR_NULL", mapping({ owner: "org", repo: "repo", referenceRepos: null }));
+
+    const all = config.getMappings();
+    expect(all.RR.referenceRepos).toEqual([
+      { repo: "https://github.com/acme/docs", path: "docs-source", ref: "v1.1.0" },
+      { repo: "https://github.com/acme/api", path: "api-source" },
+    ]);
+    expect(all.RR_NULL.referenceRepos).toBeNull();
+  });
+
+  it("reads referenceRepos as null when the stored JSON is malformed", () => {
+    config.initMappingsTable();
+    config.upsertMapping("RR_BAD", mapping({ owner: "org", repo: "repo" }));
+
+    const db = new Database(dbPath);
+    db.prepare("UPDATE mappings SET reference_repos = ? WHERE team_key = ?").run("{not json", "RR_BAD");
+    db.close();
+
+    // A malformed value must not take down every mapping read — the parse is guarded
+    // per field, so the row still loads with that one field unset.
+    expect(config.getMappings().RR_BAD.referenceRepos).toBeNull();
+    expect(config.getMappings().RR_BAD.owner).toBe("org");
+  });
+
+  it("migrates a pre-existing mappings table to include the reference_repos column (default null)", () => {
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE mappings (
+        team_key TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        workflow_file TEXT NOT NULL,
+        default_branch TEXT NOT NULL
+      )
+    `);
+    db.prepare("INSERT INTO mappings (team_key, owner, repo, workflow_file, default_branch) VALUES (?, ?, ?, ?, ?)")
+      .run("LEG_RR", "org", "legacy", "claude-implement.yml", "main");
+    db.close();
+
+    config.initMappingsTable();
+    // null, never undefined — a caller that spreads the mapping into an envelope must
+    // see an explicit absence rather than a missing key.
+    expect(config.getMappings().LEG_RR.referenceRepos).toBeNull();
+
+    const reopened = new Database(dbPath);
+    const info = reopened.prepare("PRAGMA table_info(mappings)").all() as Array<{ name: string }>;
+    reopened.close();
+    expect(info.map((c) => c.name)).toContain("reference_repos");
   });
 
   it("migrates a pre-existing mappings table to include sensitive glob columns (default null)", () => {
