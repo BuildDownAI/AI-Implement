@@ -29,7 +29,7 @@ export interface LocalRunnerInput {
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
-  phase?: "implementation" | "planning";
+  phase?: "implementation" | "planning" | "kg-refresh";
   orchestratorUrl?: string;
   runnerCallbackUrl?: string;
   runToken?: string;

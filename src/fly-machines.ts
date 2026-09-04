@@ -379,7 +379,7 @@ export interface SessionMachineInput {
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
-  phase?: "implementation" | "planning";
+  phase?: "implementation" | "planning" | "kg-refresh";
   region?: string;
   cpus?: number;
   memoryMb?: number;
@@ -497,6 +497,10 @@ export function buildSessionMachineConfig(input: SessionMachineInput): CreateMac
       ignore_app_secrets: true,
       secrets: processSecrets,
     }];
+    const ownBareNames = processSecrets.filter((s) => s.name !== undefined).map((s) => s.env_var);
+    if (ownBareNames.length > 0) {
+      env.AI_IMPLEMENT_FORWARDED_SECRETS = ownBareNames.join(",");
+    }
   } else if (input.teamKey && input.teamSecretNames?.length) {
     const ownPrefix = `${input.teamKey.toUpperCase()}_`;
     env.AI_IMPLEMENT_TEAM_SECRET_PREFIX = ownPrefix;
