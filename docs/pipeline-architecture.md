@@ -40,7 +40,7 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 | 5 | `setup` | no `setup:` hook in `WORKFLOW.md` front matter |
 | 6 | `feedback-loop` | never |
 | 7 | `preflight` | the feedback loop did not approve |
-| 8 | `push` | the run is a gap-fill (`prNumber` set) |
+| 8 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch) |
 | 9 | `verify` | no `verify:` hook, or the feedback loop did not approve |
 | 10 | `post-push-review` | not approved, or nothing was pushed, or no PR number |
 
