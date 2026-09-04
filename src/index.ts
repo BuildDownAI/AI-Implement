@@ -2938,7 +2938,7 @@ async function handleKgRefreshOutcome(
   config: AppConfig,
   registry: ProviderRegistry,
   outcome: "success" | "no-new-data" | "failure",
-  data: { failureCode?: string; failureReason?: string; dispatchId?: string },
+  data: { failureCode?: string; failureReason?: string; dispatchId?: string; timedOut?: boolean },
 ): Promise<void> {
   // One notification per outcome.
   if (config.notifyWebhookUrl) {
@@ -2946,7 +2946,7 @@ async function handleKgRefreshOutcome(
       const notif: KgRefreshOutcomeNotification = { outcome };
       if (outcome === "failure") {
         const syntheticJob = {
-          status: "failed",
+          status: data.timedOut ? "timed_out" : "failed",
           phase: "kg-refresh",
           conclusion: data.failureCode ?? null,
           prUrl: null,
@@ -2969,7 +2969,10 @@ async function handleKgRefreshOutcome(
 
   try {
     const mappings = getMappings();
-    const linearMapping = Object.values(mappings).find((m) => m.ticketingProvider === "linear");
+    // Sort by project key for stable selection when multiple Linear mappings exist.
+    const linearMapping = Object.entries(mappings)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .find(([, m]) => m.ticketingProvider === "linear")?.[1];
     if (!linearMapping) {
       console.warn("[kg-refresh] kg_refresh_report_issue is set but no Linear mapping is configured — skipping failure comment");
       return;
@@ -2983,7 +2986,7 @@ async function handleKgRefreshOutcome(
     }
 
     const syntheticJob = {
-      status: "failed",
+      status: data.timedOut ? "timed_out" : "failed",
       phase: "kg-refresh",
       conclusion: data.failureCode ?? null,
       prUrl: null,

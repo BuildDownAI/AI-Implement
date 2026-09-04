@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { notify, notifyCompletion, notifyDeploy } from "../notify.js";
+import { notify, notifyCompletion, notifyDeploy, notifyKgRefreshOutcome } from "../notify.js";
 import type { DeployNotification, Notification } from "../notify.js";
 
 const notification: Notification = {
@@ -489,6 +489,106 @@ describe("notifyDeploy", () => {
         imageRef: "registry.fly.io/ai-implement-testing-orchestrator:deployment-STALE",
       });
       expect(teamsFacts().map((f) => f.title)).not.toContain("Version");
+    });
+  });
+});
+
+describe("notifyKgRefreshOutcome", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200 } as Response);
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const sentBody = () => JSON.parse((vi.mocked(fetch).mock.calls[0][1] as RequestInit).body as string);
+  const slackText = (): string => sentBody().blocks[0].text.text;
+  const teamsBody = (): Array<{ type: string; text?: string }> => sentBody().attachments[0].content.body;
+
+  describe("slack", () => {
+    it("sends a success message with check-mark emoji", async () => {
+      await notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", { outcome: "success" });
+      expect(slackText()).toContain(":white_check_mark:");
+      expect(slackText()).toContain("KG Refresh succeeded");
+    });
+
+    it("sends a no-new-data message noting graph is current", async () => {
+      await notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", { outcome: "no-new-data" });
+      expect(slackText()).toContain("KG Refresh: graph is current");
+      expect(slackText()).toContain("no new data to ingest");
+    });
+
+    it("sends a failure message with x emoji", async () => {
+      await notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", { outcome: "failure" });
+      expect(slackText()).toContain(":x:");
+      expect(slackText()).toContain("KG Refresh failed");
+    });
+
+    it("includes summary and detail when provided on failure", async () => {
+      await notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", {
+        outcome: "failure",
+        summary: "KG Refresh hit the time limit.",
+        detail: "Failure code: TIMEOUT",
+      });
+      expect(slackText()).toContain("KG Refresh hit the time limit.");
+      expect(slackText()).toContain("Failure code: TIMEOUT");
+    });
+
+    it("uses slack by default for unrecognised type", async () => {
+      await notifyKgRefreshOutcome("other", "https://hook.example.com/other", { outcome: "success" });
+      expect(sentBody().blocks).toBeDefined();
+    });
+
+    it("throws on non-ok response", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "err" } as Response);
+      await expect(
+        notifyKgRefreshOutcome("slack", "https://hook.example.com/slack", { outcome: "success" }),
+      ).rejects.toThrow("500");
+    });
+  });
+
+  describe("teams", () => {
+    it("sends an Adaptive Card with success title", async () => {
+      await notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "success" });
+      const body = teamsBody();
+      expect(body[0].text).toContain("KG Refresh succeeded");
+      expect(body[0].text).toContain("&#x2705;");
+    });
+
+    it("sends a no-new-data card with descriptive TextBlock", async () => {
+      await notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "no-new-data" });
+      const body = teamsBody();
+      expect(body[0].text).toContain("KG Refresh: graph is current");
+      expect(JSON.stringify(body)).toContain("No new data to ingest");
+    });
+
+    it("sends a failure card with failure icon", async () => {
+      await notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "failure" });
+      const body = teamsBody();
+      expect(body[0].text).toContain("&#x274C;");
+      expect(body[0].text).toContain("KG Refresh failed");
+    });
+
+    it("includes summary and detail in failure card body", async () => {
+      await notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", {
+        outcome: "failure",
+        summary: "KG Refresh hit the time limit.",
+        detail: "Failure code: TIMEOUT",
+      });
+      const bodyText = JSON.stringify(teamsBody());
+      expect(bodyText).toContain("KG Refresh hit the time limit.");
+      expect(bodyText).toContain("Failure code: TIMEOUT");
+    });
+
+    it("is case-insensitive for the type parameter", async () => {
+      await notifyKgRefreshOutcome("Teams", "https://hook.example.com/teams", { outcome: "success" });
+      expect(sentBody().type).toBe("message");
+    });
+
+    it("throws on non-ok response", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500, text: async () => "err" } as Response);
+      await expect(
+        notifyKgRefreshOutcome("teams", "https://hook.example.com/teams", { outcome: "failure" }),
+      ).rejects.toThrow("500");
     });
   });
 });

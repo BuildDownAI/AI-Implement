@@ -369,6 +369,39 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | 2026-08-19 | v115 shipped lexical-only after the embed step was OOM-killed at ~21k quads / 1,438 cards | KGB-8 — free the rdflib graph before embedding, pre-allocate the output array, embed in slices of 64 |
 | 2026-08-20 | A degraded build was indistinguishable from a healthy one | AII-422 — `.embeddings-failed` receipt, `KG_EMBEDDINGS_DEGRADED`, `kgDegraded` on health, notification, and `get_tenant_health` |
 
+## KG-refresh outcome visibility (AII-496)
+
+Every terminal outcome (success, no-new-data, failure) calls `handleKgRefreshOutcome` in
+`src/index.ts`, which drives two visibility surfaces:
+
+**Webhook notification** (`NOTIFY_WEBHOOK_URL` + `NOTIFY_TYPE`). `notifyKgRefreshOutcome` in
+`src/notify.ts` sends a Slack or Teams message for every outcome. Failure messages include a
+human-readable classification from `classifyCompletion` (phase `kg-refresh`) plus the failure code
+or reason. A TTL-timeout outcome is classified as `status: "timed_out"` so the notification reads
+"KG Refresh hit the time limit." rather than the generic "KG Refresh failed." The function
+parallels the existing `notifyCompletion` shape: one function per provider, a shared label helper.
+
+**Failure report issue** (`kg_refresh_report_issue` admin setting, saved via `/api/settings`).
+When set to a Linear issue key (e.g. `AII-99`), a failure outcome posts a comment on that issue
+with the classification text, failure code / reason, and dispatch ID. The orchestrator finds the
+Linear mapping and calls `provider.postComment` with its own credentials; no credential ever
+leaves. Only the first Linear mapping (sorted alphabetically by project key for determinism) is
+used — a multi-Linear-workspace scenario would need a designated-mapping concept, which is not
+yet implemented.
+
+**Stuck-watchdog carve-out.** `remediateStuckJob` and `remediateFailedJob` in
+`src/stuck-watchdog.ts` both return early when `job.phase === "kg-refresh"`. This is
+forward-proofing: kg-refresh jobs are not yet tracked in `dispatch_log` (they use the
+`onRunnerComplete` callback path via `runner-callback.ts` instead), so
+`getInFlightJobs()`/`monitorJobs()` never routes one into those remediation functions. The guard
+is in place so that if kg-refresh jobs are ever logged, the watchdog does not attempt to reset or
+close them the way it does for implementation jobs.
+
+**Exactly-once guarantee.** A failed run produces exactly one webhook notification and, when the
+report issue is configured, exactly one tracker comment. The stage guard added to `onRunnerComplete`
+(`if (stage !== "ingest-running") return;`) prevents a late runner callback from re-entering the
+critical section after the TTL watchdog has already resolved the run.
+
 ## Lineage
 
 | Wave | Issues | Result |
@@ -382,3 +415,4 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | Scaling | KGB-8, AII-422 | Bounded-memory embedding, and a receipt when it still fails |
 | Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: Claude runner follows the ingest playbook; runner-callback endpoints vend scoped push token and tracker data |
 | Runner dispatch + stage machine | AII-495 | `POST /api/kg/refresh` dispatches the runner when ingest is needed; persisted stage machine (idle → checking → ingest-running → snapshot-landed → staging → terminal) survives restarts; live TTL watchdog; `/admin#deployments` stage badges |
+| KG-visible outcomes | AII-496 | Slack/Teams notification + Linear failure comment on every terminal outcome; TTL-timeout reaches the "hit the time limit" classifier; stuck-watchdog carve-out; exactly-once guarantee via stage guard |

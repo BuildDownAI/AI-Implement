@@ -167,10 +167,12 @@ interface KgRefreshInput {
    * Called once on every terminal outcome (success, no-new-data, failure).
    * Drives tracker comment posting and webhook notification in index.ts.
    * KG_SNAPSHOT_STALE maps to "no-new-data" (benign); all other runner failures map to "failure".
+   * timedOut=true is set when the ingest runner hit the TTL without calling back, so
+   * handleKgRefreshOutcome can build a synthetic "timed_out" job for classifyCompletion.
    */
   onOutcome?: (
     outcome: "success" | "no-new-data" | "failure",
-    data: { failureCode?: string; failureReason?: string; dispatchId?: string },
+    data: { failureCode?: string; failureReason?: string; dispatchId?: string; timedOut?: boolean },
   ) => void | Promise<void>;
 }
 
@@ -482,6 +484,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         void input.onOutcome?.("failure", {
           failureReason: "ingest runner timed out — no callback received within TTL",
           dispatchId: savedId ?? undefined,
+          timedOut: true,
         });
       }
       if (running) return { status: 409, body: { error: "refresh-in-progress" } };
@@ -593,6 +596,10 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     },
 
     onRunnerComplete(runnerOutcome, data) {
+      // Discard callbacks that arrive after TTL or another path already resolved the run.
+      // The !running re-entry below exists for crash-recovery; without this guard a late
+      // callback after a TTL expiry would re-enter and fire onOutcome a second time.
+      if (stage !== "ingest-running") return;
       // Past the ingest phase — clear the live TTL watchdog.
       ingestStartedAt = null;
       if (!running) {
