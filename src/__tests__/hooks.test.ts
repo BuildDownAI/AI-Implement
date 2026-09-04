@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 
 const isWindows = process.platform === "win32";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runHookScript } from "../pipeline/steps/hooks.js";
@@ -16,7 +16,7 @@ afterEach(() => {
   }
   // Clean up env the hook scripts export, so a failing assertion mid-test can't
   // leak a var into other tests sharing this Vitest worker's process.env.
-  for (const k of ["FOO_TEST_VAR", "SIMPLE_TEST_VAR", "MULTI_TEST_VAR"]) {
+  for (const k of ["FOO_TEST_VAR", "SIMPLE_TEST_VAR", "MULTI_TEST_VAR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AI_IMPLEMENT_FORWARDED_SECRETS", "QA_BASE_URL", "QA_TOKEN"]) {
     delete process.env[k];
   }
 });
@@ -37,6 +37,38 @@ describe.skipIf(isWindows)("runHookScript", () => {
 
   it("throws a clear error when the script path does not exist", () => {
     expect(() => runHookScript("setup", "missing.sh", dir)).toThrow(/missing\.sh/);
+  });
+
+  it("does not pass model credentials to hook scripts", () => {
+    const captureFile = join(dir, "hook-env.txt");
+    writeFileSync(join(dir, "setup.sh"), `env > "${captureFile}"\n`);
+    process.env.ANTHROPIC_API_KEY = "sentinel-api-key-hook";
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "sentinel-oauth-hook";
+
+    const result = runHookScript("setup", "setup.sh", dir);
+    expect(result.exitCode).toBe(0);
+
+    const captured = readFileSync(captureFile, "utf-8");
+    expect(captured).not.toContain("sentinel-api-key-hook");
+    expect(captured).not.toContain("sentinel-oauth-hook");
+    // GITHUB_ENV must be present so the hook can export variables
+    expect(captured).toContain("GITHUB_ENV=");
+  });
+
+  it("forwarded secrets are present in hook spawn env", () => {
+    const captureFile = join(dir, "hook-env.txt");
+    writeFileSync(join(dir, "setup.sh"), `env > "${captureFile}"\n`);
+    process.env.AI_IMPLEMENT_FORWARDED_SECRETS = "QA_BASE_URL,QA_TOKEN";
+    process.env.QA_BASE_URL = "https://qa.example.com";
+    process.env.QA_TOKEN = "sentinel-qa-token-hook";
+
+    const result = runHookScript("setup", "setup.sh", dir);
+    expect(result.exitCode).toBe(0);
+
+    const captured = readFileSync(captureFile, "utf-8");
+    expect(captured).toContain("sentinel-qa-token-hook");
+    expect(captured).toContain("https://qa.example.com");
+    expect(captured).toContain("AI_IMPLEMENT_FORWARDED_SECRETS=");
   });
 
   it("ignores GHA heredoc multiline values (only KEY=value is supported)", () => {

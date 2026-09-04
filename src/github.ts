@@ -82,6 +82,11 @@ function srcHeaders(token: string | null): Record<string, string> {
   return { ...GH_HEADERS, Authorization: `Bearer ${token}` };
 }
 
+/** Returns a fresh AbortSignal that cancels after FETCH_TIMEOUT_MS (default 60 s). */
+export function defaultFetchSignal(): AbortSignal {
+  return AbortSignal.timeout(Number(process.env.FETCH_TIMEOUT_MS) || 60_000);
+}
+
 /**
  * Returns the provider-related dispatch inputs for a mapping. Only adds
  * fields when the mapping opts into Bedrock — mappings that stay on the
@@ -192,7 +197,7 @@ export function profilesRunnerEnv(issue: { profiles?: string[] }): Record<string
 }
 
 export interface EnvelopeDispatchOpts {
-  runnerPhase: "implementation" | "gap-analysis" | "planning";
+  runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   baseBranch?: string;
   runnerCallbackUrl?: string;
   runToken?: string;
@@ -252,7 +257,7 @@ export function buildEnvelopeDispatchInputs(
     run_config: encodeRunConfig(runConfig),
     run_token: opts.runToken ?? "",
     ...(opts.runProgressToken !== undefined ? { run_progress_token: opts.runProgressToken } : {}),
-    ...(opts.runnerPhase !== "planning" && opts.runPublicationToken !== undefined
+    ...(opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" && opts.runPublicationToken !== undefined
       ? { run_publication_token: opts.runPublicationToken }
       : {}),
     ...providerDispatchFields(mapping),
@@ -275,6 +280,7 @@ export async function dispatchWorkflow(
       ref: mapping.defaultBranch,
       inputs,
     }),
+    signal: defaultFetchSignal(),
   });
 
   if (res.status === 204 || res.status === 200) {
@@ -301,6 +307,7 @@ export async function postPrComment(
     method: "POST",
     headers: ghHeaders(token),
     body: JSON.stringify({ body }),
+    signal: defaultFetchSignal(),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -322,7 +329,7 @@ export async function getBranchSha(
   // the whole string would turn the slashes into %2F and the ref lookup would 404.
   const encodedBranch = branch.split("/").map(encodeURIComponent).join("/");
   const url = `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${encodedBranch}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -351,7 +358,7 @@ export async function fetchRepoTarball(
   ref: string,
 ): Promise<Buffer> {
   const url = `https://api.github.com/repos/${owner}/${repo}/tarball/${ref}`;
-  const res = await fetch(url, { headers: srcHeaders(token) });
+  const res = await fetch(url, { headers: srcHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) {
     throw new Error(`fetchRepoTarball failed: HTTP ${res.status}`);
   }
@@ -382,6 +389,7 @@ export async function ensureBranchExists(
     method: "POST",
     headers: ghHeaders(token),
     body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: fromSha }),
+    signal: defaultFetchSignal(),
   });
   if (res.status === 201) return;
   const body = await res.text().catch(() => "");
@@ -416,7 +424,7 @@ export async function findWorkflowRunId(
     `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/runs` +
     `?branch=${encodeURIComponent(branch)}&event=workflow_dispatch&per_page=10`;
 
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
 
   const data = (await res.json()) as {
@@ -448,7 +456,7 @@ export async function getWorkflowRunStatus(
   runId: number,
 ): Promise<WorkflowRunStatus | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
 
   const data = (await res.json()) as {
@@ -478,7 +486,7 @@ export async function cancelWorkflowRun(
   runId: number,
 ): Promise<boolean> {
   const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/cancel`;
-  const res = await fetch(url, { method: "POST", headers: ghHeaders(token) });
+  const res = await fetch(url, { method: "POST", headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 202 || res.status === 409) return true;
   return false;
 }
@@ -495,14 +503,14 @@ export async function findPrForRun(
 ): Promise<string | null> {
   // First get the run to find the head branch
   const runUrl = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`;
-  const runRes = await fetch(runUrl, { headers: ghHeaders(token) });
+  const runRes = await fetch(runUrl, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!runRes.ok) return null;
 
   const runData = (await runRes.json()) as { head_branch: string };
 
   // Then look for PRs from that branch
   const prUrl = `https://api.github.com/repos/${owner}/${repo}/pulls?head=${encodeURIComponent(`${owner}:${runData.head_branch}`)}&state=open&per_page=1`;
-  const prRes = await fetch(prUrl, { headers: ghHeaders(token) });
+  const prRes = await fetch(prUrl, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!prRes.ok) return null;
 
   const prs = (await prRes.json()) as Array<{ html_url: string }>;
@@ -516,7 +524,7 @@ export async function getPullRequestState(
   prNumber: number,
 ): Promise<{ merged: boolean; state: "open" | "closed" } | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
   const data = (await res.json()) as { merged?: boolean; state?: string };
   return {
@@ -542,7 +550,7 @@ export async function compareBranches(
   // basehead path segments may contain slashes (feature/ool-78); encode each segment.
   const enc = (b: string) => b.split("/").map(encodeURIComponent).join("/");
   const url = `https://api.github.com/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -568,7 +576,7 @@ export async function findOpenPullRequest(
   const url =
     `https://api.github.com/repos/${owner}/${repo}/pulls` +
     `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&state=open&per_page=1`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
   const prs = (await res.json()) as Array<{ number: number; html_url: string }>;
   return prs.length > 0 ? { number: prs[0].number, url: prs[0].html_url } : null;
@@ -598,7 +606,7 @@ export async function findPullRequestByBranches(
     `https://api.github.com/repos/${owner}/${repo}/pulls` +
     `?head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}` +
     `&state=all&sort=updated&direction=desc&per_page=10`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
   const prs = (await res.json()) as Array<{
     number: number;
@@ -635,7 +643,7 @@ export async function deleteBranch(
 ): Promise<boolean> {
   const enc = branch.split("/").map(encodeURIComponent).join("/");
   const url = `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${enc}`;
-  const res = await fetch(url, { method: "DELETE", headers: ghHeaders(token) });
+  const res = await fetch(url, { method: "DELETE", headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (res.status === 204 || res.status === 404) return true;
   const body = await res.text().catch(() => "");
   if (res.status === 422 && body.includes("Reference does not exist")) return true;
@@ -661,6 +669,7 @@ export async function createPullRequest(
     method: "POST",
     headers: ghHeaders(token),
     body: JSON.stringify({ head: opts.head, base: opts.base, title: opts.title, body: opts.body }),
+    signal: defaultFetchSignal(),
   });
   if (res.status === 201) {
     const data = (await res.json()) as { number: number; html_url: string };
@@ -706,6 +715,7 @@ export async function mergeBranch(
     method: "POST",
     headers: ghHeaders(token),
     body: JSON.stringify({ base, head, commit_message: commitMessage }),
+    signal: defaultFetchSignal(),
   });
   if (res.status === 201) return "merged";
   if (res.status === 204) return "noop"; // already up to date
@@ -725,7 +735,7 @@ export async function listOpenPullRequests(
   token: string, owner: string, repo: string,
 ): Promise<Array<{ number: number; url: string; base: string; head: string; headSha: string; draft: boolean }>> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return [];
   const prs = (await res.json()) as Array<{
     number: number; html_url: string; draft?: boolean;
@@ -742,10 +752,10 @@ export async function getCombinedChecksState(
 ): Promise<"success" | "pending" | "failure"> {
   const runsRes = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/check-runs?per_page=100`,
-    { headers: ghHeaders(token) });
+    { headers: ghHeaders(token), signal: defaultFetchSignal() });
   const statusRes = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/commits/${sha}/status`,
-    { headers: ghHeaders(token) });
+    { headers: ghHeaders(token), signal: defaultFetchSignal() });
   const FAIL = new Set(["failure", "timed_out", "cancelled", "action_required", "stale"]);
   if (runsRes.ok) {
     const data = (await runsRes.json()) as { check_runs?: Array<{ status: string; conclusion: string | null }> };
@@ -767,7 +777,7 @@ export async function hasChangesRequestedReview(
 ): Promise<boolean> {
   const res = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/reviews?per_page=100`,
-    { headers: ghHeaders(token) });
+    { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return false;
   const reviews = (await res.json()) as Array<{ user: { id: number } | null; state: string }>;
   const latest = new Map<number, string>();
@@ -785,6 +795,7 @@ export async function mergePullRequest(
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/merge`, {
     method: "PUT", headers: ghHeaders(token),
     body: JSON.stringify({ merge_method: method, sha }),
+    signal: defaultFetchSignal(),
   });
   if (res.status === 200) return "merged";
   if (res.status === 405) return "blocked";
@@ -809,6 +820,7 @@ export async function addCommentReaction(
       method: "POST",
       headers: { ...ghHeaders(token), "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
+      signal: defaultFetchSignal(),
     },
   );
   // Adding a reaction that already exists returns 200 (idempotent); 201 = created.
@@ -829,7 +841,7 @@ export async function addCommentReaction(
 /** Lists up to 100 branch names for a repo. Returns [] on error. */
 export async function listBranchNames(token: string, owner: string, repo: string): Promise<string[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return [];
   const data = (await res.json()) as Array<{ name?: unknown }>;
   return data.flatMap((b) => (typeof b.name === "string" ? [b.name] : []));
@@ -838,10 +850,20 @@ export async function listBranchNames(token: string, owner: string, repo: string
 /** Lists up to 100 tag names for a repo. Returns [] on error. */
 export async function listTagNames(token: string, owner: string, repo: string): Promise<string[]> {
   const url = `https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token) });
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return [];
   const data = (await res.json()) as Array<{ name?: unknown }>;
   return data.flatMap((t) => (typeof t.name === "string" ? [t.name] : []));
+}
+
+/** Extracts the next-page URL from a GitHub Link response header, or null if none. */
+export function parseLinkNext(header: string | null): string | null {
+  if (!header) return null;
+  for (const part of header.split(",")) {
+    const match = part.match(/<([^>]+)>;\s*rel="next"/);
+    if (match) return match[1];
+  }
+  return null;
 }
 
 /** Lists branches and tags for a repo, throwing GitHubApiError on any non-200 response. */
@@ -850,24 +872,41 @@ export async function listRepoBranchesAndTags(
   owner: string,
   repo: string,
 ): Promise<{ branches: string[]; tags: string[] }> {
-  const [branchRes, tagRes] = await Promise.all([
-    fetch(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`, { headers: srcHeaders(token) }),
-    fetch(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, { headers: srcHeaders(token) }),
+  async function fetchAllNames(initialUrl: string, path: string): Promise<string[]> {
+    const names: string[] = [];
+    let url: string | null = initialUrl;
+    while (url) {
+      const res = await fetch(url, { headers: srcHeaders(token), signal: defaultFetchSignal() });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new GitHubApiError({ status: res.status, path, bodyText: body });
+      }
+      const data = (await res.json()) as Array<{ name?: unknown }>;
+      names.push(...data.flatMap((item) => (typeof item.name === "string" ? [item.name] : [])));
+      url = parseLinkNext(res.headers.get("link"));
+    }
+    return names;
+  }
+
+  const [branches, tags] = await Promise.all([
+    fetchAllNames(`https://api.github.com/repos/${owner}/${repo}/branches?per_page=100`, `/repos/${owner}/${repo}/branches`),
+    fetchAllNames(`https://api.github.com/repos/${owner}/${repo}/tags?per_page=100`, `/repos/${owner}/${repo}/tags`),
   ]);
-  if (!branchRes.ok) {
-    const body = await branchRes.text().catch(() => "");
-    throw new GitHubApiError({ status: branchRes.status, path: `/repos/${owner}/${repo}/branches`, bodyText: body });
-  }
-  if (!tagRes.ok) {
-    const body = await tagRes.text().catch(() => "");
-    throw new GitHubApiError({ status: tagRes.status, path: `/repos/${owner}/${repo}/tags`, bodyText: body });
-  }
-  const branchData = (await branchRes.json()) as Array<{ name?: unknown }>;
-  const tagData = (await tagRes.json()) as Array<{ name?: unknown }>;
-  return {
-    branches: branchData.flatMap((b) => (typeof b.name === "string" ? [b.name] : [])),
-    tags: tagData.flatMap((t) => (typeof t.name === "string" ? [t.name] : [])),
-  };
+  return { branches, tags };
+}
+
+/**
+ * Returns the default branch for a repository, or null if the request fails.
+ */
+export async function getRepoDefaultBranch(
+  token: string | null,
+  owner: string,
+  repo: string,
+): Promise<string | null> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: srcHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) return null;
+  const data = (await res.json()) as { default_branch?: unknown };
+  return typeof data.default_branch === "string" ? data.default_branch : null;
 }
 
 /**
@@ -878,7 +917,7 @@ export async function listRepoBranchesAndTags(
 export async function getRefSha(token: string | null, owner: string, repo: string, ref: string): Promise<string | null> {
   const url =
     `https://api.github.com/repos/${owner}/${repo}/commits?sha=${encodeURIComponent(ref)}&per_page=1`;
-  const res = await fetch(url, { headers: srcHeaders(token) });
+  const res = await fetch(url, { headers: srcHeaders(token), signal: defaultFetchSignal() });
   // 404 = repo not found, 422 = invalid ref
   if (!res.ok) return null;
   const data = (await res.json()) as Array<{ sha?: unknown }>;
@@ -898,7 +937,7 @@ export async function compareCommits(
   head: string,
 ): Promise<{ behindBy: number } | null> {
   const url = `https://api.github.com/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`;
-  const res = await fetch(url, { headers: srcHeaders(token) });
+  const res = await fetch(url, { headers: srcHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return null;
   const data = (await res.json()) as { behind_by?: unknown };
   return { behindBy: typeof data.behind_by === "number" ? data.behind_by : 0 };

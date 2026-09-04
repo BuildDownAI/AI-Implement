@@ -4,35 +4,13 @@ const isWindows = process.platform === "win32";
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { PassThrough } from "node:stream";
+import { EventEmitter } from "node:events";
 import { ClaudeCliExecutor } from "../pipeline/executor.js";
 
 let binDir: string;
-let originalPath: string | undefined;
-
-function installFakeClaude(stdoutLines: string[], code = 0): void {
-  const script = `#!/usr/bin/env bash
-cat <<'JSONL'
-${stdoutLines.join("\n")}
-JSONL
-exit ${code}
-`;
-  const path = join(binDir, "claude");
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
-}
-
-// A fake `claude` that writes a message to stderr (e.g. an auth/model error)
-// and exits non-zero, with no JSONL on stdout.
-function installFakeClaudeStderr(message: string, code = 1): void {
-  const script = `#!/usr/bin/env bash
-printf '%s\\n' '${message.replace(/'/g, `'\\''`)}' >&2
-exit ${code}
-`;
-  const path = join(binDir, "claude");
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
-}
 
 // A fake `claude` that records the argv it was invoked with and whatever arrived
 // on stdin, then emits a single valid result line so the stream executor settles
@@ -86,6 +64,48 @@ exit 0
   chmodSync(path, 0o755);
 }
 
+function installForwardedSecretRecordingClaude(): void {
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    result: "ok",
+    num_turns: 1,
+    duration_ms: 1,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const script = `#!/usr/bin/env bash
+printf '%s\n' "\${QA_BASE_URL-unset}" > "${binDir}/qa-base-url.txt"
+printf '%s\n' "\${QA_TOKEN-unset}" > "${binDir}/qa-token.txt"
+printf '%s\n' "\${AI_IMPLEMENT_FORWARDED_SECRETS-unset}" > "${binDir}/ai-implement-forwarded-secrets.txt"
+env > "${binDir}/env-dump.txt"
+printf '%s\n' '${resultLine}'
+exit 0
+`;
+  const path = join(binDir, "claude");
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
+function installModelCredentialRecordingClaude(): void {
+  const resultLine = JSON.stringify({
+    type: "result",
+    subtype: "success",
+    result: "ok",
+    num_turns: 1,
+    duration_ms: 1,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const script = `#!/usr/bin/env bash
+printf '%s\n' "\${ANTHROPIC_API_KEY-unset}" > "${binDir}/anthropic-api-key.txt"
+printf '%s\n' "\${CLAUDE_CODE_OAUTH_TOKEN-unset}" > "${binDir}/claude-oauth-token.txt"
+printf '%s\n' '${resultLine}'
+exit 0
+`;
+  const path = join(binDir, "claude");
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
 const SUCCESS_LINES = [
   JSON.stringify({ type: "system", subtype: "init", model: "claude-x", cwd: "/workspace" }),
   JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "pnpm check" } }] } }),
@@ -94,39 +114,40 @@ const SUCCESS_LINES = [
 
 beforeEach(() => {
   binDir = mkdtempSync(join(tmpdir(), "fakebin-"));
-  originalPath = process.env.PATH;
-  process.env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
+  vi.stubEnv("PATH", `${binDir}:${process.env.PATH ?? ""}`);
 });
 
 afterEach(() => {
-  process.env.PATH = originalPath;
-  rmSync(binDir, { recursive: true, force: true });
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  rmSync(binDir, { recursive: true, force: true });
 });
 
-function installFakeClaudeNoTrailingNewline(stdoutLines: string[], code = 0): void {
-  // Emit every line but the last via a quoted heredoc, then the final line with
-  // `printf '%s'` so there is NO trailing newline — exercises the close-handler
-  // flush. Quoted heredoc + single-quoted printf arg means `$`/backtick in JSON
-  // values are never interpreted by the shell.
-  const lines = [...stdoutLines];
-  const last = (lines.pop() ?? "").replace(/'/g, `'\\''`);
-  const head = lines.length ? `cat <<'JSONL'\n${lines.join("\n")}\nJSONL\n` : "";
-  const script = `#!/usr/bin/env bash
-${head}printf '%s' '${last}'
-exit ${code}
-`;
-  const path = join(binDir, "claude");
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
+// Builds a fake ChildProcess whose stdout emits the given content string, then
+// closes with exitCode. Content is pushed asynchronously so all event listeners
+// are registered before data arrives, matching real child process ordering.
+function makeTestProcess(stdoutContent: string, exitCode: number, stderrContent = ""): ChildProcessWithoutNullStreams {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const stdin = new PassThrough();
+  const ee = new EventEmitter();
+  const proc = Object.assign(ee, { stdout, stderr, stdin }) as unknown as ChildProcessWithoutNullStreams;
+  setImmediate(() => {
+    stdout.push(stdoutContent);
+    stdout.push(null);
+    if (stderrContent) stderr.push(stderrContent);
+    stderr.push(null);
+    setImmediate(() => ee.emit("close", exitCode));
+  });
+  return proc;
 }
 
 describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   it("returns the result event's text as stdout (compat) plus telemetry", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    installFakeClaude(SUCCESS_LINES, 0);
-    const exec = new ClaudeCliExecutor("/tmp", "summary");
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    const fakeSpawn = () => fakeProc;
+    const exec = new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn);
     const result = await exec.invoke({ prompt: "do it", model: "claude-x" });
 
     expect(result.stdout).toBe("Done implementing.");
@@ -137,9 +158,10 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   });
 
   it("does NOT print per-event lines at summary level, but prints the summary", async () => {
-    installFakeClaude(SUCCESS_LINES, 0);
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    const fakeSpawn = () => fakeProc;
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
 
     const lines = log.mock.calls.map((c) => String(c[0]));
     expect(lines.some((l) => l.startsWith("[claude] result="))).toBe(true);
@@ -147,9 +169,10 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   });
 
   it("prints per-event lines at stream level", async () => {
-    installFakeClaude(SUCCESS_LINES, 0);
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    const fakeSpawn = () => fakeProc;
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    await new ClaudeCliExecutor("/tmp", "stream").invoke({ prompt: "p", model: "m" });
+    await new ClaudeCliExecutor("/tmp", "stream", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
 
     const lines = log.mock.calls.map((c) => String(c[0]));
     expect(lines.some((l) => l.includes("tool Bash pnpm check"))).toBe(true);
@@ -158,8 +181,9 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
 
   it("propagates a non-zero exit code and degrades telemetry to unknown", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    installFakeClaude(["not even json"], 1);
-    const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    const fakeProc = makeTestProcess("not even json\n", 1);
+    const fakeSpawn = () => fakeProc;
+    const result = await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
     expect(result.exitCode).toBe(1);
     expect(result.telemetry?.outcome).toBe("unknown");
     expect(result.stdout).toBe("");
@@ -167,8 +191,14 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
 
   it("parses a final line that has no trailing newline", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    installFakeClaudeNoTrailingNewline(SUCCESS_LINES, 0);
-    const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n"), 0);
+    const fakeSpawn = () => fakeProc;
+    const result = await new ClaudeCliExecutor(
+      "/tmp",
+      "summary",
+      false,
+      fakeSpawn as unknown as typeof spawn,
+    ).invoke({ prompt: "p", model: "m" });
     expect(result.stdout).toBe("Done implementing.");
     expect(result.telemetry?.outcome).toBe("success");
     expect(result.telemetry?.numTurns).toBe(4);
@@ -177,8 +207,9 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
   it("surfaces non-empty CLI stderr via console.error and returns it", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    installFakeClaudeStderr("Authentication failed: invalid API key", 1);
-    const result = await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    const fakeProc = makeTestProcess("", 1, "Authentication failed: invalid API key\n");
+    const fakeSpawn = () => fakeProc;
+    const result = await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("Authentication failed");
@@ -300,5 +331,137 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
     expect(readFileSync(join(binDir, "github-token.txt"), "utf-8").trim()).toBe("unset");
     expect(readFileSync(join(binDir, "origin-url.txt"), "utf-8").trim()).toBe(sshOrigin);
     expect(execFileSync("git", ["remote", "get-url", "origin"], { cwd: binDir, encoding: "utf-8" }).trim()).toBe(sshOrigin);
+  });
+
+  it("OAuth-wins: when both model credentials are set, only OAuth token reaches Claude", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installModelCredentialRecordingClaude();
+    vi.stubEnv("ANTHROPIC_API_KEY", "sentinel-api-key");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "sentinel-oauth-token");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "claude-oauth-token.txt"), "utf-8").trim()).toBe("sentinel-oauth-token");
+    expect(readFileSync(join(binDir, "anthropic-api-key.txt"), "utf-8").trim()).toBe("unset");
+  });
+
+  it("API key only: API key reaches Claude when OAuth token is absent", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installModelCredentialRecordingClaude();
+    vi.stubEnv("ANTHROPIC_API_KEY", "sentinel-api-key");
+    const savedOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
+    try {
+      await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+      expect(readFileSync(join(binDir, "anthropic-api-key.txt"), "utf-8").trim()).toBe("sentinel-api-key");
+      expect(readFileSync(join(binDir, "claude-oauth-token.txt"), "utf-8").trim()).toBe("unset");
+    } finally {
+      if (savedOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = savedOAuth;
+    }
+  });
+
+  it("OAuth only: OAuth token reaches Claude when API key is absent", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installModelCredentialRecordingClaude();
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "sentinel-oauth-token");
+    const savedApiKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+
+    try {
+      await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+      expect(readFileSync(join(binDir, "claude-oauth-token.txt"), "utf-8").trim()).toBe("sentinel-oauth-token");
+      expect(readFileSync(join(binDir, "anthropic-api-key.txt"), "utf-8").trim()).toBe("unset");
+    } finally {
+      if (savedApiKey !== undefined) process.env.ANTHROPIC_API_KEY = savedApiKey;
+    }
+  });
+
+  it("strips forwarded secrets from model env by key and by value", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "QA_BASE_URL,QA_TOKEN");
+    vi.stubEnv("QA_BASE_URL", "https://qa.example.com");
+    vi.stubEnv("QA_TOKEN", "sentinel-qa-token-abc");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "qa-base-url.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "qa-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "ai-implement-forwarded-secrets.txt"), "utf-8").trim()).toBe("unset");
+    const envDump = readFileSync(join(binDir, "env-dump.txt"), "utf-8");
+    expect(envDump).not.toContain("sentinel-qa-token-abc");
+  });
+
+  it("logs forwarded secret names (not values) at runner start when list is non-empty", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "QA_BASE_URL,QA_TOKEN");
+    vi.stubEnv("QA_BASE_URL", "https://qa.example.com");
+    vi.stubEnv("QA_TOKEN", "sentinel-qa-token-xyz");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    const lines = log.mock.calls.map((c) => String(c[0]));
+    expect(lines.some((l) => l.includes("QA_BASE_URL") && l.includes("QA_TOKEN"))).toBe(true);
+    expect(lines.every((l) => !l.includes("sentinel-qa-token-xyz"))).toBe(true);
+    expect(lines.every((l) => !l.includes("https://qa.example.com"))).toBe(true);
+  });
+
+  it("does not log forwarded secrets line when AI_IMPLEMENT_FORWARDED_SECRETS is unset", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    const saved = process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
+    delete process.env.AI_IMPLEMENT_FORWARDED_SECRETS;
+
+    try {
+      await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+      const lines = log.mock.calls.map((c) => String(c[0]));
+      expect(lines.every((l) => !l.includes("forwarded secrets"))).toBe(true);
+    } finally {
+      if (saved !== undefined) process.env.AI_IMPLEMENT_FORWARDED_SECRETS = saved;
+    }
+  });
+
+  it("ignores forwarded secret names absent from the environment", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "DOES_NOT_EXIST_KEY");
+    delete process.env.DOES_NOT_EXIST_KEY;
+
+    await expect(
+      new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" }),
+    ).resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it("tolerates whitespace and empty entries in AI_IMPLEMENT_FORWARDED_SECRETS", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installForwardedSecretRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", " QA_BASE_URL , ,QA_TOKEN ");
+    vi.stubEnv("QA_BASE_URL", "https://qa.example.com");
+    vi.stubEnv("QA_TOKEN", "sentinel-qa-token-ws");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "qa-base-url.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "qa-token.txt"), "utf-8").trim()).toBe("unset");
+    const envDump = readFileSync(join(binDir, "env-dump.txt"), "utf-8");
+    expect(envDump).not.toContain("sentinel-qa-token-ws");
+  });
+
+  it("still strips MODEL_CHILD_CREDENTIAL_KEYS when forwarded secrets are also set", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    installEnvironmentRecordingClaude();
+    vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "QA_TOKEN");
+    vi.stubEnv("QA_TOKEN", "sentinel-qa-forwarded");
+    vi.stubEnv("RUN_PROGRESS_TOKEN", "run-progress-token");
+    vi.stubEnv("RUN_PUBLICATION_TOKEN", "run-publication-token");
+    vi.stubEnv("RUN_TOKEN", "run-token");
+
+    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+
+    expect(readFileSync(join(binDir, "run-progress-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-publication-token.txt"), "utf-8").trim()).toBe("unset");
+    expect(readFileSync(join(binDir, "run-token.txt"), "utf-8").trim()).toBe("unset");
   });
 });

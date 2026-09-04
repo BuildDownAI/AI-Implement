@@ -9,29 +9,7 @@ import {
   summaryLine,
   type StreamEvent,
 } from "./claude-stream.js";
-
-const GITHUB_WRITE_CREDENTIAL_KEYS = [
-  "GITHUB_TOKEN",
-  "GH_TOKEN",
-  "GITHUB_ENTERPRISE_TOKEN",
-  "GH_ENTERPRISE_TOKEN",
-  "GIT_PASSWORD",
-] as const;
-
-const MODEL_CHILD_CREDENTIAL_KEYS = [
-  "RUN_PROGRESS_TOKEN",
-  "RUN_PUBLICATION_TOKEN",
-  "RUN_TOKEN",
-] as const;
-
-function claudeEnvironment(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  for (const key of MODEL_CHILD_CREDENTIAL_KEYS) delete env[key];
-  if (!allowRepositoryWrites) {
-    for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
-  }
-  return env;
-}
+import { modelProcessEnv, parseForwardedSecrets } from "./process-env.js";
 
 function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
   const current = spawnSync("git", ["remote", "get-url", "origin"], {
@@ -84,6 +62,8 @@ export class ClaudeCliExecutor implements LLMExecutor {
     private readonly workspaceDir: string,
     private readonly logLevel: LogLevel = "summary",
     private readonly allowRepositoryWrites = false,
+    /** Injectable spawn for testing. */
+    private readonly spawnImpl: typeof spawn = spawn,
   ) {}
 
   invoke(params: {
@@ -125,13 +105,18 @@ export class ClaudeCliExecutor implements LLMExecutor {
       // `claude -p` reads the prompt from stdin, so there is no size ceiling.
       args.push("-p");
 
+      const forwarded = parseForwardedSecrets();
+      if (forwarded.length > 0) {
+        console.log(`[runner] forwarded secrets stripped from model env: ${forwarded.join(", ")}`);
+      }
+
       let proc: ChildProcessWithoutNullStreams;
       try {
-        proc = spawn("claude", args, {
+        proc = this.spawnImpl("claude", args, {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
-          env: claudeEnvironment(this.allowRepositoryWrites),
-        });
+          env: modelProcessEnv(this.allowRepositoryWrites),
+        }) as ChildProcessWithoutNullStreams;
       } catch (err) {
         try {
           restoreProtectedOrigin();

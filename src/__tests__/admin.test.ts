@@ -53,9 +53,11 @@ vi.mock("../github-app-auth.js", async (importOriginal) => ({
 }));
 
 const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
+const getRepoDefaultBranchMock = vi.hoisted(() => vi.fn());
 vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
+  getRepoDefaultBranch: getRepoDefaultBranchMock,
 }));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
@@ -1520,6 +1522,26 @@ describe("admin secrets", () => {
     expect(JSON.parse(res.body).error).toContain("not found");
   });
 
+  it("POST secrets returns 400 for reserved bare name GITHUB_TOKEN", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+
+    const res = await requestFly("/api/mappings/ENG/secrets", "POST", token, { name: "GITHUB_TOKEN", value: "evil" });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toContain("reserved");
+  });
+
+  it("POST secrets returns 400 for reserved bare names with GITHUB_ prefix", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
+
+    for (const name of ["GITHUB_OWNER", "ISSUE_ID", "AI_IMPLEMENT_TEAM", "ORCHESTRATOR_URL", "RUN_TOKEN", "ANTHROPIC_API_KEY"]) {
+      const res = await requestFly("/api/mappings/ENG/secrets", "POST", token, { name, value: "x" });
+      expect(res.statusCode, `expected 400 for reserved name ${name}`).toBe(400);
+      expect(JSON.parse(res.body).error).toContain("reserved");
+    }
+  });
+
   it("POST secrets returns 400 for malformed JSON", async () => {
     const token = await login("secret");
     await request("/api/mappings", "POST", "secret", { teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml" }, token);
@@ -2677,6 +2699,7 @@ describe("GET /api/deploy-refs", () => {
   beforeEach(() => {
     mintSourceTokenOrJwtMock.mockReset();
     listRepoBranchesAndTagsMock.mockReset();
+    getRepoDefaultBranchMock.mockReset();
   });
 
   it("returns 401 without an auth token", async () => {
@@ -2696,25 +2719,48 @@ describe("GET /api/deploy-refs", () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it("returns branches and tags via installation token for an installed owner", async () => {
+  it("returns branches, tags, and defaultBranch via installation token for an installed owner", async () => {
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
     listRepoBranchesAndTagsMock.mockResolvedValue({ branches: ["main", "dev"], tags: ["v1.0"] });
+    getRepoDefaultBranchMock.mockResolvedValue("main");
     const token = await login("secret");
     const res = await deployRefsRequest("owner/repo", token);
     expect(res.statusCode).toBe(200);
-    expect(res.body).toMatchObject({ branches: ["main", "dev"], tags: ["v1.0"] });
+    expect(res.body).toMatchObject({ branches: ["main", "dev"], tags: ["v1.0"], defaultBranch: "main" });
     expect(mintSourceTokenOrJwtMock).toHaveBeenCalledWith("test-app-id", "test-private-key", "owner", expect.objectContaining({ permissions: { contents: "read" } }));
   });
 
   it("returns branches and tags unauthenticated for a public repo outside the installation (public mode)", async () => {
     mintSourceTokenOrJwtMock.mockResolvedValue({ token: null, authMode: "public" });
     listRepoBranchesAndTagsMock.mockResolvedValue({ branches: ["main"], tags: [] });
+    getRepoDefaultBranchMock.mockResolvedValue("main");
     const token = await login("secret");
     const res = await deployRefsRequest("foreign-org/public-repo", token);
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatchObject({ branches: ["main"], tags: [] });
     // null token must be forwarded — no App JWT reaches the /repos endpoint.
     expect(listRepoBranchesAndTagsMock).toHaveBeenCalledWith(null, "foreign-org", "public-repo");
+  });
+
+  it("returns all branches when the mock returns more than 100 entries", async () => {
+    const allBranches = Array.from({ length: 122 }, (_, i) => `branch-${String(i).padStart(3, "0")}`);
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
+    listRepoBranchesAndTagsMock.mockResolvedValue({ branches: allBranches, tags: [] });
+    getRepoDefaultBranchMock.mockResolvedValue("main");
+    const token = await login("secret");
+    const res = await deployRefsRequest("owner/repo", token);
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { branches: string[] }).branches).toHaveLength(122);
+  });
+
+  it("returns defaultBranch: null when repo metadata fetch fails (graceful degradation)", async () => {
+    mintSourceTokenOrJwtMock.mockResolvedValue({ token: "inst-token", authMode: "installation" });
+    listRepoBranchesAndTagsMock.mockResolvedValue({ branches: ["main"], tags: [] });
+    getRepoDefaultBranchMock.mockResolvedValue(null);
+    const token = await login("secret");
+    const res = await deployRefsRequest("owner/repo", token);
+    expect(res.statusCode).toBe(200);
+    expect((res.body as { defaultBranch: null }).defaultBranch).toBeNull();
   });
 
   it("returns 503 with install message when unauthenticated 404 indicates a private repo (public mode)", async () => {

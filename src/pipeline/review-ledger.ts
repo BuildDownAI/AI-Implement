@@ -225,6 +225,60 @@ function isExplicitlyEmptyFindingSection(body: string): boolean {
   return /^(?:none|nothing|n\/a|no\s+(?:(?:blocking|minor|non-blocking|material|actionable)\s+)?(?:issues?|findings?|concerns?|changes)(?:\s+(?:were\s+)?(?:found|required))?)$/i.test(normalized);
 }
 
+// GHA review format is freeform (no machine-readable severity tags or path:line markers),
+// so a start-anchored denylist of absence-of-concern and resolution phrases is used instead
+// of an allowlist. Anchoring prevents false positives: "No null check is performed" does not
+// match because "check" is not in the concern-noun set.
+// Bullets using hedge-then-caveat phrasing ("No issues, but X is missing") contain a real
+// finding after the conjunction and must NOT be classified as non-findings; bail out early
+// when a contrastive conjunction follows the hedge prefix.
+function isNonFindingBullet(text: string): boolean {
+  const lc = normalizeText(text).toLowerCase();
+  if (/\b(?:but|however|though|although)\b/.test(lc)) return false;
+  if (/^no\s+(?:\w+\s+)*(?:concerns?|issues?|findings?|problems?|blocking)(?:\s|$|[,;—–-])/i.test(lc)) return true;
+  if (/^nothing\s+blocking\b/i.test(lc)) return true;
+  if (/^cleanly\s+resolved\b/i.test(lc)) return true;
+  if (/^(?:both|all)\s+(?:blocking\s+)?(?:issues?|findings?|concerns?).{0,60}\b(?:are|were|have\s+been)\s+resolved\b/i.test(lc)) return true;
+  if (/^matches?\s+the\s+spec\b/i.test(lc)) return true;
+  return false;
+}
+
+function parseSectionBullets(lines: string[]): string[] {
+  const bullets: string[] = [];
+  let current: string | undefined;
+
+  const flushCurrent = () => {
+    if (current !== undefined) {
+      const trimmed = current.trim();
+      if (trimmed) bullets.push(trimmed);
+      current = undefined;
+    }
+  };
+
+  for (const line of lines) {
+    if (/^\s*[-*]\s+\[[ xX]\]\s+/.test(line) || /^\s*[·•]\s+Branch\s*:/i.test(line)) continue;
+    if (!line.trim()) {
+      flushCurrent();
+      continue;
+    }
+    // Handles standard bullets (-, *, +, 1., 1)) and the compound "1. -" format used in GHA reviews
+    const match = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(?:[-*]\s+)?(.+)$/);
+    if (match) {
+      flushCurrent();
+      current = match[1];
+      continue;
+    }
+    if (current !== undefined && /^\s{2,}/.test(line)) {
+      current = `${current} ${line.trim()}`;
+      continue;
+    }
+    flushCurrent();
+  }
+
+  flushCurrent();
+  return bullets;
+}
+
 /**
  * Parses the live comment shape emitted by anthropics/claude-code-action when it runs
  * under GitHub Actions. The action has repeatedly omitted the requested verdict marker,
@@ -246,17 +300,34 @@ export function extractGithubActionsClaudeReviewFindings(body: string, url?: str
       sectionLines = [];
       return;
     }
-    const findingBody = normalizeText(stripClaudeActionNoise(sectionLines));
-    if (findingBody) {
-      if (isExplicitlyEmptyFindingSection(findingBody)) {
+    const bullets = parseSectionBullets(sectionLines);
+    if (bullets.length > 0) {
+      const genuineFindings = bullets.filter((b) => !isNonFindingBullet(b));
+      if (genuineFindings.length === 0) {
         explicitlyEmptySections += 1;
       } else {
-        findings.push({
-          source: "claude-review-summary",
-          severity,
-          body: findingBody,
-          ...(url ? { url } : {}),
-        });
+        for (const bulletBody of genuineFindings) {
+          findings.push({
+            source: "claude-review-summary",
+            severity,
+            body: normalizeText(bulletBody),
+            ...(url ? { url } : {}),
+          });
+        }
+      }
+    } else {
+      const findingBody = normalizeText(stripClaudeActionNoise(sectionLines));
+      if (findingBody) {
+        if (isExplicitlyEmptyFindingSection(findingBody)) {
+          explicitlyEmptySections += 1;
+        } else {
+          findings.push({
+            source: "claude-review-summary",
+            severity,
+            body: findingBody,
+            ...(url ? { url } : {}),
+          });
+        }
       }
     }
     sectionLines = [];

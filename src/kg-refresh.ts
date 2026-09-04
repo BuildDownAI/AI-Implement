@@ -29,8 +29,12 @@ const MIN_FREE_BYTES = 200 * 1024 * 1024;
 const CANARY_DEADLINE_MS = 120_000;
 const CANARY_RETRY_MS = 5_000;
 
-/** Gates evaluated on the serving graph after the swap + restart. */
-export type RefreshGate = "staging" | "answers" | "vectors" | "canary" | "stamp";
+/**
+ * Gates evaluated during refresh. `"staging"` fires before any swap; `"ingest-needed"` fires
+ * before staging when the source snapshot is not newer than the served stamp (informational,
+ * not a failure in the traditional sense — no stage/restart/revert cycle ran).
+ */
+export type RefreshGate = "staging" | "answers" | "vectors" | "canary" | "stamp" | "ingest-needed";
 
 export interface RefreshOutcome {
   ok: boolean;
@@ -74,6 +78,8 @@ interface KgRefreshInput {
   mintToken?: typeof getScopedInstallationToken;
   fetchTarball?: typeof fetchRepoTarball;
   fetchDefaultBranch?: (token: string, owner: string, repo: string) => Promise<string>;
+  /** Returns the committer date of the latest commit touching `snapshot/` on the default branch, or null on failure. */
+  fetchSnapshotCommitDate?: (token: string, owner: string, repo: string, branch: string) => Promise<string | null>;
   materialize?: (python: string, cwd: string) => Promise<void>;
   mcpToolCall?: (url: string, tool: string, args: Record<string, unknown>) => Promise<unknown>;
   canaryDeadlineMs?: number;
@@ -105,6 +111,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const mintToken = input.mintToken ?? getScopedInstallationToken;
   const fetchTarball = input.fetchTarball ?? fetchRepoTarball;
   const fetchDefaultBranch = input.fetchDefaultBranch ?? defaultFetchDefaultBranch;
+  const fetchSnapshotCommitDate = input.fetchSnapshotCommitDate ?? defaultFetchSnapshotCommitDate;
   const materialize = input.materialize ?? defaultMaterialize;
   const mcpToolCall = input.mcpToolCall ?? defaultMcpToolCall;
   const canaryDeadlineMs = input.canaryDeadlineMs ?? CANARY_DEADLINE_MS;
@@ -181,6 +188,23 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
       namespace = await readNamespace(source);
       stampBefore = await readServedStamp(namespace);
+
+      // Pre-check: if the source repo has no newer snapshot commit, skip the full cycle.
+      // Guard requires both sides known; either null falls through so the stamp gate handles it.
+      const snapshotCommitDate = await fetchSnapshotCommitDate(token, repo.owner, repo.repo, branch);
+      if (snapshotCommitDate !== null && stampBefore !== null && Date.parse(snapshotCommitDate) <= Date.parse(stampBefore)) {
+        await rm(fetchDir, { recursive: true, force: true });
+        const outcome: RefreshOutcome = {
+          ok: false,
+          at: Date.now(),
+          gate: "ingest-needed",
+          detail: "Graph is current — a new ingest is required to refresh",
+          stampBefore,
+          stampAfter: stampBefore,
+        };
+        console.log(`[kg-refresh] ${outcome.detail}`);
+        return outcome;
+      }
 
       // ---- stage: materialize in the fetched tree with the image's venv.
       // KGB-9's contract: this copies committed vectors and hard-fails on a
@@ -333,6 +357,21 @@ async function defaultFetchDefaultBranch(token: string, owner: string, repo: str
   if (!res.ok) throw new Error(`repo metadata fetch failed: HTTP ${res.status}`);
   const data = (await res.json()) as { default_branch?: string };
   return data.default_branch || "main";
+}
+
+async function defaultFetchSnapshotCommitDate(token: string, owner: string, repo: string, branch: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/commits?sha=${branch}&path=snapshot/&per_page=1`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } },
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as Array<{ commit?: { committer?: { date?: string }; author?: { date?: string } } }>;
+    if (!Array.isArray(data) || data.length === 0) return null;
+    return data[0].commit?.committer?.date ?? data[0].commit?.author?.date ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -4,6 +4,8 @@
  * Mirrors the mint→cache→Bearer shape of github-app-auth.ts, simplified to a single workspace-wide token (one Linear app credential, no per-owner cache).
  */
 
+import { defaultFetchSignal } from "./github.js";
+
 const TOKEN_ENDPOINT = "https://api.linear.app/oauth/token";
 const SCOPES = "read,write";
 
@@ -45,16 +47,18 @@ async function mintToken(): Promise<CachedToken> {
     throw new Error("Linear auth not configured (set LINEAR_CLIENT_ID and LINEAR_CLIENT_SECRET)");
   }
 
+  const tokenBody = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+    scope: SCOPES,
+    actor: "app",
+  });
   const res = await fetch(TOKEN_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: clientId,
-      client_secret: clientSecret,
-      scope: SCOPES,
-      actor: "app",
-    }),
+    body: tokenBody,
+    signal: defaultFetchSignal(),
   });
   if (!res.ok) {
     const body = await res.text();

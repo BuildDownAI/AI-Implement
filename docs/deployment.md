@@ -163,6 +163,45 @@ fly logs --app <app_name>                    # tail logs
 fly ssh console --app <app_name>             # shell into the machine
 ```
 
+### Per-project secrets (Fly)
+
+Secrets set through the admin UI Secrets panel are stored as classic Fly app secrets on the **shared sessions app**, prefixed with the team key — for example, a secret named `QA_PROBE` on the `SAN` mapping is stored as `SAN_QA_PROBE`.
+
+Classic Fly app secrets are **app-wide**: Fly injects every classic secret into every machine on the sessions app under its stored name, regardless of which team that machine belongs to. The Fly Machines API `processes[].secrets` field with `env_var` remap only applies to the non-GA named-secrets feature and has no effect on classic secrets.
+
+The runner entrypoint (`session/entrypoint.sh`, via `remap_team_secrets` in `session/lib.sh`) is the isolation boundary. When `AI_IMPLEMENT_TEAM_SECRET_PREFIX` is set, the entrypoint runs before the `su -p coder` handoff and:
+
+1. Remaps each own-team secret (`<TEAM>_<NAME>`) to its unprefixed form (`<NAME>`), making it available to setup hooks and the agent.
+2. Unsets foreign-team secrets — names from other team mappings that are listed in `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` — so machines dispatched for one team cannot read another team's secrets even though Fly injected them.
+3. Leaves global machine secrets (secrets with no team prefix, set on the sessions app for shared use) untouched — they pass through unchanged and are visible to every machine.
+4. Sets `AI_IMPLEMENT_FORWARDED_SECRETS` to a comma-joined list of the bare names exposed (e.g., `QA_PROBE,DB_URL`).
+
+`buildSessionMachineConfig` (in `src/fly-machines.ts`) passes two env vars so the entrypoint knows which names to process:
+- `AI_IMPLEMENT_TEAM_SECRET_PREFIX=<TEAM>_`: the own-team prefix; the entrypoint scans the environment for vars with this prefix and remaps them.
+- `AI_IMPLEMENT_FOREIGN_SECRET_NAMES=<comma-joined list>`: names that start with another team's prefix; the entrypoint unsets these. Global secrets are absent from this list and pass through unchanged.
+
+If a team secret's bare name (the part after the team prefix) matches a reserved orchestrator variable — `GITHUB_*`, `ISSUE_*`, `AI_IMPLEMENT_*`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `SESSION_TOKEN`, `MACHINE_NONCE`, `RUN_TOKEN`, `ORCHESTRATOR_URL`, `RUNNER_CALLBACK_URL`, `WORKSPACE_DIR`, `PATH`, or `HOME` — the entrypoint logs a warning and skips the export rather than overwriting the orchestrator-issued value. The same names are rejected at the admin UI level by `handleSetSecret` in `src/admin.ts`, so well-formed deployments never reach that guard.
+
+### Process-level secrets (AII-491 spike)
+
+Setting `FLY_PROCESS_LEVEL_SECRETS` to `true` switches `buildSessionMachineConfig` to a stricter isolation mode. Instead of setting `AI_IMPLEMENT_TEAM_SECRET_PREFIX` / `AI_IMPLEMENT_FOREIGN_SECRET_NAMES` and relying on the entrypoint filter, the machine config sets `processes[0].ignore_app_secrets: true` and enumerates only the secrets the machine should receive in `processes[0].secrets`:
+
+- Own-team secrets (`<TEAM>_<NAME>`) → `{ env_var: "<NAME>", name: "<TEAM>_<NAME>" }` (remapped to bare form)
+- Foreign-team secrets → excluded entirely
+- Global secrets (no team prefix) → `{ env_var: "<NAME>" }` (passed through unchanged)
+
+The entrypoint remap/filter logic remains active in both modes but is a no-op when the flag is on, since the machine already receives bare names with foreign names absent. The orchestrator also sets `AI_IMPLEMENT_FORWARDED_SECRETS` to the comma-joined bare names of the own-team secrets in `processes[0].secrets`, so `modelProcessEnv()` strips them from the agent's environment before Claude Code starts.
+
+**This flag is off by default.** Ship it behind the flag, run one probe, then decide:
+
+| Probe result | Action |
+|---|---|
+| `QA_PROBE` present; `SAN_QA_PROBE` + `AII_PROBE_FOREIGN` absent | Fly honours the list ✅ — leave flag on; file follow-up to make it default |
+| `SAN_QA_PROBE` + `AII_PROBE_FOREIGN` still present | `processes` not applied — add `entrypoint: ["/opt/ai-implement/entrypoint.sh"]` to `processes[0]` and retry |
+| No `QA_`, `SAN_`, `AII_` vars present | `ignore_app_secrets` applied but the list did not resolve — turn flag off; entrypoint filter remains the boundary |
+
+The dispatch log line (written only when the flag is on) lists the requested secret *names* (never values) so the outcome can be read from the orchestrator log as well as the probe hook report.
+
 ## Using AWS Bedrock
 
 To run a target repo against Bedrock instead of the Anthropic API, use the **GitHub Actions execution mode**. Bedrock is not supported on Fly Machines or local Docker: those backends have no equivalent of GitHub's OIDC role assumption, and the runner entrypoint rejects `provider=bedrock` outside GHA mode outright.

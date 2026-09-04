@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -87,6 +87,7 @@ import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import { makeKgRefresh } from "./kg-refresh.js";
+import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 
 // ---------- Configuration ----------
 
@@ -98,6 +99,7 @@ interface AppConfig {
   adminAccessCode: string | null;
   oauthRedirectBaseUrl: string | null;
   pollIntervalMs: number;
+  pollCycleTimeoutMs: number;
   healthPort: number;
   // Fly Machines (optional — only needed if any mapping uses fly-machines mode)
   flySessionsToken: string | null;
@@ -105,6 +107,7 @@ interface AppConfig {
   flySessionsRegion: string | null;
   flyOrchestratorApp: string | null;
   flyDeployToken: string | null;
+  flyProcessLevelSecrets: boolean;
   tenantId: string | null;
   sessionImage: string;
   /** Deprecation state of SESSION_IMAGE, used for the startup warning. */
@@ -215,6 +218,7 @@ function loadConfig(): AppConfig {
     adminAccessCode,
     oauthRedirectBaseUrl,
     pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "60000", 10),
+    pollCycleTimeoutMs: Number(process.env.POLL_CYCLE_TIMEOUT_MS) || 10 * 60 * 1000,
     healthPort: parseInt(process.env.PORT || "8080", 10),
     flySessionsToken: process.env.FLY_SESSIONS_TOKEN || null,
     flySessionsApp: (() => {
@@ -229,6 +233,7 @@ function loadConfig(): AppConfig {
     })(),
     flyOrchestratorApp: process.env.FLY_APP_NAME || null,
     flyDeployToken: process.env.FLY_DEPLOY_TOKEN || null,
+    flyProcessLevelSecrets: process.env.FLY_PROCESS_LEVEL_SECRETS === "true",
     tenantId: process.env.CLIENT_SLUG || process.env.FLY_APP_NAME || null,
     sessionImage: defaultRunner.image,
     sessionImageStatus: defaultRunner.sessionImageStatus,
@@ -252,9 +257,6 @@ function loadConfig(): AppConfig {
 
 // ---------- Polling logic ----------
 
-let pollCount = 0;
-let pollInProgress = false;
-
 type DispatchableIssue = TicketIssue;
 
 /**
@@ -271,13 +273,21 @@ function isGroupingParentDispatch(issue: DispatchableIssue): boolean {
 }
 
 async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void> {
-  if (pollInProgress) {
+  const cycle = beginCycle();
+  if (!cycle) {
     console.log(`[poll] Skipping poll cycle — previous poll still running`);
     return;
   }
-  pollInProgress = true;
-  try {
-  console.log(`[poll] Starting poll cycle #${++pollCount}`);
+  const { cycleId, started } = cycle;
+  console.log(`[poll] Starting poll cycle #${cycleId}`);
+
+  const timeoutMs = config.pollCycleTimeoutMs;
+
+  await runWithDeadline(
+    cycleId,
+    started,
+    timeoutMs,
+    async () => {
 
   // Independent of tracker providers so self-deploy still works on an orchestrator with none configured.
   // Best-effort — never blocks the poll.
@@ -534,6 +544,10 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     }
 
     for (const issue of readyToDispatch) {
+      if (!isCurrentCycle(cycleId)) {
+        console.warn(`[poll] Cycle #${cycleId} abandoned — skipping dispatch for ${issue.identifier}`);
+        break;
+      }
       try {
         const mapping = teamRepoMap[issue.scopeKey]!;
         const issueProvider = await registry.forMapping(mapping);
@@ -695,16 +709,26 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       anthropicApiKey: config.anthropicApiKey,
       claudeOAuthToken: config.claudeOAuthToken,
       sessionImage: config.sessionImage,
+      flyProcessLevelSecrets: config.flyProcessLevelSecrets,
     });
   }
 
   // Crash-recovery safety net for workflow syncs. (NOT the primary trigger. the admin handlers fire runWorkflowSync immediately on save) 
   // this only re-runs jobs that lost their runner to a restart or a wedge.
   await processPendingWorkflowSyncs(config);
-
-  } finally {
-    pollInProgress = false;
-  }
+  },
+  (id, elapsed) => {
+    console.warn(
+      `[poll] Cycle #${id} deadline reached after ${elapsed}s — abandoning, next tick will start a new cycle`,
+    );
+    if (config.notifyWebhookUrl) {
+      notifyText(
+        config.notifyWebhookUrl,
+        `[poll] Cycle #${id} abandoned after ${elapsed}s — next tick will start a fresh cycle`,
+      ).catch((err) => console.error("[poll] Failed to send deadline notification:", err));
+    }
+  },
+  );
 }
 
 // ---------- Dispatch breaker ----------
@@ -1094,6 +1118,8 @@ async function dispatchPlanning(
             memoryMb: mapping.machineMemoryMb,
             teamKey: issue.scopeKey,
             teamSecretNames: allSecretNames,
+            allTeamKeys: Object.keys(getMappings()),
+            flyProcessLevelSecrets: config.flyProcessLevelSecrets,
             minSecretsVersion: minSecretsVersion ?? undefined,
             orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
             runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -1106,6 +1132,10 @@ async function dispatchPlanning(
               return Object.keys(merged).length > 0 ? merged : undefined;
             })(),
           });
+          if (config.flyProcessLevelSecrets) {
+            const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
+            console.log(`[poll] process-level secrets for ${issue.identifier} planning: [${secretNames.join(", ")}]`);
+          }
 
           const machine = await createMachine(flyToken!, flyApp!, machineConfig);
           const machineLogsUrl = `https://fly.io/apps/${flyApp}/machines/${machine.id}`;
@@ -1534,6 +1564,8 @@ async function dispatchFlyMachine(
         memoryMb: mapping.machineMemoryMb,
         teamKey: issue.scopeKey,
         teamSecretNames: allSecretNames,
+        allTeamKeys: Object.keys(getMappings()),
+        flyProcessLevelSecrets: config.flyProcessLevelSecrets,
         minSecretsVersion: minSecretsVersion ?? undefined,
         orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -1546,6 +1578,10 @@ async function dispatchFlyMachine(
           return Object.keys(merged).length > 0 ? merged : undefined;
         })(),
       });
+      if (config.flyProcessLevelSecrets) {
+        const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
+        console.log(`[poll] process-level secrets for ${issue.identifier}: [${secretNames.join(", ")}]`);
+      }
 
       const machine = await createMachine(flyToken, flyApp, machineConfig);
 
@@ -2029,6 +2065,7 @@ async function findPrForIssue(
         Authorization: `Bearer ${ghToken}`,
         Accept: "application/vnd.github+json",
       },
+      signal: defaultFetchSignal(),
     });
     if (prRes.ok) {
       const prs = (await prRes.json()) as RunPrCandidate[];
@@ -2452,13 +2489,18 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
         if (job.status === "completed") {
           recordDispatchSuccess(job.issueId, breakerPhase);
         } else if (job.status === "failed" || job.status === "timed_out" || job.status === "review_failed") {
-          const breakerConclusion = job.conclusion ?? job.status;
-          // Don't fire the trip notification for stuck conclusions — stuck_giveup already
-          // fires notifyStuckGiveUp; we still record the failure so the counter advances.
-          const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
-          const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
-          if (br.tripped && !isStuck) {
-            pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+          // Skip the breaker entirely for operator_cancelled — it was a human decision,
+          // not a system failure. Recording it could park the issue and permanently
+          // suppress future genuine-failure alerts even after the breaker trips from
+          // accumulated operator-cancel events (alreadyParked stays true forever).
+          if (job.conclusion !== "operator_cancelled") {
+            const breakerConclusion = job.conclusion ?? job.status;
+            // stuck_giveup already fires notifyStuckGiveUp — don't double-fire.
+            const isStuck = job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued";
+            const br = recordDispatchFailure(job.issueId, breakerPhase, breakerConclusion);
+            if (br.tripped && !isStuck) {
+              pendingBreakerTrip = { phase: breakerPhase, failures: br.failures, conclusion: breakerConclusion };
+            }
           }
         }
       }
@@ -2467,6 +2509,26 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
       // already fires notifyStuckGiveUp, and stuck_requeued is a transparent
       // requeue that will produce its own dispatch notice on the next cycle.
       if (job.conclusion === "stuck_giveup" || job.conclusion === "stuck_requeued") {
+        markJobNotified(job.id);
+        continue;
+      }
+
+      // Operator-cancelled: one informational notice, no failure/stuck/parked triple.
+      if (job.conclusion === "operator_cancelled") {
+        if (config.notifyWebhookUrl) {
+          const identifier = job.issueIdentifier || job.issueId;
+          const prNum = job.prUrl ? job.prUrl.match(/\/pull\/(\d+)/)?.[1] : undefined;
+          const prRef = prNum ? ` (PR #${prNum})` : "";
+          try {
+            await notifyText(
+              config.notifyWebhookUrl,
+              `ℹ️ AI-Implement run cancelled by operator${prRef} — ${identifier}. PR was closed mid-run; ticket label cleared — issue excluded from automatic re-dispatch.`,
+            );
+          } catch (err) {
+            console.error(`[monitor] Failed to send operator-cancelled notice for job ${job.id}:`, err);
+          }
+        }
+        console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) operator_cancelled — benign terminal, one informational notice sent`);
         markJobNotified(job.id);
         continue;
       }
@@ -2885,7 +2947,14 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     // Health check
     if (url === "/" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", polls: pollCount, kgDegraded: isKgDegraded() }));
+      const { pollCount: polls, lastPollStartedAt, lastPollFinishedAt } = getPollStats();
+      res.end(JSON.stringify({
+        status: "ok",
+        polls,
+        kgDegraded: isKgDegraded(),
+        lastPollStartedAt: lastPollStartedAt?.toISOString() ?? null,
+        lastPollFinishedAt: lastPollFinishedAt?.toISOString() ?? null,
+      }));
       return;
     }
 

@@ -204,6 +204,7 @@ export const deploymentsScript = `
   // What the server last told us. Kept so an edit can be detected, and so the 30s poll
   // does not silently revert a checkbox someone has ticked but not yet saved.
   let savedPolicy = null;
+  let stampedBranch = null;
 
   function policyDirty() {
     if (!savedPolicy) return false;
@@ -240,16 +241,38 @@ export const deploymentsScript = `
       }
       const data = await res.json();
       const prev = refSel.value;
+      const defaultBranch = data.defaultBranch || null;
+      const currentRef = savedPolicy && savedPolicy.watchedRef ? savedPolicy.watchedRef : stampedBranch;
+      const shownSet = new Set();
+
       let html = '<option value="">— select a ref —</option>';
-      if (data.branches && data.branches.length) {
-        html += '<optgroup label="Branches">';
-        for (const b of data.branches) html += '<option value="' + window.escAttr(b) + '">' + window.esc(b) + '</option>';
+      if (currentRef) {
+        shownSet.add(currentRef);
+        html += '<optgroup label="Current">';
+        html += '<option value="' + window.escAttr(currentRef) + '">' + window.esc(currentRef) + '</option>';
+        html += '</optgroup>';
+      }
+      if (defaultBranch && !shownSet.has(defaultBranch)) {
+        shownSet.add(defaultBranch);
+        html += '<optgroup label="Default">';
+        html += '<option value="' + window.escAttr(defaultBranch) + '">' + window.esc(defaultBranch) + '</option>';
         html += '</optgroup>';
       }
       if (data.tags && data.tags.length) {
-        html += '<optgroup label="Tags">';
-        for (const t of data.tags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
-        html += '</optgroup>';
+        const remainingTags = data.tags.filter(function(t) { return !shownSet.has(t); });
+        if (remainingTags.length) {
+          html += '<optgroup label="Tags">';
+          for (const t of remainingTags) html += '<option value="' + window.escAttr(t) + '">' + window.esc(t) + '</option>';
+          html += '</optgroup>';
+        }
+      }
+      if (data.branches && data.branches.length) {
+        const remaining = data.branches.filter(function(b) { return !shownSet.has(b); }).sort();
+        if (remaining.length) {
+          html += '<optgroup label="Branches">';
+          for (const b of remaining) html += '<option value="' + window.escAttr(b) + '">' + window.esc(b) + '</option>';
+          html += '</optgroup>';
+        }
       }
       refSel.innerHTML = html;
       // Restore previous selection if it still exists in the new list
@@ -338,6 +361,8 @@ export const deploymentsScript = `
         watchedRefEl.value = savedRef;
       }
     }
+    watchedRepoEl.placeholder = data.watchedRepo || data.repo || 'owner/repo';
+    stampedBranch = data.branch || null;
     savedPolicy = {
       autoDeploy: !!data.autoDeploy,
       notifyAvailable: !!data.notifyAvailable,
@@ -573,13 +598,16 @@ export const deploymentsScript = `
       const badge = document.getElementById('kg-refresh-badge');
       if (data.running) setBadge(badge, 'info', 'refreshing');
       else if (data.kgDegraded) setBadge(badge, 'warn', 'degraded');
+      else if (data.lastRefresh?.gate === 'ingest-needed') setBadge(badge, 'ok', 'up-to-date');
       else setBadge(badge, 'ok', 'serving');
       document.getElementById('kg-refresh-stamp').textContent =
         'Served graph stamp: ' + (data.servedStamp || 'baked image graph');
       const last = data.lastRefresh;
-      document.getElementById('kg-refresh-last').textContent = last
-        ? 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' — ' + last.detail
-        : 'No refresh has run since boot.';
+      document.getElementById('kg-refresh-last').textContent = !last
+        ? 'No refresh has run since boot.'
+        : last.gate === 'ingest-needed'
+        ? 'Last refresh: ' + last.detail
+        : 'Last refresh: ' + (last.ok ? 'ok' : 'failed at gate "' + (last.gate || '?') + '"') + ' — ' + last.detail;
       document.getElementById('kg-refresh-btn').disabled = !!data.running || !!data.deployHeld;
     } catch (e) { card.hidden = true; }
   }

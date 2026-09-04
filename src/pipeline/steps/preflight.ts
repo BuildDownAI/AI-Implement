@@ -2,6 +2,7 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { repoProcessEnv } from "../process-env.js";
 
 interface PreflightInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -22,6 +23,11 @@ export const preflightStep: StepModule<PreflightInputs, PreflightOutputs> = {
     _reporter: StepReporter,
   ): Promise<PreflightOutputs> {
     const { workspaceDir } = inputs;
+    console.warn(
+      "[preflight] Repository code and task documents are executed directly. " +
+        "This runner does not isolate repository commands from the model process or the host environment — " +
+        "only use with trusted repositories and task documents.",
+    );
     const pm = String(inputs.packageManager ?? "npm");
     const runCmd = pm === "yarn" ? "yarn" : pm === "pnpm" ? "pnpm run" : "npm run";
 
@@ -37,7 +43,7 @@ export const preflightStep: StepModule<PreflightInputs, PreflightOutputs> = {
 
     const run = (cmd: string): string => {
       try {
-        const out = execSync(cmd, { cwd: workspaceDir, stdio: "pipe" }).toString();
+        const out = execSync(cmd, { cwd: workspaceDir, stdio: "pipe", env: repoProcessEnv() }).toString();
         return out;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

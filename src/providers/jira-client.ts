@@ -1,3 +1,5 @@
+import { defaultFetchSignal } from "../github.js";
+
 export interface JiraClientConfig {
   /** API token (used with Basic auth) or OAuth 2.0 access token (Bearer). */
   token: string;
@@ -86,6 +88,7 @@ export class JiraClient {
           "Content-Type": "application/json",
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: defaultFetchSignal(),
       });
     } catch (err) {
       // Node/undici throws a generic "fetch failed" TypeError for anything below

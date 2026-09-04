@@ -49,7 +49,7 @@ import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
-import { listRepoBranchesAndTags } from "./github.js";
+import { listRepoBranchesAndTags, getRepoDefaultBranch } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
@@ -57,6 +57,7 @@ import { inspectPipelinesAndSteps } from "./inspect-pipeline-graph.js";
 import { validateTicketingConfig, type TicketingMappingConfig } from "./providers/ticketing-config.js";
 import { JiraClient, JiraFieldNotSelectError } from "./providers/jira-client.js";
 import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./workflow-sync-queue.js";
+import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import picomatch from "picomatch";
 
@@ -198,7 +199,7 @@ export interface AdminDeps {
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
     trigger(): Promise<{ status: number; body: Record<string, unknown> }>;
-    status(): Promise<unknown>;
+    status(): Promise<KgRefreshStatus>;
   };
 }
 
@@ -307,7 +308,7 @@ export function handleAdminRequest(
         return true;
       }
       deps.kgRefresh.status().then(
-        (body) => json(res, 200, body as Record<string, unknown>),
+        (body) => json(res, 200, body),
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;
@@ -1044,8 +1045,11 @@ async function handleDeployRefs(
       { permissions: { contents: "read" }, repositories: [repoName] },
     );
     authMode = result.authMode;
-    const { branches, tags } = await listRepoBranchesAndTags(result.token, owner, repoName);
-    json(res, 200, { branches, tags });
+    const [{ branches, tags }, defaultBranch] = await Promise.all([
+      listRepoBranchesAndTags(result.token, owner, repoName),
+      getRepoDefaultBranch(result.token, owner, repoName),
+    ]);
+    json(res, 200, { branches, tags, defaultBranch });
   } catch (err) {
     // 403 = authenticated but forbidden; 404 in public mode = private repo hidden behind 404.
     // Both indicate the App must be installed on the owner to grant access.
@@ -1138,6 +1142,13 @@ async function handleSetSecret(
   const secretSuffix = body.name.toUpperCase().trim();
   if (!/^[A-Z0-9_]+$/.test(secretSuffix)) {
     json(res, 400, { error: "name must contain only letters, digits, and underscores" });
+    return;
+  }
+  // Keep project secrets from overwriting orchestrator-managed env vars set by
+  // buildSessionMachineConfig. Mirrors the _remap_is_reserved check in session/lib.sh.
+  if (/^(GITHUB_|ISSUE_|AI_IMPLEMENT_)/.test(secretSuffix) ||
+      /^(ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|SESSION_TOKEN|MACHINE_NONCE|RUN_TOKEN|ORCHESTRATOR_URL|RUNNER_CALLBACK_URL|WORKSPACE_DIR|PATH|HOME)$/.test(secretSuffix)) {
+    json(res, 400, { error: "name is reserved and cannot be used as a project secret" });
     return;
   }
   try {

@@ -39,7 +39,7 @@ export async function fetchPlanningContextFromOrchestrator(params: {
 }
 
 export async function postRunnerResult(params: {
-  phase: "planning" | "implementation" | "gap-analysis";
+  phase: "planning" | "implementation" | "gap-analysis" | "kg-refresh";
   workspaceDir: string;
   outcome: "success" | "failure";
   prUrl?: string;

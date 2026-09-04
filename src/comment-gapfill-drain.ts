@@ -34,6 +34,7 @@ export interface DrainCommentGapfillsInput {
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   sessionImage: string;
+  flyProcessLevelSecrets: boolean;
 }
 
 function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapabilities {
@@ -209,6 +210,8 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           memoryMb: mapping.machineMemoryMb,
           teamKey: scopeKey,
           teamSecretNames: allSecretNames,
+          allTeamKeys: Object.keys(teamRepoMap),
+          flyProcessLevelSecrets: opts.flyProcessLevelSecrets,
           minSecretsVersion: minSecretsVersion ?? undefined,
           orchestratorUrl: opts.runnerCallbackBaseUrl ?? undefined,
           runnerCallbackUrl: runnerCallbackUrl || undefined,
@@ -226,6 +229,10 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
             return Object.keys(merged).length > 0 ? merged : undefined;
           })(),
         });
+        if (opts.flyProcessLevelSecrets) {
+          const secretNames = machineConfig.config.processes?.[0]?.secrets?.map((s) => s.name ?? s.env_var) ?? [];
+          console.log(`[comment-gapfill] process-level secrets for ${prLog.issueIdentifier ?? prLog.issueId}: [${secretNames.join(", ")}]`);
+        }
 
         const machine = await createMachine(flyToken, flyApp, machineConfig);
 

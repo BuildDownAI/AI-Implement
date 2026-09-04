@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { GitHubApiError } from "./github-errors.js";
+import { defaultFetchSignal } from "./github.js";
 
 export interface InstallationDetails {
   token: string;
@@ -111,10 +112,10 @@ async function resolveInstallationId(
 ): Promise<{ id: number; repository_selection?: "all" | "selected" }> {
   // `path` (…/installation) lets classifySyncError tell a 404-not-installed from a 404-repo-not-found.
   let installPath = `/orgs/${owner}/installation`;
-  let installRes = await fetch(`https://api.github.com${installPath}`, { headers });
+  let installRes = await fetch(`https://api.github.com${installPath}`, { headers, signal: defaultFetchSignal() });
   if (installRes.status === 404) {
     installPath = `/users/${owner}/installation`;
-    installRes = await fetch(`https://api.github.com${installPath}`, { headers });
+    installRes = await fetch(`https://api.github.com${installPath}`, { headers, signal: defaultFetchSignal() });
   }
   if (!installRes.ok) {
     const body = await installRes.text();
@@ -147,7 +148,7 @@ export async function getInstallation(
   const install = await resolveInstallationId(headers, owner);
 
   const tokenPath = `/app/installations/${install.id}/access_tokens`;
-  const tokenRes = await fetch(`https://api.github.com${tokenPath}`, { method: "POST", headers });
+  const tokenRes = await fetch(`https://api.github.com${tokenPath}`, { method: "POST", headers, signal: defaultFetchSignal() });
   if (!tokenRes.ok) {
     const body = await tokenRes.text();
     throw new GitHubApiError({
@@ -235,6 +236,7 @@ export async function getScopedInstallationToken(
     method: "POST",
     headers: hasBody ? { ...headers, "Content-Type": "application/json" } : headers,
     body: hasBody ? JSON.stringify(bodyData) : undefined,
+    signal: defaultFetchSignal(),
   });
 
   if (!tokenRes.ok) {
@@ -272,7 +274,7 @@ export async function installationIncludesRepo(token: string, repoName: string):
 
   for (let page = 1; ; page++) {
     const path = `/installation/repositories?per_page=${perPage}&page=${page}`;
-    const res = await fetch(`https://api.github.com${path}`, { headers });
+    const res = await fetch(`https://api.github.com${path}`, { headers, signal: defaultFetchSignal() });
     if (!res.ok) {
       const body = await res.text();
       throw new GitHubApiError({
@@ -302,7 +304,7 @@ export async function getAppSlug(appId: string, privateKey: string): Promise<str
   const normalizedKey = privateKey.replace(/\\n/g, "\n");
   const jwt = createAppJwt(appId, normalizedKey);
   const path = "/app";
-  const res = await fetch(`https://api.github.com${path}`, { headers: githubAppHeaders(jwt) });
+  const res = await fetch(`https://api.github.com${path}`, { headers: githubAppHeaders(jwt), signal: defaultFetchSignal() });
 
   if (!res.ok) {
     const body = await res.text();

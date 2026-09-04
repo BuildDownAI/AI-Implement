@@ -11,6 +11,13 @@
 # Additional secret (Bedrock provider):
 #   AWS_BEDROCK_ROLE_ARN     - IAM role ARN trusted to GitHub OIDC; needs bedrock:InvokeModel
 #
+# Optional secret (forwarded hook environment):
+#   AI_IMPLEMENT_FORWARDED_ENV - KEY=VALUE lines (one per line) exposed to setup/verify hooks.
+#                                Read as ONE literal secret. Never serialize the whole secrets
+#                                context: that trips GitHub's malicious-workflow scanner and
+#                                gates every dispatch behind manual approval (AII-502).
+#                                Values reach hooks only; the runner strips them from the model process.
+#
 # Optional repository or organization variables:
 #   AI_IMPLEMENT_RUNNER_IMAGE                    - Default runner image for this repo/org.
 #   AI_IMPLEMENT_ALLOWED_RUNNER_IMAGE_PREFIXES   - Extra image prefixes allowed in addition to ghcr.io/builddownai/ and the repo owner's own ghcr.io/<owner>/ namespace (auto-trusted).
@@ -191,6 +198,58 @@ jobs:
           fi
           if [ -n "${{ inputs.run_progress_token }}" ]; then
             echo "::add-mask::${{ inputs.run_progress_token }}"
+          fi
+
+      # Container jobs default to sh -e; this step uses bash syntax and requires shell: bash.
+      # Reads ONE literal repository secret. Never serialize the whole secrets context: that
+      # pattern trips GitHub's malicious-workflow scanner and gates every dispatch (AII-502).
+      - name: Forward repository secrets
+        env:
+          FORWARDED_ENV: ${{ secrets.AI_IMPLEMENT_FORWARDED_ENV }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${FORWARDED_ENV:-}" ]; then
+            exit 0
+          fi
+          reserved="GITHUB_TOKEN AI_IMPLEMENT_APP_ID AI_IMPLEMENT_PRIVATE_KEY ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN AWS_BEDROCK_ROLE_ARN GH_TOKEN GITHUB_ENTERPRISE_TOKEN GH_ENTERPRISE_TOKEN GIT_PASSWORD"
+          validated=""
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            if [[ "$line" != *=* ]]; then
+              echo "::error::AI_IMPLEMENT_FORWARDED_ENV: a line has no '=' separator (expected KEY=VALUE)."
+              exit 1
+            fi
+            name="${line%%=*}"
+            val="${line#*=}"
+            if ! [[ "$name" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+              echo "::error::AI_IMPLEMENT_FORWARDED_ENV: \"$name\" does not match the required format ^[A-Z][A-Z0-9_]*\$."
+              exit 1
+            fi
+            for r in $reserved; do
+              if [ "$name" = "$r" ]; then
+                echo "::error::AI_IMPLEMENT_FORWARDED_ENV: \"$name\" is a reserved name and cannot be forwarded."
+                exit 1
+              fi
+            done
+            if [[ "$name" == RUN_* ]] || [[ "$name" == AI_IMPLEMENT_* ]]; then
+              echo "::error::AI_IMPLEMENT_FORWARDED_ENV: \"$name\" uses a reserved prefix (RUN_ or AI_IMPLEMENT_) and cannot be forwarded."
+              exit 1
+            fi
+            if [ -z "$val" ]; then
+              echo "::error::AI_IMPLEMENT_FORWARDED_ENV: \"$name\" has an empty value."
+              exit 1
+            fi
+            echo "::add-mask::$val"
+            delim="$(openssl rand -hex 16)"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$val" "$delim" >> "$GITHUB_ENV"
+            validated="${validated:+${validated},}${name}"
+          done <<< "$FORWARDED_ENV"
+          if [ -n "$validated" ]; then
+            echo "AI_IMPLEMENT_FORWARDED_SECRETS=${validated}" >> "$GITHUB_ENV"
+            echo "::notice::Forwarding repository secrets to runner environment: ${validated}"
           fi
 
       - name: Run planning
