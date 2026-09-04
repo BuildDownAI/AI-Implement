@@ -8,7 +8,7 @@ import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
 import { renderClassification, TROUBLESHOOTING_URL, type Classification } from "./completion-classification.js";
 
-export type RunnerPhase = "planning" | "implementation" | "gap-analysis";
+export type RunnerPhase = "planning" | "implementation" | "gap-analysis" | "kg-refresh";
 
 /**
  * AII-430: planning depends entirely on the runner callback to advance.
@@ -193,7 +193,8 @@ export async function handleRunnerResult(
   if (
     body.phase !== "planning" &&
     body.phase !== "implementation" &&
-    body.phase !== "gap-analysis"
+    body.phase !== "gap-analysis" &&
+    body.phase !== "kg-refresh"
   ) {
     return bad(400, "invalid_phase");
   }

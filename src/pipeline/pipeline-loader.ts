@@ -258,6 +258,17 @@ function applyWiring(step: YamlStep): StepDefinition {
         },
       };
 
+    case "kg-snapshot-push":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          githubToken: ctx.getOutputs("clone").githubToken,
+          clonedRef: ctx.getOutputs("clone").clonedRef,
+          defaultBranch: ctx.data.branch,
+        }),
+      };
+
     default:
       return step;
   }

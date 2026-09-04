@@ -379,7 +379,7 @@ export interface SessionMachineInput {
   sessionToken: string;
   machineNonce: string;
   sessionMode?: string;
-  phase?: "implementation" | "planning";
+  phase?: "implementation" | "planning" | "kg-refresh";
   region?: string;
   cpus?: number;
   memoryMb?: number;

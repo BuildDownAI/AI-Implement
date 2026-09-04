@@ -5,7 +5,7 @@ export type RunTokenAudience = "result" | "progress" | "publication";
 
 export interface RunTokenClaims {
   issueId: string;
-  phase: "planning" | "implementation" | "gap-analysis";
+  phase: "planning" | "implementation" | "gap-analysis" | "kg-refresh";
   audience: RunTokenAudience;
   dispatchId: string;
   exp: number;
