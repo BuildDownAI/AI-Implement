@@ -157,8 +157,17 @@ interface KgRefreshInput {
    * Returns machine identity for job-row tracking (machineId for Fly, machineNonce always).
    */
   dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }>;
-  /** Record a dispatch_log row for the kg-refresh run. Returns jobId. Injectable for tests. */
-  appendJobLog?: (opts: { dispatchId: string; machineNonce: string; machineId?: string; logsUrl?: string }) => number;
+  /**
+   * Record a dispatch_log row before the machine starts. Returns jobId.
+   * Called with only dispatchId so the row exists before dispatchRun, closing
+   * the waitForQuiet race window. Injectable for tests.
+   */
+  appendJobLog?: (opts: { dispatchId: string }) => number;
+  /**
+   * Update the dispatch_log row with machine identity after dispatch succeeds.
+   * Injectable for tests.
+   */
+  updateJobMachine?: (jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }) => void;
   /** Close the dispatch_log row on a terminal outcome. Injectable for tests. */
   closeJobLog?: (jobId: number, status: "completed" | "failed" | "timed_out") => void;
   /**
@@ -599,14 +608,29 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               runnerCallbackUrl,
             };
 
-            const dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
+            // Write the row before starting the machine so waitForQuiet cannot
+            // see zero in-flight work between dispatch and row creation.
+            currentJobId = input.appendJobLog?.({ dispatchId }) ?? null;
+
+            let dispatchResult: { machineId?: string; machineNonce: string; logsUrl?: string };
+            try {
+              dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
+            } catch (dispatchErr) {
+              // Machine start failed — close the row immediately so no phantom
+              // in-flight entry persists and the deploy interlock can proceed.
+              if (currentJobId !== null) input.closeJobLog?.(currentJobId, "failed");
+              currentJobId = null;
+              throw dispatchErr;
+            }
+
+            if (currentJobId !== null) {
+              input.updateJobMachine?.(currentJobId, {
+                machineNonce: dispatchResult.machineNonce,
+                machineId: dispatchResult.machineId,
+                logsUrl: dispatchResult.logsUrl,
+              });
+            }
             currentDispatchId = dispatchId;
-            currentJobId = input.appendJobLog?.({
-              dispatchId,
-              machineNonce: dispatchResult.machineNonce,
-              machineId: dispatchResult.machineId,
-              logsUrl: dispatchResult.logsUrl,
-            }) ?? null;
             stage = "ingest-running";
             ingestStartedAt = Date.now();
             persistStageFn("ingest-running", ingestStartedAt);

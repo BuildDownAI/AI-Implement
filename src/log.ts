@@ -677,6 +677,14 @@ export function updateJobMachineId(jobId: number, machineId: string): void {
     .run(machineId, jobId);
 }
 
+/** Records machine identity on a dispatched kg-refresh row after the machine starts. */
+export function updateJobMachineDetails(jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET machine_nonce = ?, machine_id = ? WHERE id = ?")
+    .run(opts.machineNonce, opts.machineId ?? null, jobId);
+  if (opts.logsUrl) updateJobPrUrl(jobId, opts.logsUrl);
+}
+
 /** Clears a job's nonce (called when machine is destroyed). */
 export function invalidateNonce(jobId: number): void {
   getDb()
