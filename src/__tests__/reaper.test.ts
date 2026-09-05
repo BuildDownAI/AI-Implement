@@ -882,6 +882,36 @@ describe("sweepOrphanedMachines — kg-refresh bootstrap deadline", () => {
     expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
   });
 
+  it("dispatched row with machineId in 'created' state within deadline is skipped", async () => {
+    // Machine is still booting (created state); job is within the grace period.
+    // Neither bootstrap-timeout nor machine-absent should fire.
+    const dispatchedJob = { ...kgRefreshJob, status: "dispatched" as const, machineId: "m-kg", dispatchedAt: Date.now() - 60_000 };
+    const createdMachine = makeMachine("m-kg", { state: "created" });
+    vi.mocked(listMachines).mockResolvedValueOnce([createdMachine] as never);
+    vi.mocked(getJobByMachineId).mockImplementation((id) => (id === "m-kg" ? dispatchedJob : null));
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([dispatchedJob]);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
+  it("dispatched row with machineId in 'starting' state within deadline is skipped", async () => {
+    const dispatchedJob = { ...kgRefreshJob, status: "dispatched" as const, machineId: "m-kg", dispatchedAt: Date.now() - 60_000 };
+    const startingMachine = makeMachine("m-kg", { state: "starting" });
+    vi.mocked(listMachines).mockResolvedValueOnce([startingMachine] as never);
+    vi.mocked(getJobByMachineId).mockImplementation((id) => (id === "m-kg" ? dispatchedJob : null));
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([dispatchedJob]);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalled();
+  });
+
   it("running row past 5 min triggers machine-absent path, not bootstrap", async () => {
     const runningJob = { ...kgRefreshJob, status: "running" as const, machineId: "m-kg", dispatchedAt: Date.now() - 10 * 60_000 };
     vi.mocked(listMachines).mockResolvedValueOnce([] as never);

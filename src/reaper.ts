@@ -99,7 +99,7 @@ async function sweepOrphanedKgRefreshJobs(
       );
       recordReaperAction({
         ruleMatched: "kg-refresh-bootstrap-timeout",
-        machineId: job.machineId ?? "",
+        machineId: job.machineId ?? "", // "" is the sentinel for "no machine yet" in reaper_actions
         tenantId: null,
         issueIdentifier: null,
         ageSeconds,
@@ -325,10 +325,13 @@ export async function sweepOrphanedMachines(
   }
 
   // Inverse sweep: find kg-refresh job rows whose machine is gone from the registry.
-  // Only machines in "started" state are considered live; stopped/failed/created machines
-  // are absent for this check even if they still appear in the registry.
+  // Machines in "started", "created", or "starting" are considered live (bootstrapping or
+  // running). "stopped" and "failed" machines are intentionally excluded so a machine that
+  // exited cleanly or crashed is treated as absent and triggers the close path.
   const activeMachineIds = new Set(
-    machines.filter((m) => m.state === "started").map((m) => m.id),
+    machines
+      .filter((m) => m.state === "started" || m.state === "created" || m.state === "starting")
+      .map((m) => m.id),
   );
   await sweepOrphanedKgRefreshJobs(config, helpers, activeMachineIds);
 
