@@ -63,6 +63,10 @@ const shell = `<div id="admin-page" class="app-shell hidden">
   </main>
 </div>`;
 
+function pageScript(name: string, src: string): string {
+  return `<script>try{${src}}catch(_e){window.markPageFailed&&window.markPageFailed(${JSON.stringify(name)},_e);console.error('[admin-ui] page ${name} failed to register',_e);}</script>`;
+}
+
 const body = `<body>
 <div id="login-page" class="login-wrap">
   <div class="login-panel">
@@ -93,7 +97,28 @@ const body = `<body>
 </div>
 ${shell}
 ${drawerHtml}
-<script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${issuesScript}${pullsScript}${blockersScript}${customizationsScript}${pipelinesAndStepsScript}${modelsAndProvidersScript}${runnersScript}${reportsScript}${deploymentsScript}${accessScript}${drawerScript}${stepperScript}</script>
+<script>${themeJs}</script>
+<script>${authJs}</script>
+<script>${routerJs}</script>
+${pageScript('overview', overviewScript)}
+${pageScript('settings', settingsScript)}
+${pageScript('projects', projectsScript)}
+${pageScript('pipelines', pipelinesScript)}
+${pageScript('reaper', reaperScript)}
+${pageScript('sessions', sessionsScript)}
+${pageScript('audit', auditScript)}
+${pageScript('issues', issuesScript)}
+${pageScript('pulls', pullsScript)}
+${pageScript('blockers', blockersScript)}
+${pageScript('customizations', customizationsScript)}
+${pageScript('pipelines-and-steps', pipelinesAndStepsScript)}
+${pageScript('models-and-providers', modelsAndProvidersScript)}
+${pageScript('runners', runnersScript)}
+${pageScript('reports', reportsScript)}
+${pageScript('deployments', deploymentsScript)}
+${pageScript('access', accessScript)}
+${pageScript('drawer', drawerScript)}
+${pageScript('stepper', stepperScript)}
 </body></html>`;
 
 export const adminHtml = head + body;
