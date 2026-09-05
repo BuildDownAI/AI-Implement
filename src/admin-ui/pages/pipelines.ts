@@ -272,7 +272,7 @@ export const pipelinesScript = `
     dialog.style.cssText = 'width:80vw;max-width:900px;max-height:80vh;overflow:auto;padding:0;border:1px solid var(--border-default);border-radius:8px;background:var(--bg-elev)';
     dialog.innerHTML = '<div style="padding:16px 20px;border-bottom:1px solid var(--border-default);display:flex;justify-content:space-between;align-items:center">'
       + '<strong>Machine Logs \u2014 ' + window.esc(machineId) + '</strong>'
-      + '<button onclick="this.closest(\'dialog\').close()" style="background:none;border:none;cursor:pointer;font-size:1.2em;color:var(--fg-secondary)">\u00d7</button>'
+      + '<button onclick="this.closest(&quot;dialog&quot;).close()" style="background:none;border:none;cursor:pointer;font-size:1.2em;color:var(--fg-secondary)">\u00d7</button>'
       + '</div>'
       + '<pre class="ml-content" style="margin:0;padding:16px;font-size:0.8em;white-space:pre-wrap;word-break:break-all;color:var(--fg-primary)">Loading\u2026</pre>';
     document.body.appendChild(dialog);
