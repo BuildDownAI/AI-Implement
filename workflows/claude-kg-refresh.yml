@@ -1,4 +1,4 @@
-# Synced to the KG source repo by the orchestrator (sync once, not overwritten on updates).
+# One-time manual step per KG source repo — not auto-synced by the orchestrator (see docs/issueless-runs.md §3).
 # Triggered by the orchestrator via workflow_dispatch when a kg-refresh ingest is needed.
 # All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
 #
@@ -34,6 +34,7 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 jobs:
   validate-runner-image:

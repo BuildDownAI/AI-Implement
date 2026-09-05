@@ -99,7 +99,7 @@ The `dispatch_log` row (schema in `src/log.ts`, `initLogTable`) written by `appe
 | `issue_identifier` | `null` | No tracker issue |
 | `issue_title` | `null` | |
 | `team_key` | `null` | No ticketing mapping |
-| `repo` | `null` | No target repo |
+| `repo` | KG source repo (`owner/repo`) | Populated from `KG_SOURCE_REPO`; required by `handleDestroySession` to cancel a GHA-backed run |
 | `phase` | `"kg-refresh"` | Run-kind tag, drives observability and routing |
 | `execution_mode` | `"fly-machines"`, `"local-docker"`, or `"github-actions"` | Resolved from global runner mode at dispatch time |
 | `machine_id` | Fly machine ID | null for GHA and local Docker |

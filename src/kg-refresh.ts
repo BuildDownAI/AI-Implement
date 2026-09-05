@@ -154,18 +154,28 @@ interface KgRefreshInput {
   /**
    * Dispatch a kg-refresh runner job. When provided, trigger() dispatches instead of
    * returning ingest-needed. opts.runConfig is the base64-encoded RunConfigV1.
+   * opts.executionPath is the already-resolved backend (from resolveExecutionMode) so
+   * dispatchRun does not re-resolve and risk observing a different runner-mode value.
    * Returns backend identity for job-row tracking.
    * - Fly path: machineId + machineNonce (always set)
    * - GHA path: workflowRunId (when found) + logsUrl; no machineNonce
    * - Local Docker: machineNonce only
    */
-  dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
+  dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string; executionPath?: string }) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
   /**
    * Record a dispatch_log row before the machine starts. Returns jobId.
-   * Called with only dispatchId so the row exists before dispatchRun, closing
-   * the waitForQuiet race window. Injectable for tests.
+   * Called with dispatchId and the already-resolved executionMode so both
+   * appendJobLog and dispatchRun use the same runner-mode snapshot.
+   * Injectable for tests.
    */
-  appendJobLog?: (opts: { dispatchId: string }) => number;
+  appendJobLog?: (opts: { dispatchId: string; executionMode?: string }) => number;
+  /**
+   * Resolve the current execution mode once per trigger() call. trigger() passes
+   * the result to both appendJobLog and dispatchRun so a runner-mode flip between
+   * the two calls cannot produce a mismatched executionMode on the dispatch_log row.
+   * Injectable for tests; defaults to "github-actions" when absent.
+   */
+  resolveExecutionMode?: () => string;
   /**
    * Update the dispatch_log row with backend identity after dispatch succeeds.
    * machineNonce is set for Fly and local Docker paths; absent for GHA (no nonce concept).
@@ -605,6 +615,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               secret: input.runnerTokenSecret,
             });
 
+            // Resolve execution mode once so appendJobLog and dispatchRun share the
+            // same runner-mode snapshot. A mode flip between the two calls would
+            // otherwise produce a dispatch_log.execution_mode that disagrees with
+            // the backend actually used.
+            const executionMode = input.resolveExecutionMode?.() ?? "github-actions";
+
             const runConfig: RunConfigV1 = {
               v: 1,
               issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
@@ -615,11 +631,11 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
             // Write the row before starting the machine so waitForQuiet cannot
             // see zero in-flight work between dispatch and row creation.
-            currentJobId = input.appendJobLog?.({ dispatchId }) ?? null;
+            currentJobId = input.appendJobLog?.({ dispatchId, executionMode }) ?? null;
 
             let dispatchResult: { machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number };
             try {
-              dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
+              dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig), executionPath: executionMode });
             } catch (dispatchErr) {
               // Machine/run start failed — close the row immediately so no phantom
               // in-flight entry persists and the deploy interlock can proceed.

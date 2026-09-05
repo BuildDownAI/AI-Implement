@@ -3028,18 +3028,23 @@ const KG_REFRESH_DEFAULT_EXECUTION_MODE = "github-actions" as const;
 
 async function dispatchKgRefreshRun(
   config: AppConfig,
-  opts: { runToken: string; dispatchId: string; runConfig: string },
+  opts: { runToken: string; dispatchId: string; runConfig: string; executionPath?: string },
 ): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
   const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
 
-  const { mode: runnerMode } = getRunnerMode();
-  const resolved = resolveExecutionPath(runnerMode, KG_REFRESH_DEFAULT_EXECUTION_MODE);
-  // Shadow mode would dispatch two concurrent ingest runs that race to push the same
-  // snapshot commit. Collapse "both" to "github-actions" (same as planning dispatch).
-  const executionPath = resolved === "both" ? "github-actions" : resolved;
+  // Use the execution path resolved once by resolveExecutionMode in trigger() when
+  // available. Falling back to an independent resolution is only a safety net for
+  // callers that do not thread the pre-resolved value (e.g. ad-hoc tests).
+  const executionPath = opts.executionPath ?? (() => {
+    const { mode: runnerMode } = getRunnerMode();
+    const resolved = resolveExecutionPath(runnerMode, KG_REFRESH_DEFAULT_EXECUTION_MODE);
+    // Shadow mode would dispatch two concurrent ingest runs that race to push the same
+    // snapshot commit. Collapse "both" to "github-actions" (same as planning dispatch).
+    return resolved === "both" ? "github-actions" : resolved;
+  })();
 
   if (executionPath === "github-actions") {
     // Dispatch to the kg-refresh workflow in the KG source repo.
@@ -3174,15 +3179,18 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     onOutcome: (outcome, data) => {
       void handleKgRefreshOutcome(config, registry, outcome, data);
     },
-    appendJobLog: (opts) => {
+    resolveExecutionMode: () => {
       const { mode: runnerMode } = getRunnerMode();
       const resolved = resolveExecutionPath(runnerMode, KG_REFRESH_DEFAULT_EXECUTION_MODE);
-      const executionMode = resolved === "both" ? "github-actions" : resolved;
+      return resolved === "both" ? "github-actions" : resolved;
+    },
+    appendJobLog: (opts) => {
       return appendLog({
         issueId: "kg-refresh",
         phase: "kg-refresh",
         dispatchId: opts.dispatchId,
-        executionMode,
+        executionMode: opts.executionMode,
+        repo: config.kgSourceRepo ? parseKgSourceRepo(config.kgSourceRepo).fullName : undefined,
       });
     },
     updateJobMachine: (jobId, opts) => {
