@@ -87,6 +87,16 @@ If the resolved path requires a backend that is not configured (e.g. `fly-machin
 
 The `claude-kg-refresh.yml` workflow lives in `workflows/` and must be added to the KG source repo before GHA dispatch can succeed. Unlike `claude-implement.yml`, it is not automatically synced — it is a one-time manual step per KG source repo.
 
+**The KG source repo also needs the runner secrets.** It is not an onboarded project mapping, so nothing seeds them; a fresh KG repo has zero secrets and a dispatched run fails at auth even though the `workflow_dispatch` itself succeeds. Set these once on the KG source repo (mirror the values the orchestrator's target repos use):
+
+| Secret | Purpose |
+|---|---|
+| `AI_IMPLEMENT_APP_ID` | GitHub App numeric ID |
+| `AI_IMPLEMENT_PRIVATE_KEY` | GitHub App PEM private key |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code OAuth token (preferred) — or `ANTHROPIC_API_KEY` |
+
+Optional variables: `AI_IMPLEMENT_RUNNER_IMAGE`, `AI_IMPLEMENT_RUNNER_LABEL`. Verify with `gh secret list --repo <owner>/<kg-repo>` (names only). Observed live 2026-09-05: the workflow file was added and dispatch would have succeeded, but the repo carried no secrets.
+
 ---
 
 ## 4. Jobs-store row
