@@ -258,6 +258,18 @@ function applyWiring(step: YamlStep): StepDefinition {
         },
       };
 
+    case "kg-tracker-data":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          callbackUrl: ctx.data.callbackUrl,
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
+        }),
+      };
+
     case "kg-snapshot-push":
       return {
         ...step,

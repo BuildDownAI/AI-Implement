@@ -72,6 +72,9 @@ while true; do
   HAS_NEXT_PAGE=$(echo "$HTTP_BODY" | jq -r '.pageInfo.hasNextPage // false')
   END_CURSOR=$(echo "$HTTP_BODY" | jq -r '.pageInfo.endCursor // ""')
 
+  # NOTE: This jq call re-encodes the full accumulated array on every page — O(n²)
+  # in total issue count. Acceptable for small teams; the TypeScript pipeline step
+  # (src/pipeline/steps/kg-tracker-data.ts) uses Array.push and is O(n).
   ALL_ISSUES=$(jq -nc --argjson a "$ALL_ISSUES" --argjson b "$PAGE_ISSUES" '$a + $b')
 
   if [ "$HAS_NEXT_PAGE" = "true" ] && [ -n "$END_CURSOR" ]; then
