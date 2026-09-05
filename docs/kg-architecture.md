@@ -355,6 +355,13 @@ the same progress token. `stripEmbeddedTokenFromOrigin` in `kg-snapshot-push.ts`
 token from the remote URL right before push to counter `refreshRunnerGithubCredentials`
 re-embedding it after clone.
 
+**Fly session image pinning (AII-534).** When dispatching a kg-refresh Fly machine,
+`dispatchKgRefreshRun` uses `process.env.FLY_IMAGE_REF` (injected by Fly into every machine)
+as the session image. This guarantees the dispatched machine runs the same image generation
+as the orchestrator, so `pipeline/kg-refresh-run.js` and its dependencies are always present.
+When `FLY_IMAGE_REF` is absent (non-Fly orchestrator, e.g. local Docker), the dispatch falls
+back to `config.sessionImage`.
+
 ## Failure history
 
 Each of these shipped a degraded or blocked deploy, and each is now covered by a guard.

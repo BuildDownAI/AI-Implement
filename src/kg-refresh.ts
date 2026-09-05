@@ -156,7 +156,7 @@ interface KgRefreshInput {
    * returning ingest-needed. opts.runConfig is the base64-encoded RunConfigV1.
    * Returns machine identity for job-row tracking (machineId for Fly, machineNonce always).
    */
-  dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }>;
+  dispatchRun?: (opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }>;
   /**
    * Record a dispatch_log row before the machine starts. Returns jobId.
    * Called with only dispatchId so the row exists before dispatchRun, closing
@@ -599,6 +599,15 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               ttlSeconds: KG_REFRESH_TTL_MS / 1000,
               secret: input.runnerTokenSecret,
             });
+            const { token: runProgressToken } = mintRunTokenFn({
+              issueId: "kg-refresh",
+              mappingTeamKey: "",
+              phase: "kg-refresh",
+              audience: "progress",
+              dispatchId,
+              ttlSeconds: KG_REFRESH_TTL_MS / 1000,
+              secret: input.runnerTokenSecret,
+            });
 
             const runConfig: RunConfigV1 = {
               v: 1,
@@ -614,7 +623,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
             let dispatchResult: { machineId?: string; machineNonce: string; logsUrl?: string };
             try {
-              dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
+              dispatchResult = await input.dispatchRun({ runToken, runProgressToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
             } catch (dispatchErr) {
               // Machine start failed — close the row immediately so no phantom
               // in-flight entry persists and the deploy interlock can proceed.

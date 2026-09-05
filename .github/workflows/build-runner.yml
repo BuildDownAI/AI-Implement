@@ -117,6 +117,22 @@ jobs:
           echo "Module exports: $output"
           echo "$output" | grep -q "PipelineRunner" || \
             { echo "ERROR: PipelineRunner not found in /app/dist/pipeline/runner.js exports"; exit 1; }
+          # AII-534: verify kg-refresh-run.js is present and importable in the image.
+          # This is the real-artifact gate: a Fly machine booting an image without this
+          # file exits immediately with "Cannot find module" before any callback fires.
+          # The vitest smoke test (tsx) verifies import resolution at source level; this
+          # step verifies the compiled dist tree — the gap that let AII-534 ship.
+          if ! kg_output=$(docker run --rm --entrypoint node \
+            "$digest_ref" \
+            -e "import('/app/dist/pipeline/kg-refresh-run.js').then(m => console.log(Object.keys(m)))" 2>&1); then
+            echo "ERROR: /app/dist/pipeline/kg-refresh-run.js is not importable in the session image"
+            echo "$kg_output"
+            echo "A Fly kg-refresh machine booting this image would exit immediately with 'Cannot find module'."
+            exit 1
+          fi
+          echo "kg-refresh-run.js exports: $kg_output"
+          echo "$kg_output" | grep -q "runKgRefresh" || \
+            { echo "ERROR: runKgRefresh not found in /app/dist/pipeline/kg-refresh-run.js exports"; exit 1; }
 
       - name: Promote tested digest to channel and debug tags
         run: |

@@ -3018,7 +3018,7 @@ async function handleKgRefreshOutcome(
 
 async function dispatchKgRefreshRun(
   config: AppConfig,
-  opts: { runToken: string; dispatchId: string; runConfig: string },
+  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string },
 ): Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
@@ -3026,11 +3026,18 @@ async function dispatchKgRefreshRun(
   const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
   const sessionToken = generateSessionToken();
   const machineNonce = generateMachineNonce();
-  const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig };
+  const extraEnv: Record<string, string> = {
+    AI_IMPLEMENT_RUN_CONFIG: opts.runConfig,
+    RUN_PROGRESS_TOKEN: opts.runProgressToken,
+  };
 
   if (config.flySessionsToken && config.flySessionsApp) {
+    // Use the orchestrator's own image ref so the session machine always runs the
+    // same pipeline generation. FLY_IMAGE_REF is injected by Fly into every machine
+    // at runtime; when absent (non-Fly orchestrator) fall back to config.sessionImage.
+    const flySessionImage = process.env.FLY_IMAGE_REF ?? config.sessionImage;
     const machineConfig = buildSessionMachineConfig({
-      image: config.sessionImage,
+      image: flySessionImage,
       issueId: "kg-refresh",
       issueIdentifier: "KG-REFRESH",
       issueTitle: "KG ingest",
