@@ -70,7 +70,7 @@ The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on bo
 - Local Docker: `LOCAL_RUNNER_IMAGE` configured, no Fly tokens
 - Neither configured → `dispatchKgRefreshRun()` throws at `src/index.ts:3085`. By this point `trigger()` has already returned 202; the throw is caught by the async IIFE catch block at `src/kg-refresh.ts:629`, which sets `stage = "failed"` and fires `onOutcome("failure", ...)` as an async failure outcome.
 
-GHA dispatch is not supported for issueless run kinds. There is no `workflow_dispatch` hook in `claude-implement.yml` that maps to `kg-refresh`.
+GHA dispatch is not exposed for issueless run kinds — there is no `workflow_dispatch` hook in `claude-implement.yml` that maps to `kg-refresh`. The cancel endpoint (`src/admin.ts`, `handleDestroySession`) still handles the `github-actions` executionMode defensively if a job ever enters that state (see §6).
 
 ---
 
@@ -369,7 +369,7 @@ In `src/completion-classification.ts`, add phase-specific handling in `classifyC
 **12. Add a notify function**
 In `src/notify.ts`, add a `notifyYourKindOutcome()` export following the shape of `notifyKgRefreshOutcome()` (Slack + Teams implementations, typed payload interface). Call it from your outcome handler in `src/index.ts`.
 
-**13. Wire the operator cancel**
+**13. Wire the operator cancel** — include the GHA cancellation branch as the kg-refresh handler does, even when the run kind is Fly-only today
 In `src/admin.ts` `handleDestroySession()`, add a `job.phase === "<your-phase>"` branch that destroys the machine/run, stamps `operator_cancelled`, calls your `onMachineLost()` equivalent, and sends a single notification.
 
 **14. Wire the in-process state machine and crash recovery**
