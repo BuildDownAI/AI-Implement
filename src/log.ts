@@ -481,6 +481,12 @@ export function updateJobPrUrl(jobId: number, prUrl: string): void {
     .run(prUrl, jobId);
 }
 
+export function updateJobMachineDetails(jobId: number, machineNonce: string | undefined, machineId: string | undefined): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET machine_nonce = ?, machine_id = ? WHERE id = ?")
+    .run(machineNonce ?? null, machineId ?? null, jobId);
+}
+
 /**
  * Returns the most recent dispatch log entry for a given PR.
  * Used to recover issue metadata for orchestrator-mediated comment gap-fills.

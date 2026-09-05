@@ -953,18 +953,27 @@ describe("kg-refresh", () => {
     });
 
     // ---- AII-517: appendJobLog / closeJobLog --------------------------------
+    // AII-518: appendJobLog must be called BEFORE dispatchRun so waitForQuiet() cannot
+    // observe a window where the machine is running but no dispatch_log row exists.
 
-    it("appendJobLog called after successful dispatch with machineNonce from dispatchRun", async () => {
+    it("appendJobLog called before dispatchRun and updateJobLog called after with machine details", async () => {
       const appendJobLog = vi.fn(() => 42);
-      buildDispatch({
-        dispatchRun: vi.fn(async () => ({ machineNonce: "nonce-abc", machineId: "m-1", logsUrl: "https://fly.io/apps/a/machines/m-1" })),
-        appendJobLog,
+      const updateJobLog = vi.fn();
+      let appendCalledBeforeDispatch = false;
+      const trackedDispatchRun = vi.fn(async () => {
+        appendCalledBeforeDispatch = appendJobLog.mock.calls.length > 0;
+        return { machineNonce: "nonce-abc", machineId: "m-1", logsUrl: "https://fly.io/apps/a/machines/m-1" };
       });
+      buildDispatch({ dispatchRun: trackedDispatchRun, appendJobLog, updateJobLog });
       await handle.trigger();
       await waitForStage("ingest-running");
+      // Row inserted before machine starts (the core AII-518 race fix).
+      expect(appendCalledBeforeDispatch).toBe(true);
       expect(appendJobLog).toHaveBeenCalledOnce();
-      expect(appendJobLog).toHaveBeenCalledWith({
-        dispatchId: "disp-1",
+      expect(appendJobLog).toHaveBeenCalledWith({ dispatchId: "disp-1" });
+      // Machine details patched onto the row after dispatch completes.
+      expect(updateJobLog).toHaveBeenCalledOnce();
+      expect(updateJobLog).toHaveBeenCalledWith(42, {
         machineNonce: "nonce-abc",
         machineId: "m-1",
         logsUrl: "https://fly.io/apps/a/machines/m-1",

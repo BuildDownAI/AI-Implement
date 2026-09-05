@@ -641,6 +641,13 @@ describe("deploy status tile", () => {
     expect(deploymentsScript).toContain("statusUnit.textContent = elapsed || 'waiting for in-flight work to finish';");
   });
 
+  it("labels kg-refresh in-flight work as 'KG ingest run' rather than the raw kind key", () => {
+    // The draining tile maps w.kind === 'kg-refresh' to a human-readable label so operators
+    // can distinguish a KG ingest drain from a runner-job drain at a glance (AII-518).
+    expect(deploymentsScript).toContain("w.kind === 'kg-refresh'");
+    expect(deploymentsScript).toContain("plural(w.count, 'KG ingest run')");
+  });
+
   it("uses fmtAgo for past events and fmtElapsed for the running one", () => {
     // fmtAgo bakes "ago" into its output, which is wrong for a duration still accruing.
     expect(deploymentsScript).toContain("'checked ' + fmtAgo(data.checkedAt)");

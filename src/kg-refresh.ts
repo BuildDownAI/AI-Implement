@@ -157,8 +157,17 @@ interface KgRefreshInput {
    * Returns machine identity for job-row tracking (machineId for Fly, machineNonce always).
    */
   dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }>;
-  /** Record a dispatch_log row for the kg-refresh run. Returns jobId. Injectable for tests. */
-  appendJobLog?: (opts: { dispatchId: string; machineNonce: string; machineId?: string; logsUrl?: string }) => number;
+  /**
+   * Record a dispatch_log row for the kg-refresh run before the machine starts.
+   * Called before dispatchRun so waitForQuiet() cannot observe a window where the
+   * machine is running but no row exists. Returns jobId. Injectable for tests.
+   */
+  appendJobLog?: (opts: { dispatchId: string }) => number;
+  /**
+   * Patch machine identity onto an existing dispatch_log row after the runner starts.
+   * Injectable for tests.
+   */
+  updateJobLog?: (jobId: number, opts: { machineNonce?: string; machineId?: string; logsUrl?: string }) => void;
   /** Close the dispatch_log row on a terminal outcome. Injectable for tests. */
   closeJobLog?: (jobId: number, status: "completed" | "failed" | "timed_out") => void;
   /**
@@ -599,14 +608,18 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               runnerCallbackUrl,
             };
 
+            // Insert the row before starting the machine so a concurrent deploy's
+            // waitForQuiet() poll cannot miss this job (AII-518 race fix).
+            currentJobId = input.appendJobLog?.({ dispatchId }) ?? null;
             const dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
             currentDispatchId = dispatchId;
-            currentJobId = input.appendJobLog?.({
-              dispatchId,
-              machineNonce: dispatchResult.machineNonce,
-              machineId: dispatchResult.machineId,
-              logsUrl: dispatchResult.logsUrl,
-            }) ?? null;
+            if (currentJobId !== null) {
+              input.updateJobLog?.(currentJobId, {
+                machineNonce: dispatchResult.machineNonce,
+                machineId: dispatchResult.machineId,
+                logsUrl: dispatchResult.logsUrl,
+              });
+            }
             stage = "ingest-running";
             ingestStartedAt = Date.now();
             persistStageFn("ingest-running", ingestStartedAt);
