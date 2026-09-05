@@ -233,7 +233,7 @@ export const pipelinesScript = `
             : '<td style="color:#aaa">—</td>';
           let logCell;
           if (entry.machineId) {
-            const btnText = entry.phase === 'kg-refresh' ? 'Logs \u2197' : 'Logs';
+            const btnText = 'Logs';
             logCell = '<button data-machine-id="' + window.escAttr(entry.machineId) + '" style="background:none;border:none;cursor:pointer;padding:0;color:var(--accent);font:inherit">' + btnText + '</button>';
           } else if (entry.prUrl) {
             logCell = '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">View</a>';

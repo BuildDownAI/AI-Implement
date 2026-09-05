@@ -2684,6 +2684,14 @@ describe("per-page grants", () => {
       expect((await request("/api/mappings", "GET", "secret", undefined, token)).statusCode).toBe(403);
     });
 
+    // The machine-logs route is parameterized and intentionally absent from PAGE_ROUTES;
+    // a jobs-granted user can read the Pipelines table but cannot proxy machine logs.
+    it("refuses the machine-logs route to a jobs-granted user", async () => {
+      accessGrants.savePageGrants(["jobs"], "ada@eudoxus.ai");
+      const res = await request("/api/sessions/machine-abc/logs", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(403);
+    });
+
     // A grant is matched on the path alone, so a query string must not defeat it.
     it("matches the path with its query string stripped", async () => {
       accessGrants.savePageGrants(["reports"], "ada@eudoxus.ai");
