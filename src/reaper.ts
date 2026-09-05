@@ -151,6 +151,7 @@ export async function sweepOrphanedMachines(
     if (!job) continue;
     if (!(job.status === "dispatched" || job.status === "running")) continue;
     if (!job.issueId) continue;
+    if (job.phase === "kg-refresh") continue; // issue-less: no provider record to look up
 
     const mapping = job.teamKey ? mappings[job.teamKey] : undefined;
     if (!mapping) continue;
@@ -234,7 +235,7 @@ export async function sweepOrphanedMachines(
     // In-flight job: check machine age
     const ageMs = ageSeconds * 1000;
     if (ageMs > SWEEP_MACHINE_MAX_AGE_MS) {
-      if (!config.reaperDryRun) {
+      if (!config.reaperDryRun && job.phase !== "kg-refresh") {
         // Only dump logs on genuine failures — check for a PR first so we don't
         // post an unexpected log comment on a session that completed but hasn't
         // been processed by the monitor loop yet.
@@ -260,7 +261,13 @@ export async function sweepOrphanedMachines(
         destroyedCount++;
         updateJobStatus(job.id, "timed_out", "machine_max_age_sweep");
         invalidateNonce(job.id);
-        await helpers.resetTicket(job);
+        if (job.phase === "kg-refresh") {
+          // Issue-less run: notify the handle so it closes the chain immediately
+          // rather than waiting for the in-process TTL watchdog on the next trigger().
+          helpers.failKgRefreshMachine?.(job);
+        } else {
+          await helpers.resetTicket(job);
+        }
       }
       continue;
     }

@@ -24,9 +24,11 @@ vi.mock("../notify.js", async (importOriginal) => ({
 }));
 
 const fetchMachineLogsMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
+const destroyMachineMock = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock("../fly-machines.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../fly-machines.js")>()),
   fetchMachineLogs: fetchMachineLogsMock,
+  destroyMachine: destroyMachineMock,
 }));
 
 vi.mock("../workflow-sync.js", () => ({
@@ -2877,5 +2879,117 @@ describe("GET /api/deploy-refs", () => {
     expect(res.statusCode).toBe(503);
     // Generic message — must NOT say "install the GitHub App" (that's the install-specific message).
     expect((res.body as { error: string }).error).not.toMatch(/install the GitHub App/i);
+  });
+});
+
+// ---------- admin sessions — kg-refresh destroy (AII-521) ----------
+
+describe("admin sessions — kg-refresh destroy", () => {
+  const FLY_TOKEN = "fly-test-token";
+  const FLY_APP = "ai-implement-sessions";
+
+  function sessionsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
+    return {
+      adminAccessCode: "secret",
+      flySessionsToken: FLY_TOKEN,
+      flySessionsApp: FLY_APP,
+      flySessionsRegion: null,
+      githubAppId: "test-app-id",
+      githubAppPrivateKey: "test-private-key",
+      notifyWebhookUrl: "https://hooks.example.com/notify",
+    };
+  }
+
+  async function deleteSession(
+    machineId: string,
+    token: string,
+    kgRefresh?: Parameters<typeof admin.handleAdminRequest>[4]["kgRefresh"],
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest(
+      `/api/sessions/${encodeURIComponent(machineId)}`,
+      "DELETE",
+      { authorization: `Bearer ${token}` },
+    );
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() },
+    });
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  beforeEach(() => {
+    destroyMachineMock.mockReset();
+    destroyMachineMock.mockResolvedValue(undefined);
+    notifyTextMock.mockReset();
+  });
+
+  it("destroys the machine and returns 200 for an in-flight kg-refresh job", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel" });
+    log.updateJobMachineId(jobId, "m-kg-cancel");
+
+    const res = await deleteSession("m-kg-cancel", token);
+
+    expect(res.statusCode).toBe(200);
+    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
+  });
+
+  it("calls kgRefresh.onMachineLost with operator_cancelled failureCode", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel2" });
+    log.updateJobMachineId(jobId, "m-kg-cancel2");
+
+    const onMachineLost = vi.fn();
+    await deleteSession("m-kg-cancel2", token, { trigger: vi.fn(), status: vi.fn(), onMachineLost });
+
+    expect(onMachineLost).toHaveBeenCalledOnce();
+    expect(onMachineLost).toHaveBeenCalledWith({ failureCode: "operator_cancelled" });
+  });
+
+  it("stamps the job row operator_cancelled before calling onMachineLost", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
+    log.updateJobMachineId(jobId, "m-kg-cancel3");
+
+    await deleteSession("m-kg-cancel3", token);
+
+    const row = log.getJobById(jobId);
+    expect(row?.status).toBe("failed");
+    expect(row?.conclusion).toBe("operator_cancelled");
+  });
+
+  it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel4" });
+    log.updateJobMachineId(jobId, "m-kg-cancel4");
+
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    await deleteSession("m-kg-cancel4", token);
+
+    expect(notifyTextMock).toHaveBeenCalledOnce();
+    expect(clearWorkingState).not.toHaveBeenCalled();
+  });
+
+  it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {
+    const token = await login("secret");
+    // Create a mapping for the ENG team
+    config.initMappingsTable();
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml",
+    }, token);
+
+    const jobId = log.appendLog({ issueId: "issue-123", issueIdentifier: "ENG-1", teamKey: "ENG", repo: "org/repo", phase: "implementation" });
+    log.updateJobMachineId(jobId, "m-issue-cancel");
+
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-issue-cancel", token, undefined);
+
+    expect(res.statusCode).toBe(200);
+    expect(clearWorkingState).toHaveBeenCalled();
   });
 });

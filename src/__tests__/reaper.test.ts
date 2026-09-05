@@ -657,3 +657,142 @@ describe("sweepOrphanedMachines — kg-refresh machine-absent rule", () => {
     expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshJob);
   });
 });
+
+// ---------- sweepOrphanedMachines — kg-refresh max-age rule ----------
+
+const kgRefreshInflight = {
+  ...kgRefreshJob,
+  status: "running" as const,
+  machineId: "m-kg",
+};
+
+describe("sweepOrphanedMachines — kg-refresh max-age rule", () => {
+  it("destroys an aged-out kg-refresh machine", async () => {
+    const oldMachine = makeMachine("m-kg", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshInflight);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
+
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+
+    expect(destroyMachine).toHaveBeenCalledWith(TOKEN, APP, "m-kg");
+  });
+
+  it("calls failKgRefreshMachine (not resetTicket) for an aged-out kg-refresh machine", async () => {
+    const oldMachine = makeMachine("m-kg", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshInflight);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(kgRefreshInflight);
+    expect(helpers.resetTicket).not.toHaveBeenCalled();
+  });
+
+  it("does not call postSessionLogs for a kg-refresh max-age eviction", async () => {
+    const oldMachine = makeMachine("m-kg", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshInflight);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.postSessionLogs).not.toHaveBeenCalled();
+  });
+
+  it("closes the job row and invalidates the nonce for an aged-out kg-refresh machine", async () => {
+    const oldMachine = makeMachine("m-kg", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshInflight);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
+
+    await sweepOrphanedMachines(makeConfig(false), makeHelpers());
+
+    expect(updateJobStatus).toHaveBeenCalledWith(kgRefreshInflight.id, "timed_out", "machine_max_age_sweep");
+    expect(invalidateNonce).toHaveBeenCalledWith(kgRefreshInflight.id);
+  });
+
+  it("issue-keyed max-age still calls resetTicket and NOT failKgRefreshMachine (regression pin)", async () => {
+    const issueJob = {
+      id: 20,
+      issueId: "issue-100",
+      issueIdentifier: "ENG-100",
+      issueTitle: "Fix thing",
+      teamKey: "ENG",
+      repo: "org/repo",
+      dispatchedAt: Date.now() - 5 * 3600_000,
+      dispatchId: null,
+      dispatchNumber: 1,
+      issueState: null,
+      runId: null,
+      status: "running" as const,
+      conclusion: null,
+      prUrl: null,
+      completedAt: null,
+      notifiedAt: null,
+      machineNonce: "nonce-issue",
+      executionMode: "fly-machines",
+      machineId: "m-issue",
+      runnerMode: "autonomous",
+      sessionImage: null,
+      phase: "implementation",
+      contract: null,
+      groupingParent: false,
+    };
+    const oldMachine = makeMachine("m-issue", {
+      created_at: new Date(Date.now() - 5 * 3600_000).toISOString(),
+    });
+    vi.mocked(listMachines).mockResolvedValueOnce([oldMachine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(issueJob);
+    vi.mocked(destroyMachine).mockResolvedValueOnce(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.resetTicket).toHaveBeenCalledWith(issueJob);
+    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+  });
+});
+
+// ---------- sweepOrphanedMachines — kg-refresh issue-terminal exclusion (regression pin) ----------
+
+describe("sweepOrphanedMachines — kg-refresh issue-terminal exclusion", () => {
+  it("does not query the ticketing provider for an in-flight kg-refresh machine", async () => {
+    // Machine is alive and young (below max-age), so the issue-terminal rule is
+    // the only one that would invoke the provider. Verify it is never called.
+    const machine = makeMachine("m-kg");
+    vi.mocked(listMachines).mockResolvedValueOnce([machine] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(kgRefreshJob);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([]);
+    const fakeProv = new FakeProvider();
+    const fetchSpy = vi.spyOn(fakeProv, "fetchLifecycleStates");
+    const registry = makeFakeRegistry(fakeProv);
+    // Configure a mapping so the provider lookup path is reachable for any
+    // issue-keyed job — the guard must fire before that path for kg-refresh.
+    const config = makeConfig(false, {
+      registry,
+      getMappings: () => ({ ENG: { ticketingProvider: "fake", teamKey: "ENG" } as never }),
+    });
+
+    await sweepOrphanedMachines(config, makeHelpers());
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
