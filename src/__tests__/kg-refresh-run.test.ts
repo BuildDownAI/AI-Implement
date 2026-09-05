@@ -119,6 +119,8 @@ describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
 // ── kg-snapshot-push step ─────────────────────────────────────────────────────
 
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError } from "../pipeline/steps/kg-snapshot-push.js";
+import { kgTrackerDataStep, KgTrackerDataFetchError } from "../pipeline/steps/kg-tracker-data.js";
+import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import type { PipelineContextData } from "../pipeline/types.js";
 
@@ -466,6 +468,183 @@ describe("kgSnapshotPushStep", () => {
   });
 });
 
+// ── kgTrackerDataStep ─────────────────────────────────────────────────────────
+
+describe("kgTrackerDataStep", () => {
+  let tmpDir: string;
+  let savedToken: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgtracker-"));
+    savedToken = process.env.RUN_PROGRESS_TOKEN;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (savedToken === undefined) delete process.env.RUN_PROGRESS_TOKEN;
+    else process.env.RUN_PROGRESS_TOKEN = savedToken;
+  });
+
+  function makeTrackerPage(issues: unknown[], hasNextPage: boolean, endCursor: string | null = null) {
+    return { issues, pageInfo: { hasNextPage, endCursor } };
+  }
+
+  function makeFetch(pages: Array<{ ok: boolean; status?: number; body?: unknown }>): typeof fetch {
+    let i = 0;
+    return async () => {
+      const p = pages[i++] ?? { ok: false, status: 500 };
+      return {
+        ok: p.ok,
+        status: p.status ?? (p.ok ? 200 : 500),
+        json: async () => p.body,
+      } as Response;
+    };
+  }
+
+  it("returns { fetched: false } when callbackUrl is absent", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "tok";
+    const capturedCalls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { capturedCalls.push(args); return {} as Response; };
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: null, workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(capturedCalls).toHaveLength(0);
+  });
+
+  it("returns { fetched: false } when RUN_PROGRESS_TOKEN is absent", async () => {
+    delete process.env.RUN_PROGRESS_TOKEN;
+    const capturedCalls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { capturedCalls.push(args); return {} as Response; };
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(capturedCalls).toHaveLength(0);
+  });
+
+  it("writes tracker-data.json as a flat JSON array and returns fetched: true", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const issues = [{ id: "1", identifier: "AII-1", title: "T", description: "D", state: { name: "S", type: "started" }, comments: [] }];
+    const written: Array<[string, string]> = [];
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl: makeFetch([{ ok: true, body: makeTrackerPage(issues, false) }]),
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: true, issueCount: 1 });
+    expect(written).toHaveLength(1);
+    expect(written[0][0]).toBe(join(tmpDir, "tracker-data.json"));
+    expect(JSON.parse(written[0][1])).toEqual(issues);
+  });
+
+  it("paginates and concatenates issues across multiple pages", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const page1Issues = [{ id: "1" }];
+    const page2Issues = [{ id: "2" }];
+    const fetchCalls: Array<{ cursor?: string }> = [];
+    let callIndex = 0;
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const body = init?.body ? JSON.parse(init.body as string) as { cursor?: string } : {};
+      fetchCalls.push({ cursor: body.cursor });
+      const page = callIndex++ === 0
+        ? makeTrackerPage(page1Issues, true, "cursor1")
+        : makeTrackerPage(page2Issues, false);
+      return { ok: true, status: 200, json: async () => page } as Response;
+    };
+    const written: Array<[string, string]> = [];
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: true, issueCount: 2 });
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[0].cursor).toBeUndefined();
+    expect(fetchCalls[1].cursor).toBe("cursor1");
+    expect(JSON.parse(written[0][1])).toEqual([...page1Issues, ...page2Issues]);
+  });
+
+  it("throws KgTrackerDataFetchError when endpoint returns non-2xx", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    await expect(
+      kgTrackerDataStep.run(
+        makeContext(),
+        {
+          callbackUrl: "http://orch",
+          workspaceDir: tmpDir,
+          fetchImpl: makeFetch([{ ok: false, status: 502 }]),
+        },
+        noopReporter,
+      ),
+    ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
+  });
+
+  it("throws KgTrackerDataFetchError when fetchImpl rejects (network error)", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const fetchImpl: typeof fetch = async () => { throw new Error("network error"); };
+    await expect(
+      kgTrackerDataStep.run(
+        makeContext(),
+        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+        noopReporter,
+      ),
+    ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
+  });
+
+  it("sends Authorization: Bearer <token> on each request", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "my-secret-token";
+    const capturedAuth: string[] = [];
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const headers = init?.headers as Record<string, string> | undefined;
+      capturedAuth.push(headers?.["Authorization"] ?? "");
+      return { ok: true, status: 200, json: async () => makeTrackerPage([], false) } as Response;
+    };
+    await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        writeFileSyncImpl: () => {},
+      },
+      noopReporter,
+    );
+    expect(capturedAuth).toHaveLength(1);
+    expect(capturedAuth[0]).toBe("Bearer my-secret-token");
+  });
+});
+
+// ── AII-458 regression: RUN_PROGRESS_TOKEN must not reach the model process ───
+
+describe("AII-458 regression: RUN_PROGRESS_TOKEN stripped from model env", () => {
+  it("modelProcessEnv strips RUN_PROGRESS_TOKEN even when present in process.env", () => {
+    const saved = process.env.RUN_PROGRESS_TOKEN;
+    process.env.RUN_PROGRESS_TOKEN = "must-not-leak";
+    try {
+      const env = modelProcessEnv(false);
+      expect("RUN_PROGRESS_TOKEN" in env).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.RUN_PROGRESS_TOKEN;
+      else process.env.RUN_PROGRESS_TOKEN = saved;
+    }
+  });
+});
+
 // ── pipeline-loader wiring for kg-snapshot-push ───────────────────────────────
 
 import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
@@ -474,6 +653,9 @@ const KG_REFRESH_PIPELINE_YAML = `id: kg-refresh
 steps:
   - id: clone
     type: clone
+  - id: kg-tracker-data
+    type: custom
+    moduleId: kg-tracker-data
   - id: feedback-loop
     type: custom
     moduleId: feedback-loop
@@ -507,6 +689,34 @@ describe("applyWiring for kg-snapshot-push", () => {
     expect(inputs.githubToken).toBe("tok");
     expect(inputs.clonedRef).toBe("abc123");
     expect(inputs.defaultBranch).toBe("main");
+  });
+});
+
+// ── pipeline-loader wiring for kg-tracker-data ────────────────────────────────
+
+describe("applyWiring for kg-tracker-data", () => {
+  it("wires callbackUrl from context data and workspaceDir from clone outputs", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-tracker-data");
+    expect(step).toBeDefined();
+    expect(step!.inputs).toBeDefined();
+
+    const ctx = makeContext({ callbackUrl: "http://orchestrator" });
+    ctx.setOutputs("clone", {
+      workspaceDir: "/ws",
+      repoOwner: "org",
+      repoRepo: "repo",
+      githubToken: "tok",
+      clonedRef: "abc123",
+    });
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.callbackUrl).toBe("http://orchestrator");
+    expect(inputs.workspaceDir).toBe("/ws");
   });
 });
 
@@ -573,6 +783,20 @@ describe("runKgRefresh", () => {
     expect(result.exitCode).toBe(1);
   });
 
+  it("returns exitCode 1 when kgTrackerData throws KgTrackerDataFetchError", async () => {
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgTrackerData: makeStepModule({}, new KgTrackerDataFetchError("orchestrator returned 502")),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
+      },
+      reporter: { report: async () => undefined },
+    });
+    expect(result.exitCode).toBe(1);
+  });
+
   it("envelope kgSourceRepo survives decode and runnerPhase is kg-refresh", () => {
     const encoded = encodeRunConfig({
       v: 1,
@@ -597,14 +821,11 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
     "KG-REFRESH.md",
   );
 
-  it("references the fetch-kg-tracker-data.sh helper script", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("fetch-kg-tracker-data.sh");
-  });
-
-  it("specifies tracker-data.json as the output file", () => {
+  it("states that tracker-data.json is written by the pipeline before the feedback loop", () => {
     const playbook = readFileSync(playbookPath, "utf-8");
     expect(playbook).toContain("tracker-data.json");
+    // Pipeline pre-fetches; agent does not invoke the shell script directly
+    expect(playbook).not.toContain("/app/session/fetch-kg-tracker-data.sh");
   });
 
   it("documents the --tracker-data flag for the ingest invocation", () => {
@@ -617,9 +838,8 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
     expect(playbook).toContain("TRACKER_DATA_SUPPORTED");
   });
 
-  it("documents the 503 / absent-env no-op behaviour", () => {
+  it("instructs the agent to proceed when tracker-data.json is absent (local/dev runs)", () => {
     const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("RUNNER_CALLBACK_URL");
-    expect(playbook).toContain("RUN_PROGRESS_TOKEN");
+    expect(playbook).toContain("absent");
   });
 });

@@ -49,7 +49,7 @@ export GITHUB_OWNER GITHUB_REPO
 [ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && PR_NUMBER="$(node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(String(c.prNumber||''))}catch{}" 2>/dev/null||true)"
 export PR_NUMBER="${PR_NUMBER:-}"
 _kg_r="$(if [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then node -e "try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,'base64').toString());process.stdout.write(c.kgSourceRepo||'')}catch{}" 2>/dev/null; fi)"
-[ -n "${_kg_r:-}" ] && { GITHUB_OWNER="${_kg_r%%/*}"; GITHUB_REPO="${_kg_r#*/}"; export GITHUB_OWNER GITHUB_REPO; }
+[ -n "${_kg_r:-}" ] && { GITHUB_OWNER="${_kg_r%%/*}"; GITHUB_REPO="${_kg_r#*/}"; }
 # ── 3. Token acquisition ─────────────────────────────────────────────────────
 export GH_TOKEN="$GITHUB_TOKEN"
 
