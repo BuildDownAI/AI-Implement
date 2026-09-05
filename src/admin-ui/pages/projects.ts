@@ -1,3 +1,5 @@
+import { stepperHtml } from "../stepper.js";
+
 export const projectsHtml = `
 <section data-page="projects" hidden>
   <header class="page-header">
@@ -12,7 +14,7 @@ export const projectsHtml = `
   <div class="page-body">
     <div class="card">
       <div class="card-body tight">
-        <table class="tbl" id="mappings-table">
+        <table class="tbl">
           <thead>
             <tr>
               <th>Team</th><th>Repo</th><th>Runner</th><th>Session</th>
@@ -61,168 +63,268 @@ export const projectsHtml = `
       <button class="btn btn-ghost btn-icon" onclick="closeMappingDialog()">&#215;</button>
     </div>
     <input type="hidden" id="md-team-key-orig">
+    <div style="padding:12px 20px 0">
+      <span class="seg" id="md-tabs">
+        <button type="button" class="btn btn-sm active" data-md-tab="ticketing" onclick="switchMappingTab('ticketing')">Ticketing</button>
+        <button type="button" class="btn btn-sm" data-md-tab="source" onclick="switchMappingTab('source')">Source</button>
+        <button type="button" class="btn btn-sm" data-md-tab="context" onclick="switchMappingTab('context')">Context</button>
+        <button type="button" class="btn btn-sm" data-md-tab="execution" onclick="switchMappingTab('execution')">Execution</button>
+        <button type="button" class="btn btn-sm" data-md-tab="capacity" onclick="switchMappingTab('capacity')">Capacity</button>
+        <button type="button" class="btn btn-sm" data-md-tab="guardrails" onclick="switchMappingTab('guardrails')">Guardrails</button>
+        <button type="button" class="btn btn-sm" data-md-tab="provider" onclick="switchMappingTab('provider')">Provider</button>
+      </span>
+    </div>
     <div class="md-body">
-      <fieldset>
-        <legend>Ticketing Provider</legend>
-        <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
-          <div class="md-field" style="margin-bottom:0;min-width:140px">
-            <label>Provider</label>
-            <select id="md-ticketing-provider" onchange="onTicketingProviderChange()">
-              <option value="linear">Linear</option>
-              <option value="jira">Jira</option>
-            </select>
+      <div data-md-panel="ticketing">
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Ticketing</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Where this project&rsquo;s issues come from, and how the orchestrator recognises them.</p>
+        <div style="display:grid;gap:12px">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="field">
+              <label class="field-label">Provider</label>
+              <select class="select" id="md-ticketing-provider" onchange="onTicketingProviderChange()">
+                <option value="linear">Linear</option>
+                <option value="jira">Jira</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field-label">Team Key</label>
+              <input class="input mono" id="md-team-key" placeholder="MY_TEAM">
+              <div class="field-hint">The tracker team this mapping serves, e.g. ENG. Cannot be changed after creation.</div>
+            </div>
+          </div>
+          <div id="md-jira-fields" class="hidden" style="display:grid;gap:12px">
+            <div class="field">
+              <label class="field-label">Mapping ID</label>
+              <input class="input mono" id="md-jira-mapping-id" placeholder="acme/billing">
+            </div>
+            <div class="field">
+              <label class="field-label">JQL</label>
+              <textarea class="textarea" id="md-jira-jql" rows="3" placeholder="project = TEST"></textarea>
+              <div style="display:flex;gap:8px;align-items:center;margin-top:2px">
+                <button type="button" class="btn btn-sm" onclick="validateJqlButton()">Validate</button>
+                <span id="md-jira-jql-status" class="field-hint"></span>
+              </div>
+              <div class="field-hint">The orchestrator wraps this with its own status filter at query time. Don't include status filters here.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Status Field</label>
+              <select class="select" id="md-jira-status-field">
+                <option value="">(auto-discover by name "AI-Implement Status")</option>
+              </select>
+              <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Status&rdquo;. Otherwise pick the field that holds the workflow status (Ready, Planning, Implementing, etc.).</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Repo Field</label>
+              <select class="select" id="md-jira-repo-field" onchange="onRepoFieldChange()">
+                <option value="">(auto-discover by name "AI-Implement Repo")</option>
+              </select>
+              <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Profiles Field</label>
+              <select class="select" id="md-jira-profiles-field">
+                <option value="">(auto-discover by name "AI-Implement Profiles")</option>
+              </select>
+              <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.</div>
+            </div>
+            <div class="field">
+              <label class="field-label">Repo Field Value</label>
+              <select class="select" id="md-jira-repo-value">
+                <option value="">Select a Repo Field first</option>
+              </select>
+              <input class="input mono hidden" id="md-jira-repo-value-text" type="text" placeholder="owner/repo">
+            </div>
           </div>
         </div>
-        <div id="md-jira-fields" class="hidden" style="margin-top:12px">
-          <div class="md-field">
-            <label>Mapping ID</label>
-            <input id="md-jira-mapping-id" placeholder="acme/billing">
+      </div>
+      <div data-md-panel="source" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Source</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">The GitHub repository this mapping dispatches against, and how its branches are named.</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="field">
+            <label class="field-label">Owner</label>
+            <input class="input mono" id="md-owner" placeholder="acme-corp">
+            <div class="field-hint">Org or user that owns the repo.</div>
           </div>
-          <div class="md-field">
-            <label>JQL</label>
-            <textarea id="md-jira-jql" rows="3" placeholder="project = TEST"></textarea>
-            <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
-              <button type="button" class="btn btn-ghost" onclick="validateJqlButton()">Validate</button>
-              <span id="md-jira-jql-status" class="text-tertiary" style="font-size:0.85em"></span>
-            </div>
+          <div class="field">
+            <label class="field-label">Repo</label>
+            <input class="input mono" id="md-repo" placeholder="backend">
+            <div class="field-hint">Repository name only, no owner prefix.</div>
           </div>
-          <div class="md-field">
-            <label>Status Field</label>
-            <select id="md-jira-status-field">
-              <option value="">(auto-discover by name "AI-Implement Status")</option>
-            </select>
-            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Status&rdquo;. Otherwise pick the field that holds the workflow status (Ready, Planning, Implementing, etc.).
-            </div>
+          <div class="field">
+            <label class="field-label">Default Branch</label>
+            <input class="input mono" id="md-branch" placeholder="development">
+            <div class="field-hint">Base for runner clones and implementation PRs.</div>
           </div>
-          <div class="md-field">
-            <label>Repo Field</label>
-            <select id="md-jira-repo-field" onchange="onRepoFieldChange()">
-              <option value="">(auto-discover by name "AI-Implement Repo")</option>
-            </select>
-            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Repo&rdquo;. Otherwise pick the field that identifies which GitHub repo an issue belongs to.
-            </div>
+          <div class="field">
+            <label class="field-label">Workflow File</label>
+            <input class="input mono" id="md-wf" value="claude-implement.yml">
+            <div class="field-hint">Synced into the target repo under .github/workflows/.</div>
           </div>
-          <div class="md-field">
-            <label>Profiles Field</label>
-            <select id="md-jira-profiles-field">
-              <option value="">(auto-discover by name "AI-Implement Profiles")</option>
-            </select>
-            <div class="text-tertiary" style="font-size:0.85em;margin-top:4px">
-              Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.
-            </div>
-          </div>
-          <div class="md-field">
-            <label>Repo Field Value</label>
-            <select id="md-jira-repo-value">
-              <option value="">Select a Repo Field first</option>
-            </select>
-            <input id="md-jira-repo-value-text" type="text" class="hidden" placeholder="owner/repo">
+          <div class="field" style="grid-column:1 / -1">
+            <label class="field-label">Branch Prefix</label>
+            <input class="input mono" id="md-branch-prefix" placeholder="pr">
+            <div class="field-hint">Blank = none.</div>
+            <details class="explain">
+              <summary>What a prefix changes</summary>
+              <div class="explain-body">A run names its branch <span class="mono">ai-implement/&lt;issue-key&gt;-&lt;title-slug&gt;</span>. The prefix is joined in front of that as a leading path segment, so <span class="mono">pr</span> turns <span class="mono">ai-implement/aii-42-add-search</span> into <span class="mono">pr/ai-implement/aii-42-add-search</span>. It may contain <span class="mono">/</span> itself to nest several segments deep.</div>
+              <div class="explain-body">Only the first run of an issue is affected. A gap-fill run commits to the pull-request branch that already exists, so setting this later does not rename anything already created.</div>
+            </details>
           </div>
         </div>
-      </fieldset>
-      <div class="md-cols">
-        <fieldset>
-          <legend>Basic</legend>
-          <div class="md-field"><label>Team Key</label><input id="md-team-key" placeholder="MY_TEAM"></div>
-          <div class="md-field"><label>Owner</label><input id="md-owner" placeholder="acme-corp"></div>
-          <div class="md-field"><label>Repo</label><input id="md-repo" placeholder="backend"></div>
-          <div class="md-field"><label>Workflow File</label><input id="md-wf" value="claude-implement.yml"></div>
-          <div class="md-field"><label>Default Branch</label><input id="md-branch" placeholder="development"></div>
-          <div class="md-field"><label>Max AI Issues</label><input id="md-max-ai" type="number" min="1" value="3"></div>
-          <div class="md-field"><label>Max Turns <span class="text-tertiary" style="font-size:0.85em">(blank = 50)</span></label><input id="md-max-turns" type="number" min="1" step="1" placeholder="50"></div>
-          <div class="md-field"><label>Max Iterations <span class="text-tertiary" style="font-size:0.85em">(blank = bedrock 2 / anthropic 3)</span></label><input id="md-max-iter" type="number" min="1" step="1" placeholder="3"></div>
-          <div class="md-field"><label>Job Timeout (min) <span class="text-tertiary" style="font-size:0.85em">(blank = 90)</span></label><input id="md-max-job-min" type="number" min="1" step="1" placeholder="90"></div>
-          <div class="md-field"><label>Branch Prefix <span class="text-tertiary" style="font-size:0.85em">(blank = none)</span></label><input id="md-branch-prefix" placeholder="pr"></div>
-          <div class="md-field">
-            <label>Skills Repo <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
-            <input id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
+      </div>
+      <div data-md-panel="context" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Context</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">What a run can reach beyond the target repository.</p>
+        <div style="display:grid;gap:12px">
+          <div class="field">
+            <label class="field-label">Skills Repo</label>
+            <input class="input mono" id="md-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git">
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
-          <div class="md-field">
-            <label>Additional sensitive patterns <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
-            <textarea id="md-sensitive-add" rows="3" placeholder="one glob per line"></textarea>
-            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
-          </div>
-          <div class="md-field">
-            <label>Allowed exceptions <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
-            <textarea id="md-sensitive-allow" rows="3" placeholder="one glob per line"></textarea>
-            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
-          </div>
-          <div class="md-field">
-            <label>Dependency Token Scope <span class="text-tertiary" style="font-size:0.85em">(optional)</span></label>
-            <select id="md-dep-token-scope">
+          <div class="field">
+            <label class="field-label">Dependency Token Scope</label>
+            <select class="select" id="md-dep-token-scope">
               <option value="">Off (default)</option>
               <option value="installation">All repos the App can access (read-only)</option>
             </select>
-            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos. When enabled, the runner mounts a scoped installation token as a git credential helper and sets <code>COMPOSER_AUTH</code>, so private dependencies resolve automatically during the install step.</div>
+            <div class="field-hint">Lets the run read private sibling repos while installing dependencies. It can never write to them. Leave off unless builds need it.</div>
+            <details class="explain">
+              <summary>How the token is scoped</summary>
+              <div class="explain-body">The run receives a second token, installation-wide but strictly read-only, fetched over the runner callback and installed as a git credential helper for github.com and as <span class="mono">COMPOSER_AUTH</span>. So private dependencies resolve during the install step, and the run still cannot push anywhere but its own target repository.</div>
+              <div class="explain-body">The scope is all-or-nothing: it reads every repository the App installation covers, not a chosen subset. It also needs a publicly reachable orchestrator &mdash; a run dispatched without a progress token skips the fetch and proceeds without private-dependency access rather than failing.</div>
+            </details>
           </div>
-        </fieldset>
-        <fieldset>
-          <legend>Execution</legend>
-          <div class="md-field">
-            <label>Mode</label>
-            <select id="md-exec-mode" onchange="onExecModeChange()">
-              <option value="github-actions">github-actions</option>
-              <option value="fly-machines">fly-machines</option>
-            </select>
-          </div>
-          <div class="md-field">
-            <label>Session Mode</label>
-            <select id="md-session-mode">
-              <option value="autonomous">autonomous</option>
-              <option value="interactive">interactive</option>
-              <option value="hybrid">hybrid</option>
-            </select>
-          </div>
-          <div id="md-fly-fields" class="hidden">
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
-              <div class="md-field" style="margin-bottom:0"><label>CPUs</label><input id="md-cpus" type="number" min="1" value="2"></div>
-              <div class="md-field" style="margin-bottom:0"><label>Memory (MB)</label><input id="md-mem" type="number" min="256" step="256" value="4096"></div>
+        </div>
+      </div>
+      <div data-md-panel="execution" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Execution</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Where runs execute, and what the runner process receives.</p>
+        <div style="display:grid;gap:12px">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="field">
+              <label class="field-label">Mode</label>
+              <select class="select" id="md-exec-mode" onchange="onExecModeChange()">
+                <option value="github-actions">github-actions</option>
+                <option value="fly-machines">fly-machines</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field-label">Session Mode</label>
+              <select class="select" id="md-session-mode">
+                <option value="autonomous">autonomous</option>
+                <option value="interactive">interactive</option>
+                <option value="hybrid">hybrid</option>
+              </select>
             </div>
           </div>
-          <div class="md-field">
-            <label>Extra Env (KEY=VALUE, one per line)</label>
-            <textarea id="md-env" rows="4" placeholder="KEY=VALUE&#10;ANOTHER=value"></textarea>
+          <div id="md-fly-fields" class="hidden" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="field">
+              <label class="field-label">CPUs</label>
+              <input class="input" id="md-cpus" type="number" min="1" value="2">
+            </div>
+            <div class="field">
+              <label class="field-label">Memory (MB)</label>
+              <input class="input" id="md-mem" type="number" min="256" step="256" value="4096">
+            </div>
           </div>
-        </fieldset>
+          <div class="field">
+            <label class="field-label">Extra Env</label>
+            <textarea class="textarea" id="md-env" rows="4" placeholder="LOG_LEVEL=debug&#10;FEATURE_FLAG=on"></textarea>
+            <div class="field-hint">One KEY=VALUE per line. Unlike secrets, these reach the model process and are visible to the agent.</div>
+          </div>
+        </div>
       </div>
-      <fieldset>
-        <legend>Planning</legend>
-        <div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap">
-          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-planning" type="checkbox" style="width:auto" onchange="onPlanningChange()"> Enabled</label>
-          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-approve" type="checkbox" style="width:auto" checked> Auto-approve</label>
-          <label style="font-size:0.85em;display:flex;align-items:center;gap:6px;white-space:nowrap"><input id="md-auto-merge" type="checkbox" style="width:auto"> Auto-merge child PRs</label>
-          <div id="md-planning-wf-wrap" class="md-field hidden" style="flex:1;min-width:160px;margin-bottom:0">
-            <label>Planning Workflow File</label><input id="md-planning-wf" value="claude-plan.yml">
+      <div data-md-panel="capacity" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Capacity</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">How much work this project may have running, and how long each run may take. Every cap applies to re-dispatches as well as initial runs.</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="field">
+            <label class="field-label">Max AI Issues</label>
+            <input class="input" id="md-max-ai" type="number" min="1" value="3">
+            <div class="field-hint">Issues in flight at once for this project. Required.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Max Turns</label>
+            <input class="input" id="md-max-turns" type="number" min="1" step="1" placeholder="50">
+            <div class="field-hint">Claude turns per implement pass. Blank = 50.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Max Iterations</label>
+            <input class="input" id="md-max-iter" type="number" min="1" step="1" placeholder="3">
+            <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Job Timeout (min)</label>
+            <input class="input" id="md-max-job-min" type="number" min="1" step="1" placeholder="90">
+            <div class="field-hint">GitHub Actions only. Blank = 90.</div>
           </div>
         </div>
-      </fieldset>
-      <fieldset>
-        <legend>Claude Provider</legend>
-        <div style="display:flex;gap:20px;align-items:flex-end;flex-wrap:wrap">
-          <div class="md-field" style="margin-bottom:0;min-width:140px">
-            <label>Provider</label>
-            <select id="md-provider" onchange="onProviderChange()">
-              <option value="anthropic">anthropic</option>
-              <option value="bedrock">bedrock</option>
-            </select>
+      </div>
+      <div data-md-panel="guardrails" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Guardrails</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Files a run is refused permission to push. AI-Implement already blocks a built-in list; these two settings extend it and carve holes in it.</p>
+        <div style="display:grid;gap:12px">
+          <div class="field">
+            <label class="field-label">Additional protected files</label>
+            <textarea class="textarea" id="md-sensitive-add" rows="3" placeholder="infra/**&#10;*.pem&#10;deploy/production.yml"></textarea>
+            <div class="field-hint">One file pattern per line, on top of the built-in list. <span class="mono">*</span> matches within one path segment, <span class="mono">**</span> matches across segments. Blank = none.</div>
           </div>
-          <div id="md-aws-region-wrap" class="md-field hidden" style="flex:1;min-width:180px;margin-bottom:0">
-            <label>AWS Region</label><input id="md-aws-region" placeholder="us-west-2">
+          <div class="field">
+            <label class="field-label">Exceptions to those rules</label>
+            <textarea class="textarea" id="md-sensitive-allow" rows="3" placeholder="infra/README.md&#10;deploy/example.yml"></textarea>
+            <div class="field-hint">One file pattern per line. Same syntax as above.</div>
+          </div>
+          <div class="alert warn">
+            <div class="alert-icon">&#9888;</div>
+            <div>
+              <div class="alert-title">Exceptions win over every other rule</div>
+              <div class="alert-desc">A file matching an exception is pushed even when it also matches the built-in list or a pattern added above.</div>
+            </div>
           </div>
         </div>
-      </fieldset>
+      </div>
+      <div data-md-panel="provider" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Provider</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 18px">Which Claude backend runs this project, and whether it plans before implementing.</p>
+        <div style="display:grid;gap:18px">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="field">
+              <label class="field-label">Provider</label>
+              <select class="select" id="md-provider" onchange="onProviderChange()">
+                <option value="anthropic">anthropic</option>
+                <option value="bedrock">bedrock</option>
+              </select>
+              <div class="field-hint">Bedrock requires the GitHub Actions execution mode.</div>
+            </div>
+            <div id="md-aws-region-wrap" class="field hidden">
+              <label class="field-label">AWS Region</label>
+              <input class="input mono" id="md-aws-region" placeholder="us-west-2">
+              <div class="field-hint">Where your Bedrock inference profile is deployed.</div>
+            </div>
+          </div>
+          <div>
+            <div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin-bottom:10px">Planning</div>
+            <label class="checkbox-row"><input id="md-planning" type="checkbox" onchange="onPlanningChange()"> Enabled &mdash; Claude posts a plan to the ticket before implementing</label>
+            <label class="checkbox-row"><input id="md-auto-approve" type="checkbox" checked> Auto-approve plans</label>
+            <label class="checkbox-row"><input id="md-auto-merge" type="checkbox"> Auto-merge child PRs into their grouping branch</label>
+            <div id="md-planning-wf-wrap" class="field hidden" style="max-width:260px;margin-top:10px">
+              <label class="field-label">Planning Workflow File</label>
+              <input class="input mono" id="md-planning-wf" value="claude-plan.yml">
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
+    <div id="md-error" class="error hidden" style="margin:0 20px"></div>
     <div class="md-footer">
-      <div id="md-error" class="error hidden" style="margin-bottom:8px"></div>
-      <div style="display:flex;gap:8px;justify-content:flex-end">
-        <button class="btn btn-ghost" onclick="closeMappingDialog()">Cancel</button>
-        <button id="md-save" class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
-      </div>
+      <button class="btn btn-ghost" onclick="closeMappingDialog()">Cancel</button>
+      <button id="md-save" class="btn btn-accent" onclick="saveMappingDialog()">Save Mapping</button>
     </div>
   </dialog>
+
+  ${stepperHtml}
 </section>
 `;
 
@@ -388,10 +490,49 @@ export const projectsScript = `
     onProviderChange();
     onPlanningChange();
     onTicketingProviderChange();
+    switchMappingTab('ticketing');
 
     document.getElementById('mapping-dialog').showModal();
   }
   window.openMappingDialog = openMappingDialog;
+
+  function switchMappingTab(name) {
+    for (const panel of document.querySelectorAll('[data-md-panel]')) {
+      panel.hidden = panel.dataset.mdPanel !== name;
+    }
+    for (const btn of document.querySelectorAll('#md-tabs [data-md-tab]')) {
+      btn.classList.toggle('active', btn.dataset.mdTab === name);
+    }
+    // a tall panel leaves the body scrolled; the next one would open part-way down
+    const body = document.querySelector('#mapping-dialog .md-body');
+    if (body) body.scrollTop = 0;
+  }
+  window.switchMappingTab = switchMappingTab;
+
+  // Blank means "use the built-in default", which the payload carries as null. Number()
+  // rather than parseInt so "1.5" fails validation instead of truncating to 1.
+  function optionalCap(id) {
+    const v = document.getElementById(id).value.trim();
+    return v === '' ? null : Number(v);
+  }
+
+  const CAP_FIELDS = [
+    ['Max Turns', 'maxTurns'],
+    ['Max Iterations', 'maxIterations'],
+    ['Job Timeout', 'maxJobMinutes'],
+  ];
+
+  function badCap(value) {
+    return value !== null && (!Number.isInteger(value) || value < 1);
+  }
+
+  // Several save rules span two tabs, so the offending field may be on a hidden panel.
+  function showMappingError(message, tab) {
+    if (tab) switchMappingTab(tab);
+    const errEl = document.getElementById('md-error');
+    errEl.textContent = message;
+    errEl.classList.remove('hidden');
+  }
 
   function closeMappingDialog() {
     document.getElementById('mapping-dialog').close();
@@ -644,8 +785,7 @@ export const projectsScript = `
     const teamKey = isNew ? document.getElementById('md-team-key').value.trim() : origKey;
     const defaultBranch = document.getElementById('md-branch').value.trim();
     if (!defaultBranch) {
-      errEl.textContent = 'Default Branch is required.';
-      errEl.classList.remove('hidden');
+      showMappingError('Default Branch is required.', 'source');
       return;
     }
 
@@ -655,7 +795,7 @@ export const projectsScript = `
       repo: document.getElementById('md-repo').value.trim(),
       workflowFile: document.getElementById('md-wf').value.trim(),
       defaultBranch,
-      maxInProgressAiIssues: parseInt(document.getElementById('md-max-ai').value, 10),
+      maxInProgressAiIssues: Number(document.getElementById('md-max-ai').value.trim() || NaN),
       executionMode: document.getElementById('md-exec-mode').value,
       sessionMode: document.getElementById('md-session-mode').value,
       machineCpus: parseInt(document.getElementById('md-cpus').value, 10),
@@ -667,9 +807,9 @@ export const projectsScript = `
       extraEnv: parseEnvText(document.getElementById('md-env').value),
       provider: document.getElementById('md-provider').value,
       awsRegion: document.getElementById('md-aws-region').value.trim() || null,
-      maxTurns: (function(){ var v = document.getElementById('md-max-turns').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
-      maxIterations: (function(){ var v = document.getElementById('md-max-iter').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
-      maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      maxTurns: optionalCap('md-max-turns'),
+      maxIterations: optionalCap('md-max-iter'),
+      maxJobMinutes: optionalCap('md-max-job-min'),
       branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
       skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
@@ -699,29 +839,34 @@ export const projectsScript = `
       };
     }
 
-    if (!body.teamKey || !body.owner || !body.repo) {
-      errEl.textContent = 'Team Key, Owner, and Repo are required.';
-      errEl.classList.remove('hidden');
+    if (!body.teamKey) {
+      showMappingError('Team Key is required.', 'ticketing');
       return;
     }
-    if (!Number.isFinite(body.maxInProgressAiIssues) || body.maxInProgressAiIssues < 1) {
-      errEl.textContent = 'Max AI Issues must be a positive integer.';
-      errEl.classList.remove('hidden');
+    if (!body.owner || !body.repo) {
+      showMappingError('Owner and Repo are required.', 'source');
       return;
+    }
+    if (!Number.isInteger(body.maxInProgressAiIssues) || body.maxInProgressAiIssues < 1) {
+      showMappingError('Max AI Issues must be a positive integer.', 'capacity');
+      return;
+    }
+    for (const cap of CAP_FIELDS) {
+      if (badCap(body[cap[1]])) {
+        showMappingError(cap[0] + ' must be a positive integer, or blank for the default.', 'capacity');
+        return;
+      }
     }
     if (body.provider === 'bedrock' && body.executionMode === 'fly-machines') {
-      errEl.textContent = 'Bedrock provider is not supported with fly-machines execution mode.';
-      errEl.classList.remove('hidden');
+      showMappingError('Bedrock is not supported with the fly-machines execution mode. Change one of them.', 'provider');
       return;
     }
     if (body.provider === 'bedrock' && !body.awsRegion) {
-      errEl.textContent = 'AWS Region is required when provider is bedrock.';
-      errEl.classList.remove('hidden');
+      showMappingError('AWS Region is required when provider is bedrock.', 'provider');
       return;
     }
     if (body.planningEnabled && !body.planningWorkflowFile) {
-      errEl.textContent = 'Planning Workflow File is required when planning is enabled.';
-      errEl.classList.remove('hidden');
+      showMappingError('Planning Workflow File is required when planning is enabled.', 'provider');
       return;
     }
 

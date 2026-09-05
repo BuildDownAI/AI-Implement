@@ -24,7 +24,7 @@ import { deploymentsHtml, deploymentsScript } from "./pages/deployments.js";
 import { stubsHtml } from "./pages/stubs.js";
 import { noAccessHtml } from "./pages/no-access.js";
 import { drawerHtml, drawerScript } from "./drawer.js";
-import { stepperHtml, stepperScript } from "./stepper.js";
+import { stepperScript } from "./stepper.js";
 
 const head = `<!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -93,7 +93,6 @@ const body = `<body>
 </div>
 ${shell}
 ${drawerHtml}
-${stepperHtml}
 <script>${themeJs}${authJs}${routerJs}${overviewScript}${settingsScript}${projectsScript}${pipelinesScript}${reaperScript}${sessionsScript}${auditScript}${issuesScript}${pullsScript}${blockersScript}${customizationsScript}${pipelinesAndStepsScript}${modelsAndProvidersScript}${runnersScript}${reportsScript}${deploymentsScript}${accessScript}${drawerScript}${stepperScript}</script>
 </body></html>`;
 
