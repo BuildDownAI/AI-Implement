@@ -36,3 +36,35 @@ describe("pipelines page time filter", () => {
     expect(pipelinesScript).toMatch(/registerPage\('jobs',[\s\S]*startLogAutoRefresh\(\);/);
   });
 });
+
+describe("pipelines page — kg-refresh row actions (AII-521)", () => {
+  it("renders a Stop button only for in-flight kg-refresh rows", () => {
+    // The condition that gates the Stop button
+    expect(pipelinesScript).toContain("isKgRefresh && isInflight && cancelId");
+    expect(pipelinesScript).toContain("data-cancel-id");
+    expect(pipelinesScript).toContain("Stop");
+  });
+
+  it("renders a Logs button for rows with a machineId", () => {
+    expect(pipelinesScript).toContain("data-machine-id");
+    expect(pipelinesScript).toContain("Logs");
+  });
+
+  it("uses DELETE /api/sessions/:cancelId to stop a kg-refresh run", () => {
+    expect(pipelinesScript).toContain("'/api/sessions/' + encodeURIComponent(cancelId)");
+    expect(pipelinesScript).toContain("method: 'DELETE'");
+  });
+
+  it("prompts for confirmation before cancelling a kg-refresh run", () => {
+    expect(pipelinesScript).toContain("confirm(");
+    expect(pipelinesScript).toContain("Stop this KG-refresh run");
+  });
+
+  it("fetches machine logs via GET /api/sessions/:machineId/logs", () => {
+    expect(pipelinesScript).toContain("'/api/sessions/' + encodeURIComponent(machineId) + '/logs'");
+  });
+
+  it("reload the log after a successful cancel", () => {
+    expect(pipelinesScript).toContain("loadLog()");
+  });
+});
