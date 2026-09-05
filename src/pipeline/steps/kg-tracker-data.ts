@@ -82,6 +82,10 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
           },
           body: cursor ? JSON.stringify({ cursor }) : "{}",
         });
+        if (res.status === 503) {
+          console.log("[kg-tracker-data] Tracker not configured (503) — skipping");
+          return { fetched: false, issueCount: 0 };
+        }
         if (!res.ok) {
           throw new KgTrackerDataFetchError(`endpoint returned ${res.status}`);
         }
