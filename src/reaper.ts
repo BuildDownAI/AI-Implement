@@ -8,6 +8,7 @@ import { notifyReaperBurst } from "./notify.js";
 import type { Job } from "./log.js";
 
 export const SWEEP_MACHINE_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
+const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 5 * 60 * 1000; // 5 minutes
 const TERMINAL_LIFECYCLE_STATES = new Set<IssueLifecycleState>(["completed", "cancelled"]);
 
 export interface ReaperConfig {
@@ -27,7 +28,7 @@ export interface ReaperHelpers {
   postSessionLogs: (job: Job, context: string) => Promise<void>;
   findPrForIssue: (repo: string | null, issueIdentifier: string | null) => Promise<string | null>;
   /** Called for each kg-refresh job whose machine is absent from the Fly registry. */
-  failKgRefreshMachine?: (job: Job) => void;
+  failKgRefreshMachine?: (job: Job, opts?: { failureCode?: string }) => void;
 }
 
 export interface DestroyContext {
@@ -88,6 +89,28 @@ async function sweepOrphanedKgRefreshJobs(
 ): Promise<void> {
   const jobs = getInFlightKgRefreshJobs();
   for (const job of jobs) {
+    // Bootstrap-deadline: a row still in dispatched status (never received a callback)
+    // past the deadline is closed regardless of machineId or registry presence. This
+    // catches machines that booted and exited before recording their identity.
+    if (job.status === "dispatched" && Date.now() - job.dispatchedAt > KG_REFRESH_BOOTSTRAP_DEADLINE_MS) {
+      const ageSeconds = Math.floor((Date.now() - job.dispatchedAt) / 1000);
+      console.log(
+        `[reaper] rule=kg-refresh-bootstrap-timeout machine=${job.machineId ?? "-"} job=${job.id} age_s=${ageSeconds} dry_run=${config.reaperDryRun}`,
+      );
+      recordReaperAction({
+        ruleMatched: "kg-refresh-bootstrap-timeout",
+        machineId: job.machineId ?? "", // "" is the sentinel for "no machine yet" in reaper_actions
+        tenantId: null,
+        issueIdentifier: null,
+        ageSeconds,
+        dryRun: config.reaperDryRun,
+      });
+      if (!config.reaperDryRun) {
+        helpers.failKgRefreshMachine?.(job, { failureCode: "bootstrap_timeout" });
+      }
+      continue;
+    }
+
     if (!job.machineId) continue; // no-machine backend (local Docker) — skip
     if (activeMachineIds.has(job.machineId)) continue; // machine alive — no action
 
@@ -302,8 +325,13 @@ export async function sweepOrphanedMachines(
   }
 
   // Inverse sweep: find kg-refresh job rows whose machine is gone from the registry.
+  // Machines in "started", "created", or "starting" are considered live (bootstrapping or
+  // running). "stopped" and "failed" machines are intentionally excluded so a machine that
+  // exited cleanly or crashed is treated as absent and triggers the close path.
   const activeMachineIds = new Set(
-    machines.filter((m) => m.state !== "destroyed").map((m) => m.id),
+    machines
+      .filter((m) => m.state === "started" || m.state === "created" || m.state === "starting")
+      .map((m) => m.id),
   );
   await sweepOrphanedKgRefreshJobs(config, helpers, activeMachineIds);
 

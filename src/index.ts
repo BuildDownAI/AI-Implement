@@ -668,7 +668,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     },
     findPrForIssue: async (repo, issueIdentifier) =>
       (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
-    failKgRefreshMachine: () => { activeKgRefresh?.onMachineLost(); },
+    failKgRefreshMachine: (_job, opts) => { activeKgRefresh?.onMachineLost(opts); },
   });
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
