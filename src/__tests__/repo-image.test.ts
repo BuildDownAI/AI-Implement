@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveKgRefreshSessionImage, __clearRepoImageCacheForTests } from "../repo-image.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -274,5 +274,122 @@ describe("resolveRunnerImageForDispatch", () => {
       fetchImpl,
     });
     expect(image).toBeUndefined();
+  });
+});
+
+// ── resolveKgRefreshSessionImage ──────────────────────────────────────────────
+
+// Builds a fetch mock that routes by URL substring:
+// "api.github.com" → image.yml lookup result
+// "ghcr.io" + "/manifests/" with no Authorization → 401 challenge
+// "ghcr.io" + "/manifests/" with Authorization → manifest check result
+// "ghcr.io/token" → token fetch result
+function mockKgFetch(opts: {
+  imageYml: "override" | "404";
+  tagExists: boolean;
+}): typeof fetch {
+  const challengeHeader =
+    'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:builddownai/ai-implement-runner:pull"';
+  return vi.fn(async (url: string, init?: RequestInit) => {
+    const urlStr = String(url);
+    if (urlStr.includes("api.github.com")) {
+      if (opts.imageYml === "override") {
+        const content = Buffer.from("image: ghcr.io/acme/custom-runner:v3\n", "utf8").toString("base64");
+        return {
+          ok: true, status: 200,
+          json: async () => ({ type: "file", encoding: "base64", content }),
+          text: async () => "",
+          headers: { get: () => null },
+        } as unknown as Response;
+      }
+      return { ok: false, status: 404, json: async () => ({}), text: async () => "", headers: { get: () => null } } as unknown as Response;
+    }
+    if (urlStr.includes("ghcr.io/token")) {
+      return { ok: true, status: 200, json: async () => ({ token: "anon-token" }), text: async () => "", headers: { get: () => null } } as unknown as Response;
+    }
+    if (urlStr.includes("/manifests/")) {
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      if (!headers["Authorization"]) {
+        return {
+          ok: false, status: 401,
+          json: async () => ({}), text: async () => "",
+          headers: { get: (k: string) => k === "www-authenticate" ? challengeHeader : null },
+        } as unknown as Response;
+      }
+      const status = opts.tagExists ? 200 : 404;
+      return { ok: opts.tagExists, status, json: async () => ({}), text: async () => "", headers: { get: () => null } } as unknown as Response;
+    }
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "", headers: { get: () => null } } as unknown as Response;
+  }) as unknown as typeof fetch;
+}
+
+describe("resolveKgRefreshSessionImage", () => {
+  beforeEach(() => {
+    __clearRepoImageCacheForTests();
+  });
+
+  it("returns source-commit-pinned image when stamp is set and tag exists", async () => {
+    const fetchImpl = mockKgFetch({ imageYml: "404", tagExists: true });
+    const result = await resolveKgRefreshSessionImage({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: DEFAULT_IMAGE,
+      sourceCommit: "abc1234567890",
+      fetchImpl,
+    });
+    expect(result.image).toBe("ghcr.io/builddownai/ai-implement-runner:abc1234567890");
+    expect(result.source).toBe("default");
+  });
+
+  it("falls back to defaultImage when source-commit tag does not exist in registry", async () => {
+    const fetchImpl = mockKgFetch({ imageYml: "404", tagExists: false });
+    const result = await resolveKgRefreshSessionImage({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: DEFAULT_IMAGE,
+      sourceCommit: "abc1234567890",
+      fetchImpl,
+    });
+    expect(result.image).toBe(DEFAULT_IMAGE);
+    expect(result.source).toBe("default");
+  });
+
+  it("falls back to defaultImage when no sourceCommit is provided", async () => {
+    const fetchImpl = mockKgFetch({ imageYml: "404", tagExists: false });
+    const result = await resolveKgRefreshSessionImage({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: DEFAULT_IMAGE,
+      fetchImpl,
+    });
+    expect(result.image).toBe(DEFAULT_IMAGE);
+    expect(result.source).toBe("default");
+    // No registry manifest calls — tag check is skipped without a sourceCommit
+    const manifestCalls = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([u]: [string]) => String(u).includes("/manifests/"),
+    );
+    expect(manifestCalls).toHaveLength(0);
+  });
+
+  it("returns per-repo image.yml override over source-commit pin", async () => {
+    const fetchImpl = mockKgFetch({ imageYml: "override", tagExists: true });
+    const result = await resolveKgRefreshSessionImage({
+      owner: "acme",
+      repo: "widgets",
+      token: "ghs_xxx",
+      defaultImage: DEFAULT_IMAGE,
+      sourceCommit: "abc1234567890",
+      fetchImpl,
+    });
+    expect(result.image).toBe("ghcr.io/acme/custom-runner:v3");
+    expect(result.source).toBe("override");
+    // No registry manifest calls — override short-circuits the check
+    const manifestCalls = (fetchImpl as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([u]: [string]) => String(u).includes("/manifests/"),
+    );
+    expect(manifestCalls).toHaveLength(0);
   });
 });

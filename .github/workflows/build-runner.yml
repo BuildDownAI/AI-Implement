@@ -117,6 +117,123 @@ jobs:
           echo "Module exports: $output"
           echo "$output" | grep -q "PipelineRunner" || \
             { echo "ERROR: PipelineRunner not found in /app/dist/pipeline/runner.js exports"; exit 1; }
+          # AII-534: verify kg-refresh-run.js is present and importable in the image.
+          # This is the real-artifact gate: a Fly machine booting an image without this
+          # file exits immediately with "Cannot find module" before any callback fires.
+          # The vitest smoke test (tsx) verifies import resolution at source level; this
+          # step verifies the compiled dist tree — the gap that let AII-534 ship.
+          if ! kg_output=$(docker run --rm --entrypoint node \
+            "$digest_ref" \
+            -e "import('/app/dist/pipeline/kg-refresh-run.js').then(m => console.log(Object.keys(m)))" 2>&1); then
+            echo "ERROR: /app/dist/pipeline/kg-refresh-run.js is not importable in the session image"
+            echo "$kg_output"
+            echo "A Fly kg-refresh machine booting this image would exit immediately with 'Cannot find module'."
+            exit 1
+          fi
+          echo "kg-refresh-run.js exports: $kg_output"
+          echo "$kg_output" | grep -q "runKgRefresh" || \
+            { echo "ERROR: runKgRefresh not found in /app/dist/pipeline/kg-refresh-run.js exports"; exit 1; }
+
+      - name: Entrypoint handoff — real-artifact gate (AII-534)
+        # Proves the entrypoint→pipeline handoff works end-to-end on the built image.
+        # The import check above verifies the dist tree; this step verifies that the
+        # entrypoint script reaches `exec node` and the pipeline reports back via HTTP.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          repo_name="${GITHUB_REPOSITORY##*/}"
+          default_branch="${{ github.event.repository.default_branch || 'main' }}"
+          cb_port=19876
+
+          # Minimal callback listener: accepts all requests, records POSTs to a file.
+          # Written as an ESM module so 'node:http' and 'node:fs' imports resolve.
+          cat > /tmp/ci-listener.mjs << 'LISTENER_EOF'
+          import http from 'node:http';
+          import fs from 'node:fs';
+          const [,, port, out] = process.argv;
+          http.createServer((req, res) => {
+            let b = '';
+            req.on('data', d => b += d);
+            req.on('end', () => {
+              fs.appendFileSync(out, req.method + ' ' + req.url + '\n');
+              process.stdout.write('[listener] ' + req.method + ' ' + req.url + '\n');
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end('{}');
+            });
+          }).listen(+port, () => process.stdout.write('[listener] ready on :' + port + '\n'));
+          LISTENER_EOF
+
+          requests_log="/tmp/ci-gate-requests.txt"
+          > "$requests_log"
+          node /tmp/ci-listener.mjs "$cb_port" "$requests_log" &
+          listener_pid=$!
+          # Wait for listener (up to 5 s)
+          for _i in $(seq 1 10); do
+            curl -sf "http://localhost:${cb_port}/" >/dev/null 2>&1 && break || sleep 0.5
+          done
+
+          # Minimal RunConfigV1 for a kg-refresh run. kgSourceRepo is the current CI
+          # repo (CI token has read access; depth-1 clone). runnerCallbackUrl points at
+          # the listener so postRunnerResult fires even when the ingest fails.
+          run_config_b64=$(printf \
+            '{"v":1,"issue":{"id":"ci-gate","identifier":"CI-GATE","title":"CI Entrypoint Gate","description":""},"runnerPhase":"kg-refresh","kgSourceRepo":"%s/%s","runnerCallbackUrl":"http://host.docker.internal:%s"}' \
+            "$owner" "$repo_name" "$cb_port" | base64 -w 0)
+
+          # Run the image with its real entrypoint. ANTHROPIC_API_KEY is a dummy that
+          # passes the entrypoint's presence check. The Claude CLI fails auth, the
+          # pipeline catches the error and calls postRunnerResult (failure) back to the
+          # listener. That failure callback IS the passing condition — the property under
+          # test is the handoff and report, not a successful ingest.
+          container_logs=$(timeout 180 docker run --rm \
+            --add-host host.docker.internal:host-gateway \
+            -e AI_IMPLEMENT_RUN_CONFIG="$run_config_b64" \
+            -e RUNNER_PHASE=kg-refresh \
+            -e ANTHROPIC_API_KEY=sk-ant-api03-placeholder-for-ci-gate-test \
+            -e GITHUB_TOKEN="$GITHUB_TOKEN" \
+            -e GITHUB_OWNER="$owner" \
+            -e GITHUB_REPO="$repo_name" \
+            -e GITHUB_DEFAULT_BRANCH="$default_branch" \
+            -e RUN_TOKEN=ci-gate-dummy-run-token \
+            -e RUN_PROGRESS_TOKEN=ci-gate-dummy-progress-token \
+            -e MACHINE_NONCE=ci-gate-nonce \
+            "$digest_ref" 2>&1) || true
+
+          kill "$listener_pid" 2>/dev/null || true
+
+          echo "--- Container logs ---"
+          printf '%s\n' "$container_logs"
+          echo "--- Listener requests ---"
+          cat "$requests_log" || true
+          echo "---"
+
+          # Assertion 1: entrypoint reached the pipeline dispatch point
+          printf '%s\n' "$container_logs" | grep -qF \
+            "Invoking TS pipeline (node /app/dist/pipeline/kg-refresh-run.js, phase=kg-refresh)" || {
+            echo "FAIL: Assertion 1 — expected log line not found in container output"
+            exit 1
+          }
+          echo "PASS: Assertion 1 — entrypoint reached the pipeline handoff"
+
+          # Assertion 2: pipeline ran and reported back via the callback
+          grep -q "POST" "$requests_log" || {
+            echo "FAIL: Assertion 2 — no POST received by callback listener"
+            exit 1
+          }
+          echo "PASS: Assertion 2 — pipeline reported back to callback listener"
+
+          # Negative check: node exits non-zero for a missing module, which proves
+          # that a missing kg-refresh-run.js would prevent assertion 2 from passing.
+          if docker run --rm --entrypoint node "$digest_ref" \
+            -e "import('/app/dist/pipeline/definitely-not-here.js').catch(()=>process.exit(1))" \
+            2>&1; then
+            echo "FAIL: negative check — expected non-zero exit for missing module"
+            exit 1
+          else
+            echo "PASS: negative check — node exits non-zero for a missing module"
+          fi
 
       - name: Promote tested digest to channel and debug tags
         run: |

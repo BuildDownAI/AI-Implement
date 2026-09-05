@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -855,5 +855,60 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
   it("instructs the agent to proceed when tracker-data.json is absent (local/dev runs)", () => {
     const playbook = readFileSync(playbookPath, "utf-8");
     expect(playbook).toContain("absent");
+  });
+});
+
+// ── Real-artifact entrypoint smoke test ───────────────────────────────────────
+//
+// Two-level testing strategy for the entrypoint→image handoff (AII-534):
+//
+// LEVEL 1 — source-level (this vitest test): runs `tsx kg-refresh-run.ts` as a
+// subprocess. Catches import resolution failures in the dev environment and
+// proves all transitive imports compile. The runKgRefresh tests above use
+// stepsOverride, so they are blind to a missing module — this subprocess test is
+// not.
+//
+// LEVEL 2 — real-artifact CI gate (.github/workflows/build-runner.yml "Smoke-test"
+// step): runs `node /app/dist/pipeline/kg-refresh-run.js` inside the actual built
+// session image via `docker run`. This is the gate that catches the AII-534 class
+// of failure — a Fly machine booting a stale image that lacks the compiled file
+// exits immediately with "Cannot find module" before any callback fires. The CI
+// gate runs after every push to main/testing and blocks channel promotion when it
+// fails, so no stale image can reach a Fly dispatch.
+//
+// The distinction matters: tsx never touches /app/dist; only the CI gate does.
+
+describe("pipeline/kg-refresh-run.ts module-load (entrypoint smoke test)", () => {
+  it("exits with env validation error, not Cannot find module, when GITHUB_TOKEN is absent", () => {
+    const workspaceRoot = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
+    // Build subprocess env: keep PATH and HOME but strip tokens so the module
+    // hits env validation before any network call.
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    env["GITHUB_OWNER"] = "test-org";
+    env["GITHUB_REPO"] = "test-repo";
+    delete env["GITHUB_TOKEN"];
+    delete env["GH_TOKEN"];
+    // Prevent AI_IMPLEMENT_RUN_CONFIG from carrying a callbackUrl that could
+    // cause a callback attempt before the env check fails.
+    delete env["AI_IMPLEMENT_RUN_CONFIG"];
+
+    const result = spawnSync(
+      join(workspaceRoot, "node_modules/.bin/tsx"),
+      [join(workspaceRoot, "src/pipeline/kg-refresh-run.ts")],
+      {
+        env,
+        cwd: workspaceRoot,
+        timeout: 20_000,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+
+    const output = (result.stderr?.toString() ?? "") + (result.stdout?.toString() ?? "");
+    // If any import in kg-refresh-run.ts cannot be resolved, tsx emits
+    // "Cannot find module" or ERR_MODULE_NOT_FOUND before the process exits.
+    // That error would surface here — proving the check catches the Fly boot failure.
+    expect(output).not.toMatch(/Cannot find module|ERR_MODULE_NOT_FOUND/i);
+    // Exits non-zero because GITHUB_TOKEN is absent (env validation in resolveKgRefreshInputs).
+    expect(result.status).not.toBe(0);
   });
 });

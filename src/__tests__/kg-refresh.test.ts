@@ -524,7 +524,9 @@ describe("kg-refresh", () => {
 
     function buildDispatch(overrides: Record<string, unknown> = {}) {
       dispatchRun = vi.fn(async () => ({ machineNonce: "test-nonce" }));
-      mintRunTokenFn = vi.fn(() => ({ token: "run-tok", dispatchId: "disp-1" }));
+      mintRunTokenFn = vi.fn()
+        .mockReturnValueOnce({ token: "run-tok", dispatchId: "disp-1" })
+        .mockReturnValue({ token: "progress-tok", dispatchId: "disp-1" });
       fetchCommitVisible = vi.fn(async () => true);
       stageStore = null;
       persistedStages = [];
@@ -599,6 +601,18 @@ describe("kg-refresh", () => {
       expect(call.dispatchId).toBe("disp-1");
       expect(call.runConfig).toBeTruthy();
       expect((await handle.status()).running).toBe(true);
+    });
+
+    it("passes a non-empty runProgressToken distinct from runToken to dispatchRun", async () => {
+      buildDispatch();
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      await waitForStage("ingest-running");
+      expect(dispatchRun).toHaveBeenCalledOnce();
+      const call = dispatchRun.mock.calls[0][0] as { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string };
+      expect(call.runProgressToken).toBeTruthy();
+      expect(call.runProgressToken).toBe("progress-tok");
+      expect(call.runProgressToken).not.toBe(call.runToken);
     });
 
     it("stage transitions checking → ingest-running when dispatch fires", async () => {

@@ -219,3 +219,135 @@ export async function resolveRunnerImageForDispatch(opts: {
   });
   return selectRunnerImageInput({ resolved, runnerImageExplicit: opts.runnerImageExplicit });
 }
+
+// ── Kg-refresh session image resolution ──────────────────────────────────────
+
+// Strip ":tag" or "@digest" from an image ref, leaving the bare registry/name.
+// Returns null when the image has no slash (not a valid ref) or no tag/digest.
+function stripImageTag(image: string): string | null {
+  const firstSlash = image.indexOf("/");
+  if (firstSlash === -1) return null;
+  const atIdx = image.indexOf("@", firstSlash);
+  if (atIdx !== -1) return image.slice(0, atIdx);
+  const colonIdx = image.lastIndexOf(":");
+  if (colonIdx <= firstSlash) return null;
+  return image.slice(0, colonIdx);
+}
+
+// Parse "host/path:tag" into its components. Returns null on invalid format.
+function parseImageRef(image: string): { host: string; name: string; tag: string } | null {
+  const firstSlash = image.indexOf("/");
+  if (firstSlash === -1) return null;
+  const host = image.slice(0, firstSlash);
+  const rest = image.slice(firstSlash + 1);
+  const colonIdx = rest.lastIndexOf(":");
+  if (colonIdx === -1) return null;
+  return { host, name: rest.slice(0, colonIdx), tag: rest.slice(colonIdx + 1) };
+}
+
+// Check whether a registry tag exists using the v2 manifest API.
+// Handles the standard Bearer-challenge auth flow for public packages (no credentials).
+// Returns false on any network error or unexpected status — falls back gracefully.
+async function checkRegistryTagExists(imageRef: string, fetchImpl: typeof fetch): Promise<boolean> {
+  const parsed = parseImageRef(imageRef);
+  if (!parsed) return false;
+  const { host, name, tag } = parsed;
+  const manifestUrl = `https://${host}/v2/${name}/manifests/${tag}`;
+  const accept = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
+
+  try {
+    let res = await fetchImpl(manifestUrl, { method: "HEAD", headers: { Accept: accept } });
+
+    if (res.status === 200) return true;
+    if (res.status === 404) return false;
+
+    if (res.status === 401) {
+      const wwwAuth = res.headers.get("www-authenticate") ?? "";
+      const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+      const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
+      const scopeMatch = wwwAuth.match(/scope="([^"]+)"/);
+      if (!realmMatch) return false;
+
+      const params = new URLSearchParams();
+      if (serviceMatch) params.set("service", serviceMatch[1]);
+      if (scopeMatch) params.set("scope", scopeMatch[1]);
+      const tokenRes = await fetchImpl(`${realmMatch[1]}?${params}`);
+      if (!tokenRes.ok) return false;
+      const { token } = (await tokenRes.json()) as { token?: string };
+      if (!token) return false;
+
+      res = await fetchImpl(manifestUrl, {
+        method: "HEAD",
+        headers: { Accept: accept, Authorization: `Bearer ${token}` },
+      });
+      return res.status === 200;
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export interface ResolveKgRefreshSessionImageInput {
+  owner: string;
+  repo: string;
+  token: string;
+  defaultImage: string;
+  /** AI_IMPLEMENT_SOURCE_COMMIT from the orchestrator's build stamp. When set,
+   *  the session image is pinned to `<base of defaultImage>:<sourceCommit>` after
+   *  verifying the tag exists in the registry (anonymous — package is public).
+   *  The per-repo image.yml override always wins over this pinning. */
+  sourceCommit?: string;
+  /** Injected for tests. Defaults to the global `fetch`. */
+  fetchImpl?: typeof fetch;
+  /** Injected for tests. Defaults to `Date.now`. */
+  nowMs?: () => number;
+}
+
+/**
+ * Resolves the session image for a kg-refresh Fly dispatch with source-commit
+ * pinning layered under the per-repo `.ai-implement/image.yml` override:
+ *
+ *  1. If image.yml has an explicit override, use it — always wins.
+ *  2. Else if sourceCommit is set, build `<base>:<sourceCommit>` (same registry
+ *     and name as defaultImage, commit-SHA tag) and verify the tag exists
+ *     anonymously. Use it on a hit; fall back to defaultImage on a miss.
+ *  3. Fall back to defaultImage and log one line naming which path was taken.
+ *
+ * This ensures a Fly kg-refresh machine runs the same pipeline generation as the
+ * orchestrator that dispatched it (`AI_IMPLEMENT_SOURCE_COMMIT` is the shared
+ * build stamp; `build-runner.yml` tags each runner build with that same SHA).
+ */
+export async function resolveKgRefreshSessionImage(
+  input: ResolveKgRefreshSessionImageInput,
+): Promise<ResolveSessionImageResult> {
+  const { owner, repo, token, defaultImage, sourceCommit } = input;
+  const fetchFn = input.fetchImpl ?? fetch;
+
+  const resolved = await resolveSessionImage({
+    owner,
+    repo,
+    token,
+    defaultImage,
+    fetchImpl: input.fetchImpl,
+    nowMs: input.nowMs,
+  });
+
+  if (resolved.source === "override") return resolved;
+
+  if (sourceCommit) {
+    const base = stripImageTag(defaultImage);
+    if (base) {
+      const pinnedImage = `${base}:${sourceCommit}`;
+      const exists = await checkRegistryTagExists(pinnedImage, fetchFn);
+      if (exists) {
+        console.log(`[repo-image] kg-refresh: using source-commit-pinned image ${pinnedImage}`);
+        return { image: pinnedImage, source: "default" };
+      }
+      console.log(`[repo-image] kg-refresh: source-commit image ${pinnedImage} not found; using ${defaultImage}`);
+    }
+  }
+
+  return resolved;
+}
