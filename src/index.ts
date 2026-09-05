@@ -44,7 +44,7 @@ import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, init
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
-import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, resolveKgRefreshSessionImage, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, planningDispatchBlockReason } from "./runner-callback.js";
@@ -3032,10 +3032,16 @@ async function dispatchKgRefreshRun(
   };
 
   if (config.flySessionsToken && config.flySessionsApp) {
-    // Use the orchestrator's own image ref so the session machine always runs the
-    // same pipeline generation. FLY_IMAGE_REF is injected by Fly into every machine
-    // at runtime; when absent (non-Fly orchestrator) fall back to config.sessionImage.
-    const flySessionImage = process.env.FLY_IMAGE_REF ?? config.sessionImage;
+    // Pair the session machine to the same pipeline generation as the orchestrator:
+    // resolve via image.yml override first, then try <base>:<AI_IMPLEMENT_SOURCE_COMMIT>
+    // (verified against the registry), finally fall back to config.sessionImage.
+    const { image: flySessionImage } = await resolveKgRefreshSessionImage({
+      owner: repo.owner,
+      repo: repo.repo,
+      token: ghToken,
+      defaultImage: config.sessionImage,
+      sourceCommit: process.env.AI_IMPLEMENT_SOURCE_COMMIT,
+    });
     const machineConfig = buildSessionMachineConfig({
       image: flySessionImage,
       issueId: "kg-refresh",
