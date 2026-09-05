@@ -1,7 +1,7 @@
 export const stepperHtml = `
 <div id="np-stepper-wrap" class="modal" hidden>
   <div class="modal-backdrop" onclick="closeNewProjectStepper()"></div>
-  <div class="modal-card" style="display:flex;flex-direction:column;max-height:90vh">
+  <div class="modal-card" style="display:flex;flex-direction:column;max-height:90vh;width:860px">
     <div style="padding:18px 24px 14px;border-bottom:1px solid var(--border-subtle);display:flex;justify-content:space-between;align-items:center">
       <div>
         <h2 style="font-size:15px;font-weight:600;margin:0">New project</h2>
@@ -10,9 +10,10 @@ export const stepperHtml = `
       <button class="btn btn-ghost btn-icon" onclick="closeNewProjectStepper()" title="Close">&times;</button>
     </div>
 
+    <div style="display:grid;grid-template-columns:186px 1fr;flex:1;min-height:0">
     <div class="stepper" id="np-stepper-rail"></div>
 
-    <div id="np-step-body" style="padding:24px;flex:1;overflow-y:auto;min-height:360px">
+    <div id="np-step-body" style="padding:24px;overflow-y:auto;min-height:360px">
       <div data-step="0">
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Ticketing System</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Choose where this mapping&rsquo;s issues come from. Each ticketing system has different config requirements on the next step.</p>
@@ -111,33 +112,65 @@ export const stepperHtml = `
             <div class="field-hint">Branch used for workflow dispatches, runner clones, and implementation PR bases.</div>
           </div>
           <div class="field" style="grid-column:1 / -1">
-            <label class="field-label">Skills Repo <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
-            <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
-            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+            <label class="field-label">Branch Prefix <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input mono" id="np-branch-prefix" placeholder="pr" autocomplete="off">
+            <div class="field-hint">Blank = none.</div>
+            <details class="explain">
+              <summary>What a prefix changes</summary>
+              <div class="explain-body">A run names its branch <span class="mono">ai-implement/&lt;issue-key&gt;-&lt;title-slug&gt;</span>. The prefix is joined in front of that as a leading path segment, so <span class="mono">pr</span> turns <span class="mono">ai-implement/aii-42-add-search</span> into <span class="mono">pr/ai-implement/aii-42-add-search</span>. It may contain <span class="mono">/</span> itself to nest several segments deep.</div>
+              <div class="explain-body">The branch name is computed at dispatch, so this only affects the first run of an issue &mdash; and a project created without a prefix has already produced that branch by the time one is added.</div>
+            </details>
           </div>
-          <div class="field" style="grid-column:1 / -1">
-            <label class="field-label">Additional sensitive patterns <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
-            <textarea class="input mono" id="np-sensitive-add" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
-            <div class="field-hint">Extra file globs to protect in addition to the built-in sensitive-files list. One glob per line. Blank = none.</div>
+        </div>
+        <div style="font-size:12px;font-weight:500;color:var(--fg-secondary);margin:22px 0 10px">Guardrails</div>
+        <div style="display:grid;gap:12px">
+          <div class="field">
+            <label class="field-label">Additional protected files <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <textarea class="input mono" id="np-sensitive-add" rows="3" placeholder="infra/**&#10;*.pem&#10;deploy/production.yml" autocomplete="off"></textarea>
+            <div class="field-hint">One file pattern per line, on top of the built-in sensitive-files list. <span class="mono">*</span> matches within one path segment, <span class="mono">**</span> matches across segments. Blank = none.</div>
           </div>
-          <div class="field" style="grid-column:1 / -1">
-            <label class="field-label">Allowed exceptions <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
-            <textarea class="input mono" id="np-sensitive-allow" rows="3" placeholder="one glob per line" autocomplete="off"></textarea>
-            <div class="field-hint" style="color:var(--st-warn-fg,#c80)">Files matching these globs bypass the sensitive-files guardrail for this project.</div>
+          <div class="field">
+            <label class="field-label">Exceptions to those rules <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <textarea class="input mono" id="np-sensitive-allow" rows="3" placeholder="infra/README.md&#10;deploy/example.yml" autocomplete="off"></textarea>
+            <div class="field-hint">One file pattern per line. Same syntax as above.</div>
           </div>
-          <div class="field" style="grid-column:1 / -1">
-            <label class="field-label">Dependency Token Scope <span style="font-weight:400;color:var(--text-tertiary)">(optional)</span></label>
-            <select class="input" id="np-dep-token-scope">
-              <option value="">Off (default)</option>
-              <option value="installation">All repos the App can access (read-only)</option>
-            </select>
-            <div class="field-hint">Grants the implementer read access to every repository this GitHub App installation can see. The run can read those repos but never write to them. Leave off unless builds fetch private dependencies from sibling repos. When enabled, the runner mounts a scoped installation token as a git credential helper and sets <code>COMPOSER_AUTH</code>, so private dependencies resolve automatically during the install step.</div>
+          <div class="alert warn">
+            <div class="alert-icon">&#9888;</div>
+            <div>
+              <div class="alert-title">Exceptions win over every other rule</div>
+              <div class="alert-desc">A file matching an exception is pushed even when it also matches the built-in sensitive-files list or a pattern added above.</div>
+            </div>
           </div>
         </div>
       </div>
 
       <div data-step="3" hidden>
-        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Runner</h3>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Context</h3>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">What a run can reach beyond the target repository.</p>
+        <div style="display:grid;gap:12px">
+          <div class="field">
+            <label class="field-label">Skills Repo <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input mono" id="np-skills-repo" placeholder="owner/skills-repo or https://github.com/owner/skills.git" autocomplete="off">
+            <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Dependency Token Scope <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <select class="input" id="np-dep-token-scope">
+              <option value="">Off (default)</option>
+              <option value="installation">All repos the App can access (read-only)</option>
+            </select>
+            <div class="field-hint">Lets the run read private sibling repos while installing dependencies. It can never write to them. Leave off unless builds need it.</div>
+            <details class="explain">
+              <summary>How the token is scoped</summary>
+              <div class="explain-body">The run receives a second token, installation-wide but strictly read-only, fetched over the runner callback and installed as a git credential helper for github.com and as <span class="mono">COMPOSER_AUTH</span>. So private dependencies resolve during the install step, and the run still cannot push anywhere but its own target repository.</div>
+              <div class="explain-body">The scope is all-or-nothing: it reads every repository the App installation covers, not a chosen subset. It also needs a publicly reachable orchestrator &mdash; a run dispatched without a progress token skips the fetch and proceeds without private-dependency access rather than failing.</div>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <div data-step="4" hidden>
+        <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Execution</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Choose where AI-Implement executes implementation runs.</p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
           <div class="runner-card active" data-runner="github-actions" onclick="selectExecutionMode('github-actions')">
@@ -171,7 +204,7 @@ export const stepperHtml = `
         </div>
       </div>
 
-      <div data-step="4" hidden>
+      <div data-step="5" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Provider</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Select the AI provider and configure planning behaviour.</p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
@@ -215,9 +248,9 @@ export const stepperHtml = `
         </div>
       </div>
 
-      <div data-step="5" hidden>
+      <div data-step="6" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Capacity</h3>
-        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Limit how many AI issues run concurrently for this project.</p>
+        <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">How much work this project may have running, and how long each run may take. Every cap applies to re-dispatches as well as initial runs.</p>
         <div class="alert warn" style="margin-bottom:18px">
           <div class="alert-icon">&#9888;</div>
           <div style="flex:1">
@@ -225,14 +258,31 @@ export const stepperHtml = `
             <div class="alert-desc">Each in-progress issue consumes API quota and spawns at least one GitHub Actions run or Fly Machine. Keep low (1&ndash;3) while evaluating.</div>
           </div>
         </div>
-        <div class="field" style="max-width:180px">
-          <label class="field-label">Max parallel AI issues</label>
-          <input class="input" type="number" id="np-maxAi" min="1" value="3">
-          <div class="field-hint">Must be a positive integer.</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="field">
+            <label class="field-label">Max parallel AI issues</label>
+            <input class="input" type="number" id="np-maxAi" min="1" value="3">
+            <div class="field-hint">Issues in flight at once for this project. Must be a positive integer.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Max Turns <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input" type="number" id="np-maxTurns" min="1" step="1" placeholder="50">
+            <div class="field-hint">Claude turns per implement pass. Blank = 50.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Max Iterations <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input" type="number" id="np-maxIterations" min="1" step="1" placeholder="3">
+            <div class="field-hint">Implement/review cycles. Blank = 2 on bedrock, 3 on anthropic.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">Job Timeout (min) <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <input class="input" type="number" id="np-maxJobMinutes" min="1" step="1" placeholder="90">
+            <div class="field-hint">GitHub Actions only. Blank = 90.</div>
+          </div>
         </div>
       </div>
 
-      <div data-step="6" hidden>
+      <div data-step="7" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Secrets</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Optionally seed one or more secrets for this project now. You can always add or update secrets later via the Secrets button on the Projects page.</p>
         <div class="alert info" style="margin-bottom:18px">
@@ -246,72 +296,109 @@ export const stepperHtml = `
         <button class="btn btn-sm" onclick="addSecretRow()">+ Add secret</button>
       </div>
 
-      <div data-step="7" hidden>
+      <div data-step="8" hidden>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 4px">Review</h3>
         <p style="font-size:12px;color:var(--fg-tertiary);margin:0 0 20px">Confirm your settings before creating the project.</p>
         <div style="display:flex;flex-direction:column">
+          <div class="np-review-h">Ticketing</div>
           <div class="np-review-row">
-            <div class="np-review-label">Ticketing</div>
+            <div class="np-review-label">System</div>
             <div data-review="ticketing"></div>
           </div>
           <div class="np-review-row">
-            <div class="np-review-label">Ticketing Config</div>
+            <div class="np-review-label">Config</div>
             <div data-review="ticketingConfig"></div>
           </div>
           <div class="np-review-row">
-            <div class="np-review-label">Team Key</div>
-            <div data-review="teamKey" class="mono"></div>
+            <div class="np-review-label">Team key</div>
+            <div data-review="teamKey"></div>
           </div>
+
+          <div class="np-review-h">Source</div>
           <div class="np-review-row">
             <div class="np-review-label">Repository</div>
-            <div data-review="repo" class="mono"></div>
+            <div data-review="repo"></div>
           </div>
           <div class="np-review-row">
             <div class="np-review-label">Default branch</div>
-            <div data-review="defaultBranch" class="mono"></div>
+            <div data-review="defaultBranch"></div>
           </div>
           <div class="np-review-row">
-            <div class="np-review-label">Skills Repo</div>
-            <div data-review="skillsRepo" class="mono"></div>
+            <div class="np-review-label">Branch prefix</div>
+            <div data-review="branchPrefix"></div>
           </div>
           <div class="np-review-row">
-            <div class="np-review-label">Sensitive add patterns</div>
+            <div class="np-review-label">Protected files</div>
             <div data-review="sensitiveAddPatterns"></div>
           </div>
           <div class="np-review-row">
-            <div class="np-review-label">Allowed exceptions</div>
+            <div class="np-review-label">Exceptions</div>
             <div data-review="sensitiveAllowPatterns"></div>
           </div>
+
+          <div class="np-review-h">Context</div>
           <div class="np-review-row">
-            <div class="np-review-label">Dep. Token Scope</div>
-            <div data-review="dependencyTokenScope"></div>
+            <div class="np-review-label">Skills repo</div>
+            <div data-review="skillsRepo"></div>
           </div>
           <div class="np-review-row">
-            <div class="np-review-label">Runner</div>
+            <div class="np-review-label">Dependency token scope</div>
+            <div data-review="dependencyTokenScope"></div>
+          </div>
+
+          <div class="np-review-h">Execution</div>
+          <div class="np-review-row">
+            <div class="np-review-label">Mode</div>
             <div data-review="runner"></div>
           </div>
           <div class="np-review-row">
             <div class="np-review-label">Session mode</div>
             <div data-review="session"></div>
           </div>
+
+          <div class="np-review-h">Provider</div>
           <div class="np-review-row">
-            <div class="np-review-label">Provider</div>
+            <div class="np-review-label">Claude provider</div>
             <div data-review="provider"></div>
           </div>
           <div class="np-review-row">
             <div class="np-review-label">Planning</div>
             <div data-review="planning"></div>
           </div>
+
+          <div class="np-review-h">Capacity</div>
           <div class="np-review-row">
-            <div class="np-review-label">Capacity</div>
+            <div class="np-review-label">Parallel issues</div>
             <div data-review="cap"></div>
           </div>
           <div class="np-review-row">
-            <div class="np-review-label">Secrets</div>
+            <div class="np-review-label">Run caps</div>
+            <div data-review="caps"></div>
+          </div>
+
+          <div class="np-review-h">Secrets</div>
+          <div class="np-review-row">
+            <div class="np-review-label">Seeded</div>
             <div data-review="secrets"></div>
+          </div>
+
+          <div class="np-review-h">Pinned defaults <span style="font-weight:400;color:var(--fg-tertiary)">&mdash; most projects keep these; the Edit dialog can change them if yours needs to</span></div>
+          <div class="np-review-row">
+            <div class="np-review-label">Workflow file</div>
+            <div><span class="mono">claude-implement.yml</span></div>
+          </div>
+          <div class="np-review-row">
+            <div class="np-review-label">Planning workflow</div>
+            <div><span class="mono">claude-plan.yml</span></div>
+          </div>
+          <div class="np-review-row">
+            <div class="np-review-label">Extra env</div>
+            <div>none</div>
           </div>
         </div>
       </div>
+    </div>
+
     </div>
 
     <div id="np-error" class="error hidden" style="margin:0 24px"></div>
@@ -331,8 +418,8 @@ export const stepperHtml = `
 export const stepperScript = `
 (function () {
   let step = 0;
-  const LAST_STEP = 7;
-  const STEP_LABELS = ['Ticketing', 'Config', 'Source', 'Runner', 'Provider', 'Capacity', 'Secrets', 'Review'];
+  const LAST_STEP = 8;
+  const STEP_LABELS = ['Ticketing', 'Config', 'Source', 'Context', 'Execution', 'Provider', 'Capacity', 'Secrets', 'Review'];
   const data = {
     ticketingProvider: 'linear',
     jiraJql: '',
@@ -340,11 +427,12 @@ export const stepperScript = `
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
     jiraProfilesFieldOverride: '',
-    teamKey: '', owner: '', repo: '', defaultBranch: '', skillsRepo: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '', dependencyTokenScope: null,
+    teamKey: '', owner: '', repo: '', defaultBranch: '', branchPrefix: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
+    skillsRepo: '', dependencyTokenScope: null,
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
-    maxInProgressAiIssues: 3,
+    maxInProgressAiIssues: 3, maxTurns: null, maxIterations: null, maxJobMinutes: null,
     secrets: [],
   };
   let jiraFieldsLoaded = false;
@@ -362,6 +450,7 @@ export const stepperScript = `
     data.owner = '';
     data.repo = '';
     data.defaultBranch = '';
+    data.branchPrefix = '';
     data.skillsRepo = '';
     data.sensitiveAddPatterns = '';
     data.sensitiveAllowPatterns = '';
@@ -376,10 +465,13 @@ export const stepperScript = `
     data.autoApprovePlans = true;
     data.autoMerge = false;
     data.maxInProgressAiIssues = 3;
+    data.maxTurns = null;
+    data.maxIterations = null;
+    data.maxJobMinutes = null;
     data.secrets = [];
 
-    // Clear inputs
-    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-skills-repo', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion'];
+    // Clear inputs. Not derived from the initializer above — a new field needs both.
+    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-maxJobMinutes'];
     const depScopeEl = document.getElementById('np-dep-token-scope');
     if (depScopeEl) depScopeEl.value = '';
     for (const id of toClear) {
@@ -473,9 +565,6 @@ export const stepperScript = `
       const cls = i === step ? 'active' : i < step ? 'done' : '';
       const numContent = i < step ? '&#10003;' : String(i + 1);
       html += '<div class="stepper-step ' + cls + '"><div class="num">' + numContent + '</div>' + STEP_LABELS[i] + '</div>';
-      if (i < STEP_LABELS.length - 1) {
-        html += '<div class="stepper-divider"></div>';
-      }
     }
     rail.innerHTML = html;
   }
@@ -623,6 +712,13 @@ export const stepperScript = `
     }
   }
 
+  // Blank means "use the built-in default", which the payload carries as null.
+  function optionalCap(id) {
+    const el = document.getElementById(id);
+    const v = el ? el.value.trim() : '';
+    return v === '' ? null : parseInt(v, 10);
+  }
+
   function collectStep(n) {
     if (n === 0) {
       const provEl = document.getElementById('np-ticketing-provider');
@@ -649,25 +745,28 @@ export const stepperScript = `
       const owEl = document.getElementById('np-owner');
       const reEl = document.getElementById('np-repo');
       const brEl = document.getElementById('np-defaultBranch');
-      const srEl = document.getElementById('np-skills-repo');
+      const bpEl = document.getElementById('np-branch-prefix');
       const saEl = document.getElementById('np-sensitive-add');
       const salEl = document.getElementById('np-sensitive-allow');
       if (owEl) data.owner = owEl.value.trim();
       if (reEl) data.repo = reEl.value.trim();
       if (brEl) data.defaultBranch = brEl.value.trim();
-      if (srEl) data.skillsRepo = srEl.value.trim();
+      if (bpEl) data.branchPrefix = bpEl.value.trim();
       if (saEl) data.sensitiveAddPatterns = saEl.value.trim();
       if (salEl) data.sensitiveAllowPatterns = salEl.value.trim();
-      const dtsEl = document.getElementById('np-dep-token-scope');
-      if (dtsEl) data.dependencyTokenScope = dtsEl.value || null;
     } else if (n === 3) {
+      const srEl = document.getElementById('np-skills-repo');
+      const dtsEl = document.getElementById('np-dep-token-scope');
+      if (srEl) data.skillsRepo = srEl.value.trim();
+      if (dtsEl) data.dependencyTokenScope = dtsEl.value || null;
+    } else if (n === 4) {
       const smEl = document.getElementById('np-sessionMode');
       const cpEl = document.getElementById('np-cpus');
       const memEl = document.getElementById('np-mem');
       if (smEl) data.sessionMode = smEl.value;
       if (cpEl) data.machineCpus = parseInt(cpEl.value, 10) || 2;
       if (memEl) data.machineMemoryMb = parseInt(memEl.value, 10) || 4096;
-    } else if (n === 4) {
+    } else if (n === 5) {
       const arEl = document.getElementById('np-awsRegion');
       const plEl = document.getElementById('np-planning');
       const aaEl = document.getElementById('np-autoApprove');
@@ -676,10 +775,13 @@ export const stepperScript = `
       if (plEl) data.planningEnabled = plEl.checked;
       if (aaEl) data.autoApprovePlans = aaEl.checked;
       if (amEl) data.autoMerge = amEl.checked;
-    } else if (n === 5) {
+    } else if (n === 6) {
       const maxEl = document.getElementById('np-maxAi');
       if (maxEl) data.maxInProgressAiIssues = parseInt(maxEl.value, 10);
-    } else if (n === 6) {
+      data.maxTurns = optionalCap('np-maxTurns');
+      data.maxIterations = optionalCap('np-maxIterations');
+      data.maxJobMinutes = optionalCap('np-maxJobMinutes');
+    } else if (n === 7) {
       const secrets = [];
       const list = document.getElementById('np-secrets-list');
       if (list) {
@@ -723,8 +825,10 @@ export const stepperScript = `
       if (!data.repo) { showError('Repository Name is required.'); return false; }
       if (!data.defaultBranch) { showError('Default Branch is required.'); return false; }
     } else if (n === 3) {
-      // executionMode is set via card selection — always valid
+      // Both Context fields are optional — always valid
     } else if (n === 4) {
+      // executionMode is set via card selection — always valid
+    } else if (n === 5) {
       if (data.provider === 'bedrock' && data.executionMode === 'fly-machines') {
         showError('AWS Bedrock cannot be used with the Fly Machines runner. Please change the runner or provider.');
         return false;
@@ -733,7 +837,7 @@ export const stepperScript = `
         showError('AWS Region is required when using the Bedrock provider.');
         return false;
       }
-    } else if (n === 5) {
+    } else if (n === 6) {
       if (!Number.isFinite(data.maxInProgressAiIssues) || data.maxInProgressAiIssues < 1) {
         showError('Max parallel AI issues must be a positive integer.');
         return false;
@@ -755,6 +859,11 @@ export const stepperScript = `
       if (el) el.innerHTML = html;
     };
 
+    // The mono face goes on the value, never the slot, so a placeholder never inherits it.
+    const monoOr = function (value) {
+      return value ? '<span class="mono">' + window.esc(value) + '</span>' : '&mdash;';
+    };
+
     set('ticketing', window.esc(data.ticketingProvider));
 
     let cfgText;
@@ -769,10 +878,11 @@ export const stepperScript = `
     }
     set('ticketingConfig', cfgText);
 
-    set('teamKey', window.esc(effectiveTeamKey()) || '&mdash;');
-    set('repo', window.esc(data.owner) + '/' + window.esc(data.repo));
-    set('defaultBranch', window.esc(data.defaultBranch) || '&mdash;');
-    set('skillsRepo', data.skillsRepo ? window.esc(data.skillsRepo) : '&mdash;');
+    set('teamKey', monoOr(effectiveTeamKey()));
+    set('repo', monoOr(data.owner && data.repo ? data.owner + '/' + data.repo : ''));
+    set('defaultBranch', monoOr(data.defaultBranch));
+    set('branchPrefix', monoOr(data.branchPrefix));
+    set('skillsRepo', monoOr(data.skillsRepo));
     set('sensitiveAddPatterns', data.sensitiveAddPatterns ? (data.sensitiveAddPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' pattern(s)') : '&mdash;');
     set('sensitiveAllowPatterns', data.sensitiveAllowPatterns ? (data.sensitiveAllowPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' exception(s)') : '&mdash;');
     set('dependencyTokenScope', data.dependencyTokenScope ? window.esc(data.dependencyTokenScope) : '&mdash;');
@@ -797,10 +907,15 @@ export const stepperScript = `
     }
     set('planning', planningText);
 
-    set('cap', data.maxInProgressAiIssues + ' parallel');
+    set('cap', String(data.maxInProgressAiIssues));
+
+    const capText = function (value, unit) { return value == null ? 'default' : value + (unit || ''); };
+    set('caps', 'turns ' + capText(data.maxTurns)
+      + ' &middot; iterations ' + capText(data.maxIterations)
+      + ' &middot; timeout ' + capText(data.maxJobMinutes, ' min'));
 
     const validSecrets = data.secrets.filter(function (s) { return s.name && s.value; });
-    set('secrets', validSecrets.length + ' configured');
+    set('secrets', String(validSecrets.length));
   }
 
   function selectExecutionMode(mode) {
@@ -1076,10 +1191,10 @@ export const stepperScript = `
 
   async function stepperSubmit() {
     // Collect any final values from secrets step
-    collectStep(6);
+    collectStep(7);
 
-    // Validate all non-secret/non-review steps (0..5)
-    for (let i = 0; i < 6; i++) {
+    // Validate all non-secret/non-review steps (0..6)
+    for (let i = 0; i < 7; i++) {
       collectStep(i);
       if (!validateStep(i)) return;
     }
@@ -1104,6 +1219,10 @@ export const stepperScript = `
       extraEnv: {},
       provider: data.provider,
       awsRegion: data.provider === 'bedrock' ? (data.awsRegion || null) : null,
+      branchPrefix: data.branchPrefix || null,
+      maxTurns: data.maxTurns,
+      maxIterations: data.maxIterations,
+      maxJobMinutes: data.maxJobMinutes,
       skillsRepo: data.skillsRepo || null,
       sensitiveAddPatterns: data.sensitiveAddPatterns || null,
       sensitiveAllowPatterns: data.sensitiveAllowPatterns || null,
