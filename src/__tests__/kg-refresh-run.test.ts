@@ -594,6 +594,20 @@ describe("kgTrackerDataStep", () => {
     ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
   });
 
+  it("returns { fetched: false } when endpoint returns 503 (tracker not configured)", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl: makeFetch([{ ok: false, status: 503 }]),
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+  });
+
   it("throws KgTrackerDataFetchError when fetchImpl rejects (network error)", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
     const fetchImpl: typeof fetch = async () => { throw new Error("network error"); };

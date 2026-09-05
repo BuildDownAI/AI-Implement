@@ -904,7 +904,12 @@ async function handleDestroySession(
       const [owner, repoName] = job.repo.split("/");
       try {
         const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-        await cancelWorkflowRun(ghToken, owner, repoName, job.runId);
+        const cancelled = await cancelWorkflowRun(ghToken, owner, repoName, job.runId);
+        if (!cancelled) {
+          console.error(`[admin] GHA did not accept cancellation for run ${job.runId}`);
+          json(res, 502, { error: "GHA did not accept cancellation" });
+          return;
+        }
       } catch (err) {
         console.error(`[admin] Failed to cancel GHA workflow run ${job.runId}:`, err);
         json(res, 500, { error: err instanceof Error ? err.message : String(err) });
