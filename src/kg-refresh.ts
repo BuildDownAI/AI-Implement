@@ -107,6 +107,12 @@ export interface KgRefreshHandle {
     outcome: "success" | "failure",
     data: { snapshotCommit?: string; failureCode?: string; failureReason?: string },
   ): void;
+  /**
+   * Called by the reaper when the runner machine is found absent from the registry.
+   * A no-op when stage is not "ingest-running" (idempotent; safe to call after TTL or callback).
+   * opts.failureCode propagates through onOutcome so the caller can suppress default notification.
+   */
+  onMachineLost(opts?: { failureCode?: string }): void;
 }
 
 interface KgRefreshInput {
@@ -151,8 +157,17 @@ interface KgRefreshInput {
    * Returns machine identity for job-row tracking (machineId for Fly, machineNonce always).
    */
   dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }>;
-  /** Record a dispatch_log row for the kg-refresh run. Returns jobId. Injectable for tests. */
-  appendJobLog?: (opts: { dispatchId: string; machineNonce: string; machineId?: string; logsUrl?: string }) => number;
+  /**
+   * Record a dispatch_log row before the machine starts. Returns jobId.
+   * Called with only dispatchId so the row exists before dispatchRun, closing
+   * the waitForQuiet race window. Injectable for tests.
+   */
+  appendJobLog?: (opts: { dispatchId: string }) => number;
+  /**
+   * Update the dispatch_log row with machine identity after dispatch succeeds.
+   * Injectable for tests.
+   */
+  updateJobMachine?: (jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }) => void;
   /** Close the dispatch_log row on a terminal outcome. Injectable for tests. */
   closeJobLog?: (jobId: number, status: "completed" | "failed" | "timed_out") => void;
   /**
@@ -491,34 +506,41 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     if (savedJobId !== null) input.closeJobLog?.(savedJobId, outcome.ok ? "completed" : "failed");
   }
 
+  /** Shared terminal path for lost/timed-out ingest runners. No-op when stage ≠ ingest-running. */
+  function failIngestRunner(reason: string, failureCode?: string): void {
+    if (stage !== "ingest-running") return;
+    lastRefresh = {
+      ok: false,
+      at: Date.now(),
+      gate: "staging",
+      detail: reason,
+      stampBefore: null,
+      stampAfter: null,
+    };
+    running = false;
+    stage = "failed";
+    ingestStartedAt = null;
+    persistStageFn("failed", Date.now());
+    const savedJobId = currentJobId;
+    currentJobId = null;
+    const savedId = currentDispatchId;
+    currentDispatchId = null;
+    void input.onOutcome?.("failure", {
+      failureReason: reason,
+      dispatchId: savedId ?? undefined,
+      timedOut: true,
+      failureCode,
+    });
+    if (savedJobId !== null) input.closeJobLog?.(savedJobId, "timed_out");
+  }
+
   return {
     async trigger() {
       // Self-heal: if a dispatched runner never reported back and the TTL has elapsed
       // in the live process, expire the lock so the operator can trigger a new refresh.
       if (running && stage === "ingest-running" && ingestStartedAt !== null &&
           Date.now() - ingestStartedAt >= KG_REFRESH_TTL_MS) {
-        lastRefresh = {
-          ok: false,
-          at: Date.now(),
-          gate: "staging",
-          detail: "ingest runner timed out — no callback received within TTL",
-          stampBefore: null,
-          stampAfter: null,
-        };
-        running = false;
-        stage = "failed";
-        ingestStartedAt = null;
-        persistStageFn("failed", Date.now());
-        const savedJobId = currentJobId;
-        currentJobId = null;
-        const savedId = currentDispatchId;
-        currentDispatchId = null;
-        void input.onOutcome?.("failure", {
-          failureReason: "ingest runner timed out — no callback received within TTL",
-          dispatchId: savedId ?? undefined,
-          timedOut: true,
-        });
-        if (savedJobId !== null) input.closeJobLog?.(savedJobId, "timed_out");
+        failIngestRunner("ingest runner timed out — no callback received within TTL");
       }
       if (running) return { status: 409, body: { error: "refresh-in-progress" } };
       if (deployHeld()) {
@@ -586,14 +608,29 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               runnerCallbackUrl,
             };
 
-            const dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
+            // Write the row before starting the machine so waitForQuiet cannot
+            // see zero in-flight work between dispatch and row creation.
+            currentJobId = input.appendJobLog?.({ dispatchId }) ?? null;
+
+            let dispatchResult: { machineId?: string; machineNonce: string; logsUrl?: string };
+            try {
+              dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
+            } catch (dispatchErr) {
+              // Machine start failed — close the row immediately so no phantom
+              // in-flight entry persists and the deploy interlock can proceed.
+              if (currentJobId !== null) input.closeJobLog?.(currentJobId, "failed");
+              currentJobId = null;
+              throw dispatchErr;
+            }
+
+            if (currentJobId !== null) {
+              input.updateJobMachine?.(currentJobId, {
+                machineNonce: dispatchResult.machineNonce,
+                machineId: dispatchResult.machineId,
+                logsUrl: dispatchResult.logsUrl,
+              });
+            }
             currentDispatchId = dispatchId;
-            currentJobId = input.appendJobLog?.({
-              dispatchId,
-              machineNonce: dispatchResult.machineNonce,
-              machineId: dispatchResult.machineId,
-              logsUrl: dispatchResult.logsUrl,
-            }) ?? null;
             stage = "ingest-running";
             ingestStartedAt = Date.now();
             persistStageFn("ingest-running", ingestStartedAt);
@@ -798,6 +835,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         lastRefresh,
         stage,
       };
+    },
+
+    onMachineLost(opts?: { failureCode?: string }) {
+      if (stage !== "ingest-running") return;
+      console.log("[kg-refresh] machine absent — reaper closed the ingest runner job");
+      failIngestRunner("ingest runner machine absent — closed by reaper sweep", opts?.failureCode);
     },
   };
 }

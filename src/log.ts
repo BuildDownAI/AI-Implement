@@ -416,6 +416,17 @@ export function getInFlightJobs(): Job[] {
   );
 }
 
+/** Returns all kg-refresh jobs in a non-terminal state (for the reaper's inverse sweep). */
+export function getInFlightKgRefreshJobs(): Job[] {
+  return mapRows(
+    getDb()
+      .prepare(
+        "SELECT * FROM dispatch_log WHERE phase = 'kg-refresh' AND status IN ('dispatched', 'running') ORDER BY dispatched_at ASC",
+      )
+      .all() as RawRow[],
+  );
+}
+
 export function getInFlightIssueIds(): Set<string> {
   const rows = getDb()
     .prepare(
@@ -664,6 +675,14 @@ export function updateJobMachineId(jobId: number, machineId: string): void {
   getDb()
     .prepare("UPDATE dispatch_log SET machine_id = ?, status = 'running' WHERE id = ?")
     .run(machineId, jobId);
+}
+
+/** Records machine identity on a dispatched kg-refresh row after the machine starts. */
+export function updateJobMachineDetails(jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET machine_nonce = ?, machine_id = ? WHERE id = ?")
+    .run(opts.machineNonce, opts.machineId ?? null, jobId);
+  if (opts.logsUrl) updateJobPrUrl(jobId, opts.logsUrl);
 }
 
 /** Clears a job's nonce (called when machine is destroyed). */

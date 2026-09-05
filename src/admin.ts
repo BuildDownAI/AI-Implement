@@ -42,9 +42,9 @@ import { getDeployStartedAt, isDeployHeld } from "./deploy-hold.js";
 import { getInFlightWork } from "./in-flight-work.js";
 import { notifyText } from "./notify.js";
 import { getLastSweepAt } from "./reaper.js";
-import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, getPulls, getIssueEnrichment } from "./log.js";
+import { listLog, getInFlightJobs, getInFlightIssueIds, updateJobStatus, getJobById, markJobNotified, getPulls, getIssueEnrichment } from "./log.js";
 import { getStepsByJobId } from "./step-log.js";
-import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret } from "./fly-machines.js";
+import { listMachines, destroyMachine, listAppSecrets, setAppSecrets, unsetAppSecret, fetchMachineLogs } from "./fly-machines.js";
 import type { TicketIssue, AIImplementSnapshot } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
@@ -52,7 +52,7 @@ import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
 import { getInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
-import { listRepoBranchesAndTags, getRepoDefaultBranch } from "./github.js";
+import { listRepoBranchesAndTags, getRepoDefaultBranch, cancelWorkflowRun } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
@@ -181,6 +181,8 @@ export interface AdminDeps {
   kgRefresh?: {
     trigger(): Promise<{ status: number; body: Record<string, unknown> }>;
     status(): Promise<KgRefreshStatus>;
+    /** Called by the operator-cancel path to close the ingest chain cleanly. */
+    onMachineLost(opts?: { failureCode?: string }): void;
   };
 }
 
@@ -501,9 +503,16 @@ export function handleAdminRequest(
       return true;
     }
 
+    const machineLogsMatch = /^\/api\/sessions\/([^/]+)\/logs$/.exec(url);
+    if (machineLogsMatch && method === "GET") {
+      const machineId = decodeURIComponent(machineLogsMatch[1]);
+      handleGetMachineLogs(req, res, config, machineId);
+      return true;
+    }
+
     if (url.startsWith("/api/sessions/") && method === "DELETE") {
       const machineId = decodeURIComponent(url.slice("/api/sessions/".length));
-      handleDestroySession(req, res, config, registry, machineId);
+      handleDestroySession(req, res, config, registry, machineId, deps);
       return true;
     }
 
@@ -855,14 +864,79 @@ async function handleDestroySession(
   config: AdminConfig,
   registry: ProviderRegistry,
   machineId: string,
+  deps: AdminDeps,
 ): Promise<void> {
+  // Find the job. For Fly jobs, match by machineId. For GHA jobs (no machineId),
+  // fall back to looking up by numeric dispatch_log id passed as the identifier.
+  const job =
+    getInFlightJobs().find((j) => j.machineId === machineId) ??
+    (Number.isFinite(Number(machineId)) ? getJobById(Number(machineId)) : null);
+
+  // Kg-refresh cancel: issue-less run, shared close path via onMachineLost (AII-522).
+  if (job?.phase === "kg-refresh") {
+    if (job.executionMode === "github-actions") {
+      if (!job.runId || !job.repo) {
+        json(res, 422, { error: "GHA run ID or repo missing on kg-refresh job" });
+        return;
+      }
+      const [owner, repoName] = job.repo.split("/");
+      try {
+        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+        const cancelled = await cancelWorkflowRun(ghToken, owner, repoName, job.runId);
+        if (!cancelled) {
+          console.error(`[admin] GHA did not accept cancellation for run ${job.runId}`);
+          json(res, 502, { error: "GHA did not accept cancellation" });
+          return;
+        }
+      } catch (err) {
+        console.error(`[admin] Failed to cancel GHA workflow run ${job.runId}:`, err);
+        json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        return;
+      }
+    } else {
+      if (!config.flySessionsToken || !config.flySessionsApp) {
+        json(res, 503, { error: "Fly sessions config not set" });
+        return;
+      }
+      try {
+        await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
+      } catch (err) {
+        // 404 is fine — machine was already gone
+        if (!(err instanceof Error && err.message.includes("404"))) {
+          console.error(`[admin] Failed to destroy kg-refresh machine ${machineId}:`, err);
+          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+          return;
+        }
+      }
+    }
+
+    // Stamp operator_cancelled before closing the chain. The updateJobStatus guard
+    // (CASE WHEN conclusion IN ('operator_cancelled') THEN conclusion ELSE ?) preserves
+    // this conclusion when onMachineLost() later calls closeJobLog with "timed_out".
+    updateJobStatus(job.id, "failed", "operator_cancelled");
+
+    // Close the ingest chain via the shared reaper path (AII-522).
+    deps.kgRefresh?.onMachineLost({ failureCode: "operator_cancelled" });
+
+    // One operator-cancel notification; mark notified to prevent the poll loop duplicate.
+    if (config.notifyWebhookUrl) {
+      notifyText(
+        config.notifyWebhookUrl,
+        `ℹ️ KG-refresh run cancelled by operator — ingest stopped, no re-dispatch.`,
+      ).catch((err) => console.error("[admin] kg-refresh cancel notify failed:", err));
+    }
+    markJobNotified(job.id);
+
+    console.log(`[admin] kg-refresh job ${job.id} cancelled by operator`);
+    json(res, 200, { destroyed: true });
+    return;
+  }
+
+  // Issue-keyed session destroy: existing path.
   if (!config.flySessionsToken || !config.flySessionsApp) {
     json(res, 503, { error: "Fly sessions config not set" });
     return;
   }
-
-  // Find the job first so we can reset its ticket
-  const job = getInFlightJobs().find((j) => j.machineId === machineId);
 
   try {
     await destroyMachine(config.flySessionsToken, config.flySessionsApp, machineId);
@@ -896,6 +970,30 @@ async function handleDestroySession(
   }
 
   json(res, 200, { destroyed: true });
+}
+
+async function handleGetMachineLogs(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  config: AdminConfig,
+  machineId: string,
+): Promise<void> {
+  if (!config.flySessionsToken || !config.flySessionsApp) {
+    json(res, 503, { error: "Fly sessions config not set" });
+    return;
+  }
+
+  try {
+    const logs = await fetchMachineLogs(config.flySessionsToken, config.flySessionsApp, machineId, 200);
+    json(res, 200, { logs });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("(404)")) {
+      json(res, 404, { error: "Logs no longer available" });
+    } else {
+      json(res, 500, { error: msg });
+    }
+  }
 }
 
 async function handleAuth(

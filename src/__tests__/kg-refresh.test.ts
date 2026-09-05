@@ -160,6 +160,7 @@ describe("kg-refresh", () => {
     await waitDone();
   });
 
+  // Regression pin: AII-518 — deploy hold blocks kg-refresh start (reverse direction of the interlock).
   it("refuses with 409 while the deploy hold is set, and does not run", async () => {
     deployHeld = true;
     const r = await handle.trigger();
@@ -858,24 +859,144 @@ describe("kg-refresh", () => {
       expect(timedOutCall![1]).toMatchObject({ timedOut: true });
     });
 
-    // ---- AII-517: appendJobLog / closeJobLog --------------------------------
+    // ---- AII-522: onMachineLost ------------------------------------------------
 
-    it("appendJobLog called after successful dispatch with machineNonce from dispatchRun", async () => {
-      const appendJobLog = vi.fn(() => 42);
+    it("onMachineLost sets stage=failed and clears running when stage=ingest-running", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.running).toBe(false);
+    });
+
+    it("onMachineLost calls onOutcome with failure and timedOut=true", async () => {
+      const onOutcome = vi.fn();
+      buildDispatch({ onOutcome });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      const failCall = onOutcome.mock.calls.find(([outcome]) => outcome === "failure");
+      expect(failCall).toBeDefined();
+      expect(failCall![1]).toMatchObject({ timedOut: true });
+    });
+
+    it("onMachineLost calls closeJobLog with timed_out", async () => {
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 55);
+      buildDispatch({ appendJobLog, closeJobLog });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(closeJobLog).toHaveBeenCalledWith(55, "timed_out");
+    });
+
+    it("onMachineLost logs the machine-absent message", async () => {
+      const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(consoleSpy).toHaveBeenCalledWith(
+        "[kg-refresh] machine absent — reaper closed the ingest runner job",
+      );
+    });
+
+    it("onMachineLost is a no-op when stage is not ingest-running", async () => {
+      const onOutcome = vi.fn();
+      buildDispatch({ onOutcome });
+      // idle stage at construction — no dispatch triggered
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(onOutcome).not.toHaveBeenCalled();
+      const s = await handle.status();
+      expect(s.stage).toBe("idle");
+    });
+
+    it("onMachineLost is idempotent — second call is no-op", async () => {
+      const onOutcome = vi.fn();
+      buildDispatch({ onOutcome });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      handle.onMachineLost(); // second call
+      await waitDone();
+      const failureCalls = onOutcome.mock.calls.filter(([outcome]) => outcome === "failure");
+      expect(failureCalls).toHaveLength(1);
+    });
+
+    it("TTL expiry still produces timed_out status (shared path regression pin)", async () => {
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 77);
       buildDispatch({
-        dispatchRun: vi.fn(async () => ({ machineNonce: "nonce-abc", machineId: "m-1", logsUrl: "https://fly.io/apps/a/machines/m-1" })),
         appendJobLog,
+        closeJobLog,
+        fetchSnapshotCommitSha: vi.fn().mockResolvedValue(SNAPSHOT_SHA),
       });
       await handle.trigger();
       await waitForStage("ingest-running");
       expect(appendJobLog).toHaveBeenCalledOnce();
-      expect(appendJobLog).toHaveBeenCalledWith({
-        dispatchId: "disp-1",
+      const advancedNow = Date.now() + 4 * 60 * 60 * 1000 + 1000;
+      const spy = vi.spyOn(Date, "now").mockReturnValue(advancedNow);
+      try {
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        expect(closeJobLog).toHaveBeenCalledWith(77, "timed_out");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    // ---- AII-529: row-before-machine ordering --------------------------------
+
+    it("appendJobLog is called before dispatchRun starts the machine", async () => {
+      const callOrder: string[] = [];
+      const appendJobLog = vi.fn(() => { callOrder.push("appendJobLog"); return 42; });
+      const dispatchRunOrdered = vi.fn(async () => { callOrder.push("dispatchRun"); return { machineNonce: "nonce-abc" }; });
+      buildDispatch({ appendJobLog, dispatchRun: dispatchRunOrdered });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(callOrder).toEqual(["appendJobLog", "dispatchRun"]);
+    });
+
+    it("updateJobMachine is called after dispatchRun with machine details", async () => {
+      const appendJobLog = vi.fn(() => 42);
+      const updateJobMachine = vi.fn();
+      buildDispatch({
+        appendJobLog,
+        updateJobMachine,
+        dispatchRun: vi.fn(async () => ({ machineNonce: "nonce-abc", machineId: "m-1", logsUrl: "https://fly.io/apps/a/machines/m-1" })),
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(updateJobMachine).toHaveBeenCalledOnce();
+      expect(updateJobMachine).toHaveBeenCalledWith(42, {
         machineNonce: "nonce-abc",
         machineId: "m-1",
         logsUrl: "https://fly.io/apps/a/machines/m-1",
       });
     });
+
+    it("closeJobLog called immediately with failed when dispatchRun throws", async () => {
+      const appendJobLog = vi.fn(() => 77);
+      const closeJobLog = vi.fn();
+      buildDispatch({
+        appendJobLog,
+        closeJobLog,
+        dispatchRun: vi.fn(async () => { throw new Error("Fly API error"); }),
+      });
+      await handle.trigger();
+      await waitDone();
+      expect(appendJobLog).toHaveBeenCalledOnce();
+      expect(closeJobLog).toHaveBeenCalledWith(77, "failed");
+    });
+
+    // ---- AII-517: appendJobLog / closeJobLog --------------------------------
 
     it("appendJobLog not called when dispatchRun is not configured", async () => {
       const appendJobLog = vi.fn(() => 42);
@@ -996,6 +1117,83 @@ describe("kg-refresh", () => {
       expect(r.status).toBe(202);
       await waitForStage("ingest-running");
       expect(dispatchRun).toHaveBeenCalledOnce();
+    });
+
+    // ---- AII-523: operator-cancel -----------------------------------------------
+
+    it("operator-cancel: onMachineLost({ failureCode }) is the shared close path — closeJobLog called once with timed_out and failureCode forwarded", async () => {
+      // The admin cancel stamps operator_cancelled on the DB row (tested at the
+      // updateJobStatus layer) then calls onMachineLost({ failureCode: "operator_cancelled" })
+      // to close the chain. Verify closeJobLog is called exactly once with "timed_out", and
+      // that failureCode is forwarded through onOutcome so handleKgRefreshOutcome can suppress
+      // its notification (leaving the admin notifyText as the single alert).
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 55);
+      const onOutcome = vi.fn();
+      buildDispatch({ appendJobLog, closeJobLog, onOutcome });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+
+      handle.onMachineLost({ failureCode: "operator_cancelled" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(closeJobLog).toHaveBeenCalledOnce();
+      expect(closeJobLog).toHaveBeenCalledWith(55, "timed_out");
+      const failCalls = onOutcome.mock.calls.filter(([o]) => o === "failure");
+      expect(failCalls).toHaveLength(1);
+      expect(failCalls[0]![1]).toMatchObject({ failureCode: "operator_cancelled", timedOut: true });
+    });
+
+    it("operator-cancel: TTL watchdog does not fire again after onMachineLost (no alert storm)", async () => {
+      // After onMachineLost() closes the chain, advancing the clock past the TTL
+      // and triggering the watchdog check must not fire closeJobLog a second time.
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 66);
+      buildDispatch({
+        appendJobLog,
+        closeJobLog,
+        fetchSnapshotCommitSha: vi.fn().mockResolvedValue(SNAPSHOT_SHA),
+      });
+
+      await handle.trigger();
+      await waitForStage("ingest-running");
+
+      // Admin cancel fires onMachineLost — chain closes, job id cleared internally.
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(closeJobLog).toHaveBeenCalledOnce();
+
+      // Advance clock past TTL and call trigger() again — watchdog check runs but
+      // stage is already "failed" (not "ingest-running"), so it is a no-op.
+      const advancedNow = Date.now() + 4 * 60 * 60 * 1000 + 1000;
+      const spy = vi.spyOn(Date, "now").mockReturnValue(advancedNow);
+      try {
+        const r = await handle.trigger();
+        // Handle is free to re-trigger (running was cleared by onMachineLost).
+        // The important assertion: closeJobLog was NOT called a second time with job 66.
+        const calls = closeJobLog.mock.calls.filter((c) => c[0] === 66);
+        expect(calls).toHaveLength(1);
+        // And no extra failure calls for the original job
+        expect(r.status).not.toBe(500);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("operator-cancel regression: issue-keyed behavior — onMachineLost on idle handle is a no-op", async () => {
+      // Issue-keyed rows never call onMachineLost via the admin cancel path (they
+      // go through the ticket-reset branch). Verify that calling onMachineLost on
+      // an idle handle (stage !== ingest-running) is harmless.
+      const closeJobLog = vi.fn();
+      const onOutcome = vi.fn();
+      buildDispatch({ closeJobLog, onOutcome });
+      // No trigger() — handle stays idle
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(closeJobLog).not.toHaveBeenCalled();
+      expect(onOutcome).not.toHaveBeenCalled();
+      const s = await handle.status();
+      expect(s.stage).toBe("idle");
     });
   });
 });

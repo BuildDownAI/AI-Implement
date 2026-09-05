@@ -231,7 +231,21 @@ export const pipelinesScript = `
           const imageCell = entry.sessionImage
             ? '<td class="mono" title="' + window.escAttr(entry.sessionImage) + '">' + window.esc(entry.sessionImage.split('/').pop()) + '</td>'
             : '<td style="color:#aaa">—</td>';
-          const linkText = entry.phase === 'kg-refresh' ? 'Logs \u2197' : 'View';
+          let logCell;
+          if (entry.machineId) {
+            const btnText = 'Logs';
+            logCell = '<button data-machine-id="' + window.escAttr(entry.machineId) + '" style="background:none;border:none;cursor:pointer;padding:0;color:var(--accent);font:inherit">' + btnText + '</button>';
+          } else if (entry.prUrl) {
+            logCell = '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">View</a>';
+          } else {
+            logCell = '—';
+          }
+          const isInflight = entry.status === 'running' || entry.status === 'dispatched';
+          const isKgRefresh = entry.phase === 'kg-refresh';
+          const cancelId = entry.machineId || (entry.executionMode === 'github-actions' ? String(entry.id) : null);
+          const cancelCell = (isKgRefresh && isInflight && cancelId)
+            ? '<button data-cancel-id="' + window.escAttr(cancelId) + '" title="Cancel this run" style="background:none;border:none;cursor:pointer;padding:0 0 0 8px;color:var(--fail-fg,#dc2626);font:inherit">\u23f9 Stop</button>'
+            : '';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
             + '<td class="mono">' + issueLabel + '</td>'
@@ -241,7 +255,7 @@ export const pipelinesScript = `
             + '<td>' + runnerCell + '</td>'
             + imageCell
             + '<td>' + statusBadge(entry.status) + '</td>'
-            + '<td>' + (entry.prUrl ? '<a href="' + window.safeUrl(entry.prUrl) + '" target="_blank">' + linkText + '</a>' : '—') + '</td>';
+            + '<td>' + logCell + cancelCell + '</td>';
         }
         tbody.appendChild(tr);
       }
@@ -253,6 +267,35 @@ export const pipelinesScript = `
   }
   window.loadLog = loadLog;
 
+  async function viewMachineLogs(machineId) {
+    const dialog = document.createElement('dialog');
+    dialog.style.cssText = 'width:80vw;max-width:900px;max-height:80vh;overflow:auto;padding:0;border:1px solid var(--border-default);border-radius:8px;background:var(--bg-elev)';
+    dialog.innerHTML = '<div style="padding:16px 20px;border-bottom:1px solid var(--border-default);display:flex;justify-content:space-between;align-items:center">'
+      + '<strong>Machine Logs \u2014 ' + window.esc(machineId) + '</strong>'
+      + '<button onclick="this.closest(\'dialog\').close()" style="background:none;border:none;cursor:pointer;font-size:1.2em;color:var(--fg-secondary)">\u00d7</button>'
+      + '</div>'
+      + '<pre class="ml-content" style="margin:0;padding:16px;font-size:0.8em;white-space:pre-wrap;word-break:break-all;color:var(--fg-primary)">Loading\u2026</pre>';
+    document.body.appendChild(dialog);
+    dialog.showModal();
+    dialog.addEventListener('close', function () { dialog.remove(); });
+    try {
+      const r = await window.api('/api/sessions/' + encodeURIComponent(machineId) + '/logs');
+      const body = await r.json();
+      const el = dialog.querySelector('.ml-content');
+      if (!el) return;
+      if (r.status === 200) {
+        el.textContent = body.logs || '(no output)';
+      } else if (r.status === 404) {
+        el.textContent = 'Logs no longer available.';
+      } else {
+        el.textContent = 'Error: ' + (body.error || 'unknown error');
+      }
+    } catch (err) {
+      const el = dialog.querySelector('.ml-content');
+      if (el) el.textContent = 'Failed to fetch logs: ' + String(err);
+    }
+  }
+
   function wireRowClicks() {
     // The job drawer reads the job-steps and mapping endpoints, both Admin-only, so opening it as a
     // user could only ever report failure. The table itself is the granted read and works.
@@ -262,6 +305,21 @@ export const pipelinesScript = `
     tbody.addEventListener('click', function (e) {
       const target = e.target;
       if (target.closest('a')) return;
+      const logsBtn = target.closest('[data-machine-id]');
+      if (logsBtn) {
+        viewMachineLogs(logsBtn.getAttribute('data-machine-id'));
+        return;
+      }
+      const cancelBtn = target.closest('[data-cancel-id]');
+      if (cancelBtn) {
+        const cancelId = cancelBtn.getAttribute('data-cancel-id');
+        if (cancelId && confirm('Stop this KG-refresh run? The machine will be destroyed and the job closed.')) {
+          window.api('/api/sessions/' + encodeURIComponent(cancelId), { method: 'DELETE' })
+            .then(function () { loadLog(); })
+            .catch(function (err) { console.error('cancel failed:', err); });
+        }
+        return;
+      }
       const tr = target.closest('tr');
       const id = tr && tr.getAttribute('data-job-id');
       if (id && window.openJobDrawer) window.openJobDrawer(Number(id));

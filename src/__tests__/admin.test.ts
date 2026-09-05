@@ -23,6 +23,14 @@ vi.mock("../notify.js", async (importOriginal) => ({
   notifyText: notifyTextMock,
 }));
 
+const fetchMachineLogsMock = vi.hoisted(() => vi.fn<() => Promise<string>>());
+const destroyMachineMock = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../fly-machines.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../fly-machines.js")>()),
+  fetchMachineLogs: fetchMachineLogsMock,
+  destroyMachine: destroyMachineMock,
+}));
+
 vi.mock("../workflow-sync.js", () => ({
   syncWorkflowTemplates: vi.fn(),
   classifySyncError: (err: unknown) => ({
@@ -1890,6 +1898,77 @@ describe("admin sessions", () => {
   });
 });
 
+describe("admin machine logs", () => {
+  function flyLogsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
+    return {
+      adminAccessCode: "secret",
+      flySessionsToken: "fly-token",
+      flySessionsApp: "test-sessions-app",
+      flySessionsRegion: null,
+      githubAppId: "test-app-id",
+      githubAppPrivateKey: "test-private-key",
+    };
+  }
+
+  async function requestWithFlyConfig(url: string, method: string, token: string): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest(url, method, { authorization: `Bearer ${token}` });
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, flyLogsConfig(), makeFakeRegistry(provider));
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  beforeEach(() => { fetchMachineLogsMock.mockReset(); });
+
+  it("returns 401 without auth", async () => {
+    const res = await request("/api/sessions/machine-abc/logs", "GET", "secret");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 503 when Fly config is not set", async () => {
+    const token = await login("secret");
+    const res = await request("/api/sessions/machine-abc/logs", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("returns 200 with log text on success", async () => {
+    fetchMachineLogsMock.mockResolvedValueOnce("line1\nline2");
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ logs: "line1\nline2" });
+  });
+
+  it("passes lastN=200 to fetchMachineLogs", async () => {
+    fetchMachineLogsMock.mockResolvedValueOnce("");
+    const token = await login("secret");
+    await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(fetchMachineLogsMock).toHaveBeenCalledWith("fly-token", "test-sessions-app", "machine-abc", 200);
+  });
+
+  it("returns 404 with unavailable message when Fly returns 404", async () => {
+    fetchMachineLogsMock.mockRejectedValueOnce(new Error("Failed to fetch logs for machine machine-abc (404): not found"));
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body).error).toBe("Logs no longer available");
+  });
+
+  it("returns 500 on unexpected Fly API error", async () => {
+    fetchMachineLogsMock.mockRejectedValueOnce(new Error("network timeout"));
+    const token = await login("secret");
+    const res = await requestWithFlyConfig("/api/sessions/machine-abc/logs", "GET", token);
+    expect(res.statusCode).toBe(500);
+    expect(JSON.parse(res.body).error).toBe("network timeout");
+  });
+
+  it("DELETE /api/sessions/:machineId still routes after logs route is added", async () => {
+    const token = await login("secret");
+    const res = await request("/api/sessions/machine-abc", "DELETE", "secret", undefined, token);
+    expect(res.statusCode).toBe(503);
+  });
+});
+
 describe("admin job-detail endpoint", () => {
   it("returns 401 without auth", async () => {
     const res = await request("/api/jobs/1/steps", "GET", "secret");
@@ -2700,6 +2779,14 @@ describe("per-page grants", () => {
       expect((await request("/api/mappings", "GET", "secret", undefined, token)).statusCode).toBe(403);
     });
 
+    // The machine-logs route is parameterized and intentionally absent from PAGE_ROUTES;
+    // a jobs-granted user can read the Pipelines table but cannot proxy machine logs.
+    it("refuses the machine-logs route to a jobs-granted user", async () => {
+      accessGrants.savePageGrants(["jobs"], "ada@eudoxus.ai");
+      const res = await request("/api/sessions/machine-abc/logs", "GET", "secret", undefined, userSession());
+      expect(res.statusCode).toBe(403);
+    });
+
     // A grant is matched on the path alone, so a query string must not defeat it.
     it("matches the path with its query string stripped", async () => {
       accessGrants.savePageGrants(["reports"], "ada@eudoxus.ai");
@@ -2885,5 +2972,117 @@ describe("GET /api/deploy-refs", () => {
     expect(res.statusCode).toBe(503);
     // Generic message — must NOT say "install the GitHub App" (that's the install-specific message).
     expect((res.body as { error: string }).error).not.toMatch(/install the GitHub App/i);
+  });
+});
+
+// ---------- admin sessions — kg-refresh destroy (AII-521) ----------
+
+describe("admin sessions — kg-refresh destroy", () => {
+  const FLY_TOKEN = "fly-test-token";
+  const FLY_APP = "ai-implement-sessions";
+
+  function sessionsConfig(): Parameters<typeof admin.handleAdminRequest>[2] {
+    return {
+      adminAccessCode: "secret",
+      flySessionsToken: FLY_TOKEN,
+      flySessionsApp: FLY_APP,
+      flySessionsRegion: null,
+      githubAppId: "test-app-id",
+      githubAppPrivateKey: "test-private-key",
+      notifyWebhookUrl: "https://hooks.example.com/notify",
+    };
+  }
+
+  async function deleteSession(
+    machineId: string,
+    token: string,
+    kgRefresh?: Parameters<typeof admin.handleAdminRequest>[4]["kgRefresh"],
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest(
+      `/api/sessions/${encodeURIComponent(machineId)}`,
+      "DELETE",
+      { authorization: `Bearer ${token}` },
+    );
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, sessionsConfig(), makeFakeRegistry(provider), {
+      kgRefresh: kgRefresh ?? { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() },
+    });
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  beforeEach(() => {
+    destroyMachineMock.mockReset();
+    destroyMachineMock.mockResolvedValue(undefined);
+    notifyTextMock.mockReset();
+  });
+
+  it("destroys the machine and returns 200 for an in-flight kg-refresh job", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel" });
+    log.updateJobMachineId(jobId, "m-kg-cancel");
+
+    const res = await deleteSession("m-kg-cancel", token);
+
+    expect(res.statusCode).toBe(200);
+    expect(destroyMachineMock).toHaveBeenCalledWith(FLY_TOKEN, FLY_APP, "m-kg-cancel");
+  });
+
+  it("calls kgRefresh.onMachineLost with operator_cancelled failureCode", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel2" });
+    log.updateJobMachineId(jobId, "m-kg-cancel2");
+
+    const onMachineLost = vi.fn();
+    await deleteSession("m-kg-cancel2", token, { trigger: vi.fn(), status: vi.fn(), onMachineLost });
+
+    expect(onMachineLost).toHaveBeenCalledOnce();
+    expect(onMachineLost).toHaveBeenCalledWith({ failureCode: "operator_cancelled" });
+  });
+
+  it("stamps the job row operator_cancelled before calling onMachineLost", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel3" });
+    log.updateJobMachineId(jobId, "m-kg-cancel3");
+
+    await deleteSession("m-kg-cancel3", token);
+
+    const row = log.getJobById(jobId);
+    expect(row?.status).toBe("failed");
+    expect(row?.conclusion).toBe("operator_cancelled");
+  });
+
+  it("sends exactly one notification and does not call provider.clearWorkingState (regression pin)", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({ issueId: "kg-refresh", phase: "kg-refresh", executionMode: "fly-machines" });
+    log.updateJobMachineDetails(jobId, { machineNonce: "nonce-kg", machineId: "m-kg-cancel4" });
+    log.updateJobMachineId(jobId, "m-kg-cancel4");
+
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    await deleteSession("m-kg-cancel4", token);
+
+    expect(notifyTextMock).toHaveBeenCalledOnce();
+    expect(clearWorkingState).not.toHaveBeenCalled();
+  });
+
+  it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {
+    const token = await login("secret");
+    // Create a mapping for the ENG team
+    config.initMappingsTable();
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "ENG", owner: "org", repo: "repo", planningWorkflowFile: "claude-plan.yml",
+    }, token);
+
+    const jobId = log.appendLog({ issueId: "issue-123", issueIdentifier: "ENG-1", teamKey: "ENG", repo: "org/repo", phase: "implementation" });
+    log.updateJobMachineId(jobId, "m-issue-cancel");
+
+    const clearWorkingState = vi.spyOn(provider, "clearWorkingState");
+    const res = await deleteSession("m-issue-cancel", token, undefined);
+
+    expect(res.statusCode).toBe(200);
+    expect(clearWorkingState).toHaveBeenCalled();
   });
 });

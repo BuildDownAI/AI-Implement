@@ -11,6 +11,7 @@ import { NoopStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError } from "./steps/kg-snapshot-push.js";
+import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { ClaudeCliExecutor } from "./executor.js";
 import type { LLMExecutor, StepReporter, StepModule } from "./types.js";
 
@@ -23,6 +24,7 @@ export interface RunKgRefreshOptions {
   fetchImpl?: typeof fetch;
   stepsOverride?: {
     clone?: StepModule;
+    kgTrackerData?: StepModule;
     feedbackLoop?: StepModule;
     kgSnapshotPush?: StepModule;
   };
@@ -164,6 +166,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
   const runner = new PipelineRunner();
   runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
+  runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
   runner.register("feedback-loop", opts.stepsOverride?.feedbackLoop ?? feedbackLoopStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
 
@@ -174,7 +177,14 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   } catch (err) {
     const isMissing = err instanceof KgSnapshotMissingError;
     const isStale = err instanceof KgSnapshotStaleError;
-    const failureCode = isMissing ? "KG_SNAPSHOT_MISSING" : isStale ? "KG_SNAPSHOT_STALE" : undefined;
+    const isTrackerDataError = err instanceof KgTrackerDataFetchError;
+    const failureCode = isMissing
+      ? "KG_SNAPSHOT_MISSING"
+      : isStale
+        ? "KG_SNAPSHOT_STALE"
+        : isTrackerDataError
+          ? "KG_TRACKER_DATA_FETCH_FAILED"
+          : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
     await postRunnerResult({
       phase: "kg-refresh",

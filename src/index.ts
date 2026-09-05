@@ -22,7 +22,7 @@ import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } f
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
@@ -91,6 +91,9 @@ import { KgSidecar } from "./kg-sidecar.js";
 import { makeKgRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+
+/** Set by startServer(); read by poll() to wire the reaper's kg-refresh failure callback. */
+let activeKgRefresh: KgRefreshHandle | null = null;
 
 // ---------- Configuration ----------
 
@@ -665,6 +668,7 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     },
     findPrForIssue: async (repo, issueIdentifier) =>
       (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
+    failKgRefreshMachine: () => { activeKgRefresh?.onMachineLost(); },
   });
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
@@ -2940,6 +2944,9 @@ async function handleKgRefreshOutcome(
   outcome: "success" | "no-new-data" | "failure",
   data: { failureCode?: string; failureReason?: string; dispatchId?: string; timedOut?: boolean },
 ): Promise<void> {
+  // Operator-cancel: the admin endpoint sends its own notification; skip here to avoid a second alert.
+  if (outcome === "failure" && data.failureCode === "operator_cancelled") return;
+
   // One notification per outcome.
   if (config.notifyWebhookUrl) {
     try {
@@ -3096,21 +3103,21 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
       void handleKgRefreshOutcome(config, registry, outcome, data);
     },
     appendJobLog: (opts) => {
-      const jobId = appendLog({
+      return appendLog({
         issueId: "kg-refresh",
         phase: "kg-refresh",
         dispatchId: opts.dispatchId,
-        machineNonce: opts.machineNonce,
-        machineId: opts.machineId,
         executionMode: config.flySessionsToken && config.flySessionsApp ? "fly-machines" : "local-docker",
       });
-      if (opts.logsUrl) updateJobPrUrl(jobId, opts.logsUrl);
-      return jobId;
+    },
+    updateJobMachine: (jobId, opts) => {
+      updateJobMachineDetails(jobId, opts);
     },
     closeJobLog: (jobId, status) => {
       updateJobStatus(jobId, status);
     },
   });
+  activeKgRefresh = kgRefresh;
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
 

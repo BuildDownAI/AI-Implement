@@ -396,7 +396,10 @@ export const deploymentsScript = `
       const elapsed = data.deployStartedAt ? fmtElapsed(data.deployStartedAt) + ' elapsed' : '';
       if (inFlight.length > 0) {
         setBadge(statusBadge, 'warn', 'Draining');
-        statusEl.textContent = inFlight.map(function (w) { return plural(w.count, w.kind); }).join(', ');
+        statusEl.textContent = inFlight.map(function (w) {
+          if (w.kind === 'kg-refresh') return plural(w.count, 'KG ingest run');
+          return plural(w.count, w.kind);
+        }).join(', ');
         statusUnit.textContent = elapsed || 'waiting for in-flight work to finish';
       } else {
         setBadge(statusBadge, 'running', 'Building');
