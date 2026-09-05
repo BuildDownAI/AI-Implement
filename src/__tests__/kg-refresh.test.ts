@@ -160,6 +160,7 @@ describe("kg-refresh", () => {
     await waitDone();
   });
 
+  // Regression pin: AII-518 — deploy hold blocks kg-refresh start (reverse direction of the interlock).
   it("refuses with 409 while the deploy hold is set, and does not run", async () => {
     deployHeld = true;
     const r = await handle.trigger();

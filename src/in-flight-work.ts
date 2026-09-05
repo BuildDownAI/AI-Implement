@@ -3,7 +3,7 @@ import { countRunningWorkflowSyncs } from "./workflow-sync-queue.js";
 
 /** A category of work executing right now. Callers render or count it. */
 export interface InFlightWork {
-  kind: "runner-job" | "workflow-sync";
+  kind: "runner-job" | "kg-refresh" | "workflow-sync";
   count: number;
 }
 
@@ -20,8 +20,12 @@ export interface InFlightWork {
 export function getInFlightWork(): InFlightWork[] {
   const work: InFlightWork[] = [];
 
-  const runnerJobs = getInFlightJobs().length;
+  const allJobs = getInFlightJobs();
+  const runnerJobs = allJobs.filter((j) => j.phase !== "kg-refresh").length;
+  const kgRefreshJobs = allJobs.filter((j) => j.phase === "kg-refresh").length;
+
   if (runnerJobs > 0) work.push({ kind: "runner-job", count: runnerJobs });
+  if (kgRefreshJobs > 0) work.push({ kind: "kg-refresh", count: kgRefreshJobs });
 
   const syncs = countRunningWorkflowSyncs();
   if (syncs > 0) work.push({ kind: "workflow-sync", count: syncs });

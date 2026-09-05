@@ -49,6 +49,10 @@ function dispatchJob(issueId: string): number {
   return log.appendLog({ issueId, repo: "org/app", phase: "implementation" });
 }
 
+function dispatchKgRefreshJob(issueId: string): number {
+  return log.appendLog({ issueId, repo: "org/kg", phase: "kg-refresh" });
+}
+
 describe("getInFlightWork", () => {
   it("reports nothing on an idle orchestrator", () => {
     expect(inFlight.getInFlightWork()).toEqual([]);
@@ -87,6 +91,32 @@ describe("getInFlightWork", () => {
       { kind: "runner-job", count: 1 },
       { kind: "workflow-sync", count: 1 },
     ]);
+  });
+
+  // Forward-direction interlock (AII-518): an in-flight kg-refresh row must block a deploy.
+  it("counts an in-flight kg-refresh job as kind 'kg-refresh', not 'runner-job'", () => {
+    dispatchKgRefreshJob("kg-refresh");
+
+    const result = inFlight.getInFlightWork();
+    expect(result).toEqual([{ kind: "kg-refresh", count: 1 }]);
+    expect(result.some((w) => w.kind === "runner-job")).toBe(false);
+  });
+
+  it("counts kg-refresh and pipeline jobs independently when both are in flight", () => {
+    dispatchJob("issue-1");
+    dispatchKgRefreshJob("kg-refresh");
+
+    expect(inFlight.getInFlightWork()).toEqual([
+      { kind: "runner-job", count: 1 },
+      { kind: "kg-refresh", count: 1 },
+    ]);
+  });
+
+  it("ignores a completed kg-refresh row", () => {
+    const id = dispatchKgRefreshJob("kg-refresh");
+    log.updateJobStatus(id, "completed");
+
+    expect(inFlight.getInFlightWork()).toEqual([]);
   });
 
   it("ignores the queues whose 'dispatched' means finished, not executing", () => {
