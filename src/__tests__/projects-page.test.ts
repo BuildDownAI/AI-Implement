@@ -67,6 +67,19 @@ describe("mapping dialog — tabbed layout", () => {
   });
 });
 
+describe("mapping dialog — cap validation", () => {
+  it("applies the same rule the server does, and routes the error to the Capacity tab", () => {
+    expect(projectsScript).toContain("value !== null && (!Number.isInteger(value) || value < 1)");
+    expect(projectsScript).toMatch(/showMappingError\(cap\[0\][^;]*'capacity'\)/);
+  });
+
+  // parseInt("1.5") is 1, so a decimal would become a different valid number silently.
+  it("parses caps with Number rather than parseInt", () => {
+    expect(projectsScript).toContain("v === '' ? null : Number(v)");
+    expect(projectsScript).not.toContain("parseInt(v, 10)");
+  });
+});
+
 describe("mapping dialog — field placement", () => {
   function panelOf(id: string): string | undefined {
     const at = projectsHtml.indexOf(`id="${id}"`);

@@ -509,6 +509,23 @@ export const projectsScript = `
   }
   window.switchMappingTab = switchMappingTab;
 
+  // Blank means "use the built-in default", which the payload carries as null. Number()
+  // rather than parseInt so "1.5" fails validation instead of truncating to 1.
+  function optionalCap(id) {
+    const v = document.getElementById(id).value.trim();
+    return v === '' ? null : Number(v);
+  }
+
+  const CAP_FIELDS = [
+    ['Max Turns', 'maxTurns'],
+    ['Max Iterations', 'maxIterations'],
+    ['Job Timeout', 'maxJobMinutes'],
+  ];
+
+  function badCap(value) {
+    return value !== null && (!Number.isInteger(value) || value < 1);
+  }
+
   // Several save rules span two tabs, so the offending field may be on a hidden panel.
   function showMappingError(message, tab) {
     if (tab) switchMappingTab(tab);
@@ -778,7 +795,7 @@ export const projectsScript = `
       repo: document.getElementById('md-repo').value.trim(),
       workflowFile: document.getElementById('md-wf').value.trim(),
       defaultBranch,
-      maxInProgressAiIssues: parseInt(document.getElementById('md-max-ai').value, 10),
+      maxInProgressAiIssues: Number(document.getElementById('md-max-ai').value.trim() || NaN),
       executionMode: document.getElementById('md-exec-mode').value,
       sessionMode: document.getElementById('md-session-mode').value,
       machineCpus: parseInt(document.getElementById('md-cpus').value, 10),
@@ -790,9 +807,9 @@ export const projectsScript = `
       extraEnv: parseEnvText(document.getElementById('md-env').value),
       provider: document.getElementById('md-provider').value,
       awsRegion: document.getElementById('md-aws-region').value.trim() || null,
-      maxTurns: (function(){ var v = document.getElementById('md-max-turns').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
-      maxIterations: (function(){ var v = document.getElementById('md-max-iter').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
-      maxJobMinutes: (function(){ var v = document.getElementById('md-max-job-min').value.trim(); return v === '' ? null : parseInt(v, 10); })(),
+      maxTurns: optionalCap('md-max-turns'),
+      maxIterations: optionalCap('md-max-iter'),
+      maxJobMinutes: optionalCap('md-max-job-min'),
       branchPrefix: (function(){ var v = document.getElementById('md-branch-prefix').value.trim(); return v === '' ? null : v; })(),
       skillsRepo: (function(){ var v = document.getElementById('md-skills-repo').value.trim(); return v === '' ? null : v; })(),
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
@@ -830,9 +847,15 @@ export const projectsScript = `
       showMappingError('Owner and Repo are required.', 'source');
       return;
     }
-    if (!Number.isFinite(body.maxInProgressAiIssues) || body.maxInProgressAiIssues < 1) {
+    if (!Number.isInteger(body.maxInProgressAiIssues) || body.maxInProgressAiIssues < 1) {
       showMappingError('Max AI Issues must be a positive integer.', 'capacity');
       return;
+    }
+    for (const cap of CAP_FIELDS) {
+      if (badCap(body[cap[1]])) {
+        showMappingError(cap[0] + ' must be a positive integer, or blank for the default.', 'capacity');
+        return;
+      }
     }
     if (body.provider === 'bedrock' && body.executionMode === 'fly-machines') {
       showMappingError('Bedrock is not supported with the fly-machines execution mode. Change one of them.', 'provider');

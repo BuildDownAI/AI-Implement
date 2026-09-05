@@ -131,6 +131,29 @@ describe("new-project stepper — the four touch points a new field needs", () =
   });
 });
 
+describe("new-project stepper — cap validation", () => {
+  // Mirrors resolveCap on the server: integer, at least 1, or null for the default. The
+  // point of checking here is to name the field rather than round-trip a 400.
+  it("rejects a cap that is not a positive integer, and allows a blank one", () => {
+    expect(stepperScript).toContain("function badCap(value)");
+    expect(stepperScript).toContain("value !== null && (!Number.isInteger(value) || value < 1)");
+  });
+
+  it("checks all three optional caps, not only the required one", () => {
+    for (const field of ["maxTurns", "maxIterations", "maxJobMinutes"]) {
+      expect(stepperScript).toContain(`'${field}'`);
+    }
+    expect(stepperScript).toContain("for (const cap of CAP_FIELDS)");
+  });
+
+  // parseInt("1.5") is 1, so a decimal would become a different valid number instead of
+  // an error. Number() keeps it non-integer so badCap can reject it.
+  it("parses with Number rather than parseInt, so a decimal cannot truncate silently", () => {
+    expect(stepperScript).not.toContain("parseInt(v, 10)");
+    expect(stepperScript).toContain("v === '' ? null : Number(v)");
+  });
+});
+
 describe("new-project stepper — field placement", () => {
   const stepOf = (id: string): number => {
     const at = stepperHtml.indexOf(`id="${id}"`);

@@ -712,11 +712,22 @@ export const stepperScript = `
     }
   }
 
-  // Blank means "use the built-in default", which the payload carries as null.
+  // Blank means "use the built-in default", which the payload carries as null. Number()
+  // rather than parseInt so "1.5" fails validation instead of truncating to 1.
   function optionalCap(id) {
     const el = document.getElementById(id);
     const v = el ? el.value.trim() : '';
-    return v === '' ? null : parseInt(v, 10);
+    return v === '' ? null : Number(v);
+  }
+
+  const CAP_FIELDS = [
+    ['Max Turns', 'maxTurns'],
+    ['Max Iterations', 'maxIterations'],
+    ['Job Timeout', 'maxJobMinutes'],
+  ];
+
+  function badCap(value) {
+    return value !== null && (!Number.isInteger(value) || value < 1);
   }
 
   function collectStep(n) {
@@ -777,7 +788,7 @@ export const stepperScript = `
       if (amEl) data.autoMerge = amEl.checked;
     } else if (n === 6) {
       const maxEl = document.getElementById('np-maxAi');
-      if (maxEl) data.maxInProgressAiIssues = parseInt(maxEl.value, 10);
+      if (maxEl) data.maxInProgressAiIssues = maxEl.value.trim() === '' ? NaN : Number(maxEl.value);
       data.maxTurns = optionalCap('np-maxTurns');
       data.maxIterations = optionalCap('np-maxIterations');
       data.maxJobMinutes = optionalCap('np-maxJobMinutes');
@@ -838,9 +849,15 @@ export const stepperScript = `
         return false;
       }
     } else if (n === 6) {
-      if (!Number.isFinite(data.maxInProgressAiIssues) || data.maxInProgressAiIssues < 1) {
+      if (!Number.isInteger(data.maxInProgressAiIssues) || data.maxInProgressAiIssues < 1) {
         showError('Max parallel AI issues must be a positive integer.');
         return false;
+      }
+      for (const cap of CAP_FIELDS) {
+        if (badCap(data[cap[1]])) {
+          showError(cap[0] + ' must be a positive integer, or blank for the default.');
+          return false;
+        }
       }
     }
     return true;
