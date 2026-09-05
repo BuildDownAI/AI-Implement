@@ -1090,5 +1090,82 @@ describe("kg-refresh", () => {
       await waitForStage("ingest-running");
       expect(dispatchRun).toHaveBeenCalledOnce();
     });
+
+    // ---- AII-523: operator-cancel -----------------------------------------------
+
+    it("operator-cancel: onMachineLost({ failureCode }) is the shared close path — closeJobLog called once with timed_out and failureCode forwarded", async () => {
+      // The admin cancel stamps operator_cancelled on the DB row (tested at the
+      // updateJobStatus layer) then calls onMachineLost({ failureCode: "operator_cancelled" })
+      // to close the chain. Verify closeJobLog is called exactly once with "timed_out", and
+      // that failureCode is forwarded through onOutcome so handleKgRefreshOutcome can suppress
+      // its notification (leaving the admin notifyText as the single alert).
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 55);
+      const onOutcome = vi.fn();
+      buildDispatch({ appendJobLog, closeJobLog, onOutcome });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+
+      handle.onMachineLost({ failureCode: "operator_cancelled" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(closeJobLog).toHaveBeenCalledOnce();
+      expect(closeJobLog).toHaveBeenCalledWith(55, "timed_out");
+      const failCalls = onOutcome.mock.calls.filter(([o]) => o === "failure");
+      expect(failCalls).toHaveLength(1);
+      expect(failCalls[0]![1]).toMatchObject({ failureCode: "operator_cancelled", timedOut: true });
+    });
+
+    it("operator-cancel: TTL watchdog does not fire again after onMachineLost (no alert storm)", async () => {
+      // After onMachineLost() closes the chain, advancing the clock past the TTL
+      // and triggering the watchdog check must not fire closeJobLog a second time.
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 66);
+      buildDispatch({
+        appendJobLog,
+        closeJobLog,
+        fetchSnapshotCommitSha: vi.fn().mockResolvedValue(SNAPSHOT_SHA),
+      });
+
+      await handle.trigger();
+      await waitForStage("ingest-running");
+
+      // Admin cancel fires onMachineLost — chain closes, job id cleared internally.
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(closeJobLog).toHaveBeenCalledOnce();
+
+      // Advance clock past TTL and call trigger() again — watchdog check runs but
+      // stage is already "failed" (not "ingest-running"), so it is a no-op.
+      const advancedNow = Date.now() + 4 * 60 * 60 * 1000 + 1000;
+      const spy = vi.spyOn(Date, "now").mockReturnValue(advancedNow);
+      try {
+        const r = await handle.trigger();
+        // Handle is free to re-trigger (running was cleared by onMachineLost).
+        // The important assertion: closeJobLog was NOT called a second time with job 66.
+        const calls = closeJobLog.mock.calls.filter((c) => c[0] === 66);
+        expect(calls).toHaveLength(1);
+        // And no extra failure calls for the original job
+        expect(r.status).not.toBe(500);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("operator-cancel regression: issue-keyed behavior — onMachineLost on idle handle is a no-op", async () => {
+      // Issue-keyed rows never call onMachineLost via the admin cancel path (they
+      // go through the ticket-reset branch). Verify that calling onMachineLost on
+      // an idle handle (stage !== ingest-running) is harmless.
+      const closeJobLog = vi.fn();
+      const onOutcome = vi.fn();
+      buildDispatch({ closeJobLog, onOutcome });
+      // No trigger() — handle stays idle
+      handle.onMachineLost();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(closeJobLog).not.toHaveBeenCalled();
+      expect(onOutcome).not.toHaveBeenCalled();
+      const s = await handle.status();
+      expect(s.stage).toBe("idle");
+    });
   });
 });

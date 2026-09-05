@@ -110,8 +110,9 @@ export interface KgRefreshHandle {
   /**
    * Called by the reaper when the runner machine is found absent from the registry.
    * A no-op when stage is not "ingest-running" (idempotent; safe to call after TTL or callback).
+   * opts.failureCode propagates through onOutcome so the caller can suppress default notification.
    */
-  onMachineLost(): void;
+  onMachineLost(opts?: { failureCode?: string }): void;
 }
 
 interface KgRefreshInput {
@@ -497,7 +498,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   }
 
   /** Shared terminal path for lost/timed-out ingest runners. No-op when stage ≠ ingest-running. */
-  function failIngestRunner(reason: string): void {
+  function failIngestRunner(reason: string, failureCode?: string): void {
     if (stage !== "ingest-running") return;
     lastRefresh = {
       ok: false,
@@ -519,6 +520,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       failureReason: reason,
       dispatchId: savedId ?? undefined,
       timedOut: true,
+      failureCode,
     });
     if (savedJobId !== null) input.closeJobLog?.(savedJobId, "timed_out");
   }
@@ -811,10 +813,10 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       };
     },
 
-    onMachineLost() {
+    onMachineLost(opts?: { failureCode?: string }) {
       if (stage !== "ingest-running") return;
       console.log("[kg-refresh] machine absent — reaper closed the ingest runner job");
-      failIngestRunner("ingest runner machine absent — closed by reaper sweep");
+      failIngestRunner("ingest runner machine absent — closed by reaper sweep", opts?.failureCode);
     },
   };
 }
