@@ -70,7 +70,7 @@ The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on bo
 - Local Docker: `LOCAL_RUNNER_IMAGE` configured, no Fly tokens
 - Neither configured → `dispatchKgRefreshRun()` throws at `src/index.ts:3085`. By this point `trigger()` has already returned 202; the throw is caught by the async IIFE catch block at `src/kg-refresh.ts:629`, which sets `stage = "failed"` and fires `onOutcome("failure", ...)` as an async failure outcome.
 
-GHA dispatch is not supported for issueless run kinds. There is no `workflow_dispatch` hook in `claude-implement.yml` that maps to `kg-refresh`.
+GHA dispatch is not exposed for issueless run kinds — there is no `workflow_dispatch` hook in `claude-implement.yml` that maps to `kg-refresh`. However, the cancel endpoint (`src/admin.ts` `handleDestroySession`) handles the `github-actions` executionMode defensively: if a kg-refresh job ever enters that state, the branch calls `cancelWorkflowRun` exactly as it would for any GHA job. New issueless run kinds should follow the same pattern (see §10 step 13).
 
 ---
 
@@ -370,7 +370,7 @@ In `src/completion-classification.ts`, add phase-specific handling in `classifyC
 In `src/notify.ts`, add a `notifyYourKindOutcome()` export following the shape of `notifyKgRefreshOutcome()` (Slack + Teams implementations, typed payload interface). Call it from your outcome handler in `src/index.ts`.
 
 **13. Wire the operator cancel**
-In `src/admin.ts` `handleDestroySession()`, add a `job.phase === "<your-phase>"` branch that destroys the machine/run, stamps `operator_cancelled`, calls your `onMachineLost()` equivalent, and sends a single notification.
+In `src/admin.ts` `handleDestroySession()`, add a `job.phase === "<your-phase>"` branch that destroys the machine/run, stamps `operator_cancelled`, calls your `onMachineLost()` equivalent, and sends a single notification. The branch must also handle `job.executionMode === "github-actions"`: check for a valid `job.runId` and `job.repo`, then call `cancelWorkflowRun` — consistent with how the kg-refresh branch is implemented (lines 899–912). GHA dispatch is not exposed for issueless run kinds today, but the cancel handler must be defensive against a job entering that state.
 
 **14. Wire the in-process state machine and crash recovery**
 Persist stage + start time to the `settings` table. On orchestrator boot, load the persisted stage and either resume or mark failed. Gate dispatch on `running === false` and `deployHeld() === false`.
@@ -387,7 +387,7 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | dispatch_log row (schema, write, query) | `src/log.ts` (`appendLog`, `getInFlightJobs`, `getInFlightKgRefreshJobs`) |
 | Callback routing carve-out | `src/runner-callback.ts` (~line 252) |
 | KG push token vending | `src/kg-push-token-vending.ts` |
-| Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
+| Tracker-data endpoint | `src/runner-callback.ts` (`handleKgTrackerDataRequest` — implementation and token verify); routed in `src/index.ts` (`/api/runner/kg-tracker-data`) |
 | Tracker-data pipeline step | `src/pipeline/steps/kg-tracker-data.ts` |
 | KG refresh pipeline definition | `pipelines/kg-refresh.yml` |
 | Fly / local Docker dispatch | `src/index.ts` (`dispatchKgRefreshRun`) |
