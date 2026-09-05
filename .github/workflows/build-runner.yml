@@ -217,9 +217,12 @@ jobs:
           }
           echo "PASS: Assertion 1 — entrypoint reached the pipeline handoff"
 
-          # Assertion 2: pipeline ran and reported back via the callback
-          grep -q "POST" "$requests_log" || {
-            echo "FAIL: Assertion 2 — no POST received by callback listener"
+          # Assertion 2: pipeline ran and reported back via the result callback.
+          # The kg-tracker-data step also POSTs to the listener (/api/runner/kg-tracker-data)
+          # before it fails; checking for /runner/result specifically ensures the pipeline
+          # reached postRunnerResult and not just the pre-flight fetch.
+          grep -q "POST /runner/result" "$requests_log" || {
+            echo "FAIL: Assertion 2 — no POST /runner/result received by callback listener"
             exit 1
           }
           echo "PASS: Assertion 2 — pipeline reported back to callback listener"

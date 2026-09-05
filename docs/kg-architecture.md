@@ -355,12 +355,23 @@ the same progress token. `stripEmbeddedTokenFromOrigin` in `kg-snapshot-push.ts`
 token from the remote URL right before push to counter `refreshRunnerGithubCredentials`
 re-embedding it after clone.
 
-**Fly session image pinning (AII-534).** When dispatching a kg-refresh Fly machine,
-`dispatchKgRefreshRun` uses `process.env.FLY_IMAGE_REF` (injected by Fly into every machine)
-as the session image. This guarantees the dispatched machine runs the same image generation
-as the orchestrator, so `pipeline/kg-refresh-run.js` and its dependencies are always present.
-When `FLY_IMAGE_REF` is absent (non-Fly orchestrator, e.g. local Docker), the dispatch falls
-back to `config.sessionImage`.
+**Fly session image pinning (AII-534).** `dispatchKgRefreshRun` pairs the session machine to
+the same pipeline generation as the orchestrator via `resolveKgRefreshSessionImage`
+(`src/repo-image.ts`). Resolution order:
+
+1. Per-repo `.ai-implement/image.yml` override always wins (same as the standard implementation
+   dispatch path).
+2. When `AI_IMPLEMENT_SOURCE_COMMIT` is set (baked into the orchestrator image by `Dockerfile`
+   build arg at the same commit as `build-runner.yml` tags each runner push), the session image
+   is resolved as `<base-of-sessionImage>:<AI_IMPLEMENT_SOURCE_COMMIT>` and verified against the
+   registry anonymously. On a hit the pinned ref is used; on a miss the function logs one line
+   and falls through.
+3. Falls back to `config.sessionImage`.
+
+`FLY_IMAGE_REF` is the orchestrator's own Fly image ref and is intentionally **not** used here
+— it points at the root `Dockerfile` orchestrator image, not the `Dockerfile.session` runner
+image. Using it would dispatch a machine running the orchestrator binary as the session image,
+reproducing the bootstrap exit this fix addresses.
 
 ## Failure history
 
