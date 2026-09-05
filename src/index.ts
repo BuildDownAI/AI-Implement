@@ -2944,6 +2944,9 @@ async function handleKgRefreshOutcome(
   outcome: "success" | "no-new-data" | "failure",
   data: { failureCode?: string; failureReason?: string; dispatchId?: string; timedOut?: boolean },
 ): Promise<void> {
+  // Operator-cancel: the admin endpoint sends its own notification; skip here to avoid a second alert.
+  if (outcome === "failure" && data.failureCode === "operator_cancelled") return;
+
   // One notification per outcome.
   if (config.notifyWebhookUrl) {
     try {

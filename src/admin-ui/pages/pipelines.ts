@@ -240,6 +240,12 @@ export const pipelinesScript = `
           } else {
             logCell = '—';
           }
+          const isInflight = entry.status === 'running' || entry.status === 'dispatched';
+          const isKgRefresh = entry.phase === 'kg-refresh';
+          const cancelId = entry.machineId || (entry.executionMode === 'github-actions' ? String(entry.id) : null);
+          const cancelCell = (isKgRefresh && isInflight && cancelId)
+            ? '<button data-cancel-id="' + window.escAttr(cancelId) + '" title="Cancel this run" style="background:none;border:none;cursor:pointer;padding:0 0 0 8px;color:var(--fail-fg,#dc2626);font:inherit">\u23f9 Stop</button>'
+            : '';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
             + '<td class="mono">' + issueLabel + '</td>'
@@ -249,7 +255,7 @@ export const pipelinesScript = `
             + '<td>' + runnerCell + '</td>'
             + imageCell
             + '<td>' + statusBadge(entry.status) + '</td>'
-            + '<td>' + logCell + '</td>';
+            + '<td>' + logCell + cancelCell + '</td>';
         }
         tbody.appendChild(tr);
       }
@@ -302,6 +308,16 @@ export const pipelinesScript = `
       const logsBtn = target.closest('[data-machine-id]');
       if (logsBtn) {
         viewMachineLogs(logsBtn.getAttribute('data-machine-id'));
+        return;
+      }
+      const cancelBtn = target.closest('[data-cancel-id]');
+      if (cancelBtn) {
+        const cancelId = cancelBtn.getAttribute('data-cancel-id');
+        if (cancelId && confirm('Stop this KG-refresh run? The machine will be destroyed and the job closed.')) {
+          window.api('/api/sessions/' + encodeURIComponent(cancelId), { method: 'DELETE' })
+            .then(function () { loadLog(); })
+            .catch(function (err) { console.error('cancel failed:', err); });
+        }
         return;
       }
       const tr = target.closest('tr');
