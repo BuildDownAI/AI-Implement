@@ -22,7 +22,7 @@ import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } f
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
@@ -3103,16 +3103,15 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
       void handleKgRefreshOutcome(config, registry, outcome, data);
     },
     appendJobLog: (opts) => {
-      const jobId = appendLog({
+      return appendLog({
         issueId: "kg-refresh",
         phase: "kg-refresh",
         dispatchId: opts.dispatchId,
-        machineNonce: opts.machineNonce,
-        machineId: opts.machineId,
         executionMode: config.flySessionsToken && config.flySessionsApp ? "fly-machines" : "local-docker",
       });
-      if (opts.logsUrl) updateJobPrUrl(jobId, opts.logsUrl);
-      return jobId;
+    },
+    updateJobMachine: (jobId, opts) => {
+      updateJobMachineDetails(jobId, opts);
     },
     closeJobLog: (jobId, status) => {
       updateJobStatus(jobId, status);

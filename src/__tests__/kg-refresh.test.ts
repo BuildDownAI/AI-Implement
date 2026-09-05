@@ -952,24 +952,51 @@ describe("kg-refresh", () => {
       }
     });
 
-    // ---- AII-517: appendJobLog / closeJobLog --------------------------------
+    // ---- AII-529: row-before-machine ordering --------------------------------
 
-    it("appendJobLog called after successful dispatch with machineNonce from dispatchRun", async () => {
+    it("appendJobLog is called before dispatchRun starts the machine", async () => {
+      const callOrder: string[] = [];
+      const appendJobLog = vi.fn(() => { callOrder.push("appendJobLog"); return 42; });
+      const dispatchRunOrdered = vi.fn(async () => { callOrder.push("dispatchRun"); return { machineNonce: "nonce-abc" }; });
+      buildDispatch({ appendJobLog, dispatchRun: dispatchRunOrdered });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(callOrder).toEqual(["appendJobLog", "dispatchRun"]);
+    });
+
+    it("updateJobMachine is called after dispatchRun with machine details", async () => {
       const appendJobLog = vi.fn(() => 42);
+      const updateJobMachine = vi.fn();
       buildDispatch({
-        dispatchRun: vi.fn(async () => ({ machineNonce: "nonce-abc", machineId: "m-1", logsUrl: "https://fly.io/apps/a/machines/m-1" })),
         appendJobLog,
+        updateJobMachine,
+        dispatchRun: vi.fn(async () => ({ machineNonce: "nonce-abc", machineId: "m-1", logsUrl: "https://fly.io/apps/a/machines/m-1" })),
       });
       await handle.trigger();
       await waitForStage("ingest-running");
-      expect(appendJobLog).toHaveBeenCalledOnce();
-      expect(appendJobLog).toHaveBeenCalledWith({
-        dispatchId: "disp-1",
+      expect(updateJobMachine).toHaveBeenCalledOnce();
+      expect(updateJobMachine).toHaveBeenCalledWith(42, {
         machineNonce: "nonce-abc",
         machineId: "m-1",
         logsUrl: "https://fly.io/apps/a/machines/m-1",
       });
     });
+
+    it("closeJobLog called immediately with failed when dispatchRun throws", async () => {
+      const appendJobLog = vi.fn(() => 77);
+      const closeJobLog = vi.fn();
+      buildDispatch({
+        appendJobLog,
+        closeJobLog,
+        dispatchRun: vi.fn(async () => { throw new Error("Fly API error"); }),
+      });
+      await handle.trigger();
+      await waitDone();
+      expect(appendJobLog).toHaveBeenCalledOnce();
+      expect(closeJobLog).toHaveBeenCalledWith(77, "failed");
+    });
+
+    // ---- AII-517: appendJobLog / closeJobLog --------------------------------
 
     it("appendJobLog not called when dispatchRun is not configured", async () => {
       const appendJobLog = vi.fn(() => 42);

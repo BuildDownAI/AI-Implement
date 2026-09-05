@@ -89,6 +89,13 @@ describe("deployments page", () => {
     expect(deploymentsScript).toContain("plural(w.count, w.kind)");
   });
 
+  it("labels kg-refresh drain entries as 'KG ingest run'", () => {
+    // The raw kind string is 'kg-refresh'; the drain tile must show a human-readable
+    // label rather than the internal kind identifier.
+    expect(deploymentsScript).toContain("w.kind === 'kg-refresh'");
+    expect(deploymentsScript).toContain("plural(w.count, 'KG ingest run')");
+  });
+
   it("confirms before triggering a deploy, and does so before the request", () => {
     // Native confirm is the house gate for consequential actions (destroying a machine,
     // deleting a secret). Ordering is the point: confirming after the POST would gate
