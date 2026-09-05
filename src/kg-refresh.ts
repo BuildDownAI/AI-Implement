@@ -154,9 +154,12 @@ interface KgRefreshInput {
   /**
    * Dispatch a kg-refresh runner job. When provided, trigger() dispatches instead of
    * returning ingest-needed. opts.runConfig is the base64-encoded RunConfigV1.
-   * Returns machine identity for job-row tracking (machineId for Fly, machineNonce always).
+   * Returns backend identity for job-row tracking.
+   * - Fly path: machineId + machineNonce (always set)
+   * - GHA path: workflowRunId (when found) + logsUrl; no machineNonce
+   * - Local Docker: machineNonce only
    */
-  dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }>;
+  dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
   /**
    * Record a dispatch_log row before the machine starts. Returns jobId.
    * Called with only dispatchId so the row exists before dispatchRun, closing
@@ -164,10 +167,12 @@ interface KgRefreshInput {
    */
   appendJobLog?: (opts: { dispatchId: string }) => number;
   /**
-   * Update the dispatch_log row with machine identity after dispatch succeeds.
+   * Update the dispatch_log row with backend identity after dispatch succeeds.
+   * machineNonce is set for Fly and local Docker paths; absent for GHA (no nonce concept).
+   * workflowRunId is set for GHA when findWorkflowRunId resolves a run.
    * Injectable for tests.
    */
-  updateJobMachine?: (jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }) => void;
+  updateJobMachine?: (jobId: number, opts: { machineNonce?: string; machineId?: string; logsUrl?: string; workflowRunId?: number }) => void;
   /** Close the dispatch_log row on a terminal outcome. Injectable for tests. */
   closeJobLog?: (jobId: number, status: "completed" | "failed" | "timed_out") => void;
   /**
@@ -612,11 +617,11 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             // see zero in-flight work between dispatch and row creation.
             currentJobId = input.appendJobLog?.({ dispatchId }) ?? null;
 
-            let dispatchResult: { machineId?: string; machineNonce: string; logsUrl?: string };
+            let dispatchResult: { machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number };
             try {
               dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
             } catch (dispatchErr) {
-              // Machine start failed — close the row immediately so no phantom
+              // Machine/run start failed — close the row immediately so no phantom
               // in-flight entry persists and the deploy interlock can proceed.
               if (currentJobId !== null) input.closeJobLog?.(currentJobId, "failed");
               currentJobId = null;
@@ -628,6 +633,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
                 machineNonce: dispatchResult.machineNonce,
                 machineId: dispatchResult.machineId,
                 logsUrl: dispatchResult.logsUrl,
+                workflowRunId: dispatchResult.workflowRunId,
               });
             }
             currentDispatchId = dispatchId;
