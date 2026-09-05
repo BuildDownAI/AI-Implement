@@ -113,6 +113,33 @@ describe("structural isolation", () => {
   });
 });
 
+// ─── pageScript name ↔ data-page route alignment ─────────────────────────────
+
+describe("pageScript name to data-page route alignment", () => {
+  // Sections that intentionally have no script wrapper (stub routes + utility page)
+  const UNSCRIPTED_ROUTES = new Set([
+    "no-access",
+    "channels", "policies", "secrets", "mcp", "webhooks", "updates",
+  ]);
+
+  it("every scripted page section's data-page value has a matching pageScript(name) call", () => {
+    const sectionRoutes = [...adminHtml.matchAll(/<section[^>]*\sdata-page="([^"]+)"/g)].map((m) => m[1]);
+    const scriptedRoutes = sectionRoutes.filter((r) => !UNSCRIPTED_ROUTES.has(r));
+
+    // Names passed to markPageFailed come from the pageScript(name, ...) first argument
+    const failedPageNames = new Set(
+      [...adminHtml.matchAll(/markPageFailed\("([^"]+)"/g)].map((m) => m[1]),
+    );
+
+    for (const route of scriptedRoutes) {
+      expect(
+        failedPageNames.has(route),
+        `data-page="${route}" has no matching pageScript("${route}", ...) — name mismatch in index.ts`,
+      ).toBe(true);
+    }
+  });
+});
+
 // ─── runtime containment ──────────────────────────────────────────────────────
 
 describe("runtime error containment", () => {

@@ -64,7 +64,8 @@ const shell = `<div id="admin-page" class="app-shell hidden">
 </div>`;
 
 function pageScript(name: string, src: string): string {
-  return `<script>try{${src}}catch(_e){window.markPageFailed&&window.markPageFailed(${JSON.stringify(name)},_e);console.error('[admin-ui] page ${name} failed to register',_e);}</script>`;
+  const n = JSON.stringify(name);
+  return `<script>try{${src}}catch(_e){window.markPageFailed&&window.markPageFailed(${n},_e);console.error('[admin-ui] page '+${n}+' failed to register',_e);}</script>`;
 }
 
 const body = `<body>
@@ -103,7 +104,7 @@ ${drawerHtml}
 ${pageScript('overview', overviewScript)}
 ${pageScript('settings', settingsScript)}
 ${pageScript('projects', projectsScript)}
-${pageScript('pipelines', pipelinesScript)}
+${pageScript('jobs', pipelinesScript)}
 ${pageScript('reaper', reaperScript)}
 ${pageScript('sessions', sessionsScript)}
 ${pageScript('audit', auditScript)}
@@ -111,8 +112,8 @@ ${pageScript('issues', issuesScript)}
 ${pageScript('pulls', pullsScript)}
 ${pageScript('blockers', blockersScript)}
 ${pageScript('customizations', customizationsScript)}
-${pageScript('pipelines-and-steps', pipelinesAndStepsScript)}
-${pageScript('models-and-providers', modelsAndProvidersScript)}
+${pageScript('pipelines', pipelinesAndStepsScript)}
+${pageScript('models', modelsAndProvidersScript)}
 ${pageScript('runners', runnersScript)}
 ${pageScript('reports', reportsScript)}
 ${pageScript('deployments', deploymentsScript)}
