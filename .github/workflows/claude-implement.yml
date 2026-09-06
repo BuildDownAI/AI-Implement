@@ -303,6 +303,8 @@ jobs:
           AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          PROVIDER: ${{ inputs.provider }}
+          AWS_REGION: ${{ inputs.aws_region }}
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
           RUN_PUBLICATION_TOKEN: ${{ inputs.run_publication_token }}
