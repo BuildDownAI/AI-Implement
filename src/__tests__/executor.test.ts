@@ -425,28 +425,78 @@ describe.skipIf(isWindows)("ClaudeCliExecutor", () => {
 
   it("ignores forwarded secret names absent from the environment", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    installForwardedSecretRecordingClaude();
     vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", "DOES_NOT_EXIST_KEY");
     delete process.env.DOES_NOT_EXIST_KEY;
 
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    const fakeSpawn = () => fakeProc;
     await expect(
-      new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" }),
+      new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" }),
     ).resolves.toMatchObject({ exitCode: 0 });
   });
 
   it("tolerates whitespace and empty entries in AI_IMPLEMENT_FORWARDED_SECRETS", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    installForwardedSecretRecordingClaude();
     vi.stubEnv("AI_IMPLEMENT_FORWARDED_SECRETS", " QA_BASE_URL , ,QA_TOKEN ");
     vi.stubEnv("QA_BASE_URL", "https://qa.example.com");
     vi.stubEnv("QA_TOKEN", "sentinel-qa-token-ws");
 
-    await new ClaudeCliExecutor("/tmp", "summary").invoke({ prompt: "p", model: "m" });
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const fakeProc = makeTestProcess(SUCCESS_LINES.join("\n") + "\n", 0);
+    const fakeSpawn = (_cmd: string, _args: string[], opts: { env?: NodeJS.ProcessEnv }) => {
+      capturedEnv = opts?.env;
+      return fakeProc;
+    };
 
-    expect(readFileSync(join(binDir, "qa-base-url.txt"), "utf-8").trim()).toBe("unset");
-    expect(readFileSync(join(binDir, "qa-token.txt"), "utf-8").trim()).toBe("unset");
-    const envDump = readFileSync(join(binDir, "env-dump.txt"), "utf-8");
-    expect(envDump).not.toContain("sentinel-qa-token-ws");
+    await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
+
+    expect(capturedEnv?.QA_BASE_URL).toBeUndefined();
+    expect(capturedEnv?.QA_TOKEN).toBeUndefined();
+    expect(capturedEnv?.AI_IMPLEMENT_FORWARDED_SECRETS).toBeUndefined();
+    expect(Object.values(capturedEnv ?? {}).some((v) => v?.includes("sentinel-qa-token-ws"))).toBe(false);
+  });
+
+  it("treats EPIPE on stdin as child-exit outcome, not a write failure", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const stdin = new PassThrough();
+    const ee = new EventEmitter();
+    const proc = Object.assign(ee, { stdout, stderr, stdin }) as unknown as ChildProcessWithoutNullStreams;
+
+    stdin.end = ((..._args: unknown[]) => {
+      setImmediate(() => stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+      return stdin;
+    }) as unknown as typeof stdin.end;
+
+    setImmediate(() => {
+      stdout.push(null);
+      stderr.push(null);
+      setImmediate(() => ee.emit("close", 1));
+    });
+
+    const fakeSpawn = () => proc;
+    const result = await new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" });
+    expect(result.exitCode).toBe(1);
+  });
+
+  it("rejects on non-EPIPE stdin write error", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const stdin = new PassThrough();
+    const ee = new EventEmitter();
+    const proc = Object.assign(ee, { stdout, stderr, stdin }) as unknown as ChildProcessWithoutNullStreams;
+
+    stdin.end = ((..._args: unknown[]) => {
+      setImmediate(() => stdin.emit("error", Object.assign(new Error("bad file descriptor"), { code: "EBADF" })));
+      return stdin;
+    }) as unknown as typeof stdin.end;
+
+    const fakeSpawn = () => proc;
+    await expect(
+      new ClaudeCliExecutor("/tmp", "summary", false, fakeSpawn as unknown as typeof spawn).invoke({ prompt: "p", model: "m" }),
+    ).rejects.toMatchObject({ code: "EBADF" });
   });
 
   it("still strips MODEL_CHILD_CREDENTIAL_KEYS when forwarded secrets are also set", async () => {
