@@ -115,11 +115,7 @@ export interface CleanExitDecision {
   deferForPrRecheck: boolean;
 }
 
-/**
- * kg-refresh rows carry a synthetic issueId and have no tracker issue. Their outcome
- * notification is owned by notifyKgRefreshOutcome (AII-496); the generic completion loop
- * must mark them notified and skip, or it fires a bogus "kg-refresh: Unknown" notice.
- */
+// kg-refresh rows have no tracker issue; generic notice fires bogus "kg-refresh: Unknown" (AII-496 owns their outcome).
 export function shouldSkipCompletionNotice(job: { phase: string }): boolean {
   return job.phase === "kg-refresh";
 }
