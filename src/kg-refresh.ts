@@ -46,6 +46,9 @@ const KG_STAGE_SETTINGS_KEY = "kg_refresh_stage";
 /** DB settings key for persisting the staged snapshot head commit SHA across restarts. */
 const KG_SNAPSHOT_SHA_SETTINGS_KEY = "kg_refresh_snapshot_sha";
 
+/** DB settings key for persisting the last terminal refresh outcome across restarts. */
+const KG_LAST_REFRESH_SETTINGS_KEY = "kg_refresh_last_refresh";
+
 /**
  * Gates evaluated during refresh. `"staging"` fires before any swap; `"ingest-needed"` fires
  * before staging when the source snapshot is not newer than the served stamp (informational,
@@ -195,13 +198,19 @@ interface KgRefreshInput {
   /**
    * Persist stage + start time to durable storage. Injectable for tests.
    * Default: writes to the DB settings table.
+   * When stage is "ingest-running", the optional envelope carries the in-flight
+   * dispatch identity so a restarted process can re-adopt the run.
    */
-  persistStage?: (stage: KgRefreshStage, startedAt: number) => void;
+  persistStage?: (stage: KgRefreshStage, startedAt: number, envelope?: { dispatchId?: string | null; jobId?: number | null }) => void;
   /**
    * Load persisted stage. Injectable for tests.
    * Default: reads from the DB settings table; returns null when absent or unreadable.
    */
-  loadStage?: () => { stage: KgRefreshStage; startedAt: number } | null;
+  loadStage?: () => { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null } | null;
+  /** Persist the last terminal refresh outcome across restarts. Injectable for tests. */
+  persistLastRefresh?: (outcome: RefreshOutcome) => void;
+  /** Load the last persisted terminal refresh outcome. Injectable for tests; returns null when absent. */
+  loadLastRefresh?: () => RefreshOutcome | null;
 
   // ---- Outcome reporting (AII-496) ----
 
@@ -260,6 +269,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const snapshotCommitRetryMs = input.snapshotCommitRetryMs ?? SNAPSHOT_COMMIT_RETRY_MS;
   const persistStageFn = input.persistStage ?? defaultPersistStage;
   const loadStageFn = input.loadStage ?? defaultLoadStage;
+  const persistLastRefreshFn = input.persistLastRefresh ?? defaultPersistLastRefresh;
+  const loadLastRefreshFn = input.loadLastRefresh ?? defaultLoadLastRefresh;
 
   let running = false;
   let lastRefresh: RefreshOutcome | null = null;
@@ -270,8 +281,11 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   let currentDispatchId: string | null = null;
   /** dispatch_log jobId for the active kg-refresh run; null when no row is tracked. */
   let currentJobId: number | null = null;
+  /** Timer re-armed on boot when an ingest-running run is re-adopted; null otherwise. */
+  let ttlWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Restore persisted state on construction (crash recovery).
+  lastRefresh = loadLastRefreshFn();
   const persisted = loadStageFn();
   if (persisted && persisted.stage === "ingest-running") {
     const ageMs = Date.now() - persisted.startedAt;
@@ -279,6 +293,16 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       running = true;
       stage = "ingest-running";
       ingestStartedAt = persisted.startedAt;
+      // Restore in-flight dispatch identity so the callback can close the job log.
+      currentDispatchId = persisted.dispatchId ?? null;
+      currentJobId = persisted.jobId ?? null;
+      // Re-arm the TTL watchdog for the remaining window; the live-process check
+      // inside trigger() only fires if trigger() is called, so a standalone timer
+      // is needed to expire an adopted run that never receives a new trigger() call.
+      const remaining = KG_REFRESH_TTL_MS - ageMs;
+      ttlWatchdogTimer = setTimeout(() => {
+        failIngestRunner("ingest runner timed out — no callback received within TTL");
+      }, remaining);
     } else {
       // TTL expired — clear the stale lock so a new dispatch can proceed.
       persistStageFn("idle", Date.now());
@@ -505,6 +529,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       stampAfter: null,
     }));
     lastRefresh = outcome;
+    persistLastRefreshFn(lastRefresh);
     running = false;
     stage = outcomeToStage(outcome);
     persistStageFn(stage, Date.now());
@@ -524,6 +549,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   /** Shared terminal path for lost/timed-out ingest runners. No-op when stage ≠ ingest-running. */
   function failIngestRunner(reason: string, failureCode?: string): void {
     if (stage !== "ingest-running") return;
+    if (ttlWatchdogTimer !== null) { clearTimeout(ttlWatchdogTimer); ttlWatchdogTimer = null; }
     lastRefresh = {
       ok: false,
       at: Date.now(),
@@ -532,6 +558,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       stampBefore: null,
       stampAfter: null,
     };
+    persistLastRefreshFn(lastRefresh);
     running = false;
     stage = "failed";
     ingestStartedAt = null;
@@ -664,12 +691,13 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             currentDispatchId = dispatchId;
             stage = "ingest-running";
             ingestStartedAt = Date.now();
-            persistStageFn("ingest-running", ingestStartedAt);
+            persistStageFn("ingest-running", ingestStartedAt, { dispatchId: currentDispatchId, jobId: currentJobId });
             console.log(`[kg-refresh] dispatched kg-refresh runner (dispatchId=${dispatchId})`);
             // running stays true — onRunnerComplete clears it when the runner reports back
           } else {
             // Local refresh completed (success, failure, or ingest-needed without dispatch).
             lastRefresh = outcome;
+            persistLastRefreshFn(lastRefresh);
             running = false;
             stage = outcomeToStage(outcome);
             persistStageFn(stage, Date.now());
@@ -690,6 +718,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             stampBefore: null,
             stampAfter: null,
           };
+          persistLastRefreshFn(lastRefresh);
           running = false;
           stage = "failed";
           persistStageFn("failed", Date.now());
@@ -710,6 +739,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       // The !running re-entry below exists for crash-recovery; without this guard a late
       // callback after a TTL expiry would re-enter and fire onOutcome a second time.
       if (stage !== "ingest-running") return;
+      // Cancel the post-restart TTL watchdog (only set when a run was re-adopted on boot).
+      if (ttlWatchdogTimer !== null) { clearTimeout(ttlWatchdogTimer); ttlWatchdogTimer = null; }
       // Past the ingest phase — clear the live TTL watchdog.
       ingestStartedAt = null;
       if (!running) {
@@ -729,6 +760,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             stampBefore: null,
             stampAfter: null,
           };
+          persistLastRefreshFn(lastRefresh);
           running = false;
           stage = "idle";
           ingestStartedAt = null;
@@ -752,6 +784,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           stampBefore: null,
           stampAfter: null,
         };
+        persistLastRefreshFn(lastRefresh);
         running = false;
         stage = "failed";
         ingestStartedAt = null;
@@ -781,6 +814,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           stampBefore: null,
           stampAfter: null,
         };
+        persistLastRefreshFn(lastRefresh);
         running = false;
         stage = "failed";
         ingestStartedAt = null;
@@ -830,6 +864,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               stampBefore: null,
               stampAfter: null,
             };
+            persistLastRefreshFn(lastRefresh);
             running = false;
             stage = "failed";
             persistStageFn("failed", Date.now());
@@ -939,23 +974,48 @@ async function defaultFetchCommitVisible(token: string, owner: string, repo: str
   }
 }
 
-function defaultPersistStage(stage: KgRefreshStage, startedAt: number): void {
+function defaultPersistStage(stage: KgRefreshStage, startedAt: number, envelope?: { dispatchId?: string | null; jobId?: number | null }): void {
   try {
+    const value: Record<string, unknown> = { stage, startedAt };
+    if (envelope?.dispatchId != null) value.dispatchId = envelope.dispatchId;
+    if (envelope?.jobId != null) value.jobId = envelope.jobId;
     getDb()
       .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
-      .run(KG_STAGE_SETTINGS_KEY, JSON.stringify({ stage, startedAt }));
+      .run(KG_STAGE_SETTINGS_KEY, JSON.stringify(value));
   } catch {
     // DB unavailable — stage will be lost on restart, which is acceptable.
   }
 }
 
-function defaultLoadStage(): { stage: KgRefreshStage; startedAt: number } | null {
+function defaultLoadStage(): { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null } | null {
   try {
     const row = getDb()
       .prepare("SELECT value FROM settings WHERE key = ?")
       .get(KG_STAGE_SETTINGS_KEY) as { value: string } | undefined;
     if (!row) return null;
-    return JSON.parse(row.value) as { stage: KgRefreshStage; startedAt: number };
+    return JSON.parse(row.value) as { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null };
+  } catch {
+    return null;
+  }
+}
+
+function defaultPersistLastRefresh(outcome: RefreshOutcome): void {
+  try {
+    getDb()
+      .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+      .run(KG_LAST_REFRESH_SETTINGS_KEY, JSON.stringify(outcome));
+  } catch {
+    // DB unavailable — lastRefresh will be lost on restart, which is acceptable.
+  }
+}
+
+function defaultLoadLastRefresh(): RefreshOutcome | null {
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(KG_LAST_REFRESH_SETTINGS_KEY) as { value: string } | undefined;
+    if (!row) return null;
+    return JSON.parse(row.value) as RefreshOutcome;
   } catch {
     return null;
   }

@@ -250,6 +250,9 @@ export async function handleRunnerResult(
   // kg-refresh runs have no mapping and no tracker issue to update.
   // Route the callback directly to the refresh rail and return early.
   if (input.body.phase === "kg-refresh") {
+    if (!input.onKgRefreshRunnerComplete) {
+      console.warn("[runner-callback] kg-refresh callback received but no handler is registered — result will not be propagated");
+    }
     input.onKgRefreshRunnerComplete?.(input.body.outcome, {
       snapshotCommit: input.body.snapshotCommit,
       failureCode: input.body.failureCode,

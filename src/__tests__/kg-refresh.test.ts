@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { makeKgRefresh, MATERIALIZE_ARGS, type KgRefreshHandle, type KgRefreshStage } from "../kg-refresh.js";
+import { makeKgRefresh, MATERIALIZE_ARGS, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome } from "../kg-refresh.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -1235,6 +1235,208 @@ describe("kg-refresh", () => {
       expect(onOutcome).not.toHaveBeenCalled();
       const s = await handle.status();
       expect(s.stage).toBe("idle");
+    });
+
+    // ---- AII-546: restart survival -----------------------------------------------
+
+    describe("restart survival", () => {
+      const KG_REFRESH_TTL_MS = 4 * 60 * 60 * 1000;
+
+      it("restart with ingest-running: dispatchId and jobId restored, callback closes job log", async () => {
+        let sharedStageStore: { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null } | null = null;
+        let lastRefreshStore: RefreshOutcome | null = null;
+        const persistStageCapture = vi.fn((s: KgRefreshStage, t: number, env?: { dispatchId?: string | null; jobId?: number | null }) => {
+          sharedStageStore = { stage: s, startedAt: t, ...(env ?? {}) };
+          stageStore = sharedStageStore;
+          persistedStages.push({ stage: s, startedAt: t });
+        });
+        const loadStageCapture = vi.fn(() => sharedStageStore);
+        const persistLastRefresh = vi.fn((o: RefreshOutcome) => { lastRefreshStore = o; });
+        const loadLastRefresh = vi.fn((): RefreshOutcome | null => lastRefreshStore);
+        const closeJobLog = vi.fn();
+        const appendJobLog = vi.fn(() => 42);
+        const onOutcome = vi.fn();
+
+        // Instance A: dispatch
+        buildDispatch({
+          appendJobLog,
+          closeJobLog,
+          onOutcome,
+          persistStage: persistStageCapture,
+          loadStage: loadStageCapture,
+          persistLastRefresh,
+          loadLastRefresh,
+        });
+        await handle.trigger();
+        await waitForStage("ingest-running");
+
+        expect(sharedStageStore?.stage).toBe("ingest-running");
+        expect(sharedStageStore?.dispatchId).toBeTruthy();
+        expect(sharedStageStore?.jobId).toBe(42);
+
+        // Instance B: simulated restart — same stores.
+        // fetchSnapshotCommitSha returns NEW_SNAPSHOT_SHA so the local rail
+        // sees a snapshot that differs from the recorded SNAPSHOT_SHA and proceeds.
+        buildDispatch({
+          appendJobLog,
+          closeJobLog,
+          onOutcome,
+          persistStage: persistStageCapture,
+          loadStage: loadStageCapture,
+          persistLastRefresh,
+          loadLastRefresh,
+          fetchSnapshotCommitSha: vi.fn().mockResolvedValue(NEW_SNAPSHOT_SHA) as never,
+        });
+
+        const s0 = await handle.status();
+        expect(s0.stage).toBe("ingest-running");
+        expect(s0.running).toBe(true);
+
+        // Fire success callback on the re-adopted instance
+        handle.onRunnerComplete("success", {});
+        await waitDone();
+
+        expect(closeJobLog).toHaveBeenCalledWith(42, "completed");
+        const successCalls = onOutcome.mock.calls.filter(([o]: [string]) => o === "success");
+        expect(successCalls).toHaveLength(1);
+        expect(successCalls[0]![1]).toMatchObject({ dispatchId: "disp-1" });
+
+        const s1 = await handle.status();
+        expect(s1.running).toBe(false);
+        expect(s1.lastRefresh?.ok).toBe(true);
+        expect(lastRefreshStore?.ok).toBe(true);
+      });
+
+      it("lastRefresh persisted and restored across restart", async () => {
+        let lastRefreshStore: RefreshOutcome | null = null;
+        const persistLastRefresh = vi.fn((o: RefreshOutcome) => { lastRefreshStore = o; });
+        const loadLastRefresh = vi.fn((): RefreshOutcome | null => lastRefreshStore);
+
+        buildDispatch({ persistLastRefresh, loadLastRefresh });
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", {});
+        await waitDone();
+
+        expect(lastRefreshStore?.ok).toBe(true);
+
+        // New instance — same lastRefresh store, no in-flight run
+        buildDispatch({ persistLastRefresh, loadLastRefresh });
+
+        const s = await handle.status();
+        expect(s.lastRefresh).toEqual(lastRefreshStore);
+        expect(s.lastRefresh?.ok).toBe(true);
+      });
+
+      it("restart with ingest-running near TTL: watchdog fires when remaining time elapses", async () => {
+        vi.useFakeTimers();
+        try {
+          const now = Date.now();
+          const remaining = 500;
+          const startedAt = now - (KG_REFRESH_TTL_MS - remaining);
+          const onOutcome = vi.fn();
+
+          buildDispatch({
+            loadStage: () => ({
+              stage: "ingest-running" as KgRefreshStage,
+              startedAt,
+              dispatchId: "re-adopted-dispatch",
+              jobId: null,
+            }),
+            onOutcome,
+          });
+
+          const s0 = await handle.status();
+          expect(s0.running).toBe(true);
+          expect(s0.stage).toBe("ingest-running");
+          expect(onOutcome).not.toHaveBeenCalled();
+
+          vi.advanceTimersByTime(remaining + 100);
+          await Promise.resolve();
+
+          const s1 = await handle.status();
+          expect(s1.stage).toBe("failed");
+          expect(s1.running).toBe(false);
+          const failCalls = onOutcome.mock.calls.filter(([o]: [string]) => o === "failure");
+          expect(failCalls).toHaveLength(1);
+          expect(failCalls[0]![1]).toMatchObject({ timedOut: true });
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("restart with ingest-running past TTL: resets to idle without calling closeJobLog", async () => {
+        const closeJobLog = vi.fn();
+        buildDispatch({
+          closeJobLog,
+          loadStage: () => ({
+            stage: "ingest-running" as KgRefreshStage,
+            startedAt: Date.now() - (KG_REFRESH_TTL_MS + 1000),
+            dispatchId: "old-dispatch",
+            jobId: 99,
+          }),
+        });
+
+        const s = await handle.status();
+        expect(s.stage).toBe("idle");
+        expect(s.running).toBe(false);
+        expect(closeJobLog).not.toHaveBeenCalled();
+      });
+
+      it("restart with old {stage, startedAt} envelope (no dispatchId/jobId): no crash", async () => {
+        const closeJobLog = vi.fn();
+        buildDispatch({
+          closeJobLog,
+          loadStage: () => ({
+            stage: "ingest-running" as KgRefreshStage,
+            startedAt: Date.now() - 30_000,
+            // no dispatchId or jobId — old format
+          }),
+        });
+
+        const s = await handle.status();
+        expect(s.stage).toBe("ingest-running");
+        expect(s.running).toBe(true);
+
+        // Callback acknowledged; closeJobLog not called (no jobId available)
+        handle.onRunnerComplete("failure", { failureCode: "TIMEOUT" });
+        await waitDone();
+        expect((await handle.status()).stage).toBe("failed");
+        expect(closeJobLog).not.toHaveBeenCalled();
+      });
+
+      it("lastRefresh persisted on all terminal outcome paths", async () => {
+        const outcomes: ["success" | "no-new-data" | "failure", RefreshOutcome | null][] = [];
+        const persistLastRefresh = vi.fn((o: RefreshOutcome) => { outcomes.push(["_", o] as never); });
+
+        // Success via local rail
+        buildDispatch({
+          persistLastRefresh,
+          loadLastRefresh: () => null,
+          loadStage: () => null,
+          fetchSnapshotCommitSha: vi.fn().mockResolvedValueOnce("new-sha").mockResolvedValue("new-sha") as never,
+          loadSnapshotSha: vi.fn(() => null) as never,
+        });
+        await handle.trigger();
+        await waitDone();
+        expect(persistLastRefresh).toHaveBeenCalledOnce();
+        const [result] = persistLastRefresh.mock.calls[0] as [RefreshOutcome];
+        expect(result.ok).toBe(true);
+        persistLastRefresh.mockClear();
+
+        // Failure via ingest runner failure
+        buildDispatch({
+          persistLastRefresh,
+          loadLastRefresh: () => null,
+        });
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", { failureCode: "TIMEOUT" });
+        await waitDone();
+        expect(persistLastRefresh).toHaveBeenCalledOnce();
+        const [failResult] = persistLastRefresh.mock.calls[0] as [RefreshOutcome];
+        expect(failResult.ok).toBe(false);
+      });
     });
   });
 });
