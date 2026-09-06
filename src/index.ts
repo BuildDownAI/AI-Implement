@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -3056,7 +3056,14 @@ async function dispatchKgRefreshRun(
   if (executionPath === "github-actions") {
     // Dispatch to the kg-refresh workflow in the KG source repo.
     const dispatchUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/dispatches`;
-    const dispatchBody = JSON.stringify({ ref: defaultBranch, inputs: { run_config: opts.runConfig, run_token: opts.runToken } });
+    const runnerImage = await resolveRunnerImageForDispatch({
+      owner: repo.owner,
+      repo: repo.repo,
+      token: ghToken,
+      defaultImage: config.sessionImage,
+      runnerImageExplicit: config.runnerImageExplicit,
+    });
+    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runnerImage });
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
       signal: defaultFetchSignal(),

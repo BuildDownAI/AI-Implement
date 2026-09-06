@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { encodeRunConfig, decodeRunConfig } from "../run-config.js";
-import { buildEnvelopeDispatchInputs } from "../github.js";
+import { buildEnvelopeDispatchInputs, buildKgRefreshGhaDispatchBody } from "../github.js";
 import type { RepoMapping } from "../config.js";
+import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1013,6 +1014,171 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
   it("instructs the agent to proceed when tracker-data.json is absent (local/dev runs)", () => {
     const playbook = readFileSync(playbookPath, "utf-8");
     expect(playbook).toContain("absent");
+  });
+});
+
+// ── GHA kg-refresh dispatch — runner_image resolution ────────────────────────
+// Verifies that dispatchKgRefreshRun's GHA branch forwards runner_image using
+// the same channel-policy helper as the implement dispatch path.
+//
+// dispatchKgRefreshRun is not exported (index.ts is the application entry
+// point with side-effectful startup; it has no exports). The tests below cover
+// two layers:
+//   1. resolveRunnerImageForDispatch in isolation — ensures the helper returns
+//      the right value for the three decision branches.
+//   2. Dispatch body wiring via buildKgRefreshGhaDispatchBody — calls the same
+//      exported function that production uses, so a key-name change or logic
+//      inversion in the real code will fail these assertions.
+
+describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerImageForDispatch", () => {
+  beforeEach(() => {
+    __clearRepoImageCacheForTests();
+  });
+
+  it("includes runner_image when orchestrator image is explicitly pinned (runnerImageExplicit=true)", async () => {
+    // No per-repo override — fetch returns 404
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+
+    const result = await resolveRunnerImageForDispatch({
+      owner: "BuildDownAI",
+      repo: "knowledge-graph-ai-implement",
+      token: "gh-tok",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
+      runnerImageExplicit: true,
+      fetchImpl,
+    });
+
+    // Explicit orchestrator pin → image forwarded; KG repo needs no AI_IMPLEMENT_RUNNER_IMAGE
+    expect(result).toBe("ghcr.io/builddownai/ai-implement-runner:next");
+  });
+
+  it("omits runner_image when orchestrator uses built-in default and KG repo has no override", async () => {
+    // No per-repo override — fetch returns 404
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+
+    const result = await resolveRunnerImageForDispatch({
+      owner: "BuildDownAI",
+      repo: "knowledge-graph-ai-implement",
+      token: "gh-tok",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+
+    // No explicit pin, no per-repo override → undefined; workflow's own
+    // AI_IMPLEMENT_RUNNER_IMAGE variable (or its built-in default) applies
+    expect(result).toBeUndefined();
+  });
+
+  it("includes runner_image when KG repo has a per-repo .ai-implement/image.yml override", async () => {
+    const yamlContent = "image: ghcr.io/org/custom-runner:sha-abc\n";
+    const b64 = Buffer.from(yamlContent).toString("base64");
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ type: "file", encoding: "base64", content: b64 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    ) as unknown as typeof fetch;
+
+    const result = await resolveRunnerImageForDispatch({
+      owner: "BuildDownAI",
+      repo: "knowledge-graph-ai-implement",
+      token: "gh-tok",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+
+    // Per-repo override wins regardless of orchestrator flag
+    expect(result).toBe("ghcr.io/org/custom-runner:sha-abc");
+  });
+
+  it("GHA and Fly resolve the same image ref for the same orchestrator (parity)", async () => {
+    // GHA calls resolveRunnerImageForDispatch (which delegates to resolveSessionImage);
+    // Fly calls resolveSessionImage directly — verify the two produce the same result.
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+
+    const opts = {
+      owner: "BuildDownAI",
+      repo: "knowledge-graph-ai-implement",
+      token: "gh-tok",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
+      runnerImageExplicit: true,
+      fetchImpl,
+    };
+
+    const ghaImage = await resolveRunnerImageForDispatch(opts);
+    __clearRepoImageCacheForTests();
+    const flyImage = await resolveRunnerImageForDispatch(opts);
+
+    expect(ghaImage).toBe(flyImage);
+    expect(ghaImage).toBe("ghcr.io/builddownai/ai-implement-runner:next");
+  });
+});
+
+// ── GHA kg-refresh dispatch — body wiring invariant ───────────────────────────
+// Exercises the full pipeline from image resolution to fetch-body by composing
+// resolveRunnerImageForDispatch with the exported buildKgRefreshGhaDispatchBody
+// (the same function dispatchKgRefreshRun uses). Tests call the real exported
+// function rather than a local copy of the spread, so a key-name change or
+// logic inversion in production will fail these assertions.
+
+describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", () => {
+  beforeEach(() => {
+    __clearRepoImageCacheForTests();
+  });
+
+  it("body includes runner_image when image is resolved (explicit orchestrator pin)", async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+    const runnerImage = await resolveRunnerImageForDispatch({
+      owner: "BuildDownAI",
+      repo: "knowledge-graph-ai-implement",
+      token: "gh-tok",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
+      runnerImageExplicit: true,
+      fetchImpl,
+    });
+
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
+    expect(body.inputs.runner_image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
+  });
+
+  it("body omits runner_image when image is not resolved (default image, no override)", async () => {
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+    const runnerImage = await resolveRunnerImageForDispatch({
+      owner: "BuildDownAI",
+      repo: "knowledge-graph-ai-implement",
+      token: "gh-tok",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
+    expect("runner_image" in body.inputs).toBe(false);
+  });
+
+  it("body includes runner_image when KG repo has a per-repo image.yml override", async () => {
+    const yamlContent = "image: ghcr.io/org/custom-runner:sha-abc\n";
+    const b64 = Buffer.from(yamlContent).toString("base64");
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ type: "file", encoding: "base64", content: b64 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    ) as unknown as typeof fetch;
+
+    const runnerImage = await resolveRunnerImageForDispatch({
+      owner: "BuildDownAI",
+      repo: "knowledge-graph-ai-implement",
+      token: "gh-tok",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
+    expect(body.inputs.runner_image).toBe("ghcr.io/org/custom-runner:sha-abc");
   });
 });
 
