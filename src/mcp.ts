@@ -8,6 +8,7 @@ import { getIssueReportCard, getFleetReport } from "./report-card.js";
 import { isKgDegraded } from "./deploy-notify.js";
 import { recheckIdentity } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
+import { getDeployPosture } from "./deploy-posture.js";
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -92,11 +93,21 @@ const DIAG_TOOLS = [
       },
     },
   },
+  {
+    name: "get_deploy_posture",
+    description:
+      "Returns the current deploy posture: whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
 
-function callDiagnosticTool(name: string, args: Record<string, unknown>): unknown {
+async function callDiagnosticTool(
+  name: string,
+  args: Record<string, unknown>,
+  context: { defaultRunnerImage?: string } = {},
+): Promise<unknown> {
   switch (name) {
     case "get_tenant_health": {
       const { mode, source } = getRunnerMode();
@@ -215,6 +226,9 @@ function callDiagnosticTool(name: string, args: Record<string, unknown>): unknow
       return getFleetReport({ days });
     }
 
+    case "get_deploy_posture":
+      return getDeployPosture({ defaultImage: context.defaultRunnerImage });
+
     default:
       return { error: `Unknown diagnostic tool: ${name}` };
   }
@@ -228,6 +242,7 @@ export async function handleMcpRequest(
   provider: MemoryProvider | null,
   baseUrl: string | null,
   providerDiagnostic?: string | null,
+  defaultRunnerImage?: string,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -292,7 +307,7 @@ export async function handleMcpRequest(
     if (DIAG_TOOL_NAMES.has(toolName)) {
       const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
       try {
-        const result = callDiagnosticTool(toolName, toolArgs);
+        const result = await callDiagnosticTool(toolName, toolArgs, { defaultRunnerImage });
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,

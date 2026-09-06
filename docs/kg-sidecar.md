@@ -211,6 +211,59 @@ The active provider is chosen at boot from the `MEMORY_PROVIDER` environment var
 4. In `proxyCall`, handle every tool the capabilities declare as true. If a call reaches `proxyCall` for a tool you cannot handle, write a JSON-RPC error response rather than crashing.
 5. Register the provider in `resolveMemoryProvider()` in `src/kg-provider.ts` and add `MEMORY_PROVIDER=your-id` to `.env.example`.
 
+## Orchestrator-native diagnostic tools
+
+These tools are served directly by the orchestrator and are always present in `tools/list` — they do not require a working sidecar. The full list is in `src/mcp.ts` (`DIAG_TOOLS`).
+
+| Tool | Description |
+|---|---|
+| `get_tenant_health` | Runner mode, in-flight job count, pending gap-fill queue count, project count, KG degraded flag |
+| `get_runner_mode` | Global runner mode and its source (env / db / default) |
+| `list_projects` | All project mappings with per-project settings |
+| `list_in_flight_jobs` | Currently dispatching or running jobs with elapsed time |
+| `get_issue_dispatch_status` | Dispatch state for a specific issue identifier |
+| `get_issue_report_card` | Full dispatch history, telemetry, and approval status for an issue |
+| `get_fleet_report` | Aggregated per-repo stats over a configurable look-back window |
+| `get_deploy_posture` | Deploy posture summary — see below |
+
+### `get_deploy_posture`
+
+No inputs. Returns a read-only snapshot of the current deploy and runner-channel state so that skills can price a merge before filing or merging.
+
+```json
+{
+  "autoDeploy": true,
+  "watchedRepo": "BuildDownAI/AI-Implement",
+  "watchedRef": "testing",
+  "runningCommit": "<sha>",
+  "headCommit": "<sha>",
+  "upToDate": false,
+  "deploy": {
+    "held": false,
+    "inFlight": false,
+    "lastOutcome": "deployed-ok"
+  },
+  "runnerChannel": {
+    "image": "ghcr.io/builddownai/ai-implement-runner",
+    "channelTag": "next",
+    "channelCommit": "<sha or null>",
+    "matchesHead": false
+  },
+  "mergeCost": "deploy+image"
+}
+```
+
+Field notes:
+
+- `autoDeploy`, `held`, `runningCommit`, `headCommit`, `lastOutcome`, `watchedRepo`, `watchedRef` — from the same source as `GET /api/deployment-status`.
+- `upToDate` — `true` when `runningCommit === headCommit`, `null` when either is unknown.
+- `deploy.inFlight` — `true` when runner jobs are currently executing (not whether a deploy is in progress).
+- `deploy.lastOutcome` — one of `"deployed-ok"`, `"deployed-not-serving"`, `"build-failed"`, or `null` when no deploy has completed yet.
+- `runnerChannel.channelTag` — `"next"` for `testing`, `"latest"` for `main`, `null` for other branches (no corresponding runner build).
+- `runnerChannel.channelCommit` — the source commit baked into the channel image via its OCI config labels (`org.opencontainers.image.revision` or `AI_IMPLEMENT_SOURCE_COMMIT`). Best-effort: a registry error or missing label yields `null`.
+- `runnerChannel.matchesHead` — `true` when `channelCommit === headCommit`, `null` when `channelCommit` is null.
+- `mergeCost` — `"deploy+image"` when `autoDeploy` is on (every merge triggers a deploy and a runner image build); `"image"` when autoDeploy is off but the watched branch has a runner build (`main` or `testing`); `"none"` otherwise.
+
 ## Repository layout
 
 `kg/` holds only a `.gitkeep` placeholder in git — the actual server code and snapshot are cloned at build time and never committed. The directory is excluded from workflow sync and never copied to target repos.

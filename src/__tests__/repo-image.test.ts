@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveKgRefreshSessionImage, __clearRepoImageCacheForTests } from "../repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, selectRunnerImageInput, resolveRunnerImageForDispatch, resolveKgRefreshSessionImage, resolveChannelCommit, stripImageTag, __clearRepoImageCacheForTests } from "../repo-image.js";
 
 const DEFAULT_IMAGE = "ghcr.io/builddownai/ai-implement-runner:latest";
 
@@ -391,5 +391,263 @@ describe("resolveKgRefreshSessionImage", () => {
       ([u]: [string]) => String(u).includes("/manifests/"),
     );
     expect(manifestCalls).toHaveLength(0);
+  });
+});
+
+// ── stripImageTag ─────────────────────────────────────────────────────────────
+
+describe("stripImageTag", () => {
+  it("strips a :tag suffix", () => {
+    expect(stripImageTag("ghcr.io/builddownai/ai-implement-runner:latest")).toBe(
+      "ghcr.io/builddownai/ai-implement-runner",
+    );
+  });
+
+  it("strips a @digest suffix", () => {
+    expect(
+      stripImageTag("ghcr.io/acme/runner@sha256:deadbeef"),
+    ).toBe("ghcr.io/acme/runner");
+  });
+
+  it("returns null for an image without a tag or digest", () => {
+    expect(stripImageTag("ghcr.io/acme/runner")).toBeNull();
+  });
+
+  it("returns null for a bare image name without a slash", () => {
+    expect(stripImageTag("ubuntu:22.04")).toBeNull();
+  });
+});
+
+// ── resolveChannelCommit ──────────────────────────────────────────────────────
+
+// Builds a controlled fetch mock for the two-round-trip OCI label flow.
+// Supports an optional 401 challenge before the manifest, and routes config blob
+// fetches separately.
+function buildChannelCommitFetch(opts: {
+  manifestStatus?: number;
+  manifestBody?: object | null;
+  configStatus?: number;
+  configBody?: object | null;
+  useAuthChallenge?: boolean;
+}): typeof fetch {
+  const {
+    manifestStatus = 200,
+    manifestBody = {
+      config: { digest: "sha256:configdigest" },
+    },
+    configStatus = 200,
+    configBody = {
+      config: {
+        Labels: { "org.opencontainers.image.revision": "abc1234567890" },
+      },
+    },
+    useAuthChallenge = false,
+  } = opts;
+
+  let manifestCallCount = 0;
+  return vi.fn(async (url: string, init?: RequestInit) => {
+    const urlStr = String(url);
+
+    // Token endpoint
+    if (urlStr.includes("ghcr.io/token")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ token: "test-token" }),
+        headers: { get: () => null },
+      } as unknown as Response;
+    }
+
+    // Manifest endpoint
+    if (urlStr.includes("/manifests/")) {
+      manifestCallCount++;
+      const headers = (init?.headers as Record<string, string>) ?? {};
+      if (useAuthChallenge && !headers["Authorization"]) {
+        return {
+          ok: false,
+          status: 401,
+          json: async () => ({}),
+          headers: {
+            get: (k: string) =>
+              k === "www-authenticate"
+                ? 'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:builddownai/ai-implement-runner:pull"'
+                : null,
+          },
+        } as unknown as Response;
+      }
+      if (manifestStatus !== 200) {
+        return { ok: false, status: manifestStatus, json: async () => ({}), headers: { get: () => null } } as unknown as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => manifestBody ?? {},
+        headers: { get: () => null },
+      } as unknown as Response;
+    }
+
+    // Config blob endpoint
+    if (urlStr.includes("/blobs/")) {
+      if (configStatus !== 200) {
+        return { ok: false, status: configStatus, json: async () => ({}), headers: { get: () => null } } as unknown as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => configBody ?? {},
+        headers: { get: () => null },
+      } as unknown as Response;
+    }
+
+    return { ok: false, status: 404, json: async () => ({}), headers: { get: () => null } } as unknown as Response;
+  }) as unknown as typeof fetch;
+}
+
+describe("resolveChannelCommit", () => {
+  const IMAGE_BASE = "ghcr.io/builddownai/ai-implement-runner";
+  const CHANNEL_TAG = "next";
+
+  it("returns SHA from org.opencontainers.image.revision label (happy path)", async () => {
+    const fetchImpl = buildChannelCommitFetch({});
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBe("abc1234567890");
+  });
+
+  it("falls back to AI_IMPLEMENT_SOURCE_COMMIT label when revision is absent", async () => {
+    const fetchImpl = buildChannelCommitFetch({
+      configBody: {
+        config: { Labels: { AI_IMPLEMENT_SOURCE_COMMIT: "fallbacksha" } },
+      },
+    });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBe("fallbacksha");
+  });
+
+  it("returns null when both labels are absent", async () => {
+    const fetchImpl = buildChannelCommitFetch({
+      configBody: { config: { Labels: { unrelated: "value" } } },
+    });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when config has no Labels field", async () => {
+    const fetchImpl = buildChannelCommitFetch({
+      configBody: { config: {} },
+    });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBeNull();
+  });
+
+  it("handles auth challenge: 401 → token fetch → retry manifest with Bearer", async () => {
+    const fetchImpl = buildChannelCommitFetch({ useAuthChallenge: true });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBe("abc1234567890");
+    // Should have called: manifest (401), token, manifest (200), config blob = 4 calls
+    expect((fetchImpl as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(4);
+  });
+
+  it("returns null when 401 has no www-authenticate realm", async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+      headers: { get: () => null },
+    })) as unknown as typeof fetch;
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBeNull();
+  });
+
+  it("returns null on manifest 404", async () => {
+    const fetchImpl = buildChannelCommitFetch({ manifestStatus: 404 });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBeNull();
+  });
+
+  it("returns null on network error (fetch throws)", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("ECONNREFUSED");
+    }) as unknown as typeof fetch;
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when manifest JSON has no config digest", async () => {
+    const fetchImpl = buildChannelCommitFetch({
+      manifestBody: { schemaVersion: 2 },
+    });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBeNull();
+  });
+
+  it("returns null on config blob fetch failure", async () => {
+    const fetchImpl = buildChannelCommitFetch({ configStatus: 500 });
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when config json() throws (malformed JSON)", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/manifests/")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ config: { digest: "sha256:xyz" } }),
+          headers: { get: () => null },
+        } as unknown as Response;
+      }
+      if (urlStr.includes("/blobs/")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => { throw new SyntaxError("Unexpected token"); },
+          headers: { get: () => null },
+        } as unknown as Response;
+      }
+      return { ok: false, status: 404, json: async () => ({}), headers: { get: () => null } } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const result = await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when imageBase has no slash (unparseable ref)", async () => {
+    const fetchImpl = vi.fn() as unknown as typeof fetch;
+    const result = await resolveChannelCommit("ubuntu", "next", fetchImpl);
+    expect(result).toBeNull();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("passes AbortSignal to every fetch call", async () => {
+    const signals: (AbortSignal | null | undefined)[] = [];
+    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+      signals.push(init?.signal ?? null);
+      return buildChannelCommitFetch({})(url, init);
+    }) as unknown as typeof fetch;
+    await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(signals.length).toBeGreaterThan(0);
+    for (const signal of signals) {
+      expect(signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it("returns null when registry hangs and the timeout fires", async () => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal | undefined;
+        if (signal) {
+          signal.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        }
+      });
+    }) as unknown as typeof fetch;
+
+    const resultPromise = resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl, 5_000);
+    await vi.advanceTimersByTimeAsync(5_001);
+    const result = await resultPromise;
+    expect(result).toBeNull();
+    vi.useRealTimers();
   });
 });

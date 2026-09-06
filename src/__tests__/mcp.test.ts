@@ -33,6 +33,10 @@ vi.mock("../deploy-notify.js", () => ({
   isKgDegraded: vi.fn(),
 }));
 
+vi.mock("../deploy-posture.js", () => ({
+  getDeployPosture: vi.fn(),
+}));
+
 const BASE_URL = "https://orchestrator.example.com";
 const SIDECAR_URL = "http://127.0.0.1:8765/mcp";
 const DEFAULT_PROVIDER = new SidecarMemoryProvider(SIDECAR_URL);
@@ -99,6 +103,7 @@ let configMock: typeof import("../config.js");
 let logMock: typeof import("../log.js");
 let dedupMock: typeof import("../dedup.js");
 let deployNotifyMock: typeof import("../deploy-notify.js");
+let deployPostureMock: typeof import("../deploy-posture.js");
 
 beforeEach(async () => {
   mockHttpRequest = vi.fn();
@@ -111,7 +116,24 @@ beforeEach(async () => {
   logMock = await import("../log.js");
   dedupMock = await import("../dedup.js");
   deployNotifyMock = await import("../deploy-notify.js");
+  deployPostureMock = await import("../deploy-posture.js");
   (deployNotifyMock.isKgDegraded as ReturnType<typeof vi.fn>).mockReturnValue(false);
+  (deployPostureMock.getDeployPosture as ReturnType<typeof vi.fn>).mockResolvedValue({
+    autoDeploy: true,
+    watchedRepo: "BuildDownAI/AI-Implement",
+    watchedRef: "testing",
+    runningCommit: "aaa",
+    headCommit: "bbb",
+    upToDate: false,
+    deploy: { held: false, inFlight: false, lastOutcome: "deployed-ok" },
+    runnerChannel: {
+      image: "ghcr.io/builddownai/ai-implement-runner",
+      channelTag: "next",
+      channelCommit: null,
+      matchesHead: null,
+    },
+    mergeCost: "deploy+image",
+  });
 
   // Sensible defaults for diagnostic tool mocks
   (runnerModeMock.getRunnerMode as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -286,6 +308,7 @@ describe("handleMcpRequest", () => {
         expect.objectContaining({ name: "list_projects" }),
         expect.objectContaining({ name: "list_in_flight_jobs" }),
         expect.objectContaining({ name: "get_issue_dispatch_status" }),
+        expect.objectContaining({ name: "get_deploy_posture" }),
       ]));
     });
 
@@ -901,6 +924,67 @@ describe("handleMcpRequest", () => {
       const parsed = JSON.parse(result.body);
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data.error).toContain("identifier is required");
+    });
+
+    it("handles get_deploy_posture — returns all required fields", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "get_deploy_posture", arguments: {} } }),
+      );
+
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data).toMatchObject({
+        autoDeploy: true,
+        watchedRepo: "BuildDownAI/AI-Implement",
+        watchedRef: "testing",
+        upToDate: false,
+        mergeCost: "deploy+image",
+      });
+      expect(data).toHaveProperty("deploy");
+      expect(data).toHaveProperty("runnerChannel");
+      expect(data.runnerChannel).toMatchObject({ channelTag: "next" });
+    });
+
+    it("get_deploy_posture — registry failure yields channelCommit null without error", async () => {
+      (deployPostureMock.getDeployPosture as ReturnType<typeof vi.fn>).mockResolvedValue({
+        autoDeploy: true,
+        watchedRepo: "BuildDownAI/AI-Implement",
+        watchedRef: "testing",
+        runningCommit: "aaa",
+        headCommit: "bbb",
+        upToDate: false,
+        deploy: { held: false, inFlight: false, lastOutcome: null },
+        runnerChannel: { image: "ghcr.io/builddownai/ai-implement-runner", channelTag: "next", channelCommit: null, matchesHead: null },
+        mergeCost: "deploy+image",
+      });
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "get_deploy_posture", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.runnerChannel.channelCommit).toBeNull();
+      expect(data.runnerChannel.matchesHead).toBeNull();
+    });
+
+    it("get_deploy_posture — unauthenticated request returns 401", async () => {
+      const result = await callMcp({ authorization: "Bearer invalid" }, false);
+      expect(result.statusCode).toBe(401);
     });
   });
 
