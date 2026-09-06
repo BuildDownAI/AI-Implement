@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -22,7 +22,7 @@ import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } f
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { handleAdminRequest } from "./admin.js";
-import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
+import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
 import { getInstallationToken, getAppSlug } from "./github-app-auth.js";
@@ -73,9 +73,11 @@ import {
   startLocalRunnerContainer,
   sweepExitedLocalContainers,
 } from "./local-docker.js";
-import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
+import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
+import { monitorGitHubActionsJob, KG_REFRESH_WORKFLOW_FILE } from "./monitor-gha.js";
+import type { MonitorGhaHelpers } from "./monitor-gha.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
@@ -86,7 +88,6 @@ import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
 import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
-import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
 import { makeKgRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
@@ -669,13 +670,6 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     findPrForIssue: async (repo, issueIdentifier) =>
       (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
     failKgRefreshMachine: (_job, opts) => { activeKgRefresh?.onMachineLost(opts); },
-    checkGhaRunStatus: async (job) => {
-      if (!job.repo || !job.runId) return null;
-      const [owner, repo] = job.repo.split("/");
-      if (!owner || !repo) return null;
-      const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-      return getWorkflowRunStatus(token, owner, repo, job.runId);
-    },
   });
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
@@ -1762,9 +1756,6 @@ async function postDispatch(
 
 // ---------- Job monitoring ----------
 
-/** Maximum age (ms) before a dispatched job without a run ID is marked timed_out. */
-const RUN_ID_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-
 /** Maximum age (ms) for a Fly Machine job before it's considered timed out. */
 const FLY_MACHINE_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes
 
@@ -1882,7 +1873,13 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
         }
         await monitorLocalDockerJob(config, provider, job);
       } else {
-        await monitorGitHubActionsJob(config, job, teamRepoMap, claimedRunIds, registry);
+        const ghaHelpers: MonitorGhaHelpers = {
+          providerForJob,
+          findPrForIssue: (repo, issueIdentifier) => findPrForIssue(config, repo, issueIdentifier),
+          reconcileAlreadyMergedPr,
+          finalizeNoOpGroupingParent,
+        };
+        await monitorGitHubActionsJob(config, job, teamRepoMap, claimedRunIds, registry, ghaHelpers);
       }
     } catch (err) {
       console.error(`[monitor] Error checking job ${job.id}:`, err);
@@ -1891,164 +1888,6 @@ async function monitorJobs(config: AppConfig, registry: ProviderRegistry): Promi
 
   // Send notifications + post comments for newly terminal jobs
   await reportJobCompletion(config, registry);
-}
-
-async function monitorGitHubActionsJob(
-  config: AppConfig,
-  job: Job,
-  teamRepoMap: Record<string, RepoMapping>,
-  claimedRunIds: Set<number>,
-  registry: ProviderRegistry,
-): Promise<void> {
-  const repoFullName = job.repo;
-  if (!repoFullName) return;
-
-  const [owner, repo] = repoFullName.split("/");
-  if (!owner || !repo) return;
-
-  const mapping = Object.values(teamRepoMap).find(
-    (m) => `${m.owner}/${m.repo}` === repoFullName,
-  );
-  const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-
-  const watchdogConfig: StuckWatchdogConfig = {
-    githubAppId: config.githubAppId,
-    githubAppPrivateKey: config.githubAppPrivateKey,
-    notifyType: config.notifyType,
-    notifyWebhookUrl: config.notifyWebhookUrl,
-  };
-
-  // If we don't have a run ID yet, try to find it
-  if (!job.runId) {
-    const dispatchTime = new Date(job.dispatchedAt - 30_000);
-    if (!mapping) return;
-
-    const workflowFile = workflowFileForJob(job, mapping);
-
-    const runId = await findWorkflowRunId(
-      ghToken,
-      owner,
-      repo,
-      workflowFile,
-      mapping.defaultBranch,
-      dispatchTime,
-      claimedRunIds,
-    );
-
-    if (runId) {
-      if (attachJobRunIdIfMissing(job.id, runId)) {
-        claimedRunIds.add(runId);
-        job.runId = runId;
-        console.log(`[monitor] Found run ID ${runId} for job ${job.id} (${job.issueIdentifier})`);
-      } else {
-        console.log(`[monitor] Skipped heuristic run link for job ${job.id} (${job.issueIdentifier}); job already has a run ID`);
-        return;
-      }
-    } else if (Date.now() - job.dispatchedAt > RUN_ID_TIMEOUT_MS) {
-      if (!isMonitorRunIdStillCurrent(job)) return;
-      console.warn(`[monitor] Job ${job.id} (${job.issueIdentifier}) timed out waiting for run ID`);
-      const provider = await providerForJob(registry, job);
-      if (!isMonitorRunIdStillCurrent(job)) return;
-      await remediateStuckJob(watchdogConfig, provider, job, "run_not_found");
-      return;
-    } else {
-      return; // Still waiting
-    }
-  }
-
-  // Check run status
-  const runStatus = await getWorkflowRunStatus(ghToken, owner, repo, job.runId);
-  if (!runStatus) return;
-  if (!isMonitorRunIdStillCurrent(job)) return;
-
-  // Detect stuck: non-terminal past the configured workflow timeout plus reconciliation grace.
-  const watchdog = githubActionsWatchdogDecision({
-    status: runStatus.status,
-    dispatchedAtMs: job.dispatchedAt,
-    nowMs: Date.now(),
-    maxJobMinutes: mapping?.maxJobMinutes ?? null,
-  });
-  if (watchdog.overdue) {
-    const elapsedMin = Math.round(watchdog.elapsedMs / 60000);
-    console.warn(
-      `[monitor] Job ${job.id} (${job.issueIdentifier}) stuck in ${runStatus.status} after ${elapsedMin}m ` +
-        `(threshold ${watchdog.jobTimeoutMinutes}m + ${watchdog.graceMinutes}m grace)`,
-    );
-    const provider = await providerForJob(registry, job);
-    if (!isMonitorRunIdStillCurrent(job)) return;
-    await remediateStuckJob(watchdogConfig, provider, job, runStatus.status);
-    return;
-  }
-
-  if (runStatus.status === "completed") {
-    let jobStatus: JobStatus;
-    if (runStatus.conclusion === "success") {
-      jobStatus = "completed";
-    } else if (runStatus.conclusion === "timed_out") {
-      jobStatus = "timed_out";
-    } else {
-      jobStatus = "failed";
-    }
-
-    // Try to find PR URL for successful runs
-    let prUrl: string | null = null;
-    let fallbackPrMatch: RunPrMatch | null = null;
-    if (jobStatus === "completed") {
-      try {
-        prUrl = await findPrForRun(ghToken, owner, repo, job.runId);
-      } catch {
-        // Non-critical
-      }
-      // workflow_dispatch runs report the ref they were dispatched on (the default
-      // branch) as head_branch, so findPrForRun misses the PR the runner created
-      // during the run. Fall back to matching a PR (open or already merged — AII-264 r6)
-      // by the issue's branch naming. Planning runs never open PRs — skip them so an
-      // implementation PR from an earlier dispatch is not misattributed to a planning row.
-      if (!prUrl && job.phase !== "planning") {
-        fallbackPrMatch = await findPrForIssue(config, job.repo, job.issueIdentifier);
-        prUrl = fallbackPrMatch?.url ?? null;
-      }
-    }
-
-    if (!isMonitorRunIdStillCurrent(job)) return;
-    updateJobStatus(job.id, jobStatus, runStatus.conclusion, prUrl);
-    console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) → ${jobStatus} (${runStatus.conclusion})`);
-
-    // AII-264 r6: the run's PR already merged (auto-merge beat this check) — route straight
-    // to the Done-reconcile so the ticket completes even if the merge-poll never sees it.
-    if (fallbackPrMatch?.merged && prUrl) {
-      reconcileAlreadyMergedPr(job, prUrl);
-    }
-
-    // AII-264 r5: a grouping parent's clean GHA run with no PR is Case-B (the runner's push
-    // step no-op'd because the agent produced no changes). Without a reachable callback the
-    // parent would strand In Progress — finalize it here so merge-up opens the roll-up PR.
-    if (jobStatus === "completed" && !prUrl && job.phase !== "planning" && job.groupingParent) {
-      const provider = await providerForJob(registry, job);
-      if (!isMonitorRunIdStillCurrent(job)) return;
-      await finalizeNoOpGroupingParent(provider, job);
-    }
-
-    if (jobStatus === "failed") {
-      const provider = await providerForJob(registry, job);
-      if (!isMonitorRunIdStillCurrent(job)) return;
-      await remediateFailedJob(watchdogConfig, provider, job, runStatus.conclusion ?? "failure");
-    }
-  }
-  // If status is queued or in_progress, ensure job is marked running
-  else if (job.status === "dispatched") {
-    updateJobRunId(job.id, job.runId);
-  }
-}
-
-function isMonitorRunIdStillCurrent(job: Job): boolean {
-  const current = getJobById(job.id);
-  if (!current) return false;
-  if (current.runId === job.runId) return true;
-  console.log(
-    `[monitor] Skipping stale cycle for job ${job.id} (${job.issueIdentifier}); run ID changed from ${job.runId ?? "none"} to ${current.runId ?? "none"}`,
-  );
-  return false;
 }
 
 /**
@@ -3029,9 +2868,6 @@ async function handleKgRefreshOutcome(
     console.error("[kg-refresh] Failed to post failure comment to report issue:", err);
   }
 }
-
-/** Workflow file expected in the KG source repo for GHA-backed kg-refresh dispatch. */
-const KG_REFRESH_WORKFLOW_FILE = "claude-kg-refresh.yml";
 
 /**
  * Default per-mapping execution mode for kg-refresh. kg-refresh has no project

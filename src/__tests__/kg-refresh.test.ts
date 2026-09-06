@@ -1510,5 +1510,52 @@ describe("kg-refresh", () => {
         expect(failResult.ok).toBe(false);
       });
     });
+
+    // ---- GHA lazy-bind and late-callback (AII-555) ----------------------------
+
+    it("GHA dispatch: updateJobMachine called with workflowRunId returned by dispatchRun", async () => {
+      const updateJobMachine = vi.fn();
+      const appendJobLog = vi.fn(() => 77);
+      buildDispatch({
+        appendJobLog,
+        updateJobMachine,
+        dispatchRun: vi.fn(async () => ({
+          workflowRunId: 12345,
+          logsUrl: "https://github.com/owner/repo/actions/runs/12345",
+        })),
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(updateJobMachine).toHaveBeenCalledWith(77, expect.objectContaining({ workflowRunId: 12345 }));
+    });
+
+    it("late rail callback: onRunnerComplete records lastRefresh when dispatch_log row is already closed externally", async () => {
+      // The GHA monitor closes the dispatch_log row via updateJobStatus (a direct DB
+      // write) before the runner callback arrives. Because onRunnerComplete guards on the
+      // in-process `stage` variable (not on DB row status), it still fires and records
+      // lastRefresh. This test verifies that path: stage stays "ingest-running" while
+      // the handle's closeJobLog injectable has not yet been called (simulating the
+      // monitor having closed the row first), and onRunnerComplete still records the outcome.
+      const persistLastRefresh = vi.fn();
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 55);
+      buildDispatch({ persistLastRefresh, closeJobLog, appendJobLog });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+
+      // Verify the handle has not yet called closeJobLog (only the monitor has, externally).
+      expect(closeJobLog).not.toHaveBeenCalled();
+
+      // Late callback arrives — stage is still "ingest-running".
+      handle.onRunnerComplete("success", {});
+      await waitDone();
+
+      expect(persistLastRefresh).toHaveBeenCalled();
+      const [outcome] = persistLastRefresh.mock.calls[0] as [RefreshOutcome];
+      expect(outcome.ok).toBe(true);
+      // The handle calls closeJobLog itself as part of settling the outcome.
+      expect(closeJobLog).toHaveBeenCalled();
+    });
   });
 });
+

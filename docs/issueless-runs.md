@@ -252,18 +252,11 @@ The stuck-watchdog path re-queues issues through the ticketing system. Since the
 
 ### Reaper reconciliation
 
-`src/reaper.ts`: at the end of each `sweepOrphanedMachines()` call, `sweepOrphanedKgRefreshJobs()` is invoked. It branches on `job.executionMode`:
+`src/reaper.ts`: at the end of each `sweepOrphanedMachines()` call, `sweepOrphanedKgRefreshJobs()` is invoked. It operates on **Fly-mode rows only**. GHA rows are skipped (`continue`) and are instead closed by the shared `monitorGitHubActionsJob` loop (see below).
 
-**Fly-mode rows** (existing behaviour): the already-fetched machine set is consulted. For each row whose `machine_id` is absent from the active set, `helpers.failKgRefreshMachine(job)` is called. A row still in `"dispatched"` state past the 5-minute bootstrap deadline is closed with `failureCode: "bootstrap_timeout"` regardless of machine presence. Local-Docker rows (no `machine_id`) are skipped.
+**Fly-mode rows**: the already-fetched machine set is consulted. For each row whose `machine_id` is absent from the active set, `helpers.failKgRefreshMachine(job)` is called. A row still in `"dispatched"` state past the 5-minute bootstrap deadline is closed with `failureCode: "bootstrap_timeout"` regardless of machine presence. Local-Docker rows (no `machine_id`) are skipped.
 
-**GHA rows** (`executionMode = "github-actions"`): machine-absent and bootstrap-deadline rules never apply. Instead, `helpers.checkGhaRunStatus(job)` queries the GitHub Actions workflow run:
-- `status` is `"queued"` or `"in_progress"` → leave the row alone
-- `status` is `"completed"` → call `helpers.failKgRefreshMachine(job, { failureCode: conclusion })` to close the chain
-- API error (helper returns `null`) → leave the row alone (fail-safe; avoid releasing the deploy interlock on ambiguous signal)
-- `run_id` is `null` and the row is within the 5-minute dispatch grace window → leave alone
-- `run_id` is `null` and past the grace window → close with `failureCode: "dispatch_lost"`
-
-All paths converge on `kgRefresh.onMachineLost()`:
+All Fly-mode paths converge on `kgRefresh.onMachineLost()`:
 
 ```typescript
 onMachineLost(opts?: { failureCode?: string }) {
@@ -274,7 +267,17 @@ onMachineLost(opts?: { failureCode?: string }) {
 
 `failIngestRunner()` closes the chain: sets `stage = "failed"`, clears `running`, fires `onOutcome("failure", { timedOut: true })`, and calls `closeJobLog(jobId, "timed_out")`.
 
-New `ruleMatched` values written to `reaper_actions`: `kg-refresh-gha-run-complete`, `kg-refresh-gha-dispatch-lost`.
+### GHA monitor and lazy run-ID bind
+
+`monitorGitHubActionsJob` in `src/index.ts` already processes all `execution_mode = 'github-actions'` rows returned by `getInFlightJobs()` (which includes kg-refresh rows). Two mechanisms operate on each poll cycle:
+
+**Lazy run-ID bind**: when `run_id IS NULL`, the function calls `getRepoDefaultBranch` to fetch the KG repo's default branch and then `findWorkflowRunId` with `KG_REFRESH_WORKFLOW_FILE` (`"claude-kg-refresh.yml"`). If a matching run is found, `attachJobRunIdIfMissing` writes the run ID to the row and transitions the status to `"running"`. This mirrors the implement-path lazy bind at the same poll frequency (~60 s).
+
+**Monitor close**: once the run ID is set, the monitor calls `getWorkflowRunStatus` on each poll cycle. When the run completes, `updateJobStatus` closes the dispatch_log row with the corresponding `JobStatus` (`"completed"`, `"failed"`, or `"timed_out"`). This is the authoritative close for GHA rows — the reaper plays no part.
+
+**Late callback safety**: if the monitor closes the dispatch_log row before the runner's result callback arrives, `onRunnerComplete` still fires because it guards on the in-process `stage` variable (not on DB row status). `lastRefresh` is recorded correctly; `closeJobLog` is then called a second time by the handle, which is an idempotent DB update.
+
+`mapping?.maxJobMinutes` is used for the stuck-watchdog threshold; it is `null` for kg-refresh rows (no mapping), which resolves to the default GHA job timeout. The stuck-watchdog remediation path (`remediateStuckJob`, `remediateFailedJob`) guards on `job.phase === "kg-refresh"` and returns early, so no ticket operations are attempted.
 
 ### Deploy interlock
 
@@ -460,7 +463,8 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | Outcome notification | `src/notify.ts` (`notifyKgRefreshOutcome`) |
 | Completion classification | `src/completion-classification.ts` |
 | Stuck-watchdog carve-out | `src/stuck-watchdog.ts` (~line 147) |
-| Reaper inverse sweep | `src/reaper.ts` (`sweepOrphanedKgRefreshJobs`) |
+| Reaper inverse sweep (Fly-only) | `src/reaper.ts` (`sweepOrphanedKgRefreshJobs`) |
+| GHA lazy bind + monitor close | `src/index.ts` (`monitorGitHubActionsJob`) |
 | Deploy interlock | `src/in-flight-work.ts` (`getInFlightWork`) |
 | Operator cancel | `src/admin.ts` (`handleDestroySession`, kg-refresh branch) |
 | Admin log proxy | `src/admin.ts` (`GET /api/sessions/:id/logs`) |
