@@ -216,7 +216,7 @@ The in-flight dispatch envelope is stored under the same `kg_refresh_stage` sett
 
 `lastRefresh` is persisted under a separate `kg_refresh_last_refresh` settings key on every terminal outcome (success, no-new-data, failure) and loaded on boot. It survives restarts independently of the in-flight state.
 
-**Token validation survives restarts** because `verifyAndConsumeRunToken` and `verifyRunToken` are DB-only — they read `runner_tokens` rows written at dispatch time. The 401 seen in run 34006075078 was caused by the progress token not being minted (AII-544, now fixed), not by in-memory state loss.
+**Token validation survives restarts** because `verifyAndConsumeRunToken` and `verifyRunToken` are DB-only — they read `runner_tokens` rows written at dispatch time, not in-memory state.
 
 **SQLite volume must persist across deploys.** An orchestrator that redeploys with a fresh volume loses both the `runner_tokens` rows and the persisted stage — token validation returns `reason: "malformed"` (row absent) and `GET /api/kg/status` shows `lastRefresh: null`.
 

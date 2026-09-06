@@ -562,6 +562,8 @@ describe("kg-refresh", () => {
           persistedStages.push({ stage: s, startedAt: t });
         },
         loadStage: () => stageStore,
+        persistLastRefresh: vi.fn() as never,
+        loadLastRefresh: vi.fn().mockReturnValue(null) as never,
         ...overrides,
       });
     }
