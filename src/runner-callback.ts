@@ -95,7 +95,7 @@ export interface HandleRunnerResultOutput {
 }
 
 export interface RunnerProgressBody {
-  step: Step;
+  step?: Step;
   githubRunId?: number;
 }
 
@@ -427,11 +427,18 @@ export async function handleRunnerProgress(
   const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
 
-  const stepOrError = validateStepBody(input.body);
-  if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
-
   const githubRunIdOrError = validateGithubRunId(input.body);
   if (githubRunIdOrError && typeof githubRunIdOrError === "object") return githubRunIdOrError;
+
+  // step is optional — a caller may send only githubRunId to bind the workflow run without
+  // reporting a step (e.g. the GHA workflow's early "Bind workflow run ID" step).
+  const hasStep = input.body && typeof input.body === "object" && "step" in input.body;
+  let step: Step | null = null;
+  if (hasStep) {
+    const stepOrError = validateStepBody(input.body);
+    if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+    step = stepOrError as Step;
+  }
 
   const job = getJobByDispatchId(verified.claims.dispatchId);
   if (!job) return bad(404, "job_not_found");
@@ -440,7 +447,9 @@ export async function handleRunnerProgress(
     claimJobRunId(job.id, githubRunIdOrError);
   }
 
-  upsertStepRecord(job.id, stepOrError);
+  if (step !== null) {
+    upsertStepRecord(job.id, step);
+  }
   return { status: 200, body: { acknowledged: true } };
 }
 

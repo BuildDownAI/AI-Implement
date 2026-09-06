@@ -898,7 +898,7 @@ describe("kgTrackerDataStep", () => {
     expect(JSON.parse(written[0][1])).toEqual([...aiiIssues, ...bdsIssues]);
   });
 
-  it("returns { fetched: false } when any configured team returns zero issues", async () => {
+  it("throws KgTrackerDataFetchError when any configured team returns zero issues", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
     const aiiIssues = [{ id: "aii-1" }, { id: "aii-2" }];
     const fetchImpl: typeof fetch = async (_, init) => {
@@ -906,23 +906,19 @@ describe("kgTrackerDataStep", () => {
       const issues = body.teamKey === "AII" ? aiiIssues : [];
       return { ok: true, status: 200, json: async () => makeTrackerPage(issues, false) } as Response;
     };
-    const written: Array<[string, string]> = [];
-    const result = await kgTrackerDataStep.run(
-      makeContext(),
-      {
-        callbackUrl: "http://orch",
-        workspaceDir: tmpDir,
-        fetchImpl,
-        writeFileSyncImpl: (p, d) => written.push([p, d]),
-        sourcesYmlReaderImpl: () => ["AII", "BDS"],
-      },
-      noopReporter,
-    );
-    // BDS returned 0 → fetched: false, but AII issues are still written
-    expect(result.fetched).toBe(false);
-    expect(result.issueCount).toBe(2);
-    expect(written).toHaveLength(1);
-    expect(JSON.parse(written[0][1])).toEqual(aiiIssues);
+    await expect(
+      kgTrackerDataStep.run(
+        makeContext(),
+        {
+          callbackUrl: "http://orch",
+          workspaceDir: tmpDir,
+          fetchImpl,
+          writeFileSyncImpl: () => {},
+          sourcesYmlReaderImpl: () => ["AII", "BDS"],
+        },
+        noopReporter,
+      ),
+    ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
   });
 
   it("returns { fetched: false } when sources.yml is absent or has no teams", async () => {
