@@ -224,7 +224,7 @@ export async function resolveRunnerImageForDispatch(opts: {
 
 // Strip ":tag" or "@digest" from an image ref, leaving the bare registry/name.
 // Returns null when the image has no slash (not a valid ref) or no tag/digest.
-function stripImageTag(image: string): string | null {
+export function stripImageTag(image: string): string | null {
   const firstSlash = image.indexOf("/");
   if (firstSlash === -1) return null;
   const atIdx = image.indexOf("@", firstSlash);
@@ -350,4 +350,85 @@ export async function resolveKgRefreshSessionImage(
   }
 
   return resolved;
+}
+
+/**
+ * Resolves the source commit baked into a runner channel image by fetching its
+ * OCI config labels. Returns null on any error (network, auth, missing label)
+ * so the caller always gets a usable value without needing to handle exceptions.
+ *
+ * Checks `org.opencontainers.image.revision` first (OCI standard), then falls
+ * back to the custom `AI_IMPLEMENT_SOURCE_COMMIT` label. A missing label or
+ * registry failure both yield null — the tool degrades gracefully in both cases.
+ */
+export async function resolveChannelCommit(
+  imageBase: string,
+  channelTag: string,
+  fetchImpl?: typeof fetch,
+): Promise<string | null> {
+  const fetchFn = fetchImpl ?? fetch;
+  const imageRef = `${imageBase}:${channelTag}`;
+  const parsed = parseImageRef(imageRef);
+  if (!parsed) return null;
+  const { host, name, tag } = parsed;
+  const manifestUrl = `https://${host}/v2/${name}/manifests/${tag}`;
+  const accept =
+    "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
+
+  try {
+    let token: string | null = null;
+    let res = await fetchFn(manifestUrl, { headers: { Accept: accept } });
+
+    if (res.status === 401) {
+      const wwwAuth = res.headers.get("www-authenticate") ?? "";
+      const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+      const serviceMatch = wwwAuth.match(/service="([^"]+)"/);
+      const scopeMatch = wwwAuth.match(/scope="([^"]+)"/);
+      if (!realmMatch) return null;
+
+      const params = new URLSearchParams();
+      if (serviceMatch) params.set("service", serviceMatch[1]);
+      if (scopeMatch) params.set("scope", scopeMatch[1]);
+      const tokenRes = await fetchFn(`${realmMatch[1]}?${params}`);
+      if (!tokenRes.ok) return null;
+      const { token: bearerToken } = (await tokenRes.json()) as { token?: string };
+      if (!bearerToken) return null;
+      token = bearerToken;
+
+      res = await fetchFn(manifestUrl, {
+        headers: { Accept: accept, Authorization: `Bearer ${token}` },
+      });
+    }
+
+    if (!res.ok) return null;
+
+    // Parse manifest to get config layer digest.
+    const manifest = (await res.json()) as { config?: { digest?: unknown } };
+    const configDigest = manifest?.config?.digest;
+    if (typeof configDigest !== "string") return null;
+
+    // Fetch the config blob to read image labels.
+    const configUrl = `https://${host}/v2/${name}/blobs/${configDigest}`;
+    const configHeaders: Record<string, string> = {};
+    if (token) configHeaders["Authorization"] = `Bearer ${token}`;
+
+    const configRes = await fetchFn(configUrl, { headers: configHeaders });
+    if (!configRes.ok) return null;
+
+    const config = (await configRes.json()) as {
+      config?: { Labels?: Record<string, unknown> | null };
+    };
+    const labels = config?.config?.Labels;
+    if (!labels || typeof labels !== "object") return null;
+
+    const revision = labels["org.opencontainers.image.revision"];
+    if (typeof revision === "string" && revision) return revision;
+
+    const stamp = labels["AI_IMPLEMENT_SOURCE_COMMIT"];
+    if (typeof stamp === "string" && stamp) return stamp;
+
+    return null;
+  } catch {
+    return null;
+  }
 }
