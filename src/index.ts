@@ -3049,7 +3049,14 @@ async function dispatchKgRefreshRun(
   if (executionPath === "github-actions") {
     // Dispatch to the kg-refresh workflow in the KG source repo.
     const dispatchUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/dispatches`;
-    const dispatchBody = JSON.stringify({ ref: defaultBranch, inputs: { run_config: opts.runConfig, run_token: opts.runToken } });
+    const runnerImage = await resolveRunnerImageForDispatch({
+      owner: repo.owner,
+      repo: repo.repo,
+      token: ghToken,
+      defaultImage: config.sessionImage,
+      runnerImageExplicit: config.runnerImageExplicit,
+    });
+    const dispatchBody = JSON.stringify({ ref: defaultBranch, inputs: { run_config: opts.runConfig, run_token: opts.runToken, ...(runnerImage ? { runner_image: runnerImage } : {}) } });
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
       signal: defaultFetchSignal(),

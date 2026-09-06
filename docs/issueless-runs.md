@@ -77,7 +77,7 @@ The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on bo
 | `local` | `local-docker` (requires `LOCAL_RUNNER_IMAGE`) |
 | `shadow` | collapses to `github-actions` — two concurrent ingest runs would race to push the same snapshot commit |
 
-**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-kg-refresh.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config` and `run_token`. If the workflow file is absent, the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message naming the missing file and the sync instruction. After a successful dispatch, `findWorkflowRunId()` is attempted (30-second look-back, best-effort) and the resulting run ID is stored on the `dispatch_log` row via `updateJobRunId()`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs.
+**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-kg-refresh.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, and `runner_image`. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image (`AI_IMPLEMENT_RUNNER_IMAGE`) or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. A testing orchestrator pinned to `:next` therefore steers kg-refresh runs to `:next` automatically — the KG source repo needs no `AI_IMPLEMENT_RUNNER_IMAGE` variable when the orchestrator is pinned. If the workflow file is absent, the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message naming the missing file and the sync instruction. After a successful dispatch, `findWorkflowRunId()` is attempted (30-second look-back, best-effort) and the resulting run ID is stored on the `dispatch_log` row via `updateJobRunId()`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs.
 
 **Fly Machines backend:** unchanged from the original implementation. Creates a session machine with `phase: "kg-refresh"`. Returns `machineId + machineNonce`.
 
@@ -95,7 +95,7 @@ The `claude-kg-refresh.yml` workflow lives in `workflows/` and must be added to 
 | `AI_IMPLEMENT_PRIVATE_KEY` | GitHub App PEM private key |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code OAuth token (preferred) — or `ANTHROPIC_API_KEY` |
 
-Optional variables: `AI_IMPLEMENT_RUNNER_IMAGE`, `AI_IMPLEMENT_RUNNER_LABEL`. Verify with `gh secret list --repo <owner>/<kg-repo>` (names only). Observed live 2026-09-05: the workflow file was added and dispatch would have succeeded, but the repo carried no secrets.
+Optional variables: `AI_IMPLEMENT_RUNNER_LABEL`. `AI_IMPLEMENT_RUNNER_IMAGE` is no longer needed on the KG source repo when the orchestrator is pinned to a specific image — the orchestrator now forwards `runner_image` in the dispatch, so the workflow receives the correct image without a repo-level variable. Leaving an existing `AI_IMPLEMENT_RUNNER_IMAGE` in place is safe (the orchestrator's forwarded value takes precedence when set). Verify with `gh secret list --repo <owner>/<kg-repo>` (names only). Observed live 2026-09-05: the workflow file was added and dispatch would have succeeded, but the repo carried no secrets.
 
 ---
 
