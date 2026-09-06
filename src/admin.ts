@@ -159,6 +159,24 @@ function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketing
     throw new Error(`Invalid ticketingProvider: expected "linear" or "jira", got ${JSON.stringify(provider)}`);
   }
   const config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
+  if (config.kind === "jira") {
+    // A field-id override is interpolated into JQL and into the fields list of a REST
+    // query, so reject anything that is not a bare identifier here rather than letting
+    // it reach Jira as a malformed query. Blank values are already normalized to null
+    // by validateTicketingConfig, so only genuinely malformed ids reach this check.
+    const overrideKeys = [
+      "statusFieldOverride",
+      "repoFieldOverride",
+      "profilesFieldOverride",
+      "baseBranchFieldOverride",
+    ] as const;
+    for (const key of overrideKeys) {
+      const value = config[key];
+      if (value != null && !/^[A-Za-z0-9_]+$/.test(value)) {
+        throw new Error(`Invalid ${key} "${value}" — Jira field ids may only contain letters, digits, and underscores`);
+      }
+    }
+  }
   return { ticketingProvider: provider, ticketingConfig: config };
 }
 

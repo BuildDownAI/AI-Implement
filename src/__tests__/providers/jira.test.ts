@@ -141,6 +141,7 @@ const jiraMapping = (
     statusFieldOverride: string | null;
     repoFieldOverride: string | null;
     profilesFieldOverride: string | null;
+    baseBranchFieldOverride: string | null;
   }> = {},
 ): RepoMapping => ({
   ...baseMapping,
@@ -152,6 +153,7 @@ const jiraMapping = (
     statusFieldOverride: overrides.statusFieldOverride,
     repoFieldOverride: overrides.repoFieldOverride,
     profilesFieldOverride: overrides.profilesFieldOverride,
+    baseBranchFieldOverride: overrides.baseBranchFieldOverride,
   },
 });
 
@@ -410,6 +412,7 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
           statusFieldOverride: "status",
           repoFieldOverride: "customfield_10101",
           profilesFieldOverride: "customfield_10200",
+          baseBranchFieldOverride: "customfield_10300",
         }),
       }),
     });
@@ -743,6 +746,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
           statusFieldOverride: "customfield_10100",
           repoFieldOverride: "customfield_10101",
           profilesFieldOverride: "customfield_10200",
+          baseBranchFieldOverride: "customfield_10300",
         }),
       }),
     });
@@ -1037,7 +1041,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
     new JiraProvider({
       client, cacheScope: "c", siteUrl: "https://x",
       getMappings: () => ({
-        m1: jiraMapping({ repoFieldValue: "acme/x", statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101", profilesFieldOverride: "customfield_10200" }),
+        m1: jiraMapping({ repoFieldValue: "acme/x", statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101", profilesFieldOverride: "customfield_10200", baseBranchFieldOverride: "customfield_10300" }),
       }),
     });
 
@@ -1155,6 +1159,7 @@ describe("JiraProvider — grouping mode from ai-implement.yml", () => {
           statusFieldOverride: "customfield_10100",
           repoFieldOverride: "customfield_10101",
           profilesFieldOverride: "customfield_10200",
+          baseBranchFieldOverride: "customfield_10300",
         }),
       }),
     });
@@ -1432,7 +1437,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
     warnSpy.mockRestore();
   });
 
-  it("uses profilesFieldOverride to resolve profiles without calling listFields for all three overrides", async () => {
+  it("uses profilesFieldOverride to resolve profiles without calling listFields when all four overrides are set", async () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(searchOk([{
         id: "10001", key: "P-1",
@@ -1459,6 +1464,7 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
         statusFieldOverride: "customfield_10100",
         repoFieldOverride: "customfield_10101",
         profilesFieldOverride: "customfield_10200",
+        baseBranchFieldOverride: "customfield_10300",
       },
     };
 
