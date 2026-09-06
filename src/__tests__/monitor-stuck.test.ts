@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Job } from "../log.js";
 import type { TicketingProvider } from "../providers/types.js";
+import { shouldSkipCompletionNotice } from "../monitor-status.js";
 
 vi.mock("../github.js", () => ({
   cancelWorkflowRun: vi.fn().mockResolvedValue(true),
@@ -304,5 +305,37 @@ describe("remediateStuckJob", () => {
 
       expect(updateJobStatus).toHaveBeenCalledWith(1, "timed_out", "stuck_giveup");
     });
+  });
+});
+
+describe("kg-refresh notification isolation", () => {
+  it("suppresses the generic completion notice for a timed_out kg-refresh job", () => {
+    const job = makeJob({ phase: "kg-refresh", issueId: "kg-refresh", issueIdentifier: null });
+    expect(shouldSkipCompletionNotice(job)).toBe(true);
+  });
+
+  it("suppresses the generic completion notice for a failed kg-refresh job", () => {
+    const job = makeJob({ phase: "kg-refresh", issueId: "kg-refresh", issueIdentifier: null, status: "failed" });
+    expect(shouldSkipCompletionNotice(job)).toBe(true);
+  });
+
+  it("suppresses the generic completion notice for a completed kg-refresh job", () => {
+    const job = makeJob({ phase: "kg-refresh", issueId: "kg-refresh", issueIdentifier: null, status: "completed" });
+    expect(shouldSkipCompletionNotice(job)).toBe(true);
+  });
+
+  it("suppresses for bootstrap_timeout conclusion — regression pin for job 699 (2026-09-06)", () => {
+    const job = makeJob({ phase: "kg-refresh", issueId: "kg-refresh", issueIdentifier: null, status: "timed_out", conclusion: "bootstrap_timeout" });
+    expect(shouldSkipCompletionNotice(job)).toBe(true);
+  });
+
+  it("does not suppress for a normal issue-keyed implementation job", () => {
+    const job = makeJob({ phase: "implementation", issueId: "issue-abc", issueIdentifier: "ENG-42", status: "timed_out" });
+    expect(shouldSkipCompletionNotice(job)).toBe(false);
+  });
+
+  it("does not suppress for a planning-phase job", () => {
+    const job = makeJob({ phase: "planning", issueId: "issue-abc", issueIdentifier: "ENG-42", status: "failed" });
+    expect(shouldSkipCompletionNotice(job)).toBe(false);
   });
 });

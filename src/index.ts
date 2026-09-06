@@ -44,7 +44,7 @@ import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, init
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
-import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, resolveKgRefreshSessionImage, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, planningDispatchBlockReason } from "./runner-callback.js";
@@ -73,7 +73,7 @@ import {
   startLocalRunnerContainer,
   sweepExitedLocalContainers,
 } from "./local-docker.js";
-import { clearPrNotFoundGrace, decideCleanExitOutcome, workflowFileForJob } from "./monitor-status.js";
+import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
@@ -2488,7 +2488,8 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
       // terminal job regardless of which backend or path produced it (GHA callback,
       // GHA monitor, Fly, local-docker).
       let pendingBreakerTrip: { phase: string; failures: number; conclusion: string } | null = null;
-      if (job.issueId) {
+      // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
+      if (job.issueId && job.phase !== "kg-refresh") {
         const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
         if (job.status === "completed") {
           recordDispatchSuccess(job.issueId, breakerPhase);
@@ -2533,6 +2534,12 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
           }
         }
         console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) operator_cancelled — benign terminal, one informational notice sent`);
+        markJobNotified(job.id);
+        continue;
+      }
+
+      // kg-refresh outcome notification is owned by notifyKgRefreshOutcome (AII-496).
+      if (shouldSkipCompletionNotice(job)) {
         markJobNotified(job.id);
         continue;
       }
@@ -3028,7 +3035,7 @@ const KG_REFRESH_DEFAULT_EXECUTION_MODE = "github-actions" as const;
 
 async function dispatchKgRefreshRun(
   config: AppConfig,
-  opts: { runToken: string; dispatchId: string; runConfig: string; executionPath?: string },
+  opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string },
 ): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
@@ -3107,15 +3114,22 @@ async function dispatchKgRefreshRun(
     }
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
-    const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig };
-    const { image: resolvedFlyImage } = await resolveSessionImage({
+    const extraEnv: Record<string, string> = {
+      AI_IMPLEMENT_RUN_CONFIG: opts.runConfig,
+      RUN_PROGRESS_TOKEN: opts.runProgressToken,
+    };
+    // Pair the session machine to the same pipeline generation as the orchestrator:
+    // resolve via image.yml override first, then try <base>:<AI_IMPLEMENT_SOURCE_COMMIT>
+    // (verified against the registry), finally fall back to config.sessionImage.
+    const { image: flySessionImage } = await resolveKgRefreshSessionImage({
       owner: repo.owner,
       repo: repo.repo,
       token: ghToken,
       defaultImage: config.sessionImage,
+      sourceCommit: process.env.AI_IMPLEMENT_SOURCE_COMMIT,
     });
     const machineConfig = buildSessionMachineConfig({
-      image: resolvedFlyImage,
+      image: flySessionImage,
       issueId: "kg-refresh",
       issueIdentifier: "KG-REFRESH",
       issueTitle: "KG ingest",
@@ -3149,7 +3163,7 @@ async function dispatchKgRefreshRun(
     }
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
-    const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig };
+    const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig, RUN_PROGRESS_TOKEN: opts.runProgressToken };
     const localOrchestratorUrl =
       config.localRunnerOrchestratorUrl ??
       config.runnerCallbackBaseUrl ??
