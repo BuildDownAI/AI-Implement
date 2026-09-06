@@ -269,6 +269,8 @@ export function buildEnvelopeDispatchInputs(
 /**
  * Builds the raw JSON body for a GHA kg-refresh workflow_dispatch call.
  * `runner_image` is omitted when `runnerImage` is undefined (no forwarding needed).
+ * `runner_callback_url` is omitted when `runnerCallbackUrl` is undefined; the
+ * entrypoint falls back to extracting it from AI_IMPLEMENT_RUN_CONFIG in that case.
  */
 export function buildKgRefreshGhaDispatchBody(opts: {
   ref: string;
@@ -276,6 +278,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
   runToken: string;
   runProgressToken: string;
   runnerImage: string | undefined;
+  runnerCallbackUrl?: string | undefined;
 }): string {
   return JSON.stringify({
     ref: opts.ref,
@@ -284,6 +287,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
       run_token: opts.runToken,
       run_progress_token: opts.runProgressToken,
       ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
+      ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
     },
   });
 }
