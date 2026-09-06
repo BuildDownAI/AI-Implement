@@ -119,7 +119,7 @@ describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
 
 // ── kg-snapshot-push step ─────────────────────────────────────────────────────
 
-import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError } from "../pipeline/steps/kg-snapshot-push.js";
+import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "../pipeline/steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "../pipeline/steps/kg-tracker-data.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
@@ -282,6 +282,7 @@ describe("kgSnapshotPushStep", () => {
 
     // No changes to snapshot since clonedRef → should fail STALE at "no staged changes"
     const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 5 });
     await expect(
       kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
     ).rejects.toBeInstanceOf(KgSnapshotStaleError);
@@ -466,6 +467,110 @@ describe("kgSnapshotPushStep", () => {
     } finally {
       rmSync(bareDir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── kgSnapshotPushStep — tracker regression guard ─────────────────────────────
+
+describe("kgSnapshotPushStep — tracker regression guard", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgpush-guard-"));
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+  });
+
+  function makeGuardInputs(overrides: Record<string, unknown> = {}) {
+    return {
+      workspaceDir: tmpDir,
+      githubToken: "fake-token",
+      defaultBranch: "main",
+      clonedRef: resolveHead(tmpDir),
+      ...overrides,
+    };
+  }
+
+  it("throws KgSnapshotTrackerRegressionError when tracker not fetched and previous snapshot has .nt files", async () => {
+    initGitRepo(tmpDir);
+    // Commit .nt files into snapshot/parts/ so the previous ref has tracker parts.
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "tracker.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-01-01T00:00:00Z");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'snapshot with tracker parts'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0 });
+
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotTrackerRegressionError);
+  });
+
+  it("does not throw tracker regression when fetched=false but previous snapshot has no .nt files", async () => {
+    initGitRepo(tmpDir);
+    const clonedRef = resolveHead(tmpDir);
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0 });
+
+    // Guard skips (no previous .nt files) — falls through to KgSnapshotMissingError
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotMissingError);
+  });
+
+  it("does not throw tracker regression when fetched=true even if previous snapshot has .nt files", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "tracker.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-01-01T00:00:00Z");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'snapshot with tracker parts'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 10 });
+
+    // Guard does not fire; falls through to KgSnapshotStaleError (snapshot unchanged since clone)
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotStaleError);
+  });
+
+  it("skips tracker regression guard when clonedRef is 'unknown'", async () => {
+    initGitRepo(tmpDir);
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0 });
+
+    // clonedRef=unknown → guard skips → falls through to KgSnapshotMissingError
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef: "unknown" }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotMissingError);
+  });
+
+  it("treats missing fetched output (empty getOutputs result) as fetched=false", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "tracker.nt"), "<s> <p> <o> .\n");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'snapshot with tracker parts'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    const ctx = makeContext();
+    // Intentionally do NOT set kg-tracker-data outputs → getOutputs returns {}
+
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotTrackerRegressionError);
   });
 });
 
@@ -1198,8 +1303,9 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
       fetchImpl,
     });
 
-    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "prog-tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
     expect(body.inputs.runner_image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
+    expect(body.inputs.run_progress_token).toBe("prog-tok");
   });
 
   it("body omits runner_image when image is not resolved (default image, no override)", async () => {
@@ -1213,8 +1319,9 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
       fetchImpl,
     });
 
-    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "prog-tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
     expect("runner_image" in body.inputs).toBe(false);
+    expect(body.inputs.run_progress_token).toBe("prog-tok");
   });
 
   it("body includes runner_image when KG repo has a per-repo image.yml override", async () => {
@@ -1236,8 +1343,22 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
       fetchImpl,
     });
 
-    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "prog-tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
     expect(body.inputs.runner_image).toBe("ghcr.io/org/custom-runner:sha-abc");
+    expect(body.inputs.run_progress_token).toBe("prog-tok");
+  });
+
+  it("body always includes run_progress_token regardless of runner_image presence", () => {
+    const bodyWithImage = JSON.parse(
+      buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "secret-prog", runnerImage: "ghcr.io/org/runner:v1" }),
+    ) as { inputs: Record<string, string> };
+    expect(bodyWithImage.inputs.run_progress_token).toBe("secret-prog");
+
+    const bodyNoImage = JSON.parse(
+      buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "secret-prog", runnerImage: undefined }),
+    ) as { inputs: Record<string, string> };
+    expect(bodyNoImage.inputs.run_progress_token).toBe("secret-prog");
+    expect("runner_image" in bodyNoImage.inputs).toBe(false);
   });
 });
 

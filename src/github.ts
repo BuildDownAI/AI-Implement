@@ -274,6 +274,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
   ref: string;
   runConfig: string;
   runToken: string;
+  runProgressToken: string;
   runnerImage: string | undefined;
 }): string {
   return JSON.stringify({
@@ -281,6 +282,7 @@ export function buildKgRefreshGhaDispatchBody(opts: {
     inputs: {
       run_config: opts.runConfig,
       run_token: opts.runToken,
+      run_progress_token: opts.runProgressToken,
       ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
     },
   });

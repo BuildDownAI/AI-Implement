@@ -19,6 +19,18 @@ export class KgSnapshotStaleError extends Error {
   }
 }
 
+/**
+ * Coded failure raised when the tracker-data step did not fetch data but the
+ * previous snapshot had tracker parts — pushing would regress the graph from
+ * tracker-enriched to docs-only.
+ */
+export class KgSnapshotTrackerRegressionError extends Error {
+  readonly code = "KG_SNAPSHOT_TRACKER_REGRESSION";
+  constructor(detail: string) {
+    super(`KG_SNAPSHOT_TRACKER_REGRESSION: ${detail}`);
+  }
+}
+
 interface KgSnapshotPushInputs extends Record<string, unknown> {
   workspaceDir: string;
   githubToken: string;
@@ -128,7 +140,7 @@ function buildCommitMessage(stats: KgStats | null): string {
 
 export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPushOutputs> = {
   async run(
-    _context: PipelineContext,
+    context: PipelineContext,
     inputs: KgSnapshotPushInputs,
     _reporter: StepReporter,
   ): Promise<KgSnapshotPushOutputs> {
@@ -139,6 +151,27 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     }
 
     const { workspaceDir, githubToken, defaultBranch, clonedRef } = inputs;
+
+    // ── 0. Tracker regression guard ──────────────────────────────────────────
+    // If the tracker-data step did not fetch (fetched=false) and the previous
+    // snapshot had tracker parts, refuse to push — a docs-only graph must never
+    // replace a tracker-enriched one.
+    const trackerOutputs = context.getOutputs("kg-tracker-data");
+    const trackerFetched = trackerOutputs.fetched === true;
+    if (!trackerFetched && clonedRef && clonedRef !== "unknown") {
+      const lsTreeResult = spawnSync(
+        "git", ["ls-tree", "--name-only", clonedRef, "--", "snapshot/parts/"],
+        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const previousNtFiles = lsTreeResult.status === 0
+        ? lsTreeResult.stdout.toString().split("\n").filter((f) => f.trim().endsWith(".nt"))
+        : [];
+      if (previousNtFiles.length > 0) {
+        throw new KgSnapshotTrackerRegressionError(
+          `tracker-data step reported fetched=false but previous snapshot has ${previousNtFiles.length} tracker .nt file(s) — refusing to push a docs-only graph`,
+        );
+      }
+    }
 
     // ── 1. Validate snapshot/parts/*.nt ─────────────────────────────────────
     const partsDir = join(workspaceDir, "snapshot", "parts");
