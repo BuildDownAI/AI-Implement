@@ -362,6 +362,8 @@ The designated tracker issue (if configured) receives failure comments; there is
 
 ## 10. How to add a new issueless run kind
 
+**Prefer a parameter of an existing file over a new file next to it. A new template, resolver, or lifecycle branch for a run kind is a finding in review.** See the [kg-refresh retrospective](kg-architecture.md#retrospective-the-dispatched-refresh-2026-09-03--09-06) for the concrete example.
+
 A checklist for implementing a second run kind from scratch, without reading AII-493–521.
 
 **1. Pick a synthetic `issueId` string constant**

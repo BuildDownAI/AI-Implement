@@ -420,6 +420,35 @@ report issue is configured, exactly one tracker comment. The stage guard added t
 (`if (stage !== "ingest-running") return;`) prevents a late runner callback from re-entering the
 critical section after the TTL watchdog has already resolved the run.
 
+## Retrospective: the dispatched refresh (2026-09-03 → 09-06)
+
+### Retrospective — what happened
+
+AII-495 wired `POST /api/kg/refresh` to dispatch a Claude runner when the source repo has no newer snapshot. On 2026-09-03, a refresh was triggered on the testing orchestrator for the first time with runner dispatch enabled. Two bugs blocked the run from completing; both were diagnosed and fixed within the window.
+
+**AII-544 — progress token not minted.** `dispatchKgRefreshRun()` minted only a result token (`audience: "result"`). Both vending endpoints — `POST /api/runner/kg-push-token` and `POST /api/runner/kg-tracker-data` — gate on `audience = "progress"`, so the runner received 403 on both. The `kg-tracker-data` step no-oped silently (`RUN_PROGRESS_TOKEN` absent → early return). The `kg-snapshot-push` step's git credential helper also received 403, so the push failed with no usable GitHub token. Fix: mint a progress token alongside the result token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv`.
+
+**AII-548 — `runnerCallbackUrl` carried the full result URL.** The `RunConfigV1` field was set to `RUNNER_CALLBACK_BASE_URL + "/runner/result"` (the full callback URL) instead of the bare base URL. Every runner-side client that appended its own path produced a doubled path — `/runner/result/runner/result`, `/api/runner/kg-tracker-data/runner/result`, etc. — all of which hit the admin-auth wall and returned 401. Fix: `runnerCallbackUrl` is always the bare base URL (e.g. `https://my-orchestrator.fly.dev`); each client is responsible for appending its own path suffix. This contract is now documented in `docs/issueless-runs.md` §3.
+
+After both fixes landed, the review of the implementation also identified an architectural pattern: the kg-refresh dispatch introduced several sibling files alongside existing ones rather than parameterizing the originals. The architecture table below names each pairing and records the cleanup issues so the next issueless run kind starts from the shared list rather than repeating the same proliferation.
+
+### Architecture — what is shared and what is kg-refresh-only
+
+| Component | Shared / existing path | kg-refresh-only path | Status |
+|---|---|---|---|
+| GHA workflow | `workflows/claude-implement.yml` | `workflows/claude-kg-refresh.yml` | removed by AII-556 |
+| Runner-side pipeline | *(step sequence in `WORKFLOW.md`)* | `pipelines/kg-refresh.yml` | present |
+| Session image resolution | `src/repo-image.ts` `resolveRunnerImageForDispatch` | `src/repo-image.ts` `resolveKgRefreshSessionImage` | removed by AII-557 |
+| Orchestrator state machine | — | `src/kg-refresh.ts` | present |
+| Pipeline entrypoint | — | `src/pipeline/kg-refresh-run.ts` | present |
+| Tracker data step | — | `src/pipeline/steps/kg-tracker-data.ts` | present |
+| Snapshot push step | — | `src/pipeline/steps/kg-snapshot-push.ts` | present |
+| Push token vending | — | `src/kg-push-token-vending.ts` | present |
+| Callback routing | `src/runner-callback.ts` (carve-out within shared file) | — | present |
+| Dispatch function | — | `src/index.ts` `dispatchKgRefreshRun` / `KG_REFRESH_WORKFLOW_FILE` | present |
+
+The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, and `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`. AII-556 and AII-557 collapse those pairs. Rows with no shared counterpart (the state machine, pipeline steps, token vending) are legitimately kg-refresh-only and belong exactly where they are.
+
 ## Lineage
 
 | Wave | Issues | Result |
