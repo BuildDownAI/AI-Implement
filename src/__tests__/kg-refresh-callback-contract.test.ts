@@ -188,6 +188,13 @@ describe("kg-refresh callback-URL contract", () => {
     expect(SERVED_ROUTES.has(`POST ${path}`)).toBe(true);
   });
 
+  it("setup_kg_push_credential resolves to POST /api/runner/kg-push-token — a served route", () => {
+    // Replicates session/git-credential-helper-kg-push.sh: strip trailing slashes then append the route.
+    const path = new URL(BASE.replace(/\/+$/, "") + "/api/runner/kg-push-token").pathname;
+    expect(path).toBe("/api/runner/kg-push-token");
+    expect(SERVED_ROUTES.has(`POST ${path}`)).toBe(true);
+  });
+
   it("kgTrackerDataStep resolves to POST /api/runner/kg-tracker-data — a served route", async () => {
     const captured: string[] = [];
     const mockFetch = vi.fn(async (url: string) => {
