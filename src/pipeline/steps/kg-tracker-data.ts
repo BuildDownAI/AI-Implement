@@ -80,8 +80,9 @@ function readTrackerTeams(workspaceDir: string): string[] {
     // Fall through to regex fallback
   }
 
-  // Fallback: matches indented `team:` lines; value stops before any trailing comment
-  const matches = [...raw.matchAll(/^\s+team:\s+(\S+)/gm)];
+  // Fallback: matches both `    team: X` (block style) and `  - team: X` (inline-dash style).
+  // Value stops at first non-space char sequence, so trailing comments are excluded.
+  const matches = [...raw.matchAll(/^\s+(?:-\s+)?team:\s+(\S+)/gm)];
   return matches.map((m) => m[1]);
 }
 

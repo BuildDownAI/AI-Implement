@@ -1037,6 +1037,20 @@ trackers:
     expect(requestBodies.map((b) => b.teamKey)).toEqual(["AII"]);
   });
 
+  it("falls back to regex when YAML is unparseable and team is in inline-dash form (- team: X)", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    // Leading `[broken` makes the YAML parser throw; the fallback regex must also match `  - team: AII`
+    writeFileSync(join(tmpDir, "sources.yml"), "[broken\n  - team: AII\n");
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(result.fetched).toBe(true);
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["AII"]);
+  });
+
   it("returns { fetched: false } when trackers block has no team keys", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
     writeFileSync(join(tmpDir, "sources.yml"), "trackers:\n  - kind: linear\n    tier: primary\n");
