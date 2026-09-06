@@ -88,7 +88,13 @@ The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on bo
 | `local` | `local-docker` (requires `LOCAL_RUNNER_IMAGE`) |
 | `shadow` | collapses to `github-actions` — two concurrent ingest runs would race to push the same snapshot commit |
 
-**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-kg-refresh.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, and `runner_image`. `run_progress_token` is the HMAC progress token; the workflow masks it immediately and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. `RUNNER_CALLBACK_URL` is not passed as an explicit workflow input — `session/entrypoint.sh` derives it from the `runnerCallbackUrl` field in the decoded `AI_IMPLEMENT_RUN_CONFIG` envelope (always present when the callback-config guard passes). Together these allow the `kg-tracker-data` step and the `setup_kg_push_credential` helper to operate on GHA the same way they do on Fly. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image (`AI_IMPLEMENT_RUNNER_IMAGE`) or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. A testing orchestrator pinned to `:next` therefore steers kg-refresh runs to `:next` automatically — the KG source repo needs no `AI_IMPLEMENT_RUNNER_IMAGE` variable when the orchestrator is pinned. If the workflow file is absent, the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message naming the missing file and the sync instruction. After a successful dispatch, `findWorkflowRunId()` is attempted (30-second look-back, best-effort) and the resulting run ID is stored on the `dispatch_log` row via `updateJobRunId()`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs. The GHA template must export `RUNNER_PHASE=kg-refresh` in the `Run pipeline` step env; `session/entrypoint.sh` defaults `RUNNER_PHASE` to `implementation` when absent, so an omission silently routes the run to `run-autonomous.js` instead of `pipeline/kg-refresh-run.js`.
+**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-kg-refresh.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, and `runner_image`. `run_progress_token` is the HMAC progress token; the workflow masks it immediately and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. `RUNNER_CALLBACK_URL` is not passed as an explicit workflow input — `session/entrypoint.sh` derives it from the `runnerCallbackUrl` field in the decoded `AI_IMPLEMENT_RUN_CONFIG` envelope (always present when the callback-config guard passes). Together these allow the `kg-tracker-data` step and the `setup_kg_push_credential` helper to operate on GHA the same way they do on Fly. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image (`AI_IMPLEMENT_RUNNER_IMAGE`) or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. A testing orchestrator pinned to `:next` therefore steers kg-refresh runs to `:next` automatically — the KG source repo needs no `AI_IMPLEMENT_RUNNER_IMAGE` variable when the orchestrator is pinned. If the workflow file is absent, the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message naming the missing file and the sync instruction. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs. The GHA template must export `RUNNER_PHASE=kg-refresh` in the `Run pipeline` step env; `session/entrypoint.sh` defaults `RUNNER_PHASE` to `implementation` when absent, so an omission silently routes the run to `run-autonomous.js` instead of `pipeline/kg-refresh-run.js`.
+
+**Run-ID binding lifecycle (GHA path):** After a successful `workflow_dispatch`, GitHub does not return a run ID — it must be discovered by polling the Runs API. `dispatchKgRefreshRun()` polls `findWorkflowRunId()` for up to ~90 s (5 rounds: 5 s, 10 s, 20 s, 30 s, 25 s) before returning. On success the run ID rides the return value; the `updateJobMachine` hook writes it to `dispatch_log.run_id` via `updateJobRunId()`, which also advances the row to `status = "running"`. On exhaustion, the row is left with `run_id = NULL` and a warning is logged — the row stays alive in `"dispatched"` status and the reaper handles it on its next sweep.
+
+The reaper's `reconcileGhaKgRefreshJob` function (in `src/reaper.ts`) applies a **lazy-bind** step before declaring `dispatch_lost`: once the 5-minute grace window has elapsed and `run_id` is still `NULL`, it calls `helpers.bindGhaRunId(job)` — which runs a `findWorkflowRunId` lookup and, on success, calls `attachJobRunIdIfMissing()` to persist the run ID. If the lazy-bind succeeds the job is left alive and will be reconciled by the run-status check on the next sweep. Only when `bindGhaRunId` returns `null` (or is absent) does the reaper declare `dispatch_lost` and call `failKgRefreshMachine` with `detail: "no workflow run appeared within 5 min of dispatch"`. Lazy-bind is skipped in dry-run mode.
+
+**Late-callback handling:** If the reaper declares `dispatch_lost` but the GHA run was actually in progress, the runner's result callback eventually arrives at `POST /api/runner/result`. `onRunnerComplete()` detects that `stage` is already `"failed"` and — rather than silently discarding the result — supersedes the reaper's synthetic outcome: it updates `lastRefresh` with the runner's actual conclusion, persists it, and logs `"[kg-refresh] late callback after reaper close — updating lastRefresh"`. The `dispatch_log` row itself remains closed (no re-open); only the in-memory and persisted `lastRefresh` is updated. `onOutcome` is not fired a second time.
 
 **Fly Machines backend:** unchanged from the original implementation. Creates a session machine with `phase: "kg-refresh"`. Returns `machineId + machineNonce`.
 
@@ -154,11 +160,22 @@ mintRunToken({
 })
 ```
 
-This token is passed as `runToken` into `buildSessionMachineConfig()`, which places it in the machine environment as `RUN_TOKEN`. No progress token is minted; `RUN_PROGRESS_TOKEN` is **not** set in the runner environment.
+Two tokens are minted at dispatch time: the result token above (as `runToken`) and a progress token:
 
-A second (`publication`) token is **not** minted: there is no target repository, so the runner never calls `POST /api/runner/publication-token`.
+```typescript
+mintRunToken({
+  issueId: "kg-refresh",
+  mappingTeamKey: "",      // empty — no ticketing mapping bound
+  phase: "kg-refresh",
+  audience: "progress",
+  ttlSeconds: 4 * 60 * 60,
+  secret: runnerTokenSecret,
+})
+```
 
-> **Current degraded state:** Both vending endpoints below require a bearer token with `audience = "progress"`. Because the kg-refresh dispatch mints only a result token, the runner cannot satisfy those checks. Both endpoints silently fail/skip rather than hard-error — see each section for the exact degradation mode.
+The result token is placed in the machine environment as `RUN_TOKEN`; the progress token as `RUN_PROGRESS_TOKEN`. Both tokens carry an empty `mappingTeamKey` — the team identity for tracker-data fetches comes from the KG source repo's `sources.yml`, not the token.
+
+A third (`publication`) token is **not** minted: there is no target repository, so the runner never calls `POST /api/runner/publication-token`.
 
 ### KG push token
 
@@ -168,21 +185,33 @@ The runner calls `GET /api/runner/kg-push-token` to receive a `contents: write` 
 - Phase-gates: only `phase === "kg-refresh"` tokens are accepted
 - Returns a token scoped exclusively to `owner/repo` of `KG_SOURCE_REPO`
 
-**Degraded state:** the kg-refresh runner only holds a result token. When it presents that token, `verifyRunToken(..., "progress", ...)` returns `verified.ok = false` and the endpoint returns 403. The git credential helper receives the 403 and the KG snapshot push step fails without a usable GitHub token. To restore this path, the dispatch must also mint a progress token and pass it as `RUN_PROGRESS_TOKEN` (see §10 step 4 for how).
-
 ### Tracker-data endpoint
 
-The runner calls `POST /api/runner/kg-tracker-data` to fetch a paginated snapshot of Linear (or Jira) issues for use as ingest context. The endpoint (`src/runner-callback.ts`) verifies with `audience = "progress"`. The `kg-tracker-data` pipeline step (`src/pipeline/steps/kg-tracker-data.ts`) reads `RUN_PROGRESS_TOKEN` and no-ops gracefully when the variable is absent:
+The runner calls `POST /api/runner/kg-tracker-data` once per configured team. The `kg-tracker-data` pipeline step (`src/pipeline/steps/kg-tracker-data.ts`) reads the team list from `sources.yml` in the cloned KG source repo:
 
-```typescript
-const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
-if (!progressToken) {
-  console.log("[kg-tracker-data] no progress token (RUN_PROGRESS_TOKEN); skipping");
-  return;
-}
+```yaml
+trackers:
+  - team: AII
+    kind: linear
+  - team: BDS
+    kind: linear
 ```
 
-**Current behaviour:** because no progress token is minted, `RUN_PROGRESS_TOKEN` is absent in the runner environment and the step always skips. The endpoint is live but non-functional for kg-refresh until a progress token is wired through.
+For each team the step makes a paginated POST loop:
+
+```
+POST /api/runner/kg-tracker-data
+Authorization: Bearer <RUN_PROGRESS_TOKEN>
+{ "teamKey": "AII", "cursor": "<optional>" }
+```
+
+The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the tracker regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
+
+```
+[kg-tracker-data] team AII: 312 issues
+[kg-tracker-data] team BDS: 47 issues
+[kg-tracker-data] fetched 359 issues
+```
 
 ### Callback
 

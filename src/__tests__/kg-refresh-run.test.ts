@@ -363,6 +363,91 @@ describe("kgSnapshotPushStep", () => {
     expect(err.message).toContain("unrecognised format");
   });
 
+  it("accepts a +00:00 offset stamp with no previous stamp (reaches git push)", async () => {
+    initGitRepo(tmpDir);
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-03T10:00:00+00:00");
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("fails with KG_SNAPSHOT_STALE when Z and +00:00 stamps represent the same instant (Z previous)", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00Z");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'add old stamp'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00+00:00");
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotStaleError);
+  });
+
+  it("fails with KG_SNAPSHOT_STALE when Z and +00:00 stamps represent the same instant (+00:00 previous)", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00+00:00");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'add old stamp'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00Z");
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotStaleError);
+  });
+
+  it("pushes when a later +00:00 stamp follows an earlier Z stamp", async () => {
+    const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare-offset-"));
+    try {
+      execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+
+      initGitRepo(tmpDir);
+      mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00Z");
+      execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+      execSync("git commit -m 'add old stamp'", { cwd: tmpDir, stdio: "ignore" });
+
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+
+      mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+      writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-02T00:00:00+00:00");
+
+      const ctx = makeContext();
+      const result = await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, defaultBranch: "main" }),
+        noopReporter,
+      );
+      expect(result.snapshotPushed).toBe(true);
+    } finally {
+      rmSync(bareDir, { recursive: true, force: true });
+    }
+  });
+
   it("pushes snapshot and returns snapshotPushed=true against a local bare remote", async () => {
     const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare-"));
     try {
@@ -668,6 +753,7 @@ describe("kgTrackerDataStep", () => {
         workspaceDir: tmpDir,
         fetchImpl: makeFetch([{ ok: true, body: makeTrackerPage(issues, false) }]),
         writeFileSyncImpl: (p, d) => written.push([p, d]),
+        sourcesYmlReaderImpl: () => ["AII"],
       },
       noopReporter,
     );
@@ -677,15 +763,15 @@ describe("kgTrackerDataStep", () => {
     expect(JSON.parse(written[0][1])).toEqual(issues);
   });
 
-  it("paginates and concatenates issues across multiple pages", async () => {
+  it("paginates and concatenates issues across multiple pages for a single team", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
     const page1Issues = [{ id: "1" }];
     const page2Issues = [{ id: "2" }];
-    const fetchCalls: Array<{ cursor?: string }> = [];
+    const fetchCalls: Array<{ cursor?: string; teamKey?: string }> = [];
     let callIndex = 0;
     const fetchImpl: typeof fetch = async (_, init) => {
-      const body = init?.body ? JSON.parse(init.body as string) as { cursor?: string } : {};
-      fetchCalls.push({ cursor: body.cursor });
+      const body = init?.body ? JSON.parse(init.body as string) as { cursor?: string; teamKey?: string } : {};
+      fetchCalls.push({ cursor: body.cursor, teamKey: body.teamKey });
       const page = callIndex++ === 0
         ? makeTrackerPage(page1Issues, true, "cursor1")
         : makeTrackerPage(page2Issues, false);
@@ -699,13 +785,16 @@ describe("kgTrackerDataStep", () => {
         workspaceDir: tmpDir,
         fetchImpl,
         writeFileSyncImpl: (p, d) => written.push([p, d]),
+        sourcesYmlReaderImpl: () => ["AII"],
       },
       noopReporter,
     );
     expect(result).toEqual({ fetched: true, issueCount: 2 });
     expect(fetchCalls).toHaveLength(2);
     expect(fetchCalls[0].cursor).toBeUndefined();
+    expect(fetchCalls[0].teamKey).toBe("AII");
     expect(fetchCalls[1].cursor).toBe("cursor1");
+    expect(fetchCalls[1].teamKey).toBe("AII");
     expect(JSON.parse(written[0][1])).toEqual([...page1Issues, ...page2Issues]);
   });
 
@@ -718,6 +807,7 @@ describe("kgTrackerDataStep", () => {
           callbackUrl: "http://orch",
           workspaceDir: tmpDir,
           fetchImpl: makeFetch([{ ok: false, status: 502 }]),
+          sourcesYmlReaderImpl: () => ["AII"],
         },
         noopReporter,
       ),
@@ -732,6 +822,7 @@ describe("kgTrackerDataStep", () => {
         callbackUrl: "http://orch",
         workspaceDir: tmpDir,
         fetchImpl: makeFetch([{ ok: false, status: 503 }]),
+        sourcesYmlReaderImpl: () => ["AII"],
       },
       noopReporter,
     );
@@ -744,19 +835,22 @@ describe("kgTrackerDataStep", () => {
     await expect(
       kgTrackerDataStep.run(
         makeContext(),
-        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, sourcesYmlReaderImpl: () => ["AII"] },
         noopReporter,
       ),
     ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
   });
 
-  it("sends Authorization: Bearer <token> on each request", async () => {
+  it("sends Authorization: Bearer <token> and teamKey on each request", async () => {
     process.env.RUN_PROGRESS_TOKEN = "my-secret-token";
     const capturedAuth: string[] = [];
+    const capturedTeamKeys: string[] = [];
     const fetchImpl: typeof fetch = async (_, init) => {
       const headers = init?.headers as Record<string, string> | undefined;
       capturedAuth.push(headers?.["Authorization"] ?? "");
-      return { ok: true, status: 200, json: async () => makeTrackerPage([], false) } as Response;
+      const body = init?.body ? JSON.parse(init.body as string) as { teamKey?: string } : {};
+      capturedTeamKeys.push(body.teamKey ?? "");
+      return { ok: true, status: 200, json: async () => makeTrackerPage([{ id: "1" }], false) } as Response;
     };
     await kgTrackerDataStep.run(
       makeContext(),
@@ -765,11 +859,208 @@ describe("kgTrackerDataStep", () => {
         workspaceDir: tmpDir,
         fetchImpl,
         writeFileSyncImpl: () => {},
+        sourcesYmlReaderImpl: () => ["AII"],
       },
       noopReporter,
     );
     expect(capturedAuth).toHaveLength(1);
     expect(capturedAuth[0]).toBe("Bearer my-secret-token");
+    expect(capturedTeamKeys).toEqual(["AII"]);
+  });
+
+  it("iterates over multiple teams from sources.yml and combines results", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const aiiIssues = [{ id: "aii-1" }];
+    const bdsIssues = [{ id: "bds-1" }, { id: "bds-2" }];
+    const requestBodies: Array<{ teamKey?: string; cursor?: string }> = [];
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const body = init?.body ? JSON.parse(init.body as string) as { teamKey?: string; cursor?: string } : {};
+      requestBodies.push(body);
+      const issues = body.teamKey === "AII" ? aiiIssues : bdsIssues;
+      return { ok: true, status: 200, json: async () => makeTrackerPage(issues, false) } as Response;
+    };
+    const written: Array<[string, string]> = [];
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+        sourcesYmlReaderImpl: () => ["AII", "BDS"],
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: true, issueCount: 3 });
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0].teamKey).toBe("AII");
+    expect(requestBodies[1].teamKey).toBe("BDS");
+    expect(JSON.parse(written[0][1])).toEqual([...aiiIssues, ...bdsIssues]);
+  });
+
+  it("throws KgTrackerDataFetchError when any configured team returns zero issues", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const aiiIssues = [{ id: "aii-1" }, { id: "aii-2" }];
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const body = init?.body ? JSON.parse(init.body as string) as { teamKey?: string } : {};
+      const issues = body.teamKey === "AII" ? aiiIssues : [];
+      return { ok: true, status: 200, json: async () => makeTrackerPage(issues, false) } as Response;
+    };
+    await expect(
+      kgTrackerDataStep.run(
+        makeContext(),
+        {
+          callbackUrl: "http://orch",
+          workspaceDir: tmpDir,
+          fetchImpl,
+          writeFileSyncImpl: () => {},
+          sourcesYmlReaderImpl: () => ["AII", "BDS"],
+        },
+        noopReporter,
+      ),
+    ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
+  });
+
+  it("returns { fetched: false } when sources.yml is absent or has no teams", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const capturedCalls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { capturedCalls.push(args); return {} as Response; };
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        sourcesYmlReaderImpl: () => [],
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(capturedCalls).toHaveLength(0);
+  });
+
+  // ── sources.yml parsing (real file shapes) ─────────────────────────────────
+
+  const REAL_SOURCES_YML = `\
+trackers:
+  - kind: linear
+    team: AII                           # AI-Implement  (PRIMARY — bound to code_repo)
+    tier: primary
+  - kind: linear
+    team: BDS                           # BuildDown Skills  (SECONDARY)
+    tier: secondary
+`;
+
+  function makeEmptyPageFetch(): { fetchImpl: typeof fetch; requestBodies: Array<Record<string, string>> } {
+    const requestBodies: Array<Record<string, string>> = [];
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const body = init?.body ? JSON.parse(init.body as string) as Record<string, string> : {};
+      requestBodies.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ issues: [{ id: "i1" }], pageInfo: { hasNextPage: false, endCursor: null } }),
+      } as Response;
+    };
+    return { fetchImpl, requestBodies };
+  }
+
+  it("parses the real multi-block sources.yml format and fetches AII and BDS", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SOURCES_YML);
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(result.fetched).toBe(true);
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["AII", "BDS"]);
+  });
+
+  it("parses the inline `- team:` format", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(join(tmpDir, "sources.yml"), "trackers:\n  - team: AII\n  - team: BDS\n");
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["AII", "BDS"]);
+  });
+
+  it("extracts team name without trailing comment", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "trackers:\n  - kind: linear\n    team: XYZ                           # some comment\n",
+    );
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["XYZ"]);
+  });
+
+  it("returns { fetched: false } when sources.yml file is absent (no file written)", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    // tmpDir has no sources.yml — existsSync returns false
+    const capturedCalls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { capturedCalls.push(args); return {} as Response; };
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(capturedCalls).toHaveLength(0);
+  });
+
+  it("falls back to regex when YAML is unparseable but an indented team: line is present", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    // Leading `[broken` makes the YAML parser throw; the fallback regex finds `team: AII`
+    writeFileSync(join(tmpDir, "sources.yml"), "[broken\n  team: AII\n");
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(result.fetched).toBe(true);
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["AII"]);
+  });
+
+  it("returns { fetched: false } when trackers block has no team keys", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(join(tmpDir, "sources.yml"), "trackers:\n  - kind: linear\n    tier: primary\n");
+    const capturedCalls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { capturedCalls.push(args); return {} as Response; };
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(capturedCalls).toHaveLength(0);
+  });
+
+  it("logs the team list after parsing sources.yml", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SOURCES_YML);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await kgTrackerDataStep.run(
+        makeContext(),
+        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl: makeEmptyPageFetch().fetchImpl, writeFileSyncImpl: () => {} },
+        noopReporter,
+      );
+      expect(logSpy).toHaveBeenCalledWith("[kg-tracker-data] teams from sources.yml: AII, BDS");
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 
@@ -1436,6 +1727,95 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
     ) as { inputs: Record<string, string> };
     expect(body.inputs.run_config).toBe("b64cfg");
     expect(body.inputs.run_token).toBe("runtok");
+  });
+});
+
+// ── GHA dispatch: run ID polling (pollForKgWorkflowRunId) ─────────────────────
+// AII-551: verifies the polling loop binds the run ID on a delayed appearance.
+
+import { pollForKgWorkflowRunId } from "../github.js";
+
+describe("GHA kg-refresh dispatch — run ID polling (pollForKgWorkflowRunId)", () => {
+  it("binds the run ID that appears on the third poll", async () => {
+    let calls = 0;
+    const findRunId = vi.fn(async () => {
+      calls++;
+      if (calls < 3) return null;
+      return 44444;
+    });
+
+    const runId = await pollForKgWorkflowRunId({
+      token: "tok",
+      owner: "org",
+      repo: "kg-repo",
+      workflowFile: "kg-refresh.yml",
+      branch: "main",
+      dispatchTime: new Date(),
+      pollDelaysMs: [0, 0, 0, 0, 0],
+      findRunId,
+    });
+
+    expect(runId).toBe(44444);
+    expect(findRunId).toHaveBeenCalledTimes(3);
+  });
+
+  it("returns undefined when run ID never appears", async () => {
+    const findRunId = vi.fn(async () => null);
+
+    const runId = await pollForKgWorkflowRunId({
+      token: "tok",
+      owner: "org",
+      repo: "kg-repo",
+      workflowFile: "kg-refresh.yml",
+      branch: "main",
+      dispatchTime: new Date(),
+      pollDelaysMs: [0, 0, 0],
+      findRunId,
+    });
+
+    expect(runId).toBeUndefined();
+    expect(findRunId).toHaveBeenCalledTimes(3);
+  });
+
+  it("returns the run ID found on the first poll without further calls", async () => {
+    const findRunId = vi.fn(async () => 11111);
+
+    const runId = await pollForKgWorkflowRunId({
+      token: "tok",
+      owner: "org",
+      repo: "kg-repo",
+      workflowFile: "kg-refresh.yml",
+      branch: "main",
+      dispatchTime: new Date(),
+      pollDelaysMs: [0, 0, 0],
+      findRunId,
+    });
+
+    expect(runId).toBe(11111);
+    expect(findRunId).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a thrown findRunId error as null and continues polling", async () => {
+    let calls = 0;
+    const findRunId = vi.fn(async () => {
+      calls++;
+      if (calls === 1) throw new Error("GitHub API error");
+      return calls >= 3 ? 55555 : null;
+    });
+
+    const runId = await pollForKgWorkflowRunId({
+      token: "tok",
+      owner: "org",
+      repo: "kg-repo",
+      workflowFile: "kg-refresh.yml",
+      branch: "main",
+      dispatchTime: new Date(),
+      pollDelaysMs: [0, 0, 0],
+      findRunId,
+    });
+
+    expect(runId).toBe(55555);
+    expect(findRunId).toHaveBeenCalledTimes(3);
   });
 });
 

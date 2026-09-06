@@ -59,6 +59,7 @@ function makeHelpers(): ReaperHelpers {
     findPrForIssue: vi.fn(() => Promise.resolve(null)),
     failKgRefreshMachine: vi.fn(),
     checkGhaRunStatus: vi.fn(() => Promise.resolve(null)),
+    bindGhaRunId: vi.fn(() => Promise.resolve(null)),
   };
 }
 
@@ -1069,7 +1070,10 @@ describe("sweepOrphanedKgRefreshJobs — GHA reconciliation", () => {
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
     expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(job, { failureCode: "dispatch_lost" });
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(
+      job,
+      expect.objectContaining({ failureCode: "dispatch_lost" }),
+    );
     expect(recordReaperAction).toHaveBeenCalledWith(
       expect.objectContaining({ ruleMatched: "kg-refresh-gha-dispatch-lost", dryRun: false }),
     );
@@ -1087,7 +1091,10 @@ describe("sweepOrphanedKgRefreshJobs — GHA reconciliation", () => {
     expect(recordReaperAction).not.toHaveBeenCalledWith(
       expect.objectContaining({ ruleMatched: "kg-refresh-bootstrap-timeout" }),
     );
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(job, { failureCode: "dispatch_lost" });
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(
+      job,
+      expect.objectContaining({ failureCode: "dispatch_lost" }),
+    );
   });
 
   it("GHA-9: dispatched GHA row past 5 min with runId set and run in_progress — neither bootstrap-timeout nor machine-absent fires", async () => {
@@ -1194,5 +1201,111 @@ describe("sweepOrphanedKgRefreshJobs — GHA detail wording", () => {
 
     const opts = (helpers.failKgRefreshMachine as ReturnType<typeof vi.fn>).mock.calls[0][1] as { detail?: string };
     expect(opts.detail).toContain("failure");
+  });
+
+  it("dispatch_lost includes specific detail text", async () => {
+    const job = { ...ghaJob, runId: null, dispatchedAt: Date.now() - 10 * 60_000 };
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([job]);
+    const helpers = makeHelpers();
+    // bindGhaRunId returns null so dispatch_lost fires
+    vi.mocked(helpers.bindGhaRunId!).mockResolvedValueOnce(null);
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    const opts = (helpers.failKgRefreshMachine as ReturnType<typeof vi.fn>).mock.calls[0][1] as { detail?: string };
+    expect(opts.detail).toBe("no workflow run appeared within 5 min of dispatch");
+  });
+});
+
+// ---------- sweepOrphanedKgRefreshJobs — GHA lazy-bind ----------
+
+describe("sweepOrphanedKgRefreshJobs — GHA lazy-bind", () => {
+  const lazyJob = {
+    ...ghaKgRefreshJob,
+    id: 50,
+    runId: null,
+    dispatchedAt: Date.now() - 10 * 60_000,
+  };
+
+  it("GHA-LB-1: lazy-bind succeeds — run ID bound, job not closed", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([lazyJob]);
+    const helpers = makeHelpers();
+    vi.mocked(helpers.bindGhaRunId!).mockResolvedValueOnce(12345);
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.bindGhaRunId).toHaveBeenCalledOnce();
+    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).not.toHaveBeenCalledWith(
+      expect.objectContaining({ ruleMatched: "kg-refresh-gha-dispatch-lost" }),
+    );
+  });
+
+  it("GHA-LB-2: lazy-bind returns null — dispatch_lost with specific detail", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([lazyJob]);
+    const helpers = makeHelpers();
+    vi.mocked(helpers.bindGhaRunId!).mockResolvedValueOnce(null);
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(
+      lazyJob,
+      expect.objectContaining({
+        failureCode: "dispatch_lost",
+        detail: "no workflow run appeared within 5 min of dispatch",
+      }),
+    );
+  });
+
+  it("GHA-LB-3: lazy-bind not attempted within grace window", async () => {
+    const withinGrace = { ...lazyJob, dispatchedAt: Date.now() - 60_000 };
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([withinGrace]);
+    const helpers = makeHelpers();
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.bindGhaRunId).not.toHaveBeenCalled();
+    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+  });
+
+  it("GHA-LB-5: dry-run — lazy-bind skipped, dispatch_lost action recorded but job not closed", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([lazyJob]);
+    const helpers = makeHelpers();
+    vi.mocked(helpers.bindGhaRunId!).mockResolvedValueOnce(12345);
+
+    await sweepOrphanedMachines(makeConfig(true), helpers);
+
+    expect(helpers.bindGhaRunId).not.toHaveBeenCalled();
+    expect(helpers.failKgRefreshMachine).not.toHaveBeenCalled();
+    expect(recordReaperAction).toHaveBeenCalledWith(
+      expect.objectContaining({ ruleMatched: "kg-refresh-gha-dispatch-lost", dryRun: true }),
+    );
+  });
+
+  it("GHA-LB-6: lazy-bind throws — treated as not found, dispatch_lost declared", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([lazyJob]);
+    const helpers = makeHelpers();
+    vi.mocked(helpers.bindGhaRunId!).mockRejectedValueOnce(new Error("GitHub API error"));
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(
+      lazyJob,
+      expect.objectContaining({ failureCode: "dispatch_lost" }),
+    );
   });
 });

@@ -650,6 +650,36 @@ describe("handleRunnerProgress", () => {
     expect(log.listLog().find((job) => job.id === jobId)?.runId).toBeNull();
     expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
   });
+
+  it("binds run ID without a step — githubRunId-only body succeeds and records no step", async () => {
+    const dispatchId = "dispatch-bind-only";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "kg-refresh",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { githubRunId: 98765 },
+      secret: SECRET,
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.listLog().find((job) => job.id === jobId)?.runId).toBe(98765);
+    expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
+  });
 });
 
 describe("handleRunnerPlanningContext", () => {

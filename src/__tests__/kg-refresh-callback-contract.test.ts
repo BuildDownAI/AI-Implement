@@ -200,7 +200,7 @@ describe("kg-refresh callback-URL contract", () => {
     const mockFetch = vi.fn(async (url: string) => {
       captured.push(url);
       return new Response(
-        JSON.stringify({ issues: [], pageInfo: { hasNextPage: false, endCursor: null } }),
+        JSON.stringify({ issues: [{ id: "1", identifier: "AII-1", title: "t", description: "", state: { name: "Todo", type: "unstarted" }, comments: [] }], pageInfo: { hasNextPage: false, endCursor: null } }),
         { status: 200 },
       );
     });
@@ -215,6 +215,7 @@ describe("kg-refresh callback-URL contract", () => {
           workspaceDir: dataRoot,
           fetchImpl: mockFetch as typeof fetch,
           writeFileSyncImpl: () => {},
+          sourcesYmlReaderImpl: () => ["AII"],
         },
         {} as never,
       );

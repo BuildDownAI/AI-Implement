@@ -133,6 +133,15 @@ jobs:
             echo "::add-mask::${{ inputs.run_progress_token }}"
           fi
 
+      - name: Bind workflow run ID
+        if: ${{ inputs.runner_callback_url != '' && inputs.run_progress_token != '' }}
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${{ inputs.run_progress_token }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"githubRunId\": ${{ github.run_id }}}" \
+            "${{ inputs.runner_callback_url }}/runner/progress" || true
+
       - name: Run pipeline
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
