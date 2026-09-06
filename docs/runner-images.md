@@ -59,6 +59,8 @@ This is why the default image stays public: a cross-org `GITHUB_TOKEN` cannot pu
 
 Pair the runner channel with the orchestrator's channel — a testing orchestrator should set its image variable to `:next` so the two move together.
 
+kg-refresh dispatches (both GitHub Actions and Fly Machines) resolve the runner image through the same `resolveRunnerImageForDispatch` path as every other run kind — per-repo `image.yml` override, then the orchestrator default, then the built-in channel tag.
+
 **Promotion order.** Commit SHA tags are pushed first, then the build digest is smoke-tested, and only then is any mutable channel tag promoted. Channel-scoped date tags follow `base-<channel>-vYYYYMMDD-<12-char-sha>` (e.g. `base-next-v20260526-abc123def456`) so `latest` and `next` never collide and same-day builds do not overwrite one another.
 
 Use the immutable **digest** for the strongest rollback pin; the SHA tag is a convenient lookup for the same build.
