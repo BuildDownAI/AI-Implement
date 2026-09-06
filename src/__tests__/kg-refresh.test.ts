@@ -1285,6 +1285,30 @@ describe("kg-refresh", () => {
       expect(s.stage).toBe("idle");
     });
 
+    // ---- AII-548: onMachineLost detail wording ------------------------------------
+
+    it("onMachineLost uses provided detail as lastRefresh.detail instead of generic string", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost({ failureCode: "success", detail: "GitHub Actions run 99001 concluded success" });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.lastRefresh?.detail).toContain("99001");
+      expect(s.lastRefresh?.detail).toContain("success");
+      expect(s.lastRefresh?.detail).not.toBe("ingest runner machine absent — closed by reaper sweep");
+    });
+
+    it("onMachineLost falls back to generic string when detail is absent", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      const s = await handle.status();
+      expect(s.lastRefresh?.detail).toBe("ingest runner machine absent — closed by reaper sweep");
+    });
+
     // ---- AII-546: restart survival -----------------------------------------------
 
     describe("restart survival", () => {

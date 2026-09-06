@@ -216,6 +216,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
             ? "KG_SNAPSHOT_TRACKER_REGRESSION"
             : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
+    console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
     await postRunnerResult({
       phase: "kg-refresh",
       workspaceDir,

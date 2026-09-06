@@ -87,6 +87,7 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
           return { fetched: false, issueCount: 0 };
         }
         if (!res.ok) {
+          console.error(`[kg-tracker-data] ${url} returned HTTP ${res.status}`);
           throw new KgTrackerDataFetchError(`endpoint returned ${res.status}`);
         }
         const page = (await res.json()) as TrackerDataPage;

@@ -52,9 +52,20 @@ const runConfig: RunConfigV1 = {
   issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
   runnerPhase: "kg-refresh",
   kgSourceRepo: "<owner/repo>",     // from config.kgSourceRepo
-  runnerCallbackUrl: "<url>",        // RUNNER_CALLBACK_BASE_URL + "/api/runner/result"
+  runnerCallbackUrl: "<url>",        // bare RUNNER_CALLBACK_BASE_URL — no path suffix
 };
 ```
+
+**Callback-URL contract:** `runnerCallbackUrl` is always the bare base URL (e.g. `https://my-orchestrator.fly.dev`). Every runner-side client is responsible for appending its own path:
+
+| Client | Appends | Served route |
+|---|---|---|
+| `runner-result.ts` `postRunnerResult` | `/runner/result` | `POST /runner/result` |
+| `pipeline/steps/kg-tracker-data.ts` | `/api/runner/kg-tracker-data` | `POST /api/runner/kg-tracker-data` |
+| `session/lib.sh` `setup_kg_push_credential` | `/api/runner/kg-push-token` | `POST /api/runner/kg-push-token` |
+| `runner-result.ts` `fetchPlanningContextFromOrchestrator` | `/runner/planning-context` | `GET /runner/planning-context` |
+
+The route `/api/runner/result` does **not** exist. Any value that appends a path to `runnerCallbackUrl` before passing it to these clients will produce a double-path URL that hits the admin-auth 401 wall.
 
 What is **absent** vs a normal implementation run:
 - No `prNumber`, `baseBranch`, `branchPrefix`

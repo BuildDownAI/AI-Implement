@@ -3070,9 +3070,7 @@ async function dispatchKgRefreshRun(
       defaultImage: config.sessionImage,
       runnerImageExplicit: config.runnerImageExplicit,
     });
-    const runnerCallbackUrl = config.runnerCallbackBaseUrl
-      ? `${config.runnerCallbackBaseUrl}/api/runner/result`
-      : undefined;
+    const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
     const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl });
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
@@ -3154,7 +3152,7 @@ async function dispatchKgRefreshRun(
       machineNonce,
       phase: "kg-refresh",
       orchestratorUrl: config.runnerCallbackBaseUrl ?? undefined,
-      runnerCallbackUrl: config.runnerCallbackBaseUrl ? `${config.runnerCallbackBaseUrl}/api/runner/result` : undefined,
+      runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
       runToken: opts.runToken,
       orchestratorApp: process.env.FLY_APP_NAME,
       expectedTtlSeconds: 4 * 60 * 60,
@@ -3194,7 +3192,7 @@ async function dispatchKgRefreshRun(
       machineNonce,
       phase: "kg-refresh",
       orchestratorUrl: localOrchestratorUrl,
-      runnerCallbackUrl: config.runnerCallbackBaseUrl ? `${config.runnerCallbackBaseUrl}/api/runner/result` : undefined,
+      runnerCallbackUrl: config.runnerCallbackBaseUrl ?? undefined,
       runToken: opts.runToken,
       extraEnv,
     });

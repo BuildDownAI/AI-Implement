@@ -115,7 +115,7 @@ export interface KgRefreshHandle {
    * A no-op when stage is not "ingest-running" (idempotent; safe to call after TTL or callback).
    * opts.failureCode propagates through onOutcome so the caller can suppress default notification.
    */
-  onMachineLost(opts?: { failureCode?: string }): void;
+  onMachineLost(opts?: { failureCode?: string; detail?: string }): void;
 }
 
 interface KgRefreshInput {
@@ -632,7 +632,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
           if (outcome.gate === "ingest-needed" && input.dispatchRun && input.runnerCallbackBaseUrl && input.runnerTokenSecret) {
             // Source repo doesn't have a newer snapshot yet. Dispatch the runner.
-            const runnerCallbackUrl = `${input.runnerCallbackBaseUrl}/api/runner/result`;
+            const runnerCallbackUrl = input.runnerCallbackBaseUrl;
             const { token: runToken, dispatchId } = mintRunTokenFn({
               issueId: "kg-refresh",
               mappingTeamKey: "",
@@ -903,10 +903,10 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       };
     },
 
-    onMachineLost(opts?: { failureCode?: string }) {
+    onMachineLost(opts?: { failureCode?: string; detail?: string }) {
       if (stage !== "ingest-running") return;
       console.log("[kg-refresh] machine absent — reaper closed the ingest runner job");
-      failIngestRunner("ingest runner machine absent — closed by reaper sweep", opts?.failureCode);
+      failIngestRunner(opts?.detail ?? "ingest runner machine absent — closed by reaper sweep", opts?.failureCode);
     },
   };
 }
