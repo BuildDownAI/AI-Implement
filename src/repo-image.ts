@@ -365,6 +365,7 @@ export async function resolveChannelCommit(
   imageBase: string,
   channelTag: string,
   fetchImpl?: typeof fetch,
+  timeoutMs = 10_000,
 ): Promise<string | null> {
   const fetchFn = fetchImpl ?? fetch;
   const imageRef = `${imageBase}:${channelTag}`;
@@ -375,9 +376,12 @@ export async function resolveChannelCommit(
   const accept =
     "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     let token: string | null = null;
-    let res = await fetchFn(manifestUrl, { headers: { Accept: accept } });
+    let res = await fetchFn(manifestUrl, { headers: { Accept: accept }, signal: controller.signal });
 
     if (res.status === 401) {
       const wwwAuth = res.headers.get("www-authenticate") ?? "";
@@ -389,7 +393,7 @@ export async function resolveChannelCommit(
       const params = new URLSearchParams();
       if (serviceMatch) params.set("service", serviceMatch[1]);
       if (scopeMatch) params.set("scope", scopeMatch[1]);
-      const tokenRes = await fetchFn(`${realmMatch[1]}?${params}`);
+      const tokenRes = await fetchFn(`${realmMatch[1]}?${params}`, { signal: controller.signal });
       if (!tokenRes.ok) return null;
       const { token: bearerToken } = (await tokenRes.json()) as { token?: string };
       if (!bearerToken) return null;
@@ -397,6 +401,7 @@ export async function resolveChannelCommit(
 
       res = await fetchFn(manifestUrl, {
         headers: { Accept: accept, Authorization: `Bearer ${token}` },
+        signal: controller.signal,
       });
     }
 
@@ -412,7 +417,7 @@ export async function resolveChannelCommit(
     const configHeaders: Record<string, string> = {};
     if (token) configHeaders["Authorization"] = `Bearer ${token}`;
 
-    const configRes = await fetchFn(configUrl, { headers: configHeaders });
+    const configRes = await fetchFn(configUrl, { headers: configHeaders, signal: controller.signal });
     if (!configRes.ok) return null;
 
     const config = (await configRes.json()) as {
@@ -430,5 +435,7 @@ export async function resolveChannelCommit(
     return null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }

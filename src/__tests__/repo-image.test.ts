@@ -617,4 +617,37 @@ describe("resolveChannelCommit", () => {
     expect(result).toBeNull();
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it("passes AbortSignal to every fetch call", async () => {
+    const signals: (AbortSignal | null | undefined)[] = [];
+    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+      signals.push(init?.signal ?? null);
+      return buildChannelCommitFetch({})(url, init);
+    }) as unknown as typeof fetch;
+    await resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl);
+    expect(signals.length).toBeGreaterThan(0);
+    for (const signal of signals) {
+      expect(signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it("returns null when registry hangs and the timeout fires", async () => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal | undefined;
+        if (signal) {
+          signal.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        }
+      });
+    }) as unknown as typeof fetch;
+
+    const resultPromise = resolveChannelCommit(IMAGE_BASE, CHANNEL_TAG, fetchImpl, 5_000);
+    await vi.advanceTimersByTimeAsync(5_001);
+    const result = await resultPromise;
+    expect(result).toBeNull();
+    vi.useRealTimers();
+  });
 });
