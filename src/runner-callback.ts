@@ -449,6 +449,10 @@ export interface HandleKgTrackerDataInput {
   secret: string;
   /** Pagination cursor from the previous page (null/undefined for the first page). */
   cursor: string | null | undefined;
+  /** Team key to fetch issues for (from request body). Validated against getMappings() keys. */
+  teamKey: string;
+  /** Returns the set of configured mapping team keys; teamKey is validated against this set. */
+  getMappings: () => Record<string, unknown>;
 }
 
 /**
@@ -476,11 +480,17 @@ export async function handleKgTrackerDataRequest(
 
   if (verified.claims.phase !== "kg-refresh") return bad(403, "Unauthorized");
 
+  const mappedKeys = Object.keys(input.getMappings());
+  if (!input.teamKey || !mappedKeys.includes(input.teamKey)) {
+    console.warn(`[kg-tracker-data] teamKey '${input.teamKey}' is not a mapped team`);
+    return bad(403, "Unauthorized");
+  }
+
   if (!isLinearAuthConfigured()) {
     return { status: 503, body: { error: "Tracker not configured" } };
   }
 
-  const teamKey = verified.mappingTeamKey;
+  const teamKey = input.teamKey;
   const FIRST = 50;
 
   try {

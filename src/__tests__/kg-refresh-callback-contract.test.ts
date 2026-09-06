@@ -215,6 +215,7 @@ describe("kg-refresh callback-URL contract", () => {
           workspaceDir: dataRoot,
           fetchImpl: mockFetch as typeof fetch,
           writeFileSyncImpl: () => {},
+          sourcesYmlReaderImpl: () => ["AII"],
         },
         {} as never,
       );
