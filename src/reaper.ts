@@ -30,7 +30,7 @@ export interface ReaperHelpers {
   postSessionLogs: (job: Job, context: string) => Promise<void>;
   findPrForIssue: (repo: string | null, issueIdentifier: string | null) => Promise<string | null>;
   /** Called for each kg-refresh job whose machine is absent from the Fly registry. */
-  failKgRefreshMachine?: (job: Job, opts?: { failureCode?: string }) => void;
+  failKgRefreshMachine?: (job: Job, opts?: { failureCode?: string; detail?: string }) => void;
   /** Called during GHA kg-refresh reconciliation to check the current workflow run status. */
   checkGhaRunStatus?: (job: Job) => Promise<WorkflowRunStatus | null>;
 }
@@ -129,7 +129,10 @@ async function reconcileGhaKgRefreshJob(
     dryRun: config.reaperDryRun,
   });
   if (!config.reaperDryRun) {
-    helpers.failKgRefreshMachine?.(job, { failureCode: runStatus.conclusion ?? undefined });
+    helpers.failKgRefreshMachine?.(job, {
+      failureCode: runStatus.conclusion ?? undefined,
+      detail: `GitHub Actions run ${job.runId} concluded ${runStatus.conclusion}`,
+    });
   }
 }
 

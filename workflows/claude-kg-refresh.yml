@@ -37,7 +37,7 @@ on:
         type: string
         default: ""
       runner_callback_url:
-        description: "Base URL the runner posts results to (e.g. https://orchestrator.example.com/api/runner/result); empty falls back to RunConfig"
+        description: "Base URL the runner posts results to (e.g. https://orchestrator.example.com); empty falls back to RunConfig"
         required: false
         type: string
         default: ""

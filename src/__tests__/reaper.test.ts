@@ -1008,7 +1008,10 @@ describe("sweepOrphanedKgRefreshJobs — GHA reconciliation", () => {
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
     expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(ghaKgRefreshJob, { failureCode: "success" });
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(
+      ghaKgRefreshJob,
+      expect.objectContaining({ failureCode: "success" }),
+    );
     expect(recordReaperAction).toHaveBeenCalledWith(
       expect.objectContaining({ ruleMatched: "kg-refresh-gha-run-complete", dryRun: false }),
     );
@@ -1024,7 +1027,10 @@ describe("sweepOrphanedKgRefreshJobs — GHA reconciliation", () => {
     await sweepOrphanedMachines(makeConfig(false), helpers);
 
     expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
-    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(ghaKgRefreshJob, { failureCode: "failure" });
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledWith(
+      ghaKgRefreshJob,
+      expect.objectContaining({ failureCode: "failure" }),
+    );
   });
 
   it("GHA-5: null status (API error) leaves job alone (fail-safe)", async () => {
@@ -1147,5 +1153,46 @@ describe("sweepOrphanedKgRefreshJobs — GHA reconciliation", () => {
     expect(recordReaperAction).toHaveBeenCalledWith(
       expect.objectContaining({ ruleMatched: "kg-refresh-machine-absent" }),
     );
+  });
+});
+
+// ---------- sweepOrphanedKgRefreshJobs — GHA reaper detail wording ----------
+
+describe("sweepOrphanedKgRefreshJobs — GHA detail wording", () => {
+  const ghaJob = {
+    ...kgRefreshJob,
+    id: 40,
+    executionMode: "github-actions",
+    machineId: null,
+    runId: 99001,
+    repo: "owner/kg-repo",
+  };
+
+  it("GHA completed run passes run ID and conclusion in detail string", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([ghaJob]);
+    const helpers = makeHelpers();
+    vi.mocked(helpers.checkGhaRunStatus!).mockResolvedValueOnce({ status: "completed", conclusion: "success", html_url: "https://example.com" });
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    expect(helpers.failKgRefreshMachine).toHaveBeenCalledOnce();
+    const opts = (helpers.failKgRefreshMachine as ReturnType<typeof vi.fn>).mock.calls[0][1] as { detail?: string };
+    expect(opts.detail).toContain("99001");
+    expect(opts.detail).toContain("success");
+  });
+
+  it("GHA failed run includes failure conclusion in detail", async () => {
+    vi.mocked(listMachines).mockResolvedValueOnce([] as never);
+    vi.mocked(getJobByMachineId).mockReturnValue(undefined);
+    vi.mocked(getInFlightKgRefreshJobs).mockReturnValue([ghaJob]);
+    const helpers = makeHelpers();
+    vi.mocked(helpers.checkGhaRunStatus!).mockResolvedValueOnce({ status: "completed", conclusion: "failure", html_url: "https://example.com" });
+
+    await sweepOrphanedMachines(makeConfig(false), helpers);
+
+    const opts = (helpers.failKgRefreshMachine as ReturnType<typeof vi.fn>).mock.calls[0][1] as { detail?: string };
+    expect(opts.detail).toContain("failure");
   });
 });
