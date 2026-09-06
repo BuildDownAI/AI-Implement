@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { OperatorCancelledError } from "../operator-cancelled.js";
+import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
@@ -691,18 +691,20 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
   const created = ghSpawn(["pr", "comment", prNumber, "--body", body]);
   if (created.exitCode !== 0) {
     // "issue is locked" is the GitHub error when a closed PR's timeline is locked.
-    // Verify the PR is closed-and-not-merged before treating as operator cancellation,
-    // rather than a transient error.
+    // Check whether the PR was merged (auto-merged mid-review) or closed by an operator.
     if ((created.stderr ?? "").toLowerCase().includes("issue is locked")) {
       const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
       if (prView.exitCode === 0) {
         try {
           const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
+          if (prState.state === "CLOSED" && prState.merged) {
+            throw new PrMergedError(prNumber);
+          }
           if (prState.state === "CLOSED" && !prState.merged) {
             throw new OperatorCancelledError(prNumber);
           }
         } catch (e) {
-          if (e instanceof OperatorCancelledError) throw e;
+          if (e instanceof PrMergedError || e instanceof OperatorCancelledError) throw e;
         }
       }
     }
@@ -732,6 +734,11 @@ function submitPrReview(
     `body=${body}`,
   ]);
   if (result.exitCode !== 0) {
+    // A 422 on a review submission may indicate the PR was merged and locked.
+    // Confirm via API rather than string-matching error messages.
+    if (isPrMerged(ghSpawn, prNumber)) {
+      throw new PrMergedError(prNumber);
+    }
     console.warn(`[post-push-review] Failed to submit ${event} review for PR #${prNumber}: ${resultDiagnostics(result)}`);
     console.warn(`[post-push-review] Native review request: endpoint=${endpoint} event=${event} bodyChars=${body.length} bodyPreview=${compactLogValue(body, 260)}`);
     logReviewFailureDiagnostics(ghSpawn, prNumber);
@@ -1008,11 +1015,12 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         });
       }
 
-      // A close that lands while the reviewer call is in flight must not become an approved or
-
-      // fix-pass exit — the approved exit on a last iteration never pushes, so nothing else would catch it.
-
+      // A close or merge that lands while the reviewer call is in flight must not
+      // become an approved or fix-pass exit.
       probeIfPrClosed(ghSpawn, prNumber);
+      if (isPrMerged(ghSpawn, prNumber)) {
+        throw new PrMergedError(prNumber);
+      }
 
 
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
@@ -1189,6 +1197,9 @@ ${externalReviewFindingsBlock(externalFindings)}
       // Re-vend at the actual write boundary; transient vending failures retain
       // the latest token already present in the environment and origin URL.
       probeIfPrClosed(ghSpawn, prNumber);
+      if (isPrMerged(ghSpawn, prNumber)) {
+        throw new PrMergedError(prNumber);
+      }
       await refreshCredentialsBeforePush(context, inputs);
       const expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
       const push = gitSpawn([
@@ -1209,6 +1220,12 @@ ${externalReviewFindingsBlock(externalFindings)}
       );
     }
     } catch (err) {
+      if (err instanceof PrMergedError) {
+        // PR was merged mid-review (auto-merged into grouping branch). Exit cleanly
+        // as approved so the run reports success and no gap-fill is triggered.
+        console.log(`[post-push-review] PR #${prNumber} merged mid-review — exiting cleanly as pr_merged`);
+        return { approved: true, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason: "pr_merged" };
+      }
       if (err instanceof OperatorCancelledError) {
         if (priorLlmFailure) {
           // A real LLM failure already set terminationReason — return that conclusion

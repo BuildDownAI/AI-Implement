@@ -243,6 +243,27 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     }
 
     if (existingPrNumber) {
+      // Resolve the existing PR URL and report it via progress callback so the
+      // auto-merge guard can see it before the final result callback fires (AII-553).
+      // Gate on having a progress token — no token means no callback is reachable.
+      const gapFillProgressToken = process.env.RUN_PROGRESS_TOKEN?.trim();
+      if (gapFillProgressToken && inputs.callbackUrl) {
+        let resolvedPrUrl: string | null = null;
+        try {
+          const prApiRes = await fetch(`https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls/${existingPrNumber}`, {
+            headers: { Authorization: `Bearer ${activeGithubToken}` },
+          });
+          if (prApiRes.ok) {
+            const prData = (await prApiRes.json()) as { html_url?: unknown };
+            if (typeof prData.html_url === "string") resolvedPrUrl = prData.html_url;
+          }
+        } catch (err) {
+          console.warn("[push] failed to resolve existing PR URL for progress callback:", err);
+        }
+        if (resolvedPrUrl) {
+          await reportPrUrlProgress(resolvedPrUrl, inputs.callbackUrl);
+        }
+      }
       return {
         prUrl: null,
         prNumber: Number(existingPrNumber),
@@ -258,9 +279,35 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     const pr = await span("pr-create", async () =>
       createOrFindPullRequest({ repoOwner, repoRepo, githubToken: activeGithubToken, prTitle, branchName, baseBranch, prBody, draft }),
     );
+    // Report the PR URL immediately via a progress callback so the orchestrator can
+    // record it on the dispatch row before the post-push-review step starts. This
+    // enables the auto-merge guard (hasInFlightJobForPr) to fire during the review
+    // loop and prevent the child PR from being merged mid-review (AII-553).
+    await reportPrUrlProgress(pr.url, inputs.callbackUrl);
     return { prUrl: pr.url, prNumber: pr.number, branchPushed: true, commitSha, draft: pr.draft };
   },
 };
+
+/** Posts the PR URL to the orchestrator's progress endpoint so dispatch_log.pr_url is
+ *  populated before the post-push-review step starts. Best-effort: failures are logged
+ *  but do not abort the pipeline. */
+async function reportPrUrlProgress(prUrl: string, callbackUrl: string | undefined): Promise<void> {
+  const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim();
+  const callbackBase = callbackUrl?.replace(/\/+$/, "");
+  if (!progressToken || !callbackBase) return;
+  try {
+    const res = await fetch(`${callbackBase}/runner/progress`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${progressToken}` },
+      body: JSON.stringify({ prUrl }),
+    });
+    if (!res.ok) {
+      console.warn(`[push] prUrl progress callback failed HTTP ${res.status}`);
+    }
+  } catch (err) {
+    console.warn("[push] prUrl progress callback failed:", err);
+  }
+}
 
 interface CreatePrInputs {
   repoOwner: string;

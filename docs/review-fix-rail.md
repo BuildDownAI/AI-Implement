@@ -89,6 +89,8 @@ reviewCheckNames:
 
 External collection can be disabled per repo via `reviewProviders` in `.ai-implement/config.yml`; when it is, the step skips the wait entirely.
 
+**PR merged mid-review (`pr_merged` termination).** For child PRs that target a grouping branch, the orchestrator's auto-merge loop can merge the PR while the post-push-review step is still running. The step detects this at two points in each iteration: after the external review wait (before submitting any COMMENT review) and before the fix-pass push. If a merge is detected at either point, the step returns `terminationReason: "pr_merged"` (approved, exit 0) — no comment is posted, no gap-fill is triggered, and the run is recorded as a clean success. The reactive handler in `postPrComment` also catches the "issue is locked" error from GitHub when the PR is merged, and maps it to the same `pr_merged` exit rather than a pipeline failure.
+
 ## Post-run: the drain loop
 
 `processReviewFixQueue` runs once per poll tick. For each pending item, in FIFO order:

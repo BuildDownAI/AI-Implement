@@ -2,7 +2,7 @@ import { claimJobRunId, getJobByDispatchId, updateJobPrUrl, updateJobStatus } fr
 import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
-import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
+import { peekRunTokenDispatchId, verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
 import { upsertStepRecord } from "./step-log.js";
 import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
@@ -95,8 +95,11 @@ export interface HandleRunnerResultOutput {
 }
 
 export interface RunnerProgressBody {
-  step: Step;
+  step?: Step;
   githubRunId?: number;
+  /** PR URL to record on the dispatch row immediately after the push step creates the PR.
+   *  Allows auto-merge guards to fire before the final result callback (AII-553). */
+  prUrl?: string;
 }
 
 export interface HandleRunnerProgressInput {
@@ -239,9 +242,22 @@ export async function handleRunnerResult(
   // if a provider outage caused dropped comments.
   const verified = verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
-    return verified.reason === "already_consumed"
-      ? bad(409, "already_consumed")
-      : bad(401, verified.reason);
+    if (verified.reason === "already_consumed") {
+      // When a child PR is merged mid-review the reconcile loop may settle the row
+      // before the runner's result callback fires (AII-553). Return 200 so the runner
+      // exits cleanly instead of logging a 409 and marking the run failed.
+      const dispatchId = peekRunTokenDispatchId(bearerToken, input.secret);
+      if (dispatchId) {
+        const job = getJobByDispatchId(dispatchId);
+        const TERMINAL = new Set(["success", "failed", "completed", "operator_cancelled"]);
+        if (job && TERMINAL.has(job.status)) {
+          console.log(`[runner-callback] result already recorded for job ${job.id} (${job.issueIdentifier}) status=${job.status} — returning 200`);
+          return { status: 200, body: { ok: true, already_recorded: true } };
+        }
+      }
+      return bad(409, "already_consumed");
+    }
+    return bad(401, verified.reason);
   }
 
   const { claims, mappingTeamKey } = verified;
@@ -427,8 +443,18 @@ export async function handleRunnerProgress(
   const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
 
-  const stepOrError = validateStepBody(input.body);
-  if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+  const rawBody = input.body as unknown as { step?: unknown; prUrl?: unknown; githubRunId?: unknown };
+  const hasStep = rawBody && typeof rawBody === "object" && rawBody.step != null;
+  const hasPrUrl = rawBody && typeof rawBody === "object" && typeof rawBody.prUrl === "string" && rawBody.prUrl.startsWith("https://");
+
+  if (!hasStep && !hasPrUrl) return bad(400, "step_or_prUrl_required");
+
+  let step: Step | null = null;
+  if (hasStep) {
+    const stepOrError = validateStepBody(input.body);
+    if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+    step = stepOrError;
+  }
 
   const githubRunIdOrError = validateGithubRunId(input.body);
   if (githubRunIdOrError && typeof githubRunIdOrError === "object") return githubRunIdOrError;
@@ -440,7 +466,15 @@ export async function handleRunnerProgress(
     claimJobRunId(job.id, githubRunIdOrError);
   }
 
-  upsertStepRecord(job.id, stepOrError);
+  if (hasPrUrl) {
+    updateJobPrUrl(job.id, rawBody.prUrl as string);
+    console.log(`[runner-progress] PR URL recorded for job ${job.id} (${job.issueIdentifier}): ${rawBody.prUrl}`);
+  }
+
+  if (step) {
+    upsertStepRecord(job.id, step);
+  }
+
   return { status: 200, body: { acknowledged: true } };
 }
 

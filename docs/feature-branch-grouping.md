@@ -369,3 +369,11 @@ target different feature branches are not affected.
   PR branch either way).
 - **Conflict-resolution attempts count at enqueue** — persistent dispatch failures burn the
   cap by design, trading unbounded retry for the alerted bounded give-up path.
+- **Ordering guarantee: a child PR merges only after its run is terminal.** The
+  auto-merge loop checks two guards before attempting a merge: (1) `hasInFlightJobForPr`
+  matches the dispatch row by `pr_url` once the push step posts it via a progress callback,
+  and (2) `hasInFlightJobForIssueKey` matches by `issue_identifier` for the window before
+  the push step completes. Both must return false for a merge to proceed. If the PR is
+  merged mid-review despite the guards (race window), the post-push-review step detects it
+  via API polling and exits with `terminationReason: "pr_merged"` (approved, exit 0) rather
+  than failing with a pipeline error.

@@ -517,6 +517,134 @@ describe("handleRunnerProgress", () => {
     expect(log.listLog().find((job) => job.id === jobId)?.runId).toBeNull();
     expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
   });
+
+  it("records prUrl on the dispatch row when progress body carries prUrl (AII-553)", async () => {
+    const dispatchId = "dispatch-prurl";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { prUrl: "https://github.com/org/repo/pull/42" } as never,
+      secret: SECRET,
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.prUrl).toBe("https://github.com/org/repo/pull/42");
+    // No step should have been recorded — prUrl-only progress leaves step table empty
+    expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
+  });
+
+  it("returns 400 when progress body has neither step nor prUrl", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({ issueId: "i", teamKey: "ENG", repo: "o/r", executionMode: "github-actions" });
+
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: {} as never,
+      secret: SECRET,
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("step_or_prUrl_required");
+  });
+});
+
+describe("handleRunnerResult — idempotent already_consumed (AII-553)", () => {
+  it("returns 200 already_recorded when the token was consumed and the row is already terminal", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    // Consume the token (first POST succeeds)
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1" },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    // Simulate the reconcile loop or GHA monitor marking the row terminal
+    log.updateJobStatus(jobId, "completed", "test_reconcile");
+
+    // Second POST with same token: row is terminal → 200 already_recorded
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1" },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, already_recorded: true });
+    expect(log.getJobById(jobId)?.status).toBe("completed");
+  });
+
+  it("still returns 409 when the token was consumed but the row is not yet terminal (live-run protection)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+      // status stays 'dispatched' — not terminal
+    });
+
+    // Consume the token directly without touching the job row status
+    runnerTokens.verifyAndConsumeRunToken(token, SECRET);
+
+    // Second POST with consumed token and non-terminal row → 409
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [], prUrl: "https://github.com/o/r/pull/1" },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("already_consumed");
+  });
 });
 
 describe("handleRunnerPlanningContext", () => {

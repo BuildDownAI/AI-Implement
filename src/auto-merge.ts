@@ -6,7 +6,7 @@ import {
 import {
   countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
 } from "./comment-gapfill-queue.js";
-import { hasInFlightJobForPr } from "./log.js";
+import { hasInFlightJobForIssueKey, hasInFlightJobForPr } from "./log.js";
 
 export interface AutoMergeDeps {
   githubAppId: string;
@@ -32,6 +32,14 @@ export function classifyStalledChild(mergeResult: string): StalledChildKind {
  *  A leaf child's own branch (ai-implement/<key>-<slug>) is NOT a grouping base. */
 export function isGroupingBranch(base: string): boolean {
   return base.startsWith("ai-implement/feature/") || base.startsWith("ai-implement/multi-issue/");
+}
+
+/** Extracts the issue key from a child implementation branch name.
+ *  Pattern: ai-implement/<KEY>-<slug>, e.g. ai-implement/aii-300-add-feature → AII-300.
+ *  Returns null when the branch does not follow this convention (fails open). */
+export function extractIssueKeyFromBranch(branch: string): string | null {
+  const match = /^ai-implement\/([A-Za-z]+-\d+)-/.exec(branch);
+  return match ? match[1].toUpperCase() : null;
 }
 
 export async function runAutoMerges(mappings: RepoMapping[], deps: AutoMergeDeps): Promise<void> {
@@ -90,6 +98,11 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
       }
       if (hasInFlightJobForPr(owner, repo, pr.number)) {
         console.log(`[auto-merge] Deferring merge of PR #${pr.number} -> ${pr.base}: run still in flight`);
+        continue;
+      }
+      const issueKey = extractIssueKeyFromBranch(pr.head);
+      if (issueKey && hasInFlightJobForIssueKey(issueKey)) {
+        console.log(`[auto-merge] Deferring merge of PR #${pr.number} -> ${pr.base}: run for ${issueKey} still in flight (pr_url not yet recorded)`);
         continue;
       }
       const result = await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");

@@ -135,3 +135,11 @@ export function verifyRunToken(
 export function verifyAndConsumeRunToken(token: string, secret: string): VerifyResult {
   return verifyRunToken(token, secret, "result", { consume: true });
 }
+
+/** Reads the dispatchId from a token's payload without checking audience, consumed-at, or
+ *  expiry. Used to identify an already-consumed token's job for idempotent result handling. */
+export function peekRunTokenDispatchId(token: string, secret: string): string | null {
+  const verified = verifyTokenSignatureAndLoadClaims(token, secret);
+  if (!verified.ok) return null;
+  return verified.claims.dispatchId;
+}

@@ -232,6 +232,16 @@ export function hasInFlightJobForPr(owner: string, repo: string, prNumber: numbe
   return row.count > 0;
 }
 
+/** Returns true when a job with status 'dispatched' or 'running' exists for the given
+ *  issue identifier. Supplements hasInFlightJobForPr for the window before pr_url is
+ *  written to the row (between dispatch and the push step completing). */
+export function hasInFlightJobForIssueKey(issueKey: string): boolean {
+  const row = getDb()
+    .prepare("SELECT COUNT(*) as count FROM dispatch_log WHERE status IN ('dispatched', 'running') AND issue_identifier = ?")
+    .get(issueKey) as { count: number };
+  return row.count > 0;
+}
+
 /**
  * Counts prior dispatches for an issue. When `phase` is given, only the
  * matching phase family is counted: planning dispatches number independently

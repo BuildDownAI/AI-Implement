@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { runAutoMerges, runGroupingBranchAutoMerge, isGroupingBranch, classifyStalledChild, MAX_CONFLICT_RESOLUTION_ATTEMPTS } from "../auto-merge.js";
+import { runAutoMerges, runGroupingBranchAutoMerge, isGroupingBranch, classifyStalledChild, MAX_CONFLICT_RESOLUTION_ATTEMPTS, extractIssueKeyFromBranch } from "../auto-merge.js";
 import type { RepoMapping } from "../config.js";
 
 vi.mock("../github-app-auth.js", () => ({
@@ -18,11 +18,12 @@ vi.mock("../comment-gapfill-queue.js", () => ({
 }));
 vi.mock("../log.js", () => ({
   hasInFlightJobForPr: vi.fn(() => false),
+  hasInFlightJobForIssueKey: vi.fn(() => false),
 }));
 
 import { listOpenPullRequests, getCombinedChecksState, hasChangesRequestedReview, mergePullRequest } from "../github.js";
 import { hasPendingConflictResolution, countConflictAttempts, enqueueConflictResolution } from "../comment-gapfill-queue.js";
-import { hasInFlightJobForPr } from "../log.js";
+import { hasInFlightJobForPr, hasInFlightJobForIssueKey } from "../log.js";
 
 function mapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   return {
@@ -60,6 +61,7 @@ beforeEach(() => {
   vi.mocked(countConflictAttempts).mockReturnValue(0);
   vi.mocked(enqueueConflictResolution).mockReturnValue(1);
   vi.mocked(hasInFlightJobForPr).mockReturnValue(false);
+  vi.mocked(hasInFlightJobForIssueKey).mockReturnValue(false);
 });
 
 describe("isGroupingBranch", () => {
@@ -331,5 +333,68 @@ describe("in-flight job guard (AII-471)", () => {
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith(
       "tok", "BuildDownAI", "AI-Implement", 6, "sha6", "merge",
     );
+  });
+});
+
+describe("extractIssueKeyFromBranch (AII-553)", () => {
+  it("extracts uppercase key from a child branch with lowercase key", () => {
+    expect(extractIssueKeyFromBranch("ai-implement/aii-300-add-feature")).toBe("AII-300");
+  });
+
+  it("extracts key when the branch key is already uppercase", () => {
+    expect(extractIssueKeyFromBranch("ai-implement/AII-521-some-title")).toBe("AII-521");
+  });
+
+  it("returns null for a grouping branch (no issue key segment)", () => {
+    expect(extractIssueKeyFromBranch("ai-implement/feature/aii-200-feat")).toBeNull();
+  });
+
+  it("returns null for unrelated branches", () => {
+    expect(extractIssueKeyFromBranch("main")).toBeNull();
+    expect(extractIssueKeyFromBranch("testing")).toBeNull();
+  });
+});
+
+describe("issue-key guard in autoMergeRepo (AII-553)", () => {
+  it("defers merge when hasInFlightJobForIssueKey returns true for the head branch key", async () => {
+    // pr_url not yet set on the dispatch row, so hasInFlightJobForPr returns false,
+    // but hasInFlightJobForIssueKey catches the in-flight run by issue identifier.
+    vi.mocked(listOpenPullRequests).mockResolvedValue([
+      pr({ number: 5, head: "ai-implement/aii-300-add-feature", headSha: "sha5" }),
+    ]);
+    vi.mocked(hasInFlightJobForPr).mockReturnValue(false);
+    vi.mocked(hasInFlightJobForIssueKey).mockReturnValue(true);
+
+    await runAutoMerges([mapping()], deps());
+
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    expect(vi.mocked(hasInFlightJobForIssueKey)).toHaveBeenCalledWith("AII-300");
+  });
+
+  it("allows merge when both guards return false", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([
+      pr({ number: 5, head: "ai-implement/aii-300-add-feature", headSha: "sha5" }),
+    ]);
+    vi.mocked(hasInFlightJobForPr).mockReturnValue(false);
+    vi.mocked(hasInFlightJobForIssueKey).mockReturnValue(false);
+
+    await runAutoMerges([mapping()], deps());
+
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips issue-key guard when head branch does not match the ai-implement pattern", async () => {
+    vi.mocked(listOpenPullRequests).mockResolvedValue([
+      pr({ number: 5, head: "some-unrelated-branch", headSha: "sha5" }),
+    ]);
+    vi.mocked(hasInFlightJobForPr).mockReturnValue(false);
+    // Guard must not be called for non-matching branches (fail-open)
+    vi.mocked(hasInFlightJobForIssueKey).mockReturnValue(true);
+
+    await runAutoMerges([mapping()], deps());
+
+    expect(vi.mocked(hasInFlightJobForIssueKey)).not.toHaveBeenCalled();
+    // Without a matching branch the issue-key guard is skipped, so merge proceeds
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);
   });
 });
