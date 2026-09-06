@@ -823,6 +823,59 @@ describe("runKgRefresh", () => {
     expect(decoded.runnerPhase).toBe("kg-refresh");
     expect(decoded.kgSourceRepo).toBe("BuildDownAI/knowledge-graph-ai-implement");
   });
+
+  it("passes maxIterations=2 to the feedback-loop step", async () => {
+    let capturedInputs: Record<string, unknown> = {};
+    const capturingFeedbackLoop: StepModule = {
+      run: async (_ctx, inputs) => {
+        capturedInputs = inputs;
+        return { approved: false };
+      },
+    };
+
+    await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        feedbackLoop: capturingFeedbackLoop,
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
+      },
+      reporter: { report: async () => undefined },
+    });
+
+    expect(capturedInputs.maxIterations).toBe(2);
+  });
+
+  it("passes reviewRubric with snapshot/ and ingest-check clauses to the feedback-loop step", async () => {
+    let capturedInputs: Record<string, unknown> = {};
+    const capturingFeedbackLoop: StepModule = {
+      run: async (_ctx, inputs) => {
+        capturedInputs = inputs;
+        return { approved: false };
+      },
+    };
+
+    await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        feedbackLoop: capturingFeedbackLoop,
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
+      },
+      reporter: { report: async () => undefined },
+    });
+
+    const rubric = capturedInputs.reviewRubric;
+    expect(typeof rubric).toBe("string");
+    const rubricStr = rubric as string;
+    // Must mention that uncommitted output is expected
+    expect(rubricStr).toContain("snapshot/");
+    expect(rubricStr).toContain("uncommitted");
+    // Must include all four ingest-check criteria
+    expect(rubricStr).toContain("embeddings.npz");
+    expect(rubricStr).toContain("embeddings.stamp");
+    expect(rubricStr).toContain("kg-stats.json");
+  });
 });
 
 // ── kg-refresh execution-path selection ──────────────────────────────────────
@@ -1014,6 +1067,12 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
   it("instructs the agent to proceed when tracker-data.json is absent (local/dev runs)", () => {
     const playbook = readFileSync(playbookPath, "utf-8");
     expect(playbook).toContain("absent");
+  });
+
+  it("states that the reviewer treats uncommitted snapshot/ output as expected", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    expect(playbook).toContain("uncommitted");
+    expect(playbook).toContain("reviewer");
   });
 });
 

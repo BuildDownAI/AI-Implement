@@ -157,6 +157,7 @@ function applyWiring(step: YamlStep): StepDefinition {
             provider: ctx.data.provider,
             maxTurns: ctx.data.maxTurns,
             maxIterations: ctx.data.maxIterations,
+            reviewRubric: ctx.data.reviewRubric,
           };
         },
       };

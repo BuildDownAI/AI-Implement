@@ -11,6 +11,7 @@ interface ReviewInputs extends Record<string, unknown> {
   issueTitle?: string;
   issueDescription?: string;
   acceptanceBar?: string;
+  reviewRubric?: string;
 }
 
 interface ReviewOutputs extends Record<string, unknown> {
@@ -54,6 +55,7 @@ const REVIEW_PROMPT = (
   diff: string | undefined,
   iteration: number,
   acceptanceBar?: string,
+  reviewRubric?: string,
 ) => {
   let prompt = `Review the implementation against the issue requirements. This is review iteration ${iteration}.`;
 
@@ -78,6 +80,10 @@ Approval contract:
 - Do not set approved=true while listing unresolved issues.
 - Put every required fix in issues[]; feedback is only summary context.`;
 
+  if (reviewRubric) {
+    prompt += `\n\n## Run-specific review rubric\n${reviewRubric}`;
+  }
+
   return prompt;
 };
 
@@ -87,10 +93,11 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     inputs: ReviewInputs,
     _reporter: StepReporter,
   ): Promise<ReviewOutputs> {
-    const { model, diff, issueTitle, issueDescription, acceptanceBar } = inputs;
+    const { model, diff, issueTitle, issueDescription, acceptanceBar, reviewRubric } = inputs;
     const iteration = typeof inputs.iteration === "number" ? inputs.iteration : 1;
+    const rubric = reviewRubric !== undefined ? String(reviewRubric) : undefined;
 
-    const prompt = REVIEW_PROMPT(issueTitle, issueDescription, diff, iteration, acceptanceBar);
+    const prompt = REVIEW_PROMPT(issueTitle, issueDescription, diff, iteration, acceptanceBar, rubric);
 
     const result = await context.llmExecutor.invoke({
       prompt,
