@@ -4,7 +4,7 @@
 
 **Date:** 2026-09-06
 
-**References:** AII-489 (dispatched KG refresh), AII-521 (issueless-run lifecycle), AII-543 / AII-549 (live-run fix groups), AII-548 (callback-URL contract), AII-553 (merge race), AII-555 (consolidation), `docs/issueless-runs.md`, `docs/pipeline-architecture.md`
+**References:** AII-489 (dispatched KG refresh), AII-521 (issueless-run lifecycle), AII-543 / AII-549 (live-run fix groups), AII-548 (callback-URL contract), AII-553 (merge race), AII-560 (merge-ordering guarantee umbrella), AII-555 (consolidation), `docs/issueless-runs.md`, `docs/pipeline-architecture.md`
 
 ## Context
 
@@ -57,6 +57,8 @@ A run kind is allowed its own **data-path** modules, because the runner never ho
 5. A hand parser for a format the repo already loads with a library.
 6. A callback URL that carries a path.
 
+**Guards are keyed on data that exists when they run.** AII-471's merge guard joined on `pr_url`, which the result callback writes at the end of the run, so it was blind for every initial run; the issue key had been on the dispatch row since dispatch. AII-560 consolidates the child-PR merge gate onto that run record — one predicate, one guarded write path — and ships the race fixture that fails on the old code. A guard's test exercises the timeline of the data it reads, not a mock of the store.
+
 **Issue bodies name the anchor.** Every touch in a `## Files` block or a Fix section cites the existing module by path — "reuse `resolveRunnerImageForDispatch` as `dispatchGitHubActions` does" — not the behaviour. A body that says "read", "derive", or "resolve" without a path is not ready to file.
 
 ## Alternatives considered
@@ -67,7 +69,7 @@ A run kind is allowed its own **data-path** modules, because the runner never ho
 
 ## Consequences
 
-- AII-555 removes the second template, the second resolver, the entrypoint derivation, and the reaper's GHA branch, and routes the KG refresh through the shared extension points.
+- AII-560 lands before AII-555 so grouped children no longer merge under their runs; AII-555 removes the second template, the second resolver, the entrypoint derivation, and the reaper's GHA branch, and routes the KG refresh through the shared extension points.
 - Any future issueless run kind (previews, migrations, scheduled jobs) starts from the table above. The expected cost is one optional template input, one `pipelines/<kind>.yml`, one prompt template, and the kind's data-path modules.
 - The acceptance clause "no implement-path test edits" is the mechanical check that a change added a parameter rather than a sibling.
 - The review rail and the driver's smoke both check for the six violations; a green suite does not clear them.
