@@ -204,16 +204,28 @@ Each stage transition is persisted to the `settings` table under the key `kg_ref
 
 ### Crash recovery (boot)
 
-On construction, `makeKgRefresh()` loads the persisted stage:
-- `ingest-running` within TTL → restores `running = true, stage = "ingest-running"` and waits for the callback
+On construction, `makeKgRefresh()` loads the persisted stage and last refresh outcome:
+
+- `ingest-running` within TTL → restores `running = true`, `stage = "ingest-running"`, `currentDispatchId`, and `currentJobId` from the persisted envelope; re-arms the TTL watchdog as a `setTimeout` for the remaining window
 - `ingest-running` past TTL → clears the lock (`persistStageFn("idle", ...)`) so a new dispatch can proceed
 - `snapshot-landed` or `staging` → the orchestrator restarted mid-rail with no pending callback; marks `"failed"` immediately so the operator can retry
 
+The in-flight dispatch envelope is stored under the same `kg_refresh_stage` settings key as the stage, atomically on every transition to `ingest-running`. The envelope carries `dispatchId` and `jobId` so that:
+- A result callback arriving after restart can close the `dispatch_log` row (`closeJobLog(jobId, ...)`) and report the correct `dispatchId` through `onOutcome`
+- `GET /api/kg/status` shows the adopted run in `stage: "ingest-running"` until the callback arrives
+
+`lastRefresh` is persisted under a separate `kg_refresh_last_refresh` settings key on every terminal outcome (success, no-new-data, failure) and loaded on boot. It survives restarts independently of the in-flight state.
+
+**Token validation survives restarts** because `verifyAndConsumeRunToken` and `verifyRunToken` are DB-only — they read `runner_tokens` rows written at dispatch time. The 401 seen in run 34006075078 was caused by the progress token not being minted (AII-544, now fixed), not by in-memory state loss.
+
+**SQLite volume must persist across deploys.** An orchestrator that redeploys with a fresh volume loses both the `runner_tokens` rows and the persisted stage — token validation returns `reason: "malformed"` (row absent) and `GET /api/kg/status` shows `lastRefresh: null`.
+
 ### TTL (4 hours)
 
-`KG_REFRESH_TTL_MS = 4 * 60 * 60 * 1000`. Two enforcement paths:
+`KG_REFRESH_TTL_MS = 4 * 60 * 60 * 1000`. Three enforcement paths:
 1. **Live process watchdog**: each `trigger()` call checks whether `Date.now() - ingestStartedAt >= KG_REFRESH_TTL_MS`; if so, calls `failIngestRunner(...)` before proceeding
-2. **Boot recovery**: as above
+2. **Boot re-adoption watchdog**: when an in-flight run is re-adopted on boot, a `setTimeout` is armed for the remaining TTL window; fires `failIngestRunner(...)` if no callback arrives within that window
+3. **Boot recovery (past TTL)**: as above — clears the stale lock on construction
 
 When the TTL fires, `onOutcome("failure", { timedOut: true })` is called with `timedOut: true`. `handleKgRefreshOutcome()` in `src/index.ts` uses `timedOut` to build a synthetic `"timed_out"` job for `classifyCompletion()` so the notification reads "KG Refresh hit the time limit." rather than a generic failure message.
 
