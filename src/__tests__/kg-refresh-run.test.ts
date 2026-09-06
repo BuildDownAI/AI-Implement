@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { encodeRunConfig, decodeRunConfig } from "../run-config.js";
-import { buildEnvelopeDispatchInputs } from "../github.js";
+import { buildEnvelopeDispatchInputs, buildKgRefreshGhaDispatchBody } from "../github.js";
 import type { RepoMapping } from "../config.js";
 import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
 
@@ -1026,11 +1026,9 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
 // two layers:
 //   1. resolveRunnerImageForDispatch in isolation — ensures the helper returns
 //      the right value for the three decision branches.
-//   2. Dispatch body wiring invariant — builds the body using the same spread
-//      pattern as the production code (src/index.ts:3059) and asserts that
-//      runner_image appears in (or is absent from) the body as expected.
-//      This catches a future regression where the spread is accidentally
-//      removed or the condition is inverted.
+//   2. Dispatch body wiring via buildKgRefreshGhaDispatchBody — calls the same
+//      exported function that production uses, so a key-name change or logic
+//      inversion in the real code will fail these assertions.
 
 describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerImageForDispatch", () => {
   beforeEach(() => {
@@ -1096,8 +1094,8 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
   });
 
   it("GHA and Fly resolve the same image ref for the same orchestrator (parity)", async () => {
-    // Both paths call resolveRunnerImageForDispatch with identical params;
-    // verify idempotency: same call → same result.
+    // GHA calls resolveRunnerImageForDispatch (which delegates to resolveSessionImage);
+    // Fly calls resolveSessionImage directly — verify the two produce the same result.
     const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
 
     const opts = {
@@ -1119,33 +1117,16 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
 });
 
 // ── GHA kg-refresh dispatch — body wiring invariant ───────────────────────────
-// Exercises the exact dispatch-body construction pattern used in
-// dispatchKgRefreshRun's GHA branch (src/index.ts:3059):
-//
-//   const dispatchBody = JSON.stringify({ ref: defaultBranch, inputs: {
-//     run_config: opts.runConfig, run_token: opts.runToken,
-//     ...(runnerImage ? { runner_image: runnerImage } : {})
-//   }});
-//
-// The tests compose resolveRunnerImageForDispatch with the spread to verify the
-// full pipeline from image-resolution to fetch-body, which is the closest
-// testable boundary when dispatchKgRefreshRun itself is not exported.
+// Exercises the full pipeline from image resolution to fetch-body by composing
+// resolveRunnerImageForDispatch with the exported buildKgRefreshGhaDispatchBody
+// (the same function dispatchKgRefreshRun uses). Tests call the real exported
+// function rather than a local copy of the spread, so a key-name change or
+// logic inversion in production will fail these assertions.
 
 describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", () => {
   beforeEach(() => {
     __clearRepoImageCacheForTests();
   });
-
-  function buildDispatchBody(runnerImage: string | undefined, opts = { ref: "main", runConfig: "cfg", runToken: "tok" }) {
-    return JSON.parse(JSON.stringify({
-      ref: opts.ref,
-      inputs: {
-        run_config: opts.runConfig,
-        run_token: opts.runToken,
-        ...(runnerImage ? { runner_image: runnerImage } : {}),
-      },
-    })) as { ref: string; inputs: Record<string, string> };
-  }
 
   it("body includes runner_image when image is resolved (explicit orchestrator pin)", async () => {
     const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
@@ -1158,7 +1139,7 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
       fetchImpl,
     });
 
-    const body = buildDispatchBody(runnerImage);
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
     expect(body.inputs.runner_image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
   });
 
@@ -1173,7 +1154,7 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
       fetchImpl,
     });
 
-    const body = buildDispatchBody(runnerImage);
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
     expect("runner_image" in body.inputs).toBe(false);
   });
 
@@ -1196,7 +1177,7 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
       fetchImpl,
     });
 
-    const body = buildDispatchBody(runnerImage);
+    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
     expect(body.inputs.runner_image).toBe("ghcr.io/org/custom-runner:sha-abc");
   });
 });

@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -3056,7 +3056,7 @@ async function dispatchKgRefreshRun(
       defaultImage: config.sessionImage,
       runnerImageExplicit: config.runnerImageExplicit,
     });
-    const dispatchBody = JSON.stringify({ ref: defaultBranch, inputs: { run_config: opts.runConfig, run_token: opts.runToken, ...(runnerImage ? { runner_image: runnerImage } : {}) } });
+    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runnerImage });
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
       signal: defaultFetchSignal(),
@@ -3108,8 +3108,14 @@ async function dispatchKgRefreshRun(
     const sessionToken = generateSessionToken();
     const machineNonce = generateMachineNonce();
     const extraEnv: Record<string, string> = { AI_IMPLEMENT_RUN_CONFIG: opts.runConfig };
+    const { image: resolvedFlyImage } = await resolveSessionImage({
+      owner: repo.owner,
+      repo: repo.repo,
+      token: ghToken,
+      defaultImage: config.sessionImage,
+    });
     const machineConfig = buildSessionMachineConfig({
-      image: config.sessionImage,
+      image: resolvedFlyImage,
       issueId: "kg-refresh",
       issueIdentifier: "KG-REFRESH",
       issueTitle: "KG ingest",
