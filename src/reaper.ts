@@ -6,9 +6,11 @@ import type { RepoMapping } from "./config.js";
 import { recordReaperAction } from "./dedup.js";
 import { notifyReaperBurst } from "./notify.js";
 import type { Job } from "./log.js";
+import type { WorkflowRunStatus } from "./github.js";
 
 export const SWEEP_MACHINE_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
 const KG_REFRESH_BOOTSTRAP_DEADLINE_MS = 5 * 60 * 1000; // 5 minutes
+const GHA_DISPATCH_GRACE_MS = 5 * 60 * 1000; // 5 minutes
 const TERMINAL_LIFECYCLE_STATES = new Set<IssueLifecycleState>(["completed", "cancelled"]);
 
 export interface ReaperConfig {
@@ -29,6 +31,8 @@ export interface ReaperHelpers {
   findPrForIssue: (repo: string | null, issueIdentifier: string | null) => Promise<string | null>;
   /** Called for each kg-refresh job whose machine is absent from the Fly registry. */
   failKgRefreshMachine?: (job: Job, opts?: { failureCode?: string }) => void;
+  /** Called during GHA kg-refresh reconciliation to check the current workflow run status. */
+  checkGhaRunStatus?: (job: Job) => Promise<WorkflowRunStatus | null>;
 }
 
 export interface DestroyContext {
@@ -76,9 +80,64 @@ export async function safeDestroyMachine(
 }
 
 /**
+ * Reconciles a GHA kg-refresh job row by querying its workflow run status.
+ * Never applies machine-absent or bootstrap-deadline rules — those are Fly-only.
+ */
+async function reconcileGhaKgRefreshJob(
+  config: ReaperConfig,
+  helpers: ReaperHelpers,
+  job: Job,
+): Promise<void> {
+  const ageSeconds = Math.floor((Date.now() - job.dispatchedAt) / 1000);
+
+  if (job.runId == null) {
+    // No run_id yet — GHA dispatch hasn't bound. Within the grace window: wait; outside: dispatch_lost.
+    if (Date.now() - job.dispatchedAt <= GHA_DISPATCH_GRACE_MS) return;
+
+    console.log(
+      `[reaper] rule=kg-refresh-gha-dispatch-lost job=${job.id} age_s=${ageSeconds} dry_run=${config.reaperDryRun}`,
+    );
+    recordReaperAction({
+      ruleMatched: "kg-refresh-gha-dispatch-lost",
+      machineId: "", // sentinel: no machine for GHA rows
+      tenantId: null,
+      issueIdentifier: null,
+      ageSeconds,
+      dryRun: config.reaperDryRun,
+    });
+    if (!config.reaperDryRun) {
+      helpers.failKgRefreshMachine?.(job, { failureCode: "dispatch_lost" });
+    }
+    return;
+  }
+
+  // run_id is set — check the workflow run status via the injected helper.
+  const runStatus = (await helpers.checkGhaRunStatus?.(job)) ?? null;
+  if (runStatus == null) return; // API error or helper absent — fail-safe: leave job alone
+
+  if (runStatus.status !== "completed") return; // queued or in_progress — leave it alone
+
+  console.log(
+    `[reaper] rule=kg-refresh-gha-run-complete job=${job.id} conclusion=${runStatus.conclusion ?? "null"} age_s=${ageSeconds} dry_run=${config.reaperDryRun}`,
+  );
+  recordReaperAction({
+    ruleMatched: "kg-refresh-gha-run-complete",
+    machineId: "", // sentinel: no machine for GHA rows
+    tenantId: null,
+    issueIdentifier: null,
+    ageSeconds,
+    dryRun: config.reaperDryRun,
+  });
+  if (!config.reaperDryRun) {
+    helpers.failKgRefreshMachine?.(job, { failureCode: runStatus.conclusion ?? undefined });
+  }
+}
+
+/**
  * Inverse sweep for issue-less kg-refresh job rows: finds rows in phase
- * "kg-refresh" whose machine is absent from the active Fly machine set and
- * closes them through the shared terminal path in KgRefreshHandle.
+ * "kg-refresh" and closes stale ones through the shared terminal path in
+ * KgRefreshHandle. GHA rows are reconciled from their workflow run status;
+ * Fly rows use the machine-registry and bootstrap-deadline rules.
  *
  * Called at the end of sweepOrphanedMachines with the already-fetched machine set.
  */
@@ -89,6 +148,13 @@ async function sweepOrphanedKgRefreshJobs(
 ): Promise<void> {
   const jobs = getInFlightKgRefreshJobs();
   for (const job of jobs) {
+    if (job.executionMode === "github-actions") {
+      await reconcileGhaKgRefreshJob(config, helpers, job);
+      continue;
+    }
+
+    // Fly / local-Docker path below.
+
     // Bootstrap-deadline: a row still in dispatched status (never received a callback)
     // past the deadline is closed regardless of machineId or registry presence. This
     // catches machines that booted and exited before recording their identity.

@@ -10,7 +10,7 @@ import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
-import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError } from "./steps/kg-snapshot-push.js";
+import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { ClaudeCliExecutor } from "./executor.js";
 import type { LLMExecutor, StepReporter, StepModule } from "./types.js";
@@ -116,6 +116,32 @@ function buildKgRefreshPrompt(params: {
   return `Run the knowledge-graph ingest for ${params.issueIdentifier}. Set up the Python venv, run the ingest, verify the snapshot (snapshot/parts/*.nt and snapshot/embeddings.npz), write snapshot/embeddings.stamp, and leave all changes uncommitted.`;
 }
 
+/**
+ * Reviewer rubric injected into the review prompt for kg-refresh runs.
+ *
+ * The KG-REFRESH.md playbook explicitly instructs the agent to leave all
+ * changes uncommitted — the kg-snapshot-push step owns the repository write.
+ * Without this rubric the generic reviewer treats untracked snapshot/ and
+ * ai-output/ files as a gap and rejects an otherwise successful ingest.
+ *
+ * Approval for a kg-refresh run is determined entirely by the four ingest
+ * checks below, NOT by the working-tree state. Untracked or modified files
+ * under snapshot/ and ai-output/ are the expected output of a correct run.
+ */
+const KG_REFRESH_REVIEW_RUBRIC = `This is a kg-refresh run. The playbook instructs the agent to leave all changes \
+uncommitted — the pipeline step that follows owns the repository write. \
+Untracked or modified files under snapshot/ and ai-output/ are the expected \
+output of a successful ingest, never a gap.
+
+Approve this run if and only if all four ingest checks pass:
+1. snapshot/parts/ contains at least one non-empty .nt file (RDF triples written).
+2. snapshot/embeddings.npz exists and is non-empty (embeddings rebuilt).
+3. snapshot/embeddings.stamp exists and contains a fresh ISO-8601 timestamp (stamp written).
+4. ai-output/kg-stats.json exists and contains the four required numeric fields: quads, vectors, docPages, durationSec (report written).
+
+Do NOT raise issues about uncommitted files in snapshot/ or ai-output/. Do NOT \
+require git add or git commit — those are pipeline responsibilities.`;
+
 export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunKgRefreshResult> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
   const {
@@ -153,11 +179,12 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       branch: defaultBranch,
       provider,
       maxTurns,
-      // kg-refresh always runs a single feedback-loop pass — the ingest either
-      // succeeds or fails; there is no review rail to cycle through. maxIterations: 1
-      // caps the loop, and the snapshot-push step (not the reviewer's verdict) is
-      // what determines success or failure for this run kind.
-      maxIterations: 1,
+      // kg-refresh allows up to 2 feedback-loop passes. If the first ingest pass
+      // has a recoverable gap (not a rubric contradiction), the reviewer can flag
+      // it and a second pass addresses it. The snapshot-push step (not the
+      // reviewer's verdict) is what determines final success or failure.
+      maxIterations: 2,
+      reviewRubric: KG_REFRESH_REVIEW_RUBRIC,
       callbackUrl: callbackUrl ?? undefined,
     },
     opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary"),
@@ -178,13 +205,16 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     const isMissing = err instanceof KgSnapshotMissingError;
     const isStale = err instanceof KgSnapshotStaleError;
     const isTrackerDataError = err instanceof KgTrackerDataFetchError;
+    const isTrackerRegression = err instanceof KgSnapshotTrackerRegressionError;
     const failureCode = isMissing
       ? "KG_SNAPSHOT_MISSING"
       : isStale
         ? "KG_SNAPSHOT_STALE"
         : isTrackerDataError
           ? "KG_TRACKER_DATA_FETCH_FAILED"
-          : undefined;
+          : isTrackerRegression
+            ? "KG_SNAPSHOT_TRACKER_REGRESSION"
+            : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
     await postRunnerResult({
       phase: "kg-refresh",

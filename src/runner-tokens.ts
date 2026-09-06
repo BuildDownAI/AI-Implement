@@ -79,6 +79,9 @@ export function mintRunToken(input: MintInput): MintOutput {
   return { token, dispatchId };
 }
 
+// Token verification is intentionally DB-only (runner_tokens table) — no in-memory state
+// is consulted. This means verification survives orchestrator restarts as long as the
+// SQLite volume persists across deploys.
 function verifyTokenSignatureAndLoadClaims(token: string, secret: string): VerifyResult {
   const parts = token.split(".");
   if (parts.length !== 2) return { ok: false, reason: "malformed" };

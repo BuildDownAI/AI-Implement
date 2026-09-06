@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 vi.mock("node:child_process", () => ({
   spawnSync: vi.fn(),
@@ -620,5 +623,102 @@ describe("feedbackLoopStep termination reasons", () => {
 
     expect(outputs.terminationReason).toBe("max_turns");
     expect(outputs.postMortem).toBeUndefined();
+  });
+});
+
+describe("feedbackLoopStep — reviewer feedback file", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+    tmpDir = mkdtempSync(join(tmpdir(), "fl-feedback-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("writes finalFeedback to ai-output/comments/80-reviewer-feedback.md on approval", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce({
+      ...APPROVED_REVIEW,
+      feedback: "All checks pass. Great ingest.",
+    });
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, workspaceDir: tmpDir },
+      new NoopStepReporter(),
+    );
+
+    const feedbackFile = join(tmpDir, "ai-output", "comments", "80-reviewer-feedback.md");
+    expect(existsSync(feedbackFile)).toBe(true);
+    expect(readFileSync(feedbackFile, "utf-8")).toContain("All checks pass. Great ingest.");
+  });
+
+  it("writes finalFeedback to the feedback file even when loop ends unapproved", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValue({
+      ...REJECTED_REVIEW,
+      feedback: "Missing embeddings.stamp file.",
+    });
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, workspaceDir: tmpDir, maxIterations: 1 },
+      new NoopStepReporter(),
+    );
+
+    const feedbackFile = join(tmpDir, "ai-output", "comments", "80-reviewer-feedback.md");
+    expect(existsSync(feedbackFile)).toBe(true);
+    expect(readFileSync(feedbackFile, "utf-8")).toContain("Missing embeddings.stamp file.");
+  });
+
+  it("does not throw when the feedback file write fails", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    // Use a path where mkdirSync will fail (a file in the way)
+    const { writeFileSync: realWriteFileSync } = await import("node:fs");
+    realWriteFileSync(join(tmpDir, "ai-output"), "NOT A DIR");
+
+    await expect(
+      feedbackLoopStep.run(
+        makeContext(),
+        { ...BASE_INPUTS, workspaceDir: tmpDir },
+        new NoopStepReporter(),
+      ),
+    ).resolves.toBeDefined();
+  });
+});
+
+describe("feedbackLoopStep — reviewRubric forwarding", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it("forwards reviewRubric to the review step", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, reviewRubric: "Only approve if snapshot/embeddings.stamp exists." },
+      new NoopStepReporter(),
+    );
+
+    const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
+    expect(reviewCall[1]).toMatchObject({
+      reviewRubric: "Only approve if snapshot/embeddings.stamp exists.",
+    });
+  });
+
+  it("does not pass reviewRubric to review step when not set", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
+    expect(reviewCall[1].reviewRubric).toBeUndefined();
   });
 });

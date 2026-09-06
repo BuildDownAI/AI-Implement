@@ -227,4 +227,27 @@ describe("reviewStep", () => {
     expect(outputs.approved).toBe(true);
     expect(outputs.score).toBe(95);
   });
+
+  it("appends reviewRubric to prompt when supplied", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+    await reviewStep.run(
+      makeContext(executor),
+      { reviewRubric: "CUSTOM RUBRIC TEXT FOR THIS RUN TYPE" },
+      new NoopStepReporter(),
+    );
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt).toContain("Run-specific review rubric");
+    expect(call.prompt).toContain("CUSTOM RUBRIC TEXT FOR THIS RUN TYPE");
+  });
+
+  it("does not include rubric section when reviewRubric is undefined", async () => {
+    const executor = makeExecutor(APPROVED_JSON);
+    await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.prompt).not.toContain("Run-specific review rubric");
+    // Approval contract must always appear regardless
+    expect(call.prompt).toContain("Approval contract");
+  });
 });
