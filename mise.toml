@@ -1,0 +1,7 @@
+# Local development toolchain and environment, for https://mise.jdx.dev
+#
+# Node is pinned in .tool-versions (mise reads it natively, as asdf did), so
+# this file only carries the environment loading that .envrc used to do under
+# direnv. Both tools stay usable side by side.
+[env]
+_.file = ".env"
