@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
-import { OperatorCancelledError } from "../pipeline/operator-cancelled.js";
+import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
 
 function makeCtx(execMock: any) {
   return {
@@ -2520,26 +2521,24 @@ describe("postPushReviewStep", () => {
     ).rejects.toThrow(OperatorCancelledError);
   });
 
-  it("falls through to generic error when 'issue is locked' but PR is merged", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+  it("exits as pr_merged when entry guard detects a merged PR (CLOSED state, merged=true)", async () => {
+    // assertPrWritable at step entry now detects merged before any write is attempted.
+    // The old "falls through to generic error when locked but merged" scenario no longer applies:
+    // the merged state is caught at entry, not inside the lock handler.
     const ghSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-      if (args[0] === "pr" && args[1] === "comment") {
-        return { stdout: "", stderr: "GraphQL: Issue is locked (addComment)", exitCode: 1 };
-      }
       if (args[0] === "pr" && args[1] === "view") {
         return { stdout: JSON.stringify({ state: "CLOSED", merged: true }), exitCode: 0 };
       }
       return { stdout: "", exitCode: 0 };
     });
-    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
-    await expect(
-      postPushReviewStep.run(
-        ctx,
-        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
-        { report: vi.fn(async () => undefined) },
-      ),
-    ).rejects.toThrow("gh pr comment failed");
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: "", exitCode: 0, tokensUsed: 0 })));
+    const out = await postPushReviewStep.run(
+      ctx,
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+      { report: vi.fn(async () => undefined) },
+    );
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("pr_merged");
   });
 
   it("surfaces genuine LLM failure when operator closes PR while failure comment is being posted (priorLlmFailure=true)", async () => {
@@ -2661,9 +2660,11 @@ describe("postPushReviewStep", () => {
   });
 
   it("exits cleanly with approved=true and pr_merged when PR is already merged at step entry", async () => {
+    // assertPrWritable uses `gh pr view --json state,merged`; the entry guard detects MERGED
+    // before the first status comment is posted.
     const ghSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "api" && args[1]?.includes("/pulls/")) {
-        return { stdout: '{"merged":true,"locked":false}', exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "view") {
+        return { stdout: JSON.stringify({ state: "MERGED", merged: true }), exitCode: 0 };
       }
       return { stdout: "", exitCode: 0 };
     });
@@ -2684,10 +2685,10 @@ describe("postPushReviewStep", () => {
     expect(gitSpawn).not.toHaveBeenCalled();
   });
 
-  it("does not treat a locked-but-unmerged PR as merged (closed/locked belongs to the AII-453 probe)", async () => {
+  it("does not treat a locked-but-unmerged PR as merged (closed/locked belongs to the operator-cancel path)", async () => {
     // A locked conversation on an OPEN, unmerged PR is not the merge race: the merged-only
     // guard must fall through to the normal review path. A locked PR that is CLOSED and
-    // unmerged is an operator cancel, which probeIfPrClosed classifies as OPERATOR_CANCELLED.
+    // unmerged is an operator cancel, which assertPrWritable classifies as OPERATOR_CANCELLED.
     const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args[1]?.includes("/pulls/")) {
@@ -2785,20 +2786,19 @@ describe("postPushReviewStep", () => {
     expect(invoke).not.toHaveBeenCalled();
     expect(ghSpawn.mock.calls.some((c) => c[0] === "pr" && c[1] === "comment")).toBe(false);
   });
-  it("exits with pr_merged at the top of the next iteration when the PR is merged during a fix pass", async () => {
-    // The in-loop guard: the PR is open at entry and through the first review and fix pass, then
-    // merged under the run before the second iteration starts (an orchestrator defer that did not
-    // hold). The top-of-iteration check exits benign instead of reviewing a merged PR.
-    const approvedWithIssues = JSON.stringify({
-      approved: true,
-      issues: ["Escape quoted user input"],
-      feedback: "Minor issue worth addressing.",
-      score: 8,
+  it("exits with pr_merged during a fix pass when assertPrWritable detects the merge before the push", async () => {
+    // The PR is open through the first review and fix-pass LLM, then merged. The
+    // assertPrWritable guard before the git push detects the merge and exits as pr_merged
+    // without pushing. iteration=1 because detection fires before the second iteration starts.
+    const reviewIssues = JSON.stringify({
+      approved: false,
+      blocking_issues: [{ title: "Bug", problem: "Null ref", required_fix: "Guard it" }],
+      feedback: "has issues",
+      score: 4,
       progress_delta: 0,
     });
     let invokeCount = 0;
     const gitSpawn = vi.fn((args: string[]) => {
-      // The fix pass produces a change, so the loop continues to a second iteration.
       if (args[0] === "status") return { stdout: " M src/example.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "feature-branch\n", exitCode: 0 };
       if (args[0] === "rev-parse") return { stdout: "abc1234\n", exitCode: 0 };
@@ -2807,16 +2807,22 @@ describe("postPushReviewStep", () => {
       return { stdout: "", exitCode: 0 };
     });
     const ghSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
-      if (args[0] === "api" && args[1] === "repos/:owner/:repo/pulls/42") {
-        // Open until the review and the fix pass have both run; merged from then on.
-        return { stdout: JSON.stringify({ merged: invokeCount >= 2, locked: false, head: { sha: "deadbeef44" } }), exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "view") {
+        // Open through review #1 (invokeCount=1) and fix-pass (invokeCount=2 while running);
+        // merged once the fix-pass LLM has returned (invokeCount >= 2).
+        return invokeCount >= 2
+          ? { stdout: JSON.stringify({ state: "MERGED", merged: true }), exitCode: 0 }
+          : { stdout: JSON.stringify({ state: "OPEN", merged: false }), exitCode: 0 };
       }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") return { stdout: "", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
     });
     const invoke = vi.fn(async () => {
       invokeCount++;
-      return { stdout: approvedWithIssues, exitCode: 0, tokensUsed: 100 };
+      if (invokeCount === 1) return { stdout: reviewIssues, exitCode: 0, tokensUsed: 100 };
+      // Fix-pass LLM: after this returns, invokeCount=2, so pr view returns MERGED.
+      return { stdout: JSON.stringify({ fixed: ["Guarded null ref"] }), exitCode: 0, tokensUsed: 100 };
     });
 
     const out = await postPushReviewStep.run(
@@ -2827,7 +2833,177 @@ describe("postPushReviewStep", () => {
 
     expect(out.approved).toBe(true);
     expect(out.terminationReason).toBe("pr_merged");
+    expect(out.iterations).toBe(1);
+    expect(invoke).toHaveBeenCalledTimes(2); // reviewer + fix-pass
+  });
+
+  it("exits as pr_merged when the PR is merged between the fix-pass comment and the review submission", async () => {
+    // The merge race described in AII-561: PR is open through the fix-pass comment, then merged.
+    // The next assertPrWritable call inside submitPrReview detects MERGED and throws PrMergedError.
+    // Reviewer #2 runs (invokeCount=3), then submitPrReview fires assertPrWritable → pr_merged.
+    let invokeCount = 0;
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: " M src/example.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "feature-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/feature-branch\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tsrc/example.ts\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view") {
+        // OPEN through reviewer #1 and fix-pass; MERGED once reviewer #2 has run (invokeCount >= 3).
+        // submitPrReview's assertPrWritable fires after invokeCount reaches 3.
+        return invokeCount >= 3
+          ? { stdout: JSON.stringify({ state: "MERGED", merged: true }), exitCode: 0 }
+          : { stdout: JSON.stringify({ state: "OPEN", merged: false }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => {
+      invokeCount++;
+      if (invokeCount === 1) {
+        return {
+          stdout: JSON.stringify({
+            approved: false,
+            blocking_issues: [{ title: "Bug", problem: "Missing null check", required_fix: "Add null guard" }],
+            feedback: "found issues",
+          }),
+          exitCode: 0,
+          tokensUsed: 100,
+        };
+      }
+      if (invokeCount === 2) {
+        return { stdout: JSON.stringify({ fixed: ["Added null guard"] }), exitCode: 0, tokensUsed: 100 };
+      }
+      // Reviewer #2: would approve, but submitPrReview's assertPrWritable detects MERGED first.
+      return { stdout: JSON.stringify({ approved: true, blocking_issues: [], feedback: "lgtm" }), exitCode: 0, tokensUsed: 100 };
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("pr_merged");
     expect(out.iterations).toBe(2);
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledTimes(3); // reviewer #1, fix-pass, reviewer #2
+  });
+
+  it("surfaces genuine LLM failure when the PR merges while posting the failure comment (priorLlmFailure+PrMergedError)", async () => {
+    // Sequence: reviewer #1 finds issues → fix-pass → reviewer #2 fails (LLM error) →
+    // failure comment postPrComment → assertPrWritable detects MERGED → PrMergedError.
+    // priorLlmFailure is true, so the genuine failure (review_failed) surfaces, not pr_merged.
+    let invokeCount = 0;
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: " M src/example.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args.includes("--abbrev-ref")) return { stdout: "feature-branch\n", exitCode: 0 };
+      if (args[0] === "rev-parse") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "abc1234\trefs/heads/feature-branch\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tsrc/example.ts\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view") {
+        return invokeCount >= 3
+          ? { stdout: JSON.stringify({ state: "MERGED", merged: true }), exitCode: 0 }
+          : { stdout: JSON.stringify({ state: "OPEN", merged: false }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => {
+      invokeCount++;
+      if (invokeCount === 1) {
+        return {
+          stdout: JSON.stringify({
+            approved: false,
+            blocking_issues: [{ title: "Bug", problem: "Missing null check", required_fix: "Add null guard" }],
+            feedback: "found issues",
+          }),
+          exitCode: 0,
+          tokensUsed: 100,
+        };
+      }
+      if (invokeCount === 2) {
+        return { stdout: "", exitCode: 0, tokensUsed: 100 };
+      }
+      // Reviewer #2: LLM fails — sets priorLlmFailure=true.
+      return { stdout: "", exitCode: 1, tokensUsed: 0 };
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [], ghSpawn, gitSpawn },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    // Genuine failure must surface — not masked by the benign merge event.
+    expect(out.terminationReason).toBe("review_failed");
+    expect(out.approved).toBe(false);
+  });
+
+  it("rethrows original error when PR is open and locked by a person (lock handler falls through)", async () => {
+    // assertPrWritable is called in the lock handler after "issue is locked" is received.
+    // When the PR is open (locked by a human, not a merge), assertPrWritable returns normally
+    // and the original write error surfaces as a genuine failure.
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    let prCommentCalls = 0;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view") {
+        // PR is OPEN throughout — locked by a person, not by a merge.
+        return { stdout: JSON.stringify({ state: "OPEN", merged: false }), exitCode: 0 };
+      }
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        prCommentCalls++;
+        if (prCommentCalls === 1) return { stdout: "", exitCode: 0 }; // start-marker succeeds
+        // Approval comment: PR is locked by a human (not a merge).
+        return { stdout: "", stderr: "issue is locked", exitCode: 1 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const ctx = makeCtx(vi.fn(async () => ({ stdout: reviewerJson, exitCode: 0, tokensUsed: 100 })));
+    await expect(
+      postPushReviewStep.run(
+        ctx,
+        { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, reviewProviders: [], ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })) },
+        { report: vi.fn(async () => undefined) },
+      ),
+    ).rejects.toThrow("gh pr comment failed");
+  });
+
+  it("PrMergedError has the correct class shape", () => {
+    const err = new PrMergedError("42");
+    expect(err.code).toBe("PR_MERGED");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("PrMergedError");
+    expect(err.message).toContain("42");
+  });
+});
+
+describe("post-push-review structural invariants", () => {
+  const source = readFileSync("src/pipeline/steps/post-push-review.ts", "utf-8");
+
+  it("probeIfPrClosed does not appear in the step source", () => {
+    expect(source).not.toContain("probeIfPrClosed(");
+  });
+
+  it("isPrMerged does not appear in the step source", () => {
+    expect(source).not.toContain("isPrMerged(");
+  });
+
+  it("assertPrWritable appears at exactly 6 call sites (1 definition + 6 calls = 7 occurrences)", () => {
+    // 7 total occurrences of assertPrWritable(:
+    //   1 function definition
+    //   6 call sites: top-of-loop probe, postPrComment first-stmt, lock handler in postPrComment,
+    //                 submitPrReview first-stmt, step entry, before git push
+    const occurrences = (source.match(/assertPrWritable\(/g) ?? []).length;
+    expect(occurrences).toBe(7);
   });
 });

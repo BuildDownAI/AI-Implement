@@ -46,6 +46,8 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 
 `dependency-auth` sits deliberately before `install`: it fetches a read-only, installation-wide token and installs it as a git credential helper plus `COMPOSER_AUTH`, so the dependency install that follows can resolve private sibling repositories. Its inputs are also a worked example of a real constraint — the run's progress token is **not** passed through `inputs`, because inputs are persisted to the step log and surfaced through the admin API. The step reads that secret from `process.env` directly. Anything secret belongs in the environment, not in a step's inputs.
 
+**Benign terminals.** `post-push-review` recognises two exits that are not failures: `pr_merged` and `operator_cancelled`. Both resolve inside `assertPrWritable` (`src/pipeline/steps/post-push-review.ts`), which is called as the first statement of every write function (`postPrComment`, `submitPrReview`) and immediately before the fix-pass `git push`. A merged PR throws `PrMergedError`; a closed-and-not-merged PR throws `OperatorCancelledError`. The boundary catch at the end of the step returns `{ approved: true, terminationReason: "pr_merged" }` or rethrows `OperatorCancelledError` as `operator_cancelled`, whichever applies. One rule governs both: if a genuine LLM failure set `priorLlmFailure` before the benign event, the genuine failure surfaces instead — the benign event does not mask a real error.
+
 `feedback-loop` is where Claude actually runs — it drives the implement/review cycle up to `maxIterations`. Everything before it prepares the workspace; everything after it reacts to the result.
 
 Two consequences worth internalising:

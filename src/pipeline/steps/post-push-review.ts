@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { OperatorCancelledError } from "../operator-cancelled.js";
+import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { formatGitNameStatusSummary } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
@@ -644,24 +644,30 @@ function summarizeHeadChanges(gitSpawn: (args: string[]) => SpawnResult): string
 }
 
 /**
- * Proactively checks if the PR is closed-and-not-merged and throws OperatorCancelledError
- * if so. Called at step start and before any push to detect operator cancellation without
- * relying on the PR being locked (which is opt-in on GitHub).
+ * Guards a PR write: throws PrMergedError if the PR is merged, OperatorCancelledError
+ * if it is closed-and-not-merged, and returns normally when the PR is open.
+ * Fails open on transient API errors — a network blip must not cancel the run.
+ * Called as the first statement of postPrComment and submitPrReview, immediately before
+ * the git push, and once at step entry.
  */
-function probeIfPrClosed(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
+function assertPrWritable(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
   const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
-  if (prView.exitCode !== 0) return; // fail open — transient errors don't cancel the run
+  if (prView.exitCode !== 0) return; // fail open
   try {
     const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
+    if (prState.merged === true) {
+      throw new PrMergedError(prNumber);
+    }
     if (prState.state === "CLOSED" && !prState.merged) {
       throw new OperatorCancelledError(prNumber);
     }
   } catch (e) {
-    if (e instanceof OperatorCancelledError) throw e;
+    if (e instanceof PrMergedError || e instanceof OperatorCancelledError) throw e;
   }
 }
 
 function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
+  assertPrWritable(ghSpawn, prNumber);
   if (marker) {
     const list = ghSpawn([
       "api",
@@ -690,21 +696,12 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
 
   const created = ghSpawn(["pr", "comment", prNumber, "--body", body]);
   if (created.exitCode !== 0) {
-    // "issue is locked" is the GitHub error when a closed PR's timeline is locked.
-    // Verify the PR is closed-and-not-merged before treating as operator cancellation,
-    // rather than a transient error.
+    // "issue is locked" fires when a PR is merged and its conversation auto-locks.
+    // Re-assert writability: throws PrMergedError or OperatorCancelledError for the merge/close
+    // race, or returns normally when the PR is open (locked by a person) so the original
+    // error can surface as a genuine failure.
     if ((created.stderr ?? "").toLowerCase().includes("issue is locked")) {
-      const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
-      if (prView.exitCode === 0) {
-        try {
-          const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
-          if (prState.state === "CLOSED" && !prState.merged) {
-            throw new OperatorCancelledError(prNumber);
-          }
-        } catch (e) {
-          if (e instanceof OperatorCancelledError) throw e;
-        }
-      }
+      assertPrWritable(ghSpawn, prNumber);
     }
     throw new Error(`gh pr comment failed: ${resultMessage(created)}`);
   }
@@ -715,6 +712,7 @@ function submitPrReview(
   prNumber: string,
   body: string,
 ): void {
+  assertPrWritable(ghSpawn, prNumber);
   // The reviewing identity is the same GitHub App installation that authored
   // the PR, and GitHub rejects APPROVE/REQUEST_CHANGES on your own PR (422).
   // COMMENT is the only review event allowed on a self-authored PR; the
@@ -775,17 +773,6 @@ async function reportInvalidStructuredReview(
   );
 }
 
-function isPrMerged(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): boolean {
-  const result = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
-  if (result.exitCode !== 0) return false;
-  try {
-    const data = JSON.parse(result.stdout) as { merged?: boolean };
-    return data.merged === true;
-  } catch {
-    return false;
-  }
-}
-
 export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReviewOutputs> = {
   async run(context, inputs, reporter) {
     const ghSpawn = inputs.ghSpawn ?? makeDefaultGhSpawn(inputs.workspaceDir);
@@ -807,20 +794,13 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let forcePushed = 0;
     let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     const reviewHistory: ReviewFinding[] = [];
-    // Set to true when a real LLM failure (non-zero exit) occurs. An OperatorCancelledError
-    // thrown afterward while posting the failure comment is suppressed so the genuine
-    // failure conclusion surfaces rather than being masked by the benign operator cancel.
+    // Set to true when a real LLM failure (non-zero exit) occurs. A benign terminal
+    // (PrMergedError or OperatorCancelledError) thrown afterward while posting the failure
+    // comment is suppressed so the genuine failure conclusion surfaces rather than being masked.
     let priorLlmFailure = false;
 
     try {
-    probeIfPrClosed(ghSpawn, prNumber);
-    // A PR merged under the run before its first comment (a manual merge, or a defer that did not
-    // hold) must not fail on the locked conversation: the merged-only benign exit applies at step
-    // entry too, not only at the top of each iteration (review finding).
-    if (isPrMerged(ghSpawn, prNumber)) {
-      console.log(`[post-push-review] PR #${prNumber} was already merged at step entry — exiting cleanly`);
-      return { approved: true, iterations: 0, finalFeedback: "", forcePushedRevisions: 0, terminationReason: "pr_merged" };
-    }
+    assertPrWritable(ghSpawn, prNumber);
     postPrComment(
       ghSpawn,
       prNumber,
@@ -830,15 +810,8 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
     while (iteration < maxIterations && !approved) {
       iteration++;
-      // Probe at the top of every pass: an operator may close the PR between iterations that never push.
-      probeIfPrClosed(ghSpawn, prNumber);
-
-      if (isPrMerged(ghSpawn, prNumber)) {
-        console.log(`[post-push-review] PR #${prNumber} was merged under the run — exiting cleanly (a closed or locked PR is probeIfPrClosed's job)`);
-        approved = true;
-        terminationReason = "pr_merged";
-        break;
-      }
+      // Probe before the LLM call: a merge/close between iterations exits immediately rather than burning a full reviewer turn.
+      assertPrWritable(ghSpawn, prNumber);
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
@@ -1011,9 +984,6 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // A close that lands while the reviewer call is in flight must not become an approved or
 
       // fix-pass exit — the approved exit on a last iteration never pushes, so nothing else would catch it.
-
-      probeIfPrClosed(ghSpawn, prNumber);
-
 
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
       // external review check did not finish within the wait budget. Do not auto-approve
@@ -1188,7 +1158,7 @@ ${externalReviewFindingsBlock(externalFindings)}
       // A fix pass can run long enough to outlive the token minted by pushStep.
       // Re-vend at the actual write boundary; transient vending failures retain
       // the latest token already present in the environment and origin URL.
-      probeIfPrClosed(ghSpawn, prNumber);
+      assertPrWritable(ghSpawn, prNumber);
       await refreshCredentialsBeforePush(context, inputs);
       const expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
       const push = gitSpawn([
@@ -1223,6 +1193,20 @@ ${externalReviewFindingsBlock(externalFindings)}
         terminationReason = "operator_cancelled";
         console.warn(`[post-push-review] PR #${prNumber} was closed by operator — surfacing as OPERATOR_CANCELLED`);
         throw err;
+      }
+      if (err instanceof PrMergedError) {
+        if (priorLlmFailure) {
+          // A real LLM failure already set terminationReason — surface the genuine failure
+          // rather than masking it with the benign merge event.
+          console.warn(
+            `[post-push-review] PR #${prNumber} was merged while posting failure comment — ` +
+              `genuine failure surfaces as ${terminationReason}`,
+          );
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason };
+        }
+        terminationReason = "pr_merged";
+        console.warn(`[post-push-review] PR #${prNumber} was merged under the run — exiting as pr_merged`);
+        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged" };
       }
       throw err;
     }
