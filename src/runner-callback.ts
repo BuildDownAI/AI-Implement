@@ -406,15 +406,13 @@ export async function handleRunnerResult(
       const snapshot = getReviewFixDispatchSnapshot(claims.dispatchId);
       if (snapshot) {
         markReviewFindingsResolvedByIds(snapshot.repo, snapshot.prNumber, snapshot.findingIds);
-        // Review-fix dispatches intentionally do not re-stamp runner_approved: the runner changed
-        // the code and it needs re-review before auto-merge is safe (AII-460).
       } else {
         markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
-        // Conflict-resolution and comment-triggered gap-fills re-stamp the approval mark so the
-        // auto-merge gate restores eligibility (AII-460). The same CASE guard that protects the
-        // implementation row prevents the GHA monitor from overwriting this conclusion.
-        updateJobStatus(job.id, "completed", "runner_approved", job.prUrl!);
       }
+      // Every gap-fill success re-stamps runner_approved: the gap-fill's own post-push review
+      // approved the PR, so the updated code is already reviewed (AII-460). The CASE guard in
+      // updateJobStatus prevents the GHA monitor's later write from overwriting this conclusion.
+      updateJobStatus(job.id, "completed", "runner_approved", job.prUrl!);
     }
   }
 

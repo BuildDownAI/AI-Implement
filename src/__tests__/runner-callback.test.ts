@@ -869,7 +869,7 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(job?.conclusion).toBe("runner_approved");
   });
 
-  it("does NOT stamp runner_approved when review-fix gap-analysis succeeds (snapshot branch)", async () => {
+  it("stamps runner_approved when review-fix gap-analysis succeeds (snapshot branch)", async () => {
     reviewStore.upsertReviewFinding({
       repo: "org/repo",
       prNumber: 12,
@@ -906,11 +906,40 @@ describe("handleRunnerResult — gap-analysis", () => {
     });
 
     expect(res.status).toBe(200);
-    // Code changed → needs re-review before auto-merge is safe; approval mark must not be written.
+    // Gap-fill's own post-push review approved the PR, so the approval mark is re-stamped (AII-460).
     const job = log.getJobByDispatchId(dispatchId);
-    expect(job?.conclusion).not.toBe("runner_approved");
+    expect(job?.conclusion).toBe("runner_approved");
     // Findings scoped to the snapshot must still be resolved.
     expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+  });
+
+  it("does NOT stamp runner_approved when gap-analysis outcome is failure (REVIEW_UNAPPROVED)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        prUrl: "https://github.com/org/repo/pull/12",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobByDispatchId(dispatchId);
+    expect(job?.conclusion).not.toBe("runner_approved");
   });
 });
 

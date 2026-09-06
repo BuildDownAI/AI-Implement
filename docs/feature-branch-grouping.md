@@ -233,7 +233,7 @@ The in-flight check remains issue-scoped: if any implementation or gap-analysis 
 
 A PR whose run completed without the approval mark — including runs terminated by the stuck watchdog, the reaper, or a machine sweep, and runs that ended with `REVIEW_UNAPPROVED` or `MAX_TURNS_EXHAUSTED` — is **held**: it is never auto-merged, and a human must either close it or trigger a re-run. A PR with no run record at all — including any PR opened by a human directly into a grouping branch — is also held; human-opened PRs into grouping branches no longer auto-merge.
 
-**Gap-fill interactions with the approval mark:** A **conflict-resolution** or **comment-triggered** gap-fill run (`/ai-implement` comment, cascade self-heal rail) re-stamps `runner_approved` on success, restoring auto-merge eligibility after the conflict is resolved. A **review-fix** gap-fill run does not re-stamp the mark — the runner changed the code to address review findings, and the updated code must be re-reviewed before auto-merge is safe; the verdict returns 'hold' until a fresh implementation or conflict-resolution run completes.
+**Gap-fill interactions with the approval mark:** Every gap-fill success re-stamps `runner_approved`, because a successful gap-fill means the gap-fill's own post-push review approved the updated code. A gap-fill that ends `REVIEW_UNAPPROVED` leaves the latest row unapproved and the PR held until a subsequent run completes with approval.
 
 Recovery for a capped or unapproved child is tracked in [AII-263](https://linear.app/eudoxus/issue/AII-263/max-turns-capped-child-run-leaves-a-stalled-draft-pr-that-silently).
 

@@ -119,11 +119,12 @@ describe("getRunRecordMergeVerdict", () => {
     expect(log.getRunRecordMergeVerdict("AII-107", "https://github.com/o/r/pull/10")).toBe("hold");
   });
 
-  it("latest-row wins: hold when newer review-fix gap-analysis row (same pr_url) is not approved", () => {
+  it("latest-row wins: hold when newer gap-analysis row ended unapproved (REVIEW_UNAPPROVED leaves conclusion=success, no mark)", () => {
     // Older approved implementation row
     const old = log.appendLog({ issueId: "i6", issueIdentifier: "AII-105", executionMode: "github-actions", phase: "implementation" });
     log.updateJobStatus(old, "completed", "runner_approved", "https://github.com/o/r/pull/1");
-    // Newer gap-analysis row with same pr_url — simulates a review-fix completing without re-stamping approval
+    // Newer gap-analysis row with same pr_url — simulates a gap-fill ending REVIEW_UNAPPROVED:
+    // the GHA monitor writes completed/success, but the callback never stamped runner_approved.
     const newer = log.appendLog({ issueId: "i6", issueIdentifier: "AII-105", executionMode: "github-actions", phase: "gap-analysis" });
     log.updateJobStatus(newer, "completed", "success", "https://github.com/o/r/pull/1");
     expect(log.getRunRecordMergeVerdict("AII-105", "https://github.com/o/r/pull/1")).toBe("hold");
@@ -133,7 +134,7 @@ describe("getRunRecordMergeVerdict", () => {
     // Older approved implementation row
     const old = log.appendLog({ issueId: "i9", issueIdentifier: "AII-108", executionMode: "github-actions", phase: "implementation" });
     log.updateJobStatus(old, "completed", "runner_approved", "https://github.com/o/r/pull/1");
-    // Newer gap-analysis row with runner_approved — simulates conflict resolution re-stamping approval
+    // Newer gap-analysis row with runner_approved — every successful gap-fill re-stamps the mark (AII-460)
     const newer = log.appendLog({ issueId: "i9", issueIdentifier: "AII-108", executionMode: "github-actions", phase: "gap-analysis" });
     log.updateJobStatus(newer, "completed", "runner_approved", "https://github.com/o/r/pull/1");
     expect(log.getRunRecordMergeVerdict("AII-108", "https://github.com/o/r/pull/1")).toBe("approved");
