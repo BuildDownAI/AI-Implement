@@ -466,6 +466,39 @@ export async function findWorkflowRunId(
   return null;
 }
 
+export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 30_000, 25_000];
+
+/**
+ * Polls for a kg-refresh workflow run ID up to ~90 s after dispatch.
+ * Injectable findRunId and pollDelaysMs for testability.
+ */
+export async function pollForKgWorkflowRunId(opts: {
+  token: string;
+  owner: string;
+  repo: string;
+  workflowFile: string;
+  branch: string;
+  dispatchTime: Date;
+  pollDelaysMs?: readonly number[];
+  findRunId?: (
+    token: string, owner: string, repo: string, workflowFile: string, branch: string, dispatchedAfter: Date,
+  ) => Promise<number | null>;
+}): Promise<number | undefined> {
+  const {
+    token, owner, repo, workflowFile, branch, dispatchTime,
+    pollDelaysMs = KG_GHA_POLL_DELAYS_MS,
+    findRunId = findWorkflowRunId,
+  } = opts;
+  for (const delay of pollDelaysMs) {
+    await new Promise<void>((r) => setTimeout(r, delay));
+    try {
+      const runId = await findRunId(token, owner, repo, workflowFile, branch, dispatchTime);
+      if (runId) return runId;
+    } catch { /* non-fatal — keep polling */ }
+  }
+  return undefined;
+}
+
 export interface WorkflowRunStatus {
   status: "queued" | "in_progress" | "completed" | string;
   conclusion: "success" | "failure" | "cancelled" | "timed_out" | string | null;

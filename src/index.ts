@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -675,6 +675,25 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
       if (!owner || !repo) return null;
       const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
       return getWorkflowRunStatus(token, owner, repo, job.runId);
+    },
+    bindGhaRunId: async (job) => {
+      if (!config.kgSourceRepo) return null;
+      const kgRepo = parseKgSourceRepo(config.kgSourceRepo);
+      try {
+        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, kgRepo.owner);
+        const defaultBranch = (await getRepoDefaultBranch(ghToken, kgRepo.owner, kgRepo.repo)) ?? "main";
+        const dispatchTime = new Date(job.dispatchedAt - 30_000);
+        const runId = await findWorkflowRunId(ghToken, kgRepo.owner, kgRepo.repo, KG_REFRESH_WORKFLOW_FILE, defaultBranch, dispatchTime);
+        if (!runId) return null;
+        const bound = attachJobRunIdIfMissing(job.id, runId);
+        if (bound) {
+          console.log(`[reaper] kg-refresh job=${job.id} lazy-bound to GHA run ${runId}`);
+        }
+        return runId;
+      } catch (err) {
+        console.error(`[reaper] bindGhaRunId failed for job=${job.id}:`, err);
+        return null;
+      }
     },
   });
 
@@ -3072,6 +3091,7 @@ async function dispatchKgRefreshRun(
     });
     const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
     const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl });
+    const dispatchedAt = Date.now();
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
       signal: defaultFetchSignal(),
@@ -3095,17 +3115,20 @@ async function dispatchKgRefreshRun(
 
     console.log(`[kg-refresh] dispatched via GitHub Actions (dispatchId=${opts.dispatchId})`);
 
-    // Best-effort: find the workflow run ID for log linking. Mirror the issue-keyed
-    // post-dispatch pattern (30-second look-back window, non-fatal on failure).
-    const dispatchTime = new Date(Date.now() - 30_000);
-    let workflowRunId: number | undefined;
-    try {
-      const runId = await findWorkflowRunId(
-        ghToken, repo.owner, repo.repo, KG_REFRESH_WORKFLOW_FILE, defaultBranch, dispatchTime,
-      );
-      workflowRunId = runId ?? undefined;
-    } catch {
-      // Non-fatal — run ID can be left absent; the admin UI will show no logs link.
+    // Poll for the workflow run ID for up to ~90 s (5 rounds: 5+10+20+30+25 s).
+    // GitHub typically creates the run within seconds, but queue depth or API lag
+    // can delay it. The reaper will lazy-bind on its next sweep if polling exhausts.
+    const dispatchTime = new Date(dispatchedAt - 30_000);
+    const workflowRunId = await pollForKgWorkflowRunId({
+      token: ghToken,
+      owner: repo.owner,
+      repo: repo.repo,
+      workflowFile: KG_REFRESH_WORKFLOW_FILE,
+      branch: defaultBranch,
+      dispatchTime,
+    });
+    if (!workflowRunId) {
+      console.warn(`[kg-refresh] run ID not resolved within ~90 s of dispatch (dispatchId=${opts.dispatchId}) — reaper will lazy-bind on next sweep`);
     }
 
     const logsUrl = workflowRunId

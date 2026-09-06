@@ -1285,6 +1285,108 @@ describe("kg-refresh", () => {
       expect(s.stage).toBe("idle");
     });
 
+    // ---- AII-551: late-callback handling ----------------------------------------
+
+    it("late callback on closed (failed) row updates lastRefresh with runner outcome", async () => {
+      const persistLastRefresh = vi.fn();
+      buildDispatch({ persistLastRefresh });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      // Simulate the reaper closing the run (onMachineLost → stage="failed")
+      handle.onMachineLost();
+      await waitDone();
+      expect((await handle.status()).stage).toBe("failed");
+      persistLastRefresh.mockClear();
+
+      // Late runner callback arrives after the reaper has closed the row
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(persistLastRefresh).toHaveBeenCalledOnce();
+      const outcome = persistLastRefresh.mock.calls[0][0] as RefreshOutcome;
+      expect(outcome.ok).toBe(true);
+      expect(outcome.detail).toContain("late callback");
+    });
+
+    it("late callback logs the late-callback message", async () => {
+      const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        "[kg-refresh] late callback after reaper close — updating lastRefresh",
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("late callback with failure outcome marks lastRefresh as not ok", async () => {
+      const persistLastRefresh = vi.fn();
+      buildDispatch({ persistLastRefresh });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      persistLastRefresh.mockClear();
+
+      handle.onRunnerComplete("failure", { failureCode: "TIMEOUT", failureReason: "timed out" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(persistLastRefresh).toHaveBeenCalledOnce();
+      const outcome = persistLastRefresh.mock.calls[0][0] as RefreshOutcome;
+      expect(outcome.ok).toBe(false);
+      expect(outcome.detail).toContain("TIMEOUT");
+    });
+
+    it("late callback with KG_SNAPSHOT_STALE marks lastRefresh as ok", async () => {
+      const persistLastRefresh = vi.fn();
+      buildDispatch({ persistLastRefresh });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      persistLastRefresh.mockClear();
+
+      handle.onRunnerComplete("failure", { failureCode: "KG_SNAPSHOT_STALE" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(persistLastRefresh).toHaveBeenCalledOnce();
+      const outcome = persistLastRefresh.mock.calls[0][0] as RefreshOutcome;
+      expect(outcome.ok).toBe(true);
+    });
+
+    it("late callback does not fire onOutcome", async () => {
+      const onOutcome = vi.fn();
+      buildDispatch({ onOutcome });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      onOutcome.mockClear();
+
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(onOutcome).not.toHaveBeenCalled();
+    });
+
+    it("late callback is a no-op when stage is idle (not failed/reverted)", async () => {
+      const persistLastRefresh = vi.fn();
+      buildDispatch({ persistLastRefresh });
+      // No trigger() — stage stays idle
+      expect((await handle.status()).stage).toBe("idle");
+
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(persistLastRefresh).not.toHaveBeenCalled();
+    });
+
     // ---- AII-548: onMachineLost detail wording ------------------------------------
 
     it("onMachineLost uses provided detail as lastRefresh.detail instead of generic string", async () => {

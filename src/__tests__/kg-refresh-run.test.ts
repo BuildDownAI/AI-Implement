@@ -1610,6 +1610,95 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
   });
 });
 
+// ── GHA dispatch: run ID polling (pollForKgWorkflowRunId) ─────────────────────
+// AII-551: verifies the polling loop binds the run ID on a delayed appearance.
+
+import { pollForKgWorkflowRunId } from "../github.js";
+
+describe("GHA kg-refresh dispatch — run ID polling (pollForKgWorkflowRunId)", () => {
+  it("binds the run ID that appears on the third poll", async () => {
+    let calls = 0;
+    const findRunId = vi.fn(async () => {
+      calls++;
+      if (calls < 3) return null;
+      return 44444;
+    });
+
+    const runId = await pollForKgWorkflowRunId({
+      token: "tok",
+      owner: "org",
+      repo: "kg-repo",
+      workflowFile: "kg-refresh.yml",
+      branch: "main",
+      dispatchTime: new Date(),
+      pollDelaysMs: [0, 0, 0, 0, 0],
+      findRunId,
+    });
+
+    expect(runId).toBe(44444);
+    expect(findRunId).toHaveBeenCalledTimes(3);
+  });
+
+  it("returns undefined when run ID never appears", async () => {
+    const findRunId = vi.fn(async () => null);
+
+    const runId = await pollForKgWorkflowRunId({
+      token: "tok",
+      owner: "org",
+      repo: "kg-repo",
+      workflowFile: "kg-refresh.yml",
+      branch: "main",
+      dispatchTime: new Date(),
+      pollDelaysMs: [0, 0, 0],
+      findRunId,
+    });
+
+    expect(runId).toBeUndefined();
+    expect(findRunId).toHaveBeenCalledTimes(3);
+  });
+
+  it("returns the run ID found on the first poll without further calls", async () => {
+    const findRunId = vi.fn(async () => 11111);
+
+    const runId = await pollForKgWorkflowRunId({
+      token: "tok",
+      owner: "org",
+      repo: "kg-repo",
+      workflowFile: "kg-refresh.yml",
+      branch: "main",
+      dispatchTime: new Date(),
+      pollDelaysMs: [0, 0, 0],
+      findRunId,
+    });
+
+    expect(runId).toBe(11111);
+    expect(findRunId).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a thrown findRunId error as null and continues polling", async () => {
+    let calls = 0;
+    const findRunId = vi.fn(async () => {
+      calls++;
+      if (calls === 1) throw new Error("GitHub API error");
+      return calls >= 3 ? 55555 : null;
+    });
+
+    const runId = await pollForKgWorkflowRunId({
+      token: "tok",
+      owner: "org",
+      repo: "kg-repo",
+      workflowFile: "kg-refresh.yml",
+      branch: "main",
+      dispatchTime: new Date(),
+      pollDelaysMs: [0, 0, 0],
+      findRunId,
+    });
+
+    expect(runId).toBe(55555);
+    expect(findRunId).toHaveBeenCalledTimes(3);
+  });
+});
+
 // ── Real-artifact entrypoint smoke test ───────────────────────────────────────
 //
 // Two-level testing strategy for the entrypoint→image handoff (AII-534):

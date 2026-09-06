@@ -33,6 +33,12 @@ export interface ReaperHelpers {
   failKgRefreshMachine?: (job: Job, opts?: { failureCode?: string; detail?: string }) => void;
   /** Called during GHA kg-refresh reconciliation to check the current workflow run status. */
   checkGhaRunStatus?: (job: Job) => Promise<WorkflowRunStatus | null>;
+  /**
+   * Called in the GHA lazy-bind path when a kg-refresh row has no run_id after the
+   * grace window. Looks up a matching workflow run and persists it via
+   * attachJobRunIdIfMissing. Returns the run id on success, null if not found.
+   */
+  bindGhaRunId?: (job: Job) => Promise<number | null>;
 }
 
 export interface DestroyContext {
@@ -91,8 +97,24 @@ async function reconcileGhaKgRefreshJob(
   const ageSeconds = Math.floor((Date.now() - job.dispatchedAt) / 1000);
 
   if (job.runId == null) {
-    // No run_id yet — GHA dispatch hasn't bound. Within the grace window: wait; outside: dispatch_lost.
+    // No run_id yet — GHA dispatch hasn't bound. Within the grace window: wait.
     if (Date.now() - job.dispatchedAt <= GHA_DISPATCH_GRACE_MS) return;
+
+    // Lazy-bind: try to find the workflow run before declaring dispatch_lost.
+    // Handles the race where the post-dispatch polling window exhausted before
+    // GitHub created the run. Only attempted outside dry-run to avoid writes.
+    if (!config.reaperDryRun && helpers.bindGhaRunId) {
+      let boundRunId: number | null = null;
+      try {
+        boundRunId = await helpers.bindGhaRunId(job);
+      } catch {
+        // treat as not found — fall through to dispatch_lost
+      }
+      if (boundRunId !== null) {
+        // Run found and bound — leave the job alive; next sweep checks its status.
+        return;
+      }
+    }
 
     console.log(
       `[reaper] rule=kg-refresh-gha-dispatch-lost job=${job.id} age_s=${ageSeconds} dry_run=${config.reaperDryRun}`,
@@ -106,7 +128,10 @@ async function reconcileGhaKgRefreshJob(
       dryRun: config.reaperDryRun,
     });
     if (!config.reaperDryRun) {
-      helpers.failKgRefreshMachine?.(job, { failureCode: "dispatch_lost" });
+      helpers.failKgRefreshMachine?.(job, {
+        failureCode: "dispatch_lost",
+        detail: "no workflow run appeared within 5 min of dispatch",
+      });
     }
     return;
   }
