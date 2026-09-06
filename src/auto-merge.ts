@@ -88,12 +88,14 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
         console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: changes requested`);
         continue;
       }
+      // If the PR title format ever changes (e.g. a leading emoji or prefix is added), non-matching
+      // PRs will fall silently into the "no issue key" hold bucket rather than raising a visible error.
       const issueKeyMatch = pr.title.match(/^([A-Z][A-Z0-9]*-\d+):/);
       if (!issueKeyMatch) {
         console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: no issue key in title`);
         continue;
       }
-      const verdict = getRunRecordMergeVerdict(issueKeyMatch[1]);
+      const verdict = getRunRecordMergeVerdict(issueKeyMatch[1], pr.url);
       if (verdict === "in_flight") {
         console.log(`[auto-merge] Deferring merge of PR #${pr.number} -> ${pr.base}: run still in flight`);
         continue;

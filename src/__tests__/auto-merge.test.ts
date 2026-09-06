@@ -79,7 +79,7 @@ const deps = () => ({
 
 function pr(overrides: Record<string, unknown> = {}) {
   return {
-    number: 5, url: "https://gh/pr/5", base: "ai-implement/feature/aii-200-feat",
+    number: 5, url: "https://github.com/o/r/pull/5", base: "ai-implement/feature/aii-200-feat",
     head: "ai-implement/aii-300-add-thing", headSha: "sha5", draft: false,
     title: "AII-300: Add thing",
     ...overrides,
@@ -168,8 +168,8 @@ describe("runAutoMerges", () => {
     log.updateJobStatus(id2, "completed", "runner_approved", "https://github.com/o/r/pull/2");
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([
-      pr({ number: 1, headSha: "sha1", base: "ai-implement/feature/group-a", title: "AII-1: thing" }),
-      pr({ number: 2, headSha: "sha2", base: "ai-implement/feature/group-b", title: "AII-2: other" }),
+      pr({ number: 1, url: "https://github.com/o/r/pull/1", headSha: "sha1", base: "ai-implement/feature/group-a", title: "AII-1: thing" }),
+      pr({ number: 2, url: "https://github.com/o/r/pull/2", headSha: "sha2", base: "ai-implement/feature/group-b", title: "AII-2: other" }),
     ]);
     vi.mocked(mergePullRequest)
       .mockRejectedValueOnce(new Error("boom"))
@@ -319,7 +319,7 @@ describe("cap-exhausted notify-once (AII-277 Finding 4)", () => {
     const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
     log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/77");
 
-    vi.mocked(listOpenPullRequests).mockResolvedValue([pr({ number: 77, title: "AII-300: Add thing" })] as never);
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr({ number: 77, url: "https://github.com/o/r/pull/77", title: "AII-300: Add thing" })] as never);
     vi.mocked(mergePullRequest).mockResolvedValue("conflict" as never);
     vi.mocked(hasPendingConflictResolution).mockReturnValue(false);
     vi.mocked(countConflictAttempts).mockReturnValue(autoMerge.MAX_CONFLICT_RESOLUTION_ATTEMPTS);
@@ -386,6 +386,21 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
     logSpy.mockRestore();
   });
 
+  it("holds a second PR sharing the same issue key when the approval was for a different PR URL", async () => {
+    // PR #5 (AII-300) was approved — a later PR #10 with the same title key must not inherit that approval
+    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+
+    vi.mocked(listOpenPullRequests).mockResolvedValue([
+      pr({ number: 10, url: "https://github.com/o/r/pull/10", title: "AII-300: Add thing" }),
+    ]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    await autoMerge.runAutoMerges([mapping()], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes("no approval mark"))).toBe(true);
+    logSpy.mockRestore();
+  });
+
   it("defers the in-flight PR and still merges the approved sibling", async () => {
     const id300 = log.appendLog({ issueId: "i300", issueIdentifier: "AII-300", executionMode: "github-actions" });
     dedup.getDb().prepare("UPDATE dispatch_log SET status = 'running' WHERE id = ?").run(id300);
@@ -394,7 +409,7 @@ describe("approval gate (AII-460) — run record verdict replaces hasInFlightJob
 
     vi.mocked(listOpenPullRequests).mockResolvedValue([
       pr({ number: 5, headSha: "sha5", base: "ai-implement/feature/aii-200-feat", title: "AII-300: Add thing" }),
-      pr({ number: 6, headSha: "sha6", base: "ai-implement/feature/aii-201-feat", title: "AII-301: Other thing" }),
+      pr({ number: 6, url: "https://github.com/o/r/pull/6", headSha: "sha6", base: "ai-implement/feature/aii-201-feat", title: "AII-301: Other thing" }),
     ]);
     await autoMerge.runGroupingBranchAutoMerge([mapping()], deps());
     expect(vi.mocked(mergePullRequest)).toHaveBeenCalledTimes(1);

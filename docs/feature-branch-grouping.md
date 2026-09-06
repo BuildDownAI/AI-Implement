@@ -227,7 +227,15 @@ Idempotency is handled differently per path:
 
 ## 8. Child-PR merge ordering guarantee
 
-A child PR is auto-merged only after its runner's result callback has written an **approval mark** (`runner_approved` conclusion) on the run record — the auto-merge gate reads `getRunRecordMergeVerdict` keyed on the issue identifier, not the PR URL, so it is evaluated from the moment the PR exists. A PR whose run record is still in `dispatched` or `running` state is **deferred** — the gate continues to the next PR and retries on the following poll tick. A PR whose run completed without the approval mark — including runs terminated by the stuck watchdog, the reaper, or a machine sweep, and runs that ended with `REVIEW_UNAPPROVED` or `MAX_TURNS_EXHAUSTED` — is **held**: it is never auto-merged, and a human must either close it or trigger a re-run. A PR with no run record at all — including any PR opened by a human directly into a grouping branch — is also held; human-opened PRs into grouping branches no longer auto-merge. Recovery for a capped or unapproved child is tracked in [AII-263](https://linear.app/eudoxus/issue/AII-263/max-turns-capped-child-run-leaves-a-stalled-draft-pr-that-silently).
+A child PR is auto-merged only after its runner's result callback has written an **approval mark** (`runner_approved` conclusion) on the run record — the auto-merge gate reads `getRunRecordMergeVerdict` keyed on **both the issue identifier and the PR URL**, so only the specific run record that produced that PR can grant approval. A stale `runner_approved` row from a prior run on the same issue (e.g. a superseded PR) does not carry over to a newly opened PR with the same title key.
+
+The in-flight check remains issue-scoped: if any implementation or gap-analysis run for the issue is still dispatched or running, the gate defers the merge and retries on the next poll tick. The approval check is PR-URL-scoped: the latest row matching both the issue identifier and the PR URL must be `completed/runner_approved`.
+
+A PR whose run completed without the approval mark — including runs terminated by the stuck watchdog, the reaper, or a machine sweep, and runs that ended with `REVIEW_UNAPPROVED` or `MAX_TURNS_EXHAUSTED` — is **held**: it is never auto-merged, and a human must either close it or trigger a re-run. A PR with no run record at all — including any PR opened by a human directly into a grouping branch — is also held; human-opened PRs into grouping branches no longer auto-merge.
+
+**Gap-fill interactions with the approval mark:** A **conflict-resolution** or **comment-triggered** gap-fill run (`/ai-implement` comment, cascade self-heal rail) re-stamps `runner_approved` on success, restoring auto-merge eligibility after the conflict is resolved. A **review-fix** gap-fill run does not re-stamp the mark — the runner changed the code to address review findings, and the updated code must be re-reviewed before auto-merge is safe; the verdict returns 'hold' until a fresh implementation or conflict-resolution run completes.
+
+Recovery for a capped or unapproved child is tracked in [AII-263](https://linear.app/eudoxus/issue/AII-263/max-turns-capped-child-run-leaves-a-stalled-draft-pr-that-silently).
 
 ---
 

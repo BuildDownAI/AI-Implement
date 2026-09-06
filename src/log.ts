@@ -222,17 +222,22 @@ export function getClaimedRunIds(): Set<number> {
 }
 
 /**
- * Returns the merge verdict for a child PR based on the run record for the given issue identifier.
- * Queries implementation and gap-analysis phase rows only (phase filter excludes planning and kg-refresh).
+ * Returns the merge verdict for a child PR based on the run record for the given issue identifier
+ * and PR URL.
  *
- * - "in_flight": any such row has status 'dispatched' or 'running' — defer the merge.
- * - "approved": the latest such row is completed with conclusion 'runner_approved' — safe to merge.
- * - "hold": no row exists, or the latest row is not runner_approved — hold for a human or re-run.
+ * - "in_flight": any implementation/gap-analysis row for the issue is dispatched or running — defer.
+ * - "approved": the latest row matching BOTH issue_identifier AND pr_url is completed/runner_approved.
+ * - "hold": no matching row, or the latest matching row lacks the approval mark.
  *
- * Fail-closed by design: a row terminalized by the stuck watchdog, reaper, or machine sweep
- * never carries runner_approved and therefore never auto-merges (AII-460).
+ * The in-flight check is intentionally issue-scoped (not PR-URL-scoped): any in-flight run for the
+ * issue should defer the merge, because it might supersede the current row. The approval check is
+ * PR-URL-scoped so that a stale approval from a prior run on the same issue does not carry over to
+ * a new PR opened with the same title key (AII-460).
+ *
+ * Fail-closed by design: a row terminalized by the stuck watchdog, reaper, or machine sweep never
+ * carries runner_approved and therefore never auto-merges.
  */
-export function getRunRecordMergeVerdict(issueIdentifier: string): "in_flight" | "approved" | "hold" {
+export function getRunRecordMergeVerdict(issueIdentifier: string, prUrl: string): "in_flight" | "approved" | "hold" {
   const inFlight = getDb()
     .prepare(
       "SELECT COUNT(*) as count FROM dispatch_log WHERE issue_identifier = ? AND phase IN ('implementation', 'gap-analysis') AND status IN ('dispatched', 'running')",
@@ -241,9 +246,9 @@ export function getRunRecordMergeVerdict(issueIdentifier: string): "in_flight" |
   if (inFlight.count > 0) return "in_flight";
   const latest = getDb()
     .prepare(
-      "SELECT status, conclusion FROM dispatch_log WHERE issue_identifier = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1",
+      "SELECT status, conclusion FROM dispatch_log WHERE issue_identifier = ? AND pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1",
     )
-    .get(issueIdentifier) as { status: string; conclusion: string | null } | undefined;
+    .get(issueIdentifier, prUrl) as { status: string; conclusion: string | null } | undefined;
   if (!latest) return "hold";
   if (latest.status === "completed" && latest.conclusion === "runner_approved") return "approved";
   return "hold";
