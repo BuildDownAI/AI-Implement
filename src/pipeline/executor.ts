@@ -133,8 +133,9 @@ export class ClaudeCliExecutor implements LLMExecutor {
       let settled = false;
 
       proc.stdin.on("error", (err) => {
-        // EPIPE here means the child exited before consuming the prompt. Mark
-        // settled so the close handler doesn't log a phantom success summary.
+        // EPIPE means the child exited before consuming the prompt — let the
+        // close event settle the promise with the child's actual exit code.
+        if ((err as NodeJS.ErrnoException).code === "EPIPE") return;
         settled = true;
         try {
           restoreProtectedOrigin();

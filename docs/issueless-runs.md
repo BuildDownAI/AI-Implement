@@ -28,7 +28,7 @@ flowchart TD
     B --> C{"snapshot SHA\nup to date?"}
     C -->|"newer snapshot in source repo"| H["local staging rail\nfetch → stage → swap → verify"]
     C -->|"ingest-needed"| D["mintRunToken phase=kg-refresh\nappendLog issueId=kg-refresh"]
-    D --> E["GHA / Fly Machine /\nlocal Docker\nrunConfig + runToken"]
+    D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
     E --> F["runner pipeline\nclone → kg-tracker-data\n→ feedback-loop\n→ kg-snapshot-push"]
     F --> G["POST /api/runner/result\nphase=kg-refresh"]
     G --> I["onRunnerComplete()\nverify snapshot commit"]
@@ -61,17 +61,41 @@ What is **absent** vs a normal implementation run:
 - No `profiles`, `planningContext`, `groupingParent`, `dependencyTokenScope`
 - No publication token (there is no target repo to push a PR to)
 
-The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable in all three execution modes. The dispatch path is `dispatchKgRefreshRun()` in `src/index.ts`, which is wired into `makeKgRefresh()` as `input.dispatchRun`.
+The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on both Fly Machines and local Docker. The dispatch path is `dispatchKgRefreshRun()` in `src/index.ts` (~line 3019), which is wired into `makeKgRefresh()` as `input.dispatchRun`.
 
 **Callback-config guard (422):** The guard at `src/kg-refresh.ts:547` fires *synchronously* inside `trigger()` before any dispatch attempt. If `input.dispatchRun` is defined but `RUNNER_CALLBACK_BASE_URL` or `RUNNER_TOKEN_SECRET` is missing, it returns HTTP 422 (`callback-unconfigured`) immediately — dispatching without a callback URL would stall the refresh with no way to report completion.
 
-**Execution backend selection** (evaluated inside `dispatchKgRefreshRun()` via `resolveExecutionPath`):
-- **GHA:** global runner mode is `gha`. Dispatches `workflow_dispatch` on `claude-kg-refresh.yml` in the KG source repo. The KG source repo must have that workflow file and the four runner secrets (`ANTHROPIC_API_KEY`, `RUNNER_CALLBACK_URL`, `RUN_TOKEN`, `RUN_PROGRESS_TOKEN`) — a one-time manual step.
-- **Fly Machines:** `FLY_SESSIONS_TOKEN` + `FLY_SESSIONS_APP` configured; the per-type default — `fly-machines` is selected when no global mode override is in effect.
-- **Local Docker:** `LOCAL_RUNNER_IMAGE` configured; selected when global runner mode is `local`.
-- **None configured** → `dispatchKgRefreshRun()` throws. By this point `trigger()` has already returned 202; the throw is caught by the async IIFE catch block in `src/kg-refresh.ts`, which sets `stage = "failed"` and fires `onOutcome("failure", ...)`.
+**Execution backend selection** (evaluated inside `dispatchKgRefreshRun()`):
 
-**GHA dispatch result** (no machine nonce): `dispatchWorkflow` returns a 204 with no run ID. `findWorkflowRunId` polls the runs list to attach a run ID, which `updateJobRunId` records and promotes the row to `running`. A 422 from `dispatchWorkflow` likely means the KG source repo hasn't synced `claude-kg-refresh.yml` yet.
+`dispatchKgRefreshRun()` calls `resolveExecutionPath(getRunnerMode().mode, "github-actions")` to determine the backend. The `"github-actions"` second argument is the kg-refresh-specific default: on a GHA-primary orchestrator running with `runnerMode = "default"`, this produces `"github-actions"`. The selector honours the global runner mode override before choosing a path:
+
+| Global runner mode | Resolved path |
+|---|---|
+| `default` | `github-actions` (kg-refresh default) |
+| `gha` | `github-actions` |
+| `fly` | `fly-machines` (requires `FLY_SESSIONS_TOKEN` + `FLY_SESSIONS_APP`) |
+| `local` | `local-docker` (requires `LOCAL_RUNNER_IMAGE`) |
+| `shadow` | collapses to `github-actions` — two concurrent ingest runs would race to push the same snapshot commit |
+
+**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-kg-refresh.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config` and `run_token`. If the workflow file is absent, the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message naming the missing file and the sync instruction. After a successful dispatch, `findWorkflowRunId()` is attempted (30-second look-back, best-effort) and the resulting run ID is stored on the `dispatch_log` row via `updateJobRunId()`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs.
+
+**Fly Machines backend:** unchanged from the original implementation. Creates a session machine with `phase: "kg-refresh"`. Returns `machineId + machineNonce`.
+
+**Local Docker backend:** starts a local container via `startLocalRunnerContainer()`. Returns `machineNonce` only.
+
+If the resolved path requires a backend that is not configured (e.g. `fly-machines` but no sessions app), `dispatchKgRefreshRun()` throws immediately. The throw is caught by the async IIFE catch block in `trigger()`, which sets `stage = "failed"` and fires `onOutcome("failure", ...)`.
+
+The `claude-kg-refresh.yml` workflow lives in `workflows/` and must be added to the KG source repo before GHA dispatch can succeed. Unlike `claude-implement.yml`, it is not automatically synced — it is a one-time manual step per KG source repo.
+
+**The KG source repo also needs the runner secrets.** It is not an onboarded project mapping, so nothing seeds them; a fresh KG repo has zero secrets and a dispatched run fails at auth even though the `workflow_dispatch` itself succeeds. Set these once on the KG source repo (mirror the values the orchestrator's target repos use):
+
+| Secret | Purpose |
+|---|---|
+| `AI_IMPLEMENT_APP_ID` | GitHub App numeric ID |
+| `AI_IMPLEMENT_PRIVATE_KEY` | GitHub App PEM private key |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code OAuth token (preferred) — or `ANTHROPIC_API_KEY` |
+
+Optional variables: `AI_IMPLEMENT_RUNNER_IMAGE`, `AI_IMPLEMENT_RUNNER_LABEL`. Verify with `gh secret list --repo <owner>/<kg-repo>` (names only). Observed live 2026-09-05: the workflow file was added and dispatch would have succeeded, but the repo carried no secrets.
 
 ---
 
@@ -85,17 +109,17 @@ The `dispatch_log` row (schema in `src/log.ts`, `initLogTable`) written by `appe
 | `issue_identifier` | `null` | No tracker issue |
 | `issue_title` | `null` | |
 | `team_key` | `null` | No ticketing mapping |
-| `repo` | `config.kgSourceRepo` | The KG source repo (`owner/repo`); always set for dispatched rows (the guard at the top of `dispatchKgRefreshRun` throws when absent) |
+| `repo` | KG source repo (`owner/repo`) | Populated from `KG_SOURCE_REPO`; required by `handleDestroySession` to cancel a GHA-backed run |
 | `phase` | `"kg-refresh"` | Run-kind tag, drives observability and routing |
-| `execution_mode` | `"fly-machines"`, `"local-docker"`, or `"github-actions"` | |
-| `machine_id` | Fly machine ID | null for local Docker and GHA |
-| `machine_nonce` | Generated | null for GHA; cleared on terminal outcome by `updateJobStatus` |
-| `run_id` | GHA workflow run ID | null for Fly/local; set via `updateJobRunId`, promotes status to `running` |
+| `execution_mode` | `"fly-machines"`, `"local-docker"`, or `"github-actions"` | Resolved from global runner mode at dispatch time |
+| `machine_id` | Fly machine ID | null for GHA and local Docker |
+| `machine_nonce` | Generated for Fly/local | null for GHA; `updateJobStatus` clears it on terminal outcome |
+| `run_id` | GHA workflow run ID | Set via `updateJobRunId()` when `findWorkflowRunId` succeeds; null for Fly/local |
 | `pr_url` | Fly machine URL or GHA run URL | Stored via `updateJobPrUrl(jobId, logsUrl)` on dispatch; used as the logs link |
 
 The row lifecycle:
 1. Inserted with `status = "dispatched"` when the runner is launched
-2. Updated to `status = "running"` when a progress callback arrives (if configured)
+2. For GHA: updated to `status = "running"` immediately when a `run_id` is found by `findWorkflowRunId()`; for Fly/local, updated to `status = "running"` when a progress callback arrives (if configured)
 3. Closed to `"completed"`, `"failed"`, or `"timed_out"` by `closeJobLog()` on every terminal outcome
 
 `machine_nonce` being cleared on terminal outcome is load-bearing: the row-eviction logic in `appendLog()` only prunes rows where `machine_nonce IS NULL`, so an in-flight row is never evicted while the runner holds its nonce.
@@ -335,8 +359,10 @@ extraEnv.RUN_PROGRESS_TOKEN = progressToken;
 
 Without the progress token, vending endpoints return 403 and dependent pipeline steps skip silently — the same degraded state the current kg-refresh dispatch exhibits for its kg-push-token and kg-tracker-data steps.
 
-**5. Write a dispatch function for Fly / local Docker**
-Follows the pattern of `dispatchKgRefreshRun()` in `src/index.ts`. Passes `AI_IMPLEMENT_RUN_CONFIG` (the base64-encoded `RunConfigV1`) in `extraEnv`. Returns `{ machineId?, machineNonce, logsUrl? }`.
+**5. Write a dispatch function with all three backends**
+Follows the pattern of `dispatchKgRefreshRun()` in `src/index.ts`. Call `resolveExecutionPath(getRunnerMode().mode, <defaultMode>)` to select the backend. Choose `<defaultMode>` based on what is "universally available" for the run kind (`"github-actions"` is the safest default). Passes `AI_IMPLEMENT_RUN_CONFIG` (the base64-encoded `RunConfigV1`) in `extraEnv` for Fly/local. For GHA, passes `run_config` + `run_token` as workflow_dispatch inputs. Returns `{ machineId?, machineNonce?, logsUrl?, workflowRunId? }` — `machineNonce` is present only for Fly/local, `workflowRunId` only for GHA.
+
+If a GHA backend is needed, create a dedicated `workflows/<your-kind>.yml` workflow (see `workflows/claude-kg-refresh.yml` as the reference). Unlike `claude-implement.yml`, issueless run kind workflows are not auto-synced and must be added to the target repo manually.
 
 **6. Record a `dispatch_log` row**
 Call `appendLog()` from `src/log.ts` with:

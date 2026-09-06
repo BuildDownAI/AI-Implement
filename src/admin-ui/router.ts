@@ -1,7 +1,14 @@
 export const routerJs = `
 (function () {
+  window.failedPages = {};
+  window.markPageFailed = function (key, err) { window.failedPages[key] = err; };
+
   const inits = {};
-  window.registerPage = function (key, fn) { inits[key] = fn; };
+  window.registerPage = function (key, fn) {
+    inits[key] = function () {
+      try { fn(); } catch (e) { console.error('[admin-ui] page ' + key + ' init failed', e); }
+    };
+  };
 
   function show(route) {
     document.querySelectorAll('[data-page]').forEach(el => {
@@ -10,6 +17,11 @@ export const routerJs = `
     document.querySelectorAll('.nav-item').forEach(el => {
       el.classList.toggle('active', el.getAttribute('data-route') === route);
     });
+    if (window.failedPages[route]) {
+      var section = document.querySelector('[data-page="' + route + '"]');
+      if (section) section.innerHTML = '<div class="page-body"><p style="color:var(--color-danger,red)">Page failed to load. Check the browser console for details.</p></div>';
+      return;
+    }
     if (inits[route]) { inits[route](); inits[route] = null; /* once */ }
   }
 

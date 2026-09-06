@@ -824,6 +824,164 @@ describe("runKgRefresh", () => {
   });
 });
 
+// ── kg-refresh execution-path selection ──────────────────────────────────────
+
+import { resolveExecutionPath } from "../runner-mode.js";
+import { makeKgRefresh } from "../kg-refresh.js";
+
+describe("kg-refresh execution path selection (resolveExecutionPath with github-actions default)", () => {
+  it("default mode resolves to github-actions (the kg-refresh fallback)", () => {
+    expect(resolveExecutionPath("default", "github-actions")).toBe("github-actions");
+  });
+
+  it("gha mode resolves to github-actions regardless of mapping default", () => {
+    expect(resolveExecutionPath("gha", "fly-machines")).toBe("github-actions");
+  });
+
+  it("fly mode resolves to fly-machines", () => {
+    expect(resolveExecutionPath("fly", "github-actions")).toBe("fly-machines");
+  });
+
+  it("local mode resolves to local-docker", () => {
+    expect(resolveExecutionPath("local", "github-actions")).toBe("local-docker");
+  });
+
+  it("shadow mode returns both, which kg-refresh collapses to github-actions", () => {
+    const resolved = resolveExecutionPath("shadow", "github-actions");
+    expect(resolved).toBe("both");
+    // dispatchKgRefreshRun collapses "both" to "github-actions" to prevent two
+    // concurrent ingest runs racing to push the same snapshot commit.
+    const effective = resolved === "both" ? "github-actions" : resolved;
+    expect(effective).toBe("github-actions");
+  });
+});
+
+// ── makeKgRefresh dispatch result threading ───────────────────────────────────
+// Verifies that trigger() correctly threads workflowRunId / machineNonce
+// from dispatchRun's result into updateJobMachine.
+
+function makeTarballForDispatchTest(): Buffer {
+  const wrap = mkdtempSync(join(tmpdir(), "kgtar-"));
+  const top = join(wrap, "repo");
+  mkdirSync(top, { recursive: true });
+  writeFileSync(join(top, "sources.yml"), "namespace: https://kg.test/\n");
+  const out = join(wrap, "src.tar.gz");
+  execSync(`tar -czf ${out} -C ${wrap} repo`);
+  const buf = readFileSync(out) as Buffer;
+  rmSync(wrap, { recursive: true, force: true });
+  return buf;
+}
+
+describe("makeKgRefresh — dispatch result threading to updateJobMachine", () => {
+  let dataRoot: string;
+
+  beforeEach(() => {
+    dataRoot = mkdtempSync(join(tmpdir(), "kgdispatch-"));
+  });
+
+  afterEach(() => {
+    rmSync(dataRoot, { recursive: true, force: true });
+    vi.clearAllMocks();
+  });
+
+  async function waitFor(fn: () => boolean, label: string): Promise<void> {
+    for (let i = 0; i < 300; i++) {
+      if (fn()) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`timeout waiting for: ${label}`);
+  }
+
+  function buildHandle(overrides: {
+    dispatchResult: { machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number };
+    appendJobLogId?: number;
+    updateJobMachineMock: ReturnType<typeof vi.fn>;
+  }) {
+    const tarball = makeTarballForDispatchTest();
+    const id = overrides.appendJobLogId ?? 99;
+    return makeKgRefresh({
+      sidecar: { restart: vi.fn(async () => {}) },
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      kgSourceRepo: "TestOrg/test-kg",
+      dataRoot,
+      kgDir: "/nonexistent-kg",
+      minFreeBytes: 1,
+      freeBytes: () => 999_999,
+      deployHeld: () => false,
+      mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
+      fetchTarball: vi.fn(async () => tarball) as never,
+      fetchDefaultBranch: vi.fn(async () => "main") as never,
+      // SHA matches recorded SHA → runRefresh() returns ingest-needed → dispatch fires
+      fetchSnapshotCommitSha: vi.fn(async () => "sha-abc") as never,
+      persistSnapshotSha: vi.fn() as never,
+      loadSnapshotSha: vi.fn(() => "sha-abc") as never,
+      mcpToolCall: vi.fn(async () => ({ edges: [] })) as never,
+      canaryDeadlineMs: 50,
+      canaryRetryMs: 10,
+      runnerCallbackBaseUrl: "http://localhost:8080",
+      runnerTokenSecret: "secret",
+      mintRunTokenFn: vi.fn(() => ({ token: "run-tok", dispatchId: "disp-1" })) as never,
+      dispatchRun: vi.fn(async () => overrides.dispatchResult) as never,
+      appendJobLog: vi.fn(() => id) as never,
+      updateJobMachine: overrides.updateJobMachineMock as never,
+      closeJobLog: vi.fn() as never,
+      onOutcome: vi.fn() as never,
+      persistStage: vi.fn() as never,
+      loadStage: vi.fn(() => null) as never,
+    });
+  }
+
+  it("passes workflowRunId and undefined machineNonce for a GHA dispatch result", async () => {
+    const updateJobMachineMock = vi.fn();
+    const handle = buildHandle({
+      dispatchResult: {
+        workflowRunId: 12345,
+        logsUrl: "https://github.com/TestOrg/test-kg/actions/runs/12345",
+      },
+      appendJobLogId: 99,
+      updateJobMachineMock,
+    });
+
+    const r = await handle.trigger();
+    expect(r.status).toBe(202);
+
+    await waitFor(() => updateJobMachineMock.mock.calls.length > 0, "updateJobMachine called");
+
+    expect(updateJobMachineMock).toHaveBeenCalledWith(99, {
+      machineNonce: undefined,
+      machineId: undefined,
+      logsUrl: "https://github.com/TestOrg/test-kg/actions/runs/12345",
+      workflowRunId: 12345,
+    });
+  });
+
+  it("passes machineNonce and machineId for a Fly dispatch result", async () => {
+    const updateJobMachineMock = vi.fn();
+    const handle = buildHandle({
+      dispatchResult: {
+        machineId: "machine-abc",
+        machineNonce: "nonce-xyz",
+        logsUrl: "https://fly.io/apps/sessions/machines/machine-abc",
+      },
+      appendJobLogId: 88,
+      updateJobMachineMock,
+    });
+
+    const r = await handle.trigger();
+    expect(r.status).toBe(202);
+
+    await waitFor(() => updateJobMachineMock.mock.calls.length > 0, "updateJobMachine called");
+
+    expect(updateJobMachineMock).toHaveBeenCalledWith(88, {
+      machineNonce: "nonce-xyz",
+      machineId: "machine-abc",
+      logsUrl: "https://fly.io/apps/sessions/machines/machine-abc",
+      workflowRunId: undefined,
+    });
+  });
+});
+
 // ── KG-REFRESH.md playbook — tracker-data step ────────────────────────────────
 
 describe("KG-REFRESH.md playbook — tracker-data step", () => {

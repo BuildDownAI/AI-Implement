@@ -1,0 +1,130 @@
+# One-time manual step per KG source repo — not auto-synced by the orchestrator (see docs/issueless-runs.md §3).
+# Triggered by the orchestrator via workflow_dispatch when a kg-refresh ingest is needed.
+# All pipeline logic lives in the runner image (ghcr.io/builddownai/ai-implement-runner).
+#
+# Required secrets (in the KG source repo):
+#   AI_IMPLEMENT_APP_ID      - GitHub App numeric ID
+#   AI_IMPLEMENT_PRIVATE_KEY - GitHub App PEM private key
+#   ANTHROPIC_API_KEY        - Anthropic API key
+#   CLAUDE_CODE_OAUTH_TOKEN  - Claude Code OAuth token (preferred over API key)
+#
+# Optional repository or organization variables:
+#   AI_IMPLEMENT_RUNNER_IMAGE - Override the runner image for this repo/org.
+#   AI_IMPLEMENT_RUNNER_LABEL - runs-on label (default ubuntu-latest).
+
+name: Claude KG Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_config:
+        description: "base64 JSON RunConfig envelope — see docs/workflow-envelope.md"
+        required: true
+        type: string
+      run_token:
+        description: "HMAC bearer token authorizing the result POST; empty skips callback"
+        required: false
+        type: string
+        default: ""
+      runner_image:
+        description: "Override the runner image for this run"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  validate-runner-image:
+    runs-on: ubuntu-latest
+    outputs:
+      runner_image: ${{ steps.resolve.outputs.runner_image }}
+    steps:
+      - name: Resolve and validate runner image
+        id: resolve
+        env:
+          REQUESTED_RUNNER_IMAGE: ${{ inputs.runner_image }}
+          CONFIGURED_RUNNER_IMAGE: ${{ vars.AI_IMPLEMENT_RUNNER_IMAGE }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          runner_image="${REQUESTED_RUNNER_IMAGE:-}"
+
+          if [ -z "$runner_image" ]; then
+            if raw="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.ai-implement/image.yml" \
+                  -H "Accept: application/vnd.github.raw+json" 2>/dev/null)"; then
+              runner_image="$(printf '%s\n' "$raw" | sed -n 's/^image:[[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1/p' | head -n1)" || true
+            fi
+          fi
+
+          if [ -z "$runner_image" ]; then
+            runner_image="${CONFIGURED_RUNNER_IMAGE:-}"
+          fi
+          if [ -z "$runner_image" ]; then
+            runner_image="ghcr.io/builddownai/ai-implement-runner:latest"
+          fi
+
+          case "$runner_image" in
+            *[!A-Za-z0-9._:/@-]*)
+              echo "::error::runner_image \"$runner_image\" contains invalid characters for a container image reference." >&2
+              exit 1
+              ;;
+          esac
+
+          allowed_prefixes="ghcr.io/builddownai/,ghcr.io/${owner}/"
+
+          allowed=false
+          IFS=',' read -ra prefixes <<< "$allowed_prefixes"
+          for raw_prefix in "${prefixes[@]}"; do
+            prefix="$(echo "$raw_prefix" | xargs)"
+            [ -z "$prefix" ] && continue
+            if [[ "$runner_image" == "$prefix"* ]]; then
+              allowed=true
+              break
+            fi
+          done
+
+          if [ "$allowed" != "true" ]; then
+            echo "::error::runner_image \"$runner_image\" is not allowed." >&2
+            exit 1
+          fi
+
+          echo "runner_image=$runner_image" >> "$GITHUB_OUTPUT"
+
+  kg-refresh:
+    needs: validate-runner-image
+    runs-on: ${{ vars.AI_IMPLEMENT_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 240
+    container:
+      image: ${{ needs.validate-runner-image.outputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ secrets.AI_IMPLEMENT_APP_ID }}
+          private-key: ${{ secrets.AI_IMPLEMENT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-metadata: read
+
+      - name: Mask runner callback token
+        run: |
+          if [ -n "${{ inputs.run_token }}" ]; then
+            echo "::add-mask::${{ inputs.run_token }}"
+          fi
+
+      - name: Run pipeline
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          AI_IMPLEMENT_RUN_CONFIG: ${{ inputs.run_config }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          RUN_TOKEN: ${{ inputs.run_token }}
+        run: /opt/ai-implement/entrypoint.sh

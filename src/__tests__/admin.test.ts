@@ -55,17 +55,21 @@ vi.mock("../deploy-availability.js", async (importOriginal) => ({
 }));
 
 const mintSourceTokenOrJwtMock = vi.hoisted(() => vi.fn());
+const getInstallationTokenMock = vi.hoisted(() => vi.fn().mockResolvedValue("gh-token-mock"));
 vi.mock("../github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github-app-auth.js")>()),
   mintSourceTokenOrJwt: mintSourceTokenOrJwtMock,
+  getInstallationToken: getInstallationTokenMock,
 }));
 
 const listRepoBranchesAndTagsMock = vi.hoisted(() => vi.fn());
 const getRepoDefaultBranchMock = vi.hoisted(() => vi.fn());
+const cancelWorkflowRunMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 vi.mock("../github.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../github.js")>()),
   listRepoBranchesAndTags: listRepoBranchesAndTagsMock,
   getRepoDefaultBranch: getRepoDefaultBranchMock,
+  cancelWorkflowRun: cancelWorkflowRunMock,
 }));
 
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
@@ -3014,6 +3018,10 @@ describe("admin sessions — kg-refresh destroy", () => {
   beforeEach(() => {
     destroyMachineMock.mockReset();
     destroyMachineMock.mockResolvedValue(undefined);
+    cancelWorkflowRunMock.mockReset();
+    cancelWorkflowRunMock.mockResolvedValue(true);
+    getInstallationTokenMock.mockReset();
+    getInstallationTokenMock.mockResolvedValue("gh-token-mock");
     notifyTextMock.mockReset();
   });
 
@@ -3066,6 +3074,38 @@ describe("admin sessions — kg-refresh destroy", () => {
 
     expect(notifyTextMock).toHaveBeenCalledOnce();
     expect(clearWorkingState).not.toHaveBeenCalled();
+  });
+
+  it("GHA-mode kg-refresh cancel reaches cancelWorkflowRun and returns 200 (not 422)", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({
+      issueId: "kg-refresh",
+      phase: "kg-refresh",
+      executionMode: "github-actions",
+      repo: "TestOrg/test-kg",
+    });
+    log.updateJobRunId(jobId, 12345);
+    // GHA jobs have no machineId; pass the numeric jobId so handleDestroySession
+    // falls back to getJobById (Number.isFinite path in admin.ts).
+    const res = await deleteSession(String(jobId), token);
+
+    expect(res.statusCode).toBe(200);
+    expect(cancelWorkflowRunMock).toHaveBeenCalledWith("gh-token-mock", "TestOrg", "test-kg", 12345);
+  });
+
+  it("GHA-mode kg-refresh cancel returns 422 when repo is absent on the row", async () => {
+    const token = await login("secret");
+    const jobId = log.appendLog({
+      issueId: "kg-refresh",
+      phase: "kg-refresh",
+      executionMode: "github-actions",
+      // repo intentionally omitted to confirm the guard fires
+    });
+    log.updateJobRunId(jobId, 99999);
+    const res = await deleteSession(String(jobId), token);
+
+    expect(res.statusCode).toBe(422);
+    expect(cancelWorkflowRunMock).not.toHaveBeenCalled();
   });
 
   it("issue-keyed session destroy still calls provider.clearWorkingState (regression pin)", async () => {
