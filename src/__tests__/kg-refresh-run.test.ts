@@ -1306,8 +1306,7 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
   });
 
   it("GHA and Fly resolve the same image ref for the same orchestrator (parity)", async () => {
-    // GHA calls resolveRunnerImageForDispatch (which delegates to resolveSessionImage);
-    // Fly calls resolveSessionImage directly — verify the two produce the same result.
+    // Both backends call resolveRunnerImageForDispatch — verify parity.
     const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
 
     const opts = {
