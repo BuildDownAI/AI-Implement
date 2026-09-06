@@ -996,21 +996,20 @@ describe("kg-refresh", () => {
       });
     });
 
-    it("updateJobRunId is called when dispatchRun returns workflowRunId (GHA path)", async () => {
+    it("updateJobMachine receives workflowRunId when dispatchRun returns it (GHA path)", async () => {
       const appendJobLog = vi.fn(() => 42);
-      const updateJobRunId = vi.fn();
       const updateJobMachine = vi.fn();
       buildDispatch({
         appendJobLog,
-        updateJobRunId,
         updateJobMachine,
         dispatchRun: vi.fn(async () => ({ workflowRunId: 999 })),
       });
       await handle.trigger();
       await waitForStage("ingest-running");
-      expect(updateJobRunId).toHaveBeenCalledOnce();
-      expect(updateJobRunId).toHaveBeenCalledWith(42, 999);
-      expect(updateJobMachine).not.toHaveBeenCalled();
+      // The GHA run id rides the same updateJobMachine hook as Fly/local identity
+      // (folded contract from AII-533); there is no separate updateJobRunId hook.
+      expect(updateJobMachine).toHaveBeenCalledOnce();
+      expect(updateJobMachine).toHaveBeenCalledWith(42, expect.objectContaining({ workflowRunId: 999 }));
     });
 
     it("updateJobMachine not called when dispatchRun returns only workflowRunId", async () => {
