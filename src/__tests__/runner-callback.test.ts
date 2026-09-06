@@ -380,6 +380,136 @@ describe("handleRunnerResult — implementation", () => {
     expect(calls.find((c) => c.method === "markImplementationFailed")).toBeUndefined();
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
+
+  it("writes runner_approved on implementation success with a PR URL (AII-460)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-approved",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-approved",
+      issueIdentifier: "ENG-2",
+      issueTitle: "Implement approved",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/42",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    const job = log.getJobById(jobId);
+    expect(job?.status).toBe("completed");
+    expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.prUrl).toBe("https://github.com/o/r/pull/42");
+  });
+
+  it("does NOT write runner_approved on noWork (grouping-parent no-op)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-nowork",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-nowork",
+      issueIdentifier: "ENG-3",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        noWork: true,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
+  });
+
+  it("does NOT write runner_approved on REVIEW_UNAPPROVED coded failure", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-unapproved",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-unapproved",
+      issueIdentifier: "ENG-4",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/99",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
+  });
+
+  it("does NOT write runner_approved on MAX_TURNS_EXHAUSTED coded failure", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-maxturn",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-maxturn",
+      issueIdentifier: "ENG-5",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "MAX_TURNS_EXHAUSTED",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/100",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
+  });
 });
 
 describe("handleRunnerProgress", () => {

@@ -221,15 +221,32 @@ export function getClaimedRunIds(): Set<number> {
   return new Set(rows.map((r) => r.run_id));
 }
 
-/** Returns true when a job with status 'dispatched' or 'running' exists whose pr_url
- *  matches the given owner/repo/prNumber. Used by the auto-merge guard to defer merging
- *  a child PR while its runner is still active (AII-471). */
-export function hasInFlightJobForPr(owner: string, repo: string, prNumber: number): boolean {
-  const prUrl = `https://github.com/${owner}/${repo}/pull/${prNumber}`;
-  const row = getDb()
-    .prepare("SELECT COUNT(*) as count FROM dispatch_log WHERE status IN ('dispatched', 'running') AND pr_url = ?")
-    .get(prUrl) as { count: number };
-  return row.count > 0;
+/**
+ * Returns the merge verdict for a child PR based on the run record for the given issue identifier.
+ * Queries implementation and gap-analysis phase rows only (phase filter excludes planning and kg-refresh).
+ *
+ * - "in_flight": any such row has status 'dispatched' or 'running' — defer the merge.
+ * - "approved": the latest such row is completed with conclusion 'runner_approved' — safe to merge.
+ * - "hold": no row exists, or the latest row is not runner_approved — hold for a human or re-run.
+ *
+ * Fail-closed by design: a row terminalized by the stuck watchdog, reaper, or machine sweep
+ * never carries runner_approved and therefore never auto-merges (AII-460).
+ */
+export function getRunRecordMergeVerdict(issueIdentifier: string): "in_flight" | "approved" | "hold" {
+  const inFlight = getDb()
+    .prepare(
+      "SELECT COUNT(*) as count FROM dispatch_log WHERE issue_identifier = ? AND phase IN ('implementation', 'gap-analysis') AND status IN ('dispatched', 'running')",
+    )
+    .get(issueIdentifier) as { count: number };
+  if (inFlight.count > 0) return "in_flight";
+  const latest = getDb()
+    .prepare(
+      "SELECT status, conclusion FROM dispatch_log WHERE issue_identifier = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1",
+    )
+    .get(issueIdentifier) as { status: string; conclusion: string | null } | undefined;
+  if (!latest) return "hold";
+  if (latest.status === "completed" && latest.conclusion === "runner_approved") return "approved";
+  return "hold";
 }
 
 /**
@@ -352,7 +369,7 @@ export function updateJobStatus(
     .prepare(
       `UPDATE dispatch_log
        SET status = ?,
-           conclusion = CASE WHEN conclusion IN ('operator_cancelled') THEN conclusion ELSE ? END,
+           conclusion = CASE WHEN conclusion IN ('operator_cancelled', 'runner_approved') THEN conclusion ELSE ? END,
            pr_url = COALESCE(?, pr_url), completed_at = ?,
            machine_nonce = CASE WHEN ? = 1 THEN NULL ELSE machine_nonce END
        WHERE id = ?`,

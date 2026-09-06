@@ -184,6 +184,12 @@ export function recordReviewFixDispatch(input: {
   return Number(result.lastInsertRowid);
 }
 
+/** Returns true when a review fix should be skipped because the PR is already merged or closed. Fail-open on null (API error) to avoid dropping a valid fix. */
+export function shouldSkipReviewFix(state: { merged: boolean; state: "open" | "closed" } | null): boolean {
+  if (state === null) return false;
+  return state.merged || state.state === "closed";
+}
+
 export function getReviewFixDispatchSnapshot(dispatchId: string): ReviewFixDispatchSnapshot | null {
   const row = getDb()
     .prepare("SELECT * FROM review_fix_dispatches WHERE dispatch_id = ?")

@@ -48,6 +48,89 @@ describe("updateJobStatus pr_url handling", () => {
   });
 });
 
+describe("updateJobStatus CASE guard — runner_approved conclusion survives monitor write", () => {
+  it("preserves runner_approved when a subsequent success write arrives", () => {
+    const id = log.appendLog({ issueId: "i-guard", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/10");
+    // Simulate GHA monitor's later write with execution-layer conclusion
+    log.updateJobStatus(id, "completed", "success", null);
+    const job = log.getJobById(id);
+    expect(job?.status).toBe("completed");
+    expect(job?.conclusion).toBe("runner_approved");
+  });
+
+  it("preserves operator_cancelled (regression — existing CASE guard entry)", () => {
+    const id = log.appendLog({ issueId: "i-op", executionMode: "github-actions" });
+    log.updateJobStatus(id, "failed", "operator_cancelled");
+    log.updateJobStatus(id, "completed", "success", null);
+    const job = log.getJobById(id);
+    expect(job?.status).toBe("completed");
+    expect(job?.conclusion).toBe("operator_cancelled");
+  });
+
+  it("updates conclusion when not in the protected set", () => {
+    const id = log.appendLog({ issueId: "i-plain", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", null);
+    log.updateJobStatus(id, "completed", "failure", null);
+    expect(log.getJobById(id)?.conclusion).toBe("failure");
+  });
+});
+
+describe("getRunRecordMergeVerdict", () => {
+  it("returns in_flight when a row is running", () => {
+    const id = log.appendLog({ issueId: "i1", issueIdentifier: "AII-100", executionMode: "github-actions" });
+    log.updateJobStatus(id, "running");
+    expect(log.getRunRecordMergeVerdict("AII-100")).toBe("in_flight");
+  });
+
+  it("returns in_flight when a row is dispatched", () => {
+    log.appendLog({ issueId: "i2", issueIdentifier: "AII-101", executionMode: "github-actions" });
+    // fresh appendLog creates rows with status 'dispatched' by default
+    expect(log.getRunRecordMergeVerdict("AII-101")).toBe("in_flight");
+  });
+
+  it("returns approved when the latest row is completed/runner_approved", () => {
+    const id = log.appendLog({ issueId: "i3", issueIdentifier: "AII-102", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/1");
+    expect(log.getRunRecordMergeVerdict("AII-102")).toBe("approved");
+  });
+
+  it("returns hold when the latest row is completed/success (no approval mark)", () => {
+    const id = log.appendLog({ issueId: "i4", issueIdentifier: "AII-103", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", null);
+    expect(log.getRunRecordMergeVerdict("AII-103")).toBe("hold");
+  });
+
+  it("returns hold when no row exists", () => {
+    expect(log.getRunRecordMergeVerdict("AII-NONEXISTENT")).toBe("hold");
+  });
+
+  it("returns hold when only a planning row exists (phase filter excludes planning)", () => {
+    const id = log.appendLog({ issueId: "i5", issueIdentifier: "AII-104", executionMode: "github-actions", phase: "planning" });
+    log.updateJobStatus(id, "completed", "runner_approved", null);
+    expect(log.getRunRecordMergeVerdict("AII-104")).toBe("hold");
+  });
+
+  it("latest-row wins: hold when newer gap-analysis row is not approved", () => {
+    // Older approved row (implementation)
+    const old = log.appendLog({ issueId: "i6", issueIdentifier: "AII-105", executionMode: "github-actions", phase: "implementation" });
+    log.updateJobStatus(old, "completed", "runner_approved", "https://github.com/o/r/pull/1");
+    // Newer gap-analysis row (no approval mark — simulates a fix run completing without the mark)
+    const newer = log.appendLog({ issueId: "i6", issueIdentifier: "AII-105", executionMode: "github-actions", phase: "gap-analysis" });
+    log.updateJobStatus(newer, "completed", "success", null);
+    expect(log.getRunRecordMergeVerdict("AII-105")).toBe("hold");
+  });
+
+  it("in_flight trumps latest approved: returns in_flight when a newer row is dispatched", () => {
+    // Older approved row
+    const old = log.appendLog({ issueId: "i7", issueIdentifier: "AII-106", executionMode: "github-actions" });
+    log.updateJobStatus(old, "completed", "runner_approved", "https://github.com/o/r/pull/1");
+    // Newer dispatched row (re-dispatch)
+    log.appendLog({ issueId: "i7", issueIdentifier: "AII-106", executionMode: "github-actions" });
+    expect(log.getRunRecordMergeVerdict("AII-106")).toBe("in_flight");
+  });
+});
+
 describe("completeOrphanedPlanningJobs", () => {
   it("marks an 'unknown' planning job completed for the issue", () => {
     const id = log.appendLog({ issueId: "i1", executionMode: "github-actions", phase: "planning" });

@@ -225,7 +225,13 @@ Idempotency is handled differently per path:
 
 ---
 
-## 8. Where each part lives
+## 8. Child-PR merge ordering guarantee
+
+A child PR is auto-merged only after its runner's result callback has written an **approval mark** (`runner_approved` conclusion) on the run record — the auto-merge gate reads `getRunRecordMergeVerdict` keyed on the issue identifier, not the PR URL, so it is evaluated from the moment the PR exists. A PR whose run record is still in `dispatched` or `running` state is **deferred** — the gate continues to the next PR and retries on the following poll tick. A PR whose run completed without the approval mark — including runs terminated by the stuck watchdog, the reaper, or a machine sweep, and runs that ended with `REVIEW_UNAPPROVED` or `MAX_TURNS_EXHAUSTED` — is **held**: it is never auto-merged, and a human must either close it or trigger a re-run. A PR with no run record at all — including any PR opened by a human directly into a grouping branch — is also held; human-opened PRs into grouping branches no longer auto-merge. Recovery for a capped or unapproved child is tracked in [AII-263](https://linear.app/eudoxus/issue/AII-263/max-turns-capped-child-run-leaves-a-stalled-draft-pr-that-silently).
+
+---
+
+## 9. Where each part lives
 
 | Concern | File |
 |---------|------|
@@ -258,7 +264,7 @@ Feature-branch grouping is supported on **both providers**:
 
 ---
 
-## 9. Operational notes
+## 10. Operational notes
 
 - **Re-sync workflows** to the target repo so `claude-implement.yml` accepts the
   `base_branch` input; otherwise GitHub 422s the grouped dispatch (the orchestrator only
@@ -278,7 +284,7 @@ Feature-branch grouping is supported on **both providers**:
 
 ---
 
-## 10. Conflict recovery & prevention
+## 11. Conflict recovery & prevention
 
 ### Cascade conflict recovery
 

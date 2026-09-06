@@ -6,7 +6,7 @@ import {
 import {
   countConflictAttempts, enqueueConflictResolution, hasPendingConflictResolution,
 } from "./comment-gapfill-queue.js";
-import { hasInFlightJobForPr } from "./log.js";
+import { getRunRecordMergeVerdict } from "./log.js";
 
 export interface AutoMergeDeps {
   githubAppId: string;
@@ -88,8 +88,18 @@ async function autoMergeRepo(mapping: RepoMapping, deps: AutoMergeDeps): Promise
         console.log(`[auto-merge] Skipping PR #${pr.number} -> ${pr.base}: changes requested`);
         continue;
       }
-      if (hasInFlightJobForPr(owner, repo, pr.number)) {
+      const issueKeyMatch = pr.title.match(/^([A-Z][A-Z0-9]*-\d+):/);
+      if (!issueKeyMatch) {
+        console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: no issue key in title`);
+        continue;
+      }
+      const verdict = getRunRecordMergeVerdict(issueKeyMatch[1]);
+      if (verdict === "in_flight") {
         console.log(`[auto-merge] Deferring merge of PR #${pr.number} -> ${pr.base}: run still in flight`);
+        continue;
+      }
+      if (verdict === "hold") {
+        console.log(`[auto-merge] Holding PR #${pr.number} -> ${pr.base}: no approval mark`);
         continue;
       }
       const result = await mergePullRequest(token, owner, repo, pr.number, pr.headSha, "merge");

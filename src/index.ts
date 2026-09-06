@@ -80,7 +80,7 @@ import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
-import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus } from "./review-fix-queue.js";
+import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix } from "./review-fix-queue.js";
 import { drainCommentGapfillQueue } from "./comment-gapfill-drain.js";
 import { sweepOrphanedGapfillRows } from "./comment-gapfill-queue.js";
 import { processPendingWorkflowSyncs } from "./workflow-sync-queue.js";
@@ -2818,6 +2818,14 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
 
       const [owner] = fix.repo.split("/");
       const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+
+      const prState = await getPullRequestState(ghToken, mapping.owner, mapping.repo, fix.prNumber);
+      if (shouldSkipReviewFix(prState)) {
+        console.log(`[review-fix] PR #${fix.prNumber} is ${prState?.merged ? "merged" : "closed"}, skipping review fix #${fix.id}`);
+        updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
+
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
       const reviewFixCapabilities = await resolveWorkflowCapabilities({

@@ -392,7 +392,11 @@ export async function handleRunnerResult(
       }
       const job = getJobByDispatchId(claims.dispatchId);
       if (job) {
-        updateJobPrUrl(job.id, input.body.prUrl!);
+        // Finalize immediately with the approval mark so the auto-merge gate can
+        // read it without waiting for the GHA monitor's later write (AII-460).
+        // The CASE guard in updateJobStatus preserves this conclusion when the
+        // monitor subsequently writes its own execution-layer conclusion.
+        updateJobStatus(job.id, "completed", "runner_approved", input.body.prUrl!);
       }
     }
   } else if (input.body.phase === "gap-analysis") {
