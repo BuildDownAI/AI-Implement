@@ -735,10 +735,27 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     },
 
     onRunnerComplete(runnerOutcome, data) {
-      // Discard callbacks that arrive after TTL or another path already resolved the run.
-      // The !running re-entry below exists for crash-recovery; without this guard a late
-      // callback after a TTL expiry would re-enter and fire onOutcome a second time.
-      if (stage !== "ingest-running") return;
+      if (stage !== "ingest-running") {
+        // Late callback after a reaper close or TTL expiry: the dispatch_log row is
+        // already closed, but the runner actually completed. Supersede the synthetic
+        // reaper outcome with the runner's real result so lastRefresh reflects reality.
+        if (stage === "failed" || stage === "reverted") {
+          const detail = runnerOutcome === "failure"
+            ? (data.failureCode ?? data.failureReason ?? "runner reported failure")
+            : "runner completed";
+          lastRefresh = {
+            ok: runnerOutcome === "success" || data.failureCode === "KG_SNAPSHOT_STALE",
+            at: Date.now(),
+            gate: "staging",
+            detail: `late callback: ${detail}`,
+            stampBefore: null,
+            stampAfter: null,
+          };
+          persistLastRefreshFn(lastRefresh);
+          console.log("[kg-refresh] late callback after reaper close — updating lastRefresh");
+        }
+        return;
+      }
       // Cancel the post-restart TTL watchdog (only set when a run was re-adopted on boot).
       if (ttlWatchdogTimer !== null) { clearTimeout(ttlWatchdogTimer); ttlWatchdogTimer = null; }
       // Past the ingest phase — clear the live TTL watchdog.
