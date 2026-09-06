@@ -60,4 +60,51 @@ describe("claude-kg-refresh.yml template", () => {
     expect(step.env).toHaveProperty("RUN_PROGRESS_TOKEN");
     expect(step.env.RUN_PROGRESS_TOKEN).toContain("run_progress_token");
   });
+
+  it("has a Bind workflow run ID step", () => {
+    const doc = getParsedTemplate();
+    const steps: any[] = doc.jobs["kg-refresh"].steps;
+    const bindStep = steps.find((s: any) => s.name === "Bind workflow run ID");
+    expect(bindStep).toBeDefined();
+  });
+
+  it("Bind workflow run ID step has a non-empty if condition", () => {
+    const doc = getParsedTemplate();
+    const steps: any[] = doc.jobs["kg-refresh"].steps;
+    const bindStep = steps.find((s: any) => s.name === "Bind workflow run ID");
+    expect(bindStep.if).toBeTruthy();
+  });
+
+  it("Bind workflow run ID step posts to /runner/progress", () => {
+    const doc = getParsedTemplate();
+    const steps: any[] = doc.jobs["kg-refresh"].steps;
+    const bindStep = steps.find((s: any) => s.name === "Bind workflow run ID");
+    expect(bindStep.run).toContain("/runner/progress");
+  });
+
+  it("Bind workflow run ID step sends githubRunId in the body", () => {
+    const doc = getParsedTemplate();
+    const steps: any[] = doc.jobs["kg-refresh"].steps;
+    const bindStep = steps.find((s: any) => s.name === "Bind workflow run ID");
+    expect(bindStep.run).toContain("githubRunId");
+    expect(bindStep.run).toContain("github.run_id");
+  });
+
+  it("Bind workflow run ID step appears between Mask and Run pipeline", () => {
+    const doc = getParsedTemplate();
+    const steps: any[] = doc.jobs["kg-refresh"].steps;
+    const maskIdx = steps.findIndex((s: any) => s.name === "Mask runner callback token");
+    const bindIdx = steps.findIndex((s: any) => s.name === "Bind workflow run ID");
+    const pipelineIdx = steps.findIndex((s: any) => s.name === "Run pipeline");
+    expect(maskIdx).toBeGreaterThanOrEqual(0);
+    expect(bindIdx).toBeGreaterThan(maskIdx);
+    expect(bindIdx).toBeLessThan(pipelineIdx);
+  });
+
+  it("Bind workflow run ID step is non-fatal (ends with || true)", () => {
+    const doc = getParsedTemplate();
+    const steps: any[] = doc.jobs["kg-refresh"].steps;
+    const bindStep = steps.find((s: any) => s.name === "Bind workflow run ID");
+    expect(bindStep.run).toContain("|| true");
+  });
 });

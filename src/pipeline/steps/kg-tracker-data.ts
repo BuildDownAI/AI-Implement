@@ -122,7 +122,6 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
     const base = callbackUrl.replace(/\/+$/, "");
     const url = `${base}/api/runner/kg-tracker-data`;
     const allIssues: TrackerIssue[] = [];
-    let anyTeamEmpty = false;
 
     for (const team of teams) {
       let cursor: string | null = null;
@@ -160,12 +159,16 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
       }
 
       console.log(`[kg-tracker-data] team ${team}: ${teamIssues.length} issues`);
-      if (teamIssues.length === 0) anyTeamEmpty = true;
+      if (teamIssues.length === 0) {
+        throw new KgTrackerDataFetchError(
+          `team ${team} returned 0 issues — a configured team must not be empty`,
+        );
+      }
       allIssues.push(...teamIssues);
     }
 
     writeFn(join(workspaceDir, "tracker-data.json"), JSON.stringify(allIssues));
     console.log(`[kg-tracker-data] fetched ${allIssues.length} issues`);
-    return { fetched: !anyTeamEmpty, issueCount: allIssues.length };
+    return { fetched: true, issueCount: allIssues.length };
   },
 };
