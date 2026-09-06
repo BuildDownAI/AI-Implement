@@ -161,7 +161,7 @@ interface KgRefreshInput {
    * - GHA path: workflowRunId (when found) + logsUrl; no machineNonce
    * - Local Docker: machineNonce only
    */
-  dispatchRun?: (opts: { runToken: string; dispatchId: string; runConfig: string; executionPath?: string }) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
+  dispatchRun?: (opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string; executionPath?: string }) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
   /**
    * Record a dispatch_log row before the machine starts. Returns jobId.
    * Called with dispatchId and the already-resolved executionMode so both
@@ -614,6 +614,15 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               ttlSeconds: KG_REFRESH_TTL_MS / 1000,
               secret: input.runnerTokenSecret,
             });
+            const { token: runProgressToken } = mintRunTokenFn({
+              issueId: "kg-refresh",
+              mappingTeamKey: "",
+              phase: "kg-refresh",
+              audience: "progress",
+              dispatchId,
+              ttlSeconds: KG_REFRESH_TTL_MS / 1000,
+              secret: input.runnerTokenSecret,
+            });
 
             // Resolve execution mode once so appendJobLog and dispatchRun share the
             // same runner-mode snapshot. A mode flip between the two calls would
@@ -635,7 +644,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
             let dispatchResult: { machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number };
             try {
-              dispatchResult = await input.dispatchRun({ runToken, dispatchId, runConfig: encodeRunConfig(runConfig), executionPath: executionMode });
+              dispatchResult = await input.dispatchRun({ runToken, runProgressToken, dispatchId, runConfig: encodeRunConfig(runConfig), executionPath: executionMode });
             } catch (dispatchErr) {
               // Machine/run start failed — close the row immediately so no phantom
               // in-flight entry persists and the deploy interlock can proceed.

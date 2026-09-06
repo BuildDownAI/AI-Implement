@@ -149,7 +149,16 @@ remap_team_secrets() {
 # Sets GIT_KG_PUSH_TOKEN_FILE, registers the helper in coder's gitconfig,
 # and removes the embedded token from the origin remote URL so the helper
 # is consulted on git push.
+#
+# Guard: if RUNNER_CALLBACK_URL or RUN_PROGRESS_TOKEN is absent the helper
+# cannot fetch a write token anyway. In that case the function logs one line
+# and returns 0 so the entrypoint always reaches the pipeline exec — it must
+# never set -e-exit before `exec node` runs.
 setup_kg_push_credential() {
+  if [ -z "${RUNNER_CALLBACK_URL:-}" ] || [ -z "${RUN_PROGRESS_TOKEN:-}" ]; then
+    log "setup_kg_push_credential: RUNNER_CALLBACK_URL or RUN_PROGRESS_TOKEN not set; skipping credential setup"
+    return 0
+  fi
   local token_file="/tmp/ai-implement-kg-push-$$.json"
   export GIT_KG_PUSH_TOKEN_FILE="$token_file"
   # Create an empty file owned by coder so the helper can read and update it.
