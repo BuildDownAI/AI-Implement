@@ -495,11 +495,12 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
     };
   }
 
-  it("throws KgSnapshotTrackerRegressionError when tracker not fetched and previous snapshot has .nt files", async () => {
+  it("throws KgSnapshotTrackerRegressionError when tracker not fetched and previous snapshot has issue.nt/comment.nt", async () => {
     initGitRepo(tmpDir);
-    // Commit .nt files into snapshot/parts/ so the previous ref has tracker parts.
+    // Commit tracker-derived .nt files so the previous ref has tracker parts.
     mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
-    writeFileSync(join(tmpDir, "snapshot", "parts", "tracker.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "parts", "comment.nt"), "<s> <p> <o> .\n");
     writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
     writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-01-01T00:00:00Z");
     execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
@@ -512,6 +513,29 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
     await expect(
       kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef }), noopReporter),
     ).rejects.toBeInstanceOf(KgSnapshotTrackerRegressionError);
+  });
+
+  it("does not throw tracker regression when fetched=false and previous snapshot has only non-tracker .nt files (docs, decisions, etc.)", async () => {
+    initGitRepo(tmpDir);
+    // Commit only doc-type .nt files — these exist on every snapshot and must not trigger the guard.
+    // Use a fresh repo with no snapshot committed so clonedRef has no stamp and the guard
+    // is the only check that could throw KgSnapshotTrackerRegressionError.
+    const clonedRef = resolveHead(tmpDir);
+
+    // Write non-tracker .nt files in the working tree only (not committed, so the snapshot is "new")
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "parts", "decisions.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-03T10:00:00Z");
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: false, issueCount: 0 });
+
+    // Guard does not fire (no tracker files in previous snapshot) → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeGuardInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
   });
 
   it("does not throw tracker regression when fetched=false but previous snapshot has no .nt files", async () => {
@@ -527,10 +551,10 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
     ).rejects.toBeInstanceOf(KgSnapshotMissingError);
   });
 
-  it("does not throw tracker regression when fetched=true even if previous snapshot has .nt files", async () => {
+  it("does not throw tracker regression when fetched=true even if previous snapshot has tracker .nt files", async () => {
     initGitRepo(tmpDir);
     mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
-    writeFileSync(join(tmpDir, "snapshot", "parts", "tracker.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), "<s> <p> <o> .\n");
     writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
     writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-01-01T00:00:00Z");
     execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
@@ -560,7 +584,7 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
   it("treats missing fetched output (empty getOutputs result) as fetched=false", async () => {
     initGitRepo(tmpDir);
     mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
-    writeFileSync(join(tmpDir, "snapshot", "parts", "tracker.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), "<s> <p> <o> .\n");
     execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
     execSync("git commit -m 'snapshot with tracker parts'", { cwd: tmpDir, stdio: "ignore" });
     const clonedRef = resolveHead(tmpDir);
@@ -901,6 +925,30 @@ describe("runKgRefresh", () => {
       reporter: { report: async () => undefined },
     });
     expect(result.exitCode).toBe(1);
+  });
+
+  it("reports failureCode KG_SNAPSHOT_TRACKER_REGRESSION when push step throws KgSnapshotTrackerRegressionError", async () => {
+    process.env.RUNNER_CALLBACK_URL = "http://orch";
+    process.env.RUN_TOKEN = "run-tok";
+    const capturedResults: Array<{ failureCode?: string }> = [];
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: makeStepModule({}, new KgSnapshotTrackerRegressionError("previous snapshot has tracker files")),
+      },
+      reporter: { report: async () => undefined },
+      fetchImpl: async (_url, init) => {
+        const body = init?.body ? JSON.parse(init.body as string) as Record<string, unknown> : {};
+        capturedResults.push(body as { failureCode?: string });
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      },
+    });
+    delete process.env.RUNNER_CALLBACK_URL;
+    delete process.env.RUN_TOKEN;
+    expect(result.exitCode).toBe(1);
+    expect(capturedResults.some((r) => r.failureCode === "KG_SNAPSHOT_TRACKER_REGRESSION")).toBe(true);
   });
 
   it("returns exitCode 1 when kgTrackerData throws KgTrackerDataFetchError", async () => {

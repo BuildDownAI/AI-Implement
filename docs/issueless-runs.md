@@ -312,6 +312,9 @@ The `dispatch_log` row appears in the admin pipelines table with:
 | `completed` | `KG_SNAPSHOT_STALE` | `null` — benign "graph is current" |
 | `failed` | `operator_cancelled` | `null` — benign, suppress alert |
 | `timed_out` | any | `{ summary: "KG Refresh hit the time limit." }` |
+| `failed` | `KG_SNAPSHOT_MISSING` | `{ summary: "KG Refresh failed." }` — snapshot parts or embeddings absent |
+| `failed` | `KG_SNAPSHOT_TRACKER_REGRESSION` | `{ summary: "KG Refresh failed." }` — tracker-data step skipped but previous snapshot contains tracker files (`issue.nt`/`comment.nt`); push refused to avoid regressing to docs-only graph |
+| `failed` | `KG_TRACKER_DATA_FETCH_FAILED` | `{ summary: "KG Refresh failed." }` — tracker-data endpoint returned a non-503 error |
 | `failed` | `exit_<N>` | `{ summary: "KG Refresh failed.", detail: "The runner exited with code N." }` |
 | `failed` | other | `{ summary: "KG Refresh failed." }` |
 

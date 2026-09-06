@@ -163,12 +163,19 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         "git", ["ls-tree", "--name-only", clonedRef, "--", "snapshot/parts/"],
         { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
       );
-      const previousNtFiles = lsTreeResult.status === 0
-        ? lsTreeResult.stdout.toString().split("\n").filter((f) => f.trim().endsWith(".nt"))
+      // Only issue.nt and comment.nt are written by a tracker refresh (per docs/kg-architecture.md).
+      // Other .nt files (docs, decisions, etc.) exist on every successful snapshot and must not
+      // trigger this guard when tracker fetch is legitimately skipped.
+      const TRACKER_NT_FILES = new Set(["issue.nt", "comment.nt"]);
+      const previousTrackerFiles = lsTreeResult.status === 0
+        ? lsTreeResult.stdout.toString().split("\n").filter((f) => {
+            const base = f.trim().split("/").pop() ?? "";
+            return TRACKER_NT_FILES.has(base);
+          })
         : [];
-      if (previousNtFiles.length > 0) {
+      if (previousTrackerFiles.length > 0) {
         throw new KgSnapshotTrackerRegressionError(
-          `tracker-data step reported fetched=false but previous snapshot has ${previousNtFiles.length} tracker .nt file(s) — refusing to push a docs-only graph`,
+          `tracker-data step reported fetched=false but previous snapshot has tracker file(s) (${previousTrackerFiles.join(", ")}) — refusing to push a docs-only graph`,
         );
       }
     }

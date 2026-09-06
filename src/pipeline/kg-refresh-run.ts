@@ -10,7 +10,7 @@ import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
-import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError } from "./steps/kg-snapshot-push.js";
+import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { ClaudeCliExecutor } from "./executor.js";
 import type { LLMExecutor, StepReporter, StepModule } from "./types.js";
@@ -205,13 +205,16 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     const isMissing = err instanceof KgSnapshotMissingError;
     const isStale = err instanceof KgSnapshotStaleError;
     const isTrackerDataError = err instanceof KgTrackerDataFetchError;
+    const isTrackerRegression = err instanceof KgSnapshotTrackerRegressionError;
     const failureCode = isMissing
       ? "KG_SNAPSHOT_MISSING"
       : isStale
         ? "KG_SNAPSHOT_STALE"
         : isTrackerDataError
           ? "KG_TRACKER_DATA_FETCH_FAILED"
-          : undefined;
+          : isTrackerRegression
+            ? "KG_SNAPSHOT_TRACKER_REGRESSION"
+            : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
     await postRunnerResult({
       phase: "kg-refresh",
