@@ -363,6 +363,91 @@ describe("kgSnapshotPushStep", () => {
     expect(err.message).toContain("unrecognised format");
   });
 
+  it("accepts a +00:00 offset stamp with no previous stamp (reaches git push)", async () => {
+    initGitRepo(tmpDir);
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-03T10:00:00+00:00");
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("fails with KG_SNAPSHOT_STALE when Z and +00:00 stamps represent the same instant (Z previous)", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00Z");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'add old stamp'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00+00:00");
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotStaleError);
+  });
+
+  it("fails with KG_SNAPSHOT_STALE when Z and +00:00 stamps represent the same instant (+00:00 previous)", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00+00:00");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'add old stamp'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00Z");
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toBeInstanceOf(KgSnapshotStaleError);
+  });
+
+  it("pushes when a later +00:00 stamp follows an earlier Z stamp", async () => {
+    const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare-offset-"));
+    try {
+      execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+
+      initGitRepo(tmpDir);
+      mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-01T00:00:00Z");
+      execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+      execSync("git commit -m 'add old stamp'", { cwd: tmpDir, stdio: "ignore" });
+
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+
+      mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+      writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+      writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-02T00:00:00+00:00");
+
+      const ctx = makeContext();
+      const result = await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, defaultBranch: "main" }),
+        noopReporter,
+      );
+      expect(result.snapshotPushed).toBe(true);
+    } finally {
+      rmSync(bareDir, { recursive: true, force: true });
+    }
+  });
+
   it("pushes snapshot and returns snapshotPushed=true against a local bare remote", async () => {
     const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare-"));
     try {

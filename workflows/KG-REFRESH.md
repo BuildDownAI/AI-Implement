@@ -71,13 +71,9 @@ After the ingest completes, confirm:
 
 If either check fails, write the details to the run report and stop without writing a stamp file.
 
-### 5. Write the stamp file
+### 5. Stamp file
 
-Write the current UTC time as an ISO-8601 string to `snapshot/embeddings.stamp`:
-
-```bash
-python3 -c "import datetime; print(datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))" > snapshot/embeddings.stamp
-```
+The ingest CLI writes `snapshot/embeddings.stamp` automatically during the ingest run (step 3). The file contains a UTC ISO-8601 timestamp of the form `YYYY-MM-DDTHH:MM:SS+00:00`. Do **not** overwrite or recreate this file — the pipeline's push step reads it to order snapshots and rejects any run where the stamp has not advanced. Both the `Z`-suffix form and the `+00:00` offset form are accepted by the pipeline.
 
 ### 6. Write the stats file
 

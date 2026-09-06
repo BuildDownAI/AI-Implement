@@ -214,10 +214,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       );
     }
     // Reject a malformed stamp rather than silently breaking the ordering check.
-    const ISO_STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+    // Accepts both Z-suffix and ±HH:MM offset forms (both are valid ISO-8601).
+    const ISO_STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$/;
     if (!ISO_STAMP_RE.test(currentStamp)) {
       throw new KgSnapshotMissingError(
-        `snapshot/embeddings.stamp has unrecognised format "${currentStamp}" — expected YYYY-MM-DDTHH:MM:SSZ`,
+        `snapshot/embeddings.stamp has unrecognised format "${currentStamp}" — expected YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM`,
       );
     }
     const previousStamp = readPreviousStamp(workspaceDir, clonedRef);
@@ -226,7 +227,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       if (!ISO_STAMP_RE.test(previousStamp)) {
         // Historical stamp in unexpected format — can't reliably order it; skip stale check.
         console.warn(`[kg-snapshot-push] Previous stamp has unrecognised format "${previousStamp}"; skipping stale check`);
-      } else if (currentStamp <= previousStamp) {
+      } else if (Date.parse(currentStamp) <= Date.parse(previousStamp)) {
         throw new KgSnapshotStaleError(
           `stamp "${currentStamp}" is not newer than previous "${previousStamp}"`,
         );
