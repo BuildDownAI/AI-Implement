@@ -1417,10 +1417,10 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
         runToken: "tok",
         runProgressToken: "prog",
         runnerImage: undefined,
-        runnerCallbackUrl: "https://orchestrator.example.com/api/runner/result",
+        runnerCallbackUrl: "https://orchestrator.example.com",
       }),
     ) as { inputs: Record<string, string> };
-    expect(body.inputs.runner_callback_url).toBe("https://orchestrator.example.com/api/runner/result");
+    expect(body.inputs.runner_callback_url).toBe("https://orchestrator.example.com");
   });
 
   it("body omits runner_callback_url when absent — entrypoint falls back to RunConfig", () => {
