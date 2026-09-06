@@ -116,6 +116,15 @@ export interface CleanExitDecision {
 }
 
 /**
+ * kg-refresh rows carry a synthetic issueId and have no tracker issue. Their outcome
+ * notification is owned by notifyKgRefreshOutcome (AII-496); the generic completion loop
+ * must mark them notified and skip, or it fires a bogus "kg-refresh: Unknown" notice.
+ */
+export function shouldSkipCompletionNotice(job: { phase: string }): boolean {
+  return job.phase === "kg-refresh";
+}
+
+/**
  * AII-264 r5 seam: terminal decision for the fly-machines and local-docker monitors.
  *
  * The runner's push step deliberately no-ops a grouping parent's closing run when the agent

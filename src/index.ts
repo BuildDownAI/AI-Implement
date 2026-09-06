@@ -73,7 +73,7 @@ import {
   startLocalRunnerContainer,
   sweepExitedLocalContainers,
 } from "./local-docker.js";
-import { clearPrNotFoundGrace, decideCleanExitOutcome, workflowFileForJob } from "./monitor-status.js";
+import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
@@ -2533,6 +2533,12 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
           }
         }
         console.log(`[monitor] Job ${job.id} (${job.issueIdentifier}) operator_cancelled — benign terminal, one informational notice sent`);
+        markJobNotified(job.id);
+        continue;
+      }
+
+      // kg-refresh outcome notification is owned by notifyKgRefreshOutcome (AII-496).
+      if (shouldSkipCompletionNotice(job)) {
         markJobNotified(job.id);
         continue;
       }
