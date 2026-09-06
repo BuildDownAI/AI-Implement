@@ -942,6 +942,130 @@ describe("kgTrackerDataStep", () => {
     expect(result).toEqual({ fetched: false, issueCount: 0 });
     expect(capturedCalls).toHaveLength(0);
   });
+
+  // ── sources.yml parsing (real file shapes) ─────────────────────────────────
+
+  const REAL_SOURCES_YML = `\
+trackers:
+  - kind: linear
+    team: AII                           # AI-Implement  (PRIMARY — bound to code_repo)
+    tier: primary
+  - kind: linear
+    team: BDS                           # BuildDown Skills  (SECONDARY)
+    tier: secondary
+`;
+
+  function makeEmptyPageFetch(): { fetchImpl: typeof fetch; requestBodies: Array<Record<string, string>> } {
+    const requestBodies: Array<Record<string, string>> = [];
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const body = init?.body ? JSON.parse(init.body as string) as Record<string, string> : {};
+      requestBodies.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ issues: [{ id: "i1" }], pageInfo: { hasNextPage: false, endCursor: null } }),
+      } as Response;
+    };
+    return { fetchImpl, requestBodies };
+  }
+
+  it("parses the real multi-block sources.yml format and fetches AII and BDS", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SOURCES_YML);
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(result.fetched).toBe(true);
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["AII", "BDS"]);
+  });
+
+  it("parses the inline `- team:` format", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(join(tmpDir, "sources.yml"), "trackers:\n  - team: AII\n  - team: BDS\n");
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["AII", "BDS"]);
+  });
+
+  it("extracts team name without trailing comment", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "trackers:\n  - kind: linear\n    team: XYZ                           # some comment\n",
+    );
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["XYZ"]);
+  });
+
+  it("returns { fetched: false } when sources.yml file is absent (no file written)", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    // tmpDir has no sources.yml — existsSync returns false
+    const capturedCalls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { capturedCalls.push(args); return {} as Response; };
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(capturedCalls).toHaveLength(0);
+  });
+
+  it("falls back to regex when YAML is unparseable but an indented team: line is present", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    // Leading `[broken` makes the YAML parser throw; the fallback regex finds `team: AII`
+    writeFileSync(join(tmpDir, "sources.yml"), "[broken\n  team: AII\n");
+    const { fetchImpl, requestBodies } = makeEmptyPageFetch();
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, writeFileSyncImpl: () => {} },
+      noopReporter,
+    );
+    expect(result.fetched).toBe(true);
+    expect(requestBodies.map((b) => b.teamKey)).toEqual(["AII"]);
+  });
+
+  it("returns { fetched: false } when trackers block has no team keys", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(join(tmpDir, "sources.yml"), "trackers:\n  - kind: linear\n    tier: primary\n");
+    const capturedCalls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { capturedCalls.push(args); return {} as Response; };
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(capturedCalls).toHaveLength(0);
+  });
+
+  it("logs the team list after parsing sources.yml", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SOURCES_YML);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await kgTrackerDataStep.run(
+        makeContext(),
+        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl: makeEmptyPageFetch().fetchImpl, writeFileSyncImpl: () => {} },
+        noopReporter,
+      );
+      expect(logSpy).toHaveBeenCalledWith("[kg-tracker-data] teams from sources.yml: AII, BDS");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
 });
 
 // ── AII-458 regression: RUN_PROGRESS_TOKEN must not reach the model process ───

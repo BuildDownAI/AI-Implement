@@ -1,5 +1,6 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 
 interface KgTrackerDataInputs extends Record<string, unknown> {
@@ -44,17 +45,44 @@ interface TrackerDataPage {
 }
 
 /**
- * Reads `trackers[].team` from sources.yml using simple regex.
+ * Reads `trackers[].team` from sources.yml using YAML parsing with a regex fallback.
  * Returns an empty array when the file is absent or contains no tracker entries.
  */
 function readTrackerTeams(workspaceDir: string): string[] {
+  const filePath = join(workspaceDir, "sources.yml");
+  if (!existsSync(filePath)) return [];
+
+  let raw: string;
   try {
-    const raw = readFileSync(join(workspaceDir, "sources.yml"), "utf8");
-    const matches = [...raw.matchAll(/^\s+-\s+team:\s+(\S+)\s*$/gm)];
-    return matches.map((m) => m[1]);
+    raw = readFileSync(filePath, "utf8");
   } catch {
     return [];
   }
+
+  // Try YAML parsing first
+  try {
+    const doc = parseYaml(raw) as unknown;
+    if (
+      doc !== null &&
+      typeof doc === "object" &&
+      Array.isArray((doc as Record<string, unknown>).trackers)
+    ) {
+      const teams = ((doc as Record<string, unknown>).trackers as unknown[])
+        .filter(
+          (t): t is Record<string, unknown> =>
+            t !== null && typeof t === "object" && !Array.isArray(t),
+        )
+        .map((t) => (typeof t.team === "string" ? t.team.trim() : null))
+        .filter((t): t is string => t !== null && t.length > 0);
+      if (teams.length > 0) return teams;
+    }
+  } catch {
+    // Fall through to regex fallback
+  }
+
+  // Fallback: matches indented `team:` lines; value stops before any trailing comment
+  const matches = [...raw.matchAll(/^\s+team:\s+(\S+)/gm)];
+  return matches.map((m) => m[1]);
 }
 
 export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOutputs> = {
@@ -89,6 +117,7 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
       console.warn("[kg-tracker-data] no teams found in sources.yml; skipping");
       return { fetched: false, issueCount: 0 };
     }
+    console.log(`[kg-tracker-data] teams from sources.yml: ${teams.join(", ")}`);
 
     const base = callbackUrl.replace(/\/+$/, "");
     const url = `${base}/api/runner/kg-tracker-data`;
