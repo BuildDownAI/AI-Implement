@@ -129,6 +129,22 @@ describe("review fix queue", () => {
     });
   });
 
+  it("shouldSkipReviewFix returns true for a merged PR", () => {
+    expect(queue.shouldSkipReviewFix({ merged: true, state: "closed" })).toBe(true);
+  });
+
+  it("shouldSkipReviewFix returns true for a closed (not merged) PR", () => {
+    expect(queue.shouldSkipReviewFix({ merged: false, state: "closed" })).toBe(true);
+  });
+
+  it("shouldSkipReviewFix returns false for an open PR", () => {
+    expect(queue.shouldSkipReviewFix({ merged: false, state: "open" })).toBe(false);
+  });
+
+  it("shouldSkipReviewFix returns false for null (API error — fail open)", () => {
+    expect(queue.shouldSkipReviewFix(null)).toBe(false);
+  });
+
   it("removes non-pending fixes from the pending list", () => {
     const id = queue.enqueueReviewFix({
       issueId: "issue-1",

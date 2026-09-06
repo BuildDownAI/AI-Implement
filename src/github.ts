@@ -759,17 +759,17 @@ export async function mergeBranch(
 
 export async function listOpenPullRequests(
   token: string, owner: string, repo: string,
-): Promise<Array<{ number: number; url: string; base: string; head: string; headSha: string; draft: boolean }>> {
+): Promise<Array<{ number: number; url: string; base: string; head: string; headSha: string; draft: boolean; title: string }>> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=100`;
   const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return [];
   const prs = (await res.json()) as Array<{
-    number: number; html_url: string; draft?: boolean;
+    number: number; html_url: string; draft?: boolean; title: string;
     base: { ref: string }; head: { ref: string; sha: string };
   }>;
   return prs.map((p) => ({
     number: p.number, url: p.html_url, base: p.base.ref,
-    head: p.head.ref, headSha: p.head.sha, draft: p.draft === true,
+    head: p.head.ref, headSha: p.head.sha, draft: p.draft === true, title: p.title,
   }));
 }
 

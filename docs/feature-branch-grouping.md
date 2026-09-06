@@ -225,7 +225,21 @@ Idempotency is handled differently per path:
 
 ---
 
-## 8. Where each part lives
+## 8. Child-PR merge ordering guarantee
+
+A child PR is auto-merged only after its runner's result callback has written an **approval mark** (`runner_approved` conclusion) on the run record — the auto-merge gate reads `getRunRecordMergeVerdict` keyed on **both the issue identifier and the PR URL**, so only the specific run record that produced that PR can grant approval. A stale `runner_approved` row from a prior run on the same issue (e.g. a superseded PR) does not carry over to a newly opened PR with the same title key.
+
+The in-flight check remains issue-scoped: if any implementation or gap-analysis run for the issue is still dispatched or running, the gate defers the merge and retries on the next poll tick. The approval check is PR-URL-scoped: the latest row matching both the issue identifier and the PR URL must be `completed/runner_approved`.
+
+A PR whose run completed without the approval mark — including runs terminated by the stuck watchdog, the reaper, or a machine sweep, and runs that ended with `REVIEW_UNAPPROVED` or `MAX_TURNS_EXHAUSTED` — is **held**: it is never auto-merged, and a human must either close it or trigger a re-run. A PR with no run record at all — including any PR opened by a human directly into a grouping branch — is also held; human-opened PRs into grouping branches no longer auto-merge.
+
+**Gap-fill interactions with the approval mark:** Every gap-fill success re-stamps `runner_approved`, because a successful gap-fill means the gap-fill's own post-push review approved the updated code. A gap-fill that ends `REVIEW_UNAPPROVED` leaves the latest row unapproved and the PR held until a subsequent run completes with approval.
+
+Recovery for a capped or unapproved child is tracked in [AII-263](https://linear.app/eudoxus/issue/AII-263/max-turns-capped-child-run-leaves-a-stalled-draft-pr-that-silently).
+
+---
+
+## 9. Where each part lives
 
 | Concern | File |
 |---------|------|
@@ -258,7 +272,7 @@ Feature-branch grouping is supported on **both providers**:
 
 ---
 
-## 9. Operational notes
+## 10. Operational notes
 
 - **Re-sync workflows** to the target repo so `claude-implement.yml` accepts the
   `base_branch` input; otherwise GitHub 422s the grouped dispatch (the orchestrator only
@@ -278,7 +292,7 @@ Feature-branch grouping is supported on **both providers**:
 
 ---
 
-## 10. Conflict recovery & prevention
+## 11. Conflict recovery & prevention
 
 ### Cascade conflict recovery
 
