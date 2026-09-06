@@ -669,6 +669,13 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     findPrForIssue: async (repo, issueIdentifier) =>
       (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
     failKgRefreshMachine: (_job, opts) => { activeKgRefresh?.onMachineLost(opts); },
+    checkGhaRunStatus: async (job) => {
+      if (!job.repo || !job.runId) return null;
+      const [owner, repo] = job.repo.split("/");
+      if (!owner || !repo) return null;
+      const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+      return getWorkflowRunStatus(token, owner, repo, job.runId);
+    },
   });
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
