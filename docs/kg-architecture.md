@@ -436,7 +436,7 @@ After both fixes landed, the review of the implementation also identified an arc
 
 | Component | Shared / existing path | kg-refresh-only path | Status |
 |---|---|---|---|
-| GHA workflow | `workflows/claude-implement.yml` | `workflows/claude-kg-refresh.yml` | removed by AII-556 |
+| GHA workflow | `workflows/claude-implement.yml` with `runner_phase: "kg-refresh"` | `workflows/claude-kg-refresh.yml` | removed by AII-556 ✓ |
 | Runner-side pipeline | *(step sequence in `WORKFLOW.md`)* | `pipelines/kg-refresh.yml` | present |
 | Session image resolution | `src/repo-image.ts` `resolveRunnerImageForDispatch` | `src/repo-image.ts` `resolveKgRefreshSessionImage` | removed by AII-557 |
 | Orchestrator state machine | — | `src/kg-refresh.ts` | present |
@@ -445,7 +445,7 @@ After both fixes landed, the review of the implementation also identified an arc
 | Snapshot push step | — | `src/pipeline/steps/kg-snapshot-push.ts` | present |
 | Push token vending | — | `src/kg-push-token-vending.ts` | present |
 | Callback routing | `src/runner-callback.ts` (carve-out within shared file) | — | present |
-| Dispatch function | — | `src/index.ts` `dispatchKgRefreshRun` / `KG_REFRESH_WORKFLOW_FILE` | present |
+| Dispatch function | — | `src/index.ts` `dispatchKgRefreshRun` | present |
 
 The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, and `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`. AII-556 and AII-557 collapse those pairs. Rows with no shared counterpart (the state machine, pipeline steps, token vending) are legitimately kg-refresh-only and belong exactly where they are.
 

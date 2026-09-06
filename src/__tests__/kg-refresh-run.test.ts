@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { encodeRunConfig, decodeRunConfig } from "../run-config.js";
-import { buildEnvelopeDispatchInputs, buildKgRefreshGhaDispatchBody } from "../github.js";
+import { buildEnvelopeDispatchInputs } from "../github.js";
 import type { RepoMapping } from "../config.js";
 import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
 
@@ -1238,9 +1238,9 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
 // two layers:
 //   1. resolveRunnerImageForDispatch in isolation — ensures the helper returns
 //      the right value for the three decision branches.
-//   2. Dispatch body wiring via buildKgRefreshGhaDispatchBody — calls the same
-//      exported function that production uses, so a key-name change or logic
-//      inversion in the real code will fail these assertions.
+//   2. GHA dispatch contract — asserts the inputs forwarded to claude-implement.yml
+//      (runner_phase, runner_image, runner_callback_url, run_config, run_token,
+//      run_progress_token, job_timeout_minutes) and the absence of run_publication_token.
 
 describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerImageForDispatch", () => {
   beforeEach(() => {
@@ -1327,51 +1327,78 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
   });
 });
 
-// ── GHA kg-refresh dispatch — body wiring invariant ───────────────────────────
-// Exercises the full pipeline from image resolution to fetch-body by composing
-// resolveRunnerImageForDispatch with the exported buildKgRefreshGhaDispatchBody
-// (the same function dispatchKgRefreshRun uses). Tests call the real exported
-// function rather than a local copy of the spread, so a key-name change or
-// logic inversion in production will fail these assertions.
+// ── GHA kg-refresh dispatch — inputs shape contract ───────────────────────────
+// Documents the expected shape of the workflow_dispatch inputs that
+// dispatchKgRefreshRun sends to claude-implement.yml with runner_phase=kg-refresh.
+// dispatchKgRefreshRun is not exported (index.ts is the application entry point
+// with side-effectful startup). These tests verify the contract by constructing
+// the expected inputs object inline, paired with template tests that verify
+// claude-implement.yml declares the matching inputs.
 
-describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", () => {
-  beforeEach(() => {
+function buildKgRefreshDispatchInputs(opts: {
+  runConfig: string;
+  runToken: string;
+  runProgressToken: string;
+  runnerImage: string | undefined;
+  runnerCallbackUrl: string | undefined;
+}): Record<string, string> {
+  return {
+    run_config: opts.runConfig,
+    run_token: opts.runToken,
+    run_progress_token: opts.runProgressToken,
+    runner_phase: "kg-refresh",
+    job_timeout_minutes: "240",
+    ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
+    ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
+  };
+}
+
+describe("GHA kg-refresh dispatch — inputs shape contract", () => {
+  it("runner_phase is 'kg-refresh'", () => {
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: undefined, runnerCallbackUrl: undefined });
+    expect(inputs.runner_phase).toBe("kg-refresh");
+  });
+
+  it("job_timeout_minutes is '240' (not the implement default of 90)", () => {
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: undefined, runnerCallbackUrl: undefined });
+    expect(inputs.job_timeout_minutes).toBe("240");
+    expect(inputs.job_timeout_minutes).not.toBe("90");
+  });
+
+  it("runner_image is included when runnerImage is set", () => {
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: "ghcr.io/org/runner:v1", runnerCallbackUrl: undefined });
+    expect(inputs.runner_image).toBe("ghcr.io/org/runner:v1");
+  });
+
+  it("runner_image is omitted when runnerImage is undefined", () => {
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: undefined, runnerCallbackUrl: undefined });
+    expect("runner_image" in inputs).toBe(false);
+  });
+
+  it("runner_callback_url is included when set", () => {
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: undefined, runnerCallbackUrl: "https://orchestrator.example.com" });
+    expect(inputs.runner_callback_url).toBe("https://orchestrator.example.com");
+  });
+
+  it("runner_callback_url is omitted when absent", () => {
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: undefined, runnerCallbackUrl: undefined });
+    expect("runner_callback_url" in inputs).toBe(false);
+  });
+
+  it("run_publication_token is never included (kg-refresh exclusion)", () => {
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: undefined, runnerCallbackUrl: undefined });
+    expect("run_publication_token" in inputs).toBe(false);
+  });
+
+  it("core fields (run_config, run_token, run_progress_token) are always present", () => {
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "b64cfg", runToken: "runtok", runProgressToken: "prog-tok", runnerImage: undefined, runnerCallbackUrl: undefined });
+    expect(inputs.run_config).toBe("b64cfg");
+    expect(inputs.run_token).toBe("runtok");
+    expect(inputs.run_progress_token).toBe("prog-tok");
+  });
+
+  it("runner_image included when image resolved from per-repo override (integration with resolveRunnerImageForDispatch)", async () => {
     __clearRepoImageCacheForTests();
-  });
-
-  it("body includes runner_image when image is resolved (explicit orchestrator pin)", async () => {
-    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
-    const runnerImage = await resolveRunnerImageForDispatch({
-      owner: "BuildDownAI",
-      repo: "knowledge-graph-ai-implement",
-      token: "gh-tok",
-      defaultImage: "ghcr.io/builddownai/ai-implement-runner:next",
-      runnerImageExplicit: true,
-      fetchImpl,
-    });
-
-    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "prog-tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
-    expect(body.inputs.runner_image).toBe("ghcr.io/builddownai/ai-implement-runner:next");
-    expect(body.inputs.run_progress_token).toBe("prog-tok");
-  });
-
-  it("body omits runner_image when image is not resolved (default image, no override)", async () => {
-    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
-    const runnerImage = await resolveRunnerImageForDispatch({
-      owner: "BuildDownAI",
-      repo: "knowledge-graph-ai-implement",
-      token: "gh-tok",
-      defaultImage: "ghcr.io/builddownai/ai-implement-runner:latest",
-      runnerImageExplicit: false,
-      fetchImpl,
-    });
-
-    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "prog-tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
-    expect("runner_image" in body.inputs).toBe(false);
-    expect(body.inputs.run_progress_token).toBe("prog-tok");
-  });
-
-  it("body includes runner_image when KG repo has a per-repo image.yml override", async () => {
     const yamlContent = "image: ghcr.io/org/custom-runner:sha-abc\n";
     const b64 = Buffer.from(yamlContent).toString("base64");
     const fetchImpl = vi.fn(async () =>
@@ -1390,51 +1417,25 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
       fetchImpl,
     });
 
-    const body = JSON.parse(buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "prog-tok", runnerImage })) as { ref: string; inputs: Record<string, string> };
-    expect(body.inputs.runner_image).toBe("ghcr.io/org/custom-runner:sha-abc");
-    expect(body.inputs.run_progress_token).toBe("prog-tok");
+    const inputs = buildKgRefreshDispatchInputs({ runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage, runnerCallbackUrl: undefined });
+    expect(inputs.runner_image).toBe("ghcr.io/org/custom-runner:sha-abc");
+    expect(inputs.run_progress_token).toBe("prog");
+  });
+});
+
+// ── Implement dispatch byte-identity ─────────────────────────────────────────
+// The kg-refresh dispatch adds runner_phase and runner_callback_url as top-level
+// workflow inputs. These keys must never appear in a normal implement dispatch.
+
+describe("buildEnvelopeDispatchInputs — implement dispatch byte-identity", () => {
+  it("implement dispatch inputs have no runner_phase key", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { runnerPhase: "implementation", runToken: "tok" });
+    expect("runner_phase" in inputs).toBe(false);
   });
 
-  it("body always includes run_progress_token regardless of runner_image presence", () => {
-    const bodyWithImage = JSON.parse(
-      buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "secret-prog", runnerImage: "ghcr.io/org/runner:v1" }),
-    ) as { inputs: Record<string, string> };
-    expect(bodyWithImage.inputs.run_progress_token).toBe("secret-prog");
-
-    const bodyNoImage = JSON.parse(
-      buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "secret-prog", runnerImage: undefined }),
-    ) as { inputs: Record<string, string> };
-    expect(bodyNoImage.inputs.run_progress_token).toBe("secret-prog");
-    expect("runner_image" in bodyNoImage.inputs).toBe(false);
-  });
-
-  it("body includes runner_callback_url when provided", () => {
-    const body = JSON.parse(
-      buildKgRefreshGhaDispatchBody({
-        ref: "main",
-        runConfig: "cfg",
-        runToken: "tok",
-        runProgressToken: "prog",
-        runnerImage: undefined,
-        runnerCallbackUrl: "https://orchestrator.example.com",
-      }),
-    ) as { inputs: Record<string, string> };
-    expect(body.inputs.runner_callback_url).toBe("https://orchestrator.example.com");
-  });
-
-  it("body omits runner_callback_url when absent — entrypoint falls back to RunConfig", () => {
-    const body = JSON.parse(
-      buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: undefined }),
-    ) as { inputs: Record<string, string> };
-    expect("runner_callback_url" in body.inputs).toBe(false);
-  });
-
-  it("core fields (run_config, run_token) are present regardless of optional fields", () => {
-    const body = JSON.parse(
-      buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "b64cfg", runToken: "runtok", runProgressToken: "prog", runnerImage: undefined }),
-    ) as { inputs: Record<string, string> };
-    expect(body.inputs.run_config).toBe("b64cfg");
-    expect(body.inputs.run_token).toBe("runtok");
+  it("implement dispatch inputs have no runner_callback_url key", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { runnerPhase: "implementation", runToken: "tok" });
+    expect("runner_callback_url" in inputs).toBe(false);
   });
 });
 

@@ -5,7 +5,7 @@ import {
 } from "./config.js";
 import type { RepoMapping } from "./config.js";
 import { isAlreadyDispatched, markDispatched, closeDb, getDispatchedIds, deleteDispatched } from "./dedup.js";
-import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch, buildKgRefreshGhaDispatchBody } from "./github.js";
+import { dispatchWorkflow, findWorkflowRunId, getWorkflowRunStatus, findPrForRun, providerDispatchFields, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, getPullRequestState, buildEnvelopeDispatchInputs, postPrComment, defaultFetchSignal, getRepoDefaultBranch } from "./github.js";
 import { resolveWorkflowCapabilities, resolveWorkflowContract } from "./workflow-probe.js";
 import { surfaceDispatchFailure } from "./dispatch-failure.js";
 import { providerConfigFromEnv, ProviderRegistry } from "./providers/index.js";
@@ -3030,9 +3030,6 @@ async function handleKgRefreshOutcome(
   }
 }
 
-/** Workflow file expected in the KG source repo for GHA-backed kg-refresh dispatch. */
-const KG_REFRESH_WORKFLOW_FILE = "claude-kg-refresh.yml";
-
 /**
  * Default per-mapping execution mode for kg-refresh. kg-refresh has no project
  * mapping, so we pass "github-actions" as the fallback: on a GHA-primary
@@ -3061,8 +3058,8 @@ async function dispatchKgRefreshRun(
   })();
 
   if (executionPath === "github-actions") {
-    // Dispatch to the kg-refresh workflow in the KG source repo.
-    const dispatchUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/dispatches`;
+    // Dispatch to claude-implement.yml in the KG source repo with runner_phase=kg-refresh.
+    const dispatchUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/actions/workflows/claude-implement.yml/dispatches`;
     const runnerImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
@@ -3071,7 +3068,18 @@ async function dispatchKgRefreshRun(
       runnerImageExplicit: config.runnerImageExplicit,
     });
     const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
-    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl });
+    const dispatchBody = JSON.stringify({
+      ref: defaultBranch,
+      inputs: {
+        run_config: opts.runConfig,
+        run_token: opts.runToken,
+        run_progress_token: opts.runProgressToken,
+        runner_phase: "kg-refresh",
+        job_timeout_minutes: "240",
+        ...(runnerImage ? { runner_image: runnerImage } : {}),
+        ...(runnerCallbackUrl ? { runner_callback_url: runnerCallbackUrl } : {}),
+      },
+    });
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
       signal: defaultFetchSignal(),
@@ -3083,8 +3091,8 @@ async function dispatchKgRefreshRun(
       const errorBody = await dispatchRes.text().catch(() => "");
       if (dispatchRes.status === 422) {
         throw new Error(
-          `[kg-refresh] GHA dispatch failed (HTTP 422): ${KG_REFRESH_WORKFLOW_FILE} not found in ` +
-          `${repo.owner}/${repo.repo} — sync workflows/${KG_REFRESH_WORKFLOW_FILE} to the KG source repo first. ` +
+          `[kg-refresh] GHA dispatch failed (HTTP 422): claude-implement.yml not found in ` +
+          `${repo.owner}/${repo.repo} — re-run workflow sync for the KG source repo mapping. ` +
           `Body: ${errorBody}`,
         );
       }
@@ -3101,7 +3109,7 @@ async function dispatchKgRefreshRun(
     let workflowRunId: number | undefined;
     try {
       const runId = await findWorkflowRunId(
-        ghToken, repo.owner, repo.repo, KG_REFRESH_WORKFLOW_FILE, defaultBranch, dispatchTime,
+        ghToken, repo.owner, repo.repo, "claude-implement.yml", defaultBranch, dispatchTime,
       );
       workflowRunId = runId ?? undefined;
     } catch {
