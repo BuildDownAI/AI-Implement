@@ -2998,12 +2998,12 @@ describe("post-push-review structural invariants", () => {
     expect(source).not.toContain("isPrMerged(");
   });
 
-  it("assertPrWritable appears at exactly 5 call sites (1 definition + 5 calls = 6 occurrences)", () => {
-    // 6 total occurrences of assertPrWritable(:
+  it("assertPrWritable appears at exactly 6 call sites (1 definition + 6 calls = 7 occurrences)", () => {
+    // 7 total occurrences of assertPrWritable(:
     //   1 function definition
-    //   5 call sites: postPrComment first-stmt, lock handler in postPrComment,
+    //   6 call sites: top-of-loop probe, postPrComment first-stmt, lock handler in postPrComment,
     //                 submitPrReview first-stmt, step entry, before git push
     const occurrences = (source.match(/assertPrWritable\(/g) ?? []).length;
-    expect(occurrences).toBe(6);
+    expect(occurrences).toBe(7);
   });
 });

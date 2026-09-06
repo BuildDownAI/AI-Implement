@@ -810,6 +810,8 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
     while (iteration < maxIterations && !approved) {
       iteration++;
+      // Probe before the LLM call: a merge/close between iterations exits immediately rather than burning a full reviewer turn.
+      assertPrWritable(ghSpawn, prNumber);
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
