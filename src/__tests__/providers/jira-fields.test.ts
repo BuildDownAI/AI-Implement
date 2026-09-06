@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { resolveCustomFieldIds, getCachedFieldIds, clearFieldCache, adfParagraph, adfWithLink, STATUS_VALUES } from "../../providers/jira-fields.js";
+import { resolveCustomFieldIds, getCachedFieldIds, clearFieldCache, adfWithLink, STATUS_VALUES } from "../../providers/jira-fields.js";
 
 const baseOverrides = { statusOverride: null, repoOverride: null, profilesOverride: null };
 const baseFields = [
@@ -214,12 +214,6 @@ describe("STATUS_VALUES", () => {
 });
 
 describe("ADF helpers", () => {
-  it("adfParagraph wraps text in a single-paragraph ADF doc", () => {
-    const doc = adfParagraph("hello") as any;
-    expect(doc.type).toBe("doc");
-    expect(doc.content[0].content[0]).toEqual({ type: "text", text: "hello" });
-  });
-
   it("adfWithLink includes a link mark on the label", () => {
     const doc = adfWithLink("PR opened: ", "PR-123", "https://example.com/pr/123") as any;
     const linkText = doc.content[0].content[1];
