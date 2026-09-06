@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { encodeRunConfig, decodeRunConfig } from "../run-config.js";
-import { buildEnvelopeDispatchInputs, buildKgRefreshGhaDispatchBody } from "../github.js";
+import { buildEnvelopeDispatchInputs, buildKgRefreshGhaDispatchBody, pollForKgWorkflowRunId } from "../github.js";
 import type { RepoMapping } from "../config.js";
 import { resolveRunnerImageForDispatch, __clearRepoImageCacheForTests } from "../repo-image.js";
 
@@ -1441,8 +1441,6 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
 
 // ── GHA dispatch: run ID polling (pollForKgWorkflowRunId) ─────────────────────
 // AII-551: verifies the polling loop binds the run ID on a delayed appearance.
-
-import { pollForKgWorkflowRunId } from "../github.js";
 
 describe("GHA kg-refresh dispatch — run ID polling (pollForKgWorkflowRunId)", () => {
   it("binds the run ID that appears on the third poll", async () => {
