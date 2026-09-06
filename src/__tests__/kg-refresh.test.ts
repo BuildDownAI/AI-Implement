@@ -996,6 +996,34 @@ describe("kg-refresh", () => {
       });
     });
 
+    it("updateJobRunId is called when dispatchRun returns workflowRunId (GHA path)", async () => {
+      const appendJobLog = vi.fn(() => 42);
+      const updateJobRunId = vi.fn();
+      const updateJobMachine = vi.fn();
+      buildDispatch({
+        appendJobLog,
+        updateJobRunId,
+        updateJobMachine,
+        dispatchRun: vi.fn(async () => ({ workflowRunId: 999 })),
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(updateJobRunId).toHaveBeenCalledOnce();
+      expect(updateJobRunId).toHaveBeenCalledWith(42, 999);
+      expect(updateJobMachine).not.toHaveBeenCalled();
+    });
+
+    it("updateJobMachine not called when dispatchRun returns only workflowRunId", async () => {
+      const updateJobMachine = vi.fn();
+      buildDispatch({
+        updateJobMachine,
+        dispatchRun: vi.fn(async () => ({ workflowRunId: 123 })),
+      });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(updateJobMachine).not.toHaveBeenCalled();
+    });
+
     it("closeJobLog called immediately with failed when dispatchRun throws", async () => {
       const appendJobLog = vi.fn(() => 77);
       const closeJobLog = vi.fn();

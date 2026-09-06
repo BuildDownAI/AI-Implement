@@ -3016,14 +3016,47 @@ async function handleKgRefreshOutcome(
   }
 }
 
+/** Workflow file dispatched in the KG source repo for GHA-mode kg-refresh runs. */
+const KG_REFRESH_WORKFLOW_FILE = "claude-kg-refresh.yml";
+
+/** Default execution mode for kg-refresh when the global runner mode is "default". */
+const KG_REFRESH_DEFAULT_EXECUTION_MODE: "github-actions" | "fly-machines" = "fly-machines";
+
 async function dispatchKgRefreshRun(
   config: AppConfig,
   opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string },
-): Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }> {
+): Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }> {
   if (!config.kgSourceRepo) throw new Error("KG_SOURCE_REPO not configured");
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
   const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+
+  const { mode: runnerMode } = getRunnerMode();
+  const execPath = resolveExecutionPath(runnerMode, KG_REFRESH_DEFAULT_EXECUTION_MODE);
+  // Shadow mode has no value for an issueless run — collapse to the default path.
+  const effectivePath = execPath === "both" ? KG_REFRESH_DEFAULT_EXECUTION_MODE : execPath;
+
+  if (effectivePath === "github-actions") {
+    const dispatchedAfter = new Date(Date.now() - 30_000);
+    const kgMapping = { owner: repo.owner, repo: repo.repo, workflowFile: KG_REFRESH_WORKFLOW_FILE, defaultBranch } as RepoMapping;
+    const result = await dispatchWorkflow(ghToken, kgMapping, {
+      run_config: opts.runConfig,
+      run_token: opts.runToken,
+      run_progress_token: opts.runProgressToken,
+    });
+    if (!result.success) {
+      const hint = result.status === 422
+        ? ` — the KG source repo may not have synced ${KG_REFRESH_WORKFLOW_FILE} yet`
+        : "";
+      throw new Error(`kg-refresh GHA dispatch failed: HTTP ${result.status}${hint}`);
+    }
+    const workflowRunId = await findWorkflowRunId(
+      ghToken, repo.owner, repo.repo, KG_REFRESH_WORKFLOW_FILE, defaultBranch, dispatchedAfter, getClaimedRunIds(),
+    );
+    console.log(`[kg-refresh] dispatched via GHA (dispatchId=${opts.dispatchId})`);
+    return { workflowRunId: workflowRunId ?? undefined };
+  }
+
   const sessionToken = generateSessionToken();
   const machineNonce = generateMachineNonce();
   const extraEnv: Record<string, string> = {
@@ -3031,7 +3064,7 @@ async function dispatchKgRefreshRun(
     RUN_PROGRESS_TOKEN: opts.runProgressToken,
   };
 
-  if (config.flySessionsToken && config.flySessionsApp) {
+  if (effectivePath === "fly-machines" && config.flySessionsToken && config.flySessionsApp) {
     // Pair the session machine to the same pipeline generation as the orchestrator:
     // resolve via image.yml override first, then try <base>:<AI_IMPLEMENT_SOURCE_COMMIT>
     // (verified against the registry), finally fall back to config.sessionImage.
@@ -3067,7 +3100,7 @@ async function dispatchKgRefreshRun(
     const machine = await createMachine(config.flySessionsToken, config.flySessionsApp, machineConfig);
     console.log(`[kg-refresh] dispatched via Fly (dispatchId=${opts.dispatchId})`);
     return { machineId: machine.id, machineNonce, logsUrl: `https://fly.io/apps/${config.flySessionsApp}/machines/${machine.id}` };
-  } else if (config.localRunnerImage) {
+  } else if (effectivePath === "local-docker" && config.localRunnerImage) {
     const localOrchestratorUrl =
       config.localRunnerOrchestratorUrl ??
       config.runnerCallbackBaseUrl ??
@@ -3097,7 +3130,8 @@ async function dispatchKgRefreshRun(
   } else {
     throw new Error(
       "No execution backend configured for kg-refresh dispatch: " +
-      "set FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP (Fly) or LOCAL_RUNNER_IMAGE (local Docker)",
+      "set FLY_SESSIONS_TOKEN + FLY_SESSIONS_APP (Fly), LOCAL_RUNNER_IMAGE (local Docker), " +
+      "or runner mode gha (GitHub Actions)",
     );
   }
 }
@@ -3116,15 +3150,22 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
       void handleKgRefreshOutcome(config, registry, outcome, data);
     },
     appendJobLog: (opts) => {
+      const { mode: runnerMode } = getRunnerMode();
+      const execPath = resolveExecutionPath(runnerMode, KG_REFRESH_DEFAULT_EXECUTION_MODE);
+      const executionMode = execPath === "both" ? KG_REFRESH_DEFAULT_EXECUTION_MODE : execPath;
       return appendLog({
         issueId: "kg-refresh",
         phase: "kg-refresh",
         dispatchId: opts.dispatchId,
-        executionMode: config.flySessionsToken && config.flySessionsApp ? "fly-machines" : "local-docker",
+        repo: config.kgSourceRepo ?? undefined,
+        executionMode,
       });
     },
     updateJobMachine: (jobId, opts) => {
       updateJobMachineDetails(jobId, opts);
+    },
+    updateJobRunId: (jobId, runId) => {
+      updateJobRunId(jobId, runId);
     },
     closeJobLog: (jobId, status) => {
       updateJobStatus(jobId, status);

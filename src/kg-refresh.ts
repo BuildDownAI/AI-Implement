@@ -154,9 +154,10 @@ interface KgRefreshInput {
   /**
    * Dispatch a kg-refresh runner job. When provided, trigger() dispatches instead of
    * returning ingest-needed. opts.runConfig is the base64-encoded RunConfigV1.
-   * Returns machine identity for job-row tracking (machineId for Fly, machineNonce always).
+   * Returns machine identity for job-row tracking: machineNonce+machineId for Fly/local,
+   * workflowRunId for GHA (both families are optional; whichever is present is used).
    */
-  dispatchRun?: (opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce: string; logsUrl?: string }>;
+  dispatchRun?: (opts: { runToken: string; runProgressToken: string; dispatchId: string; runConfig: string }) => Promise<{ machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number }>;
   /**
    * Record a dispatch_log row before the machine starts. Returns jobId.
    * Called with only dispatchId so the row exists before dispatchRun, closing
@@ -164,10 +165,15 @@ interface KgRefreshInput {
    */
   appendJobLog?: (opts: { dispatchId: string }) => number;
   /**
-   * Update the dispatch_log row with machine identity after dispatch succeeds.
+   * Update the dispatch_log row with machine identity after Fly/local dispatch succeeds.
    * Injectable for tests.
    */
   updateJobMachine?: (jobId: number, opts: { machineNonce: string; machineId?: string; logsUrl?: string }) => void;
+  /**
+   * Link the dispatch_log row to a GHA workflow run ID, promoting status to running.
+   * Injectable for tests.
+   */
+  updateJobRunId?: (jobId: number, runId: number) => void;
   /** Close the dispatch_log row on a terminal outcome. Injectable for tests. */
   closeJobLog?: (jobId: number, status: "completed" | "failed" | "timed_out") => void;
   /**
@@ -621,7 +627,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             // see zero in-flight work between dispatch and row creation.
             currentJobId = input.appendJobLog?.({ dispatchId }) ?? null;
 
-            let dispatchResult: { machineId?: string; machineNonce: string; logsUrl?: string };
+            let dispatchResult: { machineId?: string; machineNonce?: string; logsUrl?: string; workflowRunId?: number };
             try {
               dispatchResult = await input.dispatchRun({ runToken, runProgressToken, dispatchId, runConfig: encodeRunConfig(runConfig) });
             } catch (dispatchErr) {
@@ -633,11 +639,15 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             }
 
             if (currentJobId !== null) {
-              input.updateJobMachine?.(currentJobId, {
-                machineNonce: dispatchResult.machineNonce,
-                machineId: dispatchResult.machineId,
-                logsUrl: dispatchResult.logsUrl,
-              });
+              if (dispatchResult.workflowRunId != null) {
+                input.updateJobRunId?.(currentJobId, dispatchResult.workflowRunId);
+              } else if (dispatchResult.machineNonce != null) {
+                input.updateJobMachine?.(currentJobId, {
+                  machineNonce: dispatchResult.machineNonce,
+                  machineId: dispatchResult.machineId,
+                  logsUrl: dispatchResult.logsUrl,
+                });
+              }
             }
             currentDispatchId = dispatchId;
             stage = "ingest-running";
