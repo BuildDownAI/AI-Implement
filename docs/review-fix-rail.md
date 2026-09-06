@@ -95,9 +95,9 @@ External collection can be disabled per repo via `reviewProviders` in `.ai-imple
 
 1. Find the mapping whose `owner/repo` matches. **No mapping → `skipped`.**
 2. **Paused project → `skipped`.**
-3. Fetch an installation token, then call `getPullRequestState`. **PR merged or closed → `skipped`** with one `[review-fix]` log line; no dispatch is made (`shouldSkipReviewFix` in `src/review-fix-queue.ts`).
-4. Mint result and progress tokens (only when a runner callback is configured).
-5. **Snapshot the currently-open finding ids.** This is what the dispatch is permitted to resolve.
+3. **Snapshot the currently-open finding ids.** This is what the dispatch is permitted to resolve.
+4. Fetch an installation token, then call `getPullRequestState`. **PR merged or closed → `skipped`** with one `[review-fix]` log line; no dispatch is made (`shouldSkipReviewFix` in `src/review-fix-queue.ts`).
+5. Mint result and progress tokens (only when a runner callback is configured).
 6. Dispatch a `gap-analysis` phase run against the existing PR.
 7. Record the dispatch with its snapshot, then mark the queue row `dispatched`.
 

@@ -2789,6 +2789,17 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
       // allowed to resolve. Findings that arrive after the snapshot remain open
       // for a later queue event rather than being cleared by an older run.
       const dispatchFindingIds = listOpenReviewFindings(fix.repo, fix.prNumber).map((finding) => finding.id);
+
+      const [owner] = fix.repo.split("/");
+      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
+
+      const prState = await getPullRequestState(ghToken, mapping.owner, mapping.repo, fix.prNumber);
+      if (shouldSkipReviewFix(prState)) {
+        console.log(`[review-fix] PR #${fix.prNumber} is ${prState?.merged ? "merged" : "closed"}, skipping review fix #${fix.id}`);
+        updateReviewFixStatus(fix.id, "skipped");
+        continue;
+      }
+
       if (config.runnerCallbackBaseUrl && config.runnerTokenSecret) {
         // Gap-fill dispatches run the implementation workflow and can take as
         // long as the initial implementation, even though they report back as
@@ -2814,16 +2825,6 @@ async function processReviewFixQueue(config: AppConfig): Promise<void> {
         runnerCallbackUrl = config.runnerCallbackBaseUrl;
         runToken = minted.token;
         runProgressToken = progressMinted.token;
-      }
-
-      const [owner] = fix.repo.split("/");
-      const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-
-      const prState = await getPullRequestState(ghToken, mapping.owner, mapping.repo, fix.prNumber);
-      if (shouldSkipReviewFix(prState)) {
-        console.log(`[review-fix] PR #${fix.prNumber} is ${prState?.merged ? "merged" : "closed"}, skipping review fix #${fix.id}`);
-        updateReviewFixStatus(fix.id, "skipped");
-        continue;
       }
 
       const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
