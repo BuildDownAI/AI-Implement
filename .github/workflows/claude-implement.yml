@@ -82,6 +82,16 @@ on:
         required: false
         type: string
         default: ""
+      runner_callback_url:
+        description: "Base URL the runner posts results to; empty = not passed (Fly sets it in the machine env)"
+        required: false
+        type: string
+        default: ""
+      runner_phase:
+        description: "Pipeline phase; default 'implementation'. Set to 'kg-refresh' for KG ingest dispatches."
+        required: false
+        type: string
+        default: "implementation"
 
 permissions:
   contents: write
@@ -306,4 +316,6 @@ jobs:
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
           RUN_PUBLICATION_TOKEN: ${{ inputs.run_publication_token }}
+          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
+          RUNNER_PHASE: ${{ inputs.runner_phase }}
         run: /opt/ai-implement/entrypoint.sh
