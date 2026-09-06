@@ -109,3 +109,5 @@ Write `ai-output/comments/01-report.md` with:
 ### 8. Leave all changes uncommitted
 
 Do **NOT** run `git add`, `git commit`, `git push`, or open a pull request. The pipeline step that follows this run owns the repository write. Modified files in `snapshot/` and new files in `ai-output/` will be picked up by the pipeline.
+
+The reviewer is configured to treat uncommitted output under `snapshot/` and `ai-output/` as **expected**, never as a gap. Approval is decided solely by whether the four ingest checks pass (parts written, embeddings rebuilt, stamp written, stats written) — not by the working-tree state.

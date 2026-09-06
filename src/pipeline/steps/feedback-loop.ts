@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
@@ -77,6 +77,8 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   planningContext?: string;
   implementationPrompt?: string;
   parentStepId?: string;
+  /** Optional reviewer rubric appended to review prompts (e.g. kg-refresh-specific approval criteria). */
+  reviewRubric?: string;
 }
 
 export type TerminationReason = "approved" | "iterations_exhausted" | "review_error" | "max_turns";
@@ -469,6 +471,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       }
 
       // --- review sub-step ---
+      const reviewRubric = inputs.reviewRubric !== undefined ? String(inputs.reviewRubric) : undefined;
       const reviewSubStep: Step = {
         id: `review.${iteration}`,
         type: "review",
@@ -483,6 +486,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           issueTitle: inputs.issueTitle,
           issueDescription: inputs.issueDescription,
           acceptanceBar,
+          ...(reviewRubric ? { reviewRubric } : {}),
         },
         outputs: {},
         logs_url: null,
@@ -500,6 +504,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             issueDescription:
               inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
             acceptanceBar,
+            reviewRubric,
           },
           reporter,
         );
@@ -538,6 +543,17 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         `[feedback-loop] exited without approval (${terminationReason}) after ${iteration}/${effectiveMaxIterations} iteration(s). Final feedback: ${feedback || "(none)"}`,
       );
     }
+
+    if (feedback) {
+      try {
+        const feedbackDir = join(String(inputs.workspaceDir), "ai-output", "comments");
+        mkdirSync(feedbackDir, { recursive: true });
+        writeFileSync(join(feedbackDir, "80-reviewer-feedback.md"), feedback, "utf-8");
+      } catch (err) {
+        console.warn(`[feedback-loop] could not write reviewer feedback file (non-fatal): ${String(err)}`);
+      }
+    }
+
     return { approved, iterations: iteration, finalFeedback: feedback, terminationReason, passes, ...(postMortem ? { postMortem } : {}) };
   },
 };
