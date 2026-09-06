@@ -2488,7 +2488,8 @@ async function reportJobCompletion(config: AppConfig, registry: ProviderRegistry
       // terminal job regardless of which backend or path produced it (GHA callback,
       // GHA monitor, Fly, local-docker).
       let pendingBreakerTrip: { phase: string; failures: number; conclusion: string } | null = null;
-      if (job.issueId) {
+      // kg-refresh dispatch never calls isParked(), so breaker bookkeeping here is dead weight that silently mutates DB without notification.
+      if (job.issueId && job.phase !== "kg-refresh") {
         const breakerPhase = job.phase === "planning" ? "planning" : "implementation";
         if (job.status === "completed") {
           recordDispatchSuccess(job.issueId, breakerPhase);
