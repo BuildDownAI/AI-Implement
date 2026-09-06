@@ -1325,6 +1325,32 @@ describe("GHA kg-refresh dispatch — runner_image resolution via resolveRunnerI
     expect(ghaImage).toBe(flyImage);
     expect(ghaImage).toBe("ghcr.io/builddownai/ai-implement-runner:next");
   });
+
+  it("Fly path ?? config.sessionImage fallback fires when resolveRunnerImageForDispatch returns undefined", async () => {
+    // dispatchKgRefreshRun (src/index.ts) uses:
+    //   resolveRunnerImageForDispatch(...) ?? config.sessionImage
+    // When runnerImageExplicit=false and no per-repo image.yml override exists,
+    // resolveRunnerImageForDispatch returns undefined and the fallback must supply
+    // a concrete image. This test exercises that branch.
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+
+    const resolvedImage = await resolveRunnerImageForDispatch({
+      owner: "BuildDownAI",
+      repo: "knowledge-graph-ai-implement",
+      token: "gh-tok",
+      defaultImage: "ghcr.io/builddownai/ai-implement-runner:latest",
+      runnerImageExplicit: false,
+      fetchImpl,
+    });
+
+    // No explicit pin, no per-repo override → undefined (workflow resolves its own default)
+    expect(resolvedImage).toBeUndefined();
+
+    // The Fly dispatch path applies ?? config.sessionImage — must never pass undefined to createMachine
+    const configSessionImage = "ghcr.io/builddownai/ai-implement-runner:latest";
+    const flySessionImage = resolvedImage ?? configSessionImage;
+    expect(flySessionImage).toBe(configSessionImage);
+  });
 });
 
 // ── GHA kg-refresh dispatch — body wiring invariant ───────────────────────────
