@@ -1160,6 +1160,54 @@ describe("kg-refresh", () => {
       expect(dispatchRun).toHaveBeenCalledOnce();
     });
 
+    // ---- AII-546: restart re-adoption via persisted dispatchId and jobId --------
+
+    it("restart with persisted jobId re-adopts in-flight row — onRunnerComplete closes correct log row", async () => {
+      const closeJobLog = vi.fn();
+      const recentTime = Date.now() - 30_000; // 30s ago — well within 4h TTL
+      buildDispatch({
+        closeJobLog,
+        // Always return a new SHA so the local rail can proceed after onRunnerComplete.
+        fetchSnapshotCommitSha: vi.fn().mockResolvedValue(NEW_SNAPSHOT_SHA),
+        loadStage: () => ({
+          stage: "ingest-running" as KgRefreshStage,
+          startedAt: recentTime,
+          dispatchId: "adopted-dispatch-id",
+          jobId: 42,
+        }),
+      });
+      // No trigger() — simulating a callback arriving after a process restart.
+      // The handle was constructed with persisted ingest-running state (within TTL).
+      expect((await handle.status()).stage).toBe("ingest-running");
+      expect((await handle.status()).running).toBe(true);
+      handle.onRunnerComplete("success", {});
+      await waitDone();
+      // closeJobLog must be called with the restored jobId (42), not null or a new one.
+      expect(closeJobLog).toHaveBeenCalledWith(42, "completed");
+    });
+
+    it("TTL expiry on construction discards persisted jobId — closeJobLog never called for stale run", async () => {
+      const closeJobLog = vi.fn();
+      const staleTime = Date.now() - 5 * 60 * 60 * 1000; // 5h ago > 4h TTL
+      buildDispatch({
+        closeJobLog,
+        loadStage: () => ({
+          stage: "ingest-running" as KgRefreshStage,
+          startedAt: staleTime,
+          dispatchId: "stale-dispatch-id",
+          jobId: 88,
+        }),
+      });
+      // TTL expired → handle cleared to idle on construction; persisted jobId discarded
+      const s = await handle.status();
+      expect(s.stage).toBe("idle");
+      expect(s.running).toBe(false);
+      // A late callback for the stale run is rejected by the stage guard
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 30));
+      expect(closeJobLog).not.toHaveBeenCalled();
+    });
+
     // ---- AII-523: operator-cancel -----------------------------------------------
 
     it("operator-cancel: onMachineLost({ failureCode }) is the shared close path — closeJobLog called once with timed_out and failureCode forwarded", async () => {
