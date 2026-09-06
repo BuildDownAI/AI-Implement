@@ -3364,6 +3364,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
           return;
         }
         let cursor: string | null = null;
+        let teamKey = "";
         try {
           const chunks: Buffer[] = [];
           await new Promise<void>((resolve, reject) => {
@@ -3373,8 +3374,9 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
           });
           const raw = Buffer.concat(chunks).toString();
           if (raw.trim()) {
-            const parsed = JSON.parse(raw) as { cursor?: unknown };
+            const parsed = JSON.parse(raw) as { cursor?: unknown; teamKey?: unknown };
             if (typeof parsed.cursor === "string") cursor = parsed.cursor;
+            if (typeof parsed.teamKey === "string") teamKey = parsed.teamKey;
           }
         } catch {
           res.writeHead(400, { "Content-Type": "application/json" });
@@ -3385,6 +3387,8 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
           authorization: req.headers.authorization,
           secret: config.runnerTokenSecret,
           cursor,
+          teamKey,
+          getMappings,
         });
         res.writeHead(result.status, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result.body));

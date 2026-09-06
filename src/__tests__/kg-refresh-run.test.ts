@@ -668,6 +668,7 @@ describe("kgTrackerDataStep", () => {
         workspaceDir: tmpDir,
         fetchImpl: makeFetch([{ ok: true, body: makeTrackerPage(issues, false) }]),
         writeFileSyncImpl: (p, d) => written.push([p, d]),
+        sourcesYmlReaderImpl: () => ["AII"],
       },
       noopReporter,
     );
@@ -677,15 +678,15 @@ describe("kgTrackerDataStep", () => {
     expect(JSON.parse(written[0][1])).toEqual(issues);
   });
 
-  it("paginates and concatenates issues across multiple pages", async () => {
+  it("paginates and concatenates issues across multiple pages for a single team", async () => {
     process.env.RUN_PROGRESS_TOKEN = "test-token";
     const page1Issues = [{ id: "1" }];
     const page2Issues = [{ id: "2" }];
-    const fetchCalls: Array<{ cursor?: string }> = [];
+    const fetchCalls: Array<{ cursor?: string; teamKey?: string }> = [];
     let callIndex = 0;
     const fetchImpl: typeof fetch = async (_, init) => {
-      const body = init?.body ? JSON.parse(init.body as string) as { cursor?: string } : {};
-      fetchCalls.push({ cursor: body.cursor });
+      const body = init?.body ? JSON.parse(init.body as string) as { cursor?: string; teamKey?: string } : {};
+      fetchCalls.push({ cursor: body.cursor, teamKey: body.teamKey });
       const page = callIndex++ === 0
         ? makeTrackerPage(page1Issues, true, "cursor1")
         : makeTrackerPage(page2Issues, false);
@@ -699,13 +700,16 @@ describe("kgTrackerDataStep", () => {
         workspaceDir: tmpDir,
         fetchImpl,
         writeFileSyncImpl: (p, d) => written.push([p, d]),
+        sourcesYmlReaderImpl: () => ["AII"],
       },
       noopReporter,
     );
     expect(result).toEqual({ fetched: true, issueCount: 2 });
     expect(fetchCalls).toHaveLength(2);
     expect(fetchCalls[0].cursor).toBeUndefined();
+    expect(fetchCalls[0].teamKey).toBe("AII");
     expect(fetchCalls[1].cursor).toBe("cursor1");
+    expect(fetchCalls[1].teamKey).toBe("AII");
     expect(JSON.parse(written[0][1])).toEqual([...page1Issues, ...page2Issues]);
   });
 
@@ -718,6 +722,7 @@ describe("kgTrackerDataStep", () => {
           callbackUrl: "http://orch",
           workspaceDir: tmpDir,
           fetchImpl: makeFetch([{ ok: false, status: 502 }]),
+          sourcesYmlReaderImpl: () => ["AII"],
         },
         noopReporter,
       ),
@@ -732,6 +737,7 @@ describe("kgTrackerDataStep", () => {
         callbackUrl: "http://orch",
         workspaceDir: tmpDir,
         fetchImpl: makeFetch([{ ok: false, status: 503 }]),
+        sourcesYmlReaderImpl: () => ["AII"],
       },
       noopReporter,
     );
@@ -744,19 +750,22 @@ describe("kgTrackerDataStep", () => {
     await expect(
       kgTrackerDataStep.run(
         makeContext(),
-        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, sourcesYmlReaderImpl: () => ["AII"] },
         noopReporter,
       ),
     ).rejects.toBeInstanceOf(KgTrackerDataFetchError);
   });
 
-  it("sends Authorization: Bearer <token> on each request", async () => {
+  it("sends Authorization: Bearer <token> and teamKey on each request", async () => {
     process.env.RUN_PROGRESS_TOKEN = "my-secret-token";
     const capturedAuth: string[] = [];
+    const capturedTeamKeys: string[] = [];
     const fetchImpl: typeof fetch = async (_, init) => {
       const headers = init?.headers as Record<string, string> | undefined;
       capturedAuth.push(headers?.["Authorization"] ?? "");
-      return { ok: true, status: 200, json: async () => makeTrackerPage([], false) } as Response;
+      const body = init?.body ? JSON.parse(init.body as string) as { teamKey?: string } : {};
+      capturedTeamKeys.push(body.teamKey ?? "");
+      return { ok: true, status: 200, json: async () => makeTrackerPage([{ id: "1" }], false) } as Response;
     };
     await kgTrackerDataStep.run(
       makeContext(),
@@ -765,11 +774,88 @@ describe("kgTrackerDataStep", () => {
         workspaceDir: tmpDir,
         fetchImpl,
         writeFileSyncImpl: () => {},
+        sourcesYmlReaderImpl: () => ["AII"],
       },
       noopReporter,
     );
     expect(capturedAuth).toHaveLength(1);
     expect(capturedAuth[0]).toBe("Bearer my-secret-token");
+    expect(capturedTeamKeys).toEqual(["AII"]);
+  });
+
+  it("iterates over multiple teams from sources.yml and combines results", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const aiiIssues = [{ id: "aii-1" }];
+    const bdsIssues = [{ id: "bds-1" }, { id: "bds-2" }];
+    const requestBodies: Array<{ teamKey?: string; cursor?: string }> = [];
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const body = init?.body ? JSON.parse(init.body as string) as { teamKey?: string; cursor?: string } : {};
+      requestBodies.push(body);
+      const issues = body.teamKey === "AII" ? aiiIssues : bdsIssues;
+      return { ok: true, status: 200, json: async () => makeTrackerPage(issues, false) } as Response;
+    };
+    const written: Array<[string, string]> = [];
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+        sourcesYmlReaderImpl: () => ["AII", "BDS"],
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: true, issueCount: 3 });
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0].teamKey).toBe("AII");
+    expect(requestBodies[1].teamKey).toBe("BDS");
+    expect(JSON.parse(written[0][1])).toEqual([...aiiIssues, ...bdsIssues]);
+  });
+
+  it("returns { fetched: false } when any configured team returns zero issues", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const aiiIssues = [{ id: "aii-1" }, { id: "aii-2" }];
+    const fetchImpl: typeof fetch = async (_, init) => {
+      const body = init?.body ? JSON.parse(init.body as string) as { teamKey?: string } : {};
+      const issues = body.teamKey === "AII" ? aiiIssues : [];
+      return { ok: true, status: 200, json: async () => makeTrackerPage(issues, false) } as Response;
+    };
+    const written: Array<[string, string]> = [];
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+        sourcesYmlReaderImpl: () => ["AII", "BDS"],
+      },
+      noopReporter,
+    );
+    // BDS returned 0 → fetched: false, but AII issues are still written
+    expect(result.fetched).toBe(false);
+    expect(result.issueCount).toBe(2);
+    expect(written).toHaveLength(1);
+    expect(JSON.parse(written[0][1])).toEqual(aiiIssues);
+  });
+
+  it("returns { fetched: false } when sources.yml is absent or has no teams", async () => {
+    process.env.RUN_PROGRESS_TOKEN = "test-token";
+    const capturedCalls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { capturedCalls.push(args); return {} as Response; };
+    const result = await kgTrackerDataStep.run(
+      makeContext(),
+      {
+        callbackUrl: "http://orch",
+        workspaceDir: tmpDir,
+        fetchImpl,
+        sourcesYmlReaderImpl: () => [],
+      },
+      noopReporter,
+    );
+    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(capturedCalls).toHaveLength(0);
   });
 });
 

@@ -154,11 +154,22 @@ mintRunToken({
 })
 ```
 
-This token is passed as `runToken` into `buildSessionMachineConfig()`, which places it in the machine environment as `RUN_TOKEN`. No progress token is minted; `RUN_PROGRESS_TOKEN` is **not** set in the runner environment.
+Two tokens are minted at dispatch time: the result token above (as `runToken`) and a progress token:
 
-A second (`publication`) token is **not** minted: there is no target repository, so the runner never calls `POST /api/runner/publication-token`.
+```typescript
+mintRunToken({
+  issueId: "kg-refresh",
+  mappingTeamKey: "",      // empty — no ticketing mapping bound
+  phase: "kg-refresh",
+  audience: "progress",
+  ttlSeconds: 4 * 60 * 60,
+  secret: runnerTokenSecret,
+})
+```
 
-> **Current degraded state:** Both vending endpoints below require a bearer token with `audience = "progress"`. Because the kg-refresh dispatch mints only a result token, the runner cannot satisfy those checks. Both endpoints silently fail/skip rather than hard-error — see each section for the exact degradation mode.
+The result token is placed in the machine environment as `RUN_TOKEN`; the progress token as `RUN_PROGRESS_TOKEN`. Both tokens carry an empty `mappingTeamKey` — the team identity for tracker-data fetches comes from the KG source repo's `sources.yml`, not the token.
+
+A third (`publication`) token is **not** minted: there is no target repository, so the runner never calls `POST /api/runner/publication-token`.
 
 ### KG push token
 
@@ -168,21 +179,33 @@ The runner calls `GET /api/runner/kg-push-token` to receive a `contents: write` 
 - Phase-gates: only `phase === "kg-refresh"` tokens are accepted
 - Returns a token scoped exclusively to `owner/repo` of `KG_SOURCE_REPO`
 
-**Degraded state:** the kg-refresh runner only holds a result token. When it presents that token, `verifyRunToken(..., "progress", ...)` returns `verified.ok = false` and the endpoint returns 403. The git credential helper receives the 403 and the KG snapshot push step fails without a usable GitHub token. To restore this path, the dispatch must also mint a progress token and pass it as `RUN_PROGRESS_TOKEN` (see §10 step 4 for how).
-
 ### Tracker-data endpoint
 
-The runner calls `POST /api/runner/kg-tracker-data` to fetch a paginated snapshot of Linear (or Jira) issues for use as ingest context. The endpoint (`src/runner-callback.ts`) verifies with `audience = "progress"`. The `kg-tracker-data` pipeline step (`src/pipeline/steps/kg-tracker-data.ts`) reads `RUN_PROGRESS_TOKEN` and no-ops gracefully when the variable is absent:
+The runner calls `POST /api/runner/kg-tracker-data` once per configured team. The `kg-tracker-data` pipeline step (`src/pipeline/steps/kg-tracker-data.ts`) reads the team list from `sources.yml` in the cloned KG source repo:
 
-```typescript
-const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
-if (!progressToken) {
-  console.log("[kg-tracker-data] no progress token (RUN_PROGRESS_TOKEN); skipping");
-  return;
-}
+```yaml
+trackers:
+  - team: AII
+    kind: linear
+  - team: BDS
+    kind: linear
 ```
 
-**Current behaviour:** because no progress token is minted, `RUN_PROGRESS_TOKEN` is absent in the runner environment and the step always skips. The endpoint is live but non-functional for kg-refresh until a progress token is wired through.
+For each team the step makes a paginated POST loop:
+
+```
+POST /api/runner/kg-tracker-data
+Authorization: Bearer <RUN_PROGRESS_TOKEN>
+{ "teamKey": "AII", "cursor": "<optional>" }
+```
+
+The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the tracker regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
+
+```
+[kg-tracker-data] team AII: 312 issues
+[kg-tracker-data] team BDS: 47 issues
+[kg-tracker-data] fetched 359 issues
+```
 
 ### Callback
 
