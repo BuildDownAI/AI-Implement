@@ -3671,7 +3671,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
 
     // MCP endpoint — OAuth bearer token authenticated
     if (pathname === "/mcp") {
-      handleMcpRequest(req, res, memoryProvider, config.oauthRedirectBaseUrl, memoryProviderDiagnostic).catch((err) => {
+      handleMcpRequest(req, res, memoryProvider, config.oauthRedirectBaseUrl, memoryProviderDiagnostic, config.sessionImage).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

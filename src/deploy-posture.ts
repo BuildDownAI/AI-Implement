@@ -28,7 +28,14 @@ export interface DeployPosture {
   mergeCost: "deploy+image" | "image" | "none";
 }
 
-/** Maps watched branch names to their runner build channel tags. */
+/**
+ * Maps watched branch names to their runner build channel tags.
+ *
+ * Intentionally hardcoded to this orchestrator's own build branches: `main`
+ * builds the `:latest` runner image and `testing` builds `:next`. This is the
+ * correct scope since `get_deploy_posture` reports this orchestrator's own
+ * posture, not a target repo's.
+ */
 export function channelTagForRef(watchedRef: string | null): string | null {
   if (watchedRef === "testing") return "next";
   if (watchedRef === "main") return "latest";
@@ -52,6 +59,10 @@ export function deriveMergeCost(
 
 export async function getDeployPosture(opts?: {
   fetchImpl?: typeof fetch;
+  /** Pre-resolved default runner image from boot config. When provided, avoids
+   *  re-reading process.env; falls back to resolveDefaultRunnerImage(process.env)
+   *  when absent (test paths that don't inject opts). */
+  defaultImage?: string;
 }): Promise<DeployPosture> {
   const policy = getDeployPolicy();
   const stamped = readStampedTarget(process.env);
@@ -71,8 +82,8 @@ export async function getDeployPosture(opts?: {
   const watchedRepo = target ? `${target.owner}/${target.repo}` : null;
   const channelTag = channelTagForRef(watchedRef);
 
-  const { image: defaultImage } = resolveDefaultRunnerImage(process.env);
-  const imageBase = stripImageTag(defaultImage);
+  const rawImage = opts?.defaultImage ?? resolveDefaultRunnerImage(process.env).image;
+  const imageBase = stripImageTag(rawImage);
 
   let channelCommit: string | null = null;
   let matchesHead: boolean | null = null;

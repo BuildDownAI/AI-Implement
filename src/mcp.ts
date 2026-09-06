@@ -103,7 +103,11 @@ const DIAG_TOOLS = [
 
 const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
 
-async function callDiagnosticTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+async function callDiagnosticTool(
+  name: string,
+  args: Record<string, unknown>,
+  context: { defaultRunnerImage?: string } = {},
+): Promise<unknown> {
   switch (name) {
     case "get_tenant_health": {
       const { mode, source } = getRunnerMode();
@@ -223,7 +227,7 @@ async function callDiagnosticTool(name: string, args: Record<string, unknown>): 
     }
 
     case "get_deploy_posture":
-      return getDeployPosture();
+      return getDeployPosture({ defaultImage: context.defaultRunnerImage });
 
     default:
       return { error: `Unknown diagnostic tool: ${name}` };
@@ -238,6 +242,7 @@ export async function handleMcpRequest(
   provider: MemoryProvider | null,
   baseUrl: string | null,
   providerDiagnostic?: string | null,
+  defaultRunnerImage?: string,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -302,7 +307,7 @@ export async function handleMcpRequest(
     if (DIAG_TOOL_NAMES.has(toolName)) {
       const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
       try {
-        const result = await callDiagnosticTool(toolName, toolArgs);
+        const result = await callDiagnosticTool(toolName, toolArgs, { defaultRunnerImage });
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,
