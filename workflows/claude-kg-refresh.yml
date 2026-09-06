@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: ""
+      runner_callback_url:
+        description: "Base URL the runner posts results to (e.g. https://orchestrator.example.com/api/runner/result); empty falls back to RunConfig"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -136,5 +141,6 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RUN_TOKEN: ${{ inputs.run_token }}
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
+          RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUNNER_PHASE: kg-refresh
         run: /opt/ai-implement/entrypoint.sh

@@ -1408,6 +1408,35 @@ describe("GHA kg-refresh dispatch — fetch body wiring (runner_image spread)", 
     expect(bodyNoImage.inputs.run_progress_token).toBe("secret-prog");
     expect("runner_image" in bodyNoImage.inputs).toBe(false);
   });
+
+  it("body includes runner_callback_url when provided", () => {
+    const body = JSON.parse(
+      buildKgRefreshGhaDispatchBody({
+        ref: "main",
+        runConfig: "cfg",
+        runToken: "tok",
+        runProgressToken: "prog",
+        runnerImage: undefined,
+        runnerCallbackUrl: "https://orchestrator.example.com/api/runner/result",
+      }),
+    ) as { inputs: Record<string, string> };
+    expect(body.inputs.runner_callback_url).toBe("https://orchestrator.example.com/api/runner/result");
+  });
+
+  it("body omits runner_callback_url when absent — entrypoint falls back to RunConfig", () => {
+    const body = JSON.parse(
+      buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "cfg", runToken: "tok", runProgressToken: "prog", runnerImage: undefined }),
+    ) as { inputs: Record<string, string> };
+    expect("runner_callback_url" in body.inputs).toBe(false);
+  });
+
+  it("core fields (run_config, run_token) are present regardless of optional fields", () => {
+    const body = JSON.parse(
+      buildKgRefreshGhaDispatchBody({ ref: "main", runConfig: "b64cfg", runToken: "runtok", runProgressToken: "prog", runnerImage: undefined }),
+    ) as { inputs: Record<string, string> };
+    expect(body.inputs.run_config).toBe("b64cfg");
+    expect(body.inputs.run_token).toBe("runtok");
+  });
 });
 
 // ── Real-artifact entrypoint smoke test ───────────────────────────────────────

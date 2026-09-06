@@ -3070,7 +3070,10 @@ async function dispatchKgRefreshRun(
       defaultImage: config.sessionImage,
       runnerImageExplicit: config.runnerImageExplicit,
     });
-    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage });
+    const runnerCallbackUrl = config.runnerCallbackBaseUrl
+      ? `${config.runnerCallbackBaseUrl}/api/runner/result`
+      : undefined;
+    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl });
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
       signal: defaultFetchSignal(),
