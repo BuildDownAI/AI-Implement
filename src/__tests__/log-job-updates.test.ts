@@ -168,6 +168,14 @@ describe("stampJobApproved", () => {
     const job = log.getJobById(id);
     expect(job?.approved).toBe(true);
   });
+
+  it("clears machine_nonce so the row is not exempt from the retention sweep", () => {
+    const id = log.appendLog({ issueId: "sa3", issueIdentifier: "AII-202", executionMode: "github-actions" });
+    log.updateJobMachineDetails(id, { machineNonce: "nonce-abc", machineId: "m1" });
+    expect(log.getJobById(id)?.machineNonce).toBe("nonce-abc");
+    log.stampJobApproved(id, "https://github.com/o/r/pull/3");
+    expect(log.getJobById(id)?.machineNonce).toBeNull();
+  });
 });
 
 describe("getRunRecordMergeVerdict — write-order replay (AII-572)", () => {

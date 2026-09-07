@@ -409,7 +409,8 @@ export function stampJobApproved(jobId: number, prUrl: string): void {
            conclusion = 'runner_approved',
            approved = 1,
            pr_url = COALESCE(?, pr_url),
-           completed_at = COALESCE(completed_at, ?)
+           completed_at = COALESCE(completed_at, ?),
+           machine_nonce = NULL
        WHERE id = ?`,
     )
     .run(prUrl, Date.now(), jobId);
