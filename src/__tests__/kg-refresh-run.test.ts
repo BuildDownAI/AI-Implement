@@ -1858,9 +1858,9 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    // venv setup: python3 -m venv .venv, then pip install -e .
+    // venv setup: python3 -m venv .venv, then pip install -r requirements.txt
     expect(capturedArgs[0]).toEqual(["python3", "-m", "venv", ".venv"]);
-    expect(capturedArgs[1]).toEqual([join(tmpDir, ".venv", "bin", "pip"), "install", "-e", "."]);
+    expect(capturedArgs[1]).toEqual([join(tmpDir, ".venv", "bin", "pip"), "install", "-r", "requirements.txt"]);
     // main ingest uses the venv python
     expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh", "--code-repo", "/some/code-repo", "--tracker-data", join(tmpDir, "tracker-data.json")]);
     expect(capturedCwd[2]).toBe(tmpDir);
@@ -1934,6 +1934,63 @@ describe("kgIngestStep", () => {
     const tail = (err as KgIngestError).outputTail;
     expect(tail).toContain("line 49");
     expect(tail).not.toContain("line 9\n");
+  });
+
+  it("throws KgIngestError when python3 -m venv exits non-zero", async () => {
+    let callCount = 0;
+    const spawnImpl = () => {
+      callCount++;
+      // only venv setup fails; pip install and ingest would succeed but won't be reached
+      return makeFakeProcess(callCount === 1 ? 1 : 0, []) as unknown as ChildProcess;
+    };
+
+    const err = await kgIngestStep
+      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(KgIngestError);
+    expect((err as KgIngestError).exitCode).toBe(1);
+    expect(callCount).toBe(1);
+  });
+
+  it("throws KgIngestError when pip install -r requirements.txt exits non-zero", async () => {
+    let callCount = 0;
+    const spawnImpl = () => {
+      callCount++;
+      // venv setup succeeds, pip install fails
+      return makeFakeProcess(callCount === 2 ? 3 : 0, []) as unknown as ChildProcess;
+    };
+
+    const err = await kgIngestStep
+      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(KgIngestError);
+    expect((err as KgIngestError).exitCode).toBe(3);
+    expect(callCount).toBe(2);
+  });
+
+  it("ingest failure tail does not contain venv-setup or pip-install output", async () => {
+    let callCount = 0;
+    const spawnImpl = (cmd: string, args: string[]) => {
+      callCount++;
+      if (callCount <= 2) {
+        // setup phases succeed but emit recognisable output
+        return makeFakeProcess(0, [`setup-output-${callCount}`]) as unknown as ChildProcess;
+      }
+      // main ingest fails
+      return makeFakeProcess(2, [], ["ingest-error-line"]) as unknown as ChildProcess;
+    };
+
+    const err = await kgIngestStep
+      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(KgIngestError);
+    const tail = (err as KgIngestError).outputTail;
+    expect(tail).toContain("ingest-error-line");
+    expect(tail).not.toContain("setup-output-1");
+    expect(tail).not.toContain("setup-output-2");
   });
 
   it("parses stats JSON from stdout and writes ai-output/kg-stats.json", async () => {

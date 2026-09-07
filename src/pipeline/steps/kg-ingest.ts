@@ -187,8 +187,12 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
     console.log("[kg-ingest] python3 -m venv .venv");
     await runSetup("python3", ["-m", "venv", ".venv"]);
 
-    console.log("[kg-ingest] pip install -e .");
-    await runSetup(venvPip, ["install", "-e", "."]);
+    console.log("[kg-ingest] pip install -r requirements.txt");
+    await runSetup(venvPip, ["install", "-r", "requirements.txt"]);
+
+    // Reset the shared tail buffer so ingest failures only contain ingest output,
+    // not leftover venv-setup or pip-install lines.
+    tailBuffer.length = 0;
 
     const ingestArgs = ["-m", "kg_ingest", "refresh"];
     if (codeRepoDir) ingestArgs.push("--code-repo", codeRepoDir);
