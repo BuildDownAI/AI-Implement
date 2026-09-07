@@ -1858,8 +1858,12 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(capturedArgs[0]).toEqual(["python", "-m", "kg_ingest", "refresh", "--code-repo", "/some/code-repo", "--tracker-data", join(tmpDir, "tracker-data.json")]);
-    expect(capturedCwd[0]).toBe(tmpDir);
+    // venv setup: python3 -m venv .venv, then pip install -e .
+    expect(capturedArgs[0]).toEqual(["python3", "-m", "venv", ".venv"]);
+    expect(capturedArgs[1]).toEqual([join(tmpDir, ".venv", "bin", "pip"), "install", "-e", "."]);
+    // main ingest uses the venv python
+    expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh", "--code-repo", "/some/code-repo", "--tracker-data", join(tmpDir, "tracker-data.json")]);
+    expect(capturedCwd[2]).toBe(tmpDir);
     expect(writtenFiles).toHaveLength(1);
     expect(writtenFiles[0][0]).toBe(join(tmpDir, "ai-output", "kg-stats.json"));
     const stats = JSON.parse(writtenFiles[0][1]) as Record<string, unknown>;
@@ -1887,8 +1891,8 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(capturedArgs[0]).toEqual(["python", "-m", "kg_ingest", "refresh", "--code-repo", "/repo"]);
-    expect(capturedArgs[0]).not.toContain("--tracker-data");
+    expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh", "--code-repo", "/repo"]);
+    expect(capturedArgs[2]).not.toContain("--tracker-data");
   });
 
   it("spawns without --code-repo when codeRepoDir is absent", async () => {
@@ -1910,8 +1914,8 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(capturedArgs[0]).toEqual(["python", "-m", "kg_ingest", "refresh"]);
-    expect(capturedArgs[0]).not.toContain("--code-repo");
+    expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh"]);
+    expect(capturedArgs[2]).not.toContain("--code-repo");
   });
 
   it("throws KgIngestError with exit code and last 40 lines on non-zero exit", async () => {
@@ -1981,6 +1985,8 @@ describe("kgIngestStep", () => {
     expect(written).toHaveLength(1);
     const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
     expect(stats.quads).toBe(150);
+    expect(stats.vectors).toBe(0);
+    expect(stats.docPages).toBe(0);
   });
 
   it("writes stats with quads=0 when no stats JSON and snapshot/parts is absent", async () => {
@@ -2003,6 +2009,8 @@ describe("kgIngestStep", () => {
     expect(written).toHaveLength(1);
     const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
     expect(stats.quads).toBe(0);
+    expect(stats.vectors).toBe(0);
+    expect(stats.docPages).toBe(0);
   });
 });
 

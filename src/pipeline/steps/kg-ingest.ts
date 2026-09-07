@@ -82,13 +82,13 @@ function fallbackStatsFromParts(
   durationSec: number,
 ): KgStats {
   const partsDir = join(workspaceDir, "snapshot", "parts");
-  if (!existsFn(partsDir)) return { quads: 0, durationSec };
+  if (!existsFn(partsDir)) return { quads: 0, vectors: 0, docPages: 0, durationSec };
   let total = 0;
   let files: string[];
   try {
     files = readdirFn(partsDir).filter((f) => f.endsWith(".nt"));
   } catch {
-    return { quads: 0, durationSec };
+    return { quads: 0, vectors: 0, docPages: 0, durationSec };
   }
   for (const file of files) {
     try {
@@ -98,7 +98,26 @@ function fallbackStatsFromParts(
       // skip unreadable files
     }
   }
-  return { quads: total, durationSec };
+  return { quads: total, vectors: 0, docPages: 0, durationSec };
+}
+
+function buildLineReader(
+  stream: NodeJS.ReadableStream,
+  onLine: (line: string) => void,
+): void {
+  let buf = "";
+  stream.on("data", (chunk: Buffer | string) => {
+    buf += typeof chunk === "string" ? chunk : chunk.toString("utf-8");
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      onLine(line);
+    }
+  });
+  stream.on("end", () => {
+    if (buf) onLine(buf);
+  });
 }
 
 export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
@@ -123,62 +142,83 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
       ((cmd, args, opts) =>
         spawn(cmd, args, opts as Parameters<typeof spawn>[2]) as ChildProcess);
 
-    const args = ["-m", "kg_ingest", "refresh"];
-    if (codeRepoDir) args.push("--code-repo", codeRepoDir);
+    const tailBuffer: string[] = [];
+
+    function pushTail(line: string): void {
+      tailBuffer.push(line);
+      if (tailBuffer.length > MAX_TAIL_LINES) tailBuffer.shift();
+    }
+
+    function currentTail(): string {
+      let tail = tailBuffer.join("\n");
+      if (tail.length > MAX_TAIL_BYTES) {
+        tail = "..." + tail.slice(tail.length - MAX_TAIL_BYTES);
+      }
+      return tail;
+    }
+
+    async function runSetup(command: string, args: string[]): Promise<void> {
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawnFn(command, args, {
+          cwd: workspaceDir,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        buildLineReader(proc.stdout!, pushTail);
+        buildLineReader(proc.stderr!, pushTail);
+        proc.on("close", (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new KgIngestError(code ?? 1, currentTail()));
+          }
+        });
+        proc.on("error", (err) => {
+          reject(new KgIngestError(1, `spawn error (${command}): ${err.message}`));
+        });
+      });
+    }
+
+    // Create Python virtual environment and install KG source repo dependencies.
+    // Dockerfile.session installs python3/python3-pip/python3-venv but not a
+    // bare `python` binary, so we use python3 throughout.
+    const venvPython = join(workspaceDir, ".venv", "bin", "python");
+    const venvPip = join(workspaceDir, ".venv", "bin", "pip");
+
+    console.log("[kg-ingest] python3 -m venv .venv");
+    await runSetup("python3", ["-m", "venv", ".venv"]);
+
+    console.log("[kg-ingest] pip install -e .");
+    await runSetup(venvPip, ["install", "-e", "."]);
+
+    const ingestArgs = ["-m", "kg_ingest", "refresh"];
+    if (codeRepoDir) ingestArgs.push("--code-repo", codeRepoDir);
 
     const trackerDataFile = join(workspaceDir, "tracker-data.json");
-    if (existsFn(trackerDataFile)) args.push("--tracker-data", trackerDataFile);
+    if (existsFn(trackerDataFile)) ingestArgs.push("--tracker-data", trackerDataFile);
 
-    console.log(`[kg-ingest] python ${args.join(" ")}`);
+    console.log(`[kg-ingest] ${venvPython} ${ingestArgs.join(" ")}`);
     const start = Date.now();
 
     const stdoutLines: string[] = [];
-    const tailBuffer: string[] = [];
 
     await new Promise<void>((resolve, reject) => {
-      const proc = spawnFn("python", args, {
+      const proc = spawnFn(venvPython, ingestArgs, {
         cwd: workspaceDir,
         stdio: ["ignore", "pipe", "pipe"],
       });
 
-      function pushLine(line: string): void {
-        tailBuffer.push(line);
-        if (tailBuffer.length > MAX_TAIL_LINES) tailBuffer.shift();
-      }
-
-      function attachLineReader(stream: NodeJS.ReadableStream, isStdout: boolean): void {
-        let buf = "";
-        stream.on("data", (chunk: Buffer | string) => {
-          buf += typeof chunk === "string" ? chunk : chunk.toString("utf-8");
-          let nl: number;
-          while ((nl = buf.indexOf("\n")) >= 0) {
-            const line = buf.slice(0, nl);
-            buf = buf.slice(nl + 1);
-            pushLine(line);
-            if (isStdout) stdoutLines.push(line);
-          }
-        });
-        stream.on("end", () => {
-          if (buf) {
-            pushLine(buf);
-            if (isStdout) stdoutLines.push(buf);
-          }
-        });
-      }
-
-      attachLineReader(proc.stdout!, true);
-      attachLineReader(proc.stderr!, false);
+      buildLineReader(proc.stdout!, (line) => {
+        pushTail(line);
+        stdoutLines.push(line);
+      });
+      buildLineReader(proc.stderr!, pushTail);
 
       proc.on("close", (code) => {
         if (code === 0) {
           resolve();
         } else {
           const exitCode = code ?? 1;
-          let tail = tailBuffer.join("\n");
-          if (tail.length > MAX_TAIL_BYTES) {
-            tail = "..." + tail.slice(tail.length - MAX_TAIL_BYTES);
-          }
-          reject(new KgIngestError(exitCode, tail));
+          reject(new KgIngestError(exitCode, currentTail()));
         }
       });
 
@@ -189,16 +229,24 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
 
     const durationSec = (Date.now() - start) / 1000;
 
+    // Use last-match-wins so a final summary line takes precedence over any
+    // interim progress lines the CLI might emit with the same shape.
     let stats: KgStats | null = null;
     for (const line of stdoutLines) {
-      stats = tryParseStats(line);
-      if (stats) break;
+      const parsed = tryParseStats(line);
+      if (parsed) stats = parsed;
     }
 
     if (!stats) {
       stats = fallbackStatsFromParts(workspaceDir, existsFn, readdirFn, readFileFn, durationSec);
-    } else if (stats.durationSec === undefined) {
-      stats = { ...stats, durationSec };
+    } else {
+      // Ensure all four fields required by the review rubric are present.
+      stats = {
+        quads: stats.quads,
+        vectors: stats.vectors ?? 0,
+        docPages: stats.docPages ?? 0,
+        durationSec: stats.durationSec ?? durationSec,
+      };
     }
 
     const aiOutputDir = join(workspaceDir, "ai-output");
