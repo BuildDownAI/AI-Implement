@@ -52,6 +52,9 @@ describe("postRunnerResult", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    // vi.spyOn returns the existing spy when a method is already mocked, so an
+    // unrestored console spy carries the previous test's calls into the next one.
+    vi.restoreAllMocks();
   });
 
   // Task 4: the runner now always reports an outcome — the caller (run-autonomous.ts)
@@ -69,5 +72,45 @@ describe("postRunnerResult", () => {
     });
 
     expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("logs the phase and outcome when the post succeeds", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("POST ok phase=implementation outcome=success"),
+    );
+  });
+
+  it("logs the status and does not claim success when the post is refused", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      text: async () => '{"error":"already_consumed"}',
+    });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST failed HTTP 409"));
+    expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("POST ok"));
   });
 });

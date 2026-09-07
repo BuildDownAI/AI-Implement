@@ -249,3 +249,84 @@ describe("verifyAndConsumeRunToken", () => {
     if (!result.ok) expect(result.reason).toBe("wrong_audience");
   });
 });
+
+describe("verifyRunToken — claims on a refusal", () => {
+  it("carries claims when the token is already consumed", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    expect(runnerTokens.verifyAndConsumeRunToken(token, SECRET).ok).toBe(true);
+
+    const second = runnerTokens.verifyAndConsumeRunToken(token, SECRET);
+    expect(second.ok).toBe(false);
+    if (!second.ok) {
+      expect(second.reason).toBe("already_consumed");
+      expect(second.claims?.dispatchId).toBe(dispatchId);
+      expect(second.claims?.phase).toBe("implementation");
+    }
+  });
+
+  it("carries claims when the audience does not match", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const result = runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("wrong_audience");
+      expect(result.claims?.dispatchId).toBe(dispatchId);
+    }
+  });
+
+  it("carries claims when the token has expired", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: -1,
+      secret: SECRET,
+    });
+
+    const result = runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("expired");
+      expect(result.claims?.dispatchId).toBe(dispatchId);
+    }
+  });
+
+  it("omits claims when the token is malformed or badly signed", () => {
+    const malformed = runnerTokens.verifyRunToken("not-a-token", SECRET, "result", { consume: false });
+    expect(malformed.ok).toBe(false);
+    if (!malformed.ok) {
+      expect(malformed.reason).toBe("malformed");
+      expect(malformed.claims).toBeUndefined();
+    }
+
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const tampered = `${token.split(".")[0]}.${"A".repeat(token.split(".")[1].length)}`;
+
+    const badSig = runnerTokens.verifyRunToken(tampered, SECRET, "result", { consume: false });
+    expect(badSig.ok).toBe(false);
+    if (!badSig.ok) {
+      expect(badSig.reason).toBe("bad_signature");
+      expect(badSig.claims).toBeUndefined();
+    }
+  });
+});

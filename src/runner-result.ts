@@ -77,8 +77,11 @@ export async function postRunnerResult(params: {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${runToken}` },
       body: JSON.stringify(body),
     });
-    if (!res.ok)
+    if (!res.ok) {
       console.error(`[runner-callback] POST failed HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+    } else {
+      console.log(`[runner-callback] POST ok phase=${params.phase} outcome=${params.outcome}`);
+    }
   } catch (err) {
     console.error("[runner-callback] POST failed:", err);
   }
