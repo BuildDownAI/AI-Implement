@@ -97,6 +97,7 @@ describe("kg-refresh callback-URL contract", () => {
       canaryRetryMs: 30,
       runnerCallbackBaseUrl: BASE,
       runnerTokenSecret: "secret",
+      resolveMappingTeamKey: (repo: string) => repo === "TestOrg/test-kg" ? { teamKey: "KGA", dependencyTokenScope: "installation" } : undefined,
       mintRunTokenFn: mintRunTokenFn as never,
       dispatchRun: dispatchRun as never,
       fetchCommitVisible: vi.fn(async () => true) as never,

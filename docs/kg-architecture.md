@@ -349,8 +349,7 @@ any other phase or a missing/invalid token receives `403 Unauthorized` with no d
 The orchestrator performs all external writes with its own credentials; the runner receives only the
 minted token or the requested data.
 
-**Code-repo in the workspace (AII-564, child 1).** Every dispatched kg-refresh `RunConfigV1`
-carries `dependencyTokenScope: "installation"`, hardcoded in `src/kg-refresh.ts`. This activates
+**Code-repo in the workspace (AII-564, child 1).** Both run tokens for a kg-refresh dispatch are minted with the team key of the KG source repo's own project mapping (the mapping whose `owner/repo` equals `kgSourceRepo`), so the dependency-token endpoint can locate that mapping and check its `dependencyTokenScope` setting; if the mapping has `dependencyTokenScope = "installation"`, the endpoint vends the token and activates
 the `dependency-auth` step, which mints an installation-wide `contents: read` token and installs
 it as a git credential helper (the existing dependency-auth mechanism — no new token kind). A
 `clone-code-repo` step (type: `clone`) then reads the `code_repo: owner/repo` field from

@@ -553,6 +553,7 @@ describe("kg-refresh", () => {
         canaryRetryMs: 30,
         runnerCallbackBaseUrl: "http://localhost:8080",
         runnerTokenSecret: "secret",
+        resolveMappingTeamKey: (repo: string) => repo === "TestOrg/test-kg" ? { teamKey: "KGA", dependencyTokenScope: "installation" } : undefined,
         mintRunTokenFn: mintRunTokenFn as never,
         dispatchRun: dispatchRun as never,
         fetchCommitVisible: fetchCommitVisible as never,
@@ -588,6 +589,44 @@ describe("kg-refresh", () => {
       expect(r.status).toBe(422);
       expect((r.body as { precondition?: string }).precondition).toBe("callback-unconfigured");
       expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("returns 422 when dispatchRun configured but KG source repo has no mapping", async () => {
+      buildDispatch({ resolveMappingTeamKey: () => undefined });
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      expect((r.body as { precondition?: string }).precondition).toBe("kg-mapping-not-found");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("mints run tokens with the KG repo mapping team key", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(mintRunTokenFn).toHaveBeenCalledTimes(2);
+      const [firstCall, secondCall] = mintRunTokenFn.mock.calls as Array<[{ mappingTeamKey: string; audience: string }]>;
+      expect(firstCall[0].mappingTeamKey).toBe("KGA");
+      expect(firstCall[0].audience).toBe("result");
+      expect(secondCall[0].mappingTeamKey).toBe("KGA");
+      expect(secondCall[0].audience).toBe("progress");
+    });
+
+    it("runConfig envelope carries dependencyTokenScope from the KG repo mapping", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+      const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+      expect(decoded).toHaveProperty("dependencyTokenScope", "installation");
+    });
+
+    it("runConfig envelope omits dependencyTokenScope when mapping has scope=null", async () => {
+      buildDispatch({ resolveMappingTeamKey: (repo: string) => repo === "TestOrg/test-kg" ? { teamKey: "KGA", dependencyTokenScope: null } : undefined });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+      const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+      expect(decoded).not.toHaveProperty("dependencyTokenScope");
     });
 
     it("dispatches runner when ingest-needed and dispatchRun configured", async () => {
