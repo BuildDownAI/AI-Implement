@@ -239,13 +239,27 @@ export async function handleRunnerResult(
   // if a provider outage caused dropped comments.
   const verified = verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
+    console.warn(
+      `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
+        `phase=${input.body.phase} outcome=${input.body.outcome} reason=${verified.reason}`,
+    );
     return verified.reason === "already_consumed"
       ? bad(409, "already_consumed")
       : bad(401, verified.reason);
   }
+  console.log(
+    `[runner-callback] result accepted dispatch=${verified.claims.dispatchId} ` +
+      `phase=${verified.claims.phase} outcome=${input.body.outcome} comments=${input.body.comments.length}`,
+  );
 
   const { claims, mappingTeamKey } = verified;
-  if (claims.phase !== input.body.phase) return bad(400, "phase_mismatch");
+  if (claims.phase !== input.body.phase) {
+    console.warn(
+      `[runner-callback] result burned dispatch=${claims.dispatchId} reason=phase_mismatch ` +
+        `token=${claims.phase} body=${input.body.phase}`,
+    );
+    return bad(400, "phase_mismatch");
+  }
 
   // kg-refresh runs have no mapping and no tracker issue to update.
   // Route the callback directly to the refresh rail and return early.
@@ -267,6 +281,7 @@ export async function handleRunnerResult(
     !input.body.prUrl &&
     !input.body.noWork
   ) {
+    console.warn(`[runner-callback] result burned dispatch=${claims.dispatchId} reason=missing_prUrl`);
     return bad(400, "missing_prUrl");
   }
 
