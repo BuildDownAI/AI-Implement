@@ -20,6 +20,7 @@ import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
+import type { ReferenceRepo } from "./reference-repos.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -215,6 +216,7 @@ export interface ResolvedRunnerInputs {
   skillsRepo: string | undefined;
   sensitiveFiles: { add?: string[]; allow?: string[] } | undefined;
   dependencyTokenScope: "installation" | undefined;
+  referenceRepos: ReferenceRepo[] | undefined;
   baseBranch: string | undefined;
   profiles: string[];
   githubOwner: string;
@@ -279,6 +281,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     skillsRepo: cfg.skillsRepo,
     sensitiveFiles: cfg.sensitiveFiles,
     dependencyTokenScope: cfg.dependencyTokenScope,
+    referenceRepos: cfg.referenceRepos,
     baseBranch: cfg.baseBranch,
     profiles: cfg.profiles
       ? cfg.profiles
@@ -335,6 +338,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
   })();
   const skillsRepo = env.AI_IMPLEMENT_SKILLS_REPO?.trim() || undefined;
   const dependencyTokenScope = undefined;
+  const referenceRepos = undefined;
   const profiles = (env.AI_IMPLEMENT_PROFILES ?? "")
     .split(",")
     .map((p) => p.trim())
@@ -355,6 +359,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     skillsRepo,
     sensitiveFiles: undefined,
     dependencyTokenScope,
+    referenceRepos,
     baseBranch: undefined,
     profiles,
     githubOwner,
@@ -393,6 +398,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     skillsRepo,
     sensitiveFiles,
     dependencyTokenScope,
+    referenceRepos,
     baseBranch,
     profiles,
     logLevel,
@@ -493,6 +499,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       skillsRepo,
       sensitiveFiles,
       dependencyTokenScope,
+      referenceRepos,
       profiles,
       groupingParent,
       callbackUrl: callbackUrl ?? undefined,

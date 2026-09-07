@@ -75,6 +75,8 @@ export interface PipelineContextData {
   callbackUrl?: string;
   /** Autonomous runner: per-project dependency-repo read access scope (from run_config envelope). */
   dependencyTokenScope?: "installation";
+  /** Autonomous runner: reference repositories to clone read-only into the workspace (from run_config envelope). */
+  referenceRepos?: import("../reference-repos.js").ReferenceRepo[];
   /** Autonomous runner: optional reviewer rubric appended to the review prompt (e.g. kg-refresh-specific approval criteria). */
   reviewRubric?: string;
   /** Autonomous runner: short-lived read token minted by the dependency-auth step; set on context rather than returned as a step output so it is never persisted to the step log. */

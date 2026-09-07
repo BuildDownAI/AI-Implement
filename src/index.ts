@@ -35,6 +35,7 @@ import { initAccessPageGrantsTable } from "./access-page-grants.js";
 import { handleTokenRequest } from "./token-vending.js";
 import { handleDependencyTokenRequest } from "./dependency-token-vending.js";
 import { handlePublicationTokenRequest } from "./publication-token-vending.js";
+import { handleReferenceTokenRequest } from "./reference-token-vending.js";
 import { handleStatusUpdate, handleStepReport } from "./session-api.js";
 import { postStatusComment } from "./status-events.js";
 import { classifyCompletion, renderClassification } from "./completion-classification.js";
@@ -3354,6 +3355,33 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[publication-token] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Reference token vending — progress token authenticated, per-owner contents:read mints for declared referenceRepos
+    if (url === "/api/runner/reference-token" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const result = await handleReferenceTokenRequest({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          githubAppId: config.githubAppId,
+          githubAppPrivateKey: config.githubAppPrivateKey,
+          resolveMapping: (key) => getMappings()[key],
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[reference-token] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

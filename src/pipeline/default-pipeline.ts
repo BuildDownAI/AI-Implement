@@ -3,6 +3,7 @@ import type { PipelineDefinition, StepModule } from "./types.js";
 import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { installSkillsStep } from "./steps/install-skills.js";
+import { referenceReposStep } from "./steps/reference-repos.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { installStep } from "./steps/install.js";
 import { postPushReviewStep } from "./steps/post-push-review.js";
@@ -23,6 +24,7 @@ export const DEFAULT_PIPELINE: PipelineDefinition = loadPipelineDefinition(
 
 const BUILTIN_STEPS: Array<[string, StepModule]> = [
   ["clone", cloneStep],
+  ["reference-repos", referenceReposStep],
   ["install-skills", installSkillsStep],
   ["dependency-auth", dependencyAuthStep],
   ["install", installStep],
