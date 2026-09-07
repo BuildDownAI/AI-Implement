@@ -3,6 +3,10 @@ import { attachJobRunIdIfMissing, getJobById, updateJobStatus, updateJobRunId } 
 import type { Job, JobStatus } from "./log.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 
+// How long to wait for a GHA workflow run ID to appear before treating the dispatch as lost.
+// Mirrors the RUN_ID_TIMEOUT_MS used for issue-keyed runs (src/index.ts).
+const GHA_DISPATCH_GRACE_MS = 10 * 60 * 1000; // 10 minutes
+
 /**
  * Monitor a kg-refresh GHA job through its full lifecycle: lazy-bind the run ID
  * if not yet set, then check run status and close the row on completion.
@@ -11,9 +15,10 @@ import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
  * file and branch directly ("claude-implement.yml" + repo default branch) rather
  * than using the mapping lookup that would return nothing.
  *
- * onHandleLost is called when the GHA run concludes or goes overdue so that
- * KgRefreshHandle's in-memory running/stage lock is cleared promptly — not just
- * via TTL or the next trigger() call — in case the runner callback never arrived.
+ * onHandleLost is called when the GHA run concludes, goes overdue, or the dispatch
+ * grace window expires without a run ID appearing (dispatch_lost). This clears
+ * KgRefreshHandle's in-memory running/stage lock promptly — not just via TTL or
+ * the next trigger() call — in case the runner callback never arrived.
  * onMachineLost is idempotent (no-op when stage ≠ ingest-running), so it is
  * safe to call even when the callback already landed.
  *
@@ -29,13 +34,20 @@ export async function monitorKgRefreshGhaJob(
 ): Promise<void> {
   if (!job.runId) {
     // Lazy bind: find the workflow run ID for this dispatch.
-    // No RUN_ID_TIMEOUT_MS here — KgRefreshHandle's TTL watchdog handles prolonged waits.
     const kgBranch = (await getRepoDefaultBranch(ghToken, owner, repo)) ?? "main";
     const dispatchTime = new Date(job.dispatchedAt - 30_000);
     const runId = await findWorkflowRunId(
       ghToken, owner, repo, "claude-implement.yml", kgBranch, dispatchTime, claimedRunIds,
     );
-    if (!runId) return; // Still waiting
+    if (!runId) {
+      // Grace window expired with no run ID → workflow_dispatch was silently lost.
+      if (Date.now() - job.dispatchedAt > GHA_DISPATCH_GRACE_MS) {
+        const elapsedMin = Math.round((Date.now() - job.dispatchedAt) / 60000);
+        console.warn(`[monitor] kg-refresh job ${job.id} dispatch_lost: no run ID found after ${elapsedMin}m`);
+        onHandleLost?.({ failureCode: "dispatch_lost" });
+      }
+      return;
+    }
     if (!attachJobRunIdIfMissing(job.id, runId)) return; // Another path already bound a run ID
     claimedRunIds.add(runId);
     job.runId = runId;

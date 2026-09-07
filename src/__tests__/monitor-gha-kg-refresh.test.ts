@@ -113,6 +113,30 @@ describe("monitorKgRefreshGhaJob — lazy bind", () => {
     expect(getWorkflowRunStatus).not.toHaveBeenCalled();
   });
 
+  it("calls onHandleLost with dispatch_lost when grace window expires with no run ID", async () => {
+    vi.mocked(findWorkflowRunId).mockResolvedValue(null);
+
+    const onHandleLost = vi.fn();
+    // dispatchedAt = 11 minutes ago (past the 10-minute grace window)
+    const job = makeKgJob({ runId: null, dispatchedAt: Date.now() - 11 * 60 * 1000 });
+    await monitorKgRefreshGhaJob(GH_TOKEN, OWNER, REPO, job, new Set(), onHandleLost);
+
+    expect(onHandleLost).toHaveBeenCalledOnce();
+    expect(onHandleLost).toHaveBeenCalledWith({ failureCode: "dispatch_lost" });
+    expect(attachJobRunIdIfMissing).not.toHaveBeenCalled();
+  });
+
+  it("does not call onHandleLost when no run ID but grace window has not yet expired", async () => {
+    vi.mocked(findWorkflowRunId).mockResolvedValue(null);
+
+    const onHandleLost = vi.fn();
+    // dispatchedAt = 5 minutes ago (within the 10-minute grace window)
+    const job = makeKgJob({ runId: null, dispatchedAt: Date.now() - 5 * 60 * 1000 });
+    await monitorKgRefreshGhaJob(GH_TOKEN, OWNER, REPO, job, new Set(), onHandleLost);
+
+    expect(onHandleLost).not.toHaveBeenCalled();
+  });
+
   it("returns without status check when attachJobRunIdIfMissing returns false (already bound)", async () => {
     vi.mocked(findWorkflowRunId).mockResolvedValue(RUN_ID);
     vi.mocked(attachJobRunIdIfMissing).mockReturnValue(false);
