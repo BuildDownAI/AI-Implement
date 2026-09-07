@@ -15,6 +15,13 @@ interface CloneInputs extends Record<string, unknown> {
   prNumber?: string;
   orchestratorUrl?: string;
   machineNonce?: string;
+  /**
+   * When set, clone into this subdirectory of workspaceDir rather than workspaceDir itself.
+   * Auth is supplied by the git credential helper installed by dependency-auth (bare remote URL,
+   * no token embedded). refreshRunnerGithubCredentials is not called for secondary clones.
+   * Used by the clone-code-repo step to place the code repo alongside the KG source workspace.
+   */
+  targetDir?: string;
 }
 
 interface CloneOutputs extends Record<string, unknown> {
@@ -33,7 +40,70 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     inputs: CloneInputs,
     _reporter: StepReporter,
   ): Promise<CloneOutputs> {
-    const { repoOwner, repoRepo, branch, githubToken, workspaceDir } = inputs;
+    const { repoOwner, repoRepo, branch, githubToken, workspaceDir, targetDir } = inputs;
+
+    // Secondary clone into a subdirectory (e.g. the clone-code-repo step).
+    // The credential helper installed by dependency-auth supplies auth — no token in the URL.
+    if (targetDir) {
+      const effectiveDir = path.join(workspaceDir, targetDir);
+
+      if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
+        // The bind-mount covers the KG source repo only; code-repo/ does not exist.
+        console.warn(`[clone] mounted mode: skipping secondary clone into ${targetDir}`);
+        return { workspaceDir: effectiveDir, clonedRef: "unknown", cloneMethod: "mounted", repoOwner, repoRepo, branch, githubToken };
+      }
+
+      const bareRemote = `https://github.com/${repoOwner}/${repoRepo}.git`;
+      let cloneMethod: "fresh" | "incremental";
+
+      if (fs.existsSync(path.join(effectiveDir, ".git"))) {
+        const branchArgs = branch ? [branch] : [];
+        const fetchResult = spawnSync(
+          "git",
+          ["fetch", "--depth", "1", "origin", ...branchArgs],
+          { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+        );
+        if (fetchResult.status !== 0) {
+          const stderr = fetchResult.stderr?.toString() ?? "";
+          throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+        }
+        const resetTarget = branch ? `origin/${branch}` : "FETCH_HEAD";
+        const resetResult = spawnSync(
+          "git",
+          ["reset", "--hard", resetTarget],
+          { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+        );
+        if (resetResult.status !== 0) {
+          const stderr = resetResult.stderr?.toString() ?? "";
+          throw new Error(`git reset failed (exit ${resetResult.status ?? "null"}): ${stderr}`);
+        }
+        cloneMethod = "incremental";
+      } else {
+        const branchArgs = branch ? ["--branch", branch] : [];
+        const cloneResult = spawnSync(
+          "git",
+          ["clone", "--depth", "1", ...branchArgs, bareRemote, effectiveDir],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        );
+        if (cloneResult.status !== 0) {
+          const stderr = cloneResult.stderr?.toString() ?? "";
+          throw new Error(`git clone failed (exit ${cloneResult.status ?? "null"}): ${stderr}`);
+        }
+        cloneMethod = "fresh";
+      }
+
+      const revResult = spawnSync("git", ["rev-parse", "HEAD"], {
+        cwd: effectiveDir,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (revResult.status !== 0) {
+        const stderr = revResult.stderr?.toString() ?? "";
+        throw new Error(`git rev-parse HEAD failed (exit ${revResult.status ?? "null"}): ${stderr}`);
+      }
+      const clonedRef = revResult.stdout.toString().trim();
+
+      return { workspaceDir: effectiveDir, clonedRef, cloneMethod, repoOwner, repoRepo, branch, githubToken };
+    }
 
     if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
       // Workspace is bind-mounted by the dev harness — skip fetch/clone entirely.
