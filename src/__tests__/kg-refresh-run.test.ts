@@ -54,6 +54,26 @@ const baseIssue = {
   description: "Refresh the knowledge-graph snapshot",
 };
 
+// A dispatched runner sets both of these, and `npm test` inside that container inherits
+// them. postRunnerResult skips the callback when either is absent, so clearing them here
+// is what stops a suite reaching the live orchestrator and consuming the run's single-use
+// result token. File-level so a new describe cannot miss it; the describes that exercise a
+// callback re-arm the pair themselves, pointing it at an unroutable host.
+beforeEach(() => {
+  vi.stubEnv("RUN_TOKEN", "");
+  vi.stubEnv("RUNNER_CALLBACK_URL", "");
+});
+
+describe("runner callback credentials", () => {
+  // Asserting the cleared values rather than an absent fetch: outside a dispatched runner
+  // these variables are unset anyway, so nothing posts with or without the hook and a
+  // network assertion would pass in CI while the hook was missing. This fails anywhere.
+  it("are cleared for every test in this file", () => {
+    expect(process.env.RUN_TOKEN).toBe("");
+    expect(process.env.RUNNER_CALLBACK_URL).toBe("");
+  });
+});
+
 // ── RunConfigV1 envelope roundtrip ────────────────────────────────────────────
 
 describe("RunConfigV1 kg-refresh fields", () => {
