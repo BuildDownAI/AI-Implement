@@ -301,6 +301,24 @@ function applyWiring(step: YamlStep): StepDefinition {
       };
     }
 
+    case "kg-ingest": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const codeRepoOutputs = ctx.getOutputs("clone-code-repo");
+          const codeRepoDir =
+            typeof codeRepoOutputs.workspaceDir === "string"
+              ? codeRepoOutputs.workspaceDir
+              : undefined;
+          return {
+            workspaceDir,
+            ...(codeRepoDir ? { codeRepoDir } : {}),
+          };
+        },
+      };
+    }
+
     case "kg-snapshot-push":
       return {
         ...step,

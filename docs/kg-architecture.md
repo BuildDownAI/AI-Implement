@@ -330,8 +330,12 @@ the start. No new top-level function, no new route branch.
 
 ## kg-refresh run kind
 
-AII-493 adds a `kg-refresh` Claude runner that follows the ingest playbook autonomously — cloning the
-KG source repository, running the ingest scripts, and pushing the snapshot. AII-494 adds the two
+AII-493 adds a `kg-refresh` runner pipeline. The ingest runs as a **deterministic pipeline step**
+(`src/pipeline/steps/kg-ingest.ts`): `kg-ingest` spawns `python -m kg_ingest refresh` as a
+subprocess, streams its output, and on success writes `ai-output/kg-stats.json` from CLI-emitted
+stats or a fallback `.nt` line count. Claude's role in the feedback-loop step is report-only —
+it reads `kg-stats.json`, reconciles `sources.yml` scope, verifies the snapshot outputs, and writes
+the run report; it does not run the ingest or manage the Python venv. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
 long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
 when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
@@ -446,6 +450,7 @@ critical section after the TTL watchdog has already resolved the run.
 | Deploy ownership | AII-353, AII-355 | Self-deploy, source stamps, availability |
 | Docs ingestion | KGB-2 through KGB-5, KGA-2, BDS-38 | Crawl, section chunks, citable anchors |
 | Scaling | KGB-8, AII-422 | Bounded-memory embedding, and a receipt when it still fails |
-| Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: Claude runner follows the ingest playbook; runner-callback endpoints vend scoped push token and tracker data |
+| Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: runner-callback endpoints vend scoped push token and tracker data |
+| Deterministic ingest step | AII-571 | kg-ingest is now a deterministic pipeline step; Claude's feedback-loop role is report-only (verify snapshot, write run report) |
 | Runner dispatch + stage machine | AII-495 | `POST /api/kg/refresh` dispatches the runner when ingest is needed; persisted stage machine (idle → checking → ingest-running → snapshot-landed → staging → terminal) survives restarts; live TTL watchdog; `/admin#deployments` stage badges |
 | KG-visible outcomes | AII-496 | Slack/Teams notification + Linear failure comment on every terminal outcome; TTL-timeout reaches the "hit the time limit" classifier; stuck-watchdog carve-out; exactly-once guarantee via stage guard |
