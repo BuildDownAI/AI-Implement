@@ -31,6 +31,9 @@ export class KgSnapshotTrackerRegressionError extends Error {
   }
 }
 
+/** Refuse a part that shrinks below this fraction of its previous line count. */
+const PART_SHRINK_THRESHOLD = 0.5;
+
 interface KgSnapshotPushInputs extends Record<string, unknown> {
   workspaceDir: string;
   githubToken: string;
@@ -177,6 +180,79 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         throw new KgSnapshotTrackerRegressionError(
           `tracker-data step reported fetched=false but previous snapshot has tracker file(s) (${previousTrackerFiles.join(", ")}) — refusing to push a docs-only graph`,
         );
+      }
+    }
+
+    // ── 0b. Content-based regression guard ──────────────────────────────────
+    // Compare snapshot/parts/*.nt in the working tree against the cloned HEAD
+    // by line count. Refuse if any previous part is missing, if any part drops
+    // below PART_SHRINK_THRESHOLD of its previous count, or if issue.nt shrinks
+    // at all when the tracker reported a non-zero issue count.
+    if (clonedRef && clonedRef !== "unknown") {
+      const lsAllResult = spawnSync(
+        "git",
+        ["ls-tree", "--name-only", "-r", clonedRef, "--", "snapshot/parts/"],
+        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+      );
+      const previousParts = lsAllResult.status === 0
+        ? lsAllResult.stdout
+            .toString()
+            .split("\n")
+            .map((f) => f.trim())
+            .filter((f) => f.endsWith(".nt"))
+        : [];
+
+      if (previousParts.length > 0) {
+        const issueCount =
+          typeof trackerOutputs.issueCount === "number" ? trackerOutputs.issueCount : 0;
+        const regressions: string[] = [];
+        const partLogLines: string[] = [];
+
+        for (const partPath of previousParts) {
+          const partName = partPath.split("/").pop()!;
+          // git show buffers the entire file in memory — adequate for current graph scale.
+          // Switch to git cat-file --batch streaming if parts grow beyond tens of MB.
+          const prevShowResult = spawnSync(
+            "git",
+            ["show", `${clonedRef}:${partPath}`],
+            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 },
+          );
+          const prevLines =
+            prevShowResult.status === 0
+              ? prevShowResult.stdout.toString().split("\n").filter(Boolean).length
+              : 0;
+
+          const newPartPath = join(workspaceDir, "snapshot", "parts", partName);
+          if (!existsSync(newPartPath)) {
+            partLogLines.push(`${partName} prev=${prevLines} new=missing`);
+            regressions.push(`${partName}: missing (was ${prevLines} lines)`);
+            continue;
+          }
+
+          const newLines = readFileSync(newPartPath, "utf-8").split("\n").filter(Boolean).length;
+          partLogLines.push(`${partName} prev=${prevLines} new=${newLines}`);
+
+          if ((partName === "issue.nt" || partName === "doc.nt") && issueCount > 0 && newLines < prevLines) {
+            regressions.push(
+              `${partName}: shrank from ${prevLines} to ${newLines} lines (issueCount=${issueCount}; zero-shrink enforced)`,
+            );
+            continue;
+          }
+
+          if (prevLines > 0 && newLines < prevLines * PART_SHRINK_THRESHOLD) {
+            regressions.push(
+              `${partName}: shrank from ${prevLines} to ${newLines} lines (below ${PART_SHRINK_THRESHOLD * 100}% threshold)`,
+            );
+          }
+        }
+
+        console.log(`[kg-snapshot-push] parts: ${partLogLines.join(", ")}`);
+
+        if (regressions.length > 0) {
+          throw new KgSnapshotTrackerRegressionError(
+            `content regression detected — ${regressions.join("; ")}`,
+          );
+        }
       }
     }
 

@@ -355,6 +355,21 @@ the same progress token. `stripEmbeddedTokenFromOrigin` in `kg-snapshot-push.ts`
 token from the remote URL right before push to counter `refreshRunnerGithubCredentials`
 re-embedding it after clone.
 
+**Snapshot push contract — content-based, not flag-based.** `kg-snapshot-push` judges the
+snapshot by comparing the working tree's `snapshot/parts/*.nt` line counts against the cloned
+HEAD before committing. The push is refused with `KG_SNAPSHOT_TRACKER_REGRESSION` if any of the
+following hold:
+
+| Rule | Condition |
+|---|---|
+| Missing part | A part file present in the previous snapshot is absent from the working tree |
+| General shrink | Any part file's line count is below `PART_SHRINK_THRESHOLD` (50 %) of its previous count |
+| `issue.nt` / `doc.nt` zero-shrink | `issue.nt` or `doc.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
+
+One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
+pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a
+tracker-enriched graph) is a separate, prior guard; both must pass before a commit is made.
+
 **Fly session image pinning (AII-534).** `dispatchKgRefreshRun` pairs the session machine to
 the same pipeline generation as the orchestrator via `resolveKgRefreshSessionImage`
 (`src/repo-image.ts`). Resolution order:

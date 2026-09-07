@@ -205,7 +205,7 @@ Authorization: Bearer <RUN_PROGRESS_TOKEN>
 { "teamKey": "AII", "cursor": "<optional>" }
 ```
 
-The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the tracker regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
+The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the flag-based regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
 
 ```
 [kg-tracker-data] team AII: 312 issues
@@ -353,7 +353,7 @@ The `dispatch_log` row appears in the admin pipelines table with:
 | `failed` | `operator_cancelled` | `null` — benign, suppress alert |
 | `timed_out` | any | `{ summary: "KG Refresh hit the time limit." }` |
 | `failed` | `KG_SNAPSHOT_MISSING` | `{ summary: "KG Refresh failed." }` — snapshot parts or embeddings absent |
-| `failed` | `KG_SNAPSHOT_TRACKER_REGRESSION` | `{ summary: "KG Refresh failed." }` — tracker-data step skipped but previous snapshot contains tracker files (`issue.nt`/`comment.nt`); push refused to avoid regressing to docs-only graph |
+| `failed` | `KG_SNAPSHOT_TRACKER_REGRESSION` | `{ summary: "KG Refresh failed." }` — push refused due to content regression: either the tracker-data step was skipped but the previous snapshot contains tracker files (`issue.nt`/`comment.nt`), or one or more snapshot parts shrank beyond the acceptance thresholds (any part below 50 % of its previous line count, or `issue.nt`/`doc.nt` shrinking at all when the tracker reported a non-zero issue count) |
 | `failed` | `KG_TRACKER_DATA_FETCH_FAILED` | `{ summary: "KG Refresh failed." }` — tracker-data endpoint returned a non-503 error |
 | `failed` | `exit_<N>` | `{ summary: "KG Refresh failed.", detail: "The runner exited with code N." }` |
 | `failed` | other | `{ summary: "KG Refresh failed." }` |
