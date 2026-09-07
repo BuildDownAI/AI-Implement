@@ -122,8 +122,9 @@ describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
 // ── kg-snapshot-push step ─────────────────────────────────────────────────────
 
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "../pipeline/steps/kg-snapshot-push.js";
-import { kgTrackerDataStep, KgTrackerDataFetchError, readCodeRepoFromSourcesYml } from "../pipeline/steps/kg-tracker-data.js";
+import { kgTrackerDataStep, KgTrackerDataFetchError, readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "../pipeline/steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError } from "../pipeline/steps/kg-ingest.js";
+import { cloneSecondaryReposStep } from "../pipeline/steps/clone-secondary-repos.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import type { PipelineContextData } from "../pipeline/types.js";
@@ -2096,13 +2097,14 @@ describe("kgIngestStep", () => {
 // ── kg-refresh pipeline order ─────────────────────────────────────────────────
 
 describe("kg-refresh pipeline order", () => {
-  it("step IDs are clone → dependency-auth → clone-code-repo → kg-tracker-data → kg-ingest → feedback-loop → kg-snapshot-push", () => {
+  it("step IDs are clone → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → feedback-loop → kg-snapshot-push", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
     const ids = pipeline.steps.map((s) => s.id);
     expect(ids).toEqual([
       "clone",
       "dependency-auth",
       "clone-code-repo",
+      "clone-secondary-repos",
       "kg-tracker-data",
       "kg-ingest",
       "feedback-loop",
@@ -2159,6 +2161,23 @@ steps:
     const inputs = ctx.resolveInputs(step!.inputs);
     expect(inputs.workspaceDir).toBe("/ws");
     expect(inputs.codeRepoDir).toBeUndefined();
+  });
+
+  it("always wires reposRootDir as <workspaceDir>/repos", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_INGEST_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-ingest");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/ws", githubToken: "tok", clonedRef: "abc" });
+    ctx.setOutputs("clone-code-repo", {});
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.reposRootDir).toBe("/ws/repos");
   });
 });
 
@@ -2670,6 +2689,420 @@ code_repo:
   });
 });
 
+// ── readSecondaryReposFromSourcesYml ─────────────────────────────────────────
+
+const REAL_SECONDARY_REPOS_BLOCK = `\
+secondary_repos:
+  - slug: BuildDownAI/bd-knowledge-graph-base
+  - slug: BuildDownAI/docs
+  - slug: BuildDownAI/skills
+`;
+
+describe("readSecondaryReposFromSourcesYml", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgsec-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns [] when sources.yml is absent", () => {
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([]);
+  });
+
+  it("returns [] when sources.yml has no secondary_repos key", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: org/repo\ntrackers:\n  - team: AII\n");
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([]);
+  });
+
+  it("returns [] when secondary_repos is an empty list", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "secondary_repos: []\n");
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([]);
+  });
+
+  it("filters out entries without slug", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - name: foo\n  - slug: org/bar\n",
+    );
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([{ slug: "org/bar" }]);
+  });
+
+  it("filters out string-only (non-object) entries", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - just-a-string\n  - slug: org/bar\n",
+    );
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([{ slug: "org/bar" }]);
+  });
+
+  it("returns three entries from the real verbatim secondary_repos block", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([
+      { slug: "BuildDownAI/bd-knowledge-graph-base" },
+      { slug: "BuildDownAI/docs" },
+      { slug: "BuildDownAI/skills" },
+    ]);
+  });
+
+  it("returns [] for malformed YAML", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "[broken yaml\n");
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([]);
+  });
+
+  it("filters out slugs that are not owner/repo format (no slash)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: justarepo\n  - slug: org/valid\n",
+    );
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([{ slug: "org/valid" }]);
+  });
+
+  it("filters out slugs with spaces", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: org/with spaces\n  - slug: org/valid\n",
+    );
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([{ slug: "org/valid" }]);
+  });
+
+  it("returns [] when secondary_repos exists but all entries lack valid slugs", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - name: foo\n  - name: bar\n",
+    );
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([]);
+  });
+
+  it("coexists with code_repo and trackers blocks", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo: org/main\ntrackers:\n  - team: AII\nsecondary_repos:\n  - slug: org/extra\n",
+    );
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([{ slug: "org/extra" }]);
+  });
+});
+
+// ── clone-secondary-repos step module ────────────────────────────────────────
+
+describe("cloneSecondaryReposStep", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgclone-"));
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+  });
+
+  const ctx = makeContext();
+
+  it("returns clonedCount 0 when sources.yml is absent", async () => {
+    const spawnCalls: unknown[] = [];
+    const result = await cloneSecondaryReposStep.run(
+      ctx,
+      {
+        workspaceDir: tmpDir,
+        spawnSyncImpl: (cmd, args) => { spawnCalls.push([cmd, args]); return { status: 0 }; },
+        mkdirSyncImpl: () => undefined,
+      },
+      noopReporter,
+    );
+    expect(result.clonedCount).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("returns clonedCount 0 when secondary_repos is empty", async () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "secondary_repos: []\n");
+    const spawnCalls: unknown[] = [];
+    const result = await cloneSecondaryReposStep.run(
+      ctx,
+      {
+        workspaceDir: tmpDir,
+        spawnSyncImpl: (cmd, args) => { spawnCalls.push([cmd, args]); return { status: 0 }; },
+        mkdirSyncImpl: () => undefined,
+      },
+      noopReporter,
+    );
+    expect(result.clonedCount).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("clones all three real secondary repos into repos/<basename>/", async () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const spawnCalls: Array<[string, string[]]> = [];
+    const mkdirCalls: string[] = [];
+    const result = await cloneSecondaryReposStep.run(
+      ctx,
+      {
+        workspaceDir: tmpDir,
+        spawnSyncImpl: (cmd, args) => { spawnCalls.push([cmd, args]); return { status: 0 }; },
+        mkdirSyncImpl: (p) => { mkdirCalls.push(p); },
+      },
+      noopReporter,
+    );
+    expect(result.clonedCount).toBe(3);
+    expect(spawnCalls).toHaveLength(3);
+    // Verify each clone targets repos/<basename>/
+    const targets = spawnCalls.map((c) => c[1].at(-1) ?? "");
+    expect(targets).toContain(join(tmpDir, "repos", "bd-knowledge-graph-base"));
+    expect(targets).toContain(join(tmpDir, "repos", "docs"));
+    expect(targets).toContain(join(tmpDir, "repos", "skills"));
+    // repos/ directory created
+    expect(mkdirCalls).toContain(join(tmpDir, "repos"));
+  });
+
+  it("logs warning and continues when one repo clone fails", async () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let callIndex = 0;
+    const result = await cloneSecondaryReposStep.run(
+      ctx,
+      {
+        workspaceDir: tmpDir,
+        spawnSyncImpl: () => {
+          // Fail the second repo (docs), succeed the others
+          const status = callIndex++ === 1 ? 128 : 0;
+          return { status, stderr: Buffer.from("not found") };
+        },
+        mkdirSyncImpl: () => undefined,
+      },
+      noopReporter,
+    );
+    expect(result.clonedCount).toBe(2);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("clone failed for BuildDownAI/docs"),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("skips all clones and warns in mounted mode", async () => {
+    process.env.AI_IMPLEMENT_WORKSPACE_MODE = "mounted";
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const spawnCalls: unknown[] = [];
+    const result = await cloneSecondaryReposStep.run(
+      ctx,
+      {
+        workspaceDir: tmpDir,
+        spawnSyncImpl: (cmd, args) => { spawnCalls.push([cmd, args]); return { status: 0 }; },
+        mkdirSyncImpl: () => undefined,
+      },
+      noopReporter,
+    );
+    expect(result.clonedCount).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[clone-secondary-repos] mounted mode: skipping all secondary clones",
+    );
+    warnSpy.mockRestore();
+  });
+});
+
+// ── applyWiring for clone-secondary-repos ────────────────────────────────────
+
+const KG_REFRESH_WITH_SECONDARY_YAML = `id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
+  - id: clone-code-repo
+    type: clone
+  - id: clone-secondary-repos
+    type: custom
+    moduleId: clone-secondary-repos
+  - id: kg-tracker-data
+    type: custom
+    moduleId: kg-tracker-data
+  - id: kg-ingest
+    type: custom
+    moduleId: kg-ingest
+  - id: feedback-loop
+    type: custom
+    moduleId: feedback-loop
+  - id: kg-snapshot-push
+    type: custom
+    moduleId: kg-snapshot-push
+`;
+
+describe("applyWiring for clone-secondary-repos", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgsecwire-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("skip returns true when dependency-auth was not acquired", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    ctx.setOutputs("dependency-auth", { acquired: false });
+    expect(step!.skip!(ctx)).toBe(true);
+  });
+
+  it("skip returns true when dependency-auth never ran (no outputs)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    // dependency-auth outputs not set
+    expect(step!.skip!(ctx)).toBe(true);
+  });
+
+  it("skip returns false when dependency-auth acquired and secondary_repos present", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    ctx.setOutputs("dependency-auth", { acquired: true });
+    expect(step!.skip!(ctx)).toBe(false);
+  });
+
+  it("skip returns true and warns when dependency-auth acquired but no secondary_repos", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: org/repo\n");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    ctx.setOutputs("dependency-auth", { acquired: true });
+    expect(step!.skip!(ctx)).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[clone-secondary-repos] no secondary_repos in sources.yml — skipping",
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("inputs include workspaceDir from clone outputs", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.workspaceDir).toBe(tmpDir);
+  });
+
+  it("clone-secondary-repos step has type custom and moduleId clone-secondary-repos", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step?.type).toBe("custom");
+    expect(step?.moduleId).toBe("clone-secondary-repos");
+  });
+});
+
+// ── kgIngestStep — --repos-root flag ─────────────────────────────────────────
+
+describe("kgIngestStep — --repos-root flag", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgingest-repos-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("includes --repos-root in ingest args when reposRootDir is provided", async () => {
+    const capturedArgs: string[][] = [];
+    const spawnImpl = (cmd: string, args: string[]) => {
+      capturedArgs.push([cmd, ...args]);
+      return makeFakeProcess(0, ['{"quads":10,"vectors":0,"docPages":0,"durationSec":1}']) as unknown as ChildProcess;
+    };
+
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        codeRepoDir: "/ws/code-repo",
+        reposRootDir: "/ws/repos",
+        spawnImpl,
+        writeFileSyncImpl: () => undefined,
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: () => false,
+        readdirSyncImpl: () => [],
+        readFileSyncImpl: () => "",
+      },
+      noopReporter,
+    );
+
+    // capturedArgs[2] is the ingest subprocess (0=venv, 1=pip, 2=ingest)
+    const ingestArgs = capturedArgs[2];
+    expect(ingestArgs).toContain("--repos-root");
+    const idx = ingestArgs.indexOf("--repos-root");
+    expect(ingestArgs[idx + 1]).toBe("/ws/repos");
+  });
+
+  it("omits --repos-root when reposRootDir is absent", async () => {
+    const capturedArgs: string[][] = [];
+    const spawnImpl = (cmd: string, args: string[]) => {
+      capturedArgs.push([cmd, ...args]);
+      return makeFakeProcess(0, ['{"quads":10,"vectors":0,"docPages":0,"durationSec":1}']) as unknown as ChildProcess;
+    };
+
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        codeRepoDir: "/ws/code-repo",
+        // reposRootDir deliberately absent
+        spawnImpl,
+        writeFileSyncImpl: () => undefined,
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: () => false,
+        readdirSyncImpl: () => [],
+        readFileSyncImpl: () => "",
+      },
+      noopReporter,
+    );
+
+    const ingestArgs = capturedArgs[2];
+    expect(ingestArgs).not.toContain("--repos-root");
+  });
+});
+
 // ── dependencyTokenScope round-trip in kg-refresh RunConfigV1 ─────────────────
 
 describe("RunConfigV1 kg-refresh — dependencyTokenScope field", () => {
@@ -2707,13 +3140,14 @@ describe("RunConfigV1 kg-refresh — dependencyTokenScope field", () => {
 // ── kg-refresh pipeline step order (real pipelines/kg-refresh.yml) ────────────
 
 describe("kg-refresh pipeline definition step order", () => {
-  it("includes dependency-auth, clone-code-repo, and kg-ingest in correct position", () => {
+  it("includes dependency-auth, clone-code-repo, clone-secondary-repos, and kg-ingest in correct position", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
     const ids = pipeline.steps.map((s) => s.id);
     expect(ids).toEqual([
       "clone",
       "dependency-auth",
       "clone-code-repo",
+      "clone-secondary-repos",
       "kg-tracker-data",
       "kg-ingest",
       "feedback-loop",

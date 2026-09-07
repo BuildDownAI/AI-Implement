@@ -1,9 +1,10 @@
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
-import { readCodeRepoFromSourcesYml } from "./steps/kg-tracker-data.js";
+import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./steps/kg-tracker-data.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",
@@ -304,6 +305,27 @@ function applyWiring(step: YamlStep): StepDefinition {
       };
     }
 
+    case "clone-secondary-repos": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          workspaceDir: ctx.getOutputs("clone").workspaceDir as string,
+        }),
+        skip: (ctx: PipelineContext) => {
+          // Skip if dependency-auth did not acquire a token: without the git credential
+          // helper the clones would fail unauthenticated against private repos.
+          if (ctx.getOutputs("dependency-auth").acquired !== true) return true;
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const repos = readSecondaryReposFromSourcesYml(workspaceDir);
+          if (repos.length === 0) {
+            console.warn("[clone-secondary-repos] no secondary_repos in sources.yml — skipping");
+            return true;
+          }
+          return false;
+        },
+      };
+    }
+
     case "kg-ingest": {
       return {
         ...step,
@@ -317,6 +339,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           return {
             workspaceDir,
             ...(codeRepoDir ? { codeRepoDir } : {}),
+            reposRootDir: join(workspaceDir, "repos"),
           };
         },
       };

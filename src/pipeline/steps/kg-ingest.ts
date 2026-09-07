@@ -30,6 +30,8 @@ interface KgIngestInputs extends Record<string, unknown> {
   workspaceDir: string;
   /** Absolute path to the cloned code repo. Omit when clone-code-repo was skipped. */
   codeRepoDir?: string;
+  /** Absolute path to the repos/ directory holding secondary repo clones. Passed as --repos-root. */
+  reposRootDir?: string;
   /** Injectable spawn for testing. */
   spawnImpl?: SpawnImplFn;
   /** Injectable writeFileSync for testing. */
@@ -129,6 +131,7 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
     const {
       workspaceDir,
       codeRepoDir,
+      reposRootDir,
       spawnImpl,
       writeFileSyncImpl: writeFn = writeFileSync,
       mkdirSyncImpl: mkdirFn = (p, o) => mkdirSync(p, o),
@@ -203,6 +206,7 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
 
     const ingestArgs = ["-m", "kg_ingest", "refresh"];
     if (codeRepoDir) ingestArgs.push("--code-repo", codeRepoDir);
+    if (reposRootDir) ingestArgs.push("--repos-root", reposRootDir);
 
     const trackerDataFile = join(workspaceDir, "tracker-data.json");
     if (existsFn(trackerDataFile)) ingestArgs.push("--tracker-data", trackerDataFile);
