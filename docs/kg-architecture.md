@@ -349,6 +349,22 @@ any other phase or a missing/invalid token receives `403 Unauthorized` with no d
 The orchestrator performs all external writes with its own credentials; the runner receives only the
 minted token or the requested data.
 
+**Code-repo in the workspace (AII-564, child 1).** Every dispatched kg-refresh `RunConfigV1`
+carries `dependencyTokenScope: "installation"`, hardcoded in `src/kg-refresh.ts`. This activates
+the `dependency-auth` step, which mints an installation-wide `contents: read` token and installs
+it as a git credential helper (the existing dependency-auth mechanism — no new token kind). A
+`clone-code-repo` step (type: `clone`) then reads the `code_repo: owner/repo` field from
+`sources.yml` in the KG workspace and clones it with `--depth 1` into `code-repo/` alongside the
+KG workspace. The step is registered by type (`clone`) so the runner resolves it via the standard
+`cloneStep` — no separate registration. If `dependency-auth` did not acquire a token (absent
+callback URL, local run, or fetch failure), `clone-code-repo` is skipped gracefully and the ingest
+proceeds without the code repo rather than aborting the pipeline. When the clone succeeds, the
+`kg-ingest` step passes `--code-repo <path>` to `python -m kg_ingest refresh`, giving the ingest
+access to git history, commits, PRs, and files from the implementation repo. If `sources.yml`
+contains no `code_repo` field, the step is also skipped silently. Local `bd-kg-refresh` skill runs
+never carry a dispatch token and therefore always skip `clone-code-repo`; the local operator
+supplies the code repo checkout directly via `--repo` if needed.
+
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/api/runner/kg-push-token` | POST | Vends a short-lived GitHub installation token with `contents: write` scoped to the single KG source repo. `forceRefresh: true` ensures the credential helper always receives a full-lifetime token. |
