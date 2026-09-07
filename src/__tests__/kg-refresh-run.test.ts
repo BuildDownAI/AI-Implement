@@ -2163,7 +2163,7 @@ steps:
     expect(inputs.codeRepoDir).toBeUndefined();
   });
 
-  it("always wires reposRootDir as <workspaceDir>/repos", () => {
+  it("wires reposRootDir when clone-secondary-repos ran (outputs contain clonedCount)", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
       existsSyncImpl: () => false,
       readFileSyncImpl: () => KG_INGEST_PIPELINE_YAML,
@@ -2175,9 +2175,28 @@ steps:
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: "/ws", githubToken: "tok", clonedRef: "abc" });
     ctx.setOutputs("clone-code-repo", {});
+    ctx.setOutputs("clone-secondary-repos", { clonedCount: 0 });
 
     const inputs = ctx.resolveInputs(step!.inputs);
     expect(inputs.reposRootDir).toBe("/ws/repos");
+  });
+
+  it("omits reposRootDir when clone-secondary-repos was skipped (no outputs)", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_INGEST_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-ingest");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/ws", githubToken: "tok", clonedRef: "abc" });
+    ctx.setOutputs("clone-code-repo", {});
+    // clone-secondary-repos outputs not set — step was skipped
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.reposRootDir).toBeUndefined();
   });
 });
 
@@ -2900,6 +2919,48 @@ describe("cloneSecondaryReposStep", () => {
     expect(spawnCalls).toHaveLength(0);
     expect(warnSpy).toHaveBeenCalledWith(
       "[clone-secondary-repos] mounted mode: skipping all secondary clones",
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("skips and warns when slug basename resolves to '..'", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const spawnCalls: unknown[] = [];
+    const result = await cloneSecondaryReposStep.run(
+      ctx,
+      {
+        workspaceDir: tmpDir,
+        secondaryReposReaderImpl: () => [{ slug: "org/.." }],
+        spawnSyncImpl: (cmd, args) => { spawnCalls.push([cmd, args]); return { status: 0 }; },
+        mkdirSyncImpl: () => undefined,
+      },
+      noopReporter,
+    );
+    expect(result.clonedCount).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('repo name resolves to ".."'),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("skips and warns when slug basename resolves to '.'", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const spawnCalls: unknown[] = [];
+    const result = await cloneSecondaryReposStep.run(
+      ctx,
+      {
+        workspaceDir: tmpDir,
+        secondaryReposReaderImpl: () => [{ slug: "org/." }],
+        spawnSyncImpl: (cmd, args) => { spawnCalls.push([cmd, args]); return { status: 0 }; },
+        mkdirSyncImpl: () => undefined,
+      },
+      noopReporter,
+    );
+    expect(result.clonedCount).toBe(0);
+    expect(spawnCalls).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('repo name resolves to "."'),
     );
     warnSpy.mockRestore();
   });

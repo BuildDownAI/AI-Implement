@@ -231,7 +231,7 @@ Each secondary repo is cloned with `--depth 1` using a bare `https://github.com/
 
 ### `--repos-root` flag to the ingest
 
-The `kg-ingest` step always passes `--repos-root <workspaceDir>/repos` to `python -m kg_ingest refresh`. The ingest tool reads secondary repos from that directory. If `clone-secondary-repos` was skipped or all clones failed, the directory will be empty or absent — the ingest tool handles this gracefully. **Deployment note:** the `--repos-root` flag requires the KGA-8 runner image. Merge KGA-8 and release the image before merging this orchestrator change to avoid ingest subprocess failures on every kg-refresh run.
+The `kg-ingest` step passes `--repos-root <workspaceDir>/repos` to `python -m kg_ingest refresh` only when `clone-secondary-repos` actually ran (i.e., was not skipped). The step is skipped when `sources.yml` has no `secondary_repos` entries or when `dependency-auth` did not acquire a token; in those cases `--repos-root` is omitted and the ingest subprocess runs without it. When the flag is present the ingest tool reads secondary repos from the `repos/` directory; if all individual clones failed the directory is empty and the ingest tool handles that gracefully. **Deployment note:** the `--repos-root` flag requires the KGA-8 runner image. Merge KGA-8 and release the image before any KG source repo gains `secondary_repos` entries, since the flag is only passed when the step runs.
 
 ### KG push token
 

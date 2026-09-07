@@ -61,6 +61,12 @@ export const cloneSecondaryReposStep: StepModule<
       // would both target repos/docs/; the second clone overwrites the first. This is unlikely
       // with the known three repos but worth noting if more are added.
       const repoName = basename(slug);
+      if (repoName === "." || repoName === "..") {
+        console.warn(
+          `[clone-secondary-repos] skipping ${slug}: repo name resolves to "${repoName}" — malformed slug`,
+        );
+        continue;
+      }
       const targetDir = join(reposRoot, repoName);
       const bareRemote = `https://github.com/${slug}.git`;
       console.log(`[clone-secondary-repos] cloning ${slug} into repos/${repoName}`);

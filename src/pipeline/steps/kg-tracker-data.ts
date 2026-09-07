@@ -91,14 +91,6 @@ function ownerRepo(v: string): string | null {
 }
 
 /**
- * Reads the top-level `code_repo:` key from sources.yml.
- * Accepts two forms:
- *   - string:  `code_repo: owner/name`
- *   - mapping: `code_repo:\n  slug: owner/name\n  ...`
- * Returns the value as `"owner/repo"` or null when the key is absent, the file
- * is missing, or the file cannot be parsed.
- */
-/**
  * Reads `secondary_repos[].slug` from sources.yml.
  * Returns entries where `slug` passes the "owner/repo" validation.
  * Returns an empty array when the file is absent, the key is missing, the list
@@ -138,6 +130,14 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
   return [];
 }
 
+/**
+ * Reads the top-level `code_repo:` key from sources.yml.
+ * Accepts two forms:
+ *   - string:  `code_repo: owner/name`
+ *   - mapping: `code_repo:\n  slug: owner/name\n  ...`
+ * Returns the value as `"owner/repo"` or null when the key is absent, the file
+ * is missing, or the file cannot be parsed.
+ */
 export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null {
   const filePath = join(workspaceDir, "sources.yml");
   if (!existsSync(filePath)) return null;

@@ -336,10 +336,17 @@ function applyWiring(step: YamlStep): StepDefinition {
             typeof codeRepoOutputs.workspaceDir === "string"
               ? codeRepoOutputs.workspaceDir
               : undefined;
+          // Only wire reposRootDir when clone-secondary-repos actually ran (not skipped).
+          // Skipped steps leave no outputs, so clonedCount is undefined when skipped.
+          const secondaryReposOutputs = ctx.getOutputs("clone-secondary-repos");
+          const reposRootDir =
+            secondaryReposOutputs.clonedCount !== undefined
+              ? join(workspaceDir, "repos")
+              : undefined;
           return {
             workspaceDir,
             ...(codeRepoDir ? { codeRepoDir } : {}),
-            reposRootDir: join(workspaceDir, "repos"),
+            ...(reposRootDir !== undefined ? { reposRootDir } : {}),
           };
         },
       };
