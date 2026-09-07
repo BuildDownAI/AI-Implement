@@ -749,6 +749,23 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
     expect(err.message).toContain("missing");
   });
 
+  it("refuses with KgSnapshotTrackerRegressionError when the entire snapshot/parts/ directory is absent and previous snapshot had parts", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // Simulate total ingest failure: remove the entire parts directory
+    rmSync(join(tmpDir, "snapshot", "parts"), { recursive: true, force: true });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    // Content-based guard runs before section 1's existence check, so KgSnapshotTrackerRegressionError surfaces first
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("missing");
+    expect(err.message).toContain("issue.nt");
+  });
+
   it("refuses when a part shrinks below the 50% threshold", async () => {
     initGitRepo(tmpDir);
     commitPreviousSnapshot({ "doc.nt": makeLines(100) });
@@ -779,19 +796,35 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
     expect(err.message).toContain("issue.nt");
   });
 
-  it("refuses when doc.nt shrinks by any amount and issueCount > 0 (above 50% floor)", async () => {
+  it("refuses when comment.nt shrinks by any amount and issueCount > 0 (above 50% floor)", async () => {
     initGitRepo(tmpDir);
-    commitPreviousSnapshot({ "doc.nt": makeLines(100) });
+    commitPreviousSnapshot({ "comment.nt": makeLines(100) });
     const clonedRef = resolveHead(tmpDir);
 
-    // 99 lines — above the 50% general threshold, but zero-shrink rule applies when issueCount > 0
-    writeFileSync(join(tmpDir, "snapshot", "parts", "doc.nt"), makeLines(99));
+    // 99 lines — above the 50% general threshold, but zero-shrink rule applies to tracker parts when issueCount > 0
+    writeFileSync(join(tmpDir, "snapshot", "parts", "comment.nt"), makeLines(99));
 
     const ctx = makeContext();
     ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
     const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
     expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
-    expect(err.message).toContain("doc.nt");
+    expect(err.message).toContain("comment.nt");
+  });
+
+  it("permits doc.nt to shrink above the 50% floor (zero-shrink applies only to tracker parts)", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "doc.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above the 50% general threshold; doc.nt is not a tracker part so zero-shrink does not apply
+    writeWorkingTree({ "doc.nt": makeLines(99) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    // Guard passes → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
   });
 
   it("permits issue.nt to shrink when issueCount is 0", async () => {

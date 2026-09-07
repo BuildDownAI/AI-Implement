@@ -364,7 +364,7 @@ following hold:
 |---|---|
 | Missing part | A part file present in the previous snapshot is absent from the working tree |
 | General shrink | Any part file's line count is below `PART_SHRINK_THRESHOLD` (50 %) of its previous count |
-| `issue.nt` / `doc.nt` zero-shrink | `issue.nt` or `doc.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
+| `issue.nt` / `comment.nt` zero-shrink | `issue.nt` or `comment.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
 
 One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
 pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a

@@ -34,6 +34,13 @@ export class KgSnapshotTrackerRegressionError extends Error {
 /** Refuse a part that shrinks below this fraction of its previous line count. */
 const PART_SHRINK_THRESHOLD = 0.5;
 
+/**
+ * The two .nt files produced exclusively by the tracker-data step.
+ * A tracker refresh shows a diff only in these files (per docs/kg-architecture.md).
+ * Both the flag guard (section 0) and the zero-shrink rule (section 0b) use this set.
+ */
+const TRACKER_NT_FILES = new Set(["issue.nt", "comment.nt"]);
+
 interface KgSnapshotPushInputs extends Record<string, unknown> {
   workspaceDir: string;
   githubToken: string;
@@ -166,10 +173,6 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         "git", ["ls-tree", "--name-only", clonedRef, "--", "snapshot/parts/"],
         { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
       );
-      // Only issue.nt and comment.nt are written by a tracker refresh (per docs/kg-architecture.md).
-      // Other .nt files (docs, decisions, etc.) exist on every successful snapshot and must not
-      // trigger this guard when tracker fetch is legitimately skipped.
-      const TRACKER_NT_FILES = new Set(["issue.nt", "comment.nt"]);
       const previousTrackerFiles = lsTreeResult.status === 0
         ? lsTreeResult.stdout.toString().split("\n").filter((f) => {
             const base = f.trim().split("/").pop() ?? "";
@@ -186,21 +189,24 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // ── 0b. Content-based regression guard ──────────────────────────────────
     // Compare snapshot/parts/*.nt in the working tree against the cloned HEAD
     // by line count. Refuse if any previous part is missing, if any part drops
-    // below PART_SHRINK_THRESHOLD of its previous count, or if issue.nt shrinks
-    // at all when the tracker reported a non-zero issue count.
+    // below PART_SHRINK_THRESHOLD of its previous count, or if a tracker part
+    // (issue.nt / comment.nt) shrinks at all when the tracker reported a non-zero issue count.
     if (clonedRef && clonedRef !== "unknown") {
       const lsAllResult = spawnSync(
         "git",
         ["ls-tree", "--name-only", "-r", clonedRef, "--", "snapshot/parts/"],
         { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
       );
-      const previousParts = lsAllResult.status === 0
-        ? lsAllResult.stdout
-            .toString()
-            .split("\n")
-            .map((f) => f.trim())
-            .filter((f) => f.endsWith(".nt"))
-        : [];
+      if (lsAllResult.status !== 0) {
+        throw new Error(
+          `git ls-tree failed reading previous snapshot parts (exit ${lsAllResult.status ?? "null"}): ${lsAllResult.stderr?.toString().trim() ?? ""}`,
+        );
+      }
+      const previousParts = lsAllResult.stdout
+        .toString()
+        .split("\n")
+        .map((f) => f.trim())
+        .filter((f) => f.endsWith(".nt"));
 
       if (previousParts.length > 0) {
         const issueCount =
@@ -217,10 +223,12 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
             ["show", `${clonedRef}:${partPath}`],
             { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 },
           );
-          const prevLines =
-            prevShowResult.status === 0
-              ? prevShowResult.stdout.toString().split("\n").filter(Boolean).length
-              : 0;
+          if (prevShowResult.status !== 0) {
+            throw new Error(
+              `git show failed reading previous ${partPath} (exit ${prevShowResult.status ?? "null"}): ${prevShowResult.stderr?.toString().trim() ?? ""}`,
+            );
+          }
+          const prevLines = prevShowResult.stdout.toString().split("\n").filter(Boolean).length;
 
           const newPartPath = join(workspaceDir, "snapshot", "parts", partName);
           if (!existsSync(newPartPath)) {
@@ -232,7 +240,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           const newLines = readFileSync(newPartPath, "utf-8").split("\n").filter(Boolean).length;
           partLogLines.push(`${partName} prev=${prevLines} new=${newLines}`);
 
-          if ((partName === "issue.nt" || partName === "doc.nt") && issueCount > 0 && newLines < prevLines) {
+          if (TRACKER_NT_FILES.has(partName) && issueCount > 0 && newLines < prevLines) {
             regressions.push(
               `${partName}: shrank from ${prevLines} to ${newLines} lines (issueCount=${issueCount}; zero-shrink enforced)`,
             );
