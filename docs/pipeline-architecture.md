@@ -29,7 +29,7 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 
 ## The built-in pipeline
 
-`pipelines/autonomous.yml` declares ten steps. They run in file order, and each is registered under a key in `BUILTIN_STEPS` (`src/pipeline/default-pipeline.ts`).
+`pipelines/autonomous.yml` declares the steps below. They run in file order, and each is registered under a key in `BUILTIN_STEPS` (`src/pipeline/default-pipeline.ts`).
 
 | # | Step id | Skipped when |
 |---|---------|--------------|
