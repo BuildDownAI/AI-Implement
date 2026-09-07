@@ -242,19 +242,43 @@ jobs:
         run: |
           set -euo pipefail
           digest_ref="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+          channel="${{ steps.meta.outputs.channel }}"
 
           if ! current_sha=$(git ls-remote origin "refs/heads/$GITHUB_REF_NAME" | awk '{print $1}'); then
             echo "::error::Could not verify current head for ${{ github.ref_name }}. Re-run this job after the transient failure clears to re-test and promote the digest image." >&2
             exit 1
           fi
+
+          promoted_for_head=false
           if [ "$current_sha" != "${{ github.sha }}" ]; then
-            echo "::error::Ref ${{ github.ref_name }} now points at ${current_sha:-unknown}, not tested SHA ${{ github.sha }}. Skipping channel promotion." >&2
-            exit 1
+            # The branch moved while this build was running (e.g. a docs-only push
+            # landed after the code push that triggered the build).  Check whether
+            # the intervening commits touch any image-relevant paths using the
+            # canonical list in scripts/image-equiv-check.sh — identical to
+            # on.push.paths above.  Exit 0 means image-equivalent; promote for the
+            # head SHA as well.  Any non-zero exit skips promotion.
+            if ! bash scripts/image-equiv-check.sh "${{ github.sha }}" "$current_sha"; then
+              echo "::error::Ref ${{ github.ref_name }} now points at ${current_sha:-unknown}, not tested SHA ${{ github.sha }}, and the intervening commits include image-relevant changes. Skipping channel promotion." >&2
+              exit 1
+            fi
+            echo "Head advanced to ${current_sha} with no image-relevant changes — promoting for head SHA as well"
+            promoted_for_head=true
           fi
+
           # Re-pull immediately before tagging so promotion fails closed if the
           # tested digest manifest was removed between smoke test and promotion.
           docker pull "$digest_ref"
-          docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"
+          docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${channel}"
           docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"
-          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"
+          docker push "${{ steps.meta.outputs.image }}:${channel}"
           docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"
+
+          # When the head advanced with no image-relevant changes, also push a
+          # date tag for the head SHA so the deploy-posture check can confirm the
+          # channel is current for the actual branch head.
+          if [ "$promoted_for_head" = "true" ]; then
+            head_date_tag="${{ steps.meta.outputs.image }}:base-${channel}-v$(date -u +%Y%m%d)-${current_sha::12}"
+            docker tag "$digest_ref" "$head_date_tag"
+            docker push "$head_date_tag"
+            echo "Also pushed head date tag: ${head_date_tag}"
+          fi
