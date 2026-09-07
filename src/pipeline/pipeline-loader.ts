@@ -99,6 +99,19 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "reference-repos":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          referenceRepos: ctx.data.referenceRepos,
+          callbackUrl: ctx.data.callbackUrl,
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.referenceRepos?.length,
+      };
+
     case "install-skills":
       return {
         ...step,

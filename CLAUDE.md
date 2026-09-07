@@ -250,7 +250,7 @@ The two `.ai-implement/` files read from different refs: `image.yml` from the **
 
 A file at `custom/<path>` overrides the corresponding built-in. Resolution searches the workspace root, then `AI_IMPLEMENT_CUSTOM_ROOT`, then the package root — see [docs/pipeline-architecture.md](docs/pipeline-architecture.md) for the mechanics and the step contract.
 
-Built-in step keys, in pipeline order: `clone`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `preflight`, `push`, `verify`, `post-push-review`.
+Built-in step keys, in pipeline order: `clone`, `reference-repos`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `preflight`, `push`, `verify`, `post-push-review`.
 
 - `custom/` belongs to an AI-Implement **fork**, not a target repo; sync never creates it there.
 - **Place client-specific behaviour in `custom/`** rather than editing built-in modules — that is what keeps a fork rebasing cleanly.
