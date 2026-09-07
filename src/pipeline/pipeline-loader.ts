@@ -292,7 +292,11 @@ function applyWiring(step: YamlStep): StepDefinition {
         },
         skip: (ctx: PipelineContext) => {
           const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
-          return readCodeRepoFromSourcesYml(workspaceDir) === null;
+          if (readCodeRepoFromSourcesYml(workspaceDir) === null) return true;
+          // Skip if dependency-auth did not acquire a token: without a git credential
+          // helper the clone would fail unauthenticated against a private repo, which
+          // would abort the entire kg-refresh pipeline instead of degrading gracefully.
+          return ctx.getOutputs("dependency-auth").acquired !== true;
         },
       };
     }

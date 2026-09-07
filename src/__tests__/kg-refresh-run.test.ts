@@ -1917,6 +1917,16 @@ describe("readCodeRepoFromSourcesYml", () => {
     );
     expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
   });
+
+  it("returns null when code_repo value has no slash (not owner/repo format)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: justarepo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  it("returns null when code_repo value has a leading slash (empty owner)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: /repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
 });
 
 // ── dependencyTokenScope round-trip in kg-refresh RunConfigV1 ─────────────────
@@ -2030,7 +2040,7 @@ describe("applyWiring for clone-code-repo", () => {
     expect(step!.skip!(ctx)).toBe(true);
   });
 
-  it("skip returns false when sources.yml declares code_repo", () => {
+  it("skip returns false when sources.yml declares code_repo and dependency-auth acquired", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
 
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
@@ -2042,7 +2052,40 @@ describe("applyWiring for clone-code-repo", () => {
 
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    ctx.setOutputs("dependency-auth", { acquired: true });
     expect(step!.skip!(ctx)).toBe(false);
+  });
+
+  it("skip returns true when dependency-auth acquired=false even with code_repo present", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    ctx.setOutputs("dependency-auth", { acquired: false });
+    expect(step!.skip!(ctx)).toBe(true);
+  });
+
+  it("skip returns true when dependency-auth never ran (no outputs) even with code_repo present", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    // dependency-auth outputs deliberately not set (simulates no scope / missing progress token)
+    expect(step!.skip!(ctx)).toBe(true);
   });
 
   it("inputs include repoOwner, repoRepo, targetDir and empty githubToken", () => {

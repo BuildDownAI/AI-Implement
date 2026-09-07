@@ -430,6 +430,84 @@ describe("cloneStep", () => {
     });
   });
 
+  describe("secondary clone (targetDir set)", () => {
+    const SECONDARY_INPUTS = {
+      repoOwner: "acme",
+      repoRepo: "code-repo",
+      branch: "",
+      githubToken: "",
+      workspaceDir: "/tmp/workspace",
+      targetDir: "code-repo",
+    };
+
+    it("performs fresh clone into targetDir when .git does not exist there", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // git clone, git rev-parse HEAD
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      const outputs = await cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(outputs.clonedRef).toBe("abc123");
+      expect(outputs.workspaceDir).toBe("/tmp/workspace/code-repo");
+      expect(outputs.repoOwner).toBe("acme");
+      expect(outputs.repoRepo).toBe("code-repo");
+    });
+
+    it("performs incremental fetch+reset when .git already exists in targetDir", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // git fetch, git reset --hard, git rev-parse HEAD
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0, stdout: "def456\n" }]);
+
+      const outputs = await cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("incremental");
+      expect(outputs.clonedRef).toBe("def456");
+      expect(outputs.workspaceDir).toBe("/tmp/workspace/code-repo");
+    });
+
+    it("throws when secondary git clone fails", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 128, stderr: "repository not found" }]);
+
+      await expect(
+        cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter()),
+      ).rejects.toThrow(/git clone failed/);
+    });
+
+    it("throws when secondary git fetch fails", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockSpawn([{ status: 128, stderr: "authentication required" }]);
+
+      await expect(
+        cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter()),
+      ).rejects.toThrow(/git fetch failed/);
+    });
+
+    it("does not call prepareScratchExclusion for a secondary clone", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "sha1\n" }]);
+
+      await cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter());
+
+      expect(prepareScratchExclusion).not.toHaveBeenCalled();
+    });
+
+    it("skips clone and returns cloneMethod=mounted when in mounted workspace mode", async () => {
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+      try {
+        const outputs = await cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter());
+
+        expect(outputs.cloneMethod).toBe("mounted");
+        expect(outputs.clonedRef).toBe("unknown");
+        expect(outputs.workspaceDir).toBe("/tmp/workspace/code-repo");
+        expect(spawnSync).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+  });
+
   describe("mounted workspace mode (AI_IMPLEMENT_WORKSPACE_MODE=mounted)", () => {
     beforeEach(() => {
       vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");

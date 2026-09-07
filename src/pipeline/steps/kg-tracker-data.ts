@@ -85,6 +85,11 @@ function readTrackerTeams(workspaceDir: string): string[] {
   return matches.map((m) => m[1]);
 }
 
+/** Returns v when it looks like "owner/repo" (non-empty on both sides, no whitespace), else null. */
+function ownerRepo(v: string): string | null {
+  return /^[^\s/]+\/[^\s/]+$/.test(v) ? v : null;
+}
+
 /**
  * Reads the top-level `code_repo:` key from sources.yml.
  * Returns the value as `"owner/repo"` or null when the key is absent, the file
@@ -109,7 +114,7 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null 
       typeof (doc as Record<string, unknown>).code_repo === "string"
     ) {
       const value = ((doc as Record<string, unknown>).code_repo as string).trim();
-      return value || null;
+      return ownerRepo(value);
     }
   } catch {
     // Fall through to regex fallback
@@ -117,7 +122,7 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null 
 
   // Fallback: matches a top-level `code_repo:` line; value stops before any trailing comment
   const match = raw.match(/^code_repo:\s+(\S+)/m);
-  return match ? match[1] : null;
+  return match ? ownerRepo(match[1]) : null;
 }
 
 export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOutputs> = {
