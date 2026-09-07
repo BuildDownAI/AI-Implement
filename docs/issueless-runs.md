@@ -51,11 +51,13 @@ const runConfig: RunConfigV1 = {
   v: 1,
   issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
   runnerPhase: "kg-refresh",
-  kgSourceRepo: "<owner/repo>",          // from config.kgSourceRepo
-  runnerCallbackUrl: "<url>",            // bare RUNNER_CALLBACK_BASE_URL — no path suffix
-  dependencyTokenScope: "installation",  // always set; enables code-repo clone via dep token
+  kgSourceRepo: "<owner/repo>",                // from config.kgSourceRepo
+  runnerCallbackUrl: "<url>",                  // bare RUNNER_CALLBACK_BASE_URL — no path suffix
+  dependencyTokenScope: "installation",        // present only when the KG repo mapping has this set
 };
 ```
+
+Both run tokens are minted with the team key of the KG source repo's own project mapping (the mapping whose `owner/repo` equals `kgSourceRepo`). The `dependencyTokenScope` field is copied from that mapping into the envelope: the runner reads it to decide whether to activate the `dependency-auth` step, and the dependency-token endpoint reads it from the mapping again to decide whether to vend the token. Set `dependencyTokenScope = installation` on the KGA mapping in the admin UI to enable code-repo cloning in kg-refresh runs.
 
 **Callback-URL contract:** `runnerCallbackUrl` is always the bare base URL (e.g. `https://my-orchestrator.fly.dev`). Every runner-side client is responsible for appending its own path:
 

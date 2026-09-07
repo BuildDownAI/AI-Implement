@@ -86,6 +86,18 @@ function mintProgressToken(mappingTeamKey = "ENG"): string {
   return token;
 }
 
+function mintKgRefreshProgressToken(mappingTeamKey = "KGA"): string {
+  const { token } = runnerTokens.mintRunToken({
+    issueId: "kg-refresh",
+    mappingTeamKey,
+    phase: "kg-refresh",
+    audience: "progress",
+    ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+    secret: SECRET,
+  });
+  return token;
+}
+
 async function callHandler(opts: {
   authorization?: string;
   resolveMapping?: (key: string) => RepoMapping | undefined;
@@ -288,5 +300,44 @@ describe("handleDependencyTokenRequest", () => {
     });
 
     expect(JSON.stringify(result.body)).not.toContain(token);
+  });
+
+  describe("kg-refresh phase tokens", () => {
+    it("returns 200 when kg-refresh progress token carries real team key and mapping has scope=installation", async () => {
+      const token = mintKgRefreshProgressToken("KGA");
+      mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_kg_token", expiresAt: "2030-01-01T00:00:00Z" });
+
+      const result = await callHandler({
+        authorization: `Bearer ${token}`,
+        resolveMapping: () => makeMapping({ dependencyTokenScope: "installation" }),
+      });
+
+      expect(result.status).toBe(200);
+      expect(result.body.token).toBe("ghs_kg_token");
+    });
+
+    it("returns 403 when kg-refresh progress token carries real team key but mapping has scope=null", async () => {
+      const token = mintKgRefreshProgressToken("KGA");
+
+      const result = await callHandler({
+        authorization: `Bearer ${token}`,
+        resolveMapping: () => makeMapping({ dependencyTokenScope: null }),
+      });
+
+      expect(result.status).toBe(403);
+      expect(result.body).toEqual({ error: "Unauthorized" });
+    });
+
+    it("returns 403 when kg-refresh progress token resolves to no mapping", async () => {
+      const token = mintKgRefreshProgressToken("KGA");
+
+      const result = await callHandler({
+        authorization: `Bearer ${token}`,
+        resolveMapping: () => undefined,
+      });
+
+      expect(result.status).toBe(403);
+      expect(result.body).toEqual({ error: "Unauthorized" });
+    });
   });
 });

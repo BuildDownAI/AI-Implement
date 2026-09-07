@@ -3244,6 +3244,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     kgSourceRepo: config.kgSourceRepo,
     runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
     runnerTokenSecret: config.runnerTokenSecret,
+    resolveMappingTeamKey: (ownerRepo) => {
+      const entry = Object.entries(getMappings()).find(([, m]) => `${m.owner}/${m.repo}` === ownerRepo);
+      if (!entry) return undefined;
+      const [teamKey, mapping] = entry;
+      return { teamKey, dependencyTokenScope: mapping.dependencyTokenScope };
+    },
     dispatchRun: (opts) => dispatchKgRefreshRun(config, opts),
     onOutcome: (outcome, data) => {
       void handleKgRefreshOutcome(config, registry, outcome, data);

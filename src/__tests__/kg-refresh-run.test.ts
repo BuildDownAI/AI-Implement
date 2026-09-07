@@ -1701,6 +1701,7 @@ describe("makeKgRefresh — dispatch result threading to updateJobMachine", () =
       canaryRetryMs: 10,
       runnerCallbackBaseUrl: "http://localhost:8080",
       runnerTokenSecret: "secret",
+      resolveMappingTeamKey: (repo: string) => repo === "TestOrg/test-kg" ? { teamKey: "KGA", dependencyTokenScope: "installation" } : undefined,
       mintRunTokenFn: vi.fn(() => ({ token: "run-tok", dispatchId: "disp-1" })) as never,
       dispatchRun: vi.fn(async () => overrides.dispatchResult) as never,
       appendJobLog: vi.fn(() => id) as never,

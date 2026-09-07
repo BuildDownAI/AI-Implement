@@ -195,6 +195,8 @@ interface KgRefreshInput {
   fetchCommitVisible?: (token: string, owner: string, repo: string, sha: string) => Promise<boolean>;
   /** Delay between snapshot-commit visibility retries (default: 5000ms). */
   snapshotCommitRetryMs?: number;
+  /** Resolve team key + dependency token scope for the mapping whose owner/repo equals the given string. Injectable for tests; defaults to () => undefined. */
+  resolveMappingTeamKey?: (ownerRepo: string) => { teamKey: string; dependencyTokenScope: "installation" | null } | undefined;
   /**
    * Persist stage + start time to durable storage. Injectable for tests.
    * Default: writes to the DB settings table.
@@ -611,6 +613,23 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         }
       }
 
+      // Resolve the KG source repo mapping so both tokens carry its team key and dependency-token can locate it.
+      const kgMappingResolved = input.dispatchRun !== undefined
+        ? (input.resolveMappingTeamKey?.(input.kgSourceRepo) ?? undefined)
+        : undefined;
+      const kgMappingTeamKey = kgMappingResolved?.teamKey;
+      const kgDependencyTokenScope = kgMappingResolved?.dependencyTokenScope;
+      if (input.dispatchRun !== undefined && kgMappingTeamKey === undefined) {
+        return {
+          status: 422,
+          body: {
+            error: "kg-mapping-not-found",
+            precondition: "kg-mapping-not-found",
+            detail: `no project mapping found for kgSourceRepo=${input.kgSourceRepo} — add it at /admin and set dependencyTokenScope=installation`,
+          },
+        };
+      }
+
       try {
         if (freeBytes(dataRoot) < minFree) {
           return { status: 507, body: { error: "insufficient-storage", detail: `less than ${minFree} bytes free on the volume` } };
@@ -635,7 +654,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             const runnerCallbackUrl = input.runnerCallbackBaseUrl;
             const { token: runToken, dispatchId } = mintRunTokenFn({
               issueId: "kg-refresh",
-              mappingTeamKey: "",
+              mappingTeamKey: kgMappingTeamKey!,
               phase: "kg-refresh",
               audience: "result",
               ttlSeconds: KG_REFRESH_TTL_MS / 1000,
@@ -643,7 +662,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             });
             const { token: runProgressToken } = mintRunTokenFn({
               issueId: "kg-refresh",
-              mappingTeamKey: "",
+              mappingTeamKey: kgMappingTeamKey!,
               phase: "kg-refresh",
               audience: "progress",
               dispatchId,
@@ -663,7 +682,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               runnerPhase: "kg-refresh",
               kgSourceRepo: input.kgSourceRepo ?? undefined,
               runnerCallbackUrl,
-              dependencyTokenScope: "installation",
+              ...(kgDependencyTokenScope != null ? { dependencyTokenScope: kgDependencyTokenScope } : {}),
             };
 
             // Write the row before starting the machine so waitForQuiet cannot
