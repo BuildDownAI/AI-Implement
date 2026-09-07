@@ -29,7 +29,7 @@ flowchart TD
     C -->|"newer snapshot in source repo"| H["local staging rail\nfetch → stage → swap → verify"]
     C -->|"ingest-needed"| D["mintRunToken phase=kg-refresh\nappendLog issueId=kg-refresh"]
     D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
-    E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo\n→ kg-tracker-data → feedback-loop\n→ kg-snapshot-push"]
+    E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo\n→ kg-tracker-data → kg-ingest → feedback-loop\n→ kg-snapshot-push"]
     F --> G["POST /api/runner/result\nphase=kg-refresh"]
     G --> I["onRunnerComplete()\nverify snapshot commit"]
     I --> H
@@ -184,7 +184,7 @@ Every kg-refresh dispatch sets `dependencyTokenScope: "installation"` in the env
 
 The subsequent `clone-code-repo` pipeline step reads the `code_repo:` key from `sources.yml` in the cloned KG source repo (e.g. `code_repo: BuildDownAI/AI-Implement`). When the key is present, the step clones that repository into `code-repo/` in the workspace using a bare `https://github.com/...` URL — the credential helper supplies the dependency token automatically. When `code_repo:` is absent, the step is skipped.
 
-The `code-repo/` directory is the path passed as `--repo code-repo/` to the ingest binary (see §3 in `KG-REFRESH.md`). Both steps skip silently when their prerequisites are absent (no scope in the envelope, no `code_repo:` in `sources.yml`), so a mixed-version deploy with an old orchestrator produces a workspace without `code-repo/` and the ingest continues without it rather than failing.
+The `code-repo/` directory is passed as `--code-repo code-repo/` to the `kg-ingest` pipeline step, which spawns `python -m kg_ingest refresh`. Both steps skip silently when their prerequisites are absent (no scope in the envelope, no `code_repo:` in `sources.yml`), so a mixed-version deploy with an old orchestrator produces a workspace without `code-repo/` and the ingest continues without it rather than failing.
 
 The dependency token does not grant write access to any repository; it is scoped to `contents: read` across all repositories the GitHub App installation covers.
 
@@ -494,6 +494,7 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | KG push token vending | `src/kg-push-token-vending.ts` |
 | Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
 | Tracker-data pipeline step | `src/pipeline/steps/kg-tracker-data.ts` |
+| Ingest pipeline step | `src/pipeline/steps/kg-ingest.ts` |
 | KG refresh pipeline definition | `pipelines/kg-refresh.yml` |
 | Fly / local Docker dispatch | `src/index.ts` (`dispatchKgRefreshRun`) |
 | Outcome handler (notify + report issue) | `src/index.ts` (`handleKgRefreshOutcome`) |

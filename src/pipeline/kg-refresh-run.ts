@@ -13,6 +13,7 @@ import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
+import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
 import { ClaudeCliExecutor } from "./executor.js";
 import type { LLMExecutor, StepReporter, StepModule } from "./types.js";
 
@@ -27,6 +28,7 @@ export interface RunKgRefreshOptions {
     clone?: StepModule;
     dependencyAuth?: StepModule;
     kgTrackerData?: StepModule;
+    kgIngest?: StepModule;
     feedbackLoop?: StepModule;
     kgSnapshotPush?: StepModule;
   };
@@ -125,25 +127,28 @@ function buildKgRefreshPrompt(params: {
 /**
  * Reviewer rubric injected into the review prompt for kg-refresh runs.
  *
- * The KG-REFRESH.md playbook explicitly instructs the agent to leave all
- * changes uncommitted — the kg-snapshot-push step owns the repository write.
- * Without this rubric the generic reviewer treats untracked snapshot/ and
- * ai-output/ files as a gap and rejects an otherwise successful ingest.
+ * The pipeline's kg-ingest step runs the ingest as a deterministic process;
+ * Claude's role is to verify the outputs and write the run report. The
+ * KG-REFRESH.md playbook instructs the agent to leave all changes uncommitted
+ * — the kg-snapshot-push step owns the repository write. Without this rubric
+ * the generic reviewer treats untracked snapshot/ and ai-output/ files as a
+ * gap and rejects an otherwise successful ingest.
  *
  * Approval for a kg-refresh run is determined entirely by the four ingest
  * checks below, NOT by the working-tree state. Untracked or modified files
  * under snapshot/ and ai-output/ are the expected output of a correct run.
  */
-const KG_REFRESH_REVIEW_RUBRIC = `This is a kg-refresh run. The playbook instructs the agent to leave all changes \
-uncommitted — the pipeline step that follows owns the repository write. \
-Untracked or modified files under snapshot/ and ai-output/ are the expected \
-output of a successful ingest, never a gap.
+const KG_REFRESH_REVIEW_RUBRIC = `This is a kg-refresh run. The pipeline's kg-ingest step ran the ingest as a \
+deterministic process — the agent's role is to verify its outputs and write the \
+run report, then leave all changes uncommitted so the pipeline step that follows \
+owns the repository write. Untracked or modified files under snapshot/ and \
+ai-output/ are the expected output of a successful ingest, never a gap.
 
 Approve this run if and only if all four ingest checks pass:
-1. snapshot/parts/ contains at least one non-empty .nt file (RDF triples written).
-2. snapshot/embeddings.npz exists and is non-empty (embeddings rebuilt).
-3. snapshot/embeddings.stamp exists and contains a fresh ISO-8601 timestamp (stamp written).
-4. ai-output/kg-stats.json exists and contains the four required numeric fields: quads, vectors, docPages, durationSec (report written).
+1. snapshot/parts/ contains at least one non-empty .nt file (RDF triples written by the ingest step).
+2. snapshot/embeddings.npz exists and is non-empty (embeddings rebuilt by the ingest step).
+3. snapshot/embeddings.stamp exists and contains a fresh ISO-8601 timestamp (stamp written by the ingest step).
+4. ai-output/kg-stats.json exists and contains the four required numeric fields: quads, vectors, docPages, durationSec (written by the ingest step and verified in the run report).
 
 Do NOT raise issues about uncommitted files in snapshot/ or ai-output/. Do NOT \
 require git add or git commit — those are pipeline responsibilities.`;
@@ -186,11 +191,10 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       branch: defaultBranch,
       provider,
       maxTurns,
-      // kg-refresh allows up to 2 feedback-loop passes. If the first ingest pass
-      // has a recoverable gap (not a rubric contradiction), the reviewer can flag
-      // it and a second pass addresses it. The snapshot-push step (not the
-      // reviewer's verdict) is what determines final success or failure.
-      maxIterations: 2,
+      // The ingest is a deterministic pipeline step; the feedback-loop is report-only.
+      // One iteration is sufficient: Claude reads kg-stats.json, writes the run report,
+      // and answers the reviewer's checks. A second pass is never needed.
+      maxIterations: 1,
       reviewRubric: KG_REFRESH_REVIEW_RUBRIC,
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
@@ -203,6 +207,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
   runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
   runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
+  runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
   runner.register("feedback-loop", opts.stepsOverride?.feedbackLoop ?? feedbackLoopStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
 
@@ -215,6 +220,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     const isStale = err instanceof KgSnapshotStaleError;
     const isTrackerDataError = err instanceof KgTrackerDataFetchError;
     const isTrackerRegression = err instanceof KgSnapshotTrackerRegressionError;
+    const isIngestFailed = err instanceof KgIngestError;
     const failureCode = isMissing
       ? "KG_SNAPSHOT_MISSING"
       : isStale
@@ -223,7 +229,9 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
           ? "KG_TRACKER_DATA_FETCH_FAILED"
           : isTrackerRegression
             ? "KG_SNAPSHOT_TRACKER_REGRESSION"
-            : undefined;
+            : isIngestFailed
+              ? "KG_INGEST_FAILED"
+              : undefined;
     const failureReason = err instanceof Error ? err.message : String(err);
     console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
     await postRunnerResult({
