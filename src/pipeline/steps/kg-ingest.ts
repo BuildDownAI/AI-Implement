@@ -137,6 +137,13 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
       readFileSyncImpl: readFileFn = (p, enc) => readFileSync(p, enc),
     } = inputs;
 
+    if (!codeRepoDir) {
+      throw new KgIngestError(
+        1,
+        "no code repo in workspace — clone-code-repo step was skipped or failed",
+      );
+    }
+
     const spawnFn: SpawnImplFn =
       spawnImpl ??
       ((cmd, args, opts) =>

@@ -1896,27 +1896,45 @@ describe("kgIngestStep", () => {
     expect(capturedArgs[2]).not.toContain("--tracker-data");
   });
 
-  it("spawns without --code-repo when codeRepoDir is absent", async () => {
-    const capturedArgs: string[][] = [];
-    const spawnImpl = (cmd: string, args: string[]) => {
-      capturedArgs.push([cmd, ...args]);
-      return makeFakeProcess(0, ['{"quads":0}']) as unknown as ChildProcess;
-    };
+  it("throws KgIngestError with 'no code repo in workspace' when codeRepoDir is absent", async () => {
+    const spawnImpl = vi.fn(() => makeFakeProcess(0, ['{"quads":0}']) as unknown as ChildProcess);
 
-    await kgIngestStep.run(
-      makeContext(),
-      {
-        workspaceDir: tmpDir,
-        spawnImpl,
-        writeFileSyncImpl: () => undefined,
-        mkdirSyncImpl: () => undefined,
-        existsSyncImpl: () => false,
-      },
-      noopReporter,
-    );
+    const err = await kgIngestStep
+      .run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          spawnImpl,
+          writeFileSyncImpl: () => undefined,
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      )
+      .catch((e) => e);
 
-    expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh"]);
-    expect(capturedArgs[2]).not.toContain("--code-repo");
+    expect(err).toBeInstanceOf(KgIngestError);
+    expect((err as KgIngestError).outputTail).toContain("no code repo in workspace");
+  });
+
+  it("does not call spawnImpl when codeRepoDir is absent", async () => {
+    const spawnImpl = vi.fn(() => makeFakeProcess(0, []) as unknown as ChildProcess);
+
+    await kgIngestStep
+      .run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          spawnImpl,
+          writeFileSyncImpl: () => undefined,
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      )
+      .catch(() => {});
+
+    expect(spawnImpl).not.toHaveBeenCalled();
   });
 
   it("throws KgIngestError with exit code and last 40 lines on non-zero exit", async () => {
@@ -1925,7 +1943,7 @@ describe("kgIngestStep", () => {
       makeFakeProcess(2, [], errorLines) as unknown as ChildProcess;
 
     const err = await kgIngestStep
-      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .run(makeContext(), { workspaceDir: tmpDir, codeRepoDir: "/fake/code-repo", spawnImpl, existsSyncImpl: () => false }, noopReporter)
       .catch((e) => e);
 
     expect(err).toBeInstanceOf(KgIngestError);
@@ -1946,7 +1964,7 @@ describe("kgIngestStep", () => {
     };
 
     const err = await kgIngestStep
-      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .run(makeContext(), { workspaceDir: tmpDir, codeRepoDir: "/fake/code-repo", spawnImpl, existsSyncImpl: () => false }, noopReporter)
       .catch((e) => e);
 
     expect(err).toBeInstanceOf(KgIngestError);
@@ -1963,7 +1981,7 @@ describe("kgIngestStep", () => {
     };
 
     const err = await kgIngestStep
-      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .run(makeContext(), { workspaceDir: tmpDir, codeRepoDir: "/fake/code-repo", spawnImpl, existsSyncImpl: () => false }, noopReporter)
       .catch((e) => e);
 
     expect(err).toBeInstanceOf(KgIngestError);
@@ -1984,7 +2002,7 @@ describe("kgIngestStep", () => {
     };
 
     const err = await kgIngestStep
-      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .run(makeContext(), { workspaceDir: tmpDir, codeRepoDir: "/fake/code-repo", spawnImpl, existsSyncImpl: () => false }, noopReporter)
       .catch((e) => e);
 
     expect(err).toBeInstanceOf(KgIngestError);
@@ -2004,6 +2022,7 @@ describe("kgIngestStep", () => {
       makeContext(),
       {
         workspaceDir: tmpDir,
+        codeRepoDir: "/fake/code-repo",
         spawnImpl,
         writeFileSyncImpl: (p, d) => written.push([p, d]),
         mkdirSyncImpl: () => undefined,
@@ -2032,6 +2051,7 @@ describe("kgIngestStep", () => {
       makeContext(),
       {
         workspaceDir: tmpDir,
+        codeRepoDir: "/fake/code-repo",
         spawnImpl,
         writeFileSyncImpl: (p, d) => written.push([p, d]),
         mkdirSyncImpl: () => undefined,
@@ -2056,6 +2076,7 @@ describe("kgIngestStep", () => {
       makeContext(),
       {
         workspaceDir: tmpDir,
+        codeRepoDir: "/fake/code-repo",
         spawnImpl,
         writeFileSyncImpl: (p, d) => written.push([p, d]),
         mkdirSyncImpl: () => undefined,
@@ -2594,6 +2615,59 @@ describe("readCodeRepoFromSourcesYml", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo: /repo\n");
     expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
   });
+
+  // ── mapping form (code_repo: { slug: owner/name, ... }) ───────────────────
+
+  const REAL_CODE_REPO_BLOCK = `\
+code_repo:
+  slug: BuildDownAI/AI-Implement        # GitHub owner/name
+  path: ../AI-Implement                 # local clone for the git spine
+  docs_url: https://docs.builddown.ai/latest/introduction
+  doc_globs: []
+`;
+
+  it("returns slug from the real verbatim mapping form", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_CODE_REPO_BLOCK);
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+  });
+
+  it("returns slug when code_repo is a mapping with only the slug key", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: org/my-repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+  });
+
+  it("returns null when code_repo mapping has no slug key", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  path: ../repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  it("returns null when code_repo mapping slug is not owner/repo format (no slash)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: justarepo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  it("strips trailing comment from slug line", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: org/my-repo  # main repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+  });
+
+  it("returns slug when mapping form coexists with trackers block", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\ntrackers:\n  - team: AII\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/repo");
+  });
+
+  it("returns slug via regex fallback when YAML is malformed but mapping hint present", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "[broken\ncode_repo:\n  slug: org/repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/repo");
+  });
+
+  it("returns null when code_repo mapping slug value is numeric (42)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: 42\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
 });
 
 // ── dependencyTokenScope round-trip in kg-refresh RunConfigV1 ─────────────────
@@ -2775,6 +2849,92 @@ describe("applyWiring for clone-code-repo", () => {
     expect(inputs.targetDir).toBe("code-repo");
     expect(inputs.githubToken).toBe("");
     expect(inputs.workspaceDir).toBe(tmpDir);
+  });
+
+  it("emits console.warn when sources.yml has no code_repo and skip returns true", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+      });
+      const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+      expect(step).toBeDefined();
+
+      const ctx = makeContext();
+      ctx.setOutputs("clone", { workspaceDir: tmpDir });
+      // tmpDir has no sources.yml
+      expect(step!.skip!(ctx)).toBe(true);
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[clone-code-repo] sources.yml has no code_repo.slug — skipping",
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not emit console.warn when sources.yml has mapping-form code_repo and dependency-auth acquired", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n",
+    );
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+        existsSyncImpl: () => false,
+        readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+      });
+      const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+      expect(step).toBeDefined();
+
+      const ctx = makeContext();
+      ctx.setOutputs("clone", { workspaceDir: tmpDir });
+      ctx.setOutputs("dependency-auth", { acquired: true });
+      expect(step!.skip!(ctx)).toBe(false);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("skip returns false when sources.yml uses mapping form and dependency-auth acquired", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n  path: ../AI-Implement\n",
+    );
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    ctx.setOutputs("dependency-auth", { acquired: true });
+    expect(step!.skip!(ctx)).toBe(false);
+  });
+
+  it("inputs resolve repoOwner and repoRepo from mapping-form code_repo.slug", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n  path: ../AI-Implement\n",
+    );
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.repoOwner).toBe("BuildDownAI");
+    expect(inputs.repoRepo).toBe("AI-Implement");
   });
 });
 
