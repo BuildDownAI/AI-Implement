@@ -29,6 +29,8 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 
 The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs.
 
+**These are live credentials in the runner's environment, and a test suite running inside that container inherits them.** `run_token` is single-use: the first `POST /runner/result` consumes it, and every later post is refused `409 already_consumed`. So a suite that reaches a runner callback with the ambient values still set burns the token long before the run reports its own outcome — the real report is discarded, the tracker never advances, and on GitHub Actions the issue holds a dispatch slot until someone repairs it by hand. Any suite exercising a callback path must clear `RUN_TOKEN` and `RUNNER_CALLBACK_URL` in a hook rather than per call site, and a test that deliberately re-arms them must point the callback at an unroutable host.
+
 ---
 
 ## `RunConfigV1` Schema
