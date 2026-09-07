@@ -540,7 +540,7 @@ describe("handleKgTrackerDataRequest", () => {
     expect(capturedQuery).toContain("relations");
     expect(capturedQuery).toContain("relatedIssue");
     expect(capturedQuery).toContain("user");
-    expect(capturedQuery).toContain("comments(first: 50)");
+    expect(capturedQuery).toContain("comments(first: 100)");
   });
 
   it("passes the cursor to the upstream Linear query", async () => {

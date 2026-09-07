@@ -543,7 +543,7 @@ export async function handleKgTrackerDataRequest(
                 labels { nodes { name } }
                 project { name }
                 parent { identifier }
-                comments(first: 50) { nodes { body user { name } createdAt } }
+                comments(first: 100) { nodes { body user { name } createdAt } }
                 relations { nodes { type relatedIssue { identifier } } }
               }
               pageInfo { hasNextPage endCursor }
