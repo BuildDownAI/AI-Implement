@@ -182,7 +182,7 @@ A third (`publication`) token is **not** minted: there is no target repository, 
 
 ### Dependency token and code repo clone
 
-Every kg-refresh dispatch sets `dependencyTokenScope: "installation"` in the envelope. The `dependency-auth` pipeline step reads this field and calls `POST /api/runner/dependency-token` to receive a short-lived installation-wide `contents: read` GitHub App token. The step installs it as a git credential helper for `https://github.com` and exports it as `COMPOSER_AUTH`.
+Every kg-refresh dispatch sets `dependencyTokenScope: "installation"` in the envelope. The `dependency-auth` pipeline step reads this field and calls `POST /api/runner/dependency-token` to receive a short-lived installation-wide GitHub App token scoped to `contents: read` and `pull_requests: read`. The step installs it as a git credential helper for `https://github.com` and exports it as `COMPOSER_AUTH`.
 
 The subsequent `clone-code-repo` pipeline step reads the `code_repo:` key from `sources.yml` in the cloned KG source repo. Two forms are accepted:
 
@@ -206,7 +206,7 @@ The `code-repo/` directory is passed as `--code-repo code-repo/` to the `kg-inge
 
 The `kg-ingest` step also receives the dependency token as `GH_TOKEN` in the subprocess environment so that `gh` commands (e.g. `gh pr list`) can authenticate against the GitHub API. The token is sourced from `ctx.data.dependencyToken` (set by `dependency-auth`) and is never written to the step log or passed as a CLI argument. When the dependency token is absent, the step logs one warning and the subprocess runs without `GH_TOKEN`.
 
-The dependency token does not grant write access to any repository; it is scoped to `contents: read` across all repositories the GitHub App installation covers.
+The dependency token does not grant write access to any repository; it is scoped to `contents: read` and `pull_requests: read` across all repositories the GitHub App installation covers.
 
 ### KG push token
 

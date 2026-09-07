@@ -141,15 +141,15 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
       readFileSyncImpl: readFileFn = (p, enc) => readFileSync(p, enc),
     } = inputs;
 
-    if (!ghToken) {
-      console.warn("[kg-ingest] GH_TOKEN not available — gh commands may fail (no dependency token)");
-    }
-
     if (!codeRepoDir) {
       throw new KgIngestError(
         1,
         "no code repo in workspace — clone-code-repo step was skipped or failed",
       );
+    }
+
+    if (!ghToken) {
+      console.warn("[kg-ingest] GH_TOKEN not available — gh commands may fail (no dependency token)");
     }
 
     const spawnFn: SpawnImplFn =

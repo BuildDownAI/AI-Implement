@@ -2140,8 +2140,8 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    // process.env is passed through but GH_TOKEN should not be injected
-    expect(capturedEnv?.GH_TOKEN).not.toBe("dep-token-xyz");
+    // process.env is passed through unchanged — no new object means no injection
+    expect(capturedEnv).toBe(process.env);
   });
 
   it("logs exactly one warn line mentioning GH_TOKEN when ghToken is absent", async () => {
