@@ -329,4 +329,22 @@ describe("verifyRunToken — claims on a refusal", () => {
       expect(badSig.claims).toBeUndefined();
     }
   });
+
+  it("carries claims when the payload verified but its row is gone", () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "issue-9",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    dedup.getDb().prepare("DELETE FROM runner_tokens WHERE dispatch_id = ?").run(dispatchId);
+
+    const result = runnerTokens.verifyRunToken(token, SECRET, "result", { consume: false });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("malformed");
+      expect(result.claims?.dispatchId).toBe(dispatchId);
+    }
+  });
 });

@@ -107,7 +107,8 @@ function verifyTokenSignatureAndLoadClaims(token: string, secret: string): Verif
   const row = db
     .prepare("SELECT consumed_at, mapping_team_key FROM runner_tokens WHERE dispatch_id = ? AND audience = ?")
     .get(claims.dispatchId, claims.audience) as { consumed_at: number | null; mapping_team_key: string } | undefined;
-  if (!row) return { ok: false, reason: "malformed" };
+  // Reason stays "malformed" though the payload verified: callers map it to a status.
+  if (!row) return { ok: false, reason: "malformed", claims };
 
   return { ok: true, claims, mappingTeamKey: row.mapping_team_key, consumedAt: row.consumed_at };
 }

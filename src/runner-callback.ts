@@ -241,7 +241,7 @@ export async function handleRunnerResult(
   if (!verified.ok) {
     console.warn(
       `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
-        `phase=${String(input.body.phase)} outcome=${String(input.body.outcome)} reason=${verified.reason}`,
+        `phase=${input.body.phase} outcome=${input.body.outcome} reason=${verified.reason}`,
     );
     return verified.reason === "already_consumed"
       ? bad(409, "already_consumed")
@@ -256,7 +256,7 @@ export async function handleRunnerResult(
   if (claims.phase !== input.body.phase) {
     console.warn(
       `[runner-callback] result burned dispatch=${claims.dispatchId} reason=phase_mismatch ` +
-        `token=${claims.phase} body=${String(input.body.phase)}`,
+        `token=${claims.phase} body=${input.body.phase}`,
     );
     return bad(400, "phase_mismatch");
   }
