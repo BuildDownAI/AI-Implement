@@ -22,6 +22,12 @@ interface CloneInputs extends Record<string, unknown> {
    * Used by the clone-code-repo step to place the code repo alongside the KG source workspace.
    */
   targetDir?: string;
+  /**
+   * Clone depth for secondary (targetDir) clones only. "full" omits --depth to retrieve
+   * complete history; a number sets --depth to that value; omitting defaults to 1.
+   * The primary (implement) clone path ignores this field and always uses --depth 1.
+   */
+  depth?: number | "full";
 }
 
 interface CloneOutputs extends Record<string, unknown> {
@@ -40,7 +46,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     inputs: CloneInputs,
     _reporter: StepReporter,
   ): Promise<CloneOutputs> {
-    const { repoOwner, repoRepo, branch, githubToken, workspaceDir, targetDir } = inputs;
+    const { repoOwner, repoRepo, branch, githubToken, workspaceDir, targetDir, depth } = inputs;
 
     // Secondary clone into a subdirectory (e.g. the clone-code-repo step).
     // The credential helper installed by dependency-auth supplies auth — no token in the URL.
@@ -58,15 +64,47 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
 
       if (fs.existsSync(path.join(effectiveDir, ".git"))) {
         const branchArgs = branch ? [branch] : [];
-        const fetchResult = spawnSync(
-          "git",
-          ["fetch", "--depth", "1", "origin", ...branchArgs],
-          { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
-        );
-        if (fetchResult.status !== 0) {
-          const stderr = fetchResult.stderr?.toString() ?? "";
-          throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+
+        if (depth === "full") {
+          // Unshallow a pre-existing shallow clone before fetching full history.
+          const isShallowResult = spawnSync(
+            "git",
+            ["rev-parse", "--is-shallow-repository"],
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+          );
+          if (isShallowResult.stdout?.toString().trim() === "true") {
+            const unshallowResult = spawnSync(
+              "git",
+              ["fetch", "--unshallow", "origin"],
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+            );
+            if (unshallowResult.status !== 0) {
+              const stderr = unshallowResult.stderr?.toString() ?? "";
+              throw new Error(`git fetch --unshallow failed (exit ${unshallowResult.status ?? "null"}): ${stderr}`);
+            }
+          }
+          const fetchResult = spawnSync(
+            "git",
+            ["fetch", "origin", ...branchArgs],
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+          );
+          if (fetchResult.status !== 0) {
+            const stderr = fetchResult.stderr?.toString() ?? "";
+            throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+          }
+        } else {
+          const depthVal = depth !== undefined ? String(depth) : "1";
+          const fetchResult = spawnSync(
+            "git",
+            ["fetch", "--depth", depthVal, "origin", ...branchArgs],
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+          );
+          if (fetchResult.status !== 0) {
+            const stderr = fetchResult.stderr?.toString() ?? "";
+            throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+          }
         }
+
         const resetTarget = branch ? `origin/${branch}` : "FETCH_HEAD";
         const resetResult = spawnSync(
           "git",
@@ -80,9 +118,10 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         cloneMethod = "incremental";
       } else {
         const branchArgs = branch ? ["--branch", branch] : [];
+        const depthArgs = depth === "full" ? [] : ["--depth", depth !== undefined ? String(depth) : "1"];
         const cloneResult = spawnSync(
           "git",
-          ["clone", "--depth", "1", ...branchArgs, bareRemote, effectiveDir],
+          ["clone", ...depthArgs, ...branchArgs, bareRemote, effectiveDir],
           { stdio: ["ignore", "pipe", "pipe"] },
         );
         if (cloneResult.status !== 0) {

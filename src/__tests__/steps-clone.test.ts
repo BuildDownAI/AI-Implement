@@ -506,6 +506,103 @@ describe("cloneStep", () => {
         vi.unstubAllEnvs();
       }
     });
+
+    it("omits --depth from git clone args when depth is 'full'", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: "full" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      const cloneArgs = calls[0][1] as string[];
+      expect(cloneArgs[0]).toBe("clone");
+      expect(cloneArgs).not.toContain("--depth");
+    });
+
+    it("passes --depth 1 from git clone args when depth is explicitly 1", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: 1 }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      const cloneArgs = calls[0][1] as string[];
+      expect(cloneArgs[0]).toBe("clone");
+      const depthIdx = cloneArgs.indexOf("--depth");
+      expect(depthIdx).toBeGreaterThan(-1);
+      expect(cloneArgs[depthIdx + 1]).toBe("1");
+    });
+
+    it("omits --depth from git fetch and checks shallowness when depth is 'full' (not shallow)", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // is-shallow-repository → "false", fetch (no depth), reset, rev-parse
+      mockSpawn([
+        { status: 0, stdout: "false\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "def456\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: "full" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
+      const fetchArgs = calls[1][1] as string[];
+      expect(fetchArgs[0]).toBe("fetch");
+      expect(fetchArgs).not.toContain("--depth");
+      expect(outputs.cloneMethod).toBe("incremental");
+    });
+
+    it("calls git fetch --unshallow before full fetch when depth is 'full' and repo is shallow", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // is-shallow-repository → "true", unshallow, fetch, reset, rev-parse
+      mockSpawn([
+        { status: 0, stdout: "true\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "def456\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: "full" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
+      expect(calls[1][1]).toEqual(["fetch", "--unshallow", "origin"]);
+      const fetchArgs = calls[2][1] as string[];
+      expect(fetchArgs[0]).toBe("fetch");
+      expect(fetchArgs).not.toContain("--depth");
+      expect(outputs.cloneMethod).toBe("incremental");
+    });
+
+    it("throws when git fetch --unshallow fails", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockSpawn([
+        { status: 0, stdout: "true\n" },
+        { status: 1, stderr: "fatal: server does not support --unshallow" },
+      ]);
+
+      await expect(
+        cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: "full" }, new NoopStepReporter()),
+      ).rejects.toThrow(/git fetch --unshallow failed/);
+    });
+  });
+
+  describe("primary clone depth invariant", () => {
+    it("always uses --depth 1 in the primary clone path regardless of any depth input", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      // depth input is silently ignored by the primary (implement) clone path
+      await cloneStep.run(makeContext(), { ...BASE_INPUTS, depth: "full" as const }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      const cloneArgs = calls[0][1] as string[];
+      expect(cloneArgs[0]).toBe("clone");
+      const depthIdx = cloneArgs.indexOf("--depth");
+      expect(depthIdx).toBeGreaterThan(-1);
+      expect(cloneArgs[depthIdx + 1]).toBe("1");
+    });
   });
 
   describe("mounted workspace mode (AI_IMPLEMENT_WORKSPACE_MODE=mounted)", () => {

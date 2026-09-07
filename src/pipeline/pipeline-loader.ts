@@ -20,6 +20,7 @@ interface YamlStep {
   id: string;
   type: StepType;
   moduleId?: string;
+  depth?: number | "full";
 }
 
 interface YamlPipeline {
@@ -52,7 +53,7 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
     if (!step || typeof step !== "object") {
       throw new Error(`Pipeline YAML at "${sourcePath}" step[${i}] is not an object`);
     }
-    const { id: stepId, type, moduleId } = step as Record<string, unknown>;
+    const { id: stepId, type, moduleId, depth } = step as Record<string, unknown>;
     if (typeof stepId !== "string" || !stepId) {
       throw new Error(`Pipeline YAML at "${sourcePath}" step[${i}] missing 'id'`);
     }
@@ -65,7 +66,24 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
     if (moduleId !== undefined && typeof moduleId !== "string") {
       throw new Error(`Pipeline YAML at "${sourcePath}" step "${stepId}" has non-string 'moduleId'`);
     }
-    return { id: stepId, type: type as StepType, ...(moduleId ? { moduleId } : {}) };
+    let parsedDepth: number | "full" | undefined;
+    if (depth !== undefined) {
+      if (depth === "full") {
+        parsedDepth = "full";
+      } else if (typeof depth === "number" && Number.isInteger(depth) && depth > 0) {
+        parsedDepth = depth;
+      } else {
+        throw new Error(
+          `Pipeline YAML at "${sourcePath}" step "${stepId}" has invalid 'depth': expected a positive integer or "full"`,
+        );
+      }
+    }
+    return {
+      id: stepId,
+      type: type as StepType,
+      ...(moduleId ? { moduleId } : {}),
+      ...(parsedDepth !== undefined ? { depth: parsedDepth } : {}),
+    };
   });
 
   return { id, steps: parsedSteps };
@@ -288,6 +306,7 @@ function applyWiring(step: YamlStep): StepDefinition {
             githubToken: "",
             workspaceDir,
             targetDir: "code-repo",
+            depth: step.depth,
           };
         },
         skip: (ctx: PipelineContext) => {
@@ -317,6 +336,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           return {
             workspaceDir,
             ...(codeRepoDir ? { codeRepoDir } : {}),
+            ...(ctx.data.dependencyToken ? { ghToken: ctx.data.dependencyToken } : {}),
           };
         },
       };
