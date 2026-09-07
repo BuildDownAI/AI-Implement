@@ -683,6 +683,280 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
   });
 });
 
+// ── kgSnapshotPushStep — content-based regression guard ──────────────────────
+
+describe("kgSnapshotPushStep — content-based regression guard", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgpush-content-"));
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+  });
+
+  function makeInputs(overrides: Record<string, unknown> = {}) {
+    return {
+      workspaceDir: tmpDir,
+      githubToken: "fake-token",
+      defaultBranch: "main",
+      clonedRef: resolveHead(tmpDir),
+      ...overrides,
+    };
+  }
+
+  function makeLines(n: number): string {
+    return "<s> <p> <o> .\n".repeat(n);
+  }
+
+  function commitPreviousSnapshot(partsContent: Record<string, string>, stamp = "2026-01-01T00:00:00Z"): void {
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    for (const [name, content] of Object.entries(partsContent)) {
+      writeFileSync(join(tmpDir, "snapshot", "parts", name), content);
+    }
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), stamp);
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'prev snapshot'", { cwd: tmpDir, stdio: "ignore" });
+  }
+
+  function writeWorkingTree(partsContent: Record<string, string>, stamp = "2026-09-03T10:00:00Z"): void {
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    for (const [name, content] of Object.entries(partsContent)) {
+      writeFileSync(join(tmpDir, "snapshot", "parts", name), content);
+    }
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), stamp);
+  }
+
+  it("refuses when a previous part is missing from the working tree", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // Remove issue.nt from the working tree; add an unrelated file
+    rmSync(join(tmpDir, "snapshot", "parts", "issue.nt"));
+    writeWorkingTree({ "doc.nt": makeLines(50) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("issue.nt");
+    expect(err.message).toContain("missing");
+  });
+
+  it("refuses with KgSnapshotTrackerRegressionError when the entire snapshot/parts/ directory is absent and previous snapshot had parts", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // Simulate total ingest failure: remove the entire parts directory
+    rmSync(join(tmpDir, "snapshot", "parts"), { recursive: true, force: true });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    // Content-based guard runs before section 1's existence check, so KgSnapshotTrackerRegressionError surfaces first
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("missing");
+    expect(err.message).toContain("issue.nt");
+  });
+
+  it("refuses when a part shrinks below the 50% threshold", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "doc.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 49 lines < 50% of 100 → general threshold fires
+    writeFileSync(join(tmpDir, "snapshot", "parts", "doc.nt"), makeLines(49));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 500 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("doc.nt");
+  });
+
+  it("refuses when issue.nt shrinks by any amount and issueCount > 0 (above 50% floor)", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above the 50% general threshold, but zero-shrink rule applies when issueCount > 0
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), makeLines(99));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("issue.nt");
+  });
+
+  it("refuses when comment.nt shrinks by any amount and issueCount > 0 (above 50% floor)", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "comment.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above the 50% general threshold, but zero-shrink rule applies to tracker parts when issueCount > 0
+    writeFileSync(join(tmpDir, "snapshot", "parts", "comment.nt"), makeLines(99));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("comment.nt");
+  });
+
+  it("permits doc.nt to shrink above the 50% floor (zero-shrink applies only to tracker parts)", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "doc.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above the 50% general threshold; doc.nt is not a tracker part so zero-shrink does not apply
+    writeWorkingTree({ "doc.nt": makeLines(99) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    // Guard passes → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("permits issue.nt to shrink when issueCount is 0", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above 50% and zero-shrink does not apply (issueCount=0)
+    writeWorkingTree({ "issue.nt": makeLines(99) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 0 });
+    // Guard passes → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("passes a healthy snapshot where all parts grow", async () => {
+    const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare-content-"));
+    try {
+      execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+
+      writeWorkingTree({ "issue.nt": makeLines(110), "doc.nt": makeLines(210) });
+
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+      const result = await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, defaultBranch: "main" }),
+        noopReporter,
+      );
+      expect(result.snapshotPushed).toBe(true);
+    } finally {
+      rmSync(bareDir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips the guard when no previous snapshot parts exist (first ever push)", async () => {
+    initGitRepo(tmpDir);
+    // clonedRef has no snapshot/parts/ at all
+    const clonedRef = resolveHead(tmpDir);
+
+    writeWorkingTree({ "issue.nt": makeLines(100) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    // Guard skips (no previous parts) → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("skips the guard when clonedRef is 'unknown'", async () => {
+    initGitRepo(tmpDir);
+    writeWorkingTree({ "issue.nt": makeLines(5) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    // Guard skips (clonedRef=unknown) → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef: "unknown" }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("refuses the incident shape: issue.nt 9534 → 3 lines", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(9534) });
+    const clonedRef = resolveHead(tmpDir);
+
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), makeLines(3));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("issue.nt");
+    expect(err.message).toContain("9534");
+    expect(err.message).toMatch(/\b3\b/);
+  });
+
+  it("reports multiple regressions in a single error", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // Delete doc.nt; shrink issue.nt to 30 lines (violates both zero-shrink and 50% threshold)
+    rmSync(join(tmpDir, "snapshot", "parts", "doc.nt"));
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), makeLines(30));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("issue.nt");
+    expect(err.message).toContain("doc.nt");
+  });
+
+  it("emits a [kg-snapshot-push] parts: log line before throwing on a regression", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+      const clonedRef = resolveHead(tmpDir);
+
+      // issue.nt at 3 lines → regression; doc.nt grows
+      writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), makeLines(3));
+      writeFileSync(join(tmpDir, "snapshot", "parts", "doc.nt"), makeLines(210));
+
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+      const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+
+      expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+      const logCall = logSpy.mock.calls.find((c) => String(c[0]).includes("[kg-snapshot-push] parts:"));
+      expect(logCall).toBeDefined();
+      const logMsg = String(logCall![0]);
+      expect(logMsg).toContain("issue.nt");
+      expect(logMsg).toContain("doc.nt");
+      expect(logMsg).toContain("prev=");
+      expect(logMsg).toContain("new=");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
 // ── kgTrackerDataStep ─────────────────────────────────────────────────────────
 
 describe("kgTrackerDataStep", () => {
