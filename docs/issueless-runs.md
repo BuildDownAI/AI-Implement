@@ -250,18 +250,11 @@ The stuck-watchdog path re-queues issues through the ticketing system. Since the
 
 ### Reaper reconciliation
 
-`src/reaper.ts`: at the end of each `sweepOrphanedMachines()` call, `sweepOrphanedKgRefreshJobs()` is invoked. It branches on `job.executionMode`:
+`src/reaper.ts`: at the end of each `sweepOrphanedMachines()` call, `sweepOrphanedKgRefreshJobs()` is invoked. It is **Fly-mode and local-Docker only**; GHA rows are skipped (`continue`) because the implement-path monitor owns them.
 
-**Fly-mode rows** (existing behaviour): the already-fetched machine set is consulted. For each row whose `machine_id` is absent from the active set, `helpers.failKgRefreshMachine(job)` is called. A row still in `"dispatched"` state past the 5-minute bootstrap deadline is closed with `failureCode: "bootstrap_timeout"` regardless of machine presence. Local-Docker rows (no `machine_id`) are skipped.
+**Fly-mode rows**: the already-fetched machine set is consulted. For each row whose `machine_id` is absent from the active set, `helpers.failKgRefreshMachine(job)` is called. A row still in `"dispatched"` state past the 5-minute bootstrap deadline is closed with `failureCode: "bootstrap_timeout"` regardless of machine presence. Local-Docker rows (no `machine_id`) are skipped.
 
-**GHA rows** (`executionMode = "github-actions"`): machine-absent and bootstrap-deadline rules never apply. Instead, `helpers.checkGhaRunStatus(job)` queries the GitHub Actions workflow run:
-- `status` is `"queued"` or `"in_progress"` → leave the row alone
-- `status` is `"completed"` → call `helpers.failKgRefreshMachine(job, { failureCode: conclusion })` to close the chain
-- API error (helper returns `null`) → leave the row alone (fail-safe; avoid releasing the deploy interlock on ambiguous signal)
-- `run_id` is `null` and the row is within the 5-minute dispatch grace window → leave alone
-- `run_id` is `null` and past the grace window → close with `failureCode: "dispatch_lost"`
-
-All paths converge on `kgRefresh.onMachineLost()`:
+All Fly paths converge on `kgRefresh.onMachineLost()`:
 
 ```typescript
 onMachineLost(opts?: { failureCode?: string }) {
@@ -272,7 +265,15 @@ onMachineLost(opts?: { failureCode?: string }) {
 
 `failIngestRunner()` closes the chain: sets `stage = "failed"`, clears `running`, fires `onOutcome("failure", { timedOut: true })`, and calls `closeJobLog(jobId, "timed_out")`.
 
-New `ruleMatched` values written to `reaper_actions`: `kg-refresh-gha-run-complete`, `kg-refresh-gha-dispatch-lost`.
+### GHA monitor (lazy bind and run closure)
+
+GHA kg-refresh rows are monitored by `monitorKgRefreshGhaJob` in `src/monitor-gha.ts`. `monitorGitHubActionsJob` in `src/index.ts` delegates to it immediately for any row where `job.phase === "kg-refresh"`. `getInFlightJobs()` returns kg-refresh rows because it is phase-agnostic; the main monitor loop routes all non-Fly, non-local-Docker rows through `monitorGitHubActionsJob`, which then delegates.
+
+**Lazy bind (run_id IS NULL):** `monitorKgRefreshGhaJob` resolves the workflow file as `"claude-implement.yml"` (the file kg-refresh dispatches to) and the ref via `getRepoDefaultBranch()`, bypassing the `teamRepoMap` lookup that would return nothing for the KG source repo. It calls `attachJobRunIdIfMissing` and adds to `claimedRunIds`, which are shared with implement rows in the same poll cycle.
+
+**Run closure:** once `run_id` is set, `monitorKgRefreshGhaJob` polls `getWorkflowRunStatus()` and calls `updateJobStatus(job.id, jobStatus, conclusion, null)` on completion. kg-refresh rows are issueless — no PR URL, no ticket side effects. Issue-keyed side effects (ticket comments, labels) are suppressed by the existing `shouldSkipCompletionNotice(job)` guard in `reportJobCompletion` (AII-539). The reaper is **Fly-only** for kg-refresh; GHA rows are owned entirely by the monitor.
+
+**Late-callback safety:** `onRunnerComplete` in `KgRefreshHandle` checks the in-memory `stage`, not the DB row status. If the monitor has already called `updateJobStatus` before the runner's own callback arrives, `stage` is still `"ingest-running"` and the callback proceeds normally, recording `lastRefresh` and calling `closeJobLog` (a no-op re-update on an already-terminal row).
 
 ### Deploy interlock
 
