@@ -2,6 +2,11 @@ id: kg-refresh
 steps:
   - id: clone
     type: clone
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
+  - id: clone-code-repo
+    type: clone
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data

@@ -48,13 +48,16 @@ Adjust the command if the repo uses a different ingest entry point (e.g. `python
 
 ### 3. Run the ingest
 
+The pipeline clones the code repository to `code-repo/` in the workspace before this step runs (when `sources.yml` declares a `code_repo:` key). The KG source repo is the current working directory.
+
 Execute the ingest as the repo documents it (check `README.md`, `Makefile`, or a `scripts/` directory). Typical invocation:
 
 ```bash
-python scripts/ingest.py        # or
-make ingest                     # or
-python -m kg_ingest             # adapt to this repo
+python scripts/ingest.py --repo code-repo/    # or
+python -m kg_ingest --repo code-repo/         # adapt to this repo
 ```
+
+If `code-repo/` is absent (not declared in `sources.yml`, or the clone was skipped), omit `--repo` and note the absence in the run report.
 
 If `tracker-data.json` exists in the workspace (written by step 2.5) and `$TRACKER_DATA_SUPPORTED` is `true`, append `--tracker-data tracker-data.json` to the ingest invocation. This supplies Linear issue data fetched via the orchestrator proxy so the ingest does not need a direct tracker credential.
 

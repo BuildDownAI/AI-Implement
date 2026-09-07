@@ -663,6 +663,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               runnerPhase: "kg-refresh",
               kgSourceRepo: input.kgSourceRepo ?? undefined,
               runnerCallbackUrl,
+              dependencyTokenScope: "installation",
             };
 
             // Write the row before starting the machine so waitForQuiet cannot

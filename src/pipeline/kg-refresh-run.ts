@@ -9,6 +9,7 @@ import { PipelineRunner } from "./runner.js";
 import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
+import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
@@ -24,6 +25,7 @@ export interface RunKgRefreshOptions {
   fetchImpl?: typeof fetch;
   stepsOverride?: {
     clone?: StepModule;
+    dependencyAuth?: StepModule;
     kgTrackerData?: StepModule;
     feedbackLoop?: StepModule;
     kgSnapshotPush?: StepModule;
@@ -46,6 +48,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   callbackUrl: string | null;
   provider: string;
   maxTurns: number | undefined;
+  dependencyTokenScope: "installation" | undefined;
 } {
   const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
   let issueId = "";
@@ -54,6 +57,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   let issueDescription = "Refresh the knowledge-graph snapshot";
   let callbackUrl: string | null = null;
   let maxTurns: number | undefined;
+  let dependencyTokenScope: "installation" | undefined;
 
   if (rawConfig) {
     try {
@@ -66,6 +70,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
       if (cfg.maxTurns && Number.isInteger(cfg.maxTurns) && cfg.maxTurns > 0) {
         maxTurns = cfg.maxTurns;
       }
+      dependencyTokenScope = cfg.dependencyTokenScope;
     } catch (err) {
       console.warn("[kg-refresh] Could not decode run_config envelope; using env fallbacks:", err);
     }
@@ -92,6 +97,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
     callbackUrl: callbackUrl ?? env.RUNNER_CALLBACK_URL?.trim() ?? null,
     provider,
     maxTurns,
+    dependencyTokenScope,
   };
 }
 
@@ -156,6 +162,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     callbackUrl,
     provider,
     maxTurns,
+    dependencyTokenScope,
   } = resolveKgRefreshInputs(process.env);
 
   const implementationPrompt = buildKgRefreshPrompt({ issueIdentifier, issueTitle, issueDescription });
@@ -186,6 +193,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       maxIterations: 2,
       reviewRubric: KG_REFRESH_REVIEW_RUBRIC,
       callbackUrl: callbackUrl ?? undefined,
+      dependencyTokenScope,
     },
     opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary"),
   );
@@ -193,6 +201,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
   const runner = new PipelineRunner();
   runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
+  runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
   runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
   runner.register("feedback-loop", opts.stepsOverride?.feedbackLoop ?? feedbackLoopStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);

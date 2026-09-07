@@ -3,6 +3,7 @@ import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
+import { readCodeRepoFromSourcesYml } from "./steps/kg-tracker-data.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",
@@ -270,6 +271,31 @@ function applyWiring(step: YamlStep): StepDefinition {
           // reads it directly from process.env instead.
         }),
       };
+
+    case "clone-code-repo": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const codeRepo = readCodeRepoFromSourcesYml(workspaceDir) ?? "";
+          const slashIdx = codeRepo.indexOf("/");
+          const repoOwner = slashIdx > 0 ? codeRepo.slice(0, slashIdx) : codeRepo;
+          const repoRepo = slashIdx > 0 ? codeRepo.slice(slashIdx + 1) : "";
+          return {
+            repoOwner,
+            repoRepo,
+            branch: "",
+            githubToken: "",
+            workspaceDir,
+            targetDir: "code-repo",
+          };
+        },
+        skip: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          return readCodeRepoFromSourcesYml(workspaceDir) === null;
+        },
+      };
+    }
 
     case "kg-snapshot-push":
       return {

@@ -85,6 +85,41 @@ function readTrackerTeams(workspaceDir: string): string[] {
   return matches.map((m) => m[1]);
 }
 
+/**
+ * Reads the top-level `code_repo:` key from sources.yml.
+ * Returns the value as `"owner/repo"` or null when the key is absent, the file
+ * is missing, or the file cannot be parsed.
+ */
+export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null {
+  const filePath = join(workspaceDir, "sources.yml");
+  if (!existsSync(filePath)) return null;
+
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return null;
+  }
+
+  try {
+    const doc = parseYaml(raw) as unknown;
+    if (
+      doc !== null &&
+      typeof doc === "object" &&
+      typeof (doc as Record<string, unknown>).code_repo === "string"
+    ) {
+      const value = ((doc as Record<string, unknown>).code_repo as string).trim();
+      return value || null;
+    }
+  } catch {
+    // Fall through to regex fallback
+  }
+
+  // Fallback: matches a top-level `code_repo:` line; value stops before any trailing comment
+  const match = raw.match(/^code_repo:\s+(\S+)/m);
+  return match ? match[1] : null;
+}
+
 export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOutputs> = {
   async run(
     _context: PipelineContext,
