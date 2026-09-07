@@ -64,16 +64,20 @@ describe("GHA workflow shims", () => {
     expect(promoteStep.run).toContain("re-test and promote the digest image");
     expect(promoteStep.run).toContain('if [ "$current_sha" != "${{ github.sha }}" ]; then');
     expect(promoteStep.run).toContain("Skipping channel promotion");
+    // Equivalence check: script is called when head advanced past tested SHA
+    expect(promoteStep.run).toContain('bash scripts/image-equiv-check.sh "${{ github.sha }}" "$current_sha"');
     expect(promoteStep.run).toContain("Re-pull immediately before tagging");
     expect(promoteStep.run).toContain('docker pull "$digest_ref"');
-    expect(promoteStep.run).toContain(
-      'docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"',
-    );
+    // Channel tag uses a bash variable (channel=) so the value is set once at the top
+    expect(promoteStep.run).toContain('docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${channel}"');
     expect(promoteStep.run).toContain(
       'docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"',
     );
-    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"');
+    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${channel}"');
     expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"');
+    // Head date tag is pushed when head advanced with no image-relevant changes
+    expect(promoteStep.run).toContain("head_date_tag=");
+    expect(promoteStep.run).toContain('"$head_date_tag"');
   });
 
   it("keeps the canonical and synced dispatch workflows byte-for-byte identical", () => {
