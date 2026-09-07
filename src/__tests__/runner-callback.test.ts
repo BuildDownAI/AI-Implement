@@ -416,7 +416,32 @@ describe("handleRunnerResult — implementation", () => {
     const job = log.getJobById(jobId);
     expect(job?.status).toBe("completed");
     expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.approved).toBe(true);
     expect(job?.prUrl).toBe("https://github.com/o/r/pull/42");
+  });
+
+  it("warns and returns 200 when no job row exists for an approved implementation result (AII-572)", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i-no-job",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/99",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("no job row"));
   });
 
   it("does NOT write runner_approved on noWork (grouping-parent no-op)", async () => {
@@ -897,6 +922,26 @@ describe("handleRunnerResult — gap-analysis", () => {
     const job = log.getJobByDispatchId(dispatchId);
     expect(job?.status).toBe("completed");
     expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.approved).toBe(true);
+  });
+
+  it("warns when no job row exists for an approved gap-analysis result (AII-572)", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i-no-job-gap",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+    expect(res.status).toBe(200);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("no job row"));
   });
 
   it("stamps runner_approved when review-fix gap-analysis succeeds (snapshot branch)", async () => {

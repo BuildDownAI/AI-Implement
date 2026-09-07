@@ -2,7 +2,7 @@ import http from "node:http";
 import { verifyMcpToken } from "./mcp-oauth.js";
 import { getRunnerMode } from "./runner-mode.js";
 import { getMappings } from "./config.js";
-import { getInFlightJobs } from "./log.js";
+import { getInFlightJobs, getRunRecordMergeVerdict } from "./log.js";
 import { getDb } from "./dedup.js";
 import { getIssueReportCard, getFleetReport } from "./report-card.js";
 import { isKgDegraded } from "./deploy-notify.js";
@@ -194,11 +194,16 @@ async function callDiagnosticTool(
       const inFlight = recentRows.some(
         (j) => j.status === "dispatched" || j.status === "running",
       );
+      const latestPrUrl = recentRows.find((j) => j.pr_url)?.pr_url ?? null;
+      const mergeVerdict = latestPrUrl
+        ? { verdict: getRunRecordMergeVerdict(identifier, latestPrUrl), prUrl: latestPrUrl }
+        : null;
       return {
         identifier,
         inFlight,
         inDedupWindow: !!dedupRow,
         dedupEntry: dedupRow ?? null,
+        mergeVerdict,
         recentDispatches: recentRows.map((j) => ({
           id: j.id,
           status: j.status,

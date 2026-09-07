@@ -41,6 +41,9 @@ export interface Job {
    *  self). Lets the monitors treat a clean exit with no PR as Case-B finalize instead of
    *  pr_not_found (AII-264 r5). */
   groupingParent: boolean;
+  /** Durable approval mark set by stampJobApproved; survives any subsequent updateJobStatus
+   *  call from the GHA monitor or watchdog that may overwrite conclusion with 'success'. */
+  approved: boolean;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -129,6 +132,9 @@ function ensureLogColumns(): void {
   }
   if (!names.has("grouping_parent")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN grouping_parent INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!names.has("approved")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN approved INTEGER NOT NULL DEFAULT 0");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_run_id ON dispatch_log(run_id)");
 
@@ -246,11 +252,11 @@ export function getRunRecordMergeVerdict(issueIdentifier: string, prUrl: string)
   if (inFlight.count > 0) return "in_flight";
   const latest = getDb()
     .prepare(
-      "SELECT status, conclusion FROM dispatch_log WHERE issue_identifier = ? AND pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1",
+      "SELECT status, conclusion, approved FROM dispatch_log WHERE issue_identifier = ? AND pr_url = ? AND phase IN ('implementation', 'gap-analysis') ORDER BY id DESC LIMIT 1",
     )
-    .get(issueIdentifier, prUrl) as { status: string; conclusion: string | null } | undefined;
+    .get(issueIdentifier, prUrl) as { status: string; conclusion: string | null; approved: number } | undefined;
   if (!latest) return "hold";
-  if (latest.status === "completed" && latest.conclusion === "runner_approved") return "approved";
+  if (latest.status === "completed" && (latest.approved === 1 || latest.conclusion === "runner_approved")) return "approved";
   return "hold";
 }
 
@@ -387,6 +393,26 @@ export function updateJobStatus(
       isTerminal ? 1 : 0,
       jobId,
     );
+}
+
+/**
+ * Durably stamps the run row as runner-approved. Sets both `approved = 1` and
+ * `conclusion = 'runner_approved'` in a single SQL statement so no partial-stamp
+ * window exists. Unlike updateJobStatus, subsequent monitor or watchdog writes
+ * cannot clear `approved` — the column is only written here.
+ */
+export function stampJobApproved(jobId: number, prUrl: string): void {
+  getDb()
+    .prepare(
+      `UPDATE dispatch_log
+       SET status = 'completed',
+           conclusion = 'runner_approved',
+           approved = 1,
+           pr_url = COALESCE(?, pr_url),
+           completed_at = COALESCE(completed_at, ?)
+       WHERE id = ?`,
+    )
+    .run(prUrl, Date.now(), jobId);
 }
 
 /**
@@ -590,6 +616,7 @@ interface RawRow {
   contract: string | null;
   trigger: string | null;
   grouping_parent: number | null;
+  approved: number | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -618,6 +645,7 @@ function mapRows(rows: RawRow[]): Job[] {
     phase: row.phase ?? "implementation",
     contract: row.contract ?? null,
     groupingParent: row.grouping_parent === 1,
+    approved: row.approved === 1,
   }));
 }
 

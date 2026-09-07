@@ -195,6 +195,31 @@ describe("runAutoMerges", () => {
     await autoMerge.runAutoMerges([mapping(), mapping()], deps());
     expect(vi.mocked(listOpenPullRequests)).toHaveBeenCalledTimes(1);
   });
+
+  it("holds PR when run ended with conclusion=success and no approval stamp (AII-572 bug scenario)", async () => {
+    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/o/r/pull/5");
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+    await autoMerge.runAutoMerges([mapping()], deps());
+    expect(vi.mocked(mergePullRequest)).not.toHaveBeenCalled();
+  });
+
+  it("merges when approved column is set even if conclusion was overwritten to success (AII-572 fix)", async () => {
+    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
+    log.stampJobApproved(id, "https://github.com/o/r/pull/5");
+    log.updateJobStatus(id, "completed", "success", null);
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+    await autoMerge.runAutoMerges([mapping()], deps());
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith("tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge");
+  });
+
+  it("merges for rows with conclusion=runner_approved and approved=0 (backward compat — existing live rows)", async () => {
+    const id = log.appendLog({ issueId: "issue-aii-300", issueIdentifier: "AII-300", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/5");
+    vi.mocked(listOpenPullRequests).mockResolvedValue([pr()]);
+    await autoMerge.runAutoMerges([mapping()], deps());
+    expect(vi.mocked(mergePullRequest)).toHaveBeenCalledWith("tok", "BuildDownAI", "AI-Implement", 5, "sha5", "merge");
+  });
 });
 
 describe("runGroupingBranchAutoMerge (AII-349 cascade self-healing)", () => {

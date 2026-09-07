@@ -150,6 +150,54 @@ describe("getRunRecordMergeVerdict", () => {
   });
 });
 
+describe("stampJobApproved", () => {
+  it("sets approved=1 and conclusion=runner_approved", () => {
+    const id = log.appendLog({ issueId: "sa1", issueIdentifier: "AII-200", executionMode: "github-actions" });
+    log.stampJobApproved(id, "https://github.com/o/r/pull/1");
+    const job = log.getJobById(id);
+    expect(job?.approved).toBe(true);
+    expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.status).toBe("completed");
+    expect(job?.prUrl).toBe("https://github.com/o/r/pull/1");
+  });
+
+  it("approved=1 survives a subsequent updateJobStatus with conclusion=success", () => {
+    const id = log.appendLog({ issueId: "sa2", issueIdentifier: "AII-201", executionMode: "github-actions" });
+    log.stampJobApproved(id, "https://github.com/o/r/pull/2");
+    log.updateJobStatus(id, "completed", "success", null);
+    const job = log.getJobById(id);
+    expect(job?.approved).toBe(true);
+  });
+});
+
+describe("getRunRecordMergeVerdict — write-order replay (AII-572)", () => {
+  it("approved when monitor writes success first, then callback stamps approved", () => {
+    const id = log.appendLog({ issueId: "wo1", issueIdentifier: "AII-210", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/o/r/pull/10");
+    log.stampJobApproved(id, "https://github.com/o/r/pull/10");
+    expect(log.getRunRecordMergeVerdict("AII-210", "https://github.com/o/r/pull/10")).toBe("approved");
+  });
+
+  it("approved when callback stamps first, then monitor writes success (approved column persists)", () => {
+    const id = log.appendLog({ issueId: "wo2", issueIdentifier: "AII-211", executionMode: "github-actions" });
+    log.stampJobApproved(id, "https://github.com/o/r/pull/11");
+    log.updateJobStatus(id, "completed", "success", null);
+    expect(log.getRunRecordMergeVerdict("AII-211", "https://github.com/o/r/pull/11")).toBe("approved");
+  });
+
+  it("approved for rows with conclusion=runner_approved and approved=0 (backward compat — OR predicate)", () => {
+    const id = log.appendLog({ issueId: "wo3", issueIdentifier: "AII-212", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "runner_approved", "https://github.com/o/r/pull/12");
+    expect(log.getRunRecordMergeVerdict("AII-212", "https://github.com/o/r/pull/12")).toBe("approved");
+  });
+
+  it("hold when only monitor write exists (approved=0, conclusion=success) — the bug scenario", () => {
+    const id = log.appendLog({ issueId: "wo4", issueIdentifier: "AII-213", executionMode: "github-actions" });
+    log.updateJobStatus(id, "completed", "success", "https://github.com/o/r/pull/13");
+    expect(log.getRunRecordMergeVerdict("AII-213", "https://github.com/o/r/pull/13")).toBe("hold");
+  });
+});
+
 describe("completeOrphanedPlanningJobs", () => {
   it("marks an 'unknown' planning job completed for the issue", () => {
     const id = log.appendLog({ issueId: "i1", executionMode: "github-actions", phase: "planning" });

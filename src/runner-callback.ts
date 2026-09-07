@@ -1,4 +1,4 @@
-import { claimJobRunId, getJobByDispatchId, updateJobPrUrl, updateJobStatus } from "./log.js";
+import { claimJobRunId, getJobByDispatchId, stampJobApproved, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
@@ -407,11 +407,13 @@ export async function handleRunnerResult(
       }
       const job = getJobByDispatchId(claims.dispatchId);
       if (job) {
-        // Finalize immediately with the approval mark so the auto-merge gate can
-        // read it without waiting for the GHA monitor's later write (AII-460).
-        // The CASE guard in updateJobStatus preserves this conclusion when the
-        // monitor subsequently writes its own execution-layer conclusion.
-        updateJobStatus(job.id, "completed", "runner_approved", input.body.prUrl!);
+        // Stamp both approved=1 and conclusion=runner_approved atomically so the
+        // auto-merge gate can read the mark without waiting for the GHA monitor's
+        // later write (AII-460). The approved column is not touched by updateJobStatus,
+        // so any subsequent monitor write of conclusion=success cannot clear the mark.
+        stampJobApproved(job.id, input.body.prUrl!);
+      } else {
+        console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — approval mark not written`);
       }
     }
   } else if (input.body.phase === "gap-analysis") {
@@ -424,10 +426,12 @@ export async function handleRunnerResult(
       } else {
         markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
       }
-      // Every gap-fill success re-stamps runner_approved: the gap-fill's own post-push review
-      // approved the PR, so the updated code is already reviewed (AII-460). The CASE guard in
-      // updateJobStatus prevents the GHA monitor's later write from overwriting this conclusion.
-      updateJobStatus(job.id, "completed", "runner_approved", job.prUrl!);
+      // Every gap-fill success re-stamps the approval mark: the gap-fill's own post-push
+      // review approved the PR, so the updated code is already reviewed (AII-460).
+      // stampJobApproved sets approved=1 which survives any subsequent monitor write.
+      stampJobApproved(job.id, job.prUrl!);
+    } else if (!job) {
+      console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — gap-analysis approval mark not written`);
     }
   }
 
