@@ -426,9 +426,10 @@ export async function handleRunnerResult(
       } else {
         markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
       }
-      // Every gap-fill success re-stamps the approval mark: the gap-fill's own post-push
-      // review approved the PR, so the updated code is already reviewed (AII-460).
-      // stampJobApproved sets approved=1 which survives any subsequent monitor write.
+      // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
+      // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
+      // stampJobApproved then sets approved=1 durably (updateJobStatus never touches that column).
+      updateJobStatus(job.id, "completed", "runner_approved", job.prUrl!);
       stampJobApproved(job.id, job.prUrl!);
     } else if (!job) {
       console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — gap-analysis approval mark not written`);

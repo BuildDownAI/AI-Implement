@@ -9,6 +9,7 @@ import type * as RunnerCallbackModule from "../runner-callback.js";
 import type * as StepLogModule from "../step-log.js";
 import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
+import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import { formatFailureComment } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
@@ -24,6 +25,7 @@ let runnerCallback: typeof RunnerCallbackModule;
 let stepLog: typeof StepLogModule;
 let reviewStore: typeof ReviewLedgerStoreModule;
 let reviewFixQueue: typeof ReviewFixQueueModule;
+let commentGapfillQueue: typeof CommentGapfillQueueModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -39,6 +41,7 @@ beforeEach(async () => {
   stepLog = await import("../step-log.js");
   reviewStore = await import("../review-ledger-store.js");
   reviewFixQueue = await import("../review-fix-queue.js");
+  commentGapfillQueue = await import("../comment-gapfill-queue.js");
   dedup.getDb();
   log.initLogTable();
   stepLog.initStepLogTable();
@@ -1015,6 +1018,46 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(res.status).toBe(200);
     const job = log.getJobByDispatchId(dispatchId);
     expect(job?.conclusion).not.toBe("runner_approved");
+  });
+
+  it("terminates the comment_gapfill_queue row when a comment-triggered gap-analysis succeeds (AII-572 / AII-277 regression)", async () => {
+    // Simulate a conflict-resolution gap-fill dispatched by comment-gapfill-drain:
+    // the queue row is 'dispatched' and the dispatch_log row has trigger='comment'.
+    const queueId = commentGapfillQueue.enqueueConflictResolution({
+      owner: "org",
+      repo: "repo",
+      prNumber: 12,
+      featureBranch: "ai-implement/feature/parent",
+    });
+    commentGapfillQueue.markCommentGapfillProcessed(queueId, "dispatched");
+
+    expect(commentGapfillQueue.hasPendingConflictResolution("org", "repo", 12)).toBe(true);
+
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, trigger: "comment" });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    // Queue row must be terminalized so hasPendingConflictResolution returns false
+    // and auto-merge can proceed (regression: stampJobApproved alone skipped this side effect).
+    expect(commentGapfillQueue.hasPendingConflictResolution("org", "repo", 12)).toBe(false);
+    // Approval mark must still be stamped.
+    const job = log.getJobByDispatchId(dispatchId);
+    expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.approved).toBe(true);
   });
 });
 
