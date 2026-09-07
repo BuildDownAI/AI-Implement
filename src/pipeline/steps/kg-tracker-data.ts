@@ -92,6 +92,9 @@ function ownerRepo(v: string): string | null {
 
 /**
  * Reads the top-level `code_repo:` key from sources.yml.
+ * Accepts two forms:
+ *   - string:  `code_repo: owner/name`
+ *   - mapping: `code_repo:\n  slug: owner/name\n  ...`
  * Returns the value as `"owner/repo"` or null when the key is absent, the file
  * is missing, or the file cannot be parsed.
  */
@@ -108,21 +111,36 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null 
 
   try {
     const doc = parseYaml(raw) as unknown;
-    if (
-      doc !== null &&
-      typeof doc === "object" &&
-      typeof (doc as Record<string, unknown>).code_repo === "string"
-    ) {
-      const value = ((doc as Record<string, unknown>).code_repo as string).trim();
-      return ownerRepo(value);
+    if (doc !== null && typeof doc === "object") {
+      const codeRepo = (doc as Record<string, unknown>).code_repo;
+      if (typeof codeRepo === "string") {
+        return ownerRepo(codeRepo.trim());
+      }
+      if (
+        codeRepo !== null &&
+        typeof codeRepo === "object" &&
+        !Array.isArray(codeRepo) &&
+        typeof (codeRepo as Record<string, unknown>).slug === "string"
+      ) {
+        return ownerRepo(((codeRepo as Record<string, unknown>).slug as string).trim());
+      }
     }
   } catch {
     // Fall through to regex fallback
   }
 
-  // Fallback: matches a top-level `code_repo:` line; value stops before any trailing comment
-  const match = raw.match(/^code_repo:\s+(\S+)/m);
-  return match ? ownerRepo(match[1]) : null;
+  // String form fallback: code_repo: owner/name (value on the same line)
+  // If ownerRepo returns null (e.g. the match captured "slug:" from a mapping form
+  // where \s+ crossed the newline), fall through to the mapping-form regex.
+  const matchStr = raw.match(/^code_repo:\s+(\S+)/m);
+  if (matchStr) {
+    const v = ownerRepo(matchStr[1]);
+    if (v !== null) return v;
+  }
+  // Mapping form fallback: code_repo:\n  slug: owner/name
+  // Use [ \t]* (not \s*) so the trailing \n is not consumed by the whitespace class.
+  const matchMapping = raw.match(/^code_repo:[ \t]*\n[ \t]+slug:[ \t]+(\S+)/m);
+  return matchMapping ? ownerRepo(matchMapping[1]) : null;
 }
 
 export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOutputs> = {

@@ -184,9 +184,23 @@ A third (`publication`) token is **not** minted: there is no target repository, 
 
 Every kg-refresh dispatch sets `dependencyTokenScope: "installation"` in the envelope. The `dependency-auth` pipeline step reads this field and calls `POST /api/runner/dependency-token` to receive a short-lived installation-wide `contents: read` GitHub App token. The step installs it as a git credential helper for `https://github.com` and exports it as `COMPOSER_AUTH`.
 
-The subsequent `clone-code-repo` pipeline step reads the `code_repo:` key from `sources.yml` in the cloned KG source repo (e.g. `code_repo: BuildDownAI/AI-Implement`). When the key is present, the step clones that repository into `code-repo/` in the workspace using a bare `https://github.com/...` URL — the credential helper supplies the dependency token automatically. When `code_repo:` is absent, the step is skipped.
+The subsequent `clone-code-repo` pipeline step reads the `code_repo:` key from `sources.yml` in the cloned KG source repo. Two forms are accepted:
 
-The `code-repo/` directory is passed as `--code-repo code-repo/` to the `kg-ingest` pipeline step, which spawns `python -m kg_ingest refresh`. Both steps skip silently when their prerequisites are absent (no scope in the envelope, no `code_repo:` in `sources.yml`), so a mixed-version deploy with an old orchestrator produces a workspace without `code-repo/` and the ingest continues without it rather than failing.
+```yaml
+# String form (legacy)
+code_repo: BuildDownAI/AI-Implement
+
+# Mapping form (canonical)
+code_repo:
+  slug: BuildDownAI/AI-Implement        # GitHub owner/name — the field the step reads
+  path: ../AI-Implement                 # local clone path (used by the ingest tool)
+  docs_url: https://docs.builddown.ai/latest/introduction
+  doc_globs: [...]
+```
+
+When the `code_repo:` key is present, `clone-code-repo` clones that repository into `code-repo/` in the workspace using a bare `https://github.com/...` URL — the credential helper supplies the dependency token automatically. When the key is absent, the step emits a warning (`[clone-code-repo] sources.yml has no code_repo.slug — skipping`) and is skipped.
+
+The `code-repo/` directory is passed as `--code-repo code-repo/` to the `kg-ingest` pipeline step, which spawns `python -m kg_ingest refresh`. When `codeRepoDir` is absent (because `clone-code-repo` was skipped or failed), `kg-ingest` fails immediately with `KG_INGEST_FAILED: no code repo in workspace` before invoking the CLI — a missing code repo is a loud, coded failure, never a silent continuation.
 
 The dependency token does not grant write access to any repository; it is scoped to `contents: read` across all repositories the GitHub App installation covers.
 
