@@ -2,7 +2,7 @@
 model: claude-sonnet-4-6
 ---
 
-You are running a knowledge-graph ingest refresh. Your workspace is a clone of the KG source repository. The pipeline owns all repository writes — leave every change uncommitted.
+You are reviewing the output of an automated knowledge-graph ingest. The pipeline's `kg-ingest` step has already run the ingest as a deterministic process — `snapshot/`, `snapshot/parts/`, `snapshot/embeddings.npz`, `snapshot/embeddings.stamp`, and `ai-output/kg-stats.json` should all be present. Leave every change uncommitted.
 
 ## Context
 
@@ -11,20 +11,7 @@ You are running a knowledge-graph ingest refresh. Your workspace is a clone of t
 
 ## Steps
 
-### 1. Set up the Python venv
-
-Prefer `python3.10`. If `python3.10` is unavailable fall back to the next available version, but record it in the run report.
-
-```bash
-python3.10 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt   # or equivalent for this repo's tooling
-```
-
-If the repo uses a different dependency file (e.g. `pyproject.toml`, `setup.py`, `Pipfile`), adapt accordingly.
-
-### 2. Reconcile `sources.yml` scope (mechanical diff only)
+### 1. Reconcile `sources.yml` scope (mechanical diff only)
 
 Compare the current `sources.yml` against the live set of repos and teams:
 
@@ -34,75 +21,47 @@ Compare the current `sources.yml` against the live set of repos and teams:
 
 If `sources.yml` does not exist or the repo has no such file, skip this step and note it in the run report.
 
-### 2.5. Tracker data
+### 2. Verify the snapshot
 
-The pipeline fetches tracker data before this run begins. If `tracker-data.json` is present in the workspace root, the pipeline already wrote it — it is a JSON array of Linear issue objects, each with `id`, `identifier`, `title`, `description`, `state` (with `name` and `type` sub-fields), and `comments` (array of `{ body, createdAt }`). If the file is absent (local `bd-kg-refresh` skill runs, or dispatch without a callback URL), proceed without tracker context and note the absence in the run report.
-
-If `tracker-data.json` is present, check whether the ingest binary supports the `--tracker-data` flag before step 3:
-
-```bash
-python -m kg_ingest --help 2>&1 | grep -q -- '--tracker-data' && TRACKER_DATA_SUPPORTED=true || TRACKER_DATA_SUPPORTED=false
-```
-
-Adjust the command if the repo uses a different ingest entry point (e.g. `python scripts/ingest.py --help`).
-
-### 3. Run the ingest
-
-Execute the ingest as the repo documents it (check `README.md`, `Makefile`, or a `scripts/` directory). Typical invocation:
-
-```bash
-python scripts/ingest.py        # or
-make ingest                     # or
-python -m kg_ingest             # adapt to this repo
-```
-
-If `tracker-data.json` exists in the workspace (written by step 2.5) and `$TRACKER_DATA_SUPPORTED` is `true`, append `--tracker-data tracker-data.json` to the ingest invocation. This supplies Linear issue data fetched via the orchestrator proxy so the ingest does not need a direct tracker credential.
-
-Follow any additional instructions in a `WORKFLOW.md` in the workspace if one exists.
-
-If the ingest fails, diagnose the failure and retry with reasonable fixes (dependency issues, stale cache, transient network error). If it cannot be recovered in this run, write the failure details to the run report and stop — do not fabricate snapshot files.
-
-### 4. Verify the snapshot
-
-After the ingest completes, confirm:
+Confirm that the ingest step's outputs are present:
 
 - `snapshot/parts/` exists and contains at least one non-empty `.nt` file.
 - `snapshot/embeddings.npz` exists and is non-empty.
 
-If either check fails, write the details to the run report and stop without writing a stamp file.
+If either check fails, write the details to the run report and stop — do not fabricate snapshot files.
 
-### 5. Stamp file
+### 3. Stamp file
 
-The ingest CLI writes `snapshot/embeddings.stamp` automatically during the ingest run (step 3). The file contains a UTC ISO-8601 timestamp of the form `YYYY-MM-DDTHH:MM:SS+00:00`. Do **not** overwrite or recreate this file — the pipeline's push step reads it to order snapshots and rejects any run where the stamp has not advanced. Both the `Z`-suffix form and the `+00:00` offset form are accepted by the pipeline.
+`snapshot/embeddings.stamp` should have been written by the ingest step. It contains a UTC ISO-8601 timestamp of the form `YYYY-MM-DDTHH:MM:SS+00:00`. Do **not** overwrite or recreate this file.
 
-### 6. Write the stats file
+If the stamp file is absent or has an unrecognised format, report it and stop.
 
-Write `ai-output/kg-stats.json` with counts from the ingest:
+### 4. Read the stats
+
+`ai-output/kg-stats.json` was written by the `kg-ingest` pipeline step. Read it and use the values in the run report. The file contains:
 
 ```json
 {
-  "quads": <number of RDF quads ingested>,
-  "vectors": <number of embedding vectors in embeddings.npz>,
-  "docPages": <number of documentation pages processed (0 if none)>,
-  "durationSec": <total ingest wall-clock seconds as a number>,
-  "notes": ["<optional: one string per docs-site question or notable finding>"]
+  "quads": <number of RDF quads>,
+  "vectors": <number of embedding vectors>,
+  "docPages": <number of documentation pages>,
+  "durationSec": <ingest wall-clock seconds>
 }
 ```
 
-All four numeric fields are required. Use 0 for docPages when the ingest does not process documentation. The `notes` array is optional — include it only when you have docs-site questions (from step 2) or other notable findings worth recording. The pipeline embeds these notes in the snapshot commit message so they are KG-visible after the next refresh.
+If the file is absent or unparseable, note it in the report.
 
-### 7. Write the run report
+### 5. Write the run report
 
 Write `ai-output/comments/01-report.md` with:
 
 - **Outcome**: success or the specific failure encountered.
-- **Stats summary**: quads, vectors, doc pages, duration (human-readable).
+- **Stats summary**: quads, vectors, doc pages, duration (human-readable, from `ai-output/kg-stats.json`).
 - **Docs-site questions** (if any): list each question clearly so an operator can decide.
 - **sources.yml changes** (if any): summarise what was added or removed.
-- **Python version used**.
-- **Any warnings or anomalies** from the ingest.
+- **Any warnings or anomalies** observed in the snapshot outputs.
 
-### 8. Leave all changes uncommitted
+### 6. Leave all changes uncommitted
 
 Do **NOT** run `git add`, `git commit`, `git push`, or open a pull request. The pipeline step that follows this run owns the repository write. Modified files in `snapshot/` and new files in `ai-output/` will be picked up by the pipeline.
 

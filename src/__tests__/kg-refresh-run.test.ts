@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -120,7 +122,8 @@ describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
 // ── kg-snapshot-push step ─────────────────────────────────────────────────────
 
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "../pipeline/steps/kg-snapshot-push.js";
-import { kgTrackerDataStep, KgTrackerDataFetchError } from "../pipeline/steps/kg-tracker-data.js";
+import { kgTrackerDataStep, KgTrackerDataFetchError, readCodeRepoFromSourcesYml } from "../pipeline/steps/kg-tracker-data.js";
+import { kgIngestStep, KgIngestError } from "../pipeline/steps/kg-ingest.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import type { PipelineContextData } from "../pipeline/types.js";
@@ -683,6 +686,280 @@ describe("kgSnapshotPushStep — tracker regression guard", () => {
   });
 });
 
+// ── kgSnapshotPushStep — content-based regression guard ──────────────────────
+
+describe("kgSnapshotPushStep — content-based regression guard", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgpush-content-"));
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+  });
+
+  function makeInputs(overrides: Record<string, unknown> = {}) {
+    return {
+      workspaceDir: tmpDir,
+      githubToken: "fake-token",
+      defaultBranch: "main",
+      clonedRef: resolveHead(tmpDir),
+      ...overrides,
+    };
+  }
+
+  function makeLines(n: number): string {
+    return "<s> <p> <o> .\n".repeat(n);
+  }
+
+  function commitPreviousSnapshot(partsContent: Record<string, string>, stamp = "2026-01-01T00:00:00Z"): void {
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    for (const [name, content] of Object.entries(partsContent)) {
+      writeFileSync(join(tmpDir, "snapshot", "parts", name), content);
+    }
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), stamp);
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'prev snapshot'", { cwd: tmpDir, stdio: "ignore" });
+  }
+
+  function writeWorkingTree(partsContent: Record<string, string>, stamp = "2026-09-03T10:00:00Z"): void {
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    for (const [name, content] of Object.entries(partsContent)) {
+      writeFileSync(join(tmpDir, "snapshot", "parts", name), content);
+    }
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), stamp);
+  }
+
+  it("refuses when a previous part is missing from the working tree", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // Remove issue.nt from the working tree; add an unrelated file
+    rmSync(join(tmpDir, "snapshot", "parts", "issue.nt"));
+    writeWorkingTree({ "doc.nt": makeLines(50) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("issue.nt");
+    expect(err.message).toContain("missing");
+  });
+
+  it("refuses with KgSnapshotTrackerRegressionError when the entire snapshot/parts/ directory is absent and previous snapshot had parts", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // Simulate total ingest failure: remove the entire parts directory
+    rmSync(join(tmpDir, "snapshot", "parts"), { recursive: true, force: true });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    // Content-based guard runs before section 1's existence check, so KgSnapshotTrackerRegressionError surfaces first
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("missing");
+    expect(err.message).toContain("issue.nt");
+  });
+
+  it("refuses when a part shrinks below the 50% threshold", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "doc.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 49 lines < 50% of 100 → general threshold fires
+    writeFileSync(join(tmpDir, "snapshot", "parts", "doc.nt"), makeLines(49));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 500 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("doc.nt");
+  });
+
+  it("refuses when issue.nt shrinks by any amount and issueCount > 0 (above 50% floor)", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above the 50% general threshold, but zero-shrink rule applies when issueCount > 0
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), makeLines(99));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("issue.nt");
+  });
+
+  it("refuses when comment.nt shrinks by any amount and issueCount > 0 (above 50% floor)", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "comment.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above the 50% general threshold, but zero-shrink rule applies to tracker parts when issueCount > 0
+    writeFileSync(join(tmpDir, "snapshot", "parts", "comment.nt"), makeLines(99));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("comment.nt");
+  });
+
+  it("permits doc.nt to shrink above the 50% floor (zero-shrink applies only to tracker parts)", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "doc.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above the 50% general threshold; doc.nt is not a tracker part so zero-shrink does not apply
+    writeWorkingTree({ "doc.nt": makeLines(99) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    // Guard passes → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("permits issue.nt to shrink when issueCount is 0", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // 99 lines — above 50% and zero-shrink does not apply (issueCount=0)
+    writeWorkingTree({ "issue.nt": makeLines(99) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 0 });
+    // Guard passes → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("passes a healthy snapshot where all parts grow", async () => {
+    const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare-content-"));
+    try {
+      execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+
+      writeWorkingTree({ "issue.nt": makeLines(110), "doc.nt": makeLines(210) });
+
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+      const result = await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, defaultBranch: "main" }),
+        noopReporter,
+      );
+      expect(result.snapshotPushed).toBe(true);
+    } finally {
+      rmSync(bareDir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips the guard when no previous snapshot parts exist (first ever push)", async () => {
+    initGitRepo(tmpDir);
+    // clonedRef has no snapshot/parts/ at all
+    const clonedRef = resolveHead(tmpDir);
+
+    writeWorkingTree({ "issue.nt": makeLines(100) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    // Guard skips (no previous parts) → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("skips the guard when clonedRef is 'unknown'", async () => {
+    initGitRepo(tmpDir);
+    writeWorkingTree({ "issue.nt": makeLines(5) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    // Guard skips (clonedRef=unknown) → falls through to git push failure
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef: "unknown" }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("refuses the incident shape: issue.nt 9534 → 3 lines", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(9534) });
+    const clonedRef = resolveHead(tmpDir);
+
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), makeLines(3));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("issue.nt");
+    expect(err.message).toContain("9534");
+    expect(err.message).toMatch(/\b3\b/);
+  });
+
+  it("reports multiple regressions in a single error", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+    const clonedRef = resolveHead(tmpDir);
+
+    // Delete doc.nt; shrink issue.nt to 30 lines (violates both zero-shrink and 50% threshold)
+    rmSync(join(tmpDir, "snapshot", "parts", "doc.nt"));
+    writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), makeLines(30));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("issue.nt");
+    expect(err.message).toContain("doc.nt");
+  });
+
+  it("emits a [kg-snapshot-push] parts: log line before throwing on a regression", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "issue.nt": makeLines(100), "doc.nt": makeLines(200) });
+      const clonedRef = resolveHead(tmpDir);
+
+      // issue.nt at 3 lines → regression; doc.nt grows
+      writeFileSync(join(tmpDir, "snapshot", "parts", "issue.nt"), makeLines(3));
+      writeFileSync(join(tmpDir, "snapshot", "parts", "doc.nt"), makeLines(210));
+
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 654 });
+      const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+
+      expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+      const logCall = logSpy.mock.calls.find((c) => String(c[0]).includes("[kg-snapshot-push] parts:"));
+      expect(logCall).toBeDefined();
+      const logMsg = String(logCall![0]);
+      expect(logMsg).toContain("issue.nt");
+      expect(logMsg).toContain("doc.nt");
+      expect(logMsg).toContain("prev=");
+      expect(logMsg).toContain("new=");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
 // ── kgTrackerDataStep ─────────────────────────────────────────────────────────
 
 describe("kgTrackerDataStep", () => {
@@ -1197,6 +1474,7 @@ describe("runKgRefresh", () => {
       workspaceDir: tmpDir,
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({ statsFile: null }),
         feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
@@ -1210,6 +1488,7 @@ describe("runKgRefresh", () => {
       workspaceDir: tmpDir,
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({ statsFile: null }),
         feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({}, new KgSnapshotMissingError("no parts")),
       },
@@ -1226,6 +1505,7 @@ describe("runKgRefresh", () => {
       workspaceDir: tmpDir,
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({ statsFile: null }),
         feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({}, new KgSnapshotTrackerRegressionError("previous snapshot has tracker files")),
       },
@@ -1268,7 +1548,7 @@ describe("runKgRefresh", () => {
     expect(decoded.kgSourceRepo).toBe("BuildDownAI/knowledge-graph-ai-implement");
   });
 
-  it("passes maxIterations=2 to the feedback-loop step", async () => {
+  it("passes maxIterations=1 to the feedback-loop step (report-only, ingest is a deterministic step)", async () => {
     let capturedInputs: Record<string, unknown> = {};
     const capturingFeedbackLoop: StepModule = {
       run: async (_ctx, inputs) => {
@@ -1281,13 +1561,14 @@ describe("runKgRefresh", () => {
       workspaceDir: tmpDir,
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({ statsFile: null }),
         feedbackLoop: capturingFeedbackLoop,
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
     });
 
-    expect(capturedInputs.maxIterations).toBe(2);
+    expect(capturedInputs.maxIterations).toBe(1);
   });
 
   it("passes reviewRubric with snapshot/ and ingest-check clauses to the feedback-loop step", async () => {
@@ -1303,6 +1584,7 @@ describe("runKgRefresh", () => {
       workspaceDir: tmpDir,
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({ statsFile: null }),
         feedbackLoop: capturingFeedbackLoop,
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
@@ -1480,9 +1762,9 @@ describe("makeKgRefresh — dispatch result threading to updateJobMachine", () =
   });
 });
 
-// ── KG-REFRESH.md playbook — tracker-data step ────────────────────────────────
+// ── KG-REFRESH.md template assertions ────────────────────────────────────────
 
-describe("KG-REFRESH.md playbook — tracker-data step", () => {
+describe("KG-REFRESH.md template — report-only, no ingest instructions", () => {
   const playbookPath = join(
     fileURLToPath(new URL(".", import.meta.url)),
     "..",
@@ -1491,32 +1773,416 @@ describe("KG-REFRESH.md playbook — tracker-data step", () => {
     "KG-REFRESH.md",
   );
 
-  it("states that tracker-data.json is written by the pipeline before the feedback loop", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("tracker-data.json");
-    // Pipeline pre-fetches; agent does not invoke the shell script directly
-    expect(playbook).not.toContain("/app/session/fetch-kg-tracker-data.sh");
-  });
-
-  it("documents the --tracker-data flag for the ingest invocation", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("--tracker-data");
-  });
-
-  it("includes a capability check before passing --tracker-data to the ingest", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("TRACKER_DATA_SUPPORTED");
-  });
-
-  it("instructs the agent to proceed when tracker-data.json is absent (local/dev runs)", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("absent");
-  });
-
   it("states that the reviewer treats uncommitted snapshot/ output as expected", () => {
     const playbook = readFileSync(playbookPath, "utf-8");
     expect(playbook).toContain("uncommitted");
     expect(playbook).toContain("reviewer");
+  });
+
+  it("does not instruct Claude to run the ingest (no python/venv/kg_ingest references)", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    expect(playbook).not.toContain("python");
+    expect(playbook).not.toContain("venv");
+    expect(playbook).not.toContain("kg_ingest");
+    expect(playbook).not.toContain("--code-repo");
+    expect(playbook).not.toContain("--tracker-data");
+    expect(playbook).not.toContain("TRACKER_DATA_SUPPORTED");
+  });
+
+  it("instructs Claude to read kg-stats.json and write 01-report.md", () => {
+    const playbook = readFileSync(playbookPath, "utf-8");
+    expect(playbook).toContain("kg-stats.json");
+    expect(playbook).toContain("01-report.md");
+  });
+});
+
+// ── kgIngestStep unit tests ───────────────────────────────────────────────────
+
+type FakeProcess = EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
+
+function makeFakeProcess(
+  exitCode: number,
+  stdoutLines: string[] = [],
+  stderrLines: string[] = [],
+): FakeProcess {
+  const proc = new EventEmitter() as FakeProcess;
+  proc.stdout = new EventEmitter();
+  proc.stderr = new EventEmitter();
+  setImmediate(() => {
+    for (const line of stdoutLines) {
+      proc.stdout.emit("data", Buffer.from(line + "\n"));
+    }
+    proc.stdout.emit("end");
+    for (const line of stderrLines) {
+      proc.stderr.emit("data", Buffer.from(line + "\n"));
+    }
+    proc.stderr.emit("end");
+    proc.emit("close", exitCode);
+  });
+  return proc;
+}
+
+describe("kgIngestStep", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgingest-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("spawns python -m kg_ingest refresh with --code-repo and --tracker-data when both present", async () => {
+    const capturedArgs: string[][] = [];
+    const capturedCwd: string[] = [];
+    const spawnImpl = (cmd: string, args: string[], opts: { cwd: string }) => {
+      capturedArgs.push([cmd, ...args]);
+      capturedCwd.push(opts.cwd);
+      return makeFakeProcess(0, ['{"quads":100,"vectors":50,"docPages":5,"durationSec":10}']) as unknown as ChildProcess;
+    };
+    const writtenFiles: Array<[string, string]> = [];
+
+    writeFileSync(join(tmpDir, "tracker-data.json"), "[]");
+
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        codeRepoDir: "/some/code-repo",
+        spawnImpl,
+        writeFileSyncImpl: (p, d) => writtenFiles.push([p, d]),
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: (p) => p === join(tmpDir, "tracker-data.json"),
+      },
+      noopReporter,
+    );
+
+    // venv setup: python3 -m venv .venv, then pip install -r requirements.txt
+    expect(capturedArgs[0]).toEqual(["python3", "-m", "venv", ".venv"]);
+    expect(capturedArgs[1]).toEqual([join(tmpDir, ".venv", "bin", "pip"), "install", "-r", "requirements.txt"]);
+    // main ingest uses the venv python
+    expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh", "--code-repo", "/some/code-repo", "--tracker-data", join(tmpDir, "tracker-data.json")]);
+    expect(capturedCwd[2]).toBe(tmpDir);
+    expect(writtenFiles).toHaveLength(1);
+    expect(writtenFiles[0][0]).toBe(join(tmpDir, "ai-output", "kg-stats.json"));
+    const stats = JSON.parse(writtenFiles[0][1]) as Record<string, unknown>;
+    expect(stats.quads).toBe(100);
+    expect(stats.vectors).toBe(50);
+  });
+
+  it("spawns without --tracker-data when tracker-data.json is absent", async () => {
+    const capturedArgs: string[][] = [];
+    const spawnImpl = (cmd: string, args: string[]) => {
+      capturedArgs.push([cmd, ...args]);
+      return makeFakeProcess(0, ['{"quads":50}']) as unknown as ChildProcess;
+    };
+
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        codeRepoDir: "/repo",
+        spawnImpl,
+        writeFileSyncImpl: () => undefined,
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: () => false,
+      },
+      noopReporter,
+    );
+
+    expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh", "--code-repo", "/repo"]);
+    expect(capturedArgs[2]).not.toContain("--tracker-data");
+  });
+
+  it("spawns without --code-repo when codeRepoDir is absent", async () => {
+    const capturedArgs: string[][] = [];
+    const spawnImpl = (cmd: string, args: string[]) => {
+      capturedArgs.push([cmd, ...args]);
+      return makeFakeProcess(0, ['{"quads":0}']) as unknown as ChildProcess;
+    };
+
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        spawnImpl,
+        writeFileSyncImpl: () => undefined,
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: () => false,
+      },
+      noopReporter,
+    );
+
+    expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh"]);
+    expect(capturedArgs[2]).not.toContain("--code-repo");
+  });
+
+  it("throws KgIngestError with exit code and last 40 lines on non-zero exit", async () => {
+    const errorLines = Array.from({ length: 50 }, (_, i) => `line ${i}`);
+    const spawnImpl = () =>
+      makeFakeProcess(2, [], errorLines) as unknown as ChildProcess;
+
+    const err = await kgIngestStep
+      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(KgIngestError);
+    expect((err as KgIngestError).exitCode).toBe(2);
+    expect((err as KgIngestError).code).toBe("KG_INGEST_FAILED");
+    // tail should contain only the last 40 of 50 lines
+    const tail = (err as KgIngestError).outputTail;
+    expect(tail).toContain("line 49");
+    expect(tail).not.toContain("line 9\n");
+  });
+
+  it("throws KgIngestError when python3 -m venv exits non-zero", async () => {
+    let callCount = 0;
+    const spawnImpl = () => {
+      callCount++;
+      // only venv setup fails; pip install and ingest would succeed but won't be reached
+      return makeFakeProcess(callCount === 1 ? 1 : 0, []) as unknown as ChildProcess;
+    };
+
+    const err = await kgIngestStep
+      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(KgIngestError);
+    expect((err as KgIngestError).exitCode).toBe(1);
+    expect(callCount).toBe(1);
+  });
+
+  it("throws KgIngestError when pip install -r requirements.txt exits non-zero", async () => {
+    let callCount = 0;
+    const spawnImpl = () => {
+      callCount++;
+      // venv setup succeeds, pip install fails
+      return makeFakeProcess(callCount === 2 ? 3 : 0, []) as unknown as ChildProcess;
+    };
+
+    const err = await kgIngestStep
+      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(KgIngestError);
+    expect((err as KgIngestError).exitCode).toBe(3);
+    expect(callCount).toBe(2);
+  });
+
+  it("ingest failure tail does not contain venv-setup or pip-install output", async () => {
+    let callCount = 0;
+    const spawnImpl = (cmd: string, args: string[]) => {
+      callCount++;
+      if (callCount <= 2) {
+        // setup phases succeed but emit recognisable output
+        return makeFakeProcess(0, [`setup-output-${callCount}`]) as unknown as ChildProcess;
+      }
+      // main ingest fails
+      return makeFakeProcess(2, [], ["ingest-error-line"]) as unknown as ChildProcess;
+    };
+
+    const err = await kgIngestStep
+      .run(makeContext(), { workspaceDir: tmpDir, spawnImpl, existsSyncImpl: () => false }, noopReporter)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(KgIngestError);
+    const tail = (err as KgIngestError).outputTail;
+    expect(tail).toContain("ingest-error-line");
+    expect(tail).not.toContain("setup-output-1");
+    expect(tail).not.toContain("setup-output-2");
+  });
+
+  it("parses stats JSON from stdout and writes ai-output/kg-stats.json", async () => {
+    const statsJson = '{"quads":1234,"vectors":56,"docPages":7,"durationSec":8.9}';
+    const spawnImpl = () =>
+      makeFakeProcess(0, ["some log line", statsJson, "another log"]) as unknown as ChildProcess;
+
+    const written: Array<[string, string]> = [];
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        spawnImpl,
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: () => false,
+      },
+      noopReporter,
+    );
+
+    expect(written).toHaveLength(1);
+    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(stats.quads).toBe(1234);
+    expect(stats.vectors).toBe(56);
+    expect(stats.docPages).toBe(7);
+  });
+
+  it("falls back to counting .nt lines when no stats JSON on stdout", async () => {
+    const spawnImpl = () =>
+      makeFakeProcess(0, ["ingesting...", "done"]) as unknown as ChildProcess;
+
+    const written: Array<[string, string]> = [];
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n".repeat(100));
+    writeFileSync(join(tmpDir, "snapshot", "parts", "b.nt"), "<s> <p> <o> .\n".repeat(50));
+
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        spawnImpl,
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: (p) => !p.endsWith("tracker-data.json"),
+      },
+      noopReporter,
+    );
+
+    expect(written).toHaveLength(1);
+    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(stats.quads).toBe(150);
+    expect(stats.vectors).toBe(0);
+    expect(stats.docPages).toBe(0);
+  });
+
+  it("writes stats with quads=0 when no stats JSON and snapshot/parts is absent", async () => {
+    const spawnImpl = () =>
+      makeFakeProcess(0, []) as unknown as ChildProcess;
+
+    const written: Array<[string, string]> = [];
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        spawnImpl,
+        writeFileSyncImpl: (p, d) => written.push([p, d]),
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: () => false,
+      },
+      noopReporter,
+    );
+
+    expect(written).toHaveLength(1);
+    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(stats.quads).toBe(0);
+    expect(stats.vectors).toBe(0);
+    expect(stats.docPages).toBe(0);
+  });
+});
+
+// ── kg-refresh pipeline order ─────────────────────────────────────────────────
+
+describe("kg-refresh pipeline order", () => {
+  it("step IDs are clone → dependency-auth → clone-code-repo → kg-tracker-data → kg-ingest → feedback-loop → kg-snapshot-push", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
+    const ids = pipeline.steps.map((s) => s.id);
+    expect(ids).toEqual([
+      "clone",
+      "dependency-auth",
+      "clone-code-repo",
+      "kg-tracker-data",
+      "kg-ingest",
+      "feedback-loop",
+      "kg-snapshot-push",
+    ]);
+  });
+});
+
+// ── kg-ingest wiring in pipeline-loader ──────────────────────────────────────
+
+describe("applyWiring for kg-ingest", () => {
+  const KG_INGEST_PIPELINE_YAML = `id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+  - id: clone-code-repo
+    type: clone
+  - id: kg-ingest
+    type: custom
+    moduleId: kg-ingest
+`;
+
+  it("wires workspaceDir from clone outputs and codeRepoDir from clone-code-repo outputs", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_INGEST_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-ingest");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/ws", githubToken: "tok", clonedRef: "abc" });
+    ctx.setOutputs("clone-code-repo", { workspaceDir: "/ws/code-repo" });
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.workspaceDir).toBe("/ws");
+    expect(inputs.codeRepoDir).toBe("/ws/code-repo");
+  });
+
+  it("omits codeRepoDir when clone-code-repo was skipped (outputs empty)", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_INGEST_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-ingest");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: "/ws", githubToken: "tok", clonedRef: "abc" });
+    ctx.setOutputs("clone-code-repo", {}); // skipped — no outputs
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.workspaceDir).toBe("/ws");
+    expect(inputs.codeRepoDir).toBeUndefined();
+  });
+});
+
+// ── KgIngestError → KG_INGEST_FAILED failure code ────────────────────────────
+
+describe("runKgRefresh — KgIngestError maps to KG_INGEST_FAILED", () => {
+  let tmpDir: string;
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgrun-ingest-"));
+    originalEnv = { ...process.env };
+    process.env.GITHUB_OWNER = "org";
+    process.env.GITHUB_REPO = "kg-repo";
+    process.env.GITHUB_TOKEN = "tok";
+    process.env.GITHUB_DEFAULT_BRANCH = "main";
+    process.env.WORKSPACE_DIR = tmpDir;
+    process.env.RUNNER_CALLBACK_URL = "http://orch";
+    process.env.RUN_TOKEN = "run-tok";
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    for (const k of ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN", "GITHUB_DEFAULT_BRANCH", "WORKSPACE_DIR", "RUN_TOKEN", "RUNNER_CALLBACK_URL"]) {
+      if (originalEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = originalEnv[k];
+    }
+  });
+
+  it("returns exitCode 1 and posts failureCode KG_INGEST_FAILED when kgIngestStep throws KgIngestError", async () => {
+    const capturedResults: Array<Record<string, unknown>> = [];
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        kgIngest: makeStepModule({}, new KgIngestError(1, "output tail from ingest")),
+      },
+      reporter: { report: async () => undefined },
+      fetchImpl: async (_url, init) => {
+        const body = init?.body ? JSON.parse(init.body as string) as Record<string, unknown> : {};
+        capturedResults.push(body);
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(capturedResults.some((r) => r.failureCode === "KG_INGEST_FAILED")).toBe(true);
   });
 });
 
@@ -1871,5 +2537,358 @@ describe("pipeline/kg-refresh-run.ts module-load (entrypoint smoke test)", () =>
     expect(output).not.toMatch(/Cannot find module|ERR_MODULE_NOT_FOUND/i);
     // Exits non-zero because GITHUB_TOKEN is absent (env validation in resolveKgRefreshInputs).
     expect(result.status).not.toBe(0);
+  });
+});
+
+// ── readCodeRepoFromSourcesYml ────────────────────────────────────────────────
+
+describe("readCodeRepoFromSourcesYml", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgcrepo-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns null when sources.yml is absent", () => {
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  it("returns owner/repo when code_repo key is present", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+  });
+
+  it("returns null when code_repo key is absent", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "trackers:\n  - team: AII\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  it("trims trailing comments from the code_repo value", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement  # main code repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+  });
+
+  it("returns null for malformed YAML that lacks code_repo", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "[broken\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  it("returns owner/repo when code_repo is present alongside trackers block", () => {
+    writeFileSync(join(tmpDir, "sources.yml"),
+      "code_repo: org/my-repo\ntrackers:\n  - team: AII\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+  });
+
+  it("returns null when code_repo value has no slash (not owner/repo format)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: justarepo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  it("returns null when code_repo value has a leading slash (empty owner)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: /repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+});
+
+// ── dependencyTokenScope round-trip in kg-refresh RunConfigV1 ─────────────────
+
+describe("RunConfigV1 kg-refresh — dependencyTokenScope field", () => {
+  it("encodes and decodes dependencyTokenScope installation", () => {
+    const encoded = encodeRunConfig({
+      v: 1,
+      issue: baseIssue,
+      runnerPhase: "kg-refresh",
+      dependencyTokenScope: "installation",
+    });
+    const decoded = decodeRunConfig(encoded);
+    expect(decoded.dependencyTokenScope).toBe("installation");
+  });
+
+  it("dependencyTokenScope is absent when not provided", () => {
+    const encoded = encodeRunConfig({ v: 1, issue: baseIssue, runnerPhase: "kg-refresh" });
+    const decoded = decodeRunConfig(encoded);
+    expect(decoded.dependencyTokenScope).toBeUndefined();
+  });
+
+  it("dependencyTokenScope and kgSourceRepo both survive pickKnownKeys", () => {
+    const encoded = encodeRunConfig({
+      v: 1,
+      issue: baseIssue,
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
+      dependencyTokenScope: "installation",
+    });
+    const decoded = decodeRunConfig(encoded);
+    expect(decoded.kgSourceRepo).toBe("BuildDownAI/knowledge-graph-ai-implement");
+    expect(decoded.dependencyTokenScope).toBe("installation");
+  });
+});
+
+// ── kg-refresh pipeline step order (real pipelines/kg-refresh.yml) ────────────
+
+describe("kg-refresh pipeline definition step order", () => {
+  it("includes dependency-auth, clone-code-repo, and kg-ingest in correct position", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
+    const ids = pipeline.steps.map((s) => s.id);
+    expect(ids).toEqual([
+      "clone",
+      "dependency-auth",
+      "clone-code-repo",
+      "kg-tracker-data",
+      "kg-ingest",
+      "feedback-loop",
+      "kg-snapshot-push",
+    ]);
+  });
+
+  it("clone-code-repo step has type clone", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step?.type).toBe("clone");
+  });
+
+  it("dependency-auth step has type custom and moduleId dependency-auth", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
+    const step = pipeline.steps.find((s) => s.id === "dependency-auth");
+    expect(step?.type).toBe("custom");
+    expect(step?.moduleId).toBe("dependency-auth");
+  });
+});
+
+// ── clone-code-repo wiring (applyWiring) ─────────────────────────────────────
+
+const KG_REFRESH_FULL_PIPELINE_YAML = `id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
+  - id: clone-code-repo
+    type: clone
+  - id: kg-tracker-data
+    type: custom
+    moduleId: kg-tracker-data
+  - id: feedback-loop
+    type: custom
+    moduleId: feedback-loop
+  - id: kg-snapshot-push
+    type: custom
+    moduleId: kg-snapshot-push
+`;
+
+describe("applyWiring for clone-code-repo", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgwire-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("skip returns true when sources.yml has no code_repo", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    // No sources.yml in tmpDir → skip
+    expect(step!.skip!(ctx)).toBe(true);
+  });
+
+  it("skip returns false when sources.yml declares code_repo and dependency-auth acquired", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    ctx.setOutputs("dependency-auth", { acquired: true });
+    expect(step!.skip!(ctx)).toBe(false);
+  });
+
+  it("skip returns true when dependency-auth acquired=false even with code_repo present", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    ctx.setOutputs("dependency-auth", { acquired: false });
+    expect(step!.skip!(ctx)).toBe(true);
+  });
+
+  it("skip returns true when dependency-auth never ran (no outputs) even with code_repo present", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    // dependency-auth outputs deliberately not set (simulates no scope / missing progress token)
+    expect(step!.skip!(ctx)).toBe(true);
+  });
+
+  it("inputs include repoOwner, repoRepo, targetDir and empty githubToken", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.repoOwner).toBe("BuildDownAI");
+    expect(inputs.repoRepo).toBe("AI-Implement");
+    expect(inputs.targetDir).toBe("code-repo");
+    expect(inputs.githubToken).toBe("");
+    expect(inputs.workspaceDir).toBe(tmpDir);
+  });
+});
+
+// ── dependency-auth step registered and dependencyTokenScope threaded ─────────
+
+describe("runKgRefresh — dependency-auth step and dependencyTokenScope", () => {
+  let tmpDir: string;
+  let originalEnv: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgdep-"));
+    originalEnv = { ...process.env };
+    process.env.GITHUB_OWNER = "org";
+    process.env.GITHUB_REPO = "kg-repo";
+    process.env.GITHUB_TOKEN = "tok";
+    process.env.GITHUB_DEFAULT_BRANCH = "main";
+    process.env.WORKSPACE_DIR = tmpDir;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    for (const k of ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN", "GITHUB_DEFAULT_BRANCH", "WORKSPACE_DIR", "AI_IMPLEMENT_RUN_CONFIG"]) {
+      if (originalEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = originalEnv[k];
+    }
+  });
+
+  it("dependency-auth step override is called when dependencyTokenScope is set in run_config", async () => {
+    const encoded = encodeRunConfig({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      dependencyTokenScope: "installation",
+    });
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encoded;
+
+    let depAuthCalled = false;
+    const capturingDepAuth: StepModule = {
+      run: async () => {
+        depAuthCalled = true;
+        return { acquired: false, expiresAt: null };
+      },
+    };
+
+    await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        dependencyAuth: capturingDepAuth,
+        kgIngest: makeStepModule({ statsFile: null }),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
+      },
+      reporter: { report: async () => undefined },
+    });
+
+    expect(depAuthCalled).toBe(true);
+  });
+
+  it("dependencyTokenScope from run_config is threaded into pipeline context", async () => {
+    const encoded = encodeRunConfig({
+      v: 1,
+      issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
+      runnerPhase: "kg-refresh",
+      kgSourceRepo: "BuildDownAI/knowledge-graph-ai-implement",
+      dependencyTokenScope: "installation",
+    });
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encoded;
+
+    let capturedScope: unknown;
+    const capturingDepAuth: StepModule = {
+      run: async (ctx) => {
+        capturedScope = ctx.data.dependencyTokenScope;
+        return { acquired: false, expiresAt: null };
+      },
+    };
+
+    await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        dependencyAuth: capturingDepAuth,
+        kgIngest: makeStepModule({ statsFile: null }),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
+      },
+      reporter: { report: async () => undefined },
+    });
+
+    expect(capturedScope).toBe("installation");
+  });
+
+  it("dependency-auth step is skipped and pipeline succeeds when run_config has no dependencyTokenScope", async () => {
+    // No AI_IMPLEMENT_RUN_CONFIG → dependencyTokenScope is undefined → dep-auth skip fires
+    let depAuthCalled = false;
+    const capturingDepAuth: StepModule = {
+      run: async () => {
+        depAuthCalled = true;
+        return { acquired: false, expiresAt: null };
+      },
+    };
+
+    const result = await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        dependencyAuth: capturingDepAuth,
+        kgIngest: makeStepModule({ statsFile: null }),
+        feedbackLoop: makeStepModule({ approved: false }),
+        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
+      },
+      reporter: { report: async () => undefined },
+    });
+
+    expect(depAuthCalled).toBe(false);
+    expect(result.exitCode).toBe(0);
   });
 });

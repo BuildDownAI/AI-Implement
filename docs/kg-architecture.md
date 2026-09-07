@@ -330,8 +330,12 @@ the start. No new top-level function, no new route branch.
 
 ## kg-refresh run kind
 
-AII-493 adds a `kg-refresh` Claude runner that follows the ingest playbook autonomously — cloning the
-KG source repository, running the ingest scripts, and pushing the snapshot. AII-494 adds the two
+AII-493 adds a `kg-refresh` runner pipeline. The ingest runs as a **deterministic pipeline step**
+(`src/pipeline/steps/kg-ingest.ts`): `kg-ingest` spawns `python -m kg_ingest refresh` as a
+subprocess, streams its output, and on success writes `ai-output/kg-stats.json` from CLI-emitted
+stats or a fallback `.nt` line count. Claude's role in the feedback-loop step is report-only —
+it reads `kg-stats.json`, reconciles `sources.yml` scope, verifies the snapshot outputs, and writes
+the run report; it does not run the ingest or manage the Python venv. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
 long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
 when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
@@ -345,6 +349,22 @@ any other phase or a missing/invalid token receives `403 Unauthorized` with no d
 The orchestrator performs all external writes with its own credentials; the runner receives only the
 minted token or the requested data.
 
+**Code-repo in the workspace (AII-564, child 1).** Every dispatched kg-refresh `RunConfigV1`
+carries `dependencyTokenScope: "installation"`, hardcoded in `src/kg-refresh.ts`. This activates
+the `dependency-auth` step, which mints an installation-wide `contents: read` token and installs
+it as a git credential helper (the existing dependency-auth mechanism — no new token kind). A
+`clone-code-repo` step (type: `clone`) then reads the `code_repo: owner/repo` field from
+`sources.yml` in the KG workspace and clones it with `--depth 1` into `code-repo/` alongside the
+KG workspace. The step is registered by type (`clone`) so the runner resolves it via the standard
+`cloneStep` — no separate registration. If `dependency-auth` did not acquire a token (absent
+callback URL, local run, or fetch failure), `clone-code-repo` is skipped gracefully and the ingest
+proceeds without the code repo rather than aborting the pipeline. When the clone succeeds, the
+`kg-ingest` step passes `--code-repo <path>` to `python -m kg_ingest refresh`, giving the ingest
+access to git history, commits, PRs, and files from the implementation repo. If `sources.yml`
+contains no `code_repo` field, the step is also skipped silently. Local `bd-kg-refresh` skill runs
+never carry a dispatch token and therefore always skip `clone-code-repo`; the local operator
+supplies the code repo checkout directly via `--repo` if needed.
+
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/api/runner/kg-push-token` | POST | Vends a short-lived GitHub installation token with `contents: write` scoped to the single KG source repo. `forceRefresh: true` ensures the credential helper always receives a full-lifetime token. |
@@ -354,6 +374,21 @@ The git credential helper (`session/git-credential-helper-kg-push.sh`) re-mints 
 the same progress token. `stripEmbeddedTokenFromOrigin` in `kg-snapshot-push.ts` re-strips the
 token from the remote URL right before push to counter `refreshRunnerGithubCredentials`
 re-embedding it after clone.
+
+**Snapshot push contract — content-based, not flag-based.** `kg-snapshot-push` judges the
+snapshot by comparing the working tree's `snapshot/parts/*.nt` line counts against the cloned
+HEAD before committing. The push is refused with `KG_SNAPSHOT_TRACKER_REGRESSION` if any of the
+following hold:
+
+| Rule | Condition |
+|---|---|
+| Missing part | A part file present in the previous snapshot is absent from the working tree |
+| General shrink | Any part file's line count is below `PART_SHRINK_THRESHOLD` (50 %) of its previous count |
+| `issue.nt` / `comment.nt` zero-shrink | `issue.nt` or `comment.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
+
+One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
+pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a
+tracker-enriched graph) is a separate, prior guard; both must pass before a commit is made.
 
 **Fly session image pinning (AII-534).** `dispatchKgRefreshRun` pairs the session machine to
 the same pipeline generation as the orchestrator via `resolveKgRefreshSessionImage`
@@ -431,6 +466,7 @@ critical section after the TTL watchdog has already resolved the run.
 | Deploy ownership | AII-353, AII-355 | Self-deploy, source stamps, availability |
 | Docs ingestion | KGB-2 through KGB-5, KGA-2, BDS-38 | Crawl, section chunks, citable anchors |
 | Scaling | KGB-8, AII-422 | Bounded-memory embedding, and a receipt when it still fails |
-| Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: Claude runner follows the ingest playbook; runner-callback endpoints vend scoped push token and tracker data |
+| Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: runner-callback endpoints vend scoped push token and tracker data |
+| Deterministic ingest step | AII-571 | kg-ingest is now a deterministic pipeline step; Claude's feedback-loop role is report-only (verify snapshot, write run report) |
 | Runner dispatch + stage machine | AII-495 | `POST /api/kg/refresh` dispatches the runner when ingest is needed; persisted stage machine (idle → checking → ingest-running → snapshot-landed → staging → terminal) survives restarts; live TTL watchdog; `/admin#deployments` stage badges |
 | KG-visible outcomes | AII-496 | Slack/Teams notification + Linear failure comment on every terminal outcome; TTL-timeout reaches the "hit the time limit" classifier; stuck-watchdog carve-out; exactly-once guarantee via stage guard |

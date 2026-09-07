@@ -29,7 +29,7 @@ flowchart TD
     C -->|"newer snapshot in source repo"| H["local staging rail\nfetch → stage → swap → verify"]
     C -->|"ingest-needed"| D["mintRunToken phase=kg-refresh\nappendLog issueId=kg-refresh"]
     D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
-    E --> F["runner pipeline\nclone → kg-tracker-data\n→ feedback-loop\n→ kg-snapshot-push"]
+    E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo\n→ kg-tracker-data → kg-ingest → feedback-loop\n→ kg-snapshot-push"]
     F --> G["POST /api/runner/result\nphase=kg-refresh"]
     G --> I["onRunnerComplete()\nverify snapshot commit"]
     I --> H
@@ -51,8 +51,9 @@ const runConfig: RunConfigV1 = {
   v: 1,
   issue: { id: "kg-refresh", identifier: "KG-REFRESH", title: "KG ingest", description: "" },
   runnerPhase: "kg-refresh",
-  kgSourceRepo: "<owner/repo>",     // from config.kgSourceRepo
-  runnerCallbackUrl: "<url>",        // bare RUNNER_CALLBACK_BASE_URL — no path suffix
+  kgSourceRepo: "<owner/repo>",          // from config.kgSourceRepo
+  runnerCallbackUrl: "<url>",            // bare RUNNER_CALLBACK_BASE_URL — no path suffix
+  dependencyTokenScope: "installation",  // always set; enables code-repo clone via dep token
 };
 ```
 
@@ -69,7 +70,7 @@ The route `/api/runner/result` does **not** exist. Any value that appends a path
 
 What is **absent** vs a normal implementation run:
 - No `prNumber`, `baseBranch`, `branchPrefix`
-- No `profiles`, `planningContext`, `groupingParent`, `dependencyTokenScope`
+- No `profiles`, `planningContext`, `groupingParent`
 - No publication token (there is no target repo to push a PR to)
 
 The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on both Fly Machines and local Docker. The dispatch path is `dispatchKgRefreshRun()` in `src/index.ts` (~line 3019), which is wired into `makeKgRefresh()` as `input.dispatchRun`.
@@ -177,6 +178,16 @@ The result token is placed in the machine environment as `RUN_TOKEN`; the progre
 
 A third (`publication`) token is **not** minted: there is no target repository, so the runner never calls `POST /api/runner/publication-token`.
 
+### Dependency token and code repo clone
+
+Every kg-refresh dispatch sets `dependencyTokenScope: "installation"` in the envelope. The `dependency-auth` pipeline step reads this field and calls `POST /api/runner/dependency-token` to receive a short-lived installation-wide `contents: read` GitHub App token. The step installs it as a git credential helper for `https://github.com` and exports it as `COMPOSER_AUTH`.
+
+The subsequent `clone-code-repo` pipeline step reads the `code_repo:` key from `sources.yml` in the cloned KG source repo (e.g. `code_repo: BuildDownAI/AI-Implement`). When the key is present, the step clones that repository into `code-repo/` in the workspace using a bare `https://github.com/...` URL — the credential helper supplies the dependency token automatically. When `code_repo:` is absent, the step is skipped.
+
+The `code-repo/` directory is passed as `--code-repo code-repo/` to the `kg-ingest` pipeline step, which spawns `python -m kg_ingest refresh`. Both steps skip silently when their prerequisites are absent (no scope in the envelope, no `code_repo:` in `sources.yml`), so a mixed-version deploy with an old orchestrator produces a workspace without `code-repo/` and the ingest continues without it rather than failing.
+
+The dependency token does not grant write access to any repository; it is scoped to `contents: read` across all repositories the GitHub App installation covers.
+
 ### KG push token
 
 The runner calls `GET /api/runner/kg-push-token` to receive a `contents: write` GitHub App token scoped to the KG source repository. The endpoint is implemented in `src/kg-push-token-vending.ts`:
@@ -205,7 +216,7 @@ Authorization: Bearer <RUN_PROGRESS_TOKEN>
 { "teamKey": "AII", "cursor": "<optional>" }
 ```
 
-The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the tracker regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
+The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the flag-based regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
 
 ```
 [kg-tracker-data] team AII: 312 issues
@@ -353,7 +364,7 @@ The `dispatch_log` row appears in the admin pipelines table with:
 | `failed` | `operator_cancelled` | `null` — benign, suppress alert |
 | `timed_out` | any | `{ summary: "KG Refresh hit the time limit." }` |
 | `failed` | `KG_SNAPSHOT_MISSING` | `{ summary: "KG Refresh failed." }` — snapshot parts or embeddings absent |
-| `failed` | `KG_SNAPSHOT_TRACKER_REGRESSION` | `{ summary: "KG Refresh failed." }` — tracker-data step skipped but previous snapshot contains tracker files (`issue.nt`/`comment.nt`); push refused to avoid regressing to docs-only graph |
+| `failed` | `KG_SNAPSHOT_TRACKER_REGRESSION` | `{ summary: "KG Refresh failed." }` — push refused due to content regression: either the tracker-data step was skipped but the previous snapshot contains tracker files (`issue.nt`/`comment.nt`), or one or more snapshot parts shrank beyond the acceptance thresholds (any part below 50 % of its previous line count, or `issue.nt`/`comment.nt` shrinking at all when the tracker reported a non-zero issue count) |
 | `failed` | `KG_TRACKER_DATA_FETCH_FAILED` | `{ summary: "KG Refresh failed." }` — tracker-data endpoint returned a non-503 error |
 | `failed` | `exit_<N>` | `{ summary: "KG Refresh failed.", detail: "The runner exited with code N." }` |
 | `failed` | other | `{ summary: "KG Refresh failed." }` |
@@ -483,6 +494,7 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | KG push token vending | `src/kg-push-token-vending.ts` |
 | Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
 | Tracker-data pipeline step | `src/pipeline/steps/kg-tracker-data.ts` |
+| Ingest pipeline step | `src/pipeline/steps/kg-ingest.ts` |
 | KG refresh pipeline definition | `pipelines/kg-refresh.yml` |
 | Fly / local Docker dispatch | `src/index.ts` (`dispatchKgRefreshRun`) |
 | Outcome handler (notify + report issue) | `src/index.ts` (`handleKgRefreshOutcome`) |

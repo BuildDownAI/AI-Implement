@@ -2,12 +2,20 @@ id: kg-refresh
 steps:
   - id: clone
     type: clone
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
+  - id: clone-code-repo
+    type: clone
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
-  # feedback-loop drives the ingest via Claude (maxIterations: 1 enforced in
-  # kg-refresh-run.ts). The LLM review verdict is deliberately not consulted —
-  # success or failure is decided by kg-snapshot-push via artifact validation.
+  - id: kg-ingest
+    type: custom
+    moduleId: kg-ingest
+  # feedback-loop is report-only (maxIterations: 1 enforced in kg-refresh-run.ts).
+  # The ingest ran as a deterministic step above. Claude reads ai-output/kg-stats.json,
+  # writes the run report, and answers the reviewer's checks — no ingest work here.
   - id: feedback-loop
     type: custom
     moduleId: feedback-loop

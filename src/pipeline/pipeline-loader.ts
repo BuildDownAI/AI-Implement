@@ -3,6 +3,7 @@ import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
+import { readCodeRepoFromSourcesYml } from "./steps/kg-tracker-data.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",
@@ -270,6 +271,53 @@ function applyWiring(step: YamlStep): StepDefinition {
           // reads it directly from process.env instead.
         }),
       };
+
+    case "clone-code-repo": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const codeRepo = readCodeRepoFromSourcesYml(workspaceDir) ?? "";
+          const slashIdx = codeRepo.indexOf("/");
+          const repoOwner = slashIdx > 0 ? codeRepo.slice(0, slashIdx) : codeRepo;
+          const repoRepo = slashIdx > 0 ? codeRepo.slice(slashIdx + 1) : "";
+          return {
+            repoOwner,
+            repoRepo,
+            branch: "",
+            githubToken: "",
+            workspaceDir,
+            targetDir: "code-repo",
+          };
+        },
+        skip: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          if (readCodeRepoFromSourcesYml(workspaceDir) === null) return true;
+          // Skip if dependency-auth did not acquire a token: without a git credential
+          // helper the clone would fail unauthenticated against a private repo, which
+          // would abort the entire kg-refresh pipeline instead of degrading gracefully.
+          return ctx.getOutputs("dependency-auth").acquired !== true;
+        },
+      };
+    }
+
+    case "kg-ingest": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const codeRepoOutputs = ctx.getOutputs("clone-code-repo");
+          const codeRepoDir =
+            typeof codeRepoOutputs.workspaceDir === "string"
+              ? codeRepoOutputs.workspaceDir
+              : undefined;
+          return {
+            workspaceDir,
+            ...(codeRepoDir ? { codeRepoDir } : {}),
+          };
+        },
+      };
+    }
 
     case "kg-snapshot-push":
       return {
