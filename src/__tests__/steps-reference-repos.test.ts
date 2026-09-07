@@ -3,7 +3,7 @@ import {
   mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { referenceReposStep } from "../pipeline/steps/reference-repos.js";
 import type { SpawnSyncFn } from "../pipeline/steps/reference-repos.js";
@@ -534,6 +534,121 @@ describe("resolveRunnerInputs referenceRepos threading", () => {
     } finally {
       process.env = origEnv;
       if (savedConfig !== undefined) process.env.AI_IMPLEMENT_RUN_CONFIG = savedConfig;
+    }
+  });
+});
+
+describe("referenceReposStep — per-entry validation", () => {
+  it("clones the valid entries when a sibling has an invalid path", async () => {
+    const repoA = makeRepo({ "a.md": "A" });
+    const repoB = makeRepo({ "b.md": "B" });
+    extraDirs.push(repoA, repoB);
+
+    const out = await referenceReposStep.run(
+      ctx(),
+      {
+        referenceRepos: [
+          { repo: "https://github.com/org/a", path: "refs/a" },
+          { repo: "https://github.com/org/bad", path: "/etc/passwd" },
+          { repo: "https://github.com/org/b", path: "refs/b" },
+        ],
+        callbackUrl: "http://localhost:8080",
+        fetchImpl: mockPublicFetch("org"),
+        spawnSyncImpl: makeRedirectingSpawnSync(new Map([
+          ["https://github.com/org/a", repoA],
+          ["https://github.com/org/b", repoB],
+        ])),
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(out.results).toHaveLength(3);
+    const byRepo = new Map(out.results.map((r) => [r.repo, r]));
+    expect(byRepo.get("https://github.com/org/a")?.arrived).toBe(true);
+    expect(byRepo.get("https://github.com/org/b")?.arrived).toBe(true);
+    expect(byRepo.get("https://github.com/org/bad")).toMatchObject({
+      arrived: false,
+      cause: "path-invalid",
+    });
+
+    expect(existsSync(join(workspaceDir, "refs/a", "a.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "refs/b", "b.md"))).toBe(true);
+  });
+
+  it("rejects a second entry claiming a path the first already took", async () => {
+    const repoA = makeRepo({ "a.md": "A" });
+    const repoB = makeRepo({ "b.md": "B" });
+    extraDirs.push(repoA, repoB);
+
+    const out = await referenceReposStep.run(
+      ctx(),
+      {
+        referenceRepos: [
+          { repo: "https://github.com/org/a", path: "refs/shared" },
+          { repo: "https://github.com/org/b", path: "refs/shared" },
+        ],
+        callbackUrl: "http://localhost:8080",
+        fetchImpl: mockPublicFetch("org"),
+        spawnSyncImpl: makeRedirectingSpawnSync(new Map([
+          ["https://github.com/org/a", repoA],
+          ["https://github.com/org/b", repoB],
+        ])),
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(out.results).toHaveLength(2);
+    const byRepo = new Map(out.results.map((r) => [r.repo, r]));
+    expect(byRepo.get("https://github.com/org/a")?.arrived).toBe(true);
+    expect(byRepo.get("https://github.com/org/b")).toMatchObject({
+      arrived: false,
+      cause: "path-invalid",
+    });
+
+    // The winner's content is present and the loser never overwrote it.
+    expect(existsSync(join(workspaceDir, "refs/shared", "a.md"))).toBe(true);
+    expect(existsSync(join(workspaceDir, "refs/shared", "b.md"))).toBe(false);
+  });
+
+  it("reports every entry when all of them are invalid", async () => {
+    const out = await referenceReposStep.run(
+      ctx(),
+      {
+        referenceRepos: [
+          { repo: "https://github.com/org/a", path: "/absolute" },
+          { repo: "https://github.com/org/b", path: "../outside" },
+        ],
+        callbackUrl: "http://localhost:8080",
+        fetchImpl: mockPublicFetch("org"),
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(out.results).toHaveLength(2);
+    expect(out.results.every((r) => r.arrived === false && r.cause === "path-invalid")).toBe(true);
+  });
+
+  // The configuration guards run above validation, so an unrunnable step reports nothing
+  // rather than a partial record set that would read as "these arrived, that one didn't".
+  // The absent warning is what pins the ordering: validation logs one per rejected entry.
+  it("exits before validating when the run has no progress token", async () => {
+    delete process.env.RUN_PROGRESS_TOKEN;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const out = await referenceReposStep.run(
+        ctx(),
+        {
+          referenceRepos: [{ repo: "https://github.com/org/a", path: "/absolute" }],
+          callbackUrl: "http://localhost:8080",
+        },
+        new NoopStepReporter(),
+      );
+
+      expect(out.results).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 });

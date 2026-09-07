@@ -100,7 +100,8 @@ function cloneRepo(params: {
   const isSha = ref && SHA_RE.test(ref);
 
   if (isSha) {
-    // SHA pin: git init → fetch --depth 1 origin <sha> → checkout FETCH_HEAD
+    // SHA pin: git init → fetch --depth 1 <url> <sha> → checkout FETCH_HEAD.
+    // Fetching by URL adds no origin remote, so nothing about the source persists in the clone.
     const initResult = spawnFn("git", ["init", absDest], {
       stdio: ["ignore", "pipe", "pipe"],
       env: credEnv,
@@ -187,24 +188,6 @@ export const referenceReposStep: StepModule<ReferenceReposInputs, ReferenceRepos
       return { results: [] };
     }
 
-    // Re-validate paths against current rules — a value stored before a rule
-    // tightened is still in the database, and this is the moment it becomes a
-    // filesystem operation.
-    let validatedRepos: ReferenceRepo[];
-    try {
-      validatedRepos = normalizeReferenceRepos(referenceRepos) ?? [];
-    } catch (err) {
-      console.warn(
-        `[reference-repos] path validation failed: ${err instanceof Error ? err.message : String(err)}; skipping all entries`,
-      );
-      return { results: [] };
-    }
-
-    if (validatedRepos.length === 0) {
-      console.log("[reference-repos] no valid entries after re-validation; skipping");
-      return { results: [] };
-    }
-
     // Read the bearer secret directly from the environment so it never appears
     // in step inputs, which are persisted to the step log and served by the admin API.
     const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
@@ -216,6 +199,42 @@ export const referenceReposStep: StepModule<ReferenceReposInputs, ReferenceRepos
     if (!callbackUrl) {
       console.log("[reference-repos] no callback URL; skipping");
       return { results: [] };
+    }
+
+    // Re-validate against current rules — a value stored before a rule tightened is still
+    // in the database, and this is the moment it becomes a filesystem operation.
+    const results: ReferenceRepoResult[] = [];
+    const validatedRepos: ReferenceRepo[] = [];
+    const seenPaths = new Set<string>();
+
+    for (const entry of referenceRepos) {
+      let normalized: ReferenceRepo | undefined;
+      try {
+        // One entry at a time: a batch call rejects the whole array on the first bad entry,
+        // discarding every valid sibling and reporting nothing about any of them.
+        normalized = normalizeReferenceRepos([entry])?.[0];
+      } catch (err) {
+        console.warn(
+          `[reference-repos] rejecting ${entry.repo} → ${entry.path}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!normalized) {
+        results.push({ repo: entry.repo, path: entry.path, ref: entry.ref, arrived: false, cause: "path-invalid" });
+        continue;
+      }
+      // Uniqueness is a cross-entry rule a per-entry call cannot see, so re-apply it here.
+      if (seenPaths.has(normalized.path)) {
+        console.warn(`[reference-repos] rejecting duplicate path "${normalized.path}" (${normalized.repo})`);
+        results.push({ repo: normalized.repo, path: normalized.path, ref: normalized.ref, arrived: false, cause: "path-invalid" });
+        continue;
+      }
+      seenPaths.add(normalized.path);
+      validatedRepos.push(normalized);
+    }
+
+    if (validatedRepos.length === 0) {
+      console.log("[reference-repos] no valid entries after re-validation");
+      return { results };
     }
 
     const workspaceDir = process.env.WORKSPACE_DIR ?? "/workspace";
@@ -235,8 +254,6 @@ export const referenceReposStep: StepModule<ReferenceReposInputs, ReferenceRepos
       );
       ownerTokens = new Map();
     }
-
-    const results: ReferenceRepoResult[] = [];
 
     for (const entry of validatedRepos) {
       const owner = ownerFromRepo(entry.repo);
