@@ -136,6 +136,38 @@ describe("monitorKgRefreshGhaJob — lazy bind", () => {
   });
 });
 
+// ---------- Watchdog-overdue ----------
+
+describe("monitorKgRefreshGhaJob — watchdog overdue", () => {
+  it("calls onHandleLost and does not close the DB row when the job is overdue", async () => {
+    vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "in_progress", conclusion: null, html_url: "" });
+    vi.mocked(getJobById).mockReturnValue({ ...makeKgJob({ runId: RUN_ID }), runId: RUN_ID } as unknown as Job);
+    vi.mocked(githubActionsWatchdogDecision).mockReturnValue({
+      overdue: true, elapsedMs: 25_200_000, jobTimeoutMinutes: 360, graceMinutes: 5, thresholdMs: 21_900_000,
+    });
+
+    const onHandleLost = vi.fn();
+    const job = makeKgJob({ runId: RUN_ID, status: "running" });
+    await monitorKgRefreshGhaJob(GH_TOKEN, OWNER, REPO, job, new Set(), onHandleLost);
+
+    expect(onHandleLost).toHaveBeenCalledOnce();
+    expect(onHandleLost).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.stringContaining("overdue") }));
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+
+  it("does not call onHandleLost when the job is not overdue", async () => {
+    vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "in_progress", conclusion: null, html_url: "" });
+    vi.mocked(getJobById).mockReturnValue({ ...makeKgJob({ runId: RUN_ID }), runId: RUN_ID } as unknown as Job);
+    // Default mock returns overdue: false
+
+    const onHandleLost = vi.fn();
+    await monitorKgRefreshGhaJob(GH_TOKEN, OWNER, REPO, makeKgJob({ runId: RUN_ID, status: "running" }), new Set(), onHandleLost);
+
+    expect(onHandleLost).not.toHaveBeenCalled();
+    expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+});
+
 // ---------- Run-conclusion closure ----------
 
 describe("monitorKgRefreshGhaJob — run-conclusion closure", () => {
@@ -188,6 +220,42 @@ describe("monitorKgRefreshGhaJob — run-conclusion closure", () => {
     await monitorKgRefreshGhaJob(GH_TOKEN, OWNER, REPO, job, new Set());
 
     expect(updateJobStatus).not.toHaveBeenCalled();
+  });
+
+  it("calls onHandleLost after updateJobStatus on successful completion", async () => {
+    vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "completed", conclusion: "success", html_url: "" });
+    vi.mocked(getJobById).mockReturnValue({ ...makeKgJob({ runId: RUN_ID }), runId: RUN_ID } as unknown as Job);
+
+    const onHandleLost = vi.fn();
+    await monitorKgRefreshGhaJob(GH_TOKEN, OWNER, REPO, makeKgJob({ runId: RUN_ID, status: "running" }), new Set(), onHandleLost);
+
+    expect(updateJobStatus).toHaveBeenCalledWith(42, "completed", "success", null);
+    expect(onHandleLost).toHaveBeenCalledOnce();
+    expect(onHandleLost).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.stringContaining("concluded") }));
+  });
+
+  it("calls onHandleLost after updateJobStatus on failed completion", async () => {
+    vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "completed", conclusion: "failure", html_url: "" });
+    vi.mocked(getJobById).mockReturnValue({ ...makeKgJob({ runId: RUN_ID }), runId: RUN_ID } as unknown as Job);
+
+    const onHandleLost = vi.fn();
+    await monitorKgRefreshGhaJob(GH_TOKEN, OWNER, REPO, makeKgJob({ runId: RUN_ID, status: "running" }), new Set(), onHandleLost);
+
+    expect(updateJobStatus).toHaveBeenCalledWith(42, "failed", "failure", null);
+    expect(onHandleLost).toHaveBeenCalledOnce();
+  });
+
+  it("does not call onHandleLost when the recheck runId guard fires (stale second guard)", async () => {
+    vi.mocked(getWorkflowRunStatus).mockResolvedValue({ status: "completed", conclusion: "success", html_url: "" });
+    vi.mocked(getJobById)
+      .mockReturnValueOnce({ ...makeKgJob({ runId: RUN_ID }), runId: RUN_ID } as unknown as Job) // first guard
+      .mockReturnValueOnce({ ...makeKgJob({ runId: 11111 }), runId: 11111 } as unknown as Job); // recheck
+
+    const onHandleLost = vi.fn();
+    await monitorKgRefreshGhaJob(GH_TOKEN, OWNER, REPO, makeKgJob({ runId: RUN_ID, status: "running" }), new Set(), onHandleLost);
+
+    expect(updateJobStatus).not.toHaveBeenCalled();
+    expect(onHandleLost).not.toHaveBeenCalled();
   });
 
   it("does not call attachJobRunIdIfMissing when runId is already set", async () => {

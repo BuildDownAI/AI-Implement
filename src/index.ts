@@ -1914,7 +1914,8 @@ async function monitorGitHubActionsJob(
 
   // kg-refresh GHA rows are handled by their own monitor (no teamRepoMap entry, no issue).
   if (job.phase === "kg-refresh") {
-    await monitorKgRefreshGhaJob(ghToken, owner, repo, job, claimedRunIds);
+    await monitorKgRefreshGhaJob(ghToken, owner, repo, job, claimedRunIds,
+      (opts) => activeKgRefresh?.onMachineLost(opts));
     return;
   }
 

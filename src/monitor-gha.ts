@@ -9,9 +9,15 @@ import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
  *
  * kg-refresh rows are not in teamRepoMap, so this function derives the workflow
  * file and branch directly ("claude-implement.yml" + repo default branch) rather
- * than using the mapping lookup that would return nothing. The KgRefreshHandle's
- * own TTL watchdog handles prolonged failures; the reaper is Fly-only for
- * kg-refresh. Called from monitorGitHubActionsJob for phase === "kg-refresh".
+ * than using the mapping lookup that would return nothing.
+ *
+ * onHandleLost is called when the GHA run concludes or goes overdue so that
+ * KgRefreshHandle's in-memory running/stage lock is cleared promptly — not just
+ * via TTL or the next trigger() call — in case the runner callback never arrived.
+ * onMachineLost is idempotent (no-op when stage ≠ ingest-running), so it is
+ * safe to call even when the callback already landed.
+ *
+ * Called from monitorGitHubActionsJob for phase === "kg-refresh".
  */
 export async function monitorKgRefreshGhaJob(
   ghToken: string,
@@ -19,6 +25,7 @@ export async function monitorKgRefreshGhaJob(
   repo: string,
   job: Job,
   claimedRunIds: Set<number>,
+  onHandleLost?: (opts?: { failureCode?: string; detail?: string }) => void,
 ): Promise<void> {
   if (!job.runId) {
     // Lazy bind: find the workflow run ID for this dispatch.
@@ -49,12 +56,13 @@ export async function monitorKgRefreshGhaJob(
     maxJobMinutes: null, // kg-refresh has no teamRepoMap mapping
   });
   if (watchdog.overdue) {
-    // No issue or provider to remediate — KgRefreshHandle's TTL watchdog owns this.
     const elapsedMin = Math.round(watchdog.elapsedMs / 60000);
     console.warn(
       `[monitor] kg-refresh GHA job ${job.id} stuck in ${runStatus.status} after ${elapsedMin}m ` +
         `(threshold ${watchdog.jobTimeoutMinutes}m + ${watchdog.graceMinutes}m grace)`,
     );
+    // Release the in-memory handle so a new refresh can be triggered without waiting for the TTL.
+    onHandleLost?.({ detail: `GHA run ${job.runId} overdue (${elapsedMin}m) — releasing handle` });
     return;
   }
 
@@ -75,6 +83,8 @@ export async function monitorKgRefreshGhaJob(
     // kg-refresh rows are issueless; no PR URL or ticket side effects.
     updateJobStatus(job.id, jobStatus, runStatus.conclusion, null);
     console.log(`[monitor] kg-refresh job ${job.id} → ${jobStatus} (${runStatus.conclusion})`);
+    // Notify the handle: clears the in-memory lock if the runner callback never arrived.
+    onHandleLost?.({ detail: `GHA run ${job.runId} concluded ${runStatus.conclusion} — no runner callback received` });
   } else if (job.status === "dispatched") {
     updateJobRunId(job.id, job.runId);
   }
