@@ -232,7 +232,7 @@ Authorization: Bearer <RUN_PROGRESS_TOKEN>
 { "teamKey": "AII", "cursor": "<optional>" }
 ```
 
-The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the flag-based regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
+The endpoint validates that `teamKey` is present in the orchestrator's configured mapping set (`getMappings()`) and rejects unknown keys with 403. Each issue record carries: `id`, `identifier`, `title`, `description`, `branchName`, `state { name type }`, `labels { nodes { name } }`, `project { name }`, `parent { identifier }`, `comments(first: 50) { nodes { body user { name } createdAt } }`, and `relations { nodes { type relatedIssue { identifier } } }`. A mapped team with zero fetched issues logs a warning and causes the step to return `fetched: false`, which triggers the flag-based regression guard in `kg-snapshot-push` if the previous snapshot already contained tracker files (`issue.nt` / `comment.nt`). All teams' issues are combined into `tracker-data.json` before the snapshot is assembled. One log line is emitted per team:
 
 ```
 [kg-tracker-data] team AII: 312 issues
