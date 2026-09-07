@@ -1,3 +1,5 @@
+import type { ReferenceRepo } from "./reference-repos.js";
+
 /**
  * Versioned orchestrator→runner config envelope. Travels as ONE
  * workflow_dispatch input (`run_config`) on GHA and as the
@@ -27,6 +29,8 @@ export interface RunConfigV1 {
   groupingParent?: boolean;
   /** Per-project dependency-repo read access. Absent = feature off. */
   dependencyTokenScope?: "installation";
+  /** Reference repositories cloned read-only into the workspace. Absent on planning and kg-refresh dispatches. */
+  referenceRepos?: ReferenceRepo[];
 }
 
 const MAX_DESCRIPTION_CHARS = 40_000;
@@ -93,7 +97,8 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
-    profiles, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo } = cfg;
+    profiles, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
+    referenceRepos } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -110,5 +115,6 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (groupingParent !== undefined) out.groupingParent = groupingParent;
   if (dependencyTokenScope !== undefined) out.dependencyTokenScope = dependencyTokenScope;
   if (kgSourceRepo !== undefined) out.kgSourceRepo = kgSourceRepo;
+  if (referenceRepos !== undefined) out.referenceRepos = referenceRepos;
   return out;
 }

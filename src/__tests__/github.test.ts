@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags } from "../github.js";
-import { decodeRunConfig } from "../run-config.js";
+import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
@@ -28,6 +28,7 @@ function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
     maxJobMinutes: null,
     branchPrefix: null,
     skillsRepo: null,
+    referenceRepos: null,
     autoMerge: false,
     ...overrides,
   };
@@ -439,6 +440,47 @@ describe("buildEnvelopeDispatchInputs", () => {
     const cfg = decodeRunConfig(inputs.run_config as string);
     expect(cfg.profiles).toBeUndefined();
     expect(cfg.planningContext).toEqual(ctx);
+  });
+
+  it("implementation dispatch carries referenceRepos when mapping has entries", () => {
+    const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "implementation" });
+    const cfg = decodeRunConfig(inputs.run_config as string);
+    expect(cfg.referenceRepos).toEqual(repos);
+  });
+
+  it("implementation dispatch omits referenceRepos when mapping has none", () => {
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: null }), baseIssue, { runnerPhase: "implementation" });
+    expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
+  });
+
+  it("planning dispatch omits referenceRepos even when mapping has entries", () => {
+    const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "planning" });
+    expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
+  });
+
+  it("kg-refresh dispatch omits referenceRepos even when mapping has entries", () => {
+    const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "kg-refresh" });
+    expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
+  });
+
+  it("gap-analysis dispatch carries referenceRepos when mapping has entries", () => {
+    const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "gap-analysis" });
+    expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toEqual(repos);
+  });
+
+  it("encode-then-decode round-trip preserves all referenceRepos entries including one without ref", () => {
+    const repos = [
+      { repo: "https://github.com/org/repo-a", path: "refs/repo-a", ref: "main" },
+      { repo: "https://github.com/org/repo-b", path: "refs/repo-b" },
+    ];
+    const encoded = encodeRunConfig({ v: 1, issue: { id: "x", identifier: "X-1", title: "T", description: "D" }, referenceRepos: repos });
+    const cfg = decodeRunConfig(encoded);
+    expect(cfg.referenceRepos).toEqual(repos);
+    expect("ref" in (cfg.referenceRepos?.[1] ?? {})).toBe(false);
   });
 });
 

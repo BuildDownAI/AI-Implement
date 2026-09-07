@@ -41,7 +41,7 @@ interface RunConfigV1 {
   issue: { id: string; identifier: string; title: string; description: string };
   prNumber?: string;
   baseBranch?: string;
-  runnerPhase?: "implementation" | "gap-analysis" | "planning";
+  runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   branchPrefix?: string;
   skillsRepo?: string;
   runnerCallbackUrl?: string;
@@ -51,7 +51,9 @@ interface RunConfigV1 {
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   profiles?: string[];
   planningContext?: { parent?: string; siblings?: string; dependencies?: string };
+  groupingParent?: boolean;
   dependencyTokenScope?: "installation";
+  referenceRepos?: Array<{ repo: string; path: string; ref?: string }>;
 }
 ```
 
@@ -62,12 +64,14 @@ Field notes:
 | `issue.description` | Capped at 40,000 characters on encode; truncation is appended as a marker string |
 | `prNumber` | Set for gap-analysis and review-feedback re-dispatches; absent on initial implementation |
 | `baseBranch` | Feature-branch parent for child issues; repo default branch otherwise |
-| `runnerPhase` | `"implementation"` (default), `"gap-analysis"`, or `"planning"` |
+| `runnerPhase` | `"implementation"` (default), `"gap-analysis"`, `"planning"`, or `"kg-refresh"` |
 | `sensitiveFiles.add` | Glob patterns extending the built-in sensitive-file blocklist |
 | `sensitiveFiles.allow` | Glob patterns that override the blocklist; allow wins over both built-in and add patterns |
 | `profiles` | Jira AI-Implement Profiles field values (comma-split strings) |
 | `planningContext` | Populated for child issues in a feature tree; carries parent and sibling summaries |
+| `groupingParent` | True when this dispatch is a grouping parent's own closing-work run |
 | `dependencyTokenScope` | `"installation"` enables the dependency token step in the runner; absent or null disables it. The runner fetches a read-only token covering all App-installation repos and injects it as a git credential helper and `COMPOSER_AUTH`. Requires a publicly reachable orchestrator (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`). |
+| `referenceRepos` | Repositories to clone read-only into the workspace before the implement loop. Each entry carries `repo` (normalized `https://github.com/owner/repo`), `path` (workspace-relative directory), and an optional `ref` (branch, tag, or commit hash; absent means the default branch). **Absent on planning dispatches** — the planning runner reads no such field. **Absent on kg-refresh dispatches** — the kg-refresh pipeline clones a knowledge-graph source repository as its workspace and has no pipeline step that would consume reference repos. Envelope-only: no dispatch input and no environment variable carry this field, so a target repo on the legacy workflow contract does not receive it. |
 
 ---
 
