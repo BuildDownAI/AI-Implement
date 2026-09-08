@@ -64,16 +64,20 @@ describe("GHA workflow shims", () => {
     expect(promoteStep.run).toContain("re-test and promote the digest image");
     expect(promoteStep.run).toContain('if [ "$current_sha" != "${{ github.sha }}" ]; then');
     expect(promoteStep.run).toContain("Skipping channel promotion");
+    // Equivalence check: script is called when head advanced past tested SHA
+    expect(promoteStep.run).toContain('bash scripts/image-equiv-check.sh "${{ github.sha }}" "$current_sha"');
     expect(promoteStep.run).toContain("Re-pull immediately before tagging");
     expect(promoteStep.run).toContain('docker pull "$digest_ref"');
-    expect(promoteStep.run).toContain(
-      'docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"',
-    );
+    // Channel tag uses a bash variable (channel=) so the value is set once at the top
+    expect(promoteStep.run).toContain('docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${channel}"');
     expect(promoteStep.run).toContain(
       'docker tag "$digest_ref" "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"',
     );
-    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}"');
+    expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${channel}"');
     expect(promoteStep.run).toContain('docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.date_tag }}"');
+    // Head date tag is pushed when head advanced with no image-relevant changes
+    expect(promoteStep.run).toContain("head_date_tag=");
+    expect(promoteStep.run).toContain('"$head_date_tag"');
   });
 
   it("keeps the canonical and synced dispatch workflows byte-for-byte identical", () => {
@@ -109,6 +113,22 @@ describe("GHA workflow shims", () => {
       expect(actionRefs.length).toBeGreaterThan(0);
       for (const ref of actionRefs) {
         expect(ref).toMatch(/@[0-9a-f]{40}$/);
+      }
+    });
+  }
+
+  for (const f of SYNCED_WORKFLOW_FILES) {
+    it(`${f} never interpolates runner token inputs directly into run: script text`, () => {
+      const doc = parse(readFileSync(f, "utf-8")) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      for (const job of jobs) {
+        for (const step of job.steps ?? []) {
+          if (typeof step.run === "string") {
+            expect(step.run).not.toContain("inputs.run_token");
+            expect(step.run).not.toContain("inputs.run_progress_token");
+            expect(step.run).not.toContain("inputs.run_publication_token");
+          }
+        }
       }
     });
   }
@@ -275,24 +295,39 @@ describe("GHA workflow shims", () => {
       expect(yaml).toMatch(/GITHUB_REPOSITORY_OWNER is empty/);
     });
 
-    it(`${f} masks runner progress tokens before the container step uses them`, () => {
+    it(`${f} masks runner progress tokens via env: before the container step uses them`, () => {
       const yaml = readFileSync(f, "utf-8");
-      expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_progress_token\s*\}\}/);
+      const doc = parse(yaml) as any;
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const maskStep = containerJob.steps.find((s: any) => s.name === "Mask runner callback tokens");
+      expect(maskStep).toBeDefined();
+      expect(maskStep.env?.RUN_PROGRESS_TOKEN).toBe("${{ inputs.run_progress_token }}");
+      expect(maskStep.run).toContain("::add-mask::$RUN_PROGRESS_TOKEN");
+      expect(maskStep.run).not.toContain("inputs.run_progress_token");
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
     });
 
-    it(`${f} accepts and masks a dedicated publication token only for the pipeline step`, () => {
+    it(`${f} accepts and masks a dedicated publication token via env:, exposed only to mask and pipeline steps`, () => {
       const yaml = readFileSync(f, "utf-8");
       const doc = parse(yaml) as any;
       expect(doc.on.workflow_dispatch.inputs.run_publication_token).toBeDefined();
       expect(doc.on.workflow_dispatch.inputs.run_publication_token.required).toBe(false);
-      expect(yaml).toMatch(/::add-mask::\$\{\{\s*inputs\.run_publication_token\s*\}\}/);
       expect(yaml.indexOf("Mask runner callback tokens")).toBeLessThan(yaml.indexOf("Run pipeline"));
+
+      const jobs = Object.values(doc.jobs) as any[];
+      const containerJob = jobs.find((j: any) => j.container);
+      const maskStep = containerJob.steps.find((s: any) => s.name === "Mask runner callback tokens");
+      expect(maskStep.env?.RUN_PUBLICATION_TOKEN).toBe("${{ inputs.run_publication_token }}");
+      expect(maskStep.run).toContain("::add-mask::$RUN_PUBLICATION_TOKEN");
+      expect(maskStep.run).not.toContain("inputs.run_publication_token");
 
       const pipelineStep = doc.jobs.implement.steps.find((step: any) => step.name === "Run pipeline");
       expect(pipelineStep.env.RUN_PUBLICATION_TOKEN).toBe("${{ inputs.run_publication_token }}");
-      const nonPipelineSteps = doc.jobs.implement.steps.filter((step: any) => step.name !== "Run pipeline");
-      expect(JSON.stringify(nonPipelineSteps)).not.toContain("RUN_PUBLICATION_TOKEN");
+      const otherSteps = doc.jobs.implement.steps.filter(
+        (step: any) => step.name !== "Run pipeline" && step.name !== "Mask runner callback tokens",
+      );
+      expect(JSON.stringify(otherSteps)).not.toContain("RUN_PUBLICATION_TOKEN");
     });
 
     it(`${f} validates Bedrock config before configuring AWS credentials`, () => {

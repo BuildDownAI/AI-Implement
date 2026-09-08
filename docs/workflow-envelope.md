@@ -27,7 +27,9 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 | `run_progress_token` | No | string | HMAC bearer token for in-progress callbacks; empty skips progress posts. **Masked.** |
 | `run_publication_token` | No | string | Dedicated, single-use bearer token that may be exchanged immediately before repository publication for a fresh repo-scoped GitHub credential. **Masked. Implementation and gap-analysis only.** |
 
-The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs.
+The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs. Token inputs are wired through `env:` on the mask step and never interpolated directly into script text, because GHA prints a step's script in the `##[group]Run …` header before the step executes.
+
+These are live credentials in the runner's environment; `src/__tests__/setup/clear-runner-credentials.ts` (registered as a Vitest `setupFile`) deletes all five credential variables before every test so no suite can burn a single-use token against the live orchestrator. A test that needs a credential value may set it in the test body — the global `beforeEach` ensures it is cleared again before the next test. Tests that exercise callback or fetch paths should inject a mock `fetchImpl` (or equivalent dependency-injection point) rather than letting code reach a live URL.
 
 ---
 
@@ -41,7 +43,7 @@ interface RunConfigV1 {
   issue: { id: string; identifier: string; title: string; description: string };
   prNumber?: string;
   baseBranch?: string;
-  runnerPhase?: "implementation" | "gap-analysis" | "planning";
+  runnerPhase?: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   branchPrefix?: string;
   skillsRepo?: string;
   runnerCallbackUrl?: string;
@@ -51,7 +53,9 @@ interface RunConfigV1 {
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   profiles?: string[];
   planningContext?: { parent?: string; siblings?: string; dependencies?: string };
+  groupingParent?: boolean;
   dependencyTokenScope?: "installation";
+  referenceRepos?: Array<{ repo: string; path: string; ref?: string }>;
 }
 ```
 
@@ -62,12 +66,14 @@ Field notes:
 | `issue.description` | Capped at 40,000 characters on encode; truncation is appended as a marker string |
 | `prNumber` | Set for gap-analysis and review-feedback re-dispatches; absent on initial implementation |
 | `baseBranch` | Feature-branch parent for child issues; repo default branch otherwise |
-| `runnerPhase` | `"implementation"` (default), `"gap-analysis"`, or `"planning"` |
+| `runnerPhase` | `"implementation"` (default), `"gap-analysis"`, `"planning"`, or `"kg-refresh"` |
 | `sensitiveFiles.add` | Glob patterns extending the built-in sensitive-file blocklist |
 | `sensitiveFiles.allow` | Glob patterns that override the blocklist; allow wins over both built-in and add patterns |
 | `profiles` | Jira AI-Implement Profiles field values (comma-split strings) |
 | `planningContext` | Populated for child issues in a feature tree; carries parent and sibling summaries |
+| `groupingParent` | True when this dispatch is a grouping parent's own closing-work run |
 | `dependencyTokenScope` | `"installation"` enables the dependency token step in the runner; absent or null disables it. The runner fetches a read-only token covering all App-installation repos and injects it as a git credential helper and `COMPOSER_AUTH`. Requires a publicly reachable orchestrator (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`). |
+| `referenceRepos` | Repositories to clone read-only into the workspace before the implement loop. Each entry carries `repo` (normalized `https://github.com/owner/repo`), `path` (workspace-relative directory), and an optional `ref` (branch, tag, or commit hash; absent means the default branch). **Absent on planning dispatches** — the planning runner reads no such field. **Absent on kg-refresh dispatches** — the kg-refresh pipeline clones a knowledge-graph source repository as its workspace and has no pipeline step that would consume reference repos. Envelope-only: no dispatch input and no environment variable carry this field, so a target repo on the legacy workflow contract does not receive it. |
 
 ---
 

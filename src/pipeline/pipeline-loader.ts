@@ -1,8 +1,11 @@
 import { readFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
+import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./steps/kg-tracker-data.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",
@@ -19,6 +22,7 @@ interface YamlStep {
   id: string;
   type: StepType;
   moduleId?: string;
+  depth?: number | "full";
 }
 
 interface YamlPipeline {
@@ -51,7 +55,7 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
     if (!step || typeof step !== "object") {
       throw new Error(`Pipeline YAML at "${sourcePath}" step[${i}] is not an object`);
     }
-    const { id: stepId, type, moduleId } = step as Record<string, unknown>;
+    const { id: stepId, type, moduleId, depth } = step as Record<string, unknown>;
     if (typeof stepId !== "string" || !stepId) {
       throw new Error(`Pipeline YAML at "${sourcePath}" step[${i}] missing 'id'`);
     }
@@ -64,7 +68,24 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
     if (moduleId !== undefined && typeof moduleId !== "string") {
       throw new Error(`Pipeline YAML at "${sourcePath}" step "${stepId}" has non-string 'moduleId'`);
     }
-    return { id: stepId, type: type as StepType, ...(moduleId ? { moduleId } : {}) };
+    let parsedDepth: number | "full" | undefined;
+    if (depth !== undefined) {
+      if (depth === "full") {
+        parsedDepth = "full";
+      } else if (typeof depth === "number" && Number.isInteger(depth) && depth > 0) {
+        parsedDepth = depth;
+      } else {
+        throw new Error(
+          `Pipeline YAML at "${sourcePath}" step "${stepId}" has invalid 'depth': expected a positive integer or "full"`,
+        );
+      }
+    }
+    return {
+      id: stepId,
+      type: type as StepType,
+      ...(moduleId ? { moduleId } : {}),
+      ...(parsedDepth !== undefined ? { depth: parsedDepth } : {}),
+    };
   });
 
   return { id, steps: parsedSteps };
@@ -95,7 +116,21 @@ function applyWiring(step: YamlStep): StepDefinition {
           prNumber: ctx.data.prNumber,
           orchestratorUrl: ctx.data.orchestratorUrl,
           machineNonce: ctx.data.nonce,
+          depth: step.depth,
         }),
+      };
+
+    case "reference-repos":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          referenceRepos: ctx.data.referenceRepos,
+          callbackUrl: ctx.data.callbackUrl,
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.referenceRepos?.length,
       };
 
     case "install-skills":
@@ -146,12 +181,14 @@ function applyWiring(step: YamlStep): StepDefinition {
           const repoModels = ctx.getOutputs("install").repoModels as
             | { implement?: string; review?: string }
             | undefined;
+          const referenceRepoOutputs = ctx.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] };
           return {
             workspaceDir: ctx.getOutputs("clone").workspaceDir,
             issueTitle: ctx.data.issueTitle,
             issueDescription: ctx.data.issueDescription,
             implementationPrompt: ctx.data.implementationPrompt,
             planningContext: ctx.data.planningContext,
+            referenceRepoResults: referenceRepoOutputs.results,
             repoImplementModel: repoModels?.implement,
             repoReviewModel: repoModels?.review,
             provider: ctx.data.provider,
@@ -270,6 +307,104 @@ function applyWiring(step: YamlStep): StepDefinition {
           // reads it directly from process.env instead.
         }),
       };
+
+    case "clone-code-repo": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const codeRepo = readCodeRepoFromSourcesYml(workspaceDir);
+          const slug = codeRepo?.slug ?? "";
+          const slashIdx = slug.indexOf("/");
+          const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
+          const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
+          return {
+            repoOwner,
+            repoRepo,
+            branch: codeRepo?.branch ?? "",
+            githubToken: "",
+            workspaceDir,
+            targetDir: "code-repo",
+            depth: step.depth,
+          };
+        },
+        skip: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          if (readCodeRepoFromSourcesYml(workspaceDir) === null) {
+            console.warn("[clone-code-repo] sources.yml has no code_repo.slug — skipping");
+            return true;
+          }
+          // Skip if dependency-auth did not acquire a token: without a git credential
+          // helper the clone would fail unauthenticated against a private repo, which
+          // would abort the entire kg-refresh pipeline instead of degrading gracefully.
+          return ctx.getOutputs("dependency-auth").acquired !== true;
+        },
+      };
+    }
+
+    case "clone-secondary-repos": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const repos = readSecondaryReposFromSourcesYml(workspaceDir);
+          const targets = repos.map(({ slug, branch }) => {
+            const slashIdx = slug.indexOf("/");
+            const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
+            const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
+            return { repoOwner, repoRepo, targetDir: join("repos", basename(slug)), ...(branch !== undefined ? { branch } : {}) };
+          });
+          return {
+            repoOwner: "",
+            repoRepo: "",
+            branch: "",
+            githubToken: "",
+            workspaceDir,
+            targets,
+            depth: step.depth,
+          };
+        },
+        skip: (ctx: PipelineContext) => {
+          // Skip if dependency-auth did not acquire a token: without the git credential
+          // helper the clones would fail unauthenticated against private repos.
+          if (ctx.getOutputs("dependency-auth").acquired !== true) return true;
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const repos = readSecondaryReposFromSourcesYml(workspaceDir);
+          if (repos.length === 0) {
+            console.warn("[clone-secondary-repos] no secondary_repos in sources.yml — skipping");
+            return true;
+          }
+          return false;
+        },
+      };
+    }
+
+    case "kg-ingest": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const codeRepoOutputs = ctx.getOutputs("clone-code-repo");
+          const codeRepoDir =
+            typeof codeRepoOutputs.workspaceDir === "string"
+              ? codeRepoOutputs.workspaceDir
+              : undefined;
+          // Only wire reposRootDir when clone-secondary-repos actually ran (not skipped).
+          // Skipped steps leave no outputs, so clonedCount is undefined when skipped.
+          const secondaryReposOutputs = ctx.getOutputs("clone-secondary-repos");
+          const reposRootDir =
+            secondaryReposOutputs.clonedCount !== undefined
+              ? join(workspaceDir, "repos")
+              : undefined;
+          return {
+            workspaceDir,
+            ...(codeRepoDir ? { codeRepoDir } : {}),
+            ...(reposRootDir !== undefined ? { reposRootDir } : {}),
+            ...(ctx.data.dependencyToken ? { ghToken: ctx.data.dependencyToken } : {}),
+          };
+        },
+      };
+    }
 
     case "kg-snapshot-push":
       return {

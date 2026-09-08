@@ -8,10 +8,13 @@ import type * as RunnerTokensModule from "../runner-tokens.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import type * as StepLogModule from "../step-log.js";
 import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
+import type * as ReviewFixQueueModule from "../review-fix-queue.js";
+import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import { formatFailureComment } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { Step } from "../pipeline/types.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
@@ -22,6 +25,8 @@ let runnerTokens: typeof RunnerTokensModule;
 let runnerCallback: typeof RunnerCallbackModule;
 let stepLog: typeof StepLogModule;
 let reviewStore: typeof ReviewLedgerStoreModule;
+let reviewFixQueue: typeof ReviewFixQueueModule;
+let commentGapfillQueue: typeof CommentGapfillQueueModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -36,6 +41,8 @@ beforeEach(async () => {
   runnerCallback = await import("../runner-callback.js");
   stepLog = await import("../step-log.js");
   reviewStore = await import("../review-ledger-store.js");
+  reviewFixQueue = await import("../review-fix-queue.js");
+  commentGapfillQueue = await import("../comment-gapfill-queue.js");
   dedup.getDb();
   log.initLogTable();
   stepLog.initStepLogTable();
@@ -380,6 +387,391 @@ describe("handleRunnerResult — implementation", () => {
     expect(calls.find((c) => c.method === "markImplementationFailed")).toBeUndefined();
     expect(log.getJobById(jobId)?.conclusion).toBe("operator_cancelled");
   });
+
+  it("writes runner_approved on implementation success with a PR URL (AII-460)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-approved",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-approved",
+      issueIdentifier: "ENG-2",
+      issueTitle: "Implement approved",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/42",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    const job = log.getJobById(jobId);
+    expect(job?.status).toBe("completed");
+    expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.approved).toBe(true);
+    expect(job?.prUrl).toBe("https://github.com/o/r/pull/42");
+  });
+
+  it("warns and returns 200 when no job row exists for an approved implementation result (AII-572)", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i-no-job",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/99",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("no job row"));
+  });
+
+  it("does NOT write runner_approved on noWork (grouping-parent no-op)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-nowork",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-nowork",
+      issueIdentifier: "ENG-3",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        noWork: true,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
+  });
+
+  it("does NOT write runner_approved on REVIEW_UNAPPROVED coded failure", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-unapproved",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-unapproved",
+      issueIdentifier: "ENG-4",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/99",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
+  });
+
+  it("does NOT write runner_approved on MAX_TURNS_EXHAUSTED coded failure", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i-maxturn",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i-maxturn",
+      issueIdentifier: "ENG-5",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "MAX_TURNS_EXHAUSTED",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/100",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider({ recordCalls: true })),
+    });
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
+  });
+});
+
+describe("handleRunnerResult — reference repositories", () => {
+  it("posts a comment naming each missing repo with a human-readable cause", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "no-auth" },
+    ];
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    const comments = fake.commentsFor("i");
+    const refComment = comments.find((c) => c.includes("reference repositor"));
+    expect(refComment).toBeDefined();
+    expect(refComment).toContain("https://github.com/a/b");
+    expect(refComment).toContain("GitHub App is not installed");
+  });
+
+  it("does not post a reference-repo comment when all repos arrived", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+    ];
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    const comments = fake.commentsFor("i");
+    expect(comments.some((c) => c.includes("reference repositor"))).toBe(false);
+  });
+
+  it("does not post a reference-repo comment when referenceRepoResults is absent", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    const comments = fake.commentsFor("i");
+    expect(comments.some((c) => c.includes("reference repositor"))).toBe(false);
+  });
+
+  it("does not change run classification when a reference repo is missing", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "clone-error" },
+    ];
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    const calls = fake.recordedCalls();
+    expect(calls.find((c) => c.method === "markPrReady")).toBeDefined();
+    expect(calls.find((c) => c.method === "markImplementationFailed")).toBeUndefined();
+  });
+
+  it("posts missing-repo comment and preserves failure classification on failure", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "ref-not-found" },
+    ];
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    const calls = fake.recordedCalls();
+    expect(calls.find((c) => c.method === "markImplementationFailed")).toBeDefined();
+    const comments = fake.commentsFor("i");
+    expect(comments.some((c) => c.includes("reference repositor"))).toBe(true);
+  });
+
+  it("names only missed repos in the comment when some arrived and some did not", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+      { repo: "https://github.com/c/d", path: "refs/d", ref: "main", arrived: false, cause: "token-error" },
+    ];
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    const comments = fake.commentsFor("i");
+    const refComment = comments.find((c) => c.includes("reference repositor"));
+    expect(refComment).toBeDefined();
+    expect(refComment).toContain("https://github.com/c/d");
+    expect(refComment).not.toContain("https://github.com/a/b");
+  });
+
+  it("returns 200 with a warning when posting the missing-repo comment throws", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    fake.postComment = async () => {
+      throw new Error("network down");
+    };
+    // Silence the expected console.error noise.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "no-auth" },
+    ];
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        // Empty so the per-comment loop never calls postComment: the only call left is
+        // the reference-repo one, so the warning cannot have come from anywhere else.
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(
+      (res.body.warnings as string[]).some((w) => w.includes("missing-reference-repos")),
+    ).toBe(true);
+  });
 });
 
 describe("handleRunnerProgress", () => {
@@ -515,6 +907,36 @@ describe("handleRunnerProgress", () => {
 
     expect(res).toMatchObject({ status: 400, body: { error: "invalid_github_run_id" } });
     expect(log.listLog().find((job) => job.id === jobId)?.runId).toBeNull();
+    expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
+  });
+
+  it("binds run ID without a step — githubRunId-only body succeeds and records no step", async () => {
+    const dispatchId = "dispatch-bind-only";
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "kg-refresh",
+      audience: "progress",
+      dispatchId,
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerProgress({
+      authorization: `Bearer ${token}`,
+      body: { githubRunId: 98765 },
+      secret: SECRET,
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.listLog().find((job) => job.id === jobId)?.runId).toBe(98765);
     expect(stepLog.getStepsByJobId(jobId)).toEqual([]);
   });
 });
@@ -710,6 +1132,163 @@ describe("handleRunnerResult — gap-analysis", () => {
     expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toMatchObject([
       { body: "New feedback that arrived while the gap-fill was running" },
     ]);
+  });
+
+  it("stamps runner_approved conclusion when conflict-resolution gap-analysis succeeds (no snapshot)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobByDispatchId(dispatchId);
+    expect(job?.status).toBe("completed");
+    expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.approved).toBe(true);
+  });
+
+  it("warns when no job row exists for an approved gap-analysis result (AII-572)", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i-no-job-gap",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+    expect(res.status).toBe(200);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("no job row"));
+  });
+
+  it("stamps runner_approved when review-fix gap-analysis succeeds (snapshot branch)", async () => {
+    reviewStore.upsertReviewFinding({
+      repo: "org/repo",
+      prNumber: 12,
+      source: "github-review",
+      severity: "blocking",
+      body: "Fix me",
+    });
+    const findingIds = reviewStore.listOpenReviewFindings("org/repo", 12).map((f) => f.id);
+
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    // Recording a review-fix snapshot marks this as a review-fix dispatch.
+    reviewFixQueue.recordReviewFixDispatch({
+      queueId: 1,
+      dispatchId,
+      repo: "org/repo",
+      prNumber: 12,
+      findingIds,
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    // Gap-fill's own post-push review approved the PR, so the approval mark is re-stamped (AII-460).
+    const job = log.getJobByDispatchId(dispatchId);
+    expect(job?.conclusion).toBe("runner_approved");
+    // Findings scoped to the snapshot must still be resolved.
+    expect(reviewStore.listOpenReviewFindings("org/repo", 12)).toEqual([]);
+  });
+
+  it("does NOT stamp runner_approved when gap-analysis outcome is failure (REVIEW_UNAPPROVED)", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "gap-analysis",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        prUrl: "https://github.com/org/repo/pull/12",
+        comments: [],
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    const job = log.getJobByDispatchId(dispatchId);
+    expect(job?.conclusion).not.toBe("runner_approved");
+  });
+
+  it("terminates the comment_gapfill_queue row when a comment-triggered gap-analysis succeeds (AII-572 / AII-277 regression)", async () => {
+    // Simulate a conflict-resolution gap-fill dispatched by comment-gapfill-drain:
+    // the queue row is 'dispatched' and the dispatch_log row has trigger='comment'.
+    const queueId = commentGapfillQueue.enqueueConflictResolution({
+      owner: "org",
+      repo: "repo",
+      prNumber: 12,
+      featureBranch: "ai-implement/feature/parent",
+    });
+    commentGapfillQueue.markCommentGapfillProcessed(queueId, "dispatched");
+
+    expect(commentGapfillQueue.hasPendingConflictResolution("org", "repo", 12)).toBe(true);
+
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "gap-analysis",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({ issueId: "i", repo: "org/repo", dispatchId, trigger: "comment" });
+    log.updateJobPrUrl(jobId, "https://github.com/org/repo/pull/12");
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "gap-analysis", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    // Queue row must be terminalized so hasPendingConflictResolution returns false
+    // and auto-merge can proceed (regression: stampJobApproved alone skipped this side effect).
+    expect(commentGapfillQueue.hasPendingConflictResolution("org", "repo", 12)).toBe(false);
+    // Approval mark must still be stamped.
+    const job = log.getJobByDispatchId(dispatchId);
+    expect(job?.conclusion).toBe("runner_approved");
+    expect(job?.approved).toBe(true);
   });
 });
 
@@ -1127,5 +1706,117 @@ describe("handleRunnerResult — token replay", () => {
     });
     expect(second.status).toBe(409);
     expect(second.body.error).toBe("already_consumed");
+  });
+});
+
+describe("handleRunnerResult — call attribution", () => {
+  it("logs the accepted call with its dispatch id, phase and outcome", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`result accepted dispatch=${dispatchId} phase=planning outcome=success`),
+    );
+  });
+
+  it("names the dispatch when a replayed token is refused", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const body = { phase: "planning" as const, outcome: "success" as const, comments: [] };
+    const resolveProvider = makeResolve(new FakeProvider());
+
+    await runnerCallback.handleRunnerResult({ authorization: `Bearer ${token}`, body, secret: SECRET, resolveProvider });
+    warnSpy.mockClear();
+    const second = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`, body, secret: SECRET, resolveProvider,
+    });
+
+    expect(second.status).toBe(409);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`result refused dispatch=${dispatchId}`),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("reason=already_consumed"));
+  });
+
+  it("reports an unknown dispatch rather than throwing when the token never parsed", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: "Bearer garbage",
+      body: { phase: "planning", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(401);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("result refused dispatch=unknown"));
+  });
+
+  // These two consume the token and then bail, so without a line the burn is invisible.
+  it("logs a burned token on phase_mismatch", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "planning",
+      ttlSeconds: runnerTokens.PLANNING_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", prUrl: "https://github.com/o/r/pull/1", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("phase_mismatch");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`result burned dispatch=${dispatchId} reason=phase_mismatch`),
+    );
+  });
+
+  it("logs a burned token on missing_prUrl", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: { phase: "implementation", outcome: "success", comments: [] },
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("missing_prUrl");
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`result burned dispatch=${dispatchId} reason=missing_prUrl`),
+    );
   });
 });

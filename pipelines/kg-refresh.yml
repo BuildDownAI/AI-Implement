@@ -2,15 +2,25 @@ id: kg-refresh
 steps:
   - id: clone
     type: clone
+    depth: full
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
+  - id: clone-code-repo
+    type: clone
+    depth: full
+  - id: clone-secondary-repos
+    type: clone
+    depth: full
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
-  # feedback-loop drives the ingest via Claude (maxIterations: 1 enforced in
-  # kg-refresh-run.ts). The LLM review verdict is deliberately not consulted —
-  # success or failure is decided by kg-snapshot-push via artifact validation.
-  - id: feedback-loop
+  - id: kg-ingest
     type: custom
-    moduleId: feedback-loop
+    moduleId: kg-ingest
+  # No agent step: the ingest is deterministic and kg-snapshot-push is the guard and the
+  # report. An agent in this workspace re-ran the ingest without a GitHub token and deleted
+  # snapshot/parts/pr.nt (AII-575 runs 2–4, 2026-09-08).
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push

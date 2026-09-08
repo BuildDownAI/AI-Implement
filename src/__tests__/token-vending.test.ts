@@ -220,14 +220,20 @@ function mintKgProgressToken(): string {
 }
 
 describe("handleKgTrackerDataRequest", () => {
+  const DEFAULT_MAPPINGS: Record<string, unknown> = { AII: {}, BDS: {} };
+
   async function callTrackerData(opts: {
     authorization?: string;
     cursor?: string | null;
+    teamKey?: string;
+    getMappings?: () => Record<string, unknown>;
   }): Promise<{ status: number; body: Record<string, unknown> }> {
     return runnerCallback.handleKgTrackerDataRequest({
       authorization: opts.authorization,
       secret: SECRET,
       cursor: opts.cursor,
+      teamKey: opts.teamKey ?? "AII",
+      getMappings: opts.getMappings ?? (() => DEFAULT_MAPPINGS),
     });
   }
 
@@ -285,6 +291,47 @@ describe("handleKgTrackerDataRequest", () => {
     expect(result.body).toEqual({ error: "Tracker not configured" });
   });
 
+  it("returns 200 for a teamKey present in getMappings", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
+    mockWithLinearToken.mockResolvedValueOnce(makeLinearOkResponse());
+
+    const result = await callTrackerData({
+      authorization: `Bearer ${token}`,
+      teamKey: "AII",
+      getMappings: () => ({ AII: {}, BDS: {} }),
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body.issues).toEqual(MOCK_ISSUES);
+  });
+
+  it("returns 403 for a teamKey not present in getMappings", async () => {
+    const token = mintKgProgressToken();
+
+    const result = await callTrackerData({
+      authorization: `Bearer ${token}`,
+      teamKey: "EVIL",
+      getMappings: () => ({ AII: {}, BDS: {} }),
+    });
+
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 403 when teamKey is empty", async () => {
+    const token = mintKgProgressToken();
+
+    const result = await callTrackerData({
+      authorization: `Bearer ${token}`,
+      teamKey: "",
+      getMappings: () => ({ AII: {} }),
+    });
+
+    expect(result.status).toBe(403);
+    expect(result.body).toEqual({ error: "Unauthorized" });
+  });
+
   it("returns 200 with issues and pageInfo on the happy path", async () => {
     const token = mintKgProgressToken();
     mockIsLinearAuthConfigured.mockReturnValueOnce(true);
@@ -307,6 +354,42 @@ describe("handleKgTrackerDataRequest", () => {
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
+  });
+
+  it("selection string contains every ISSUE_FIELDS field", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
+
+    let capturedQuery: string | null = null;
+    mockWithLinearToken.mockImplementationOnce(
+      async (cb: (token: string) => Promise<Response>) => {
+        const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: {
+              issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+            },
+          }),
+        } as unknown as Response);
+        const resp = await cb("fake-linear-token");
+        const rawBody = fetchSpy.mock.calls[0]?.[1]?.body;
+        capturedQuery = (JSON.parse(rawBody as string) as Record<string, unknown>)
+          .query as string;
+        fetchSpy.mockRestore();
+        return resp;
+      },
+    );
+
+    await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(capturedQuery).toContain("branchName");
+    expect(capturedQuery).toContain("labels");
+    expect(capturedQuery).toContain("project");
+    expect(capturedQuery).toContain("parent");
+    expect(capturedQuery).toContain("relations");
+    expect(capturedQuery).toContain("relatedIssue");
+    expect(capturedQuery).toContain("user");
+    expect(capturedQuery).toContain("comments(first: 100)");
   });
 
   it("passes the cursor to the upstream Linear query", async () => {

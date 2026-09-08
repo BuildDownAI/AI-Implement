@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import os from "node:os";
+import path from "node:path";
 import { cloneStep } from "../pipeline/steps/clone.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -10,6 +12,7 @@ vi.mock("node:child_process", () => ({
 vi.mock("node:fs", () => ({
   default: {
     existsSync: vi.fn(),
+    mkdirSync: vi.fn(),
   },
 }));
 
@@ -430,6 +433,628 @@ describe("cloneStep", () => {
     });
   });
 
+  describe("secondary clone (targetDir set)", () => {
+    const SECONDARY_INPUTS = {
+      repoOwner: "acme",
+      repoRepo: "code-repo",
+      branch: "",
+      githubToken: "",
+      workspaceDir: "/tmp/workspace",
+      targetDir: "code-repo",
+    };
+
+    it("performs fresh clone into targetDir when .git does not exist there", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // git clone, git rev-parse HEAD
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      const outputs = await cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(outputs.clonedRef).toBe("abc123");
+      expect(outputs.workspaceDir).toBe("/tmp/workspace/code-repo");
+      expect(outputs.repoOwner).toBe("acme");
+      expect(outputs.repoRepo).toBe("code-repo");
+    });
+
+    it("performs incremental fetch+reset when .git already exists in targetDir", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // git fetch, git reset --hard, git rev-parse HEAD
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0, stdout: "def456\n" }]);
+
+      const outputs = await cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("incremental");
+      expect(outputs.clonedRef).toBe("def456");
+      expect(outputs.workspaceDir).toBe("/tmp/workspace/code-repo");
+    });
+
+    it("incremental fetch with a branch set uses an explicit refspec, never a bare positional", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // git fetch, git reset --hard, git rev-parse HEAD
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0, stdout: "def456\n" }]);
+
+      await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, branch: "testing" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/testing"]);
+      expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+    });
+
+    it("incremental fetch with a hostile flag-like branch value fetches via explicit refspec, never as a bare positional", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0, stdout: "def456\n" }]);
+
+      await cloneStep.run(
+        makeContext(),
+        { ...SECONDARY_INPUTS, branch: "--upload-pack=x" },
+        new NoopStepReporter(),
+      );
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/--upload-pack=x"]);
+      expect(calls[0][1]).not.toContain("--upload-pack=x");
+    });
+
+    it("throws when secondary git clone fails", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 128, stderr: "repository not found" }]);
+
+      await expect(
+        cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter()),
+      ).rejects.toThrow(/git clone failed/);
+    });
+
+    it("throws when secondary git fetch fails", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockSpawn([{ status: 128, stderr: "authentication required" }]);
+
+      await expect(
+        cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter()),
+      ).rejects.toThrow(/git fetch failed/);
+    });
+
+    it("does not call prepareScratchExclusion for a secondary clone", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "sha1\n" }]);
+
+      await cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter());
+
+      expect(prepareScratchExclusion).not.toHaveBeenCalled();
+    });
+
+    it("skips clone and returns cloneMethod=mounted when in mounted workspace mode", async () => {
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+      try {
+        const outputs = await cloneStep.run(makeContext(), SECONDARY_INPUTS, new NoopStepReporter());
+
+        expect(outputs.cloneMethod).toBe("mounted");
+        expect(outputs.clonedRef).toBe("unknown");
+        expect(outputs.workspaceDir).toBe("/tmp/workspace/code-repo");
+        expect(spawnSync).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it("omits --depth from git clone args when depth is 'full'", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: "full" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      const cloneArgs = calls[0][1] as string[];
+      expect(cloneArgs[0]).toBe("clone");
+      expect(cloneArgs).not.toContain("--depth");
+    });
+
+    it("passes --depth 1 from git clone args when depth is explicitly 1", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: 1 }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      const cloneArgs = calls[0][1] as string[];
+      expect(cloneArgs[0]).toBe("clone");
+      const depthIdx = cloneArgs.indexOf("--depth");
+      expect(depthIdx).toBeGreaterThan(-1);
+      expect(cloneArgs[depthIdx + 1]).toBe("1");
+    });
+
+    it("omits --depth from git fetch and checks shallowness when depth is 'full' (not shallow)", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // is-shallow-repository → "false", fetch (no depth), reset, rev-parse
+      mockSpawn([
+        { status: 0, stdout: "false\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "def456\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: "full" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
+      const fetchArgs = calls[1][1] as string[];
+      expect(fetchArgs[0]).toBe("fetch");
+      expect(fetchArgs).not.toContain("--depth");
+      expect(outputs.cloneMethod).toBe("incremental");
+    });
+
+    it("calls git fetch --unshallow before full fetch when depth is 'full' and repo is shallow", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // is-shallow-repository → "true", unshallow, fetch, reset, rev-parse
+      mockSpawn([
+        { status: 0, stdout: "true\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "def456\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: "full" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
+      expect(calls[1][1]).toEqual(["fetch", "--unshallow", "origin"]);
+      const fetchArgs = calls[2][1] as string[];
+      expect(fetchArgs[0]).toBe("fetch");
+      expect(fetchArgs).not.toContain("--depth");
+      expect(outputs.cloneMethod).toBe("incremental");
+    });
+
+    it("throws when git fetch --unshallow fails", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockSpawn([
+        { status: 0, stdout: "true\n" },
+        { status: 1, stderr: "fatal: server does not support --unshallow" },
+      ]);
+
+      await expect(
+        cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, depth: "full" }, new NoopStepReporter()),
+      ).rejects.toThrow(/git fetch --unshallow failed/);
+    });
+  });
+
+  describe("primary clone depth", () => {
+    it("omits --depth when depth is 'full' on a fresh primary clone", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // clone, config user.name, config user.email, rev-parse
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      await cloneStep.run(makeContext(), { ...BASE_INPUTS, depth: "full" as const }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      const cloneArgs = calls[0][1] as string[];
+      expect(cloneArgs[0]).toBe("clone");
+      expect(cloneArgs).not.toContain("--depth");
+    });
+
+    it("uses --depth 1 when depth is not set on a fresh primary clone (regression guard)", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }, { status: 0, stdout: "abc123\n" }]);
+
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      const cloneArgs = calls[0][1] as string[];
+      expect(cloneArgs[0]).toBe("clone");
+      const depthIdx = cloneArgs.indexOf("--depth");
+      expect(depthIdx).toBeGreaterThan(-1);
+      expect(cloneArgs[depthIdx + 1]).toBe("1");
+    });
+
+    it("runs unshallow + full fetch when depth is 'full' on an incremental primary clone (shallow)", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // rev-parse --is-shallow-repository, fetch --unshallow, fetch origin branch, reset, config×2, rev-parse
+      mockSpawn([
+        { status: 0, stdout: "true\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "def456\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), { ...BASE_INPUTS, depth: "full" as const }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
+      expect(calls[1][1]).toEqual(["fetch", "--unshallow", "origin"]);
+      expect(calls[2][1]).toEqual(["fetch", "origin", "main"]);
+      expect(calls[3][1]).toEqual(["reset", "--hard", "origin/main"]);
+      expect(outputs.cloneMethod).toBe("incremental");
+    });
+
+    it("skips unshallow and does full fetch when depth is 'full' on an incremental primary clone (already full)", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // rev-parse --is-shallow-repository, fetch origin branch, reset, config×2, rev-parse
+      mockSpawn([
+        { status: 0, stdout: "false\n" },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "def456\n" },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), { ...BASE_INPUTS, depth: "full" as const }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
+      expect(calls[1][1]).toEqual(["fetch", "origin", "main"]);
+      expect(calls[2][1]).toEqual(["reset", "--hard", "origin/main"]);
+      expect(outputs.cloneMethod).toBe("incremental");
+    });
+
+    it("uses --depth 1 when depth is not set on an incremental primary clone (regression guard)", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // fetch --depth 1, reset, config×2, rev-parse
+      mockSpawn([
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+        { status: 0, stdout: "def456\n" },
+      ]);
+
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "main"]);
+    });
+
+    it("throws when unshallow fails on the primary incremental path", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // rev-parse → shallow, unshallow fails
+      mockSpawn([
+        { status: 0, stdout: "true\n" },
+        { status: 1, stderr: "server does not support --unshallow" },
+      ]);
+
+      await expect(
+        cloneStep.run(makeContext(), { ...BASE_INPUTS, depth: "full" as const }, new NoopStepReporter()),
+      ).rejects.toThrow(/git fetch --unshallow failed/);
+    });
+  });
+
+  describe("multi-target clones (targets input)", () => {
+    const THREE_TARGETS = [
+      { repoOwner: "BuildDownAI", repoRepo: "bd-knowledge-graph-base", targetDir: "repos/bd-knowledge-graph-base" },
+      { repoOwner: "BuildDownAI", repoRepo: "docs", targetDir: "repos/docs" },
+      { repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills" },
+    ];
+
+    const TARGETS_INPUTS = {
+      repoOwner: "",
+      repoRepo: "",
+      branch: "",
+      githubToken: "",
+      workspaceDir: "/tmp/workspace",
+      targets: THREE_TARGETS,
+    };
+
+    it("returns clonedCount 0 when targets is an empty array", async () => {
+      const outputs = await cloneStep.run(makeContext(), {
+        ...TARGETS_INPUTS,
+        targets: [],
+      }, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(0);
+      expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    it("clones all three targets via git clone and returns clonedCount 3", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // Three fresh clones, one git clone call per target
+      mockSpawn([
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(3);
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls).toHaveLength(3);
+      // Each call is a git clone with the bare remote and effectiveDir
+      expect(calls[0][1]).toContain("clone");
+      expect(calls[0][1]).toContain("https://github.com/BuildDownAI/bd-knowledge-graph-base.git");
+      expect(calls[1][1]).toContain("https://github.com/BuildDownAI/docs.git");
+      expect(calls[2][1]).toContain("https://github.com/BuildDownAI/skills.git");
+    });
+
+    it("logs warning and continues when one target clone fails, returns clonedCount 2", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      let callIndex = 0;
+      vi.mocked(spawnSync).mockImplementation(() => {
+        const status = callIndex++ === 1 ? 128 : 0;
+        return {
+          status,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("not found"),
+          pid: 0,
+          output: [],
+          signal: null,
+          error: undefined,
+        };
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(2);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("clone failed for BuildDownAI/docs"),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("creates parent directory before each clone", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }]);
+
+      await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      // mkdirSync should be called once per target with the parent dir
+      expect(fs.mkdirSync).toHaveBeenCalledTimes(3);
+      expect(fs.mkdirSync).toHaveBeenCalledWith("/tmp/workspace/repos", { recursive: true });
+    });
+
+    it("skips all clones and warns when AI_IMPLEMENT_WORKSPACE_MODE=mounted", async () => {
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+        expect(outputs.clonedCount).toBe(0);
+        expect(spawnSync).not.toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalledWith("[clone] mounted mode: skipping secondary clones");
+      } finally {
+        vi.unstubAllEnvs();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("uses incremental fetch+reset when .git already exists in targetDir", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // Incremental: fetch + reset per target (2 calls each × 3 targets = 6)
+      mockSpawn([
+        { status: 0 }, { status: 0 },
+        { status: 0 }, { status: 0 },
+        { status: 0 }, { status: 0 },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(3);
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls).toHaveLength(6);
+      // Each even call is a fetch, each odd call is a reset
+      expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin"]);
+      expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+    });
+
+    it("skips and warns when slug basename resolves to '..'", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const outputs = await cloneStep.run(makeContext(), {
+        ...TARGETS_INPUTS,
+        targets: [
+          { repoOwner: "org", repoRepo: "evil", targetDir: "repos/.." },
+          { repoOwner: "BuildDownAI", repoRepo: "bd-knowledge-graph-base", targetDir: "repos/bd-knowledge-graph-base" },
+        ],
+      }, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(1);
+      expect(spawnSync).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("targetDir basename '..' is unsafe"),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("continues past a failed incremental fetch and counts only successful repos", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      let callIndex = 0;
+      vi.mocked(spawnSync).mockImplementation(() => {
+        // Fail fetch on the second target (call index 2)
+        const status = callIndex++ === 2 ? 128 : 0;
+        return {
+          status,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("auth error"),
+          pid: 0,
+          output: [],
+          signal: null,
+          error: undefined,
+        };
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(2);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("clone failed for BuildDownAI/docs"),
+      );
+      warnSpy.mockRestore();
+    });
+
+    describe("branch and depth on targets", () => {
+      it("fresh clone with branch and depth: 'full' uses --branch --single-branch and no --depth", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+        mockSpawn([{ status: 0 }]);
+
+        await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills", branch: "testing" }],
+          depth: "full" as const,
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual([
+          "clone", "--branch", "testing", "--single-branch",
+          "https://github.com/BuildDownAI/skills.git",
+          "/tmp/workspace/repos/skills",
+        ]);
+      });
+
+      it("fresh clone with branch and numeric depth uses --depth and --branch --single-branch", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+        mockSpawn([{ status: 0 }]);
+
+        await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills", branch: "testing" }],
+          depth: 2,
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual([
+          "clone", "--depth", "2", "--branch", "testing", "--single-branch",
+          "https://github.com/BuildDownAI/skills.git",
+          "/tmp/workspace/repos/skills",
+        ]);
+      });
+
+      it("fresh clone with no branch and no depth uses --depth 1 and no --branch (regression guard)", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+        mockSpawn([{ status: 0 }]);
+
+        await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills" }],
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual([
+          "clone", "--depth", "1",
+          "https://github.com/BuildDownAI/skills.git",
+          "/tmp/workspace/repos/skills",
+        ]);
+      });
+
+      it("existing-dir with branch and depth: 'full' (shallow) runs unshallow then fetch origin branch then reset to FETCH_HEAD", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        // rev-parse --is-shallow-repository, fetch --unshallow, fetch origin testing, reset
+        mockSpawn([
+          { status: 0, stdout: "true\n" },
+          { status: 0 },
+          { status: 0 },
+          { status: 0 },
+        ]);
+
+        const outputs = await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills", branch: "testing" }],
+          depth: "full" as const,
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
+        expect(calls[1][1]).toEqual(["fetch", "--unshallow", "origin"]);
+        expect(calls[2][1]).toEqual(["fetch", "origin", "refs/heads/testing"]);
+        expect(calls[3][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+        expect(outputs.clonedCount).toBe(1);
+      });
+
+      it("existing-dir with branch and depth: 'full' (already full) runs fetch origin branch then reset to FETCH_HEAD", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        // rev-parse --is-shallow-repository, fetch origin testing, reset
+        mockSpawn([
+          { status: 0, stdout: "false\n" },
+          { status: 0 },
+          { status: 0 },
+        ]);
+
+        const outputs = await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills", branch: "testing" }],
+          depth: "full" as const,
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
+        expect(calls[1][1]).toEqual(["fetch", "origin", "refs/heads/testing"]);
+        expect(calls[2][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+        expect(outputs.clonedCount).toBe(1);
+      });
+
+      it("existing-dir with branch and no depth uses --depth 1 fetch with branch and resets to FETCH_HEAD", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        // fetch --depth 1 origin testing, reset
+        mockSpawn([{ status: 0 }, { status: 0 }]);
+
+        await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills", branch: "testing" }],
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/testing"]);
+        expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+      });
+
+      it("existing-dir with hostile flag-like branch value fetches via explicit refspec, never as a bare positional", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        mockSpawn([{ status: 0 }, { status: 0 }]);
+
+        await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills", branch: "--upload-pack=x" }],
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/--upload-pack=x"]);
+        expect(calls[0][1]).not.toContain("--upload-pack=x");
+        expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+      });
+
+      it("existing-dir with no branch and no depth uses --depth 1 fetch and resets to FETCH_HEAD (regression guard)", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        // fetch --depth 1 origin, reset FETCH_HEAD
+        mockSpawn([{ status: 0 }, { status: 0 }]);
+
+        await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills" }],
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin"]);
+        expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+      });
+
+      it("soft-skips entry and continues when unshallow fails in depth: 'full' existing-dir", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+        // is-shallow → true, unshallow fails
+        mockSpawn([
+          { status: 0, stdout: "true\n" },
+          { status: 1, stderr: "server does not support --unshallow" },
+        ]);
+
+        const outputs = await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills", branch: "testing" }],
+          depth: "full" as const,
+        }, new NoopStepReporter());
+
+        expect(outputs.clonedCount).toBe(0);
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining("clone failed for BuildDownAI/skills"),
+        );
+        warnSpy.mockRestore();
+      });
+    });
+  });
+
   describe("mounted workspace mode (AI_IMPLEMENT_WORKSPACE_MODE=mounted)", () => {
     beforeEach(() => {
       vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
@@ -488,6 +1113,221 @@ describe("cloneStep", () => {
 
       expect(outputs.cloneMethod).toBe("mounted");
       expect(outputs.clonedRef).toBe("unknown");
+    });
+  });
+
+  // Every other test in this file asserts spawnSync *argv* against a mock — it can't see
+  // whether git actually does what the argv implies. This describe instead points the
+  // already-mocked spawnSync/fs.existsSync/fs.mkdirSync at their real implementations
+  // (via vi.importActual, never vi.unmock/resetModules) and runs cloneStep against a
+  // throwaway bare repo served over file://, then asserts on git's real resulting state.
+  // A bare local path (no scheme) would make git silently ignore --depth, so the fixture
+  // is served over file:// to keep the shallow-clone assertions meaningful.
+  describe("real git (throwaway repo, file:// remote)", () => {
+    const FIXED_OWNER = "realgit-owner";
+    const FIXED_REPO = "realgit-repo";
+    const FIXED_TOKEN = "test-token";
+
+    let gitAvailable = true;
+    let realSpawnSync: typeof import("node:child_process").spawnSync;
+    let realFs: typeof import("node:fs");
+    let tmpRoot = "";
+    let bareRepoDir = "";
+    let mainTipSha = "";
+    let fileUrl = "";
+
+    function runRealGit(args: string[], cwd: string): string {
+      const result = realSpawnSync("git", args, {
+        cwd,
+        env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (result.status !== 0) {
+        throw new Error(`git ${args.join(" ")} failed (exit ${result.status ?? "null"}): ${result.stderr?.toString()}`);
+      }
+      return (result.stdout ?? Buffer.from("")).toString().trim();
+    }
+
+    beforeAll(async () => {
+      const cp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      realSpawnSync = cp.spawnSync;
+      realFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+
+      const check = realSpawnSync("git", ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+      if (check.error || check.status !== 0) {
+        gitAvailable = false;
+        return;
+      }
+
+      tmpRoot = realFs.mkdtempSync(path.join(os.tmpdir(), "clone-step-real-git-"));
+      const srcDir = path.join(tmpRoot, "src");
+      realFs.mkdirSync(srcDir);
+
+      runRealGit(["init", "-q"], srcDir);
+      runRealGit(["symbolic-ref", "HEAD", "refs/heads/main"], srcDir);
+      runRealGit(["config", "user.name", "Test"], srcDir);
+      runRealGit(["config", "user.email", "test@example.com"], srcDir);
+      runRealGit(["commit", "--allow-empty", "-q", "-m", "main-1"], srcDir);
+      runRealGit(["commit", "--allow-empty", "-q", "-m", "main-2"], srcDir);
+      runRealGit(["commit", "--allow-empty", "-q", "-m", "main-3"], srcDir);
+      mainTipSha = runRealGit(["rev-parse", "HEAD"], srcDir);
+      runRealGit(["checkout", "-q", "-b", "testing"], srcDir);
+      runRealGit(["commit", "--allow-empty", "-q", "-m", "testing-1"], srcDir);
+
+      bareRepoDir = path.join(tmpRoot, "bare.git");
+      runRealGit(["clone", "-q", "--bare", srcDir, bareRepoDir], tmpRoot);
+      runRealGit(["symbolic-ref", "HEAD", "refs/heads/main"], bareRepoDir);
+
+      fileUrl = `file://${bareRepoDir}`;
+    });
+
+    afterAll(() => {
+      if (tmpRoot) {
+        realFs.rmSync(tmpRoot, { recursive: true, force: true });
+      }
+    });
+
+    beforeEach(() => {
+      if (!gitAvailable) return;
+      // Redirect the exact URLs cloneStep constructs (both the token-embedded primary-clone
+      // form and the bare targetDir/targets form) to the local bare repo, via git's
+      // env-based config injection — no real GitHub host is ever contacted.
+      const primaryAlias = `https://x-access-token:${FIXED_TOKEN}@github.com/${FIXED_OWNER}/${FIXED_REPO}.git`;
+      const secondaryAlias = `https://github.com/${FIXED_OWNER}/${FIXED_REPO}.git`;
+      vi.stubEnv("GIT_CONFIG_COUNT", "2");
+      vi.stubEnv("GIT_CONFIG_KEY_0", `url.${fileUrl}.insteadOf`);
+      vi.stubEnv("GIT_CONFIG_VALUE_0", primaryAlias);
+      vi.stubEnv("GIT_CONFIG_KEY_1", `url.${fileUrl}.insteadOf`);
+      vi.stubEnv("GIT_CONFIG_VALUE_1", secondaryAlias);
+      vi.mocked(spawnSync).mockImplementation(realSpawnSync);
+      vi.mocked(fs.existsSync).mockImplementation(realFs.existsSync);
+      vi.mocked(fs.mkdirSync).mockImplementation(realFs.mkdirSync);
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.mocked(spawnSync).mockReset();
+      vi.mocked(fs.existsSync).mockReset();
+      vi.mocked(fs.mkdirSync).mockReset();
+    });
+
+    it("primary path, fresh clone with depth: full has full history and is not shallow", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "primary-fresh-full");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: FIXED_OWNER,
+        repoRepo: FIXED_REPO,
+        branch: "main",
+        githubToken: FIXED_TOKEN,
+        workspaceDir,
+        depth: "full" as const,
+      }, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(runRealGit(["rev-list", "--count", "HEAD"], workspaceDir)).toBe("3");
+      expect(runRealGit(["rev-parse", "--is-shallow-repository"], workspaceDir)).toBe("false");
+    });
+
+    it("primary path, fresh clone with depth unset is shallow with a single commit (regression guard)", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "primary-fresh-shallow");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: FIXED_OWNER,
+        repoRepo: FIXED_REPO,
+        branch: "main",
+        githubToken: FIXED_TOKEN,
+        workspaceDir,
+      }, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(runRealGit(["rev-list", "--count", "HEAD"], workspaceDir)).toBe("1");
+      expect(runRealGit(["rev-parse", "--is-shallow-repository"], workspaceDir)).toBe("true");
+    });
+
+    it("primary path, existing shallow directory unshallows to full history when depth: full is requested", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "primary-existing-unshallow");
+      const inputsBase = {
+        repoOwner: FIXED_OWNER,
+        repoRepo: FIXED_REPO,
+        branch: "main",
+        githubToken: FIXED_TOKEN,
+        workspaceDir,
+      };
+
+      await cloneStep.run(makeContext(), inputsBase, new NoopStepReporter());
+      expect(runRealGit(["rev-list", "--count", "HEAD"], workspaceDir)).toBe("1");
+
+      const outputs = await cloneStep.run(
+        makeContext(),
+        { ...inputsBase, depth: "full" as const },
+        new NoopStepReporter(),
+      );
+
+      expect(outputs.cloneMethod).toBe("incremental");
+      expect(runRealGit(["rev-list", "--count", "HEAD"], workspaceDir)).toBe("3");
+      expect(runRealGit(["rev-parse", "--is-shallow-repository"], workspaceDir)).toBe("false");
+    });
+
+    it("targetDir path clones with depth: 2", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "targetdir-depth2");
+      const effectiveDir = path.join(workspaceDir, "repo");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: FIXED_OWNER,
+        repoRepo: FIXED_REPO,
+        branch: "",
+        githubToken: "",
+        workspaceDir,
+        targetDir: "repo",
+        depth: 2,
+      }, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(outputs.workspaceDir).toBe(effectiveDir);
+      expect(runRealGit(["rev-list", "--count", "HEAD"], effectiveDir)).toBe("2");
+    });
+
+    it("targets path clones an explicit branch with depth: full (AII-582)", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "targets-branch-full");
+      const effectiveDir = path.join(workspaceDir, "repo");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: "",
+        repoRepo: "",
+        branch: "",
+        githubToken: "",
+        workspaceDir,
+        targets: [{ repoOwner: FIXED_OWNER, repoRepo: FIXED_REPO, targetDir: "repo", branch: "testing" }],
+        depth: "full" as const,
+      }, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(1);
+      expect(runRealGit(["rev-list", "--count", "HEAD"], effectiveDir)).toBe("4");
+      expect(runRealGit(["rev-parse", "--abbrev-ref", "HEAD"], effectiveDir)).toBe("testing");
+    });
+
+    it("targets path without a branch clones the default branch shallowly", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "targets-no-branch");
+      const effectiveDir = path.join(workspaceDir, "repo");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: "",
+        repoRepo: "",
+        branch: "",
+        githubToken: "",
+        workspaceDir,
+        targets: [{ repoOwner: FIXED_OWNER, repoRepo: FIXED_REPO, targetDir: "repo" }],
+      }, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(1);
+      expect(runRealGit(["rev-parse", "HEAD"], effectiveDir)).toBe(mainTipSha);
+      expect(runRealGit(["rev-parse", "--is-shallow-repository"], effectiveDir)).toBe("true");
     });
   });
 });

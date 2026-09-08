@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import type { ReferenceRepoResult } from "./reference-repos.js";
 
 export function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
   const dir = join(workspaceDir, "ai-output", "comments");
@@ -48,6 +49,8 @@ export async function postRunnerResult(params: {
   failureCode?: string;
   /** True when a grouping-parent run produced no changes; skips prUrl requirement on the callback. */
   noWork?: boolean;
+  /** Reference repository clone outcomes, present only when the run declared entries. */
+  referenceRepoResults?: ReferenceRepoResult[];
   /**
    * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
    * Falls back to the legacy RUNNER_CALLBACK_URL env var (never set in GHA envelope mode,
@@ -70,6 +73,9 @@ export async function postRunnerResult(params: {
   if (params.failureReason) body.failureReason = params.failureReason;
   if (params.failureCode) body.failureCode = params.failureCode;
   if (params.noWork) body.noWork = params.noWork;
+  if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
+    body.referenceRepoResults = params.referenceRepoResults;
+  }
   const fetchFn = params.fetchImpl ?? fetch;
   try {
     const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {
@@ -77,8 +83,11 @@ export async function postRunnerResult(params: {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${runToken}` },
       body: JSON.stringify(body),
     });
-    if (!res.ok)
+    if (!res.ok) {
       console.error(`[runner-callback] POST failed HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+    } else {
+      console.log(`[runner-callback] POST ok phase=${params.phase} outcome=${params.outcome}`);
+    }
   } catch (err) {
     console.error("[runner-callback] POST failed:", err);
   }

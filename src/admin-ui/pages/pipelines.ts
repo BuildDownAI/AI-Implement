@@ -138,7 +138,10 @@ export const pipelinesScript = `
       function makeBadge(cls, text) {
         return '<span class="badge tight ' + cls + '">' + window.esc(text) + '</span>';
       }
-      function statusBadge(status) {
+      function statusBadge(status, conclusion) {
+        if (status === 'timed_out' && conclusion === 'stuck_giveup') {
+          return makeBadge('fail', 'Needs human');
+        }
         const label = status === 'review_failed' ? 'review failed' : (status || 'dispatched');
         return makeBadge(statusClass[status] || 'neutral', label);
       }
@@ -205,7 +208,7 @@ export const pipelinesScript = `
           // status (e.g. 'unknown' after an orchestrator restart) is known-completed.
           const planStatus = (plan.status === 'unknown' || plan.status === 'dispatched' || plan.status === 'running')
             ? 'completed' : plan.status;
-          const combinedStatus = statusBadge(planStatus) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status);
+          const combinedStatus = statusBadge(planStatus, plan.conclusion) + ' <span style="color:#aaa;font-size:0.8em">→</span> ' + statusBadge(impl.status, impl.conclusion);
           const prLink = impl.prUrl ? '<a href="' + window.safeUrl(impl.prUrl) + '" target="_blank">View</a>' : '—';
           tr.innerHTML = '<td style="white-space:nowrap">' + dt + '</td>'
             + '<td style="text-align:center">' + dnBadge + '</td>'
@@ -254,7 +257,7 @@ export const pipelinesScript = `
             + '<td class="mono">' + window.esc(entry.repo || '—') + '</td>'
             + '<td>' + runnerCell + '</td>'
             + imageCell
-            + '<td>' + statusBadge(entry.status) + '</td>'
+            + '<td>' + statusBadge(entry.status, entry.conclusion) + '</td>'
             + '<td>' + logCell + cancelCell + '</td>';
         }
         tbody.appendChild(tr);

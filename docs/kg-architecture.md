@@ -68,8 +68,10 @@ So a dead graph never takes the pipeline down. Only a *deploy* joins their fates
 
 ### Resources are shared
 
-The machine runs at **512 MB** — raised from 256 MB for the sidecar in AII-322. The published setup
-docs still describe 256 MB, which is right only for an orchestrator built without the KG.
+The machine runs at **1 GB** — raised from 256 MB for the sidecar in AII-322, and from 512 MB on
+2026-09-08 when the refresh rail's materialize step was OOM-killed at ~31.6k quads (see the history
+table). The published setup docs still describe 256 MB, which is right only for an orchestrator built
+without the KG.
 
 Memory is also shared at build time, and that has bitten once already: the embed step was OOM-killed
 at ~21k quads once DocSection cards entered the graph (KGB-8). Growth in the graph is a constraint on
@@ -82,7 +84,7 @@ the image build, not only on query latency.
 | 1 | **Ingest** | local machine, python ≥ 3.10 | the only stage that fetches source data |
 | 2 | **Commit** | git — `snapshot/parts/*.nt` | the transport between the repos |
 | 3 | **Build** | Docker: node:24-slim + python venv | the graph is materialized here |
-| 4 | **Serve** | Fly machine, 512 MB | lazy load on first query |
+| 4 | **Serve** | Fly machine, 1 GB | lazy load on first query |
 | 5 | **Access** | MCP client over HTTPS + OAuth | |
 
 The repository boundary sits between stages 2 and 3. The configured KG source repository owns the
@@ -300,7 +302,10 @@ flowchart TD
   `np.savez_compressed`), because the serving machine can never compute them — KGB-8's OOM is
   the proof. The graph stays derived; only the vectors ship. Measured 2026-08-21 at ~21k quads:
   12.0 MB uncompressed (7.0 MB of it fixed-width-column zero-padding), 2.5 MB compressed.
-  Peak refresh footprint is ~75 MB against the 1 GB volume — tenfold headroom.
+  Peak refresh footprint on disk is ~75 MB against the 1 GB volume — tenfold headroom. Resident
+  memory is the tighter budget: the rail's materialize runs as a second Python process beside the
+  serving sidecar, and at ~31.6k quads it reached 271 MB RSS — which is what the 512 MB machine
+  could not hold on 2026-09-08.
 
 ### The `index.ts` budget
 
@@ -330,8 +335,13 @@ the start. No new top-level function, no new route branch.
 
 ## kg-refresh run kind
 
-AII-493 adds a `kg-refresh` Claude runner that follows the ingest playbook autonomously — cloning the
-KG source repository, running the ingest scripts, and pushing the snapshot. AII-494 adds the two
+AII-493 adds a `kg-refresh` runner pipeline. The ingest runs as a **deterministic pipeline step**
+(`src/pipeline/steps/kg-ingest.ts`): `kg-ingest` spawns `python -m kg_ingest refresh` as a
+subprocess, streams its output, and on success writes `ai-output/kg-stats.json` from CLI-emitted
+stats or a fallback `.nt` line count. No agent runs after it: the step's echoed counters and
+`ai-output/kg-ingest.log` (AII-581) are the run's report, and `kg-snapshot-push` is the guard. The
+report step that once followed was removed on 2026-09-08 after it re-ran the ingest by hand and
+deleted `snapshot/parts/pr.nt`. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
 long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
 when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
@@ -345,6 +355,21 @@ any other phase or a missing/invalid token receives `403 Unauthorized` with no d
 The orchestrator performs all external writes with its own credentials; the runner receives only the
 requested data.
 
+**Code-repo in the workspace (AII-564, child 1).** Both run tokens for a kg-refresh dispatch are minted with the team key of the KG source repo's own project mapping (the mapping whose `owner/repo` equals `kgSourceRepo`), so the dependency-token endpoint can locate that mapping and check its `dependencyTokenScope` setting; if the mapping has `dependencyTokenScope = "installation"`, the endpoint vends the token and activates
+the `dependency-auth` step, which mints an installation-wide `contents: read` token and installs
+it as a git credential helper (the existing dependency-auth mechanism — no new token kind). A
+`clone-code-repo` step (type: `clone`) then reads the `code_repo: owner/repo` field from
+`sources.yml` in the KG workspace and clones it with `--depth 1` into `code-repo/` alongside the
+KG workspace. The step is registered by type (`clone`) so the runner resolves it via the standard
+`cloneStep` — no separate registration. If `dependency-auth` did not acquire a token (absent
+callback URL, local run, or fetch failure), `clone-code-repo` is skipped gracefully and the ingest
+proceeds without the code repo rather than aborting the pipeline. When the clone succeeds, the
+`kg-ingest` step passes `--code-repo <path>` to `python -m kg_ingest refresh`, giving the ingest
+access to git history, commits, PRs, and files from the implementation repo. If `sources.yml`
+contains no `code_repo` field, the step is also skipped silently. Local `bd-kg-refresh` skill runs
+never carry a dispatch token and therefore always skip `clone-code-repo`; the local operator
+supplies the code repo checkout directly via `--repo` if needed.
+
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/api/runner/kg-tracker-data` | POST | Returns one paginated page (50 issues) of Linear issues for the run's team, including comments. The orchestrator performs the read; no Linear credential ever leaves the orchestrator. |
@@ -353,6 +378,21 @@ The snapshot push step (`src/pipeline/steps/kg-snapshot-push.ts`) calls `refresh
 immediately before the push — the same pattern as `push.ts`. In Fly/local-docker mode this re-mints
 a fresh token via the machine nonce; in GHA mode it is a no-op (no publication token for kg-refresh)
 and the dispatch-time `GITHUB_TOKEN` is used directly.
+
+**Snapshot push contract — content-based, not flag-based.** `kg-snapshot-push` judges the
+snapshot by comparing the working tree's `snapshot/parts/*.nt` line counts against the cloned
+HEAD before committing. The push is refused with `KG_SNAPSHOT_TRACKER_REGRESSION` if any of the
+following hold:
+
+| Rule | Condition |
+|---|---|
+| Missing part | A part file present in the previous snapshot is absent from the working tree |
+| General shrink | Any part file's line count is below `PART_SHRINK_THRESHOLD` (50 %) of its previous count |
+| `issue.nt` / `comment.nt` zero-shrink | `issue.nt` or `comment.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
+
+One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
+pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a
+tracker-enriched graph) is a separate, prior guard; both must pass before a commit is made.
 
 **Fly session image pinning (AII-534, updated AII-555).** `dispatchKgRefreshRun` resolves the
 session machine image via `resolveRunnerImageForDispatch` (`src/repo-image.ts`), the same
@@ -381,6 +421,10 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | 2026-08-18 | Self-deploy v111 built the previous snapshot; v112 minutes later was correct | Remote-builder git-cache lag on a `--depth 1` clone — wait and redeploy |
 | 2026-08-19 | v115 shipped lexical-only after the embed step was OOM-killed at ~21k quads / 1,438 cards | KGB-8 — free the rdflib graph before embedding, pre-allocate the output array, embed in slices of 64 |
 | 2026-08-20 | A degraded build was indistinguishable from a healthy one | AII-422 — `.embeddings-failed` receipt, `KG_EMBEDDINGS_DEGRADED`, `kgDegraded` on health, notification, and `get_tenant_health` |
+| 2026-09-08 | First guard-clean, stamp-clean run (34273291848) failed at the push with 403: `origin` was bare and the first credential helper to answer for github.com was dependency-auth's read-only token, not the kg-push helper | `kg-snapshot-push` pushes with the primary token in the origin URL, the `push.ts` shape; the kg-push helper is no longer consulted (its deletion is AII-583) |
+| 2026-09-08 | With the report step gone, the stale-stamp gate read `snapshot/embeddings.stamp`, a file only hand edits and that agent ever wrote; the first guard-clean run (34270413381) failed `KG_SNAPSHOT_STALE` on it | The gate reads `age_stamp` from `snapshot/embeddings.meta.json` — the ingest's own stamp and the one the rail's materialize checks — with the legacy file as fallback |
+| 2026-09-08 | The kg-refresh report step (feedback-loop) re-ran the ingest by hand without a GitHub token and rewrote `snapshot/parts/` without `pr.nt`; the guard refused three runs | The report step is removed from `pipelines/kg-refresh.yml`; the ingest step's counters and `ai-output/kg-ingest.log` (AII-581) plus the snapshot-push guard are the report |
+| 2026-09-08 | Refresh rail's materialize OOM-killed at ~31.6k quads (271 MB RSS beside the serving sidecar on a 512 MB machine); the rail refused the swap and kept serving the old graph | `fly.toml` memory raised to 1 GB — the documented headroom figure, not a code change |
 
 ## KG-refresh outcome visibility (AII-496)
 
@@ -456,5 +500,7 @@ The rule for future run kinds: prefer a parameter of an existing file over a new
 | Docs ingestion | KGB-2 through KGB-5, KGA-2, BDS-38 | Crawl, section chunks, citable anchors |
 | Scaling | KGB-8, AII-422 | Bounded-memory embedding, and a receipt when it still fails |
 | Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: Claude runner follows the ingest playbook; runner-callback endpoint vends tracker data; snapshot push uses the standard credential-refresh path |
+| Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: runner-callback endpoints vend scoped push token and tracker data |
+| Deterministic ingest step | AII-571 | kg-ingest is a deterministic pipeline step; the report step that followed it was removed on 2026-09-08 (see the history table) — no agent runs in a kg-refresh workspace |
 | Runner dispatch + stage machine | AII-495 | `POST /api/kg/refresh` dispatches the runner when ingest is needed; persisted stage machine (idle → checking → ingest-running → snapshot-landed → staging → terminal) survives restarts; live TTL watchdog; `/admin#deployments` stage badges |
 | KG-visible outcomes | AII-496 | Slack/Teams notification + Linear failure comment on every terminal outcome; TTL-timeout reaches the "hit the time limit" classifier; stuck-watchdog carve-out; exactly-once guarantee via stage guard |

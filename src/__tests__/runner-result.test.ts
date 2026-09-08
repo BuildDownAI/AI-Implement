@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "../runner-result.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 describe("fetchPlanningContextFromOrchestrator", () => {
   it("GETs /runner/planning-context with the progress token and returns the context", async () => {
@@ -52,6 +53,9 @@ describe("postRunnerResult", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    // vi.spyOn returns the existing spy when a method is already mocked, so an
+    // unrestored console spy carries the previous test's calls into the next one.
+    vi.restoreAllMocks();
   });
 
   // Task 4: the runner now always reports an outcome — the caller (run-autonomous.ts)
@@ -69,5 +73,98 @@ describe("postRunnerResult", () => {
     });
 
     expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it("logs the phase and outcome when the post succeeds", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("POST ok phase=implementation outcome=success"),
+    );
+  });
+
+  it("includes referenceRepoResults in body when non-empty", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "ref-not-found" },
+    ];
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      referenceRepoResults,
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body.referenceRepoResults).toEqual(referenceRepoResults);
+  });
+
+  it("omits referenceRepoResults from body when array is empty", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      referenceRepoResults: [],
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty("referenceRepoResults");
+  });
+
+  it("omits referenceRepoResults from body when not provided", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty("referenceRepoResults");
+  });
+
+  it("logs the status and does not claim success when the post is refused", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      text: async () => '{"error":"already_consumed"}',
+    });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining("POST failed HTTP 409"));
+    expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining("POST ok"));
   });
 });

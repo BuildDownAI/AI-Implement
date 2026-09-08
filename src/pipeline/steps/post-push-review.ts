@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { OperatorCancelledError } from "../operator-cancelled.js";
-import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary } from "../step-utils.js";
+import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
+import type { LLMResult, PipelineContext, StepModule, StepReporter } from "../types.js";
+import { formatGitNameStatusSummary, terminalResultFailureMessage } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
+import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, type ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import {
@@ -196,51 +197,7 @@ function issueFromString(text: string): ReviewIssue {
   };
 }
 
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function parseReviewIssue(value: unknown): ReviewIssue | null {
-  if (typeof value === "string") {
-    const text = value.trim();
-    return text ? issueFromString(text) : null;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-
-  const issue = value as Record<string, unknown>;
-  const title = stringValue(issue.title) || stringValue(issue.summary) || "Blocking issue";
-  const location = stringValue(issue.location) || stringValue(issue.file) || stringValue(issue.path) || undefined;
-  const problem = stringValue(issue.problem) || stringValue(issue.issue) || stringValue(issue.details) || stringValue(issue.description);
-  const requiredFix = stringValue(issue.required_fix) || stringValue(issue.requiredFix) || stringValue(issue.fix) || stringValue(issue.recommendation);
-  const rawText = stringValue(issue.text);
-  if (!problem && !requiredFix && !rawText) return null;
-  if (rawText && !problem && !requiredFix) return issueFromString(rawText);
-
-  return {
-    title,
-    location,
-    problem: problem || rawText || title,
-    requiredFix,
-  };
-}
-
-function parseReviewIssues(parsed: Record<string, unknown>): ReviewIssue[] {
-  const source = Array.isArray(parsed.blocking_issues)
-    ? parsed.blocking_issues
-    : Array.isArray(parsed.blockingIssues)
-      ? parsed.blockingIssues
-      : Array.isArray(parsed.issues)
-        ? parsed.issues
-        : Array.isArray(parsed.findings)
-          ? parsed.findings
-          : [];
-
-  return source
-    .map(parseReviewIssue)
-    .filter((issue): issue is ReviewIssue => issue !== null);
-}
-
-function plainIssueText(issue: ReviewIssue): string {
+function postPushIssueText(issue: ReviewIssue): string {
   if (issue.rawText) return issue.rawText;
   return [
     issue.title,
@@ -300,7 +257,7 @@ function reviewerSummaryBlock(feedback: string, issues: ReviewIssue[]): string {
   const summary = feedback.trim();
   if (!summary) return "";
   const normalizedSummary = normalizeForComparison(summary);
-  const issueTexts = issues.map(plainIssueText);
+  const issueTexts = issues.map(postPushIssueText);
   const repeatsIssue = issueTexts.some((issue) => normalizeForComparison(issue) === normalizedSummary);
   const repeatsAllIssues = normalizeForComparison(issueTexts.join("\n")) === normalizedSummary;
   if (repeatsIssue || repeatsAllIssues) return "";
@@ -370,8 +327,13 @@ function dedupeIssuesAgainstExternalFindings(
   const externalBodies = new Set(externalFindings.map((finding) => normalizeForComparison(finding.body)));
   const seen = new Set<string>();
   return issues.filter((issue) => {
-    const normalized = normalizeForComparison(plainIssueText(issue));
-    if (!normalized || externalBodies.has(normalized) || seen.has(normalized)) return false;
+    const normalized = normalizeForComparison(postPushIssueText(issue));
+    const issueParts = [
+      normalized,
+      normalizeForComparison(issue.problem),
+      normalizeForComparison(issue.rawText ?? ""),
+    ].filter(Boolean);
+    if (!normalized || issueParts.some((part) => externalBodies.has(part)) || seen.has(normalized)) return false;
     seen.add(normalized);
     return true;
   });
@@ -644,24 +606,30 @@ function summarizeHeadChanges(gitSpawn: (args: string[]) => SpawnResult): string
 }
 
 /**
- * Proactively checks if the PR is closed-and-not-merged and throws OperatorCancelledError
- * if so. Called at step start and before any push to detect operator cancellation without
- * relying on the PR being locked (which is opt-in on GitHub).
+ * Guards a PR write: throws PrMergedError if the PR is merged, OperatorCancelledError
+ * if it is closed-and-not-merged, and returns normally when the PR is open.
+ * Fails open on transient API errors — a network blip must not cancel the run.
+ * Called as the first statement of postPrComment and submitPrReview, immediately before
+ * the git push, and once at step entry.
  */
-function probeIfPrClosed(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
+function assertPrWritable(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): void {
   const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
-  if (prView.exitCode !== 0) return; // fail open — transient errors don't cancel the run
+  if (prView.exitCode !== 0) return; // fail open
   try {
     const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
+    if (prState.merged === true) {
+      throw new PrMergedError(prNumber);
+    }
     if (prState.state === "CLOSED" && !prState.merged) {
       throw new OperatorCancelledError(prNumber);
     }
   } catch (e) {
-    if (e instanceof OperatorCancelledError) throw e;
+    if (e instanceof PrMergedError || e instanceof OperatorCancelledError) throw e;
   }
 }
 
 function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: string, body: string, marker?: string) {
+  assertPrWritable(ghSpawn, prNumber);
   if (marker) {
     const list = ghSpawn([
       "api",
@@ -690,21 +658,12 @@ function postPrComment(ghSpawn: (args: string[]) => SpawnResult, prNumber: strin
 
   const created = ghSpawn(["pr", "comment", prNumber, "--body", body]);
   if (created.exitCode !== 0) {
-    // "issue is locked" is the GitHub error when a closed PR's timeline is locked.
-    // Verify the PR is closed-and-not-merged before treating as operator cancellation,
-    // rather than a transient error.
+    // "issue is locked" fires when a PR is merged and its conversation auto-locks.
+    // Re-assert writability: throws PrMergedError or OperatorCancelledError for the merge/close
+    // race, or returns normally when the PR is open (locked by a person) so the original
+    // error can surface as a genuine failure.
     if ((created.stderr ?? "").toLowerCase().includes("issue is locked")) {
-      const prView = ghSpawn(["pr", "view", prNumber, "--json", "state,merged"]);
-      if (prView.exitCode === 0) {
-        try {
-          const prState = JSON.parse(prView.stdout) as { state?: string; merged?: boolean };
-          if (prState.state === "CLOSED" && !prState.merged) {
-            throw new OperatorCancelledError(prNumber);
-          }
-        } catch (e) {
-          if (e instanceof OperatorCancelledError) throw e;
-        }
-      }
+      assertPrWritable(ghSpawn, prNumber);
     }
     throw new Error(`gh pr comment failed: ${resultMessage(created)}`);
   }
@@ -715,6 +674,7 @@ function submitPrReview(
   prNumber: string,
   body: string,
 ): void {
+  assertPrWritable(ghSpawn, prNumber);
   // The reviewing identity is the same GitHub App installation that authored
   // the PR, and GitHub rejects APPROVE/REQUEST_CHANGES on your own PR (422).
   // COMMENT is the only review event allowed on a self-authored PR; the
@@ -743,9 +703,23 @@ function failedReviewOutputs(feedback: string) {
   return {
     approved: false,
     feedback,
-    issues: [plainIssueText(issue)],
+    issues: [postPushIssueText(issue)],
     blockingIssues: [issue],
   };
+}
+
+function issueFromVerdictIssue(issue: VerdictReviewIssue): ReviewIssue {
+  return {
+    title: issue.title,
+    ...(issue.location ? { location: issue.location } : {}),
+    problem: issue.problem,
+    requiredFix: issue.requiredFix,
+  };
+}
+
+function reviewFailureMessage(result: LLMResult): string | null {
+  if (result.exitCode !== 0) return `Reviewer LLM failed (${llmResultMessage(result)})`;
+  return terminalResultFailureMessage(result, "Reviewer LLM");
 }
 
 async function reportInvalidStructuredReview(
@@ -775,23 +749,12 @@ async function reportInvalidStructuredReview(
   );
 }
 
-function isPrMerged(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): boolean {
-  const result = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
-  if (result.exitCode !== 0) return false;
-  try {
-    const data = JSON.parse(result.stdout) as { merged?: boolean };
-    return data.merged === true;
-  } catch {
-    return false;
-  }
-}
-
 export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReviewOutputs> = {
   async run(context, inputs, reporter) {
     const ghSpawn = inputs.ghSpawn ?? makeDefaultGhSpawn(inputs.workspaceDir);
     const gitSpawn = inputs.gitSpawn ?? makeDefaultGitSpawn(inputs.workspaceDir);
     const maxIterations = inputs.maxIterations ?? DEFAULT_MAX_ITERATIONS;
-    const model = inputs.model ?? context.data.model ?? "claude-sonnet-4-6";
+    const model = inputs.model ?? context.data.model ?? "claude-sonnet-5";
     const prNumber = String(inputs.prNumber ?? "");
     if (!prNumber) throw new Error("post-push-review requires a PR number");
 
@@ -807,20 +770,13 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     let forcePushed = 0;
     let terminationReason: PostPushReviewTerminationReason = "iterations_exhausted";
     const reviewHistory: ReviewFinding[] = [];
-    // Set to true when a real LLM failure (non-zero exit) occurs. An OperatorCancelledError
-    // thrown afterward while posting the failure comment is suppressed so the genuine
-    // failure conclusion surfaces rather than being masked by the benign operator cancel.
+    // Set to true when a real LLM failure (non-zero exit) occurs. A benign terminal
+    // (PrMergedError or OperatorCancelledError) thrown afterward while posting the failure
+    // comment is suppressed so the genuine failure conclusion surfaces rather than being masked.
     let priorLlmFailure = false;
 
     try {
-    probeIfPrClosed(ghSpawn, prNumber);
-    // A PR merged under the run before its first comment (a manual merge, or a defer that did not
-    // hold) must not fail on the locked conversation: the merged-only benign exit applies at step
-    // entry too, not only at the top of each iteration (review finding).
-    if (isPrMerged(ghSpawn, prNumber)) {
-      console.log(`[post-push-review] PR #${prNumber} was already merged at step entry — exiting cleanly`);
-      return { approved: true, iterations: 0, finalFeedback: "", forcePushedRevisions: 0, terminationReason: "pr_merged" };
-    }
+    assertPrWritable(ghSpawn, prNumber);
     postPrComment(
       ghSpawn,
       prNumber,
@@ -830,15 +786,8 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
 
     while (iteration < maxIterations && !approved) {
       iteration++;
-      // Probe at the top of every pass: an operator may close the PR between iterations that never push.
-      probeIfPrClosed(ghSpawn, prNumber);
-
-      if (isPrMerged(ghSpawn, prNumber)) {
-        console.log(`[post-push-review] PR #${prNumber} was merged under the run — exiting cleanly (a closed or locked PR is probeIfPrClosed's job)`);
-        approved = true;
-        terminationReason = "pr_merged";
-        break;
-      }
+      // Probe before the LLM call: a merge/close between iterations exits immediately rather than burning a full reviewer turn.
+      assertPrWritable(ghSpawn, prNumber);
 
       const diffRes = ghSpawn(["pr", "diff", prNumber]);
       if (diffRes.exitCode !== 0) throw new Error(`gh pr diff failed: ${resultMessage(diffRes)}`);
@@ -898,12 +847,13 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         model,
         maxTurns: REVIEW_MAX_TURNS,
         tools: READ_ONLY_ALLOWED_TOOLS,
+        jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
       });
-      if (reviewResult.exitCode !== 0) {
+      const reviewFailure = reviewFailureMessage(reviewResult);
+      if (reviewFailure) {
         priorLlmFailure = true;
         terminationReason = "review_failed";
-        const failure = `Reviewer LLM failed (${llmResultMessage(reviewResult)})`;
-        feedback = compactErrorMessage(failure);
+        feedback = compactErrorMessage(reviewFailure);
         await reporter.report({
           id: `post-push-review.${iteration}`,
           type: "custom",
@@ -925,36 +875,20 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         break;
       }
 
-      const parsed = extractFirstJsonObject(reviewResult.stdout) as
-        | { approved?: boolean; feedback?: string; issues?: unknown[]; findings?: unknown[]; blocking_issues?: unknown[]; blockingIssues?: unknown[] }
-        | null;
-      if (!parsed) {
+      if (reviewResult.structuredOutput === undefined) {
         terminationReason = "invalid_review";
-        feedback = compactErrorMessage(`Reviewer returned non-JSON output: ${reviewResult.stdout || "(empty stdout)"}`);
-        await reporter.report({
-          id: `post-push-review.${iteration}`,
-          type: "custom",
-          status: "failed",
-          started_at: new Date().toISOString(),
-          ended_at: new Date().toISOString(),
-          parent_step_id: "post-push-review",
-          inputs: { iteration, prNumber },
-          outputs: failedReviewOutputs(feedback),
-          logs_url: null,
-        });
-        const marker = `<!-- ai-implement post-push iter=${iteration} review-invalid -->`;
-        postPrComment(
-          ghSpawn,
-          prNumber,
-          `${marker}\n⚠️ Post-push review returned invalid output.\n\n${feedback}\n\nThe implementation PR is still available, but this automated review pass did not finish. No actionable code feedback was produced by this review attempt.\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
-          marker,
-        );
+        feedback = compactErrorMessage(`Reviewer returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`);
+        await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
       }
 
-      if (typeof parsed.approved !== "boolean") {
+      let verdict;
+      try {
+        verdict = parseReviewVerdict(reviewResult.structuredOutput);
+      } catch (err) {
         terminationReason = "invalid_review";
-        feedback = "Reviewer returned invalid structured review output: expected approved:boolean.";
+        const reason = err instanceof Error ? err.message : String(err);
+        feedback = compactErrorMessage(`Reviewer returned invalid structured review output: ${reason}.`);
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
       }
@@ -989,10 +923,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames)
         : [];
 
-      feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
-      let issues = parseReviewIssues(parsed);
+      feedback = suppressDuplicateExternalFeedback(verdict.feedback, externalFindings);
+      let issues = verdict.blockingIssues.map(issueFromVerdictIssue);
       issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
-      if (issues.length === 0 && parsed.approved === false && !hasExternalFindings) {
+      if (issues.length === 0 && verdict.approved === false && !hasExternalFindings) {
         terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
@@ -1012,13 +946,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
 
       // fix-pass exit — the approved exit on a last iteration never pushes, so nothing else would catch it.
 
-      probeIfPrClosed(ghSpawn, prNumber);
-
-
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
       // external review check did not finish within the wait budget. Do not auto-approve
       // against a reviewer that is still in flight — defer to a human.
-      const internalApprovable = parsed.approved === true && issues.length === 0 && !hasExternalFindings;
+      const internalApprovable = verdict.approved === true && issues.length === 0 && !hasExternalFindings;
       if (internalApprovable && externalReviewPending) {
         terminationReason = "external_review_pending";
         feedback = "External review did not complete within the wait budget; not auto-approving.";
@@ -1054,7 +985,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         ended_at: new Date().toISOString(),
         parent_step_id: "post-push-review",
         inputs: { iteration, prNumber },
-        outputs: { approved, feedback, issues: issues.map(plainIssueText), blockingIssues: issues },
+        outputs: { approved, feedback, issues: issues.map(postPushIssueText), blockingIssues: issues },
         logs_url: null,
       });
 
@@ -1188,7 +1119,7 @@ ${externalReviewFindingsBlock(externalFindings)}
       // A fix pass can run long enough to outlive the token minted by pushStep.
       // Re-vend at the actual write boundary; transient vending failures retain
       // the latest token already present in the environment and origin URL.
-      probeIfPrClosed(ghSpawn, prNumber);
+      assertPrWritable(ghSpawn, prNumber);
       await refreshCredentialsBeforePush(context, inputs);
       const expectedRemoteSha = remoteBranchSha(gitSpawn, branchName);
       const push = gitSpawn([
@@ -1223,6 +1154,20 @@ ${externalReviewFindingsBlock(externalFindings)}
         terminationReason = "operator_cancelled";
         console.warn(`[post-push-review] PR #${prNumber} was closed by operator — surfacing as OPERATOR_CANCELLED`);
         throw err;
+      }
+      if (err instanceof PrMergedError) {
+        if (priorLlmFailure) {
+          // A real LLM failure already set terminationReason — surface the genuine failure
+          // rather than masking it with the benign merge event.
+          console.warn(
+            `[post-push-review] PR #${prNumber} was merged while posting failure comment — ` +
+              `genuine failure surfaces as ${terminationReason}`,
+          );
+          return { approved, iterations: iteration, finalFeedback: feedback, forcePushedRevisions: forcePushed, terminationReason };
+        }
+        terminationReason = "pr_merged";
+        console.warn(`[post-push-review] PR #${prNumber} was merged under the run — exiting as pr_merged`);
+        return { approved: true, iterations: iteration, finalFeedback: "", forcePushedRevisions: forcePushed, terminationReason: "pr_merged" };
       }
       throw err;
     }

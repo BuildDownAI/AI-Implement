@@ -73,8 +73,14 @@ describe("claude-implement.yml template — runner_phase and runner_callback_url
   it("masks run_progress_token in the Mask runner callback tokens step (regression guard)", () => {
     const step = getMaskStep();
     expect(step).toBeDefined();
-    expect(step.run).toContain("inputs.run_progress_token");
-    expect(step.run).toContain("add-mask");
+    expect(step.env?.RUN_PROGRESS_TOKEN).toContain("run_progress_token");
+    expect(step.run).toContain("::add-mask::$RUN_PROGRESS_TOKEN");
+    expect(step.run).not.toContain("inputs.run_progress_token");
+  });
+
+  it("passes AI_IMPLEMENT_LOG_LEVEL from the repo variable into the Run pipeline step env", () => {
+    const step = getPipelineStep();
+    expect(step.env.AI_IMPLEMENT_LOG_LEVEL).toBe("${{ vars.AI_IMPLEMENT_LOG_LEVEL }}");
   });
 
   it("'kg-refresh' case arm exists in session/entrypoint.sh", () => {
@@ -82,4 +88,5 @@ describe("claude-implement.yml template — runner_phase and runner_callback_url
     expect(arms.length).toBeGreaterThan(0);
     expect(arms).toContain("kg-refresh");
   });
+
 });

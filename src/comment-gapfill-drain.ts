@@ -180,6 +180,7 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
           prNumber: String(item.prNumber),
           ...(mapping.branchPrefix ? { branchPrefix: mapping.branchPrefix } : {}),
           ...(mapping.skillsRepo ? { skillsRepo: mapping.skillsRepo } : {}),
+          ...(mapping.referenceRepos != null ? { referenceRepos: mapping.referenceRepos } : {}),
           ...(runnerCallbackUrl ? { runnerCallbackUrl } : {}),
           ...(mapping.maxTurns != null ? { maxTurns: mapping.maxTurns } : {}),
           ...(mapping.maxIterations != null ? { maxIterations: mapping.maxIterations } : {}),

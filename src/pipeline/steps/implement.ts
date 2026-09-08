@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
+import { describeReferenceRepoCause, type ReferenceRepoResult } from "../../reference-repos.js";
 
 interface ImplementInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -8,6 +9,7 @@ interface ImplementInputs extends Record<string, unknown> {
   model?: string;
   maxTurns?: number;
   planningContext?: string;
+  referenceRepoResults?: ReferenceRepoResult[];
 }
 
 interface ImplementOutputs extends Record<string, unknown> {
@@ -18,13 +20,43 @@ interface ImplementOutputs extends Record<string, unknown> {
   telemetry?: RunTelemetry;
 }
 
+function buildReferenceReposSection(results: ReferenceRepoResult[]): string {
+  const arrived = results.filter((r) => r.arrived);
+  const missed = results.filter((r) => !r.arrived);
+  const lines: string[] = ["## Reference Repositories"];
+
+  if (arrived.length > 0) {
+    lines.push(
+      "",
+      "The following repositories are available in the workspace as read-only reference material. Read them for context and do not modify them.",
+      "",
+    );
+    for (const r of arrived) {
+      lines.push(`- \`${r.repo}\` — available at \`${r.path}\``);
+    }
+  }
+
+  if (missed.length > 0) {
+    lines.push(
+      "",
+      "The following repositories were declared but could not be cloned. Do not assert anything about their contents — treat them as unavailable.",
+      "",
+    );
+    for (const r of missed) {
+      lines.push(`- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
   async run(
     context: PipelineContext,
     inputs: ImplementInputs,
     _reporter: StepReporter,
   ): Promise<ImplementOutputs> {
-    const { workspaceDir, model, maxTurns, planningContext } = inputs;
+    const { workspaceDir, model, maxTurns, planningContext, referenceRepoResults } = inputs;
 
     let fullPrompt = inputs.prompt;
 
@@ -32,9 +64,13 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       fullPrompt += `\n\n## Planning Context\n\n${planningContext}`;
     }
 
+    if (referenceRepoResults && referenceRepoResults.length > 0) {
+      fullPrompt += `\n\n${buildReferenceReposSection(referenceRepoResults)}`;
+    }
+
     const result = await context.llmExecutor.invoke({
       prompt: fullPrompt,
-      model: model ?? "claude-sonnet-4-6",
+      model: model ?? "claude-sonnet-5",
       maxTurns,
     });
 

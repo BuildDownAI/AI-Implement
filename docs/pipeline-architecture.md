@@ -29,22 +29,27 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 
 ## The built-in pipeline
 
-`pipelines/autonomous.yml` declares ten steps. They run in file order, and each is registered under a key in `BUILTIN_STEPS` (`src/pipeline/default-pipeline.ts`).
+`pipelines/autonomous.yml` declares the steps below. They run in file order, and each is registered under a key in `BUILTIN_STEPS` (`src/pipeline/default-pipeline.ts`).
 
 | # | Step id | Skipped when |
 |---|---------|--------------|
 | 1 | `clone` | never |
-| 2 | `install-skills` | no `skillsRepo` configured |
-| 3 | `dependency-auth` | the mapping has no Dependency Token Scope set |
-| 4 | `install` | never (internally no-ops for a mounted workspace or a repo with no `package.json`) |
-| 5 | `setup` | no `setup:` hook in `WORKFLOW.md` front matter |
-| 6 | `feedback-loop` | never |
-| 7 | `preflight` | the feedback loop did not approve |
-| 8 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch) |
-| 9 | `verify` | no `verify:` hook, or the feedback loop did not approve |
-| 10 | `post-push-review` | not approved, or nothing was pushed, or no PR number |
+| 2 | `reference-repos` | the envelope declares no `referenceRepos` entries |
+| 3 | `install-skills` | no `skillsRepo` configured |
+| 4 | `dependency-auth` | the mapping has no Dependency Token Scope set |
+| 5 | `install` | never (internally no-ops for a mounted workspace or a repo with no `package.json`) |
+| 6 | `setup` | no `setup:` hook in `WORKFLOW.md` front matter |
+| 7 | `feedback-loop` | never |
+| 8 | `preflight` | the feedback loop did not approve |
+| 9 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch) |
+| 10 | `verify` | no `verify:` hook, or the feedback loop did not approve |
+| 11 | `post-push-review` | not approved, or nothing was pushed, or no PR number |
+
+`reference-repos` runs immediately after `clone` to populate the workspace with any declared reference repositories before any hook or install step runs. It fetches per-owner installation tokens from the orchestrator's `/api/runner/reference-token` endpoint (gated on the mapping's `referenceRepos` field), then clones each entry shallow. The credential is passed via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` environment variables — the only form that does not persist the token into the clone's `.git/config` or `remote.origin.url`. After each clone, the path is appended to `.git/info/exclude` so `git add -A` can never stage it. A clone failure is logged and reported in the step outputs but never fails the run.
 
 `dependency-auth` sits deliberately before `install`: it fetches a read-only, installation-wide token and installs it as a git credential helper plus `COMPOSER_AUTH`, so the dependency install that follows can resolve private sibling repositories. Its inputs are also a worked example of a real constraint — the run's progress token is **not** passed through `inputs`, because inputs are persisted to the step log and surfaced through the admin API. The step reads that secret from `process.env` directly. Anything secret belongs in the environment, not in a step's inputs.
+
+**Benign terminals.** `post-push-review` recognises two exits that are not failures: `pr_merged` and `operator_cancelled`. Both resolve inside `assertPrWritable` (`src/pipeline/steps/post-push-review.ts`), which is called as the first statement of every write function (`postPrComment`, `submitPrReview`) and immediately before the fix-pass `git push`. A merged PR throws `PrMergedError`; a closed-and-not-merged PR throws `OperatorCancelledError`. The boundary catch at the end of the step returns `{ approved: true, terminationReason: "pr_merged" }` or rethrows `OperatorCancelledError` as `operator_cancelled`, whichever applies. One rule governs both: if a genuine LLM failure set `priorLlmFailure` before the benign event, the genuine failure surfaces instead — the benign event does not mask a real error.
 
 `feedback-loop` is where Claude actually runs — it drives the implement/review cycle up to `maxIterations`. Everything before it prepares the workspace; everything after it reacts to the result.
 
@@ -53,6 +58,18 @@ Two consequences worth internalising:
 **`preflight` does not gate the push.** It is skipped unless the review already approved, and `push` runs regardless of what it found. It records `typecheck`/`lint`/`test` results; it does not block a pull request on them. Work that fails preflight still ships.
 
 **The pipeline owns all repository writes.** `push` runs for both initial and gap-fill runs: an initial run creates the implementation branch and opens a PR, while a gap-fill run commits any remaining uncommitted changes and force-pushes to the existing PR branch. `WORKFLOW.md` must instruct the agent to leave changes uncommitted in both modes — the pipeline always handles the commit and push.
+
+## Review result contract
+
+The built-in implementation review and post-push review request a JSON Schema through the executor. Claude Code still emits `stream-json` events for progress and telemetry; the verdict comes from the terminal result's `structured_output` field, not JSON extracted from assistant prose. Review consumers validate the required fields and their types before applying the verdict. Outstanding issues prevent approval even if the reviewer sets `approved` to true.
+
+An unsuccessful or missing terminal result, missing structured output, or invalid review payload is an incomplete review, not actionable implementation feedback. The feedback loop stops rather than running another implementation pass on a formatting error. Post-push review preserves the PR and reports that automated review did not complete. Custom executors used with these built-in review steps must implement the structured-result contract in `src/pipeline/types.ts`.
+
+The runner pins Claude Code in `Dockerfile.session`. Built-in model fallbacks and newly seeded workflow templates use `claude-sonnet-5`. Explicit model settings retain their existing precedence; already-seeded target-repo `WORKFLOW.md` and `PLANNING.md` files are not overwritten by template sync, so projects that pin an older model keep that model until their configuration changes. Bedrock projects still need a model ID accepted by their configured provider.
+
+Repositories that pin a runner image with `.ai-implement/image.yml` must update that image to include this executor and a Claude Code CLI supporting `--json-schema` and terminal `structured_output` (the bundled runner pins 2.1.263). Updating the orchestrator alone does not update a pinned runner image; an older CLI or executor can leave automated reviews incomplete.
+
+Claude Code documents schema-based output in [programmatic usage](https://code.claude.com/docs/en/headless#get-structured-output). Sonnet 5 migration details, including the changed tokenizer and thinking defaults, are in the [official migration guide](https://platform.claude.com/docs/en/models/sonnet-5/migration-guide).
 
 ## Hook environment and forwarded secrets
 

@@ -2,14 +2,14 @@
 # Claude model used for implementation. Passed through verbatim to
 # `claude-code --model`, so any ID your configured provider accepts is fine.
 # Examples:
-#   Anthropic API / OAuth: claude-sonnet-4-6, claude-opus-4-7, claude-haiku-4-5-20251001
+#   Anthropic API / OAuth: claude-sonnet-5, claude-opus-4-7, claude-haiku-4-5-20251001
 #   AWS Bedrock:           anthropic.claude-sonnet-4-6-20250805-v1:0
 #                          or an inference-profile ARN (arn:aws:bedrock:...)
 # The default below works for the Anthropic provider. If this repo's mapping
 # is switched to provider=bedrock in the orchestrator admin UI, replace this
 # with a Bedrock model ID: nothing validates the pairing, so an Anthropic-style
 # ID reaches Bedrock verbatim and fails at invocation time rather than early.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 
 # To run a cheaper model for the automated review pass than for implementation,
 # set models.implement / models.review in .ai-implement/config.yml. Those take

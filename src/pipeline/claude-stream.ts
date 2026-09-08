@@ -1,4 +1,4 @@
-import type { RunTelemetry } from "./types.js";
+import type { LLMTerminalStatus, RunTelemetry } from "./types.js";
 
 export interface StreamEvent {
   type?: string;
@@ -39,6 +39,10 @@ export function finalText(events: StreamEvent[]): string {
   return texts.join("\n");
 }
 
+export function finalStructuredOutput(events: StreamEvent[]): unknown {
+  return lastResult(events)?.structured_output;
+}
+
 function num(v: unknown): number | null {
   return typeof v === "number" ? v : null;
 }
@@ -48,6 +52,15 @@ function mapOutcome(subtype: unknown): RunTelemetry["outcome"] {
   if (subtype === "error_max_turns") return "max_turns";
   if (typeof subtype === "string" && subtype.startsWith("error")) return "error";
   return "unknown";
+}
+
+export function extractTerminalStatus(events: StreamEvent[]): LLMTerminalStatus | undefined {
+  const result = lastResult(events);
+  if (!result) return undefined;
+  return {
+    subtype: typeof result.subtype === "string" ? result.subtype : null,
+    isError: typeof result.is_error === "boolean" ? result.is_error : null,
+  };
 }
 
 export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
@@ -78,7 +91,7 @@ export function extractTelemetry(events: StreamEvent[]): RunTelemetry {
   const cacheRead = num(usage.cache_read_input_tokens);
   const inParts = [uncachedIn, cacheCreation, cacheRead].filter((v): v is number => v != null);
   return {
-    outcome: mapOutcome(result.subtype),
+    outcome: result.subtype === "error_max_turns" ? "max_turns" : result.is_error === true ? "error" : mapOutcome(result.subtype),
     numTurns: num(result.num_turns),
     durationMs: num(result.duration_ms),
     costUsd: num(result.total_cost_usd),

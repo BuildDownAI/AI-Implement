@@ -130,6 +130,7 @@ describe("kg-refresh", () => {
     expect(s.lastRefresh?.ok).toBe(true);
     expect(s.lastRefresh?.stampBefore).toBe(OLD_STAMP);
     expect(s.lastRefresh?.stampAfter).toBe(NEW_STAMP);
+    expect(s.servedStamp).toBe(NEW_STAMP);
     expect(restart).toHaveBeenCalledTimes(1);
 
     const current = join(dataRoot, "current");
@@ -505,6 +506,68 @@ describe("kg-refresh", () => {
     expect(persistSnapshotSha).not.toHaveBeenCalled();
   });
 
+  // AII-579: status() reads servedStamp live from the sidecar, so a failed
+  // refresh with stampAfter: null does not mask the sidecar's real stamp.
+  it("pre-staging failure: servedStamp reflects sidecar stamp, not null", async () => {
+    // Establish currentDir/sources.yml via a successful refresh.
+    await handle.trigger();
+    await waitDone();
+    // servedStamp = NEW_STAMP after restart; currentDir has sources.yml.
+
+    // Sidecar goes down: stampBefore = null during the next fetch,
+    // which propagates to stampAfter: null on staging failure.
+    sidecarUp = false;
+    materialize.mockImplementationOnce(async () => {
+      throw new Error("ingest runner failed: KG_SNAPSHOT_TRACKER_REGRESSION");
+    });
+    await handle.trigger();
+    await waitDone();
+
+    // Sidecar comes back; it is still serving the graph from the prior refresh.
+    sidecarUp = true;
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.stampAfter).toBeNull();
+    expect(s.servedStamp).toBe(NEW_STAMP);
+  });
+
+  // AII-579: fresh boot — current/ does not exist yet; status() falls back to kgDir.
+  it("fresh boot: servedStamp reads from kgDir when current/ is absent", async () => {
+    // Build a real kgDir with a sources.yml so readNamespace() can find the namespace.
+    const realKgDir = mkdtempSync(join(tmpdir(), "kgdir-"));
+    writeFileSync(join(realKgDir, "sources.yml"), `namespace: ${NAMESPACE}\n`);
+    try {
+      build({ kgDir: realKgDir });
+      // No trigger() called — current/ has never been staged.
+      const s = await handle.status();
+      expect(s.running).toBe(false);
+      expect(s.lastRefresh).toBeNull();
+      // Sidecar is up serving OLD_STAMP under NAMESPACE; kgDir branch must reach it.
+      expect(s.servedStamp).toBe(OLD_STAMP);
+    } finally {
+      rmSync(realKgDir, { recursive: true, force: true });
+    }
+  });
+
+  // AII-579: live orchestrator with legacy current/ (no sources.yml) falls back to kgDir.
+  it("legacy current/ without sources.yml falls back to kgDir for servedStamp", async () => {
+    const realKgDir = mkdtempSync(join(tmpdir(), "kgdir-"));
+    writeFileSync(join(realKgDir, "sources.yml"), `namespace: ${NAMESPACE}\n`);
+    try {
+      build({ kgDir: realKgDir });
+      // Simulate a legacy current/ directory that has no sources.yml (pre-fix overlay).
+      const currentDir = join(dataRoot, "current");
+      mkdirSync(currentDir, { recursive: true });
+      writeFileSync(join(currentDir, "graph.trig"), "placeholder");
+      // No sources.yml in currentDir — status() must fall back to kgDir.
+      const s = await handle.status();
+      expect(s.servedStamp).toBe(OLD_STAMP);
+    } finally {
+      rmSync(realKgDir, { recursive: true, force: true });
+    }
+  });
+
   // ---- AII-495: dispatch-path tests ----------------------------------------
 
   describe("dispatch path", () => {
@@ -553,6 +616,7 @@ describe("kg-refresh", () => {
         canaryRetryMs: 30,
         runnerCallbackBaseUrl: "http://localhost:8080",
         runnerTokenSecret: "secret",
+        resolveMappingTeamKey: (repo: string) => repo === "TestOrg/test-kg" ? { teamKey: "KGA", dependencyTokenScope: "installation" } : undefined,
         mintRunTokenFn: mintRunTokenFn as never,
         dispatchRun: dispatchRun as never,
         fetchCommitVisible: fetchCommitVisible as never,
@@ -588,6 +652,44 @@ describe("kg-refresh", () => {
       expect(r.status).toBe(422);
       expect((r.body as { precondition?: string }).precondition).toBe("callback-unconfigured");
       expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("returns 422 when dispatchRun configured but KG source repo has no mapping", async () => {
+      buildDispatch({ resolveMappingTeamKey: () => undefined });
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      expect((r.body as { precondition?: string }).precondition).toBe("kg-mapping-not-found");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("mints run tokens with the KG repo mapping team key", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      expect(mintRunTokenFn).toHaveBeenCalledTimes(2);
+      const [firstCall, secondCall] = mintRunTokenFn.mock.calls as Array<[{ mappingTeamKey: string; audience: string }]>;
+      expect(firstCall[0].mappingTeamKey).toBe("KGA");
+      expect(firstCall[0].audience).toBe("result");
+      expect(secondCall[0].mappingTeamKey).toBe("KGA");
+      expect(secondCall[0].audience).toBe("progress");
+    });
+
+    it("runConfig envelope carries dependencyTokenScope from the KG repo mapping", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+      const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+      expect(decoded).toHaveProperty("dependencyTokenScope", "installation");
+    });
+
+    it("runConfig envelope omits dependencyTokenScope when mapping has scope=null", async () => {
+      buildDispatch({ resolveMappingTeamKey: (repo: string) => repo === "TestOrg/test-kg" ? { teamKey: "KGA", dependencyTokenScope: null } : undefined });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+      const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+      expect(decoded).not.toHaveProperty("dependencyTokenScope");
     });
 
     it("dispatches runner when ingest-needed and dispatchRun configured", async () => {
@@ -1307,6 +1409,108 @@ describe("kg-refresh", () => {
       expect(onOutcome).not.toHaveBeenCalled();
       const s = await handle.status();
       expect(s.stage).toBe("idle");
+    });
+
+    // ---- AII-551: late-callback handling ----------------------------------------
+
+    it("late callback on closed (failed) row updates lastRefresh with runner outcome", async () => {
+      const persistLastRefresh = vi.fn();
+      buildDispatch({ persistLastRefresh });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      // Simulate the reaper closing the run (onMachineLost → stage="failed")
+      handle.onMachineLost();
+      await waitDone();
+      expect((await handle.status()).stage).toBe("failed");
+      persistLastRefresh.mockClear();
+
+      // Late runner callback arrives after the reaper has closed the row
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(persistLastRefresh).toHaveBeenCalledOnce();
+      const outcome = persistLastRefresh.mock.calls[0][0] as RefreshOutcome;
+      expect(outcome.ok).toBe(true);
+      expect(outcome.detail).toContain("late callback");
+    });
+
+    it("late callback logs the late-callback message", async () => {
+      const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        "[kg-refresh] late callback after reaper close — updating lastRefresh",
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("late callback with failure outcome marks lastRefresh as not ok", async () => {
+      const persistLastRefresh = vi.fn();
+      buildDispatch({ persistLastRefresh });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      persistLastRefresh.mockClear();
+
+      handle.onRunnerComplete("failure", { failureCode: "TIMEOUT", failureReason: "timed out" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(persistLastRefresh).toHaveBeenCalledOnce();
+      const outcome = persistLastRefresh.mock.calls[0][0] as RefreshOutcome;
+      expect(outcome.ok).toBe(false);
+      expect(outcome.detail).toContain("TIMEOUT");
+    });
+
+    it("late callback with KG_SNAPSHOT_STALE marks lastRefresh as ok", async () => {
+      const persistLastRefresh = vi.fn();
+      buildDispatch({ persistLastRefresh });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      persistLastRefresh.mockClear();
+
+      handle.onRunnerComplete("failure", { failureCode: "KG_SNAPSHOT_STALE" });
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(persistLastRefresh).toHaveBeenCalledOnce();
+      const outcome = persistLastRefresh.mock.calls[0][0] as RefreshOutcome;
+      expect(outcome.ok).toBe(true);
+    });
+
+    it("late callback does not fire onOutcome", async () => {
+      const onOutcome = vi.fn();
+      buildDispatch({ onOutcome });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onMachineLost();
+      await waitDone();
+      onOutcome.mockClear();
+
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(onOutcome).not.toHaveBeenCalled();
+    });
+
+    it("late callback is a no-op when stage is idle (not failed/reverted)", async () => {
+      const persistLastRefresh = vi.fn();
+      buildDispatch({ persistLastRefresh });
+      // No trigger() — stage stays idle
+      expect((await handle.status()).stage).toBe("idle");
+
+      handle.onRunnerComplete("success", {});
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(persistLastRefresh).not.toHaveBeenCalled();
     });
 
     // ---- AII-548: onMachineLost detail wording ------------------------------------

@@ -1,5 +1,6 @@
-import { claimJobRunId, getJobByDispatchId, updateJobPrUrl, updateJobStatus } from "./log.js";
+import { claimJobRunId, getJobByDispatchId, stampJobApproved, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
+import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
@@ -70,6 +71,8 @@ export interface RunnerResultBody {
    * Only present for phase=kg-refresh.
    */
   snapshotCommit?: string;
+  /** Reference repository clone outcomes, present only when the run declared entries. */
+  referenceRepoResults?: ReferenceRepoResult[];
 }
 
 export interface HandleRunnerResultInput {
@@ -95,7 +98,7 @@ export interface HandleRunnerResultOutput {
 }
 
 export interface RunnerProgressBody {
-  step: Step;
+  step?: Step;
   githubRunId?: number;
 }
 
@@ -239,13 +242,27 @@ export async function handleRunnerResult(
   // if a provider outage caused dropped comments.
   const verified = verifyAndConsumeRunToken(bearerToken, input.secret);
   if (!verified.ok) {
+    console.warn(
+      `[runner-callback] result refused dispatch=${verified.claims?.dispatchId ?? "unknown"} ` +
+        `phase=${input.body.phase} outcome=${input.body.outcome} reason=${verified.reason}`,
+    );
     return verified.reason === "already_consumed"
       ? bad(409, "already_consumed")
       : bad(401, verified.reason);
   }
+  console.log(
+    `[runner-callback] result accepted dispatch=${verified.claims.dispatchId} ` +
+      `phase=${verified.claims.phase} outcome=${input.body.outcome} comments=${input.body.comments.length}`,
+  );
 
   const { claims, mappingTeamKey } = verified;
-  if (claims.phase !== input.body.phase) return bad(400, "phase_mismatch");
+  if (claims.phase !== input.body.phase) {
+    console.warn(
+      `[runner-callback] result burned dispatch=${claims.dispatchId} reason=phase_mismatch ` +
+        `token=${claims.phase} body=${input.body.phase}`,
+    );
+    return bad(400, "phase_mismatch");
+  }
 
   // kg-refresh runs have no mapping and no tracker issue to update.
   // Route the callback directly to the refresh rail and return early.
@@ -267,6 +284,7 @@ export async function handleRunnerResult(
     !input.body.prUrl &&
     !input.body.noWork
   ) {
+    console.warn(`[runner-callback] result burned dispatch=${claims.dispatchId} reason=missing_prUrl`);
     return bad(400, "missing_prUrl");
   }
 
@@ -293,6 +311,20 @@ export async function handleRunnerResult(
       await provider.postComment(claims.issueId, c.body);
     } catch (err) {
       warn("postComment", err);
+    }
+  }
+
+  const missedRepos = (input.body.referenceRepoResults ?? []).filter((r) => !r.arrived);
+  if (missedRepos.length > 0) {
+    const lines = [
+      "⚠️ One or more reference repositories could not be cloned and were unavailable to the agent during this run.",
+      "",
+      ...missedRepos.map((r) => `- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`),
+    ];
+    try {
+      await provider.postComment(claims.issueId, lines.join("\n"));
+    } catch (err) {
+      warn("postComment(missing-reference-repos)", err);
     }
   }
 
@@ -392,7 +424,13 @@ export async function handleRunnerResult(
       }
       const job = getJobByDispatchId(claims.dispatchId);
       if (job) {
-        updateJobPrUrl(job.id, input.body.prUrl!);
+        // Stamp both approved=1 and conclusion=runner_approved atomically so the
+        // auto-merge gate can read the mark without waiting for the GHA monitor's
+        // later write (AII-460). The approved column is not touched by updateJobStatus,
+        // so any subsequent monitor write of conclusion=success cannot clear the mark.
+        stampJobApproved(job.id, input.body.prUrl!);
+      } else {
+        console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — approval mark not written`);
       }
     }
   } else if (input.body.phase === "gap-analysis") {
@@ -405,9 +443,15 @@ export async function handleRunnerResult(
       } else {
         markReviewFindingsResolvedForPrSeenBefore(job.repo, prNumber, job.dispatchedAt);
       }
+      // updateJobStatus first: triggers markCommentGapfillRunTerminal for trigger='comment'
+      // jobs (AII-277 livelock) and resets machine_nonce on terminal transition.
+      // stampJobApproved then sets approved=1 durably (updateJobStatus never touches that column).
+      updateJobStatus(job.id, "completed", "runner_approved", job.prUrl!);
+      stampJobApproved(job.id, job.prUrl!);
+    } else if (!job) {
+      console.warn(`[runner-callback] no job row for dispatch=${claims.dispatchId} — gap-analysis approval mark not written`);
     }
   }
-  // gap-analysis success: no status transition
 
   return { status: 200, body: { acknowledged: true, warnings } };
 }
@@ -427,11 +471,18 @@ export async function handleRunnerProgress(
   const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
   if (!verified.ok) return bad(401, verified.reason);
 
-  const stepOrError = validateStepBody(input.body);
-  if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
-
   const githubRunIdOrError = validateGithubRunId(input.body);
   if (githubRunIdOrError && typeof githubRunIdOrError === "object") return githubRunIdOrError;
+
+  // step is optional — a caller may send only githubRunId to bind the workflow run without
+  // reporting a step (e.g. the GHA workflow's early "Bind workflow run ID" step).
+  const hasStep = input.body && typeof input.body === "object" && "step" in input.body;
+  let step: Step | null = null;
+  if (hasStep) {
+    const stepOrError = validateStepBody(input.body);
+    if ("status" in stepOrError && "body" in stepOrError) return stepOrError;
+    step = stepOrError as Step;
+  }
 
   const job = getJobByDispatchId(verified.claims.dispatchId);
   if (!job) return bad(404, "job_not_found");
@@ -440,7 +491,9 @@ export async function handleRunnerProgress(
     claimJobRunId(job.id, githubRunIdOrError);
   }
 
-  upsertStepRecord(job.id, stepOrError);
+  if (step !== null) {
+    upsertStepRecord(job.id, step);
+  }
   return { status: 200, body: { acknowledged: true } };
 }
 
@@ -449,6 +502,10 @@ export interface HandleKgTrackerDataInput {
   secret: string;
   /** Pagination cursor from the previous page (null/undefined for the first page). */
   cursor: string | null | undefined;
+  /** Team key to fetch issues for (from request body). Validated against getMappings() keys. */
+  teamKey: string;
+  /** Returns the set of configured mapping team keys; teamKey is validated against this set. */
+  getMappings: () => Record<string, unknown>;
 }
 
 /**
@@ -476,11 +533,17 @@ export async function handleKgTrackerDataRequest(
 
   if (verified.claims.phase !== "kg-refresh") return bad(403, "Unauthorized");
 
+  const mappedKeys = Object.keys(input.getMappings());
+  if (!input.teamKey || !mappedKeys.includes(input.teamKey)) {
+    console.warn(`[kg-tracker-data] teamKey '${input.teamKey}' is not a mapped team`);
+    return bad(403, "Unauthorized");
+  }
+
   if (!isLinearAuthConfigured()) {
     return { status: 503, body: { error: "Tracker not configured" } };
   }
 
-  const teamKey = verified.mappingTeamKey;
+  const teamKey = input.teamKey;
   const FIRST = 50;
 
   try {
@@ -492,9 +555,13 @@ export async function handleKgTrackerDataRequest(
           query: `query($teamKey: String!, $first: Int!, $after: String) {
             issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
               nodes {
-                id identifier title description
+                id identifier title description branchName
                 state { name type }
-                comments(first: 100) { nodes { body createdAt } }
+                labels { nodes { name } }
+                project { name }
+                parent { identifier }
+                comments(first: 100) { nodes { body user { name } createdAt } }
+                relations { nodes { type relatedIssue { identifier } } }
               }
               pageInfo { hasNextPage endCursor }
             }

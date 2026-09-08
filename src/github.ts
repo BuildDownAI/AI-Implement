@@ -248,6 +248,7 @@ export function buildEnvelopeDispatchInputs(
       ? { sensitiveFiles: { add: mapping.sensitiveAddPatterns ?? undefined, allow: mapping.sensitiveAllowPatterns ?? undefined } }
       : {}),
     ...(mapping.dependencyTokenScope != null && opts.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
+    ...(mapping.referenceRepos != null && opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" ? { referenceRepos: mapping.referenceRepos } : {}),
     ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
     ...(opts.groupingParent ? { groupingParent: true } : {}),
@@ -438,6 +439,68 @@ export async function findWorkflowRunId(
     }
   }
   return null;
+}
+
+export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 30_000, 25_000];
+
+/**
+ * Polls for a kg-refresh workflow run ID up to ~90 s after dispatch.
+ * Injectable findRunId and pollDelaysMs for testability.
+ */
+/**
+ * Body for a GHA-backed kg-refresh `workflow_dispatch`. The envelope's
+ * `runnerCallbackUrl` is the bare base URL (AII-548); `runner_phase` selects the
+ * kg-refresh entry in the shared claude-implement.yml template (AII-556).
+ */
+export function buildKgRefreshGhaDispatchBody(opts: {
+  ref: string;
+  runConfig: string;
+  runToken: string;
+  runProgressToken: string;
+  runnerImage: string | undefined;
+  runnerCallbackUrl?: string | undefined;
+  runnerPhase?: string;
+  jobTimeoutMinutes?: string;
+}): string {
+  return JSON.stringify({
+    ref: opts.ref,
+    inputs: {
+      run_config: opts.runConfig,
+      run_token: opts.runToken,
+      run_progress_token: opts.runProgressToken,
+      ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
+      ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
+      ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
+      ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
+    },
+  });
+}
+
+export async function pollForKgWorkflowRunId(opts: {
+  token: string;
+  owner: string;
+  repo: string;
+  workflowFile: string;
+  branch: string;
+  dispatchTime: Date;
+  pollDelaysMs?: readonly number[];
+  findRunId?: (
+    token: string, owner: string, repo: string, workflowFile: string, branch: string, dispatchedAfter: Date,
+  ) => Promise<number | null>;
+}): Promise<number | undefined> {
+  const {
+    token, owner, repo, workflowFile, branch, dispatchTime,
+    pollDelaysMs = KG_GHA_POLL_DELAYS_MS,
+    findRunId = findWorkflowRunId,
+  } = opts;
+  for (const delay of pollDelaysMs) {
+    await new Promise<void>((r) => setTimeout(r, delay));
+    try {
+      const runId = await findRunId(token, owner, repo, workflowFile, branch, dispatchTime);
+      if (runId) return runId;
+    } catch { /* non-fatal — keep polling */ }
+  }
+  return undefined;
 }
 
 export interface WorkflowRunStatus {
@@ -733,17 +796,17 @@ export async function mergeBranch(
 
 export async function listOpenPullRequests(
   token: string, owner: string, repo: string,
-): Promise<Array<{ number: number; url: string; base: string; head: string; headSha: string; draft: boolean }>> {
+): Promise<Array<{ number: number; url: string; base: string; head: string; headSha: string; draft: boolean; title: string }>> {
   const url = `https://api.github.com/repos/${owner}/${repo}/pulls?state=open&per_page=100`;
   const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
   if (!res.ok) return [];
   const prs = (await res.json()) as Array<{
-    number: number; html_url: string; draft?: boolean;
+    number: number; html_url: string; draft?: boolean; title: string;
     base: { ref: string }; head: { ref: string; sha: string };
   }>;
   return prs.map((p) => ({
     number: p.number, url: p.html_url, base: p.base.ref,
-    head: p.head.ref, headSha: p.head.sha, draft: p.draft === true,
+    head: p.head.ref, headSha: p.head.sha, draft: p.draft === true, title: p.title,
   }));
 }
 

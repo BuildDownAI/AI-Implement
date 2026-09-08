@@ -77,3 +77,21 @@ A preview environment is a deployment of one PR branch, reachable before merge, 
 A reference repository is a second repository that a run clones read-only at dispatch, so the agent can check a claim against real source. A project mapping declares each one with a workspace path and an optional ref.
 
 **Not to be confused with:** The knowledge graph, which serves prose — issues, decisions, and documentation — and holds no source code. Also not a sibling repository, which Dependency Token Scope makes readable so a dependency install can resolve private packages.
+
+## Run record
+
+The run record is the orchestrator's row for one dispatched run of one issue. It holds the run's status and its conclusion. The orchestrator writes it, and the runner reports into it through authenticated callbacks.
+
+**Not to be confused with:** The GitHub Actions run or the Fly machine, which are execution-layer records that the run record points to.
+
+## Approval mark
+
+The approval mark is the conclusion the runner's result callback writes on the run record when the post-push review approved the PR. The auto-merge gate merges a child PR only when the approval mark is present and no run for the issue is still in flight.
+
+**Not to be confused with:** A GitHub review approval, which the runner cannot submit on its own PR.
+
+## Benign terminal
+
+A benign terminal is an end of a run that is not a failure of the run: the PR was merged, or an operator closed it. The runner reports it as its own outcome, and the orchestrator does not retry or alert.
+
+**Not to be confused with:** A review failure or a crash, which stay failures even when the PR is closed afterwards.

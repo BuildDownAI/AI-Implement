@@ -1,6 +1,6 @@
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { formatLlmResultDetail } from "../step-utils.js";
-import { extractFirstJsonObject } from "../json-extract.js";
+import { formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
+import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, plainIssueText } from "../review-verdict.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 
@@ -21,14 +21,6 @@ interface ReviewOutputs extends Record<string, unknown> {
   progressDelta: number;
   feedback: string;
   tokensUsed: number;
-}
-
-interface ReviewJson {
-  approved?: boolean;
-  issues?: string[];
-  score?: number;
-  progress_delta?: number;
-  feedback?: string;
 }
 
 /**
@@ -69,16 +61,16 @@ const REVIEW_PROMPT = (
   prompt += `\n\nRespond with a JSON object only:
 {
   "approved": true | false,
-  "issues": ["<issue 1>", "<issue 2>"],
+  "blocking_issues": [{"title": "<issue title>", "location": "<file/function; omit when unknown>", "problem": "<full failing behavior>", "required_fix": "<full required fix>"}],
   "score": <0-100 quality score>,
   "progress_delta": <0-100 percentage of issue addressed>,
   "feedback": "<concise reviewer notes>"
 }
 
 Approval contract:
-- If issues[] is non-empty, approved must be false.
+- If blocking_issues[] is non-empty, approved must be false.
 - Do not set approved=true while listing unresolved issues.
-- Put every required fix in issues[]; feedback is only summary context.`;
+- Put every required fix in blocking_issues[]; feedback is only summary context.`;
 
   if (reviewRubric) {
     prompt += `\n\n## Run-specific review rubric\n${reviewRubric}`;
@@ -101,38 +93,32 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
 
     const result = await context.llmExecutor.invoke({
       prompt,
-      model: model ?? "claude-sonnet-4-6",
+      model: model ?? "claude-sonnet-5",
       tools: READ_ONLY_ALLOWED_TOOLS,
+      jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
     });
 
     if (result.exitCode !== 0) {
       throw new Error(`Review LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
     }
-
-    let approved = false;
-    let issues: string[] = [];
-    let score = 0;
-    let progressDelta = 0;
-    let feedback = "";
-
-    try {
-      const parsed = extractFirstJsonObject(result.stdout);
-      if (parsed) {
-        const json = parsed as ReviewJson;
-        issues = Array.isArray(json.issues)
-          ? json.issues.filter((issue): issue is string => typeof issue === "string" && issue.trim().length > 0)
-          : [];
-        approved = (json.approved ?? false) && issues.length === 0;
-        score = typeof json.score === "number" ? json.score : 0;
-        progressDelta = typeof json.progress_delta === "number" ? json.progress_delta : 0;
-        feedback = json.feedback ?? "";
-      } else {
-        feedback = result.stdout.trim();
-      }
-    } catch {
-      feedback = result.stdout.trim();
+    const terminalFailure = terminalResultFailureMessage(result, "Review LLM invocation");
+    if (terminalFailure) throw new Error(terminalFailure);
+    if (result.structuredOutput === undefined) {
+      throw new Error(`Review LLM invocation did not return structured_output${formatLlmResultDetail(result)}`);
     }
 
-    return { approved, issues, score, progressDelta, feedback, tokensUsed: result.tokensUsed };
+    const verdict = parseReviewVerdict(result.structuredOutput);
+    if (!verdict.approved && verdict.blockingIssues.length === 0) {
+      throw new Error("approved=false requires at least one blocking_issues entry");
+    }
+
+    return {
+      approved: verdict.approved,
+      issues: verdict.blockingIssues.map(plainIssueText),
+      score: verdict.score,
+      progressDelta: verdict.progressDelta,
+      feedback: verdict.feedback,
+      tokensUsed: result.tokensUsed,
+    };
   },
 };
