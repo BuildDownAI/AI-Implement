@@ -130,6 +130,7 @@ describe("kg-refresh", () => {
     expect(s.lastRefresh?.ok).toBe(true);
     expect(s.lastRefresh?.stampBefore).toBe(OLD_STAMP);
     expect(s.lastRefresh?.stampAfter).toBe(NEW_STAMP);
+    expect(s.servedStamp).toBe(NEW_STAMP);
     expect(restart).toHaveBeenCalledTimes(1);
 
     const current = join(dataRoot, "current");
@@ -503,6 +504,32 @@ describe("kg-refresh", () => {
     const s = await handle.status();
     expect(s.lastRefresh?.gate).toBe("staging");
     expect(persistSnapshotSha).not.toHaveBeenCalled();
+  });
+
+  // AII-579: status() reads servedStamp live from the sidecar, so a failed
+  // refresh with stampAfter: null does not mask the sidecar's real stamp.
+  it("pre-staging failure: servedStamp reflects sidecar stamp, not null", async () => {
+    // Establish currentDir/sources.yml via a successful refresh.
+    await handle.trigger();
+    await waitDone();
+    // servedStamp = NEW_STAMP after restart; currentDir has sources.yml.
+
+    // Sidecar goes down: stampBefore = null during the next fetch,
+    // which propagates to stampAfter: null on staging failure.
+    sidecarUp = false;
+    materialize.mockImplementationOnce(async () => {
+      throw new Error("ingest runner failed: KG_SNAPSHOT_TRACKER_REGRESSION");
+    });
+    await handle.trigger();
+    await waitDone();
+
+    // Sidecar comes back; it is still serving the graph from the prior refresh.
+    sidecarUp = true;
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.stampAfter).toBeNull();
+    expect(s.servedStamp).toBe(NEW_STAMP);
   });
 
   // ---- AII-495: dispatch-path tests ----------------------------------------

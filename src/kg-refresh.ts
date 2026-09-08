@@ -416,6 +416,9 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       await mkdir(stagingDir, { recursive: true });
       await copyFile(join(source, "out", "graph.trig"), join(stagingDir, "graph.trig"));
       await copyFile(join(source, "out", "embeddings.npz"), join(stagingDir, "embeddings.npz"));
+      if (existsSync(join(source, "sources.yml"))) {
+        await copyFile(join(source, "sources.yml"), join(stagingDir, "sources.yml"));
+      }
       // The marker is written LAST — the atomic-overlay invariant.
       await writeFile(join(stagingDir, COMPLETION_MARKER), new Date().toISOString());
     } catch (err) {
@@ -930,11 +933,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     },
 
     async status() {
+      const servedDir = existsSync(currentDir) ? currentDir : kgDir;
       return {
         running,
         deployHeld: deployHeld(),
         kgDegraded: isKgDegraded(),
-        servedStamp: lastRefresh?.stampAfter ?? null,
+        servedStamp: await readServedStamp(await readNamespace(servedDir)),
         lastRefresh,
         stage,
       };
