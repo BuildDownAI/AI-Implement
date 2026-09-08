@@ -2887,6 +2887,14 @@ describe("GHA kg-refresh dispatch — run ID polling (pollForKgWorkflowRunId)", 
 //
 // The distinction matters: tsx never touches /app/dist; only the CI gate does.
 
+describe("kg-refresh runner log level", () => {
+  it("builds its executor from AI_IMPLEMENT_LOG_LEVEL through resolveLogLevel, like run-autonomous", () => {
+    const src = readFileSync(join(fileURLToPath(new URL(".", import.meta.url)), "..", "pipeline", "kg-refresh-run.ts"), "utf8");
+    expect(src).toContain("new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL))");
+    expect(src).not.toContain('new ClaudeCliExecutor(workspaceDir, "summary")');
+  });
+});
+
 describe("pipeline/kg-refresh-run.ts module-load (entrypoint smoke test)", () => {
   it("exits with env validation error, not Cannot find module, when GITHUB_TOKEN is absent", () => {
     const workspaceRoot = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
