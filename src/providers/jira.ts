@@ -8,7 +8,6 @@ import type {
   TicketingProvider,
 } from "./types.js";
 import { MissingProviderConfigError } from "./types.js";
-import { normalizeBaseBranch } from "../base-branch.js";
 import { JiraApiError, JiraClient } from "./jira-client.js";
 import {
   getCachedFieldIds,
@@ -127,30 +126,12 @@ function isTerminalStatus(fields: Record<string, unknown>): boolean {
   return ((fields.status as { statusCategory?: { key?: string } } | null)?.statusCategory?.key) === "done";
 }
 
-/**
- * Reads and validates the "AI-Implement Base Branch" field value. Defensive about
- * shape the same way parseMultiSelectValues is below: the field may be created as
- * Paragraph (rich text, serializes as an ADF object) or a number/array field rather
- * than the expected short-text field, so a bare `.trim()` on an unchecked cast can
- * throw and take down mapIssue (and the whole snapshot) for one bad field.
- *
- * Also runs the value through normalizeBaseBranch so a human-typed value that would
- * be unsafe as a git refspec segment is caught here — with a warning and the field
- * left unset for this issue — rather than reaching a dispatch/git-fetch path
- * unchecked. One bad value disables the feature for its own issue only.
+/** Preserve a nonblank branch choice so dispatch validation can refuse invalid refs.
+ * Dropping an invalid choice here would silently dispatch against the default branch.
+ * Unexpected Jira field shapes remain absent, matching other optional field readers.
  */
-function readBaseBranchValue(raw: unknown, issueKey: string): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  const trimmed = raw.trim();
-  if (trimmed === "") return undefined;
-  try {
-    return normalizeBaseBranch(trimmed) ?? undefined;
-  } catch (err) {
-    console.warn(
-      `[jira] Ignoring invalid AI-Implement Base Branch value on ${issueKey}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return undefined;
-  }
+function readBaseBranchValue(raw: unknown): string | undefined {
+  return typeof raw === "string" ? raw.trim() || undefined : undefined;
 }
 
 function parseMultiSelectValues(raw: unknown): string[] {
@@ -347,7 +328,7 @@ export class JiraProvider implements TicketingProvider {
       ? parseMultiSelectValues(raw.fields[fieldIds.profilesFieldId])
       : [];
     const baseBranch = fieldIds.baseBranchFieldId
-      ? readBaseBranchValue(raw.fields[fieldIds.baseBranchFieldId], raw.key)
+      ? readBaseBranchValue(raw.fields[fieldIds.baseBranchFieldId])
       : undefined;
     return {
       id: raw.id,

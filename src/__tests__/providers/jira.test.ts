@@ -4,6 +4,7 @@ import { JiraClient } from "../../providers/jira-client.js";
 import { MissingProviderConfigError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
 import { validateTicketingConfig } from "../../providers/ticketing-config.js";
+import { validateIssueBaseBranch } from "../../base-branch.js";
 import type { RepoMapping } from "../../config.js";
 
 const stubClient = () => new JiraClient({ token: "t", cloudId: "c" });
@@ -349,6 +350,29 @@ describe("JiraProvider.fetchAIImplementSnapshot", () => {
 
   const searchOk = (issues: unknown[]): Response =>
     ({ ok: true, json: async () => ({ issues }) }) as Response;
+
+  it("refuses an invalid branch from the Jira snapshot instead of falling back to the default", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const raw = issue("10001", "P-1", "Ready", "acme/x");
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(searchOk([{ ...raw, fields: { ...raw.fields, customfield_10300: "release..bad" } }]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+    const p = makeProvider({ cacheScope: "invalid-base", mappings: { "acme/x": jiraMapping({
+      statusFieldOverride: "customfield_10100", repoFieldOverride: "customfield_10101",
+      profilesFieldOverride: "customfield_10200", baseBranchFieldOverride: "customfield_10300",
+    }) } });
+    const snap = await p.fetchAIImplementSnapshot();
+    const markFailed = vi.fn(async () => {});
+    const lookup = vi.fn(async () => null);
+    const result = await validateIssueBaseBranch({
+      ghToken: "test", owner: "acme", repo: "x", issue: snap.needsPlanning[0],
+      markFailed, getBranchShaImpl: lookup,
+    });
+    expect(result).toEqual({ refused: true });
+    expect(markFailed).toHaveBeenCalledWith("10001", "acme/x", expect.stringContaining("invalid"));
+    expect(lookup).not.toHaveBeenCalled();
+  });
 
   it("buckets issues by status field value", async () => {
     vi.mocked(fetch)
