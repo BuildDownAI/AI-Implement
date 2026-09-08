@@ -411,6 +411,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           githubToken: ctx.getOutputs("clone").githubToken,
           clonedRef: ctx.getOutputs("clone").clonedRef,
           defaultBranch: ctx.data.branch,
+          dryRun: ctx.data.kgDryRun === true,
         }),
       };
 

@@ -20,6 +20,13 @@ export interface LocalSessionLaunchOptions {
   secretEnv: Record<string, string>;
   /** If set, bind-mounts this absolute path at /workspace inside the container. */
   workspace?: string;
+  /**
+   * Additional volume mounts passed verbatim as docker run -v arguments.
+   * Each entry is a Docker volume spec: "host_path:container_path" or
+   * "host_path:container_path:ro". Used by kg-refresh runs which mount the
+   * KG source repo at /kg-source and the tracker-data file at /dev-tracker-data.json.
+   */
+  extraVolumes?: string[];
 }
 
 export interface LocalSessionHandle {
@@ -57,6 +64,10 @@ export async function launchLocalSession(
 
   if (opts.workspace) {
     args.push("-v", `${opts.workspace}:/workspace`);
+  }
+
+  for (const vol of opts.extraVolumes ?? []) {
+    args.push("-v", vol);
   }
 
   args.push("--env-file", envFilePath);

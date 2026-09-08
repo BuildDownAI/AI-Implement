@@ -202,6 +202,23 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
       sourcesYmlReaderImpl: readTeams = readTrackerTeams,
     } = inputs;
 
+    // Dev-harness kg-refresh: when KG_TRACKER_DATA_FILE points to a pre-fetched file,
+    // copy it into the workspace and return fetched=true without calling the orchestrator.
+    const preloadedFile = process.env.KG_TRACKER_DATA_FILE?.trim() || null;
+    if (preloadedFile && existsSync(preloadedFile)) {
+      const content = readFileSync(preloadedFile, "utf-8");
+      let issueCount = 0;
+      try {
+        const parsed = JSON.parse(content) as unknown;
+        issueCount = Array.isArray(parsed) ? parsed.length : 0;
+      } catch {
+        // malformed JSON → report 0 issues but still write the file
+      }
+      writeFn(join(workspaceDir, "tracker-data.json"), content);
+      console.log(`[kg-tracker-data] using pre-fetched data from ${preloadedFile}: ${issueCount} issues`);
+      return { fetched: true, issueCount };
+    }
+
     // Read the bearer secret directly from the environment so it never appears
     // in step inputs, which are persisted to the step log and exposed via the admin API.
     const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
