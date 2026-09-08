@@ -51,8 +51,9 @@ describe("claude-kg-refresh.yml template", () => {
   it("masks run_progress_token in the Mask runner callback token step", () => {
     const step = getMaskStep();
     expect(step).toBeDefined();
-    expect(step.run).toContain("inputs.run_progress_token");
-    expect(step.run).toContain("add-mask");
+    expect(step.env?.RUN_PROGRESS_TOKEN).toContain("run_progress_token");
+    expect(step.run).toContain("::add-mask::$RUN_PROGRESS_TOKEN");
+    expect(step.run).not.toContain("inputs.run_progress_token");
   });
 
   it("exports RUN_PROGRESS_TOKEN in the Run pipeline step env", () => {
