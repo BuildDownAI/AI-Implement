@@ -307,7 +307,7 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     codeRepo = readCodeRepoFromSourcesYml(sourceDir);
     secondaryRepos = readSecondaryReposFromSourcesYml(sourceDir);
   } catch {
-    // Could not fetch sources.yml; proceed with no slug list.
+    results.push({ repo: kgRepoSlug, grant: "sources.yml:read", ok: false, status: 0 });
   } finally {
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }

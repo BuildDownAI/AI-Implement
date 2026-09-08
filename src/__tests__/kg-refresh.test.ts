@@ -1888,5 +1888,20 @@ describe("kg-refresh", () => {
       expect(r.status).toBe(501);
       expect(probeRepo).not.toHaveBeenCalled();
     });
+
+    it("sources.yml fetch throws — gate=preflight, ok=false, no dispatch", async () => {
+      buildPreflight({
+        fetchTarball: vi.fn(async () => { throw new Error("network error"); }) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect((s.lastRefresh?.gate as RefreshGate)).toBe("preflight");
+      expect(s.lastRefresh?.ok).toBe(false);
+      expect(s.lastRefresh?.detail).toContain("TestOrg/test-kg");
+      expect(s.lastRefresh?.detail).toContain("sources.yml:read");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
   });
 });
