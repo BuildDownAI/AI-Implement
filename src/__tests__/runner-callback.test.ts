@@ -733,6 +733,45 @@ describe("handleRunnerResult — reference repositories", () => {
     expect(refComment).toContain("https://github.com/c/d");
     expect(refComment).not.toContain("https://github.com/a/b");
   });
+
+  it("returns 200 with a warning when posting the missing-repo comment throws", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    fake.postComment = async () => {
+      throw new Error("network down");
+    };
+    // Silence the expected console.error noise.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "no-auth" },
+    ];
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        // Empty so the per-comment loop never calls postComment: the only call left is
+        // the reference-repo one, so the warning cannot have come from anywhere else.
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    expect(
+      (res.body.warnings as string[]).some((w) => w.includes("missing-reference-repos")),
+    ).toBe(true);
+  });
 });
 
 describe("handleRunnerProgress", () => {
