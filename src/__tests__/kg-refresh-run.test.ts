@@ -2960,6 +2960,44 @@ describe("readSecondaryReposFromSourcesYml", () => {
     );
     expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([{ slug: "org/extra" }]);
   });
+
+  it("returns branch when secondary_repos entry has a branch key", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: testing\n  - slug: BuildDownAI/docs\n",
+    );
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([
+      { slug: "BuildDownAI/skills", branch: "testing" },
+      { slug: "BuildDownAI/docs" },
+    ]);
+  });
+
+  it("trims branch value and returns trimmed string", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"  testing  \"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0].branch).toBe("testing");
+  });
+
+  it("omits branch when value is an empty string", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when branch key is absent from entry", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
 });
 
 
@@ -3094,6 +3132,90 @@ describe("applyWiring for clone-secondary-repos", () => {
     const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
     expect(step?.type).toBe("clone");
     expect(step?.moduleId).toBeUndefined();
+  });
+
+  it("inputs include branch on targets when sources.yml declares branch for a secondary repo", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: testing\n  - slug: BuildDownAI/docs\n",
+    );
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    const targets = inputs.targets as Array<{ repoOwner: string; repoRepo: string; targetDir: string; branch?: string }>;
+    expect(targets).toHaveLength(2);
+    expect(targets[0].branch).toBe("testing");
+    expect(targets[1]).not.toHaveProperty("branch");
+  });
+
+  it("inputs include depth: 'full' when clone-secondary-repos step declares depth: full", () => {
+    const KG_WITH_DEPTH_YAML = `id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
+  - id: clone-secondary-repos
+    type: clone
+    depth: full
+  - id: kg-snapshot-push
+    type: custom
+    moduleId: kg-snapshot-push
+`;
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_WITH_DEPTH_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.depth).toBe("full");
+  });
+
+  it("inputs have depth: undefined when clone-secondary-repos step omits depth", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.depth).toBeUndefined();
+  });
+
+  it("clone step in kg-refresh.yml declares depth: full and loader preserves it", () => {
+    const KG_WITH_CLONE_DEPTH_YAML = `id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+    depth: full
+  - id: kg-snapshot-push
+    type: custom
+    moduleId: kg-snapshot-push
+`;
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_WITH_CLONE_DEPTH_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone");
+    expect(step).toBeDefined();
+    expect((step as unknown as Record<string, unknown>).depth).toBe("full");
   });
 });
 

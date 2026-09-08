@@ -96,12 +96,14 @@ function ownerRepo(v: string): string | null {
 }
 
 /**
- * Reads `secondary_repos[].slug` from sources.yml.
+ * Reads `secondary_repos[].slug` and optional `branch` from sources.yml.
  * Returns entries where `slug` passes the "owner/repo" validation.
+ * When `branch` is present and non-empty after trimming, it is included in the
+ * returned entry; otherwise the entry has no `branch` key.
  * Returns an empty array when the file is absent, the key is missing, the list
  * is empty, or the file cannot be parsed.
  */
-export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ slug: string }> {
+export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ slug: string; branch?: string }> {
   const filePath = join(workspaceDir, "sources.yml");
   if (!existsSync(filePath)) return [];
 
@@ -124,7 +126,10 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
           )
           .flatMap((r) => {
             const slug = typeof r.slug === "string" ? ownerRepo(r.slug.trim()) : null;
-            return slug !== null ? [{ slug }] : [];
+            if (slug === null) return [];
+            const branchRaw = typeof r.branch === "string" ? r.branch.trim() : "";
+            const branch = branchRaw || undefined;
+            return [{ slug, ...(branch !== undefined ? { branch } : {}) }];
           });
       }
     }

@@ -346,11 +346,11 @@ function applyWiring(step: YamlStep): StepDefinition {
         inputs: (ctx: PipelineContext) => {
           const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
           const repos = readSecondaryReposFromSourcesYml(workspaceDir);
-          const targets = repos.map(({ slug }) => {
+          const targets = repos.map(({ slug, branch }) => {
             const slashIdx = slug.indexOf("/");
             const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
             const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
-            return { repoOwner, repoRepo, targetDir: join("repos", basename(slug)) };
+            return { repoOwner, repoRepo, targetDir: join("repos", basename(slug)), ...(branch !== undefined ? { branch } : {}) };
           });
           return {
             repoOwner: "",
@@ -359,6 +359,7 @@ function applyWiring(step: YamlStep): StepDefinition {
             githubToken: "",
             workspaceDir,
             targets,
+            depth: step.depth,
           };
         },
         skip: (ctx: PipelineContext) => {
