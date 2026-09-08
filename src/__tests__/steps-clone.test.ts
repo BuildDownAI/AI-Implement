@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import os from "node:os";
+import path from "node:path";
 import { cloneStep } from "../pipeline/steps/clone.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
@@ -1069,6 +1071,221 @@ describe("cloneStep", () => {
 
       expect(outputs.cloneMethod).toBe("mounted");
       expect(outputs.clonedRef).toBe("unknown");
+    });
+  });
+
+  // Every other test in this file asserts spawnSync *argv* against a mock — it can't see
+  // whether git actually does what the argv implies. This describe instead points the
+  // already-mocked spawnSync/fs.existsSync/fs.mkdirSync at their real implementations
+  // (via vi.importActual, never vi.unmock/resetModules) and runs cloneStep against a
+  // throwaway bare repo served over file://, then asserts on git's real resulting state.
+  // A bare local path (no scheme) would make git silently ignore --depth, so the fixture
+  // is served over file:// to keep the shallow-clone assertions meaningful.
+  describe("real git (throwaway repo, file:// remote)", () => {
+    const FIXED_OWNER = "realgit-owner";
+    const FIXED_REPO = "realgit-repo";
+    const FIXED_TOKEN = "test-token";
+
+    let gitAvailable = true;
+    let realSpawnSync: typeof import("node:child_process").spawnSync;
+    let realFs: typeof import("node:fs");
+    let tmpRoot = "";
+    let bareRepoDir = "";
+    let mainTipSha = "";
+    let fileUrl = "";
+
+    function runRealGit(args: string[], cwd: string): string {
+      const result = realSpawnSync("git", args, {
+        cwd,
+        env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (result.status !== 0) {
+        throw new Error(`git ${args.join(" ")} failed (exit ${result.status ?? "null"}): ${result.stderr?.toString()}`);
+      }
+      return (result.stdout ?? Buffer.from("")).toString().trim();
+    }
+
+    beforeAll(async () => {
+      const cp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      realSpawnSync = cp.spawnSync;
+      realFs = await vi.importActual<typeof import("node:fs")>("node:fs");
+
+      const check = realSpawnSync("git", ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+      if (check.error || check.status !== 0) {
+        gitAvailable = false;
+        return;
+      }
+
+      tmpRoot = realFs.mkdtempSync(path.join(os.tmpdir(), "clone-step-real-git-"));
+      const srcDir = path.join(tmpRoot, "src");
+      realFs.mkdirSync(srcDir);
+
+      runRealGit(["init", "-q"], srcDir);
+      runRealGit(["symbolic-ref", "HEAD", "refs/heads/main"], srcDir);
+      runRealGit(["config", "user.name", "Test"], srcDir);
+      runRealGit(["config", "user.email", "test@example.com"], srcDir);
+      runRealGit(["commit", "--allow-empty", "-q", "-m", "main-1"], srcDir);
+      runRealGit(["commit", "--allow-empty", "-q", "-m", "main-2"], srcDir);
+      runRealGit(["commit", "--allow-empty", "-q", "-m", "main-3"], srcDir);
+      mainTipSha = runRealGit(["rev-parse", "HEAD"], srcDir);
+      runRealGit(["checkout", "-q", "-b", "testing"], srcDir);
+      runRealGit(["commit", "--allow-empty", "-q", "-m", "testing-1"], srcDir);
+
+      bareRepoDir = path.join(tmpRoot, "bare.git");
+      runRealGit(["clone", "-q", "--bare", srcDir, bareRepoDir], tmpRoot);
+      runRealGit(["symbolic-ref", "HEAD", "refs/heads/main"], bareRepoDir);
+
+      fileUrl = `file://${bareRepoDir}`;
+    });
+
+    afterAll(() => {
+      if (tmpRoot) {
+        realFs.rmSync(tmpRoot, { recursive: true, force: true });
+      }
+    });
+
+    beforeEach(() => {
+      if (!gitAvailable) return;
+      // Redirect the exact URLs cloneStep constructs (both the token-embedded primary-clone
+      // form and the bare targetDir/targets form) to the local bare repo, via git's
+      // env-based config injection — no real GitHub host is ever contacted.
+      const primaryAlias = `https://x-access-token:${FIXED_TOKEN}@github.com/${FIXED_OWNER}/${FIXED_REPO}.git`;
+      const secondaryAlias = `https://github.com/${FIXED_OWNER}/${FIXED_REPO}.git`;
+      vi.stubEnv("GIT_CONFIG_COUNT", "2");
+      vi.stubEnv("GIT_CONFIG_KEY_0", `url.${fileUrl}.insteadOf`);
+      vi.stubEnv("GIT_CONFIG_VALUE_0", primaryAlias);
+      vi.stubEnv("GIT_CONFIG_KEY_1", `url.${fileUrl}.insteadOf`);
+      vi.stubEnv("GIT_CONFIG_VALUE_1", secondaryAlias);
+      vi.mocked(spawnSync).mockImplementation(realSpawnSync);
+      vi.mocked(fs.existsSync).mockImplementation(realFs.existsSync);
+      vi.mocked(fs.mkdirSync).mockImplementation(realFs.mkdirSync);
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      vi.mocked(spawnSync).mockReset();
+      vi.mocked(fs.existsSync).mockReset();
+      vi.mocked(fs.mkdirSync).mockReset();
+    });
+
+    it("primary path, fresh clone with depth: full has full history and is not shallow", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "primary-fresh-full");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: FIXED_OWNER,
+        repoRepo: FIXED_REPO,
+        branch: "main",
+        githubToken: FIXED_TOKEN,
+        workspaceDir,
+        depth: "full" as const,
+      }, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(runRealGit(["rev-list", "--count", "HEAD"], workspaceDir)).toBe("3");
+      expect(runRealGit(["rev-parse", "--is-shallow-repository"], workspaceDir)).toBe("false");
+    });
+
+    it("primary path, fresh clone with depth unset is shallow with a single commit (regression guard)", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "primary-fresh-shallow");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: FIXED_OWNER,
+        repoRepo: FIXED_REPO,
+        branch: "main",
+        githubToken: FIXED_TOKEN,
+        workspaceDir,
+      }, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(runRealGit(["rev-list", "--count", "HEAD"], workspaceDir)).toBe("1");
+      expect(runRealGit(["rev-parse", "--is-shallow-repository"], workspaceDir)).toBe("true");
+    });
+
+    it("primary path, existing shallow directory unshallows to full history when depth: full is requested", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "primary-existing-unshallow");
+      const inputsBase = {
+        repoOwner: FIXED_OWNER,
+        repoRepo: FIXED_REPO,
+        branch: "main",
+        githubToken: FIXED_TOKEN,
+        workspaceDir,
+      };
+
+      await cloneStep.run(makeContext(), inputsBase, new NoopStepReporter());
+      expect(runRealGit(["rev-list", "--count", "HEAD"], workspaceDir)).toBe("1");
+
+      const outputs = await cloneStep.run(
+        makeContext(),
+        { ...inputsBase, depth: "full" as const },
+        new NoopStepReporter(),
+      );
+
+      expect(outputs.cloneMethod).toBe("incremental");
+      expect(runRealGit(["rev-list", "--count", "HEAD"], workspaceDir)).toBe("3");
+      expect(runRealGit(["rev-parse", "--is-shallow-repository"], workspaceDir)).toBe("false");
+    });
+
+    it("targetDir path clones with depth: 2", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "targetdir-depth2");
+      const effectiveDir = path.join(workspaceDir, "repo");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: FIXED_OWNER,
+        repoRepo: FIXED_REPO,
+        branch: "",
+        githubToken: "",
+        workspaceDir,
+        targetDir: "repo",
+        depth: 2,
+      }, new NoopStepReporter());
+
+      expect(outputs.cloneMethod).toBe("fresh");
+      expect(outputs.workspaceDir).toBe(effectiveDir);
+      expect(runRealGit(["rev-list", "--count", "HEAD"], effectiveDir)).toBe("2");
+    });
+
+    it("targets path clones an explicit branch with depth: full (AII-582)", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "targets-branch-full");
+      const effectiveDir = path.join(workspaceDir, "repo");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: "",
+        repoRepo: "",
+        branch: "",
+        githubToken: "",
+        workspaceDir,
+        targets: [{ repoOwner: FIXED_OWNER, repoRepo: FIXED_REPO, targetDir: "repo", branch: "testing" }],
+        depth: "full" as const,
+      }, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(1);
+      expect(runRealGit(["rev-list", "--count", "HEAD"], effectiveDir)).toBe("4");
+      expect(runRealGit(["rev-parse", "--abbrev-ref", "HEAD"], effectiveDir)).toBe("testing");
+    });
+
+    it("targets path without a branch clones the default branch shallowly", async () => {
+      if (!gitAvailable) return;
+      const workspaceDir = path.join(tmpRoot, "targets-no-branch");
+      const effectiveDir = path.join(workspaceDir, "repo");
+
+      const outputs = await cloneStep.run(makeContext(), {
+        repoOwner: "",
+        repoRepo: "",
+        branch: "",
+        githubToken: "",
+        workspaceDir,
+        targets: [{ repoOwner: FIXED_OWNER, repoRepo: FIXED_REPO, targetDir: "repo" }],
+      }, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(1);
+      expect(runRealGit(["rev-parse", "HEAD"], effectiveDir)).toBe(mainTipSha);
+      expect(runRealGit(["rev-parse", "--is-shallow-repository"], effectiveDir)).toBe("true");
     });
   });
 });
