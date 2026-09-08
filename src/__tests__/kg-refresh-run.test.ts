@@ -3207,6 +3207,15 @@ describe("readSecondaryReposFromSourcesYml", () => {
     const result = readSecondaryReposFromSourcesYml(tmpDir);
     expect(result[0]).not.toHaveProperty("branch");
   });
+
+  it("omits branch when value starts with dash (flag-injection guard)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"--upload-pack=evil\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
 });
 
 

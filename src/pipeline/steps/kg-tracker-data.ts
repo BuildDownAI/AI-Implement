@@ -128,7 +128,7 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
             const slug = typeof r.slug === "string" ? ownerRepo(r.slug.trim()) : null;
             if (slug === null) return [];
             const branchRaw = typeof r.branch === "string" ? r.branch.trim() : "";
-            const branch = branchRaw || undefined;
+            const branch = branchRaw && !branchRaw.startsWith("-") ? branchRaw : undefined;
             return [{ slug, ...(branch !== undefined ? { branch } : {}) }];
           });
       }
