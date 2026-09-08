@@ -28,11 +28,11 @@ interface CloneInputs extends Record<string, unknown> {
    * logs a warning and continues rather than aborting. Returns { clonedCount }.
    * Used by the clone-secondary-repos step in the kg-refresh pipeline.
    */
-  targets?: Array<{ repoOwner: string; repoRepo: string; targetDir: string }>;
+  targets?: Array<{ repoOwner: string; repoRepo: string; targetDir: string; branch?: string }>;
   /**
-   * Clone depth for secondary (targetDir) clones only. "full" omits --depth to retrieve
-   * complete history; a number sets --depth to that value; omitting defaults to 1.
-   * The primary (implement) clone path ignores this field and always uses --depth 1.
+   * Clone depth. "full" omits --depth to retrieve complete history; a number sets --depth
+   * to that value; omitting defaults to 1. Honored by secondary (targetDir and targets)
+   * clones and by the primary workspace clone path.
    */
   depth?: number | "full";
 }
@@ -81,21 +81,60 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
         fs.mkdirSync(path.dirname(effectiveDir), { recursive: true });
 
         if (fs.existsSync(path.join(effectiveDir, ".git"))) {
-          const fetchResult = spawnSync(
-            "git",
-            ["fetch", "--depth", "1", "origin"],
-            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
-          );
-          if (fetchResult.status !== 0) {
-            const stderr = (fetchResult.stderr?.toString() ?? "").trim();
-            console.warn(
-              `[clone] clone failed for ${target.repoOwner}/${target.repoRepo} (exit ${fetchResult.status ?? "null"}): ${stderr} — continuing`,
+          if (depth === "full") {
+            const isShallowResult = spawnSync(
+              "git",
+              ["rev-parse", "--is-shallow-repository"],
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
             );
-            continue;
+            if (isShallowResult.stdout?.toString().trim() === "true") {
+              const unshallowResult = spawnSync(
+                "git",
+                ["fetch", "--unshallow", "origin"],
+                { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+              );
+              if (unshallowResult.status !== 0) {
+                const stderr = (unshallowResult.stderr?.toString() ?? "").trim();
+                console.warn(
+                  `[clone] clone failed for ${target.repoOwner}/${target.repoRepo} (exit ${unshallowResult.status ?? "null"}): ${stderr} — continuing`,
+                );
+                continue;
+              }
+            }
+            const branchArgs = target.branch ? [target.branch] : [];
+            const fetchResult = spawnSync(
+              "git",
+              ["fetch", "origin", ...branchArgs],
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+            );
+            if (fetchResult.status !== 0) {
+              const stderr = (fetchResult.stderr?.toString() ?? "").trim();
+              console.warn(
+                `[clone] clone failed for ${target.repoOwner}/${target.repoRepo} (exit ${fetchResult.status ?? "null"}): ${stderr} — continuing`,
+              );
+              continue;
+            }
+          } else {
+            const branchArgs = target.branch ? [target.branch] : [];
+            const fetchResult = spawnSync(
+              "git",
+              ["fetch", "--depth", String(depth ?? 1), "origin", ...branchArgs],
+              { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+            );
+            if (fetchResult.status !== 0) {
+              const stderr = (fetchResult.stderr?.toString() ?? "").trim();
+              console.warn(
+                `[clone] clone failed for ${target.repoOwner}/${target.repoRepo} (exit ${fetchResult.status ?? "null"}): ${stderr} — continuing`,
+              );
+              continue;
+            }
           }
+          // fetch origin <branch> lands in FETCH_HEAD under a single-branch refspec
+          // (does not create refs/remotes/origin/<branch>), so always reset to FETCH_HEAD.
+          const resetTarget = "FETCH_HEAD";
           const resetResult = spawnSync(
             "git",
-            ["reset", "--hard", "FETCH_HEAD"],
+            ["reset", "--hard", resetTarget],
             { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
           );
           if (resetResult.status !== 0) {
@@ -106,9 +145,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
             continue;
           }
         } else {
+          const branchArgs = target.branch ? ["--branch", target.branch, "--single-branch"] : [];
+          const depthArgs = depth === "full" ? [] : ["--depth", String(depth ?? 1)];
           const cloneResult = spawnSync(
             "git",
-            ["clone", "--depth", "1", bareRemote, effectiveDir],
+            ["clone", ...depthArgs, ...branchArgs, bareRemote, effectiveDir],
             { stdio: ["ignore", "pipe", "pipe"] },
           );
           if (cloneResult.status !== 0) {
@@ -240,14 +281,43 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
 
     if (fs.existsSync(path.join(workspaceDir, ".git"))) {
       // Incremental: fetch the branch and reset to it
-      const fetchResult = spawnSync(
-        "git",
-        ["fetch", "--depth", "1", "origin", branch],
-        { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_ASKPASS: "echo", GIT_USERNAME: "x-access-token", GIT_PASSWORD: githubToken } },
-      );
-      if (fetchResult.status !== 0) {
-        const stderr = (fetchResult.stderr?.toString() ?? "").replace(githubToken, "***");
-        throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+      const gitAuthEnv = { ...process.env, GIT_ASKPASS: "echo", GIT_USERNAME: "x-access-token", GIT_PASSWORD: githubToken };
+      if (depth === "full") {
+        const isShallowResult = spawnSync(
+          "git",
+          ["rev-parse", "--is-shallow-repository"],
+          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"] },
+        );
+        if (isShallowResult.stdout?.toString().trim() === "true") {
+          const unshallowResult = spawnSync(
+            "git",
+            ["fetch", "--unshallow", "origin"],
+            { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitAuthEnv },
+          );
+          if (unshallowResult.status !== 0) {
+            const stderr = (unshallowResult.stderr?.toString() ?? "").replace(githubToken, "***");
+            throw new Error(`git fetch --unshallow failed (exit ${unshallowResult.status ?? "null"}): ${stderr}`);
+          }
+        }
+        const fetchResult = spawnSync(
+          "git",
+          ["fetch", "origin", branch],
+          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitAuthEnv },
+        );
+        if (fetchResult.status !== 0) {
+          const stderr = (fetchResult.stderr?.toString() ?? "").replace(githubToken, "***");
+          throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+        }
+      } else {
+        const fetchResult = spawnSync(
+          "git",
+          ["fetch", "--depth", "1", "origin", branch],
+          { cwd: workspaceDir, stdio: ["ignore", "pipe", "pipe"], env: gitAuthEnv },
+        );
+        if (fetchResult.status !== 0) {
+          const stderr = (fetchResult.stderr?.toString() ?? "").replace(githubToken, "***");
+          throw new Error(`git fetch failed (exit ${fetchResult.status ?? "null"}): ${stderr}`);
+        }
       }
 
       const resetResult = spawnSync(
@@ -263,9 +333,10 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       cloneMethod = "incremental";
     } else {
       // Fresh clone — embed token in URL but pipe stdio so token never prints
+      const depthArgs = depth === "full" ? [] : ["--depth", "1"];
       const cloneResult = spawnSync(
         "git",
-        ["clone", "--depth", "1", "--branch", branch, remote, workspaceDir],
+        ["clone", ...depthArgs, "--branch", branch, remote, workspaceDir],
         { stdio: ["ignore", "pipe", "pipe"] },
       );
       if (cloneResult.status !== 0) {

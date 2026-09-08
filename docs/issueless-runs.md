@@ -184,6 +184,8 @@ A third (`publication`) token is **not** minted: there is no target repository, 
 
 Every kg-refresh dispatch sets `dependencyTokenScope: "installation"` in the envelope. The `dependency-auth` pipeline step reads this field and calls `POST /api/runner/dependency-token` to receive a short-lived installation-wide GitHub App token scoped to `contents: read` and `pull_requests: read`. The step installs it as a git credential helper for `https://github.com` and exports it as `COMPOSER_AUTH`.
 
+The primary workspace clone (the KG source repo itself) is cloned with **full history** (`depth: full` on the `clone` step in `pipelines/kg-refresh.yml`). `sources.yml` in the KG source repo sets `self_ingest: true`, so the ingest tool ingests its own commit graph — a shallow clone would see only 1 commit. If `session/entrypoint.sh` pre-cloned the workspace shallowly (the default), the pipeline's clone step detects shallowness and issues `git fetch --unshallow origin` before resetting.
+
 The subsequent `clone-code-repo` pipeline step reads the `code_repo:` key from `sources.yml` in the cloned KG source repo. Two forms are accepted:
 
 ```yaml
@@ -215,23 +217,29 @@ After `clone-code-repo`, the `clone-secondary-repos` pipeline step reads the `se
 ```yaml
 secondary_repos:
   - slug: BuildDownAI/bd-knowledge-graph-base
+    branch: testing
   - slug: BuildDownAI/docs
   - slug: BuildDownAI/skills
+    branch: testing
 ```
 
-Each secondary repo is cloned with `--depth 1` using a bare `https://github.com/<slug>.git` URL. Auth is supplied by the same git credential helper installed by `dependency-auth`, so no token appears in the URL. One log line is emitted per repo:
+Each entry accepts an optional `branch` field that controls which branch is cloned. When `branch` is set, the clone uses `--branch <branch> --single-branch` (or fetches that specific branch on an existing directory). When absent, the repo's default branch is used.
+
+`pipelines/kg-refresh.yml` sets `depth: full` on both `clone` and `clone-secondary-repos`, so all clones retrieve complete history rather than `--depth 1`. This matches the local ingest behavior and ensures the ingest tool sees the full commit graph. When the directory already exists as a shallow clone from a prior run, the step detects shallowness (`git rev-parse --is-shallow-repository`) and issues `git fetch --unshallow origin` before the branch-targeting fetch.
+
+Each secondary repo is cloned using a bare `https://github.com/<slug>.git` URL. Auth is supplied by the same git credential helper installed by `dependency-auth`, so no token appears in the URL. One log line is emitted per repo:
 
 ```
 [clone] cloning BuildDownAI/bd-knowledge-graph-base into repos/bd-knowledge-graph-base
 ```
 
-**Soft failure:** if a clone fails (repo missing, private, or credential scope too narrow), a warning is logged and the step continues to the next repo rather than aborting the pipeline. A run that clones zero of N repos still proceeds to `kg-ingest` — the ingest tool receives whatever repos were cloned.
+**Soft failure:** if a clone or unshallow fails (repo missing, private, credential scope too narrow, or server does not support unshallow), a warning is logged and the step continues to the next repo rather than aborting the pipeline. A run that clones zero of N repos still proceeds to `kg-ingest` — the ingest tool receives whatever repos were cloned.
 
 **Skip conditions:** the step is skipped when `dependency-auth` did not acquire a token (no credential helper → clones would fail unauthenticated), or when `sources.yml` has no `secondary_repos` entries. Skipping logs a warning.
 
 **Mounted mode:** when `AI_IMPLEMENT_WORKSPACE_MODE=mounted`, all secondary clones are skipped with a warning (the bind-mount covers the KG source repo only).
 
-**Future additions:** adding a fourth secondary repo requires only a `sources.yml` change in the KG source repo — the step reads the list dynamically and no orchestrator change is needed.
+**Future additions:** adding a fourth secondary repo, or changing a branch, requires only a `sources.yml` change in the KG source repo — the step reads the list dynamically and no orchestrator change is needed.
 
 ### `--repos-root` flag to the ingest
 
