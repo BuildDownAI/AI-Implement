@@ -3018,6 +3018,14 @@ code_repo:
     expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
   });
 
+  it("omits branch when value contains ':' (would form a two-sided refspec)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch: \"main:refs/heads/other\"\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
   it("accepts a branch containing a hyphen mid-string", () => {
     writeFileSync(
       join(tmpDir, "sources.yml"),
@@ -3205,6 +3213,15 @@ describe("readSecondaryReposFromSourcesYml", () => {
     writeFileSync(
       join(tmpDir, "sources.yml"),
       "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"main evil\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when value contains ':' (would form a two-sided refspec)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"main:refs/heads/other\"\n",
     );
     const result = readSecondaryReposFromSourcesYml(tmpDir);
     expect(result[0]).not.toHaveProperty("branch");

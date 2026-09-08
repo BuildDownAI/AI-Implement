@@ -97,11 +97,23 @@ function ownerRepo(v: string): string | null {
 
 /**
  * Returns true when a trimmed branch value is safe to pass to git as a bare positional
- * argument: does not start with "-" (would be parsed as a flag) and contains no internal
- * whitespace or ".." (ref-traversal ambiguity).
+ * argument or inside a `refs/heads/<branch>` refspec: does not start with "-" (would be
+ * parsed as a flag), and contains no internal whitespace, ".." (ref-traversal ambiguity),
+ * or ":" (would turn a refspec into a two-sided source:destination mapping).
  */
 function isSafeBranch(v: string): boolean {
-  return !v.startsWith("-") && !/\s/.test(v) && !v.includes("..");
+  return !v.startsWith("-") && !/\s/.test(v) && !v.includes("..") && !v.includes(":");
+}
+
+/**
+ * Validates a trimmed, possibly-empty branch value against `isSafeBranch`, logging and
+ * dropping it when unsafe. Returns `undefined` for an empty or rejected value.
+ */
+function sanitizeBranch(branchRaw: string, slug: string): string | undefined {
+  if (branchRaw.length === 0) return undefined;
+  if (isSafeBranch(branchRaw)) return branchRaw;
+  console.warn(`[kg-tracker-data] rejecting unsafe branch for ${slug}: ${JSON.stringify(branchRaw)}`);
+  return undefined;
 }
 
 /**
@@ -139,15 +151,7 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
             const slug = typeof r.slug === "string" ? ownerRepo(r.slug.trim()) : null;
             if (slug === null) return [];
             const branchRaw = typeof r.branch === "string" ? r.branch.trim() : "";
-            let branch: string | undefined;
-            if (branchRaw.length === 0) {
-              branch = undefined;
-            } else if (isSafeBranch(branchRaw)) {
-              branch = branchRaw;
-            } else {
-              console.warn(`[kg-tracker-data] rejecting unsafe branch for ${slug}: ${JSON.stringify(branchRaw)}`);
-              branch = undefined;
-            }
+            const branch = sanitizeBranch(branchRaw, slug);
             return [{ slug, ...(branch !== undefined ? { branch } : {}) }];
           });
       }
@@ -201,15 +205,7 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): { slug: string
         const branchRaw = typeof (codeRepo as Record<string, unknown>).branch === "string"
           ? ((codeRepo as Record<string, unknown>).branch as string).trim()
           : "";
-        let branch: string | undefined;
-        if (branchRaw.length === 0) {
-          branch = undefined;
-        } else if (isSafeBranch(branchRaw)) {
-          branch = branchRaw;
-        } else {
-          console.warn(`[kg-tracker-data] rejecting unsafe branch for ${slug}: ${JSON.stringify(branchRaw)}`);
-          branch = undefined;
-        }
+        const branch = sanitizeBranch(branchRaw, slug);
         return { slug, ...(branch !== undefined ? { branch } : {}) };
       }
     }

@@ -183,7 +183,9 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       let cloneMethod: "fresh" | "incremental";
 
       if (fs.existsSync(path.join(effectiveDir, ".git"))) {
-        const branchArgs = branch ? [branch] : [];
+        // A bare branch name would be parsed as a flag if it starts with "-"; an explicit
+        // refspec is unambiguously a ref regardless of its leading character.
+        const branchArgs = branch ? [`refs/heads/${branch}`] : [];
 
         if (depth === "full") {
           // Unshallow a pre-existing shallow clone before fetching full history.
