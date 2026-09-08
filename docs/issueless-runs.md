@@ -29,7 +29,7 @@ flowchart TD
     C -->|"newer snapshot in source repo"| H["local staging rail\nfetch → stage → swap → verify"]
     C -->|"ingest-needed"| D["mintRunToken phase=kg-refresh\nappendLog issueId=kg-refresh"]
     D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
-    E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo\n→ kg-tracker-data → kg-ingest → feedback-loop\n→ kg-snapshot-push"]
+    E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → feedback-loop\n→ kg-snapshot-push"]
     F --> G["POST /api/runner/result\nphase=kg-refresh"]
     G --> I["onRunnerComplete()\nverify snapshot commit"]
     I --> H
@@ -203,6 +203,35 @@ When the `code_repo:` key is present, `clone-code-repo` clones that repository i
 The `code-repo/` directory is passed as `--code-repo code-repo/` to the `kg-ingest` pipeline step, which spawns `python -m kg_ingest refresh`. When `codeRepoDir` is absent (because `clone-code-repo` was skipped or failed), `kg-ingest` fails immediately with `KG_INGEST_FAILED: no code repo in workspace` before invoking the CLI — a missing code repo is a loud, coded failure, never a silent continuation.
 
 The dependency token does not grant write access to any repository; it is scoped to `contents: read` across all repositories the GitHub App installation covers.
+
+### Secondary repo cloning
+
+After `clone-code-repo`, the `clone-secondary-repos` pipeline step reads the `secondary_repos[].slug` list from `sources.yml` and clones each into `repos/<basename(slug)>/` in the KG source workspace. A real sources.yml example:
+
+```yaml
+secondary_repos:
+  - slug: BuildDownAI/bd-knowledge-graph-base
+  - slug: BuildDownAI/docs
+  - slug: BuildDownAI/skills
+```
+
+Each secondary repo is cloned with `--depth 1` using a bare `https://github.com/<slug>.git` URL. Auth is supplied by the same git credential helper installed by `dependency-auth`, so no token appears in the URL. One log line is emitted per repo:
+
+```
+[clone] cloning BuildDownAI/bd-knowledge-graph-base into repos/bd-knowledge-graph-base
+```
+
+**Soft failure:** if a clone fails (repo missing, private, or credential scope too narrow), a warning is logged and the step continues to the next repo rather than aborting the pipeline. A run that clones zero of N repos still proceeds to `kg-ingest` — the ingest tool receives whatever repos were cloned.
+
+**Skip conditions:** the step is skipped when `dependency-auth` did not acquire a token (no credential helper → clones would fail unauthenticated), or when `sources.yml` has no `secondary_repos` entries. Skipping logs a warning.
+
+**Mounted mode:** when `AI_IMPLEMENT_WORKSPACE_MODE=mounted`, all secondary clones are skipped with a warning (the bind-mount covers the KG source repo only).
+
+**Future additions:** adding a fourth secondary repo requires only a `sources.yml` change in the KG source repo — the step reads the list dynamically and no orchestrator change is needed.
+
+### `--repos-root` flag to the ingest
+
+The `kg-ingest` step passes `--repos-root <workspaceDir>/repos` to `python -m kg_ingest refresh` only when `clone-secondary-repos` actually ran (i.e., was not skipped). The step is skipped when `sources.yml` has no `secondary_repos` entries or when `dependency-auth` did not acquire a token; in those cases `--repos-root` is omitted and the ingest subprocess runs without it. When the flag is present the ingest tool reads secondary repos from the `repos/` directory; if all individual clones failed the directory is empty and the ingest tool handles that gracefully. **Deployment note:** the `--repos-root` flag requires the KGA-8 runner image. Merge KGA-8 and release the image before any KG source repo gains `secondary_repos` entries, since the flag is only passed when the step runs.
 
 ### KG push token
 
@@ -510,6 +539,7 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | KG push token vending | `src/kg-push-token-vending.ts` |
 | Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
 | Tracker-data pipeline step | `src/pipeline/steps/kg-tracker-data.ts` |
+| Secondary repo clone step | `src/pipeline/steps/clone.ts` (targets input) |
 | Ingest pipeline step | `src/pipeline/steps/kg-ingest.ts` |
 | KG refresh pipeline definition | `pipelines/kg-refresh.yml` |
 | Fly / local Docker dispatch | `src/index.ts` (`dispatchKgRefreshRun`) |

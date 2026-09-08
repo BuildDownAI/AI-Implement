@@ -96,6 +96,46 @@ function ownerRepo(v: string): string | null {
 }
 
 /**
+ * Reads `secondary_repos[].slug` from sources.yml.
+ * Returns entries where `slug` passes the "owner/repo" validation.
+ * Returns an empty array when the file is absent, the key is missing, the list
+ * is empty, or the file cannot be parsed.
+ */
+export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ slug: string }> {
+  const filePath = join(workspaceDir, "sources.yml");
+  if (!existsSync(filePath)) return [];
+
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+
+  try {
+    const doc = parseYaml(raw) as unknown;
+    if (doc !== null && typeof doc === "object") {
+      const secondaryRepos = (doc as Record<string, unknown>).secondary_repos;
+      if (Array.isArray(secondaryRepos)) {
+        return secondaryRepos
+          .filter(
+            (r): r is Record<string, unknown> =>
+              r !== null && typeof r === "object" && !Array.isArray(r),
+          )
+          .flatMap((r) => {
+            const slug = typeof r.slug === "string" ? ownerRepo(r.slug.trim()) : null;
+            return slug !== null ? [{ slug }] : [];
+          });
+      }
+    }
+  } catch {
+    // malformed YAML → return empty
+  }
+
+  return [];
+}
+
+/**
  * Reads the top-level `code_repo:` key from sources.yml.
  * Accepts two forms:
  *   - string:  `code_repo: owner/name`

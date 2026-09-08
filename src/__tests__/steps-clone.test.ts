@@ -10,6 +10,7 @@ vi.mock("node:child_process", () => ({
 vi.mock("node:fs", () => ({
   default: {
     existsSync: vi.fn(),
+    mkdirSync: vi.fn(),
   },
 }));
 
@@ -505,6 +506,172 @@ describe("cloneStep", () => {
       } finally {
         vi.unstubAllEnvs();
       }
+    });
+  });
+
+  describe("multi-target clones (targets input)", () => {
+    const THREE_TARGETS = [
+      { repoOwner: "BuildDownAI", repoRepo: "bd-knowledge-graph-base", targetDir: "repos/bd-knowledge-graph-base" },
+      { repoOwner: "BuildDownAI", repoRepo: "docs", targetDir: "repos/docs" },
+      { repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills" },
+    ];
+
+    const TARGETS_INPUTS = {
+      repoOwner: "",
+      repoRepo: "",
+      branch: "",
+      githubToken: "",
+      workspaceDir: "/tmp/workspace",
+      targets: THREE_TARGETS,
+    };
+
+    it("returns clonedCount 0 when targets is an empty array", async () => {
+      const outputs = await cloneStep.run(makeContext(), {
+        ...TARGETS_INPUTS,
+        targets: [],
+      }, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(0);
+      expect(spawnSync).not.toHaveBeenCalled();
+    });
+
+    it("clones all three targets via git clone and returns clonedCount 3", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      // Three fresh clones, one git clone call per target
+      mockSpawn([
+        { status: 0 },
+        { status: 0 },
+        { status: 0 },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(3);
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls).toHaveLength(3);
+      // Each call is a git clone with the bare remote and effectiveDir
+      expect(calls[0][1]).toContain("clone");
+      expect(calls[0][1]).toContain("https://github.com/BuildDownAI/bd-knowledge-graph-base.git");
+      expect(calls[1][1]).toContain("https://github.com/BuildDownAI/docs.git");
+      expect(calls[2][1]).toContain("https://github.com/BuildDownAI/skills.git");
+    });
+
+    it("logs warning and continues when one target clone fails, returns clonedCount 2", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      let callIndex = 0;
+      vi.mocked(spawnSync).mockImplementation(() => {
+        const status = callIndex++ === 1 ? 128 : 0;
+        return {
+          status,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("not found"),
+          pid: 0,
+          output: [],
+          signal: null,
+          error: undefined,
+        };
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(2);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("clone failed for BuildDownAI/docs"),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("creates parent directory before each clone", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0 }]);
+
+      await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      // mkdirSync should be called once per target with the parent dir
+      expect(fs.mkdirSync).toHaveBeenCalledTimes(3);
+      expect(fs.mkdirSync).toHaveBeenCalledWith("/tmp/workspace/repos", { recursive: true });
+    });
+
+    it("skips all clones and warns when AI_IMPLEMENT_WORKSPACE_MODE=mounted", async () => {
+      vi.stubEnv("AI_IMPLEMENT_WORKSPACE_MODE", "mounted");
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+        expect(outputs.clonedCount).toBe(0);
+        expect(spawnSync).not.toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalledWith("[clone] mounted mode: skipping secondary clones");
+      } finally {
+        vi.unstubAllEnvs();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("uses incremental fetch+reset when .git already exists in targetDir", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // Incremental: fetch + reset per target (2 calls each × 3 targets = 6)
+      mockSpawn([
+        { status: 0 }, { status: 0 },
+        { status: 0 }, { status: 0 },
+        { status: 0 }, { status: 0 },
+      ]);
+
+      const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(3);
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls).toHaveLength(6);
+      // Each even call is a fetch, each odd call is a reset
+      expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin"]);
+      expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+    });
+
+    it("skips and warns when slug basename resolves to '..'", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const outputs = await cloneStep.run(makeContext(), {
+        ...TARGETS_INPUTS,
+        targets: [
+          { repoOwner: "org", repoRepo: "evil", targetDir: "repos/.." },
+          { repoOwner: "BuildDownAI", repoRepo: "bd-knowledge-graph-base", targetDir: "repos/bd-knowledge-graph-base" },
+        ],
+      }, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(1);
+      expect(spawnSync).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("targetDir basename '..' is unsafe"),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("continues past a failed incremental fetch and counts only successful repos", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      let callIndex = 0;
+      vi.mocked(spawnSync).mockImplementation(() => {
+        // Fail fetch on the second target (call index 2)
+        const status = callIndex++ === 2 ? 128 : 0;
+        return {
+          status,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from("auth error"),
+          pid: 0,
+          output: [],
+          signal: null,
+          error: undefined,
+        };
+      });
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const outputs = await cloneStep.run(makeContext(), TARGETS_INPUTS, new NoopStepReporter());
+
+      expect(outputs.clonedCount).toBe(2);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("clone failed for BuildDownAI/docs"),
+      );
+      warnSpy.mockRestore();
     });
   });
 
