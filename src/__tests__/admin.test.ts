@@ -874,6 +874,7 @@ describe("admin mappings", () => {
       statusFieldOverride: null,
       repoFieldOverride: null,
       profilesFieldOverride: null,
+      baseBranchFieldOverride: null,
     });
   });
 

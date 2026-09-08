@@ -79,6 +79,7 @@ import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
 import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
+import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
 import { runGroupingBranchAutoMerge } from "./auto-merge.js";
 import { getPendingReviewFixes, recordReviewFixDispatch, updateReviewFixStatus, shouldSkipReviewFix } from "./review-fix-queue.js";
@@ -607,6 +608,21 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
           // is per-owner cached, so the in-dispatch-fn fetches below are cache hits.
           const baseGhToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
+          // Validate the "AI-Implement Base Branch" field before dispatch. On refusal
+          // markImplementationFailed has already been called — skip this issue.
+          // Deliberately runs BEFORE the grouping roll-up hold below: the
+          // field-plus-grouping conflict is exactly one of the refusals, so a
+          // misconfigured grouping parent must surface that error rather than being
+          // silently held forever.
+          const implValidated = await validateIssueBaseBranch({
+            ghToken: baseGhToken,
+            owner: mapping.owner,
+            repo: mapping.repo,
+            issue,
+            markFailed: (id, sk, reason) => issueProvider.markImplementationFailed(id, sk, reason),
+          });
+          if (implValidated.refused) continue;
+
           // AII-264 r3: a grouping parent with an OPEN top-of-tree roll-up PR has no
           // dispatchable work — hold it (dedup untouched) until the PR merges or closes.
           // Checked BEFORE resolveBaseBranch so the hold never (re)creates branches.
@@ -618,18 +634,26 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
             }
           }
 
-          const baseBranch = await resolveBaseBranch({ ghToken: baseGhToken, issue, mapping });
+          // When the field was set and validated, it wins; otherwise fall through to
+          // feature-branch grouping resolution (featureBranchChain → feature branch).
+          const baseBranch = implValidated.branch ?? await resolveBaseBranch({ ghToken: baseGhToken, issue, mapping });
+
+          // The validated field value (null when unset) — threaded separately from
+          // baseBranch so each dispatch path can gate its branch comment on the FIELD,
+          // not on the fully-resolved base (which also covers the unrelated
+          // feature-branch-grouping fallback and must not trigger a comment).
+          const implFieldValue = implValidated.branch;
 
           if (execPath === "both") {
             // Shadow: GHA is primary (controls ticket state and dedup); Fly is secondary
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, true);
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue, true);
           } else if (execPath === "local-docker") {
-            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
+            await dispatchLocalDocker(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
           } else if (execPath === "fly-machines") {
-            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
+            await dispatchFlyMachine(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
           } else {
-            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch);
+            await dispatchGitHubActions(config, issueProvider, issue, mapping, prior, runnerMode, baseBranch, implFieldValue);
           }
         }
       } catch (err) {
@@ -852,6 +876,9 @@ async function dispatchGitHubActions(
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
   baseBranch: string,
+  /** The validated "AI-Implement Base Branch" field value, or null when unset. Distinct
+   *  from baseBranch, which also covers the feature-branch-grouping fallback. */
+  baseBranchFieldValue: string | null,
 ): Promise<void> {
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner);
 
@@ -884,6 +911,10 @@ async function dispatchGitHubActions(
   }
 
   const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
+
+  // True whenever base_branch is forwarded as a legacy workflow input — set by the
+  // field OR by feature-branch grouping. Used only to attribute a 422 below.
+  const implSentBaseBranch = baseBranch !== mapping.defaultBranch;
 
   const workflowCapabilities = await resolveWorkflowCapabilities({
     owner: mapping.owner,
@@ -963,6 +994,20 @@ async function dispatchGitHubActions(
         phase: "implementation",
       },
     );
+    // Only reachable on the legacy contract — under the envelope base_branch is not a
+    // workflow input at all (it rides inside run_config), so a 422 can never be about
+    // it. implSentBaseBranch is also true for the pre-existing feature-branch grouping
+    // path, and a 422 has many possible causes, so also require the error body itself
+    // to mention base_branch before attributing it to a stale claude-implement.yml.
+    if (contract === "legacy" && result.status === 422 && implSentBaseBranch && /base_branch/.test(result.error ?? "")) {
+      await provider.markImplementationFailed(
+        issue.id,
+        issue.scopeKey,
+        "dispatch rejected (422): base_branch was not accepted. Either the target repo has not "
+          + "re-synced claude-implement.yml, or the workflow-contract probe cached \"legacy\" for a repo "
+          + "that has since re-synced to the envelope contract (that cache is short-lived — retry first).",
+      );
+    }
     // No dedup row was written at this point (markDispatched is called only on success below).
     const _brImpl = recordDispatchFailure(issue.id, "implementation", "workflow_dispatch_failed");
     if (_brImpl.tripped) {
@@ -995,6 +1040,8 @@ async function dispatchGitHubActions(
   }
 
   await postDispatch(config, provider, issue, mapping, ghToken, jobId, "github-actions");
+
+  postBranchComment(provider, issue, baseBranchFieldValue, mapping.defaultBranch, "implementation");
 
   console.log(`[poll] Dispatched ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (github-actions, image: ${runnerImage ?? "workflow-default"})`);
 }
@@ -1046,6 +1093,29 @@ async function dispatchPlanning(
     );
     return;
   }
+
+  // Validate the "AI-Implement Base Branch" field before planning dispatch: planning
+  // clones this branch, so the check must run before any dispatch work. Placed after
+  // the early returns above so an unrelated skip (bedrock, missing credential, missing
+  // Fly config) still reports its own reason rather than an installation error.
+  // The token is only fetched when there is a value to validate — validateIssueBaseBranch
+  // short-circuits without touching ghToken when issue.baseBranch is unset, which is
+  // always the case for Linear (the field is Jira-only). getInstallationToken is
+  // per-owner cached, so the later unconditional fetches are cache hits.
+  const planningValidated = await validateIssueBaseBranch({
+    ghToken: issue.baseBranch
+      ? await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, mapping.owner)
+      : "",
+    owner: mapping.owner,
+    repo: mapping.repo,
+    issue,
+    markFailed: (id, sk, reason) => provider.markPlanningFailed(id, sk, reason),
+  });
+  if (planningValidated.refused) return;
+
+  // featureBranchChain is NOT consulted for planning — that grouping applies only to
+  // implementation dispatches. Planning clones the validated field value or the default.
+  const resolvedPlanningBranch = planningValidated.branch ?? mapping.defaultBranch;
 
   // Build planning context (PARENT/SIBLINGS/DEPENDENCIES) for all execution paths.
   const planningContextInputs = await buildPlanningContextInputs({
@@ -1136,7 +1206,7 @@ async function dispatchPlanning(
             issueDescription: issue.description || issue.title,
             owner: mapping.owner,
             repo: mapping.repo,
-            defaultBranch: mapping.defaultBranch,
+            defaultBranch: resolvedPlanningBranch,
             anthropicApiKey: config.anthropicApiKey ?? undefined,
             claudeOAuthToken: config.claudeOAuthToken ?? undefined,
             githubToken: ghToken,
@@ -1193,7 +1263,7 @@ async function dispatchPlanning(
             issueDescription: issue.description || issue.title,
             owner: mapping.owner,
             repo: mapping.repo,
-            defaultBranch: mapping.defaultBranch,
+            defaultBranch: resolvedPlanningBranch,
             anthropicApiKey: config.anthropicApiKey ?? undefined,
             claudeOAuthToken: config.claudeOAuthToken ?? undefined,
             githubToken: ghToken,
@@ -1242,6 +1312,7 @@ async function dispatchPlanning(
             err,
           );
         }
+        postBranchComment(provider, issue, planningValidated.branch, mapping.defaultBranch, "planning");
       },
     });
     return;
@@ -1277,6 +1348,12 @@ async function dispatchPlanning(
   // claude-plan.yml are not rejected with a 422 "unexpected inputs".
   const runnerImage = await resolveDispatchRunnerImage(config, mapping, ghToken);
 
+  // Only forward base_branch when it differs from the repo default — same guard as the
+  // implementation dispatch: GitHub rejects unknown workflow_dispatch inputs with 422,
+  // so repos that have not re-synced claude-plan.yml keep working on the common path.
+  // Legacy contract only; under the envelope the branch rides inside run_config.
+  const planningSentBaseBranch = resolvedPlanningBranch !== mapping.defaultBranch;
+
   const planningContract = await resolveWorkflowContract({
     owner: mapping.owner,
     repo: mapping.repo,
@@ -1288,6 +1365,8 @@ async function dispatchPlanning(
   const planningDispatchInputs = planningContract === "envelope"
     ? buildEnvelopeDispatchInputs(planningMapping, issue, {
         runnerPhase: "planning",
+        // Base branch for the planning clone. Rides inside run_config on the envelope.
+        baseBranch: planningSentBaseBranch ? resolvedPlanningBranch : undefined,
         runnerCallbackUrl: runnerCallbackUrl || undefined,
         runToken,
         // No runProgressToken: planning dispatches don't mint progress tokens.
@@ -1301,6 +1380,9 @@ async function dispatchPlanning(
         issue_description: issue.description || issue.title,
         ...planningContextInputs,
         ...providerDispatchFields(planningMapping),
+        // Gated: an empty spread when unset, so legacy repos on the common path still
+        // send no unexpected inputs and cannot 422.
+        ...(planningSentBaseBranch ? { base_branch: resolvedPlanningBranch } : {}),
         runner_callback_url: runnerCallbackUrl,
         run_token: runToken,
         ...(runnerImage ? { runner_image: runnerImage } : {}),
@@ -1327,6 +1409,17 @@ async function dispatchPlanning(
         phase: "planning",
       },
     );
+    // Same legacy-only, content-gated attribution as the implementation path: under the
+    // envelope base_branch is not an input at all, and planningSentBaseBranch alone is
+    // not a reliable signal, so require the error body to mention base_branch before
+    // blaming a stale claude-plan.yml.
+    if (planningContract === "legacy" && result.status === 422 && planningSentBaseBranch && /base_branch/.test(result.error ?? "")) {
+      await provider.markPlanningFailed(
+        issue.id,
+        issue.scopeKey,
+        "dispatch rejected (422): target repo must re-sync claude-plan.yml to accept the base_branch input",
+      );
+    }
     // Planning never writes a dedup row (intentional), but we still count the failure.
     const _brPlan = recordDispatchFailure(issue.id, "planning", "workflow_dispatch_failed");
     if (_brPlan.tripped) {
@@ -1370,6 +1463,8 @@ async function dispatchPlanning(
     );
   }
 
+  postBranchComment(provider, issue, planningValidated.branch, mapping.defaultBranch, "planning");
+
   console.log(`[poll] Dispatched planning for ${issue.identifier} -> ${mapping.owner}/${mapping.repo} (${mapping.planningWorkflowFile}, image: ${runnerImage ?? "workflow-default"})`);
 }
 
@@ -1411,6 +1506,11 @@ async function dispatchSession(
       jobId: number,
       executionMode: "github-actions" | "fly-machines" | "local-docker",
     ) => Promise<void>;
+    /** When set, post a ticket comment naming the base branch, gated on the validated
+     *  "AI-Implement Base Branch" field value (fieldValue), NOT on the fully-resolved
+     *  base — see postBranchComment for why that distinction matters. Uses opts.phase
+     *  for the comment text. */
+    branchInfo?: { fieldValue: string | null; defaultBranch: string };
   },
 ): Promise<void> {
   const sessionToken = generateSessionToken();
@@ -1469,6 +1569,12 @@ async function dispatchSession(
       const doPostDispatch = opts.onPostDispatch ?? postDispatch;
       await doPostDispatch(config, provider, issue, mapping, result.ghToken, jobId, result.executionMode);
 
+      // No-op unless the caller passed branchInfo — the shadow Fly dispatch
+      // deliberately passes none, so "both" mode posts exactly once.
+      if (opts.branchInfo) {
+        postBranchComment(provider, issue, opts.branchInfo.fieldValue, opts.branchInfo.defaultBranch, opts.phase);
+      }
+
       if (result.statusComment) {
         postStatusComment(provider, issue.id, {
           type: "machine_created",
@@ -1504,6 +1610,8 @@ async function dispatchFlyMachine(
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
   baseBranch: string,
+  /** The validated "AI-Implement Base Branch" field value, or null when unset. */
+  baseBranchFieldValue: string | null,
   shadow = false,
 ): Promise<void> {
   if (mapping.provider === "bedrock") {
@@ -1536,6 +1644,7 @@ async function dispatchFlyMachine(
     tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
     doMarkDispatched: !shadow,
     shadow,
+    branchInfo: shadow ? undefined : { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
     backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
       const minSecretsVersion = getFlySecretsMinVersion();
 
@@ -1642,6 +1751,9 @@ async function dispatchLocalDocker(
   prior: { count: number; lastDispatchedAt: number | null },
   runnerMode: string,
   baseBranch: string,
+  /** The validated "AI-Implement Base Branch" field value, or null when unset. Distinct
+   *  from baseBranch, which also covers the feature-branch-grouping fallback. */
+  baseBranchFieldValue: string | null,
 ): Promise<void> {
   if (mapping.provider === "bedrock") {
     console.error(`[poll] Cannot dispatch ${issue.identifier} via local Docker: provider=bedrock is not supported on container runners`);
@@ -1658,6 +1770,7 @@ async function dispatchLocalDocker(
     tokenTtlSeconds: IMPLEMENTATION_TTL_SECONDS,
     doMarkDispatched: true,
     shadow: false,
+    branchInfo: { fieldValue: baseBranchFieldValue, defaultBranch: mapping.defaultBranch },
     backend: async ({ sessionToken, machineNonce, runnerCallbackUrl, runToken }) => {
       const localOrchestratorUrl =
         config.localRunnerOrchestratorUrl ??

@@ -8,6 +8,7 @@ import type {
   TicketingProvider,
 } from "./types.js";
 import { MissingProviderConfigError } from "./types.js";
+import { normalizeBaseBranch } from "../base-branch.js";
 import { JiraApiError, JiraClient } from "./jira-client.js";
 import {
   getCachedFieldIds,
@@ -126,6 +127,32 @@ function isTerminalStatus(fields: Record<string, unknown>): boolean {
   return ((fields.status as { statusCategory?: { key?: string } } | null)?.statusCategory?.key) === "done";
 }
 
+/**
+ * Reads and validates the "AI-Implement Base Branch" field value. Defensive about
+ * shape the same way parseMultiSelectValues is below: the field may be created as
+ * Paragraph (rich text, serializes as an ADF object) or a number/array field rather
+ * than the expected short-text field, so a bare `.trim()` on an unchecked cast can
+ * throw and take down mapIssue (and the whole snapshot) for one bad field.
+ *
+ * Also runs the value through normalizeBaseBranch so a human-typed value that would
+ * be unsafe as a git refspec segment is caught here — with a warning and the field
+ * left unset for this issue — rather than reaching a dispatch/git-fetch path
+ * unchecked. One bad value disables the feature for its own issue only.
+ */
+function readBaseBranchValue(raw: unknown, issueKey: string): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined;
+  try {
+    return normalizeBaseBranch(trimmed) ?? undefined;
+  } catch (err) {
+    console.warn(
+      `[jira] Ignoring invalid AI-Implement Base Branch value on ${issueKey}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return undefined;
+  }
+}
+
 function parseMultiSelectValues(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   return (raw as Array<unknown>)
@@ -216,6 +243,7 @@ export class JiraProvider implements TicketingProvider {
       statusOverride: m.ticketingConfig.statusFieldOverride ?? null,
       repoOverride: m.ticketingConfig.repoFieldOverride ?? null,
       profilesOverride: m.ticketingConfig.profilesFieldOverride ?? null,
+      baseBranchOverride: m.ticketingConfig.baseBranchFieldOverride ?? null,
     });
   }
 
@@ -248,6 +276,7 @@ export class JiraProvider implements TicketingProvider {
         fieldIds.repoFieldId,
         ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
         ...(fieldIds.profilesFieldId ? [fieldIds.profilesFieldId] : []),
+        ...(fieldIds.baseBranchFieldId ? [fieldIds.baseBranchFieldId] : []),
       ];
 
       // Reference the status field by its resolved customfield id, not a hardcoded
@@ -317,6 +346,9 @@ export class JiraProvider implements TicketingProvider {
     const profiles = fieldIds.profilesFieldId
       ? parseMultiSelectValues(raw.fields[fieldIds.profilesFieldId])
       : [];
+    const baseBranch = fieldIds.baseBranchFieldId
+      ? readBaseBranchValue(raw.fields[fieldIds.baseBranchFieldId], raw.key)
+      : undefined;
     return {
       id: raw.id,
       identifier: raw.key,
@@ -325,6 +357,7 @@ export class JiraProvider implements TicketingProvider {
       scopeKey,
       nativeStatus: statusOption?.value ?? "",
       ...(profiles.length > 0 ? { profiles } : {}),
+      ...(baseBranch ? { baseBranch } : {}),
     };
   }
   /**

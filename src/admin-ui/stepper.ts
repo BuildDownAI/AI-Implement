@@ -71,6 +71,13 @@ export const stepperHtml = `
             <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Profiles&rdquo;. Otherwise pick the multi-select field that holds the implementation profiles for an issue.</div>
           </div>
           <div class="field">
+            <label class="field-label">Base Branch Field</label>
+            <select class="input" id="np-jira-base-branch-field">
+              <option value="">(auto-discover by name "AI-Implement Base Branch")</option>
+            </select>
+            <div class="field-hint">Leave at auto-discover if your Jira instance has a custom field named exactly &ldquo;AI-Implement Base Branch&rdquo;. Otherwise pick the text field that holds the branch an issue's PR should target instead of the repo's default branch.</div>
+          </div>
+          <div class="field">
             <label class="field-label">Repo Field Value</label>
             <select class="input" id="np-jira-repo-value" onchange="updateStepperNextButton()">
               <option value="">Select a Repo Field first</option>
@@ -427,6 +434,7 @@ export const stepperScript = `
     jiraStatusFieldOverride: '',
     jiraRepoFieldOverride: '',
     jiraProfilesFieldOverride: '',
+    jiraBaseBranchFieldOverride: '',
     teamKey: '', owner: '', repo: '', defaultBranch: '', branchPrefix: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
     skillsRepo: '', dependencyTokenScope: null,
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
@@ -446,6 +454,7 @@ export const stepperScript = `
     data.jiraStatusFieldOverride = '';
     data.jiraRepoFieldOverride = '';
     data.jiraProfilesFieldOverride = '';
+    data.jiraBaseBranchFieldOverride = '';
     data.teamKey = '';
     data.owner = '';
     data.repo = '';
@@ -531,6 +540,8 @@ export const stepperScript = `
     if (repoFldEl) repoFldEl.value = '';
     const profilesFldEl = document.getElementById('np-jira-profiles-field');
     if (profilesFldEl) profilesFldEl.value = '';
+    const baseBranchFldEl = document.getElementById('np-jira-base-branch-field');
+    if (baseBranchFldEl) baseBranchFldEl.value = '';
     const jqlStatus = document.getElementById('np-jira-jql-status');
     if (jqlStatus) { jqlStatus.textContent = ''; jqlStatus.style.color = ''; }
     const linearCfg = document.getElementById('np-linear-config');
@@ -745,9 +756,11 @@ export const stepperScript = `
         const sf = document.getElementById('np-jira-status-field');
         const rf = document.getElementById('np-jira-repo-field');
         const pf = document.getElementById('np-jira-profiles-field');
+        const bbf = document.getElementById('np-jira-base-branch-field');
         if (sf) data.jiraStatusFieldOverride = sf.value.trim();
         if (rf) data.jiraRepoFieldOverride = rf.value.trim();
         if (pf) data.jiraProfilesFieldOverride = pf.value.trim();
+        if (bbf) data.jiraBaseBranchFieldOverride = bbf.value.trim();
       } else {
         const tkEl = document.getElementById('np-teamKey');
         if (tkEl) data.teamKey = tkEl.value.trim();
@@ -890,6 +903,7 @@ export const stepperScript = `
       if (data.jiraStatusFieldOverride) cfgText += ' &middot; statusField=' + window.esc(data.jiraStatusFieldOverride);
       if (data.jiraRepoFieldOverride) cfgText += ' &middot; repoField=' + window.esc(data.jiraRepoFieldOverride);
       if (data.jiraProfilesFieldOverride) cfgText += ' &middot; profilesField=' + window.esc(data.jiraProfilesFieldOverride);
+      if (data.jiraBaseBranchFieldOverride) cfgText += ' &middot; baseBranchField=' + window.esc(data.jiraBaseBranchFieldOverride);
     } else {
       cfgText = 'team=' + (window.esc(data.teamKey) || '&mdash;');
     }
@@ -1006,8 +1020,9 @@ export const stepperScript = `
     const statusSel = document.getElementById('np-jira-status-field');
     const repoSel = document.getElementById('np-jira-repo-field');
     const profilesSel = document.getElementById('np-jira-profiles-field');
+    const baseBranchSel = document.getElementById('np-jira-base-branch-field');
     if (jiraFieldsLoaded) return;
-    if (!statusSel && !repoSel && !profilesSel) return;
+    if (!statusSel && !repoSel && !profilesSel && !baseBranchSel) return;
     try {
       const res = await window.api('/api/jira/fields');
       if (!res.ok) return;
@@ -1018,15 +1033,19 @@ export const stepperScript = `
       const prevStatus = statusSel ? (statusSel.value || statusSel.dataset.pendingValue || '') : '';
       const prevRepo = repoSel ? (repoSel.value || repoSel.dataset.pendingValue || '') : '';
       const prevProfiles = profilesSel ? (profilesSel.value || profilesSel.dataset.pendingValue || '') : '';
+      const prevBaseBranch = baseBranchSel ? (baseBranchSel.value || baseBranchSel.dataset.pendingValue || '') : '';
       const statusPlaceholder = statusSel && statusSel.options[0] ? statusSel.options[0] : null;
       const repoPlaceholder = repoSel && repoSel.options[0] ? repoSel.options[0] : null;
       const profilesPlaceholder = profilesSel && profilesSel.options[0] ? profilesSel.options[0] : null;
+      const baseBranchPlaceholder = baseBranchSel && baseBranchSel.options[0] ? baseBranchSel.options[0] : null;
       if (statusSel) statusSel.innerHTML = '';
       if (repoSel) repoSel.innerHTML = '';
       if (profilesSel) profilesSel.innerHTML = '';
+      if (baseBranchSel) baseBranchSel.innerHTML = '';
       if (statusSel && statusPlaceholder) statusSel.appendChild(statusPlaceholder);
       if (repoSel && repoPlaceholder) repoSel.appendChild(repoPlaceholder);
       if (profilesSel && profilesPlaceholder) profilesSel.appendChild(profilesPlaceholder);
+      if (baseBranchSel && baseBranchPlaceholder) baseBranchSel.appendChild(baseBranchPlaceholder);
       for (const f of fields) {
         const labelText = f.name + ' (' + f.id + ')';
         if (statusSel) {
@@ -1047,10 +1066,17 @@ export const stepperScript = `
           o3.textContent = labelText;
           profilesSel.appendChild(o3);
         }
+        if (baseBranchSel) {
+          const o4 = document.createElement('option');
+          o4.value = f.id;
+          o4.textContent = labelText;
+          baseBranchSel.appendChild(o4);
+        }
       }
       if (statusSel && prevStatus) statusSel.value = prevStatus;
       if (repoSel && prevRepo) repoSel.value = prevRepo;
       if (profilesSel && prevProfiles) profilesSel.value = prevProfiles;
+      if (baseBranchSel && prevBaseBranch) baseBranchSel.value = prevBaseBranch;
       jiraFieldsLoaded = true;
     } catch (err) {
       console.error('stepperLoadJiraFields failed:', err);
@@ -1253,6 +1279,7 @@ export const stepperScript = `
             statusFieldOverride: data.jiraStatusFieldOverride || null,
             repoFieldOverride: data.jiraRepoFieldOverride || null,
             profilesFieldOverride: data.jiraProfilesFieldOverride || null,
+            baseBranchFieldOverride: data.jiraBaseBranchFieldOverride || null,
           }
         : { kind: 'linear' },
     };
