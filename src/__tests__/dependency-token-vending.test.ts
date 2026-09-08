@@ -124,7 +124,7 @@ describe("handleDependencyTokenRequest", () => {
     expect(result.body.expires_at).toBe(realExpiry);
   });
 
-  it("force-mints with { contents: 'read' } permissions and no repositories field", async () => {
+  it("force-mints with { contents: 'read', pull_requests: 'read' } permissions and no repositories field", async () => {
     const token = mintProgressToken();
     mockGetScopedToken.mockResolvedValueOnce({ token: "ghs_token", expiresAt: "2030-01-01T00:00:00Z" });
 
@@ -134,7 +134,7 @@ describe("handleDependencyTokenRequest", () => {
       "app-id",
       "fake-key",
       "acme",
-      { permissions: { contents: "read" }, forceRefresh: true },
+      { permissions: { contents: "read", pull_requests: "read" }, forceRefresh: true },
     );
     const opts = mockGetScopedToken.mock.calls[0][3] as Record<string, unknown>;
     expect(opts).not.toHaveProperty("repositories");
