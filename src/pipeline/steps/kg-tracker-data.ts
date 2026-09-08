@@ -32,8 +32,13 @@ interface TrackerIssue {
   identifier: string;
   title: string;
   description: string;
+  branchName: string | null;
   state: { name: string; type: string };
-  comments: Array<{ body: string; createdAt: string }>;
+  labels: { nodes: Array<{ name: string }> };
+  project: { name: string } | null;
+  parent: { identifier: string } | null;
+  comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
+  relations: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
 }
 
 interface TrackerDataPage {
