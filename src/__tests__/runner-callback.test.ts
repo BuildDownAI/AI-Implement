@@ -14,7 +14,7 @@ import { formatFailureComment } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { Step } from "../pipeline/types.js";
-import type { ReferenceRepoResult } from "../pipeline/steps/reference-repos.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 

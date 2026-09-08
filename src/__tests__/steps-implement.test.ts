@@ -3,7 +3,7 @@ import { implementStep } from "../pipeline/steps/implement.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
-import type { ReferenceRepoResult } from "../pipeline/steps/reference-repos.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 function makeExecutor(overrides: Partial<LLMResult> = {}): LLMExecutor {
   return {

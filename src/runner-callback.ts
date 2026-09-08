@@ -1,6 +1,6 @@
 import { claimJobRunId, getJobByDispatchId, stampJobApproved, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
-import type { ReferenceRepoResult } from "./pipeline/steps/reference-repos.js";
+import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
@@ -316,17 +316,10 @@ export async function handleRunnerResult(
 
   const missedRepos = (input.body.referenceRepoResults ?? []).filter((r) => !r.arrived);
   if (missedRepos.length > 0) {
-    const causeLabels: Record<string, string> = {
-      "no-auth": "the GitHub App is not installed on that owner",
-      "ref-not-found": "the declared ref does not exist in the repository",
-      "token-error": "the authentication token could not be minted for that owner",
-      "clone-error": "a network or git error prevented the clone",
-      "path-invalid": "the declared path is invalid or duplicated",
-    };
     const lines = [
       "⚠️ One or more reference repositories could not be cloned and were unavailable to the agent during this run.",
       "",
-      ...missedRepos.map((r) => `- \`${r.repo}\`: ${causeLabels[r.cause ?? ""] ?? "an unknown error prevented the clone"}`),
+      ...missedRepos.map((r) => `- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`),
     ];
     try {
       await provider.postComment(claims.issueId, lines.join("\n"));

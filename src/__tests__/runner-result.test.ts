@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "../runner-result.js";
-import type { ReferenceRepoResult } from "../pipeline/steps/reference-repos.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 describe("fetchPlanningContextFromOrchestrator", () => {
   it("GETs /runner/planning-context with the progress token and returns the context", async () => {

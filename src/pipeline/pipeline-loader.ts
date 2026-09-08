@@ -4,7 +4,7 @@ import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } fr
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
 import { readCodeRepoFromSourcesYml } from "./steps/kg-tracker-data.js";
-import type { ReferenceRepoResult } from "./steps/reference-repos.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",

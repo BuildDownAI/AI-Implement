@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import type { ReferenceRepoResult } from "./pipeline/steps/reference-repos.js";
+import type { ReferenceRepoResult } from "./reference-repos.js";
 
 export function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
   const dir = join(workspaceDir, "ai-output", "comments");

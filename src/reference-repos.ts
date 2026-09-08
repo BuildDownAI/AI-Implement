@@ -1,5 +1,13 @@
 import path from "node:path";
 
+/** Why a declared reference repository did not arrive in the workspace. */
+export type ReferenceRepoResultCause =
+  | "no-auth"
+  | "ref-not-found"
+  | "token-error"
+  | "clone-error"
+  | "path-invalid";
+
 /** One repository a project's runs clone read-only into the workspace. */
 export interface ReferenceRepo {
   /** Normalized `https://github.com/owner/repo`. */
@@ -10,9 +18,29 @@ export interface ReferenceRepo {
   ref?: string;
 }
 
+/** One declared entry's outcome. Extends the entry so the two cannot drift. */
+export interface ReferenceRepoResult extends ReferenceRepo {
+  arrived: boolean;
+  cause?: ReferenceRepoResultCause;
+}
+
 const REPO_SHORTHAND = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const MAX_ENTRIES = 10;
 const MAX_PATH_LENGTH = 256;
+
+// Keyed to the union rather than to `string`: adding a cause without a phrase then
+// fails the build instead of silently rendering "an unknown error" in a prompt.
+const CAUSE_PHRASES: Record<ReferenceRepoResultCause, string> = {
+  "no-auth": "the repository is private and the GitHub App is not installed on that owner",
+  "ref-not-found": "the declared ref does not exist in the repository",
+  "token-error": "the authentication token could not be minted for that owner",
+  "clone-error": "a network or git error prevented the clone",
+  "path-invalid": "the declared path is invalid or duplicated",
+};
+
+export function describeReferenceRepoCause(cause: ReferenceRepoResultCause | undefined): string {
+  return cause ? CAUSE_PHRASES[cause] : "an unknown error prevented the clone";
+}
 
 /** Returns null for both absent and empty, so the column stores one "unset" value. */
 export function normalizeReferenceRepos(raw: unknown): ReferenceRepo[] | null {

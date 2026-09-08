@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { implementStep } from "./implement.js";
-import type { ReferenceRepoResult } from "./reference-repos.js";
+import type { ReferenceRepoResult } from "../../reference-repos.js";
 import { reviewStep } from "./review.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";

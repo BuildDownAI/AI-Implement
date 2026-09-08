@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail } from "../step-utils.js";
-import type { ReferenceRepoResult, ReferenceRepoResultCause } from "./reference-repos.js";
+import { describeReferenceRepoCause, type ReferenceRepoResult } from "../../reference-repos.js";
 
 interface ImplementInputs extends Record<string, unknown> {
   workspaceDir: string;
@@ -18,17 +18,6 @@ interface ImplementOutputs extends Record<string, unknown> {
   exitCode: number;
   subagentCount: number;
   telemetry?: RunTelemetry;
-}
-
-function describeCause(cause: ReferenceRepoResultCause | undefined): string {
-  switch (cause) {
-    case "no-auth": return "the GitHub App is not installed on that owner";
-    case "ref-not-found": return "the declared ref does not exist in the repository";
-    case "token-error": return "the authentication token could not be minted for that owner";
-    case "clone-error": return "a network or git error prevented the clone";
-    case "path-invalid": return "the declared path is invalid or duplicated";
-    default: return "an unknown error prevented the clone";
-  }
 }
 
 function buildReferenceReposSection(results: ReferenceRepoResult[]): string {
@@ -48,14 +37,13 @@ function buildReferenceReposSection(results: ReferenceRepoResult[]): string {
   }
 
   if (missed.length > 0) {
-    if (arrived.length > 0) lines.push("");
     lines.push(
       "",
       "The following repositories were declared but could not be cloned. Do not assert anything about their contents — treat them as unavailable.",
       "",
     );
     for (const r of missed) {
-      lines.push(`- \`${r.repo}\`: ${describeCause(r.cause)}`);
+      lines.push(`- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`);
     }
   }
 
