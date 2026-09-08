@@ -340,20 +340,19 @@ When the runner completes, it calls `POST /api/runner/result` which routes to `o
 `src/kg-refresh.ts`. If a `snapshotCommit` SHA is included, the orchestrator verifies the commit is
 visible via the GitHub API (one retry for git-cache lag) before starting the local staging rail.
 
-Both callback endpoints require a `kg-refresh`-phase progress token (multi-use, `consume: false`);
+The tracker-data callback endpoint requires a `kg-refresh`-phase progress token (multi-use, `consume: false`);
 any other phase or a missing/invalid token receives `403 Unauthorized` with no distinguishing body.
 The orchestrator performs all external writes with its own credentials; the runner receives only the
-minted token or the requested data.
+requested data.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/runner/kg-push-token` | POST | Vends a short-lived GitHub installation token with `contents: write` scoped to the single KG source repo. `forceRefresh: true` ensures the credential helper always receives a full-lifetime token. |
 | `/api/runner/kg-tracker-data` | POST | Returns one paginated page (50 issues) of Linear issues for the run's team, including comments. The orchestrator performs the read; no Linear credential ever leaves the orchestrator. |
 
-The git credential helper (`session/git-credential-helper-kg-push.sh`) re-mints on expiry using
-the same progress token. `stripEmbeddedTokenFromOrigin` in `kg-snapshot-push.ts` re-strips the
-token from the remote URL right before push to counter `refreshRunnerGithubCredentials`
-re-embedding it after clone.
+The snapshot push step (`src/pipeline/steps/kg-snapshot-push.ts`) calls `refreshRunnerGithubCredentials`
+immediately before the push — the same pattern as `push.ts`. In Fly/local-docker mode this re-mints
+a fresh token via the machine nonce; in GHA mode it is a no-op (no publication token for kg-refresh)
+and the dispatch-time `GITHUB_TOKEN` is used directly.
 
 **Fly session image pinning (AII-534, updated AII-555).** `dispatchKgRefreshRun` resolves the
 session machine image via `resolveRunnerImageForDispatch` (`src/repo-image.ts`), the same
@@ -422,7 +421,7 @@ critical section after the TTL watchdog has already resolved the run.
 
 AII-495 wired `POST /api/kg/refresh` to dispatch a Claude runner when the source repo has no newer snapshot. On 2026-09-03, a refresh was triggered on the testing orchestrator for the first time with runner dispatch enabled. Two bugs blocked the run from completing; both were diagnosed and fixed within the window.
 
-**AII-544 — progress token not minted.** `dispatchKgRefreshRun()` minted only a result token (`audience: "result"`). Both vending endpoints — `POST /api/runner/kg-push-token` and `POST /api/runner/kg-tracker-data` — gate on `audience = "progress"`, so the runner received 403 on both. The `kg-tracker-data` step no-oped silently (`RUN_PROGRESS_TOKEN` absent → early return). The `kg-snapshot-push` step's git credential helper also received 403, so the push failed with no usable GitHub token. Fix: mint a progress token alongside the result token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv`.
+**AII-544 — progress token not minted.** `dispatchKgRefreshRun()` minted only a result token (`audience: "result"`). The `POST /api/runner/kg-tracker-data` endpoint gates on `audience = "progress"`, so the runner received 403. The `kg-tracker-data` step no-oped silently (`RUN_PROGRESS_TOKEN` absent → early return). Fix: mint a progress token alongside the result token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv`.
 
 **AII-548 — `runnerCallbackUrl` carried the full result URL.** The `RunConfigV1` field was set to `RUNNER_CALLBACK_BASE_URL + "/runner/result"` (the full callback URL) instead of the bare base URL. Every runner-side client that appended its own path produced a doubled path — `/runner/result/runner/result`, `/api/runner/kg-tracker-data/runner/result`, etc. — all of which hit the admin-auth wall and returned 401. Fix: `runnerCallbackUrl` is always the bare base URL (e.g. `https://my-orchestrator.fly.dev`); each client is responsible for appending its own path suffix. This contract is now documented in `docs/issueless-runs.md` §3.
 
@@ -439,11 +438,11 @@ After both fixes landed, the review of the implementation also identified an arc
 | Pipeline entrypoint | — | `src/pipeline/kg-refresh-run.ts` | present |
 | Tracker data step | — | `src/pipeline/steps/kg-tracker-data.ts` | present |
 | Snapshot push step | — | `src/pipeline/steps/kg-snapshot-push.ts` | present |
-| Push token vending | — | `src/kg-push-token-vending.ts` | present |
+| Push credential | `src/pipeline/steps/push.ts` `refreshRunnerGithubCredentials` | — | removed by AII-583 ✓ |
 | Callback routing | `src/runner-callback.ts` (carve-out within shared file) | — | present |
 | Dispatch function | — | `src/index.ts` `dispatchKgRefreshRun` | present |
 
-The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, and `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`. AII-556 and AII-557 collapsed both pairs. Rows with no shared counterpart (the state machine, pipeline steps, token vending) are legitimately kg-refresh-only and belong exactly where they are.
+The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`, and the kg-push credential helper should have reused `refreshRunnerGithubCredentials` from the standard push step. AII-556, AII-557, and AII-583 collapse those pairs. Rows with no shared counterpart (the state machine, pipeline steps) are legitimately kg-refresh-only and belong exactly where they are.
 
 ## Lineage
 
@@ -456,6 +455,6 @@ The rule for future run kinds: prefer a parameter of an existing file over a new
 | Deploy ownership | AII-353, AII-355 | Self-deploy, source stamps, availability |
 | Docs ingestion | KGB-2 through KGB-5, KGA-2, BDS-38 | Crawl, section chunks, citable anchors |
 | Scaling | KGB-8, AII-422 | Bounded-memory embedding, and a receipt when it still fails |
-| Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: Claude runner follows the ingest playbook; runner-callback endpoints vend scoped push token and tracker data |
+| Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: Claude runner follows the ingest playbook; runner-callback endpoint vends tracker data; snapshot push uses the standard credential-refresh path |
 | Runner dispatch + stage machine | AII-495 | `POST /api/kg/refresh` dispatches the runner when ingest is needed; persisted stage machine (idle → checking → ingest-running → snapshot-landed → staging → terminal) survives restarts; live TTL watchdog; `/admin#deployments` stage badges |
 | KG-visible outcomes | AII-496 | Slack/Teams notification + Linear failure comment on every terminal outcome; TTL-timeout reaches the "hit the time limit" classifier; stuck-watchdog carve-out; exactly-once guarantee via stage guard |

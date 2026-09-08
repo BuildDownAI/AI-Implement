@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 
 /** Coded failure raised when the snapshot parts or embeddings file are absent. */
 export class KgSnapshotMissingError extends Error {
@@ -38,6 +39,11 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
   defaultBranch: string;
   /** HEAD SHA at clone time — used to read the previous snapshot stamp. */
   clonedRef: string;
+  repoOwner: string;
+  repoRepo: string;
+  orchestratorUrl?: string;
+  machineNonce?: string;
+  callbackUrl?: string;
 }
 
 interface KgSnapshotPushOutputs extends Record<string, unknown> {
@@ -51,34 +57,6 @@ interface KgStats {
   docPages?: number;
   durationSec?: number;
   notes?: string[];
-}
-
-/**
- * Strip any embedded credentials from the origin remote URL so git consults
- * the registered credential helper rather than using the embedded token.
- *
- * cloneStep:refreshRunnerGithubCredentials re-embeds the standard /api/token
- * credential in the origin URL after entrypoint.sh's setup_kg_push_credential
- * strips it. Calling this immediately before the push restores the clean URL
- * so the scoped kg-push credential helper is actually consulted — including
- * its re-mint-on-expiry logic for long-running ingests.
- */
-function stripEmbeddedTokenFromOrigin(workspaceDir: string): void {
-  const getUrlResult = spawnSync("git", ["remote", "get-url", "origin"], {
-    cwd: workspaceDir,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (getUrlResult.status !== 0) return;
-
-  const currentUrl = getUrlResult.stdout.toString().trim();
-  // Remove the userinfo component (x-access-token:TOKEN@) from the HTTPS URL.
-  const cleanUrl = currentUrl.replace(/^https:\/\/[^@]+@/, "https://");
-  if (cleanUrl === currentUrl) return;
-
-  spawnSync("git", ["remote", "set-url", "origin", cleanUrl], {
-    cwd: workspaceDir,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
 }
 
 function runGit(workspaceDir: string, args: string[], githubToken: string, label: string): void {
@@ -150,7 +128,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       return { snapshotPushed: false, commitSha: null };
     }
 
-    const { workspaceDir, githubToken, defaultBranch, clonedRef } = inputs;
+    const { workspaceDir, githubToken, defaultBranch, clonedRef, repoOwner, repoRepo } = inputs;
 
     // ── 0. Tracker regression guard ──────────────────────────────────────────
     // If the tracker-data step did not fetch (fetched=false) and the previous
@@ -272,18 +250,21 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const commitSha = resolveHeadSha(workspaceDir);
 
     // ── 6. Push directly to default branch (no PR, no feature branch) ────────
-    // When the kg-push credential helper is active (GIT_KG_PUSH_TOKEN_FILE set),
-    // strip the embedded token from the origin URL immediately before pushing.
-    // cloneStep:refreshRunnerGithubCredentials re-embeds the /api/token credential
-    // in the remote URL after entrypoint.sh's setup_kg_push_credential strips it,
-    // so we must strip again here to force git to consult the helper — which
-    // vends a contents:write token scoped to the KG repo and re-mints on expiry.
+    // Refresh the dispatch-time token immediately before the push — the same
+    // pattern as push.ts. In Fly/local-docker mode the machine nonce re-mints a
+    // fresh token; in GHA mode this is a no-op (no publication token on kg-refresh).
     // --force-with-lease compares against refs/remotes/origin/<defaultBranch>
     // which the clone step populated.
-    if (process.env.GIT_KG_PUSH_TOKEN_FILE) {
-      stripEmbeddedTokenFromOrigin(workspaceDir);
-    }
-    runGit(workspaceDir, ["push", "origin", `HEAD:refs/heads/${defaultBranch}`, "--force-with-lease"], githubToken, "git push");
+    const activeGithubToken = await refreshRunnerGithubCredentials({
+      currentToken: githubToken,
+      orchestratorUrl: inputs.orchestratorUrl,
+      machineNonce: inputs.machineNonce,
+      callbackUrl: inputs.callbackUrl,
+      owner: repoOwner,
+      repo: repoRepo,
+      workspaceDir,
+    });
+    runGit(workspaceDir, ["push", "origin", `HEAD:refs/heads/${defaultBranch}`, "--force-with-lease"], activeGithubToken, "git push");
 
     return { snapshotPushed: true, commitSha };
   },

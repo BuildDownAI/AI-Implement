@@ -49,7 +49,6 @@ import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
-import { handleKgPushTokenRequest } from "./kg-push-token-vending.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -3326,33 +3325,6 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[publication-token] Unhandled error:", err);
-        if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-      });
-      return;
-    }
-
-    // KG push token vending — progress token authenticated, scoped contents:write to kgSourceRepo only
-    if (url === "/api/runner/kg-push-token" && req.method === "POST") {
-      (async () => {
-        if (!config.runnerTokenSecret) {
-          res.writeHead(501, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Runner callback not configured" }));
-          return;
-        }
-        const result = await handleKgPushTokenRequest({
-          authorization: req.headers.authorization,
-          secret: config.runnerTokenSecret,
-          githubAppId: config.githubAppId,
-          githubAppPrivateKey: config.githubAppPrivateKey,
-          kgSourceRepo: config.kgSourceRepo,
-        });
-        res.writeHead(result.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result.body));
-      })().catch((err) => {
-        console.error("[kg-push-token] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

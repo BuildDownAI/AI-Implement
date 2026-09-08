@@ -1,87 +1,85 @@
-# 013. Extend the pipeline by parameter, not by sibling
+# ADR 013: extend the pipeline by parameter, not by sibling file
 
 **Status:** Accepted
-**Date:** 2026-09-08
+
+**Date:** 2026-09-06
+
+**References:** AII-489 (dispatched KG refresh), AII-521 (issueless-run lifecycle), AII-543 / AII-549 (live-run fix groups), AII-548 (callback-URL contract), AII-553 (merge race), AII-560 (merge-ordering guarantee umbrella), AII-555 (consolidation), `docs/issueless-runs.md`, `docs/pipeline-architecture.md`
 
 ## Context
 
-AII-489 designed the kg-refresh run kind as a dispatched runner job that reuses the existing
-execution backends. During build-up (AII-493–521), the kg-refresh pieces were filed as **new
-files next to the existing ones** instead of as **parameters of the existing ones**. Each new
-file was a place where existing behaviour was re-described by hand, and each re-description was
-wrong in a way that only a live run could show. Eight live runs and fourteen issues
-(AII-532–534, 538, 541, 543–548, 549–554) were needed to reach the push step.
+The dispatched KG refresh (AII-489) was the first run kind that is not keyed to a tracker issue. It was built as a set of files **next to** the implement pipeline's files: a second workflow template (`workflows/claude-kg-refresh.yml`), a second image resolver (`resolveKgRefreshSessionImage`), a second GitHub Actions lifecycle inside the reaper, an inline callback-URL derivation in the entrypoint, and a hand-written YAML parser in a step.
 
-The six seams where sibling code was introduced instead of parameterising an existing module:
+Each of those files re-described behaviour the pipeline already had, and each re-description was wrong in a way only a live run exposed. Between 2026-09-03 and 2026-09-06 the refresh needed eight live runs and fourteen fix issues to reach the snapshot-push step. The seams, in the order found, with what already existed:
 
-| Seam | Sibling introduced | Module that already existed |
+| Seam | New code that failed | What already existed |
 |---|---|---|
-| GHA workflow | `workflows/claude-kg-refresh.yml` | `workflows/claude-implement.yml` — accepts `runner_phase` input |
-| Runner image on Fly | `resolveKgRefreshSessionImage` with registry round-trip | `resolveRunnerImageForDispatch`, used by implement and planning dispatch |
-| Runner image on GHA | dispatch omitted `runner_image` | `resolveRunnerImageForDispatch`, already called by implement dispatch |
-| Phase selection | template never set `RUNNER_PHASE` | `session/entrypoint.sh` `case "$RUNNER_PHASE"` + envelope `runnerPhase` |
-| Callback URL | inline derivation doubled the path | `config.runnerCallbackBaseUrl`, bare base exported by the implement path |
-| Reaper | second GHA lifecycle branch | `attachJobRunIdIfMissing` + `monitorGitHubActionsJob` in the monitor |
+| Backend selection | hard-wired to Fly | `resolveExecutionPath` + the mapping's execution mode |
+| Image on Fly | unpaired image, machine exited at boot | the channel tag every run uses; `build-runner.yml` promotion |
+| Image on GHA | dispatch omitted `runner_image` | `resolveRunnerImageForDispatch` |
+| Phase | template never set `RUNNER_PHASE` | the entrypoint's phase arm and the envelope's `runnerPhase` |
+| Progress token | template lacked the input | `claude-implement.yml` declares and masks it |
+| Callback URL | envelope carried a path; an inline derivation doubled it | `config.runnerCallbackBaseUrl`, the bare base |
+| GHA lifecycle | reaper closed rows; then a second binding path in the reaper | `attachJobRunIdIfMissing` + `monitorGitHubActionsJob` |
+| Review rubric | generic reviewer rejected untracked output | the template's "pipeline owns writes" contract |
+| Stamp format | validator accepted only `Z` | the ingest's own `isoformat()` stamp |
+| Tracker scope | empty team key, then a regex parser | the repo's YAML loader; `sources.yml` |
 
-Two process causes drove each failure. Issue bodies described the **behaviour** the new code
-should have, rather than naming the **module to reuse** — so the implementer wrote a parallel
-version (second template, source-commit resolver, inline URL derivation). And the review that
-would have caught the sibling pattern never posted on grouped children, because auto-merge raced
-the review gate (AII-471, AII-553).
+Two process causes stood behind every row. Issue bodies described behaviour ("read the file", "derive the URL") instead of naming the module to reuse, so the implementer wrote a parallel version. And the reviews that would have caught the parallel version never posted on grouped child PRs, because auto-merge raced the review (AII-471, fixed for initial runs by AII-553).
 
 ## Decision
 
-**A new run kind extends the pipeline by adding parameters to existing modules, not by creating
-sibling files that re-describe the same behaviour.**
+**A new run kind is a parameter of the files the pipeline already has. It is never a sibling file.**
 
-Concrete rules:
+The pipeline's extension points, and the only places a new run kind may add to:
 
-1. A new GHA dispatch target is an additional `runner_phase` value in `claude-implement.yml`,
-   not a second `.yml` template. `claude-implement.yml` is in `ALWAYS_SYNC_FILES` and is
-   auto-delivered to every target repo; a second template is not.
+| Subsystem | Extension point | Not this |
+|---|---|---|
+| Dispatch backend | `resolveExecutionPath(runnerMode, mappingMode)`; the same Fly and GHA dispatch calls the implement path uses | a per-kind backend choice |
+| Workflow template | `workflows/claude-implement.yml`, delivered by workflow sync to every mapping; new behaviour is an **optional `workflow_dispatch` input whose default preserves today's run** | a second template, hand-copied |
+| Runner image | `resolveRunnerImageForDispatch` for both backends; the channel tag | a per-kind resolver or pinning policy |
+| Entrypoint | `session/entrypoint.sh` selects the entry script from `RUNNER_PHASE`, which the template and the machine env set | inline derivation of a value the platform already provides |
+| Pipeline definition | `pipelines/<kind>.yml` loaded by `src/pipeline/pipeline-loader.ts`; kind-specific behaviour is a step module under `src/pipeline/steps/` | a second executor or loader |
+| Prompt template | `workflows/<KIND>.md` with the same front-matter and substitution rules as `WORKFLOW.md` | a different assembly path |
+| Callbacks and tokens | `/runner/result`, progress tokens, `runner_tokens`; the envelope's `runnerCallbackUrl` is the **bare base URL** and every client appends its own path | a per-kind callback shape |
+| Lifecycle | one `dispatch_log` row per run; GitHub Actions rows are bound and monitored by the poll loop's lazy bind and `monitorGitHubActionsJob`; Fly rows by the machine monitor and the Fly reaper rules | a per-kind reaper branch or binding loop |
+| Deploy interlock | `dispatch_log` in-flight rows hold the deploy | a per-kind hold |
+| Parsing | the repo's YAML loader (`src/issue-config.ts`, `src/pipeline/pipeline-loader.ts` pattern) | a regex over YAML |
 
-2. Runner image resolution for any dispatch path goes through `resolveRunnerImageForDispatch`
-   (`src/repo-image.ts`). Per-repo `.ai-implement/image.yml` overrides and explicit
-   orchestrator-wide defaults are the only reasons to forward a specific image; the channel tag
-   (`latest` / `next`) governs everything else.
+A run kind is allowed its own **data-path** modules, because the runner never holds a tracker credential (AII-146): for the KG refresh these are the tracker-read and push-credential proxies (`/api/runner/kg-tracker-data`, `/api/runner/kg-push-token`), the `kg-tracker-data` and `kg-snapshot-push` steps, and the rail in `src/kg-refresh.ts`. Those are new capabilities, not re-descriptions.
 
-3. The entrypoint (`session/entrypoint.sh`) routes new phases via a new `case` arm in the
-   existing `$RUNNER_PHASE` switch. A new entrypoint script is a sibling; a new arm is a
-   parameter.
+**What counts as a violation in review.** Any of these in a PR is a finding, whatever the tests say:
 
-4. `runnerCallbackUrl` in the `RunConfigV1` envelope is always the bare base URL
-   (`https://host`). Every runner-side client appends its own path. No caller derives the base
-   URL inline from another field.
+1. A second workflow template, or a template that is not in `ALWAYS_SYNC_FILES`.
+2. A second image resolver, or an image policy that differs by run kind.
+3. A lifecycle branch keyed on the run kind inside the reaper, the monitor, or the dispatch.
+4. An inline derivation, in shell or TypeScript, of a value the template, the envelope, or the machine env already provides.
+5. A hand parser for a format the repo already loads with a library.
+6. A callback URL that carries a path.
 
-5. GHA run-ID binding and job monitoring go through the existing `attachJobRunIdIfMissing` and
-   `monitorGitHubActionsJob` path. A new monitor loop or a new reaper branch for a single phase
-   is a sibling; a phase-keyed delegation is a parameter.
+**Guards are keyed on data that exists when they run.** AII-471's merge guard joined on `pr_url`, which the result callback writes at the end of the run, so it was blind for every initial run; the issue key had been on the dispatch row since dispatch. AII-560 consolidates the child-PR merge gate onto that run record — one predicate, one guarded write path — and ships the race fixture that fails on the old code. A guard's test exercises the timeline of the data it reads, not a mock of the store.
 
-6. An issue body that implements this decision names the specific function or file to reuse, not
-   the behaviour it should exhibit. This is the only change that fixes the process cause.
+**Issue bodies name the anchor.** Every touch in a `## Files` block or a Fix section cites the existing module by path — "reuse `resolveRunnerImageForDispatch` as `dispatchGitHubActions` does" — not the behaviour. A body that says "read", "derive", or "resolve" without a path is not ready to file.
 
-Extension points for the shared pipeline, in execution order:
+## Alternatives considered
 
-| Extension point | How to add a new phase |
-|---|---|
-| Workflow dispatch | Add `runner_phase` value to the dispatch body; `claude-implement.yml` already accepts it |
-| Image resolution | `resolveRunnerImageForDispatch` — no change needed |
-| Entrypoint routing | New `case` arm in `session/entrypoint.sh` `$RUNNER_PHASE` switch |
-| Pipeline definition | New file in `pipelines/` — this is legitimately phase-specific |
-| Runner callback | Add `if (input.body.phase === "<phase>") { ... return; }` carve-out in `src/runner-callback.ts` before the tracker-write path |
-| GHA monitor | Delegate from `monitorGitHubActionsJob` by phase, passing `workflowFile: "claude-implement.yml"` |
-| Reaper | Add a phase-specific Fly sweep in `src/reaper.ts`; skip GHA rows (owned by the monitor) |
+- **Keep sibling files but sync them.** Adding `claude-kg-refresh.yml` to the sync set removes the manual copy and keeps two files that drift. Rejected: the drift is the defect.
+- **Make the source-commit image pairing universal.** It would unify the policy at the cost of a registry round-trip on every dispatch, to compensate for a channel promotion that is now verified. Rejected.
+- **A generic "run kind" plugin interface.** More surface, and every kind would still need the same ten touches. Rejected: the parameter form already exists in every subsystem above.
 
 ## Consequences
 
-- **Easier:** each new run kind is a set of parameters on existing machinery rather than a
-  parallel copy. Type-checking and the existing test suite catch omissions at the seams where
-  the shared code already has coverage.
-- **Harder:** the shared modules accumulate optional inputs and phase-conditional branches. A
-  module that genuinely needs a different contract — not just a parameter — is legitimately
-  phase-specific and belongs in its own file (the kg-refresh state machine, pipeline steps, and
-  token-vending endpoints are correct as singletons).
-- **Clean-up:** `claude-kg-refresh.yml` was removed by AII-556; `resolveKgRefreshSessionImage`
-  was removed by AII-557. `src/workflow-sync.ts` `REMOVE_FILES` queues deletion of the
-  manually-distributed `claude-kg-refresh.yml` from every KG source repo that received it.
-- **Checklist for new run kinds:** see `docs/issueless-runs.md` §10.
+- AII-560 lands before AII-555 so grouped children no longer merge under their runs; AII-555 removes the second template, the second resolver, the entrypoint derivation, and the reaper's GHA branch, and routes the KG refresh through the shared extension points.
+- Any future issueless run kind (previews, migrations, scheduled jobs) starts from the table above. The expected cost is one optional template input, one `pipelines/<kind>.yml`, one prompt template, and the kind's data-path modules.
+- The acceptance clause "no implement-path test edits" is the mechanical check that a change added a parameter rather than a sibling.
+- The review rail and the driver's smoke both check for the six violations; a green suite does not clear them.
+
+## Siblings removed under this rule
+
+| Sibling (removed) | Shared path reused | Issue |
+|---|---|---|
+| `workflows/claude-kg-refresh.yml` | `workflows/claude-implement.yml` with `runner_phase: "kg-refresh"` | AII-556 |
+| `resolveKgRefreshSessionImage` in `src/repo-image.ts` | `resolveRunnerImageForDispatch` in `src/repo-image.ts` | AII-557 |
+| `session/git-credential-helper-kg-push.sh`, `src/kg-push-token-vending.ts`, `POST /api/runner/kg-push-token` | the primary token in the origin URL, as `push.ts` pushes (`kg-snapshot-push.ts`) | AII-583 |
+| The kg-refresh report step (`feedback-loop` in `pipelines/kg-refresh.yml`, `workflows/KG-REFRESH.md`) | the ingest step's counters and `ai-output/kg-ingest.log`; `kg-snapshot-push` is the guard | AII-575 follow-up, 2026-09-08 |
+
