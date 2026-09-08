@@ -15,6 +15,7 @@ import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSna
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
 import { ClaudeCliExecutor } from "./executor.js";
+import { resolveLogLevel } from "../run-autonomous.js";
 import type { LLMExecutor, StepReporter, StepModule } from "./types.js";
 
 const PACKAGE_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
@@ -199,7 +200,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
     },
-    opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, "summary"),
+    opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
   );
 
   const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
