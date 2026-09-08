@@ -147,15 +147,15 @@ Register two additional redirect URIs in the provider consoles, alongside the ad
 
 Fastembed models load into process memory at startup. A small model such as `BAAI/bge-small-en-v1.5` is ~130 MB on disk but expands to roughly 300–400 MB resident. With the orchestrator's own Node footprint of 100–150 MB, **256 MB Fly machines are too small** and will OOM-kill one process or the other.
 
-Minimum with the sidecar is **512 MB**; **1 GB** gives comfortable headroom for larger models or concurrent requests.
+Minimum with the sidecar is **512 MB** for serving alone. The refresh rail needs more: its materialize step runs as a second Python process beside the serving sidecar, and at ~31.6k quads it reached 271 MB RSS and was OOM-killed on a 512 MB machine (2026-09-08). **1 GB** is the working size for an orchestrator that refreshes its graph in place.
 
 ```toml
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "1gb"
 ```
 
-`fly.toml` ships 512 MB as the base default. Adjust per client in `clients/<slug>.toml`.
+`fly.toml` ships 1 GB as the base default. Adjust per client in `clients/<slug>.toml`.
 
 ## Memory provider contract
 

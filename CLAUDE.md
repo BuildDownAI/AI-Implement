@@ -89,6 +89,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
 | Issueless run kinds (kg-refresh lifecycle and pattern) | `src/kg-refresh.ts`, `src/index.ts` | [docs/issueless-runs.md](docs/issueless-runs.md) |
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
+| Runner context settings (skills repo, dependency token scope) | `src/pipeline/steps/install-skills.ts`, `src/pipeline/steps/dependency-auth.ts` | [docs/runner-context.md](docs/runner-context.md) |
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | Knowledge graph end-to-end (ingest → snapshot → image → serve) | `Dockerfile` KG stages, `docker-entrypoint.sh` | [docs/kg-architecture.md](docs/kg-architecture.md) |
 | KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
@@ -223,9 +224,7 @@ On **legacy** repos only — those still carrying `comment-trigger.yml` — the 
 
 **Jira profiles** ride `run_config.profiles`, read from a multi-select custom field that must be named exactly `AI-Implement Profiles` unless `profilesFieldOverride` pins its ID. Option names must not contain commas — the contract is a comma-joined list. **No built-in step consumes profiles**; they exist as the contract surface for image-baked `custom/` steps.
 
-**Dependency Token Scope** runs on a deliberate two-token split. The **primary** token carries the App's full grants but is scoped to the target repository alone; the **dependency** token is installation-wide but strictly `contents: read` and `pull_requests: read`. The `dependency-auth` step fetches the second from `POST /api/runner/dependency-token`, installs it as a git credential helper for `github.com` and as `COMPOSER_AUTH`, and the helper re-mints it when under ten minutes remain. So the implementer can read sibling repos and their pull requests, but cannot push to them.
-
-Two things to know before enabling it. The scope is **all-or-nothing** — the token reads every repository the App installation covers, not a chosen subset (a per-project list is a planned v2; the field is stored as text so a JSON array slots in without a migration). And it needs a **publicly reachable orchestrator**, since the token is fetched over the runner callback; runs dispatched without a progress token skip the fetch and proceed without private-dependency access rather than failing.
+**Dependency Token Scope** runs on a deliberate two-token split: the primary token carries the App's full grants but is scoped to the target repository alone, while the dependency token is installation-wide and strictly `contents: read` plus `pull_requests: read` (the second grant lets the KG ingest list pull requests with `gh`). Two things to know before enabling it — the scope is **all-or-nothing**, and it needs a **publicly reachable orchestrator**.
 
 > **Behaviour change for existing Fly deployments.** The Fly-mode `/api/token` endpoint used to mint a full-installation token. It now narrows the primary token to the target repository, matching the GHA path. A deployment that incidentally relied on org-wide primary-token access to read private sibling repos must set this field to restore it.
 
@@ -250,7 +249,7 @@ The two `.ai-implement/` files read from different refs: `image.yml` from the **
 
 A file at `custom/<path>` overrides the corresponding built-in. Resolution searches the workspace root, then `AI_IMPLEMENT_CUSTOM_ROOT`, then the package root — see [docs/pipeline-architecture.md](docs/pipeline-architecture.md) for the mechanics and the step contract.
 
-Built-in step keys, in pipeline order: `clone`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `preflight`, `push`, `verify`, `post-push-review`.
+Built-in step keys, in pipeline order: `clone`, `reference-repos`, `install-skills`, `dependency-auth`, `install`, `setup`, `feedback-loop`, `preflight`, `push`, `verify`, `post-push-review`.
 
 - `custom/` belongs to an AI-Implement **fork**, not a target repo; sync never creates it there.
 - **Place client-specific behaviour in `custom/`** rather than editing built-in modules — that is what keeps a fork rebasing cleanly.

@@ -1,5 +1,6 @@
 import { claimJobRunId, getJobByDispatchId, stampJobApproved, updateJobPrUrl, updateJobStatus } from "./log.js";
 import type { Step } from "./pipeline/types.js";
+import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
@@ -70,6 +71,8 @@ export interface RunnerResultBody {
    * Only present for phase=kg-refresh.
    */
   snapshotCommit?: string;
+  /** Reference repository clone outcomes, present only when the run declared entries. */
+  referenceRepoResults?: ReferenceRepoResult[];
 }
 
 export interface HandleRunnerResultInput {
@@ -308,6 +311,20 @@ export async function handleRunnerResult(
       await provider.postComment(claims.issueId, c.body);
     } catch (err) {
       warn("postComment", err);
+    }
+  }
+
+  const missedRepos = (input.body.referenceRepoResults ?? []).filter((r) => !r.arrived);
+  if (missedRepos.length > 0) {
+    const lines = [
+      "⚠️ One or more reference repositories could not be cloned and were unavailable to the agent during this run.",
+      "",
+      ...missedRepos.map((r) => `- \`${r.repo}\`: ${describeReferenceRepoCause(r.cause)}`),
+    ];
+    try {
+      await provider.postComment(claims.issueId, lines.join("\n"));
+    } catch (err) {
+      warn("postComment(missing-reference-repos)", err);
     }
   }
 

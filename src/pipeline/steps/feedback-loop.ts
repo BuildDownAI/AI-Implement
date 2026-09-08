@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PipelineContext, Step, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { implementStep } from "./implement.js";
+import type { ReferenceRepoResult } from "../../reference-repos.js";
 import { reviewStep } from "./review.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
@@ -75,6 +76,7 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   maxTurns?: number;
   provider?: string;
   planningContext?: string;
+  referenceRepoResults?: ReferenceRepoResult[];
   implementationPrompt?: string;
   parentStepId?: string;
   /** Optional reviewer rubric appended to review prompts (e.g. kg-refresh-specific approval criteria). */
@@ -396,6 +398,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
           model: resolvedImplementModel,
           maxTurns: effectiveMaxTurns,
           planningContext: implementPlanningContext,
+          referenceRepoResults: inputs.referenceRepoResults,
         },
         outputs: {},
         logs_url: null,
@@ -412,6 +415,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
             model: resolvedImplementModel,
             maxTurns: effectiveMaxTurns,
             planningContext: implementPlanningContext,
+            referenceRepoResults: inputs.referenceRepoResults,
           },
           reporter,
         );

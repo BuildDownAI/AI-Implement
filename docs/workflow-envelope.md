@@ -27,7 +27,9 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 | `run_progress_token` | No | string | HMAC bearer token for in-progress callbacks; empty skips progress posts. **Masked.** |
 | `run_publication_token` | No | string | Dedicated, single-use bearer token that may be exchanged immediately before repository publication for a fresh repo-scoped GitHub credential. **Masked. Implementation and gap-analysis only.** |
 
-The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs.
+The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs. Token inputs are wired through `env:` on the mask step and never interpolated directly into script text, because GHA prints a step's script in the `##[group]Run …` header before the step executes.
+
+**These are live credentials in the runner's environment, and a test suite running inside that container inherits them.** `run_token` is single-use: the first `POST /runner/result` consumes it, and every later post is refused `409 already_consumed`. So a suite that reaches a runner callback with the ambient values still set burns the token long before the run reports its own outcome — the real report is discarded, the tracker never advances, and on GitHub Actions the issue holds a dispatch slot until someone repairs it by hand. Any suite exercising a callback path must clear `RUN_TOKEN` and `RUNNER_CALLBACK_URL` in a hook rather than per call site, and a test that deliberately re-arms them must point the callback at an unroutable host.
 
 ---
 

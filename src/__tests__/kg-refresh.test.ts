@@ -130,6 +130,7 @@ describe("kg-refresh", () => {
     expect(s.lastRefresh?.ok).toBe(true);
     expect(s.lastRefresh?.stampBefore).toBe(OLD_STAMP);
     expect(s.lastRefresh?.stampAfter).toBe(NEW_STAMP);
+    expect(s.servedStamp).toBe(NEW_STAMP);
     expect(restart).toHaveBeenCalledTimes(1);
 
     const current = join(dataRoot, "current");
@@ -503,6 +504,68 @@ describe("kg-refresh", () => {
     const s = await handle.status();
     expect(s.lastRefresh?.gate).toBe("staging");
     expect(persistSnapshotSha).not.toHaveBeenCalled();
+  });
+
+  // AII-579: status() reads servedStamp live from the sidecar, so a failed
+  // refresh with stampAfter: null does not mask the sidecar's real stamp.
+  it("pre-staging failure: servedStamp reflects sidecar stamp, not null", async () => {
+    // Establish currentDir/sources.yml via a successful refresh.
+    await handle.trigger();
+    await waitDone();
+    // servedStamp = NEW_STAMP after restart; currentDir has sources.yml.
+
+    // Sidecar goes down: stampBefore = null during the next fetch,
+    // which propagates to stampAfter: null on staging failure.
+    sidecarUp = false;
+    materialize.mockImplementationOnce(async () => {
+      throw new Error("ingest runner failed: KG_SNAPSHOT_TRACKER_REGRESSION");
+    });
+    await handle.trigger();
+    await waitDone();
+
+    // Sidecar comes back; it is still serving the graph from the prior refresh.
+    sidecarUp = true;
+
+    const s = await handle.status();
+    expect(s.lastRefresh?.ok).toBe(false);
+    expect(s.lastRefresh?.stampAfter).toBeNull();
+    expect(s.servedStamp).toBe(NEW_STAMP);
+  });
+
+  // AII-579: fresh boot — current/ does not exist yet; status() falls back to kgDir.
+  it("fresh boot: servedStamp reads from kgDir when current/ is absent", async () => {
+    // Build a real kgDir with a sources.yml so readNamespace() can find the namespace.
+    const realKgDir = mkdtempSync(join(tmpdir(), "kgdir-"));
+    writeFileSync(join(realKgDir, "sources.yml"), `namespace: ${NAMESPACE}\n`);
+    try {
+      build({ kgDir: realKgDir });
+      // No trigger() called — current/ has never been staged.
+      const s = await handle.status();
+      expect(s.running).toBe(false);
+      expect(s.lastRefresh).toBeNull();
+      // Sidecar is up serving OLD_STAMP under NAMESPACE; kgDir branch must reach it.
+      expect(s.servedStamp).toBe(OLD_STAMP);
+    } finally {
+      rmSync(realKgDir, { recursive: true, force: true });
+    }
+  });
+
+  // AII-579: live orchestrator with legacy current/ (no sources.yml) falls back to kgDir.
+  it("legacy current/ without sources.yml falls back to kgDir for servedStamp", async () => {
+    const realKgDir = mkdtempSync(join(tmpdir(), "kgdir-"));
+    writeFileSync(join(realKgDir, "sources.yml"), `namespace: ${NAMESPACE}\n`);
+    try {
+      build({ kgDir: realKgDir });
+      // Simulate a legacy current/ directory that has no sources.yml (pre-fix overlay).
+      const currentDir = join(dataRoot, "current");
+      mkdirSync(currentDir, { recursive: true });
+      writeFileSync(join(currentDir, "graph.trig"), "placeholder");
+      // No sources.yml in currentDir — status() must fall back to kgDir.
+      const s = await handle.status();
+      expect(s.servedStamp).toBe(OLD_STAMP);
+    } finally {
+      rmSync(realKgDir, { recursive: true, force: true });
+    }
   });
 
   // ---- AII-495: dispatch-path tests ----------------------------------------

@@ -68,8 +68,10 @@ So a dead graph never takes the pipeline down. Only a *deploy* joins their fates
 
 ### Resources are shared
 
-The machine runs at **512 MB** — raised from 256 MB for the sidecar in AII-322. The published setup
-docs still describe 256 MB, which is right only for an orchestrator built without the KG.
+The machine runs at **1 GB** — raised from 256 MB for the sidecar in AII-322, and from 512 MB on
+2026-09-08 when the refresh rail's materialize step was OOM-killed at ~31.6k quads (see the history
+table). The published setup docs still describe 256 MB, which is right only for an orchestrator built
+without the KG.
 
 Memory is also shared at build time, and that has bitten once already: the embed step was OOM-killed
 at ~21k quads once DocSection cards entered the graph (KGB-8). Growth in the graph is a constraint on
@@ -82,7 +84,7 @@ the image build, not only on query latency.
 | 1 | **Ingest** | local machine, python ≥ 3.10 | the only stage that fetches source data |
 | 2 | **Commit** | git — `snapshot/parts/*.nt` | the transport between the repos |
 | 3 | **Build** | Docker: node:24-slim + python venv | the graph is materialized here |
-| 4 | **Serve** | Fly machine, 512 MB | lazy load on first query |
+| 4 | **Serve** | Fly machine, 1 GB | lazy load on first query |
 | 5 | **Access** | MCP client over HTTPS + OAuth | |
 
 The repository boundary sits between stages 2 and 3. The configured KG source repository owns the
@@ -300,7 +302,10 @@ flowchart TD
   `np.savez_compressed`), because the serving machine can never compute them — KGB-8's OOM is
   the proof. The graph stays derived; only the vectors ship. Measured 2026-08-21 at ~21k quads:
   12.0 MB uncompressed (7.0 MB of it fixed-width-column zero-padding), 2.5 MB compressed.
-  Peak refresh footprint is ~75 MB against the 1 GB volume — tenfold headroom.
+  Peak refresh footprint on disk is ~75 MB against the 1 GB volume — tenfold headroom. Resident
+  memory is the tighter budget: the rail's materialize runs as a second Python process beside the
+  serving sidecar, and at ~31.6k quads it reached 271 MB RSS — which is what the 512 MB machine
+  could not hold on 2026-09-08.
 
 ### The `index.ts` budget
 
@@ -420,6 +425,7 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | 2026-08-18 | Self-deploy v111 built the previous snapshot; v112 minutes later was correct | Remote-builder git-cache lag on a `--depth 1` clone — wait and redeploy |
 | 2026-08-19 | v115 shipped lexical-only after the embed step was OOM-killed at ~21k quads / 1,438 cards | KGB-8 — free the rdflib graph before embedding, pre-allocate the output array, embed in slices of 64 |
 | 2026-08-20 | A degraded build was indistinguishable from a healthy one | AII-422 — `.embeddings-failed` receipt, `KG_EMBEDDINGS_DEGRADED`, `kgDegraded` on health, notification, and `get_tenant_health` |
+| 2026-09-08 | Refresh rail's materialize OOM-killed at ~31.6k quads (271 MB RSS beside the serving sidecar on a 512 MB machine); the rail refused the swap and kept serving the old graph | `fly.toml` memory raised to 1 GB — the documented headroom figure, not a code change |
 
 ## KG-refresh outcome visibility (AII-496)
 

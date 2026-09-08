@@ -5,6 +5,7 @@ import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } fr
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
 import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./steps/kg-tracker-data.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",
@@ -118,6 +119,19 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "reference-repos":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          referenceRepos: ctx.data.referenceRepos,
+          callbackUrl: ctx.data.callbackUrl,
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
+        }),
+        skip: (ctx: PipelineContext) => !ctx.data.referenceRepos?.length,
+      };
+
     case "install-skills":
       return {
         ...step,
@@ -166,12 +180,14 @@ function applyWiring(step: YamlStep): StepDefinition {
           const repoModels = ctx.getOutputs("install").repoModels as
             | { implement?: string; review?: string }
             | undefined;
+          const referenceRepoOutputs = ctx.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] };
           return {
             workspaceDir: ctx.getOutputs("clone").workspaceDir,
             issueTitle: ctx.data.issueTitle,
             issueDescription: ctx.data.issueDescription,
             implementationPrompt: ctx.data.implementationPrompt,
             planningContext: ctx.data.planningContext,
+            referenceRepoResults: referenceRepoOutputs.results,
             repoImplementModel: repoModels?.implement,
             repoReviewModel: repoModels?.review,
             provider: ctx.data.provider,

@@ -29,20 +29,23 @@ The `context` argument carries `PipelineContextData` — the issue fields, works
 
 ## The built-in pipeline
 
-`pipelines/autonomous.yml` declares ten steps. They run in file order, and each is registered under a key in `BUILTIN_STEPS` (`src/pipeline/default-pipeline.ts`).
+`pipelines/autonomous.yml` declares the steps below. They run in file order, and each is registered under a key in `BUILTIN_STEPS` (`src/pipeline/default-pipeline.ts`).
 
 | # | Step id | Skipped when |
 |---|---------|--------------|
 | 1 | `clone` | never |
-| 2 | `install-skills` | no `skillsRepo` configured |
-| 3 | `dependency-auth` | the mapping has no Dependency Token Scope set |
-| 4 | `install` | never (internally no-ops for a mounted workspace or a repo with no `package.json`) |
-| 5 | `setup` | no `setup:` hook in `WORKFLOW.md` front matter |
-| 6 | `feedback-loop` | never |
-| 7 | `preflight` | the feedback loop did not approve |
-| 8 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch) |
-| 9 | `verify` | no `verify:` hook, or the feedback loop did not approve |
-| 10 | `post-push-review` | not approved, or nothing was pushed, or no PR number |
+| 2 | `reference-repos` | the envelope declares no `referenceRepos` entries |
+| 3 | `install-skills` | no `skillsRepo` configured |
+| 4 | `dependency-auth` | the mapping has no Dependency Token Scope set |
+| 5 | `install` | never (internally no-ops for a mounted workspace or a repo with no `package.json`) |
+| 6 | `setup` | no `setup:` hook in `WORKFLOW.md` front matter |
+| 7 | `feedback-loop` | never |
+| 8 | `preflight` | the feedback loop did not approve |
+| 9 | `push` | never (initial runs create the branch and PR; gap-fill runs commit remaining changes and force-push to the existing PR branch) |
+| 10 | `verify` | no `verify:` hook, or the feedback loop did not approve |
+| 11 | `post-push-review` | not approved, or nothing was pushed, or no PR number |
+
+`reference-repos` runs immediately after `clone` to populate the workspace with any declared reference repositories before any hook or install step runs. It fetches per-owner installation tokens from the orchestrator's `/api/runner/reference-token` endpoint (gated on the mapping's `referenceRepos` field), then clones each entry shallow. The credential is passed via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` environment variables — the only form that does not persist the token into the clone's `.git/config` or `remote.origin.url`. After each clone, the path is appended to `.git/info/exclude` so `git add -A` can never stage it. A clone failure is logged and reported in the step outputs but never fails the run.
 
 `dependency-auth` sits deliberately before `install`: it fetches a read-only, installation-wide token and installs it as a git credential helper plus `COMPOSER_AUTH`, so the dependency install that follows can resolve private sibling repositories. Its inputs are also a worked example of a real constraint — the run's progress token is **not** passed through `inputs`, because inputs are persisted to the step log and surfaced through the admin API. The step reads that secret from `process.env` directly. Anything secret belongs in the environment, not in a step's inputs.
 

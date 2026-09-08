@@ -158,7 +158,9 @@ export class FakeProvider implements TicketingProvider {
         },
         phase, lifecycle: "active",
       });
-      this.comments.set(issueId, []);
+      if (!this.comments.has(issueId)) {
+        this.comments.set(issueId, []);
+      }
       return;
     }
     entry.phase = phase;
