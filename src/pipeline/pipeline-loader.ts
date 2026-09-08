@@ -313,14 +313,15 @@ function applyWiring(step: YamlStep): StepDefinition {
         ...step,
         inputs: (ctx: PipelineContext) => {
           const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
-          const codeRepo = readCodeRepoFromSourcesYml(workspaceDir) ?? "";
-          const slashIdx = codeRepo.indexOf("/");
-          const repoOwner = slashIdx > 0 ? codeRepo.slice(0, slashIdx) : codeRepo;
-          const repoRepo = slashIdx > 0 ? codeRepo.slice(slashIdx + 1) : "";
+          const codeRepo = readCodeRepoFromSourcesYml(workspaceDir);
+          const slug = codeRepo?.slug ?? "";
+          const slashIdx = slug.indexOf("/");
+          const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
+          const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
           return {
             repoOwner,
             repoRepo,
-            branch: "",
+            branch: codeRepo?.branch ?? "",
             githubToken: "",
             workspaceDir,
             targetDir: "code-repo",

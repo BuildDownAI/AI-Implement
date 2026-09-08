@@ -2947,9 +2947,9 @@ describe("readCodeRepoFromSourcesYml", () => {
     expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
   });
 
-  it("returns owner/repo when code_repo key is present", () => {
+  it("returns { slug } when code_repo string key is present", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement" });
   });
 
   it("returns null when code_repo key is absent", () => {
@@ -2959,7 +2959,7 @@ describe("readCodeRepoFromSourcesYml", () => {
 
   it("trims trailing comments from the code_repo value", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement  # main code repo\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement" });
   });
 
   it("returns null for malformed YAML that lacks code_repo", () => {
@@ -2967,11 +2967,11 @@ describe("readCodeRepoFromSourcesYml", () => {
     expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
   });
 
-  it("returns owner/repo when code_repo is present alongside trackers block", () => {
+  it("returns { slug } when code_repo is present alongside trackers block", () => {
     writeFileSync(join(tmpDir, "sources.yml"),
       "code_repo: org/my-repo\ntrackers:\n  - team: AII\n",
     );
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/my-repo" });
   });
 
   it("returns null when code_repo value has no slash (not owner/repo format)", () => {
@@ -2994,14 +2994,14 @@ code_repo:
   doc_globs: []
 `;
 
-  it("returns slug from the real verbatim mapping form", () => {
+  it("returns { slug } from the real verbatim mapping form", () => {
     writeFileSync(join(tmpDir, "sources.yml"), REAL_CODE_REPO_BLOCK);
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement" });
   });
 
-  it("returns slug when code_repo is a mapping with only the slug key", () => {
+  it("returns { slug } when code_repo is a mapping with only the slug key", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: org/my-repo\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/my-repo" });
   });
 
   it("returns null when code_repo mapping has no slug key", () => {
@@ -3016,25 +3016,69 @@ code_repo:
 
   it("strips trailing comment from slug line", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: org/my-repo  # main repo\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/my-repo" });
   });
 
-  it("returns slug when mapping form coexists with trackers block", () => {
+  it("returns { slug } when mapping form coexists with trackers block", () => {
     writeFileSync(
       join(tmpDir, "sources.yml"),
       "code_repo:\n  slug: org/repo\ntrackers:\n  - team: AII\n",
     );
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
   });
 
-  it("returns slug via regex fallback when YAML is malformed but mapping hint present", () => {
+  it("returns { slug } via regex fallback when YAML is malformed but mapping hint present", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "[broken\ncode_repo:\n  slug: org/repo\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
   });
 
   it("returns null when code_repo mapping slug value is numeric (42)", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: 42\n");
     expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  // ── branch field ───────────────────────────────────────────────────────────
+
+  it("returns { slug, branch } when mapping form has branch key", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n  branch: testing\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement", branch: "testing" });
+  });
+
+  it("returns { slug } without branch when mapping form has no branch key", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: BuildDownAI/AI-Implement\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement" });
+  });
+
+  it("trims whitespace from branch value", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch:  testing \n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo", branch: "testing" });
+  });
+
+  it("omits branch when branch value starts with a dash (would be misread as git flag)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch: -f\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
+  it("returns { slug } without branch via regex fallback (branch not captured by regex)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "[broken\ncode_repo:\n  slug: org/repo\n  branch: testing\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
+  it("string form never carries a branch", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: org/repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
   });
 });
 
@@ -3167,6 +3211,15 @@ describe("readSecondaryReposFromSourcesYml", () => {
     writeFileSync(
       join(tmpDir, "sources.yml"),
       "secondary_repos:\n  - slug: BuildDownAI/skills\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when value starts with dash (flag-injection guard)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"--upload-pack=evil\"\n",
     );
     const result = readSecondaryReposFromSourcesYml(tmpDir);
     expect(result[0]).not.toHaveProperty("branch");
@@ -3794,6 +3847,65 @@ steps:
     const inputs = ctx.resolveInputs(step!.inputs);
 
     expect(inputs.depth).toBeUndefined();
+  });
+
+  it("inputs carry branch from mapping-form code_repo.branch", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n  branch: testing\n",
+    );
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.branch).toBe("testing");
+    expect(inputs.repoOwner).toBe("BuildDownAI");
+    expect(inputs.repoRepo).toBe("AI-Implement");
+  });
+
+  it("inputs carry branch: '' when mapping-form code_repo has no branch field", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n",
+    );
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.branch).toBe("");
+  });
+
+  it("inputs carry branch: '' for string-form code_repo (no branch in string form)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.branch).toBe("");
   });
 });
 

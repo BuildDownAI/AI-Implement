@@ -197,12 +197,13 @@ code_repo: BuildDownAI/AI-Implement
 # Mapping form (canonical)
 code_repo:
   slug: BuildDownAI/AI-Implement        # GitHub owner/name — the field the step reads
+  branch: testing                       # optional: branch to clone; omit for repo default
   path: ../AI-Implement                 # local clone path (used by the ingest tool)
   docs_url: https://docs.builddown.ai/latest/introduction
   doc_globs: [...]
 ```
 
-When the `code_repo:` key is present, `clone-code-repo` clones that repository into `code-repo/` in the workspace using a bare `https://github.com/...` URL — the credential helper supplies the dependency token automatically. When the key is absent, the step emits a warning (`[clone-code-repo] sources.yml has no code_repo.slug — skipping`) and is skipped.
+When the `code_repo:` key is present, `clone-code-repo` clones that repository into `code-repo/` in the workspace using a bare `https://github.com/...` URL — the credential helper supplies the dependency token automatically. When the key is absent, the step emits a warning (`[clone-code-repo] sources.yml has no code_repo.slug — skipping`) and is skipped. The optional `branch` field in the mapping form controls which branch is cloned; when absent the repo's default branch is used. The string form (`code_repo: owner/name`) does not support a branch.
 
 The `clone-code-repo` step clones with **full history** (`depth: full` in `pipelines/kg-refresh.yml`), omitting `--depth`. This ensures the ingest tool sees the complete commit graph — author counts, full `git log`, `gh pr list` queries — rather than the shallow 1-commit view. If the repo directory already exists as a shallow clone from a prior run, the step detects shallowness (`git rev-parse --is-shallow-repository`) and issues `git fetch --unshallow origin` before the branch-targeting fetch.
 

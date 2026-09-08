@@ -128,7 +128,7 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
             const slug = typeof r.slug === "string" ? ownerRepo(r.slug.trim()) : null;
             if (slug === null) return [];
             const branchRaw = typeof r.branch === "string" ? r.branch.trim() : "";
-            const branch = branchRaw || undefined;
+            const branch = branchRaw && !branchRaw.startsWith("-") ? branchRaw : undefined;
             return [{ slug, ...(branch !== undefined ? { branch } : {}) }];
           });
       }
@@ -144,11 +144,14 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
  * Reads the top-level `code_repo:` key from sources.yml.
  * Accepts two forms:
  *   - string:  `code_repo: owner/name`
- *   - mapping: `code_repo:\n  slug: owner/name\n  ...`
- * Returns the value as `"owner/repo"` or null when the key is absent, the file
+ *   - mapping: `code_repo:\n  slug: owner/name\n  branch: <b>\n  ...`
+ * Returns `{ slug, branch? }` or null when the key is absent, the file
  * is missing, or the file cannot be parsed.
+ * When `branch` is present in the mapping form and non-empty after trimming,
+ * it is included; values starting with `-` are silently rejected (would be
+ * misinterpreted as git flags). The string form never carries a branch.
  */
-export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null {
+export function readCodeRepoFromSourcesYml(workspaceDir: string): { slug: string; branch?: string } | null {
   const filePath = join(workspaceDir, "sources.yml");
   if (!existsSync(filePath)) return null;
 
@@ -164,7 +167,8 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null 
     if (doc !== null && typeof doc === "object") {
       const codeRepo = (doc as Record<string, unknown>).code_repo;
       if (typeof codeRepo === "string") {
-        return ownerRepo(codeRepo.trim());
+        const slug = ownerRepo(codeRepo.trim());
+        return slug !== null ? { slug } : null;
       }
       if (
         codeRepo !== null &&
@@ -172,7 +176,13 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null 
         !Array.isArray(codeRepo) &&
         typeof (codeRepo as Record<string, unknown>).slug === "string"
       ) {
-        return ownerRepo(((codeRepo as Record<string, unknown>).slug as string).trim());
+        const slug = ownerRepo(((codeRepo as Record<string, unknown>).slug as string).trim());
+        if (slug === null) return null;
+        const branchRaw = typeof (codeRepo as Record<string, unknown>).branch === "string"
+          ? ((codeRepo as Record<string, unknown>).branch as string).trim()
+          : "";
+        const branch = branchRaw && !branchRaw.startsWith("-") ? branchRaw : undefined;
+        return { slug, ...(branch !== undefined ? { branch } : {}) };
       }
     }
   } catch {
@@ -184,13 +194,18 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): string | null 
   // where \s+ crossed the newline), fall through to the mapping-form regex.
   const matchStr = raw.match(/^code_repo:\s+(\S+)/m);
   if (matchStr) {
-    const v = ownerRepo(matchStr[1]);
-    if (v !== null) return v;
+    const slug = ownerRepo(matchStr[1]);
+    if (slug !== null) return { slug };
   }
   // Mapping form fallback: code_repo:\n  slug: owner/name
   // Use [ \t]* (not \s*) so the trailing \n is not consumed by the whitespace class.
+  // Branch is not captured in the regex fallback path (broken-YAML best-effort).
   const matchMapping = raw.match(/^code_repo:[ \t]*\n[ \t]+slug:[ \t]+(\S+)/m);
-  return matchMapping ? ownerRepo(matchMapping[1]) : null;
+  if (matchMapping) {
+    const slug = ownerRepo(matchMapping[1]);
+    return slug !== null ? { slug } : null;
+  }
+  return null;
 }
 
 export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOutputs> = {
