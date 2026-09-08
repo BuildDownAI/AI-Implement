@@ -4,6 +4,7 @@ import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } fr
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
 import { readCodeRepoFromSourcesYml } from "./steps/kg-tracker-data.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
   "clone",
@@ -160,12 +161,14 @@ function applyWiring(step: YamlStep): StepDefinition {
           const repoModels = ctx.getOutputs("install").repoModels as
             | { implement?: string; review?: string }
             | undefined;
+          const referenceRepoOutputs = ctx.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] };
           return {
             workspaceDir: ctx.getOutputs("clone").workspaceDir,
             issueTitle: ctx.data.issueTitle,
             issueDescription: ctx.data.issueDescription,
             implementationPrompt: ctx.data.implementationPrompt,
             planningContext: ctx.data.planningContext,
+            referenceRepoResults: referenceRepoOutputs.results,
             repoImplementModel: repoModels?.implement,
             repoReviewModel: repoModels?.review,
             provider: ctx.data.provider,

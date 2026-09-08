@@ -38,12 +38,13 @@ Each setting below is documented in the same shape — what it gives a run, the 
 |---------|------------------|----------------|------------|--------------|
 | Skills repository | applied | applied | ignored | ignored |
 | Dependency token scope | applied | applied | not sent | applied |
+| Reference repositories | applied | applied | not sent | not sent |
 
 Gap-analysis shares the implementation entry module — it is an implementation run with `prNumber` set — so the two columns will agree for any setting added here.
 
-**Planning applies nothing on this page.** `run-planning.js` invokes Claude directly and runs no pipeline, so there is no step to consume anything. The two settings reach that boundary differently: dependency token scope is guarded out of the planning envelope at dispatch, while a skills repository is encoded into it and then never read. Treat neither as a bug to fix in passing — giving planning access to pipeline-provided capabilities is tracked work with a wider scope than dropping a field.
+**Planning applies nothing on this page.** `run-planning.js` invokes Claude directly and runs no pipeline, so there is no step to consume anything. The settings reach that boundary differently: dependency token scope and reference repositories are both guarded out of the planning envelope at dispatch, while a skills repository is encoded into it and then never read. Treat neither as a bug to fix in passing — giving planning access to pipeline-provided capabilities is tracked work with a wider scope than dropping a field.
 
-**kg-refresh runs its own pipeline** (`pipelines/kg-refresh.yml`), which includes `dependency-auth` but not `install-skills`. Its dependency token is not optional in the way the table suggests: a later step depends on it, and `docs/issueless-runs.md` §5 covers that rail.
+**kg-refresh runs its own pipeline** (`pipelines/kg-refresh.yml`), which includes `dependency-auth` but neither `install-skills` nor `reference-repos`. Reference repositories are additionally guarded out of its envelope, so that phase never receives the field at all. Its dependency token is not optional in the way the table suggests: a later step depends on it, and `docs/issueless-runs.md` §5 covers that rail.
 
 ## Skills repository
 
@@ -112,9 +113,54 @@ A per-project repository list is the planned second version, and the field is st
 
 **What omitting it costs.** A dependency install that needs a private sibling repository fails at install time with an authentication error, not with a message naming this setting.
 
+## Reference repositories
+
+**What it gives a run.** Other repositories, cloned into the workspace and kept out of the implementation commit, so the agent can check a claim against real source instead of trusting what the issue asserts. This changes what the agent can *see*.
+
+**The field.** `referenceRepos`, column `reference_repos`, stored as a JSON array; null means none. Each entry declares a `repo` (`owner/repo` shorthand or an `https://github.com/...` URL), a workspace-relative `path` to clone it into, and an optional `ref` — a branch, tag, or full commit hash, where absent means the default branch. The same repository may appear twice at two paths on two refs, since entries are keyed by path.
+
+`normalizeReferenceRepos` validates entries when the mapping is saved, and the step validates each one again before using it. The second pass is deliberate: a value stored before a rule tightened is still in the database, and the clone is the moment a declared path becomes a filesystem operation. Entries are validated one at a time, so a single bad path records `path-invalid` and is skipped while its siblings proceed.
+
+**How it reaches the runner — the envelope only.** There is no dispatch input and no environment variable. The runner's legacy-env branch hardcodes the value to `undefined`, so a repository still on the legacy workflow contract cannot receive this setting no matter what the mapping says.
+
+**What the step does.** `reference-repos` runs immediately after `clone`, so everything later can assume the directories exist, and is skipped when the envelope declares no entries.
+
+It first posts to `/api/runner/reference-token` with the run's progress token as its bearer. The orchestrator verifies that token without consuming it, re-reads the repository list from the mapping rather than from the request — a runner cannot name a repository the mapping never declared — and mints one token per distinct owner. Per owner rather than per entry, so two entries from the same organization cost one credential request.
+
+**Each token is scoped to exactly the repositories declared for that owner**, not to everything the installation covers, and carries only `contents: read`. That narrowing is the point of the feature having its own vending endpoint: reusing the installation-wide dependency token was considered and rejected, because it would make an operator grant read across every repository the App can see in order to clone the one they named. An owner the App is not installed on returns no token at all and its public repositories still clone.
+
+The clone takes one of two paths, and neither leaves the credential behind:
+
+- **A full commit hash** — `git init`, then `git fetch --depth 1 <url> <sha>`, then a checkout of `FETCH_HEAD`. No origin remote is ever created.
+- **A branch, tag, or the default branch** — `git clone --depth 1 [--branch <ref>]`, where the URL is a command argument rather than stored configuration.
+
+Both pass the credential through `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_0` / `GIT_CONFIG_VALUE_0`, which git reads for a single invocation and never writes to disk. A token embedded in the URL would survive in `remote.origin.url` for the whole run, in a directory the agent is pointed at — which is why this form is specified rather than left to the implementer.
+
+After each clone the destination is appended to `.git/info/exclude`, so the directory cannot be staged by `git add -A` or swept into a commit by the push step.
+
+**What it reports, and to whom.** The step returns one result per declared entry carrying the repository, the path, the resolved ref, whether it arrived, and — when it did not — one of five causes:
+
+| Cause | What happened | What an operator can do |
+|-------|---------------|-------------------------|
+| `no-auth` | The repository is private and the App is not installed on that owner | Install the App on that organization |
+| `ref-not-found` | The declared ref does not exist | Correct the `ref` in the mapping |
+| `token-error` | The orchestrator could not mint a token for that owner | Check the orchestrator log for the mint failure |
+| `clone-error` | A network or git error prevented the clone | Usually transient; re-dispatch |
+| `path-invalid` | The declared path failed re-validation, or collides with another entry | Correct the `path` in the mapping |
+
+Those results reach two readers. The implement step appends a `## Reference Repositories` section to the prompt at invocation time and on every feedback-loop iteration, naming each repository that arrived with its path, and naming each one that did not with its cause plus an instruction to assert nothing about it. The terminal callback carries the same results to the orchestrator, which comments on the ticket only when something is missing — a run where everything arrived says nothing, because a report nobody needs is noise on a surface where noise costs attention.
+
+A missing repository never fails the run or changes its classification. That is the whole design: a silently absent source tree is the worst available outcome, because the agent falls back to transcribing the issue and the run looks identical to a successful one.
+
+**What enabling it costs.** Exposure to whatever the declared repositories contain, for the length of the run. The credential itself is narrow — read-only, and limited to the repositories named — so this does not widen what a run can reach beyond what the operator chose. The reviewer is the gap worth knowing about: it works in the same workspace and can open the files, but it receives no reference-repositories section, so it is not told they are there.
+
+**What omitting it costs.** The agent improvises from the target repository alone. For an issue that turns on how a sibling repository actually behaves, that produces confident output which may be wrong in exactly the way automated review cannot catch — since the reviewer has no more access to the truth than the implementer did.
+
 ## Gotchas
 
 - **Dependency token scope is silently inert on a legacy-contract repository.** The setting saves, displays, and does nothing. The admin interface does not distinguish, so the only way to know is the target repository's workflow contract.
+- **Reference repositories are also inert on legacy-contract repositories.** The field is envelope-only; no dispatch input and no environment variable carry it, so the step never receives entries on a legacy workflow.
 - **A skills repository is encoded into every envelope, including phases that ignore it.** An envelope carrying `skillsRepo` proves nothing about whether the run will use it; the phase table above is what decides.
 - **Both steps report success while doing nothing.** `install-skills` returns zero installed on every failure path, and `dependency-auth` returns `acquired: false`. Neither fails its step, so the `[skills]` and `[dependency-auth]` log lines are the only evidence a setting took effect.
 - **A skills repository can overwrite a skill the image ships.** The copy is forced and keyed on directory name, with no warning on collision.
+- **A missing reference repository does not fail the run.** The step records a cause and continues. The agent receives a prompt telling it the repository is unavailable; whether that makes the output wrong is the issue author's problem to anticipate, not the pipeline's to prevent.

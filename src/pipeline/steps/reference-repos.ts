@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
 import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { normalizeReferenceRepos, type ReferenceRepo } from "../../reference-repos.js";
+import { normalizeReferenceRepos, type ReferenceRepo, type ReferenceRepoResult, type ReferenceRepoResultCause } from "../../reference-repos.js";
 import { appendExcludePaths } from "../scratch-exclude.js";
 
 export type SpawnSyncFn = (
@@ -12,21 +12,6 @@ export type SpawnSyncFn = (
 ) => SpawnSyncReturns<Buffer | string>;
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
-
-export type ReferenceRepoResultCause =
-  | "no-auth"
-  | "ref-not-found"
-  | "token-error"
-  | "clone-error"
-  | "path-invalid";
-
-export interface ReferenceRepoResult {
-  repo: string;
-  path: string;
-  ref: string | undefined;
-  arrived: boolean;
-  cause?: ReferenceRepoResultCause;
-}
 
 interface ReferenceReposInputs extends Record<string, unknown> {
   referenceRepos: ReferenceRepo[] | undefined;
@@ -219,13 +204,13 @@ export const referenceReposStep: StepModule<ReferenceReposInputs, ReferenceRepos
         );
       }
       if (!normalized) {
-        results.push({ repo: entry.repo, path: entry.path, ref: entry.ref, arrived: false, cause: "path-invalid" });
+        results.push({ ...entry, arrived: false, cause: "path-invalid" });
         continue;
       }
       // Uniqueness is a cross-entry rule a per-entry call cannot see, so re-apply it here.
       if (seenPaths.has(normalized.path)) {
         console.warn(`[reference-repos] rejecting duplicate path "${normalized.path}" (${normalized.repo})`);
-        results.push({ repo: normalized.repo, path: normalized.path, ref: normalized.ref, arrived: false, cause: "path-invalid" });
+        results.push({ ...normalized, arrived: false, cause: "path-invalid" });
         continue;
       }
       seenPaths.add(normalized.path);
@@ -261,7 +246,7 @@ export const referenceReposStep: StepModule<ReferenceReposInputs, ReferenceRepos
 
       if (ownerEntry?.authMode === "error") {
         console.warn(`[reference-repos] token mint failed for owner "${owner}" (${entry.repo}); skipping`);
-        results.push({ repo: entry.repo, path: entry.path, ref: entry.ref, arrived: false, cause: "token-error" });
+        results.push({ ...entry, arrived: false, cause: "token-error" });
         continue;
       }
 
@@ -282,12 +267,12 @@ export const referenceReposStep: StepModule<ReferenceReposInputs, ReferenceRepos
           `[reference-repos] cloned ${entry.repo} → ${entry.path}` +
             (entry.ref ? ` @ ${entry.ref}` : " (default branch)"),
         );
-        results.push({ repo: entry.repo, path: entry.path, ref: entry.ref, arrived: true });
+        results.push({ ...entry, arrived: true });
       } else {
         console.warn(
           `[reference-repos] failed to clone ${entry.repo} → ${entry.path}: cause=${cause ?? "unknown"}`,
         );
-        results.push({ repo: entry.repo, path: entry.path, ref: entry.ref, arrived: false, cause });
+        results.push({ ...entry, arrived: false, cause });
       }
     }
 

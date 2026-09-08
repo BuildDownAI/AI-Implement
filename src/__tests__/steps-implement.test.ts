@@ -3,6 +3,7 @@ import { implementStep } from "../pipeline/steps/implement.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
+import type { ReferenceRepoResult } from "../reference-repos.js";
 
 function makeExecutor(overrides: Partial<LLMResult> = {}): LLMExecutor {
   return {
@@ -150,6 +151,117 @@ describe("implementStep", () => {
     );
 
     expect(outputs.telemetry).toEqual(telemetry);
+  });
+
+  describe("reference repositories section", () => {
+    it("appends section with arrived repo and path when entry arrived", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext(executor);
+      const referenceRepoResults: ReferenceRepoResult[] = [
+        { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+      ];
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir: "/tmp/test", prompt: "Do it", referenceRepoResults },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).toContain("## Reference Repositories");
+      expect(call.prompt).toContain("https://github.com/a/b");
+      expect(call.prompt).toContain("refs/b");
+      expect(call.prompt).toContain("read-only reference material");
+    });
+
+    it("appends section with cause phrase when entry did not arrive", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext(executor);
+      const referenceRepoResults: ReferenceRepoResult[] = [
+        { repo: "https://github.com/a/b", path: "refs/b", ref: "main", arrived: false, cause: "no-auth" },
+      ];
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir: "/tmp/test", prompt: "Do it", referenceRepoResults },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).toContain("## Reference Repositories");
+      expect(call.prompt).toContain("https://github.com/a/b");
+      expect(call.prompt).toContain("GitHub App is not installed");
+      expect(call.prompt).toContain("Do not assert anything");
+    });
+
+    it("includes both arrived and missed repos in section", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext(executor);
+      const referenceRepoResults: ReferenceRepoResult[] = [
+        { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+        { repo: "https://github.com/c/d", path: "refs/d", ref: "main", arrived: false, cause: "ref-not-found" },
+      ];
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir: "/tmp/test", prompt: "Do it", referenceRepoResults },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).toContain("https://github.com/a/b");
+      expect(call.prompt).toContain("refs/b");
+      expect(call.prompt).toContain("https://github.com/c/d");
+      expect(call.prompt).toContain("does not exist");
+    });
+
+    it("does not append section when array is empty", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext(executor);
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir: "/tmp/test", prompt: "Do it", referenceRepoResults: [] },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).not.toContain("## Reference Repositories");
+    });
+
+    it("does not append section when referenceRepoResults is absent", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext(executor);
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir: "/tmp/test", prompt: "Do it" },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      expect(call.prompt).not.toContain("## Reference Repositories");
+    });
+
+    it("appends planning context before reference repositories section", async () => {
+      const executor = makeExecutor();
+      const ctx = makeContext(executor);
+      const referenceRepoResults: ReferenceRepoResult[] = [
+        { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+      ];
+
+      await implementStep.run(
+        ctx,
+        { workspaceDir: "/tmp/test", prompt: "Do it", planningContext: "Use factory pattern", referenceRepoResults },
+        new NoopStepReporter(),
+      );
+
+      const call = vi.mocked(executor.invoke).mock.calls[0][0];
+      const planningIdx = call.prompt.indexOf("## Planning Context");
+      const refIdx = call.prompt.indexOf("## Reference Repositories");
+      expect(planningIdx).toBeGreaterThanOrEqual(0);
+      expect(refIdx).toBeGreaterThan(planningIdx);
+    });
   });
 
   it("does not throw on non-zero exit when the outcome is max_turns", async () => {
