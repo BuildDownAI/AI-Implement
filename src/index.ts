@@ -91,6 +91,7 @@ import { KgSidecar } from "./kg-sidecar.js";
 import { makeKgRefresh } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { monitorKgRefreshGhaJob } from "./monitor-gha.js";
 
 /** Set by startServer(); read by poll() to wire the reaper's kg-refresh failure callback. */
 let activeKgRefresh: KgRefreshHandle | null = null;
@@ -669,13 +670,6 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     findPrForIssue: async (repo, issueIdentifier) =>
       (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
     failKgRefreshMachine: (_job, opts) => { activeKgRefresh?.onMachineLost(opts); },
-    checkGhaRunStatus: async (job) => {
-      if (!job.repo || !job.runId) return null;
-      const [owner, repo] = job.repo.split("/");
-      if (!owner || !repo) return null;
-      const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-      return getWorkflowRunStatus(token, owner, repo, job.runId);
-    },
   });
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
@@ -1918,11 +1912,18 @@ async function monitorGitHubActionsJob(
     notifyWebhookUrl: config.notifyWebhookUrl,
   };
 
+  // kg-refresh GHA rows are handled by their own monitor (no teamRepoMap entry, no issue).
+  if (job.phase === "kg-refresh") {
+    await monitorKgRefreshGhaJob(ghToken, owner, repo, job, claimedRunIds,
+      (opts) => activeKgRefresh?.onMachineLost(opts));
+    return;
+  }
+
   // If we don't have a run ID yet, try to find it
   if (!job.runId) {
-    const dispatchTime = new Date(job.dispatchedAt - 30_000);
     if (!mapping) return;
 
+    const dispatchTime = new Date(job.dispatchedAt - 30_000);
     const workflowFile = workflowFileForJob(job, mapping);
 
     const runId = await findWorkflowRunId(

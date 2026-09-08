@@ -1160,6 +1160,30 @@ describe("kg-refresh", () => {
       expect(dispatchRun).toHaveBeenCalledOnce();
     });
 
+    // AII-559: late rail callback still records lastRefresh when the GHA monitor
+    // already closed the dispatch_log row via updateJobStatus. The handle checks
+    // the in-memory stage (not the DB row status), so onRunnerComplete proceeds.
+    it("onRunnerComplete records lastRefresh even after monitor has closed the dispatch_log row", async () => {
+      const persistLastRefresh = vi.fn();
+      const closeJobLog = vi.fn();
+      const appendJobLog = vi.fn(() => 55);
+      buildDispatch({ appendJobLog, closeJobLog, persistLastRefresh });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+
+      // Simulate: GHA monitor called updateJobStatus(55, "completed", "success") in the DB.
+      // The handle's in-memory stage is still "ingest-running", so the callback fires.
+      handle.onRunnerComplete("success", {});
+      await waitDone();
+
+      expect(persistLastRefresh).toHaveBeenCalledOnce();
+      const [result] = persistLastRefresh.mock.calls[0] as [import("../kg-refresh.js").RefreshOutcome];
+      expect(result.ok).toBe(true);
+
+      // closeJobLog is still called — idempotent with the monitor's prior DB update.
+      expect(closeJobLog).toHaveBeenCalledWith(55, "completed");
+    });
+
     // ---- AII-546: restart re-adoption via persisted dispatchId and jobId --------
 
     it("restart with persisted jobId re-adopts in-flight row — onRunnerComplete closes correct log row", async () => {
