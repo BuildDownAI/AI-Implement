@@ -1,9 +1,10 @@
 import { readFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
 import { buildIssueBranchName } from "./branch-name.js";
-import { readCodeRepoFromSourcesYml } from "./steps/kg-tracker-data.js";
+import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./steps/kg-tracker-data.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 
 const VALID_STEP_TYPES = new Set<StepType>([
@@ -21,6 +22,7 @@ interface YamlStep {
   id: string;
   type: StepType;
   moduleId?: string;
+  depth?: number | "full";
 }
 
 interface YamlPipeline {
@@ -53,7 +55,7 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
     if (!step || typeof step !== "object") {
       throw new Error(`Pipeline YAML at "${sourcePath}" step[${i}] is not an object`);
     }
-    const { id: stepId, type, moduleId } = step as Record<string, unknown>;
+    const { id: stepId, type, moduleId, depth } = step as Record<string, unknown>;
     if (typeof stepId !== "string" || !stepId) {
       throw new Error(`Pipeline YAML at "${sourcePath}" step[${i}] missing 'id'`);
     }
@@ -66,7 +68,24 @@ function parseYamlPipeline(raw: string, sourcePath: string): YamlPipeline {
     if (moduleId !== undefined && typeof moduleId !== "string") {
       throw new Error(`Pipeline YAML at "${sourcePath}" step "${stepId}" has non-string 'moduleId'`);
     }
-    return { id: stepId, type: type as StepType, ...(moduleId ? { moduleId } : {}) };
+    let parsedDepth: number | "full" | undefined;
+    if (depth !== undefined) {
+      if (depth === "full") {
+        parsedDepth = "full";
+      } else if (typeof depth === "number" && Number.isInteger(depth) && depth > 0) {
+        parsedDepth = depth;
+      } else {
+        throw new Error(
+          `Pipeline YAML at "${sourcePath}" step "${stepId}" has invalid 'depth': expected a positive integer or "full"`,
+        );
+      }
+    }
+    return {
+      id: stepId,
+      type: type as StepType,
+      ...(moduleId ? { moduleId } : {}),
+      ...(parsedDepth !== undefined ? { depth: parsedDepth } : {}),
+    };
   });
 
   return { id, steps: parsedSteps };
@@ -304,6 +323,7 @@ function applyWiring(step: YamlStep): StepDefinition {
             githubToken: "",
             workspaceDir,
             targetDir: "code-repo",
+            depth: step.depth,
           };
         },
         skip: (ctx: PipelineContext) => {
@@ -320,6 +340,42 @@ function applyWiring(step: YamlStep): StepDefinition {
       };
     }
 
+    case "clone-secondary-repos": {
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const repos = readSecondaryReposFromSourcesYml(workspaceDir);
+          const targets = repos.map(({ slug }) => {
+            const slashIdx = slug.indexOf("/");
+            const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
+            const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
+            return { repoOwner, repoRepo, targetDir: join("repos", basename(slug)) };
+          });
+          return {
+            repoOwner: "",
+            repoRepo: "",
+            branch: "",
+            githubToken: "",
+            workspaceDir,
+            targets,
+          };
+        },
+        skip: (ctx: PipelineContext) => {
+          // Skip if dependency-auth did not acquire a token: without the git credential
+          // helper the clones would fail unauthenticated against private repos.
+          if (ctx.getOutputs("dependency-auth").acquired !== true) return true;
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const repos = readSecondaryReposFromSourcesYml(workspaceDir);
+          if (repos.length === 0) {
+            console.warn("[clone-secondary-repos] no secondary_repos in sources.yml — skipping");
+            return true;
+          }
+          return false;
+        },
+      };
+    }
+
     case "kg-ingest": {
       return {
         ...step,
@@ -330,9 +386,18 @@ function applyWiring(step: YamlStep): StepDefinition {
             typeof codeRepoOutputs.workspaceDir === "string"
               ? codeRepoOutputs.workspaceDir
               : undefined;
+          // Only wire reposRootDir when clone-secondary-repos actually ran (not skipped).
+          // Skipped steps leave no outputs, so clonedCount is undefined when skipped.
+          const secondaryReposOutputs = ctx.getOutputs("clone-secondary-repos");
+          const reposRootDir =
+            secondaryReposOutputs.clonedCount !== undefined
+              ? join(workspaceDir, "repos")
+              : undefined;
           return {
             workspaceDir,
             ...(codeRepoDir ? { codeRepoDir } : {}),
+            ...(reposRootDir !== undefined ? { reposRootDir } : {}),
+            ...(ctx.data.dependencyToken ? { ghToken: ctx.data.dependencyToken } : {}),
           };
         },
       };

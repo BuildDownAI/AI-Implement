@@ -7,6 +7,9 @@ steps:
     moduleId: dependency-auth
   - id: clone-code-repo
     type: clone
+    depth: full
+  - id: clone-secondary-repos
+    type: clone
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data

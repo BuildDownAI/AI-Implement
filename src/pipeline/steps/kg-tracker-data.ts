@@ -32,8 +32,13 @@ interface TrackerIssue {
   identifier: string;
   title: string;
   description: string;
+  branchName: string | null;
   state: { name: string; type: string };
-  comments: Array<{ body: string; createdAt: string }>;
+  labels: { nodes: Array<{ name: string }> };
+  project: { name: string } | null;
+  parent: { identifier: string } | null;
+  comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
+  relations: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
 }
 
 interface TrackerDataPage {
@@ -88,6 +93,46 @@ function readTrackerTeams(workspaceDir: string): string[] {
 /** Returns v when it looks like "owner/repo" (non-empty on both sides, no whitespace), else null. */
 function ownerRepo(v: string): string | null {
   return /^[^\s/]+\/[^\s/]+$/.test(v) ? v : null;
+}
+
+/**
+ * Reads `secondary_repos[].slug` from sources.yml.
+ * Returns entries where `slug` passes the "owner/repo" validation.
+ * Returns an empty array when the file is absent, the key is missing, the list
+ * is empty, or the file cannot be parsed.
+ */
+export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ slug: string }> {
+  const filePath = join(workspaceDir, "sources.yml");
+  if (!existsSync(filePath)) return [];
+
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+
+  try {
+    const doc = parseYaml(raw) as unknown;
+    if (doc !== null && typeof doc === "object") {
+      const secondaryRepos = (doc as Record<string, unknown>).secondary_repos;
+      if (Array.isArray(secondaryRepos)) {
+        return secondaryRepos
+          .filter(
+            (r): r is Record<string, unknown> =>
+              r !== null && typeof r === "object" && !Array.isArray(r),
+          )
+          .flatMap((r) => {
+            const slug = typeof r.slug === "string" ? ownerRepo(r.slug.trim()) : null;
+            return slug !== null ? [{ slug }] : [];
+          });
+      }
+    }
+  } catch {
+    // malformed YAML → return empty
+  }
+
+  return [];
 }
 
 /**

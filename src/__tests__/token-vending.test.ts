@@ -507,6 +507,42 @@ describe("handleKgTrackerDataRequest", () => {
     expect(second.status).toBe(200);
   });
 
+  it("selection string contains every ISSUE_FIELDS field", async () => {
+    const token = mintKgProgressToken();
+    mockIsLinearAuthConfigured.mockReturnValueOnce(true);
+
+    let capturedQuery: string | null = null;
+    mockWithLinearToken.mockImplementationOnce(
+      async (cb: (token: string) => Promise<Response>) => {
+        const fetchSpy = vi.spyOn(global, "fetch").mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            data: {
+              issues: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+            },
+          }),
+        } as unknown as Response);
+        const resp = await cb("fake-linear-token");
+        const rawBody = fetchSpy.mock.calls[0]?.[1]?.body;
+        capturedQuery = (JSON.parse(rawBody as string) as Record<string, unknown>)
+          .query as string;
+        fetchSpy.mockRestore();
+        return resp;
+      },
+    );
+
+    await callTrackerData({ authorization: `Bearer ${token}` });
+
+    expect(capturedQuery).toContain("branchName");
+    expect(capturedQuery).toContain("labels");
+    expect(capturedQuery).toContain("project");
+    expect(capturedQuery).toContain("parent");
+    expect(capturedQuery).toContain("relations");
+    expect(capturedQuery).toContain("relatedIssue");
+    expect(capturedQuery).toContain("user");
+    expect(capturedQuery).toContain("comments(first: 100)");
+  });
+
   it("passes the cursor to the upstream Linear query", async () => {
     const token = mintKgProgressToken();
     mockIsLinearAuthConfigured.mockReturnValueOnce(true);

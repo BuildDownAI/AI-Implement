@@ -22,7 +22,7 @@ const MAX_TAIL_BYTES = 8192;
 type SpawnImplFn = (
   command: string,
   args: string[],
-  options: { cwd: string; stdio: ["ignore", "pipe", "pipe"] },
+  options: { cwd: string; stdio: ["ignore", "pipe", "pipe"]; env?: NodeJS.ProcessEnv },
 ) => ChildProcess;
 
 interface KgIngestInputs extends Record<string, unknown> {
@@ -30,6 +30,11 @@ interface KgIngestInputs extends Record<string, unknown> {
   workspaceDir: string;
   /** Absolute path to the cloned code repo. Omit when clone-code-repo was skipped. */
   codeRepoDir?: string;
+  /** Absolute path to the repos/ directory holding secondary repo clones. Passed as --repos-root. */
+  reposRootDir?: string;
+  /** Short-lived installation token forwarded as GH_TOKEN to the ingest subprocess so
+   *  gh commands (e.g. gh pr list) can authenticate. Sourced from ctx.data.dependencyToken. */
+  ghToken?: string;
   /** Injectable spawn for testing. */
   spawnImpl?: SpawnImplFn;
   /** Injectable writeFileSync for testing. */
@@ -129,6 +134,8 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
     const {
       workspaceDir,
       codeRepoDir,
+      reposRootDir,
+      ghToken,
       spawnImpl,
       writeFileSyncImpl: writeFn = writeFileSync,
       mkdirSyncImpl: mkdirFn = (p, o) => mkdirSync(p, o),
@@ -142,6 +149,10 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
         1,
         "no code repo in workspace — clone-code-repo step was skipped or failed",
       );
+    }
+
+    if (!ghToken) {
+      console.warn("[kg-ingest] GH_TOKEN not available — gh commands may fail (no dependency token)");
     }
 
     const spawnFn: SpawnImplFn =
@@ -203,6 +214,7 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
 
     const ingestArgs = ["-m", "kg_ingest", "refresh"];
     if (codeRepoDir) ingestArgs.push("--code-repo", codeRepoDir);
+    if (reposRootDir) ingestArgs.push("--repos-root", reposRootDir);
 
     const trackerDataFile = join(workspaceDir, "tracker-data.json");
     if (existsFn(trackerDataFile)) ingestArgs.push("--tracker-data", trackerDataFile);
@@ -210,12 +222,17 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
     console.log(`[kg-ingest] ${venvPython} ${ingestArgs.join(" ")}`);
     const start = Date.now();
 
+    const ingestEnv: NodeJS.ProcessEnv = ghToken
+      ? { ...process.env, GH_TOKEN: ghToken }
+      : process.env;
+
     const stdoutLines: string[] = [];
 
     await new Promise<void>((resolve, reject) => {
       const proc = spawnFn(venvPython, ingestArgs, {
         cwd: workspaceDir,
         stdio: ["ignore", "pipe", "pipe"],
+        env: ingestEnv,
       });
 
       buildLineReader(proc.stdout!, (line) => {

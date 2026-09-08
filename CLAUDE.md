@@ -224,7 +224,7 @@ On **legacy** repos only — those still carrying `comment-trigger.yml` — the 
 
 **Jira profiles** ride `run_config.profiles`, read from a multi-select custom field that must be named exactly `AI-Implement Profiles` unless `profilesFieldOverride` pins its ID. Option names must not contain commas — the contract is a comma-joined list. **No built-in step consumes profiles**; they exist as the contract surface for image-baked `custom/` steps.
 
-**Dependency Token Scope** runs on a deliberate two-token split: the primary token carries the App's full grants but is scoped to the target repository alone, while the dependency token is installation-wide and strictly `contents: read`. Two things to know before enabling it — the scope is **all-or-nothing**, and it needs a **publicly reachable orchestrator**.
+**Dependency Token Scope** runs on a deliberate two-token split: the primary token carries the App's full grants but is scoped to the target repository alone, while the dependency token is installation-wide and strictly `contents: read` plus `pull_requests: read` (the second grant lets the KG ingest list pull requests with `gh`). Two things to know before enabling it — the scope is **all-or-nothing**, and it needs a **publicly reachable orchestrator**.
 
 > **Behaviour change for existing Fly deployments.** The Fly-mode `/api/token` endpoint used to mint a full-installation token. It now narrows the primary token to the target repository, matching the GHA path. A deployment that incidentally relied on org-wide primary-token access to read private sibling repos must set this field to restore it.
 
