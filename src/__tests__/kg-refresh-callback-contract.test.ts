@@ -5,7 +5,6 @@
  * Served routes (src/index.ts):
  *   POST /runner/result
  *   POST /api/runner/kg-tracker-data
- *   POST /api/runner/kg-push-token
  *   POST /api/runner/dependency-token
  *   GET  /runner/planning-context
  *
@@ -32,7 +31,6 @@ const NEW_STAMP = "2026-08-24T12:00:00+00:00";
 const SERVED_ROUTES = new Set([
   "POST /runner/result",
   "POST /api/runner/kg-tracker-data",
-  "POST /api/runner/kg-push-token",
   "POST /api/runner/dependency-token",
   "GET /runner/planning-context",
 ]);
@@ -185,13 +183,6 @@ describe("kg-refresh callback-URL contract", () => {
     expect(captured).toHaveLength(1);
     const path = new URL(captured[0]).pathname;
     expect(path).toBe("/runner/result");
-    expect(SERVED_ROUTES.has(`POST ${path}`)).toBe(true);
-  });
-
-  it("setup_kg_push_credential resolves to POST /api/runner/kg-push-token — a served route", () => {
-    // Replicates session/git-credential-helper-kg-push.sh: strip trailing slashes then append the route.
-    const path = new URL(BASE.replace(/\/+$/, "") + "/api/runner/kg-push-token").pathname;
-    expect(path).toBe("/api/runner/kg-push-token");
     expect(SERVED_ROUTES.has(`POST ${path}`)).toBe(true);
   });
 
