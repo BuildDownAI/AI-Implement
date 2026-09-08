@@ -81,7 +81,7 @@ Extension points for the shared pipeline, in execution order:
   module that genuinely needs a different contract — not just a parameter — is legitimately
   phase-specific and belongs in its own file (the kg-refresh state machine, pipeline steps, and
   token-vending endpoints are correct as singletons).
-- **Clean-up:** `claude-kg-refresh.yml` and `resolveKgRefreshSessionImage` were removed by
-  AII-555. `src/workflow-sync.ts` `REMOVE_FILES` queues deletion of the manually-distributed
-  `claude-kg-refresh.yml` from every KG source repo that received it.
+- **Clean-up:** `claude-kg-refresh.yml` was removed by AII-556; `resolveKgRefreshSessionImage`
+  was removed by AII-557. `src/workflow-sync.ts` `REMOVE_FILES` queues deletion of the
+  manually-distributed `claude-kg-refresh.yml` from every KG source repo that received it.
 - **Checklist for new run kinds:** see `docs/issueless-runs.md` §10.

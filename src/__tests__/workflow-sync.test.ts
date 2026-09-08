@@ -590,7 +590,7 @@ describe("syncWorkflowTemplates", () => {
     };
     const fake = makeGithubFetch({ mainFiles });
 
-    await syncWorkflowTemplates({
+    const result = await syncWorkflowTemplates({
       mapping,
       githubAppId: "app-id",
       githubAppPrivateKey: "private-key",
@@ -599,6 +599,7 @@ describe("syncWorkflowTemplates", () => {
       getInstallationTokenImpl: async () => "token",
     });
 
+    expect(result.changedFiles).not.toContain(".github/workflows/claude-kg-refresh.yml");
     expect(fake.calls.every((call) => !(call.method === "DELETE" && call.path.includes("claude-kg-refresh.yml")))).toBe(true);
   });
 
