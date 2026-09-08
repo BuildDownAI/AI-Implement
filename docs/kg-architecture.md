@@ -355,23 +355,19 @@ the same progress token. `stripEmbeddedTokenFromOrigin` in `kg-snapshot-push.ts`
 token from the remote URL right before push to counter `refreshRunnerGithubCredentials`
 re-embedding it after clone.
 
-**Fly session image pinning (AII-534).** `dispatchKgRefreshRun` pairs the session machine to
-the same pipeline generation as the orchestrator via `resolveKgRefreshSessionImage`
-(`src/repo-image.ts`). Resolution order:
+**Fly session image pinning (AII-534, updated AII-555).** `dispatchKgRefreshRun` resolves the
+session machine image via `resolveRunnerImageForDispatch` (`src/repo-image.ts`), the same
+function the standard implement and planning dispatch paths use. Resolution order:
 
-1. Per-repo `.ai-implement/image.yml` override always wins (same as the standard implementation
-   dispatch path).
-2. When `AI_IMPLEMENT_SOURCE_COMMIT` is set (baked into the orchestrator image by `Dockerfile`
-   build arg at the same commit as `build-runner.yml` tags each runner push), the session image
-   is resolved as `<base-of-sessionImage>:<AI_IMPLEMENT_SOURCE_COMMIT>` and verified against the
-   registry anonymously. On a hit the pinned ref is used; on a miss the function logs one line
-   and falls through.
-3. Falls back to `config.sessionImage`.
+1. Per-repo `.ai-implement/image.yml` override always wins.
+2. An explicit orchestrator-wide default (`AI_IMPLEMENT_RUNNER_IMAGE` or legacy `SESSION_IMAGE`).
+3. Falls back to `undefined` — the target workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable
+   (if set) applies, then the workflow's built-in default image.
 
-`FLY_IMAGE_REF` is the orchestrator's own Fly image ref and is intentionally **not** used here
-— it points at the root `Dockerfile` orchestrator image, not the `Dockerfile.session` runner
-image. Using it would dispatch a machine running the orchestrator binary as the session image,
-reproducing the bootstrap exit this fix addresses.
+The source-commit pairing policy that pinned each run to the exact runner image baked at the
+same orchestrator commit (via the deleted `resolveKgRefreshSessionImage`) was removed by AII-555:
+it required an anonymous registry round-trip on every dispatch, and the channel tag (`latest` /
+`next`) already tracks the correct image pair for both the implement and kg-refresh paths.
 
 ## Failure history
 
@@ -438,7 +434,7 @@ After both fixes landed, the review of the implementation also identified an arc
 |---|---|---|---|
 | GHA workflow | `workflows/claude-implement.yml` with `runner_phase: "kg-refresh"` | `workflows/claude-kg-refresh.yml` | removed by AII-556 ✓ |
 | Runner-side pipeline | *(step sequence in `WORKFLOW.md`)* | `pipelines/kg-refresh.yml` | present |
-| Session image resolution | `src/repo-image.ts` `resolveRunnerImageForDispatch` | `src/repo-image.ts` `resolveKgRefreshSessionImage` | removed by AII-557 |
+| Session image resolution | `src/repo-image.ts` `resolveRunnerImageForDispatch` | `src/repo-image.ts` `resolveKgRefreshSessionImage` | removed by AII-555 ✓ |
 | Orchestrator state machine | — | `src/kg-refresh.ts` | present |
 | Pipeline entrypoint | — | `src/pipeline/kg-refresh-run.ts` | present |
 | Tracker data step | — | `src/pipeline/steps/kg-tracker-data.ts` | present |
@@ -447,7 +443,7 @@ After both fixes landed, the review of the implementation also identified an arc
 | Callback routing | `src/runner-callback.ts` (carve-out within shared file) | — | present |
 | Dispatch function | — | `src/index.ts` `dispatchKgRefreshRun` | present |
 
-The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, and `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`. AII-556 and AII-557 collapse those pairs. Rows with no shared counterpart (the state machine, pipeline steps, token vending) are legitimately kg-refresh-only and belong exactly where they are.
+The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, and `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`. AII-555 collapsed both pairs. Rows with no shared counterpart (the state machine, pipeline steps, token vending) are legitimately kg-refresh-only and belong exactly where they are.
 
 ## Lineage
 

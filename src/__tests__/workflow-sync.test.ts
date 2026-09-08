@@ -555,6 +555,53 @@ describe("syncWorkflowTemplates", () => {
     expect(result.changedFiles).toEqual([".github/workflows/comment-trigger.yml"]);
   });
 
+  it("REMOVE_FILES: removes claude-kg-refresh.yml when present in target repo", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      ".github/workflows/claude-kg-refresh.yml": "old-kg-refresh\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
+
+    const result = await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(result.changedFiles).toContain(".github/workflows/claude-kg-refresh.yml");
+    expect(fake.branches["sync/ai-implement"].files[".github/workflows/claude-kg-refresh.yml"]).toBeUndefined();
+    expect(fake.calls.some((call) => call.method === "DELETE" && call.path.includes("claude-kg-refresh.yml"))).toBe(true);
+  });
+
+  it("REMOVE_FILES: no-ops when claude-kg-refresh.yml is absent from target repo", async () => {
+    const templatesRoot = makeTemplatesRoot();
+    const mainFiles = {
+      ".github/workflows/claude-implement.yml": "implement-yml\n",
+      ".github/workflows/claude-plan.yml": "plan-yml\n",
+      "WORKFLOW.md": "workflow-md\n",
+      "PLANNING.md": "planning-md\n",
+    };
+    const fake = makeGithubFetch({ mainFiles });
+
+    await syncWorkflowTemplates({
+      mapping,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "private-key",
+      templatesRoot,
+      fetchImpl: fake.fetchImpl,
+      getInstallationTokenImpl: async () => "token",
+    });
+
+    expect(fake.calls.every((call) => !(call.method === "DELETE" && call.path.includes("claude-kg-refresh.yml")))).toBe(true);
+  });
+
 });
 
 describe("classifySyncError", () => {
