@@ -29,7 +29,7 @@ The envelope consolidates all YAML-safe data into a single base64-encoded JSON b
 
 The three runner tokens stay outside the envelope specifically so the workflow can `::add-mask::` them before the runner container starts — secret values inside base64 blobs cannot be masked by GHA. The publication token is exposed only to the pipeline process, never to model child processes or persisted step inputs. Token inputs are wired through `env:` on the mask step and never interpolated directly into script text, because GHA prints a step's script in the `##[group]Run …` header before the step executes.
 
-These are live credentials in the runner's environment; `src/__tests__/setup/clear-runner-credentials.ts` (registered as a Vitest `setupFile`) deletes all five credential variables before every test so no suite can burn a single-use token against the live orchestrator.
+These are live credentials in the runner's environment; `src/__tests__/setup/clear-runner-credentials.ts` (registered as a Vitest `setupFile`) deletes all five credential variables before every test so no suite can burn a single-use token against the live orchestrator. A test that needs a credential value may set it in the test body — the global `beforeEach` ensures it is cleared again before the next test. Tests that exercise callback or fetch paths should inject a mock `fetchImpl` (or equivalent dependency-injection point) rather than letting code reach a live URL.
 
 ---
 
