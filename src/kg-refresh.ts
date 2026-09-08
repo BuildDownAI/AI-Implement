@@ -933,7 +933,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     },
 
     async status() {
-      const servedDir = existsSync(currentDir) ? currentDir : kgDir;
+      const servedDir = existsSync(join(currentDir, "sources.yml")) ? currentDir : kgDir;
       return {
         running,
         deployHeld: deployHeld(),

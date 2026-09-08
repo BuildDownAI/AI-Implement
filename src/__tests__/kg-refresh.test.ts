@@ -532,6 +532,42 @@ describe("kg-refresh", () => {
     expect(s.servedStamp).toBe(NEW_STAMP);
   });
 
+  // AII-579: fresh boot — current/ does not exist yet; status() falls back to kgDir.
+  it("fresh boot: servedStamp reads from kgDir when current/ is absent", async () => {
+    // Build a real kgDir with a sources.yml so readNamespace() can find the namespace.
+    const realKgDir = mkdtempSync(join(tmpdir(), "kgdir-"));
+    writeFileSync(join(realKgDir, "sources.yml"), `namespace: ${NAMESPACE}\n`);
+    try {
+      build({ kgDir: realKgDir });
+      // No trigger() called — current/ has never been staged.
+      const s = await handle.status();
+      expect(s.running).toBe(false);
+      expect(s.lastRefresh).toBeNull();
+      // Sidecar is up serving OLD_STAMP under NAMESPACE; kgDir branch must reach it.
+      expect(s.servedStamp).toBe(OLD_STAMP);
+    } finally {
+      rmSync(realKgDir, { recursive: true, force: true });
+    }
+  });
+
+  // AII-579: live orchestrator with legacy current/ (no sources.yml) falls back to kgDir.
+  it("legacy current/ without sources.yml falls back to kgDir for servedStamp", async () => {
+    const realKgDir = mkdtempSync(join(tmpdir(), "kgdir-"));
+    writeFileSync(join(realKgDir, "sources.yml"), `namespace: ${NAMESPACE}\n`);
+    try {
+      build({ kgDir: realKgDir });
+      // Simulate a legacy current/ directory that has no sources.yml (pre-fix overlay).
+      const currentDir = join(dataRoot, "current");
+      mkdirSync(currentDir, { recursive: true });
+      writeFileSync(join(currentDir, "graph.trig"), "placeholder");
+      // No sources.yml in currentDir — status() must fall back to kgDir.
+      const s = await handle.status();
+      expect(s.servedStamp).toBe(OLD_STAMP);
+    } finally {
+      rmSync(realKgDir, { recursive: true, force: true });
+    }
+  });
+
   // ---- AII-495: dispatch-path tests ----------------------------------------
 
   describe("dispatch path", () => {
