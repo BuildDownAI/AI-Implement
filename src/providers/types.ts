@@ -48,7 +48,8 @@ export interface TicketIssue {
   profiles?: string[];
   /** Target base branch for this issue's PR, from a provider-specific field (Jira:
    *  the "AI-Implement Base Branch" text field). Absent when the provider has no such
-   *  field, the field is unset, or the value failed validation. */
+   *  field, the field is unset, or the field has an unexpected shape. Nonblank strings
+   *  remain present until dispatch validation can refuse invalid refs. */
   baseBranch?: string;
 }
 

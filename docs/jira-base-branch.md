@@ -26,7 +26,7 @@ entirely.
 |---|---|
 | Read (`readBaseBranchValue`) | Non-string shapes return undefined — the field may be created as Paragraph (ADF object) or a number field, and an unchecked `.trim()` would take down the whole snapshot for one bad value |
 | Normalize (`normalizeBaseBranch`) | Trimmed; blank is unset; `refs/heads/` and `refs/remotes/` forms rejected; ref segments validated |
-| Invalid value | Warned and left unset **for that issue only** — never fails the snapshot |
+| Invalid nonblank string | Preserved in the snapshot, then refused before dispatch with a failure comment; never silently targets the default branch |
 | Dispatch | Validated against GitHub, then carried in `run_config.baseBranch` |
 
 `normalizeBaseBranch` shares `validateRefSegments` with `normalizeBranchPrefix`, so

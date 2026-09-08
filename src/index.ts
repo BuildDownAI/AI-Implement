@@ -3661,13 +3661,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
             githubAppId: config.githubAppId,
             githubAppPrivateKey: config.githubAppPrivateKey,
             notifyType: config.notifyType,
-            pollNow: () => {
-          if (pollInProgress) return { started: false };
-          console.log("[poll] Immediate poll requested via admin UI");
-          void poll(config, registry);
-          return { started: true };
-        },
-        notifyWebhookUrl: config.notifyWebhookUrl,
+            notifyWebhookUrl: config.notifyWebhookUrl,
           },
           onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
         });
@@ -3936,6 +3930,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         flySessionsRegion: config.flySessionsRegion,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
+        pollNow: () => {
+          // poll() claims beginCycle synchronously before its first await.
+          const before = getPollStats().pollCount;
+          void poll(config, registry).catch((err) => console.error("[poll] Immediate poll failed:", err));
+          return { started: getPollStats().pollCount > before };
+        },
         notifyWebhookUrl: config.notifyWebhookUrl,
       }, registry, { startDeploy, selfDeployTarget: config.selfDeployTarget, kgRefresh })) return;
     }
