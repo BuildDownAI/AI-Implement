@@ -277,6 +277,47 @@ describe("kgSnapshotPushStep", () => {
     ).rejects.toBeInstanceOf(KgSnapshotStaleError);
   });
 
+  it("reads the stamp from embeddings.meta.json age_stamp (the ingest's file) and orders against the committed one", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.meta.json"), JSON.stringify({ count: 2, age_stamp: "2026-09-07T23:58:54+00:00" }));
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'add meta'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.meta.json"), JSON.stringify({ count: 3, age_stamp: "2026-09-08T19:43:09+00:00" }));
+
+    const ctx = makeContext();
+    // No embeddings.stamp at all: the metadata stamp orders the run and it reaches the push.
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("prefers embeddings.meta.json over a stale legacy embeddings.stamp (the file nothing writes any more)", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.meta.json"), JSON.stringify({ age_stamp: "2026-09-07T23:58:54+00:00" }));
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-07T00:28:32+00:00");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'add meta and legacy stamp'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    // The ingest advanced the metadata stamp; the legacy file is untouched and would read as stale.
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.meta.json"), JSON.stringify({ age_stamp: "2026-09-08T19:43:09+00:00" }));
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
   it("accepts a new stamp when no previous stamp exists in clonedRef", async () => {
     initGitRepo(tmpDir);
     const clonedRef = resolveHead(tmpDir);
