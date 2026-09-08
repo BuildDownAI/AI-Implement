@@ -101,7 +101,9 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
                 continue;
               }
             }
-            const branchArgs = target.branch ? [target.branch] : [];
+            // A bare branch name would be parsed as a flag if it starts with "-"; an explicit
+            // refspec is unambiguously a ref regardless of its leading character.
+            const branchArgs = target.branch ? [`refs/heads/${target.branch}`] : [];
             const fetchResult = spawnSync(
               "git",
               ["fetch", "origin", ...branchArgs],
@@ -115,7 +117,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
               continue;
             }
           } else {
-            const branchArgs = target.branch ? [target.branch] : [];
+            const branchArgs = target.branch ? [`refs/heads/${target.branch}`] : [];
             const fetchResult = spawnSync(
               "git",
               ["fetch", "--depth", String(depth ?? 1), "origin", ...branchArgs],
@@ -181,7 +183,9 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
       let cloneMethod: "fresh" | "incremental";
 
       if (fs.existsSync(path.join(effectiveDir, ".git"))) {
-        const branchArgs = branch ? [branch] : [];
+        // A bare branch name would be parsed as a flag if it starts with "-"; an explicit
+        // refspec is unambiguously a ref regardless of its leading character.
+        const branchArgs = branch ? [`refs/heads/${branch}`] : [];
 
         if (depth === "full") {
           // Unshallow a pre-existing shallow clone before fetching full history.
@@ -223,10 +227,11 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
           }
         }
 
-        const resetTarget = branch ? `origin/${branch}` : "FETCH_HEAD";
+        // fetch origin refs/heads/<branch> lands in FETCH_HEAD under a single-ref refspec
+        // (does not update refs/remotes/origin/<branch>), so always reset to FETCH_HEAD.
         const resetResult = spawnSync(
           "git",
-          ["reset", "--hard", resetTarget],
+          ["reset", "--hard", "FETCH_HEAD"],
           { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
         );
         if (resetResult.status !== 0) {

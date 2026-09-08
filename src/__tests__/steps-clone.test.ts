@@ -467,6 +467,33 @@ describe("cloneStep", () => {
       expect(outputs.workspaceDir).toBe("/tmp/workspace/code-repo");
     });
 
+    it("incremental fetch with a branch set uses an explicit refspec, never a bare positional", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      // git fetch, git reset --hard, git rev-parse HEAD
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0, stdout: "def456\n" }]);
+
+      await cloneStep.run(makeContext(), { ...SECONDARY_INPUTS, branch: "testing" }, new NoopStepReporter());
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/testing"]);
+      expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+    });
+
+    it("incremental fetch with a hostile flag-like branch value fetches via explicit refspec, never as a bare positional", async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      mockSpawn([{ status: 0 }, { status: 0 }, { status: 0, stdout: "def456\n" }]);
+
+      await cloneStep.run(
+        makeContext(),
+        { ...SECONDARY_INPUTS, branch: "--upload-pack=x" },
+        new NoopStepReporter(),
+      );
+
+      const calls = vi.mocked(spawnSync).mock.calls;
+      expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/--upload-pack=x"]);
+      expect(calls[0][1]).not.toContain("--upload-pack=x");
+    });
+
     it("throws when secondary git clone fails", async () => {
       vi.mocked(fs.existsSync).mockReturnValue(false);
       mockSpawn([{ status: 128, stderr: "repository not found" }]);
@@ -930,7 +957,7 @@ describe("cloneStep", () => {
         const calls = vi.mocked(spawnSync).mock.calls;
         expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
         expect(calls[1][1]).toEqual(["fetch", "--unshallow", "origin"]);
-        expect(calls[2][1]).toEqual(["fetch", "origin", "testing"]);
+        expect(calls[2][1]).toEqual(["fetch", "origin", "refs/heads/testing"]);
         expect(calls[3][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
         expect(outputs.clonedCount).toBe(1);
       });
@@ -952,7 +979,7 @@ describe("cloneStep", () => {
 
         const calls = vi.mocked(spawnSync).mock.calls;
         expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
-        expect(calls[1][1]).toEqual(["fetch", "origin", "testing"]);
+        expect(calls[1][1]).toEqual(["fetch", "origin", "refs/heads/testing"]);
         expect(calls[2][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
         expect(outputs.clonedCount).toBe(1);
       });
@@ -968,7 +995,22 @@ describe("cloneStep", () => {
         }, new NoopStepReporter());
 
         const calls = vi.mocked(spawnSync).mock.calls;
-        expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "testing"]);
+        expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/testing"]);
+        expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
+      });
+
+      it("existing-dir with hostile flag-like branch value fetches via explicit refspec, never as a bare positional", async () => {
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        mockSpawn([{ status: 0 }, { status: 0 }]);
+
+        await cloneStep.run(makeContext(), {
+          ...TARGETS_INPUTS,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "skills", targetDir: "repos/skills", branch: "--upload-pack=x" }],
+        }, new NoopStepReporter());
+
+        const calls = vi.mocked(spawnSync).mock.calls;
+        expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/--upload-pack=x"]);
+        expect(calls[0][1]).not.toContain("--upload-pack=x");
         expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
       });
 
