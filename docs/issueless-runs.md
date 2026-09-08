@@ -62,7 +62,6 @@ const runConfig: RunConfigV1 = {
 |---|---|---|
 | `runner-result.ts` `postRunnerResult` | `/runner/result` | `POST /runner/result` |
 | `pipeline/steps/kg-tracker-data.ts` | `/api/runner/kg-tracker-data` | `POST /api/runner/kg-tracker-data` |
-| `session/lib.sh` `setup_kg_push_credential` | `/api/runner/kg-push-token` | `POST /api/runner/kg-push-token` |
 | `runner-result.ts` `fetchPlanningContextFromOrchestrator` | `/runner/planning-context` | `GET /runner/planning-context` |
 
 The route `/api/runner/result` does **not** exist. Any value that appends a path to `runnerCallbackUrl` before passing it to these clients will produce a double-path URL that hits the admin-auth 401 wall.
@@ -88,7 +87,7 @@ The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on bo
 | `local` | `local-docker` (requires `LOCAL_RUNNER_IMAGE`) |
 | `shadow` | collapses to `github-actions` — two concurrent ingest runs would race to push the same snapshot commit |
 
-**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-implement.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, `runner_phase: "kg-refresh"`, `job_timeout_minutes: "240"`, and optionally `runner_image` and `runner_callback_url`. `run_progress_token` is the HMAC progress token; the workflow masks it and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. `runner_phase: "kg-refresh"` is forwarded as `RUNNER_PHASE`, which routes `session/entrypoint.sh` to `pipeline/kg-refresh-run.js`. `runner_callback_url` is passed when `RUNNER_CALLBACK_BASE_URL` is set on the orchestrator; the `setup_kg_push_credential` helper and the `kg-tracker-data` step read it from `RUNNER_CALLBACK_URL`. `job_timeout_minutes: "240"` preserves the 240-minute ceiling that `claude-kg-refresh.yml` formerly hard-coded; the implement template defaults to 90 minutes when the input is absent. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. `claude-implement.yml` is in `ALWAYS_SYNC_FILES` and is delivered to the KG source repo mapping automatically by workflow sync — no manual copy step is needed. If the workflow file is absent (e.g. the KG repo mapping predates the sync that delivered `claude-implement.yml`), the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message directing the operator to re-run workflow sync for the KG source repo mapping. After a successful dispatch, `findWorkflowRunId()` is attempted (30-second look-back, best-effort) and the resulting run ID is stored on the `dispatch_log` row via `updateJobRunId()`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs.
+**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-implement.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, `runner_phase: "kg-refresh"`, `job_timeout_minutes: "240"`, and optionally `runner_image` and `runner_callback_url`. `run_progress_token` is the HMAC progress token; the workflow masks it and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. `runner_phase: "kg-refresh"` is forwarded as `RUNNER_PHASE`, which routes `session/entrypoint.sh` to `pipeline/kg-refresh-run.js`. `runner_callback_url` is passed when `RUNNER_CALLBACK_BASE_URL` is set on the orchestrator; the `kg-tracker-data` step reads it from `RUNNER_CALLBACK_URL`. `job_timeout_minutes: "240"` preserves the 240-minute ceiling that `claude-kg-refresh.yml` formerly hard-coded; the implement template defaults to 90 minutes when the input is absent. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. `claude-implement.yml` is in `ALWAYS_SYNC_FILES` and is delivered to the KG source repo mapping automatically by workflow sync — no manual copy step is needed. If the workflow file is absent (e.g. the KG repo mapping predates the sync that delivered `claude-implement.yml`), the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message directing the operator to re-run workflow sync for the KG source repo mapping. After a successful dispatch, `findWorkflowRunId()` is attempted (30-second look-back, best-effort) and the resulting run ID is stored on the `dispatch_log` row via `updateJobRunId()`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs.
 
 **Fly Machines backend:** unchanged from the original implementation. Creates a session machine with `phase: "kg-refresh"`. Returns `machineId + machineNonce`.
 
@@ -155,18 +154,6 @@ mintRunToken({
 This token is passed as `runToken` into `buildSessionMachineConfig()`, which places it in the machine environment as `RUN_TOKEN`. No progress token is minted; `RUN_PROGRESS_TOKEN` is **not** set in the runner environment.
 
 A second (`publication`) token is **not** minted: there is no target repository, so the runner never calls `POST /api/runner/publication-token`.
-
-> **Current degraded state:** Both vending endpoints below require a bearer token with `audience = "progress"`. Because the kg-refresh dispatch mints only a result token, the runner cannot satisfy those checks. Both endpoints silently fail/skip rather than hard-error — see each section for the exact degradation mode.
-
-### KG push token
-
-The runner calls `GET /api/runner/kg-push-token` to receive a `contents: write` GitHub App token scoped to the KG source repository. The endpoint is implemented in `src/kg-push-token-vending.ts`:
-
-- Verifies the bearer token with `audience = "progress"` (multi-use, non-consuming, so the git credential helper can re-mint on expiry)
-- Phase-gates: only `phase === "kg-refresh"` tokens are accepted
-- Returns a token scoped exclusively to `owner/repo` of `KG_SOURCE_REPO`
-
-**Degraded state:** the kg-refresh runner only holds a result token. When it presents that token, `verifyRunToken(..., "progress", ...)` returns `verified.ok = false` and the endpoint returns 403. The git credential helper receives the 403 and the KG snapshot push step fails without a usable GitHub token. To restore this path, the dispatch must also mint a progress token and pass it as `RUN_PROGRESS_TOKEN` (see §10 step 4 for how).
 
 ### Tracker-data endpoint
 
@@ -384,7 +371,7 @@ Do not include `prNumber`, `baseBranch`, `branchPrefix`, `profiles`, `planningCo
 **4. Mint the required run token(s)**
 Always mint a result token (`audience: "result"`, `mappingTeamKey: ""`) and set `ttlSeconds` to the TTL you will enforce. Do **not** mint a `publication` audience token — there is no target repository.
 
-If your run kind needs to call any orchestrator vending endpoint — analogous to `GET /api/runner/kg-push-token` or `POST /api/runner/kg-tracker-data` — those endpoints verify `audience = "progress"`. You must also mint a progress token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv` when building the machine config:
+If your run kind needs to call any orchestrator vending endpoint — analogous to `POST /api/runner/kg-tracker-data` — those endpoints verify `audience = "progress"`. You must also mint a progress token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv` when building the machine config:
 
 ```typescript
 const { token: progressToken } = mintRunToken({
@@ -399,7 +386,7 @@ const { token: progressToken } = mintRunToken({
 extraEnv.RUN_PROGRESS_TOKEN = progressToken;
 ```
 
-Without the progress token, vending endpoints return 403 and dependent pipeline steps skip silently — the same degraded state the current kg-refresh dispatch exhibits for its kg-push-token and kg-tracker-data steps.
+Without the progress token, vending endpoints return 403 and dependent pipeline steps skip silently — the same degraded state kg-refresh exhibited before AII-544 was fixed.
 
 **5. Write a dispatch function with all three backends**
 Follows the pattern of `dispatchKgRefreshRun()` in `src/index.ts`. Call `resolveExecutionPath(getRunnerMode().mode, <defaultMode>)` to select the backend. Choose `<defaultMode>` based on what is "universally available" for the run kind (`"github-actions"` is the safest default). Passes `AI_IMPLEMENT_RUN_CONFIG` (the base64-encoded `RunConfigV1`) in `extraEnv` for Fly/local. For GHA, passes `run_config` + `run_token` as workflow_dispatch inputs. Returns `{ machineId?, machineNonce?, logsUrl?, workflowRunId? }` — `machineNonce` is present only for Fly/local, `workflowRunId` only for GHA.
@@ -456,7 +443,6 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | Runner token mint/verify | `src/runner-tokens.ts` |
 | dispatch_log row (schema, write, query) | `src/log.ts` (`appendLog`, `getInFlightJobs`, `getInFlightKgRefreshJobs`) |
 | Callback routing carve-out | `src/runner-callback.ts` (~line 252) |
-| KG push token vending | `src/kg-push-token-vending.ts` |
 | Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
 | Tracker-data pipeline step | `src/pipeline/steps/kg-tracker-data.ts` |
 | KG refresh pipeline definition | `pipelines/kg-refresh.yml` |

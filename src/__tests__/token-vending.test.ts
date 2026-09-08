@@ -7,7 +7,6 @@ import type * as TokenVendingModule from "../token-vending.js";
 import type * as LogModule from "../log.js";
 import type * as DedupModule from "../dedup.js";
 import type * as RunnerTokensModule from "../runner-tokens.js";
-import type * as KgPushTokenModule from "../kg-push-token-vending.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 
 vi.mock("../github-app-auth.js", () => ({
@@ -61,7 +60,6 @@ let tokenVending: typeof TokenVendingModule;
 let log: typeof LogModule;
 let dedup: typeof DedupModule;
 let runnerTokens: typeof RunnerTokensModule;
-let kgPushToken: typeof KgPushTokenModule;
 let runnerCallback: typeof RunnerCallbackModule;
 
 let mockGetScopedInstallationToken: ReturnType<typeof vi.fn>;
@@ -78,7 +76,6 @@ beforeEach(async () => {
   log = await import("../log.js");
   runnerTokens = await import("../runner-tokens.js");
   tokenVending = await import("../token-vending.js");
-  kgPushToken = await import("../kg-push-token-vending.js");
   runnerCallback = await import("../runner-callback.js");
   const ghAuth = await import("../github-app-auth.js");
   mockGetScopedInstallationToken = vi.mocked(ghAuth.getScopedInstallationToken);
@@ -208,7 +205,7 @@ describe("getJobByNonce", () => {
   });
 });
 
-// ── handleKgPushTokenRequest ──────────────────────────────────────────────────
+// ── handleKgTrackerDataRequest ────────────────────────────────────────────────
 
 function mintKgProgressToken(): string {
   const { token } = runnerTokens.mintRunToken({
@@ -221,154 +218,6 @@ function mintKgProgressToken(): string {
   });
   return token;
 }
-
-async function callKgPushTokenHandler(opts: {
-  authorization?: string;
-  kgSourceRepo?: string | null;
-}): Promise<{ status: number; body: Record<string, unknown> }> {
-  return kgPushToken.handleKgPushTokenRequest({
-    authorization: opts.authorization,
-    secret: SECRET,
-    githubAppId: "app-id",
-    githubAppPrivateKey: "fake-key",
-    kgSourceRepo: opts.kgSourceRepo !== undefined ? opts.kgSourceRepo : "acme/kg-repo",
-  });
-}
-
-describe("handleKgPushTokenRequest", () => {
-  it("returns 200 with token and expires_at for a valid kg-refresh progress token", async () => {
-    const token = mintKgProgressToken();
-    const expiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    mockGetScopedInstallationToken.mockResolvedValueOnce({ token: "ghs_push_token", expiresAt: expiry });
-
-    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
-
-    expect(result.status).toBe(200);
-    expect(result.body.token).toBe("ghs_push_token");
-    expect(result.body.expires_at).toBe(expiry);
-  });
-
-  it("passes explicit contents:write permission scoped to the kg repo only", async () => {
-    const token = mintKgProgressToken();
-    mockGetScopedInstallationToken.mockResolvedValueOnce({ token: "ghs_tok", expiresAt: "2030-01-01T00:00:00Z" });
-
-    await callKgPushTokenHandler({ authorization: `Bearer ${token}`, kgSourceRepo: "acme/kg-repo" });
-
-    expect(mockGetScopedInstallationToken).toHaveBeenCalledWith(
-      "app-id",
-      "fake-key",
-      "acme",
-      { permissions: { contents: "write" }, repositories: ["kg-repo"], forceRefresh: true },
-    );
-    const opts = mockGetScopedInstallationToken.mock.calls[0][3] as Record<string, unknown>;
-    const repos = opts.repositories as string[];
-    expect(repos.length).toBeGreaterThan(0);
-  });
-
-  it("always passes forceRefresh: true so the credential helper receives a full-lifetime token", async () => {
-    const token = mintKgProgressToken();
-    mockGetScopedInstallationToken.mockResolvedValueOnce({ token: "ghs_tok", expiresAt: "2030-01-01T00:00:00Z" });
-
-    await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
-
-    const opts = mockGetScopedInstallationToken.mock.calls[0][3] as Record<string, unknown>;
-    expect(opts.forceRefresh).toBe(true);
-  });
-
-  it("progress token is multi-use — second call with the same token still succeeds", async () => {
-    const token = mintKgProgressToken();
-    mockGetScopedInstallationToken.mockResolvedValue({ token: "ghs_tok", expiresAt: "2030-01-01T00:00:00Z" });
-
-    const first = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
-    const second = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
-
-    expect(first.status).toBe(200);
-    expect(second.status).toBe(200);
-  });
-
-  it("returns 403 for a non-kg-refresh phase token", async () => {
-    const { token } = runnerTokens.mintRunToken({
-      issueId: "issue-1",
-      mappingTeamKey: "AII",
-      phase: "implementation",
-      audience: "progress",
-      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
-      secret: SECRET,
-    });
-
-    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
-
-    expect(result.status).toBe(403);
-    expect(result.body).toEqual({ error: "Unauthorized" });
-  });
-
-  it("returns 403 for a result-audience token (wrong audience)", async () => {
-    const { token } = runnerTokens.mintRunToken({
-      issueId: "issue-1",
-      mappingTeamKey: "AII",
-      phase: "kg-refresh",
-      audience: "result",
-      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
-      secret: SECRET,
-    });
-
-    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
-
-    expect(result.status).toBe(403);
-    expect(result.body).toEqual({ error: "Unauthorized" });
-  });
-
-  it("returns 403 when Authorization header is missing", async () => {
-    const result = await callKgPushTokenHandler({ authorization: undefined });
-    expect(result.status).toBe(403);
-    expect(result.body).toEqual({ error: "Unauthorized" });
-  });
-
-  it("returns 403 when kgSourceRepo is not configured", async () => {
-    const token = mintKgProgressToken();
-    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}`, kgSourceRepo: null });
-    expect(result.status).toBe(403);
-    expect(result.body).toEqual({ error: "Unauthorized" });
-  });
-
-  it("returns 500 when the GitHub API fails", async () => {
-    const token = mintKgProgressToken();
-    mockGetScopedInstallationToken.mockRejectedValueOnce(new Error("GitHub API error"));
-
-    const result = await callKgPushTokenHandler({ authorization: `Bearer ${token}` });
-
-    expect(result.status).toBe(500);
-    expect(result.body).toEqual({ error: "Failed to mint token" });
-  });
-
-  it("all auth/authz failure modes return byte-identical 403 body", async () => {
-    const expectedBody = { error: "Unauthorized" };
-    const kgToken = mintKgProgressToken();
-    const { token: implToken } = runnerTokens.mintRunToken({
-      issueId: "i2",
-      mappingTeamKey: "AII",
-      phase: "implementation",
-      audience: "progress",
-      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
-      secret: SECRET,
-    });
-
-    const cases = await Promise.all([
-      callKgPushTokenHandler({ authorization: undefined }),
-      callKgPushTokenHandler({ authorization: "" }),
-      callKgPushTokenHandler({ authorization: "Bearer bad.token" }),
-      callKgPushTokenHandler({ authorization: `Bearer ${implToken}` }),
-      callKgPushTokenHandler({ authorization: `Bearer ${kgToken}`, kgSourceRepo: null }),
-    ]);
-
-    for (const result of cases) {
-      expect(result.status).toBe(403);
-      expect(result.body).toEqual(expectedBody);
-    }
-  });
-});
-
-// ── handleKgTrackerDataRequest ────────────────────────────────────────────────
 
 describe("handleKgTrackerDataRequest", () => {
   async function callTrackerData(opts: {
