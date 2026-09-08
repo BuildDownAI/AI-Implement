@@ -3661,7 +3661,13 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
             githubAppId: config.githubAppId,
             githubAppPrivateKey: config.githubAppPrivateKey,
             notifyType: config.notifyType,
-            notifyWebhookUrl: config.notifyWebhookUrl,
+            pollNow: () => {
+          if (pollInProgress) return { started: false };
+          console.log("[poll] Immediate poll requested via admin UI");
+          void poll(config, registry);
+          return { started: true };
+        },
+        notifyWebhookUrl: config.notifyWebhookUrl,
           },
           onKgRefreshRunnerComplete: kgRefresh.onRunnerComplete.bind(kgRefresh),
         });
