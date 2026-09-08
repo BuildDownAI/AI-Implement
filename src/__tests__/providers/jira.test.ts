@@ -3,7 +3,7 @@ import { JiraProvider, createJiraProviderFromConfig } from "../../providers/jira
 import { JiraClient } from "../../providers/jira-client.js";
 import { MissingProviderConfigError, type TicketingProvider } from "../../providers/types.js";
 import { clearFieldCache } from "../../providers/jira-fields.js";
-import { validateTicketingConfig } from "../../providers/ticketing-config.js";
+import { resolveRepoFieldValue, validateTicketingConfig } from "../../providers/ticketing-config.js";
 import type { RepoMapping } from "../../config.js";
 
 const stubClient = () => new JiraClient({ token: "t", cloudId: "c" });
@@ -1505,5 +1505,156 @@ describe("validateTicketingConfig — profilesFieldOverride passthrough", () => 
     });
     if (result.kind !== "jira") throw new Error("expected jira");
     expect(result.profilesFieldOverride).toBeNull();
+  });
+});
+
+describe("resolveRepoFieldValue", () => {
+  const mapping = (repoFieldValue: string | null) => ({
+    owner: "acme",
+    repo: "backend",
+    ticketingConfig: validateTicketingConfig("jira", {
+      kind: "jira",
+      jql: "project = TEST",
+      repoFieldValue,
+    }),
+  });
+
+  it("derives owner/repo when repoFieldValue is absent", () => {
+    const cfg = validateTicketingConfig("jira", { kind: "jira", jql: "project = TEST" });
+    expect(resolveRepoFieldValue({ owner: "acme", repo: "backend", ticketingConfig: cfg }))
+      .toBe("acme/backend");
+  });
+
+  it("derives owner/repo when repoFieldValue is blank or whitespace", () => {
+    expect(resolveRepoFieldValue(mapping(""))).toBe("acme/backend");
+    expect(resolveRepoFieldValue(mapping("   "))).toBe("acme/backend");
+  });
+
+  it("prefers an explicit repoFieldValue over the derived one", () => {
+    expect(resolveRepoFieldValue(mapping("Backend Service"))).toBe("Backend Service");
+  });
+
+  it("trims an explicit repoFieldValue", () => {
+    expect(resolveRepoFieldValue(mapping("  acme/other  "))).toBe("acme/other");
+  });
+
+  it("normalizes a blank stored repoFieldValue to null so it derives", () => {
+    const cfg = validateTicketingConfig("jira", { kind: "jira", jql: "project = T", repoFieldValue: "" });
+    if (cfg.kind !== "jira") throw new Error("expected jira");
+    expect(cfg.repoFieldValue).toBeNull();
+  });
+
+  it("no longer throws when repoFieldValue is omitted", () => {
+    expect(() => validateTicketingConfig("jira", { kind: "jira", jql: "project = T" })).not.toThrow();
+  });
+
+  it("still throws when jql is omitted", () => {
+    expect(() => validateTicketingConfig("jira", { kind: "jira", repoFieldValue: "acme/x" })).toThrow();
+  });
+});
+
+describe("JiraProvider repo matching without an explicit repoFieldValue", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    clearFieldCache();
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const issue = (id: string, key: string, status: string, repo: string) => ({
+    id, key,
+    fields: {
+      summary: `summary-${key}`, description: null,
+      customfield_10100: { value: status },
+      customfield_10101: { value: repo },
+    },
+  });
+  const searchOk = (issues: unknown[]): Response =>
+    ({ ok: true, json: async () => ({ issues }) }) as Response;
+
+  const derivedMapping = (owner: string, repo: string): RepoMapping => ({
+    ...baseMapping,
+    owner,
+    repo,
+    ticketingProvider: "jira",
+    ticketingConfig: { kind: "jira", jql: "project = TEST", repoFieldValue: null },
+  });
+
+  it("matches issues on the derived owner/repo when repoFieldValue is null", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([
+        issue("10001", "P-1", "Ready", "acme/backend"),
+        issue("10002", "P-2", "Ready", "acme/frontend"),
+      ]))
+      .mockResolvedValueOnce(searchOk([])) // children query
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-derive" }),
+      cacheScope: "c-derive", siteUrl: "https://x",
+      getMappings: () => ({ "acme/backend": derivedMapping("acme", "backend") }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+
+    expect(snap.needsPlanning.map((i) => i.identifier)).toEqual(["P-1"]);
+  });
+
+  it("stays quiet when the unmatched repo value belongs to another mapping", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([issue("10002", "P-2", "Ready", "acme/frontend")]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([])) // bucket, mapping acme/frontend
+      .mockResolvedValueOnce(searchOk([]));
+
+    const onRepoFieldMismatch = vi.fn();
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-quiet-sibling" }),
+      cacheScope: "c-quiet-sibling", siteUrl: "https://x",
+      getMappings: () => ({
+        "acme/backend": derivedMapping("acme", "backend"),
+        "acme/frontend": derivedMapping("acme", "frontend"),
+      }),
+      onRepoFieldMismatch,
+    });
+    await p.fetchAIImplementSnapshot();
+
+    expect(onRepoFieldMismatch).not.toHaveBeenCalled();
+  });
+
+  it("still reports a repo value no mapping claims", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([issue("10003", "P-3", "Ready", "acme/typo")]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const onRepoFieldMismatch = vi.fn();
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-report-typo" }),
+      cacheScope: "c-report-typo", siteUrl: "https://x",
+      getMappings: () => ({ "acme/backend": derivedMapping("acme", "backend") }),
+      onRepoFieldMismatch,
+    });
+    await p.fetchAIImplementSnapshot();
+
+    expect(onRepoFieldMismatch).toHaveBeenCalledWith("acme/backend", "P-3", "acme/typo");
+  });
+
+  it("still reports an empty repo field", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([issue("10004", "P-4", "Ready", "")]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const onRepoFieldMismatch = vi.fn();
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-report-empty" }),
+      cacheScope: "c-report-empty", siteUrl: "https://x",
+      getMappings: () => ({ "acme/backend": derivedMapping("acme", "backend") }),
+      onRepoFieldMismatch,
+    });
+    await p.fetchAIImplementSnapshot();
+
+    expect(onRepoFieldMismatch).toHaveBeenCalledWith("acme/backend", "P-4", "");
   });
 });
