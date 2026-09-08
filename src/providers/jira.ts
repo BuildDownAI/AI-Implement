@@ -10,7 +10,6 @@ import type {
 import { MissingProviderConfigError } from "./types.js";
 import { JiraApiError, JiraClient } from "./jira-client.js";
 import {
-  adfParagraph,
   getCachedFieldIds,
   STATUS_VALUES,
   type ResolvedFieldIds,
@@ -18,16 +17,25 @@ import {
 import type { RepoMapping } from "../config.js";
 import { classifyByChildren, ancestorChain, type ChildState } from "./jira-hierarchy.js";
 import { parseIssueConfig } from "../issue-config.js";
+import { markdownToAdf } from "./markdown-to-adf.js";
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
 import { assemblePlanningContext } from "../planning-context-assembly.js";
 
-function adfToPlainText(adf: unknown): string {
+export function adfToPlainText(adf: unknown): string {
   const out: string[] = [];
-  function walk(node: unknown): void {
+  // ADF is structural: headings, list markers and inline code carry no literal characters.
+  // Every consumer downstream matches on markdown syntax — fetchPlanningContext
+  // prefix-matches JIRA_V2_PREFIXES ("## …"), parseDeclaredFiles needs a "- " bullet AND
+  // backticked paths, parseIssueConfig needs fences — so a reader that drops the markers
+  // silently returns nothing for any ADF that was authored structurally (i.e. anything
+  // written by markdownToAdf). Re-emit them.
+  function walk(node: unknown, inBulletList = false): void {
     if (!node || typeof node !== "object") return;
     const n = node as Record<string, unknown>;
     if (typeof n.text === "string") {
-      out.push(n.text);
+      const marks = Array.isArray(n.marks) ? n.marks as Array<Record<string, unknown>> : [];
+      const isCode = marks.some((m) => m && m.type === "code");
+      out.push(isCode ? `\`${n.text}\`` : n.text);
       return;
     }
     if (Array.isArray(n.content)) {
@@ -36,7 +44,14 @@ function adfToPlainText(adf: unknown): string {
       // markdown-shaped consumers (parseIssueConfig) see the same text a Linear
       // description would carry.
       if (t === "codeBlock") out.push("\n```\n");
-      for (const child of n.content) walk(child);
+      if (t === "heading") {
+        const attrs = n.attrs as Record<string, unknown> | undefined;
+        const level = typeof attrs?.level === "number" ? attrs.level : 1;
+        out.push("\n" + "#".repeat(Math.min(Math.max(level, 1), 6)) + " ");
+      }
+      if (t === "listItem" && inBulletList) out.push("- ");
+      const childInBullet = t === "bulletList" ? true : t === "orderedList" ? false : inBulletList;
+      for (const child of n.content) walk(child, childInBullet);
       if (t === "codeBlock") out.push("\n```\n");
       if (t === "paragraph" || t === "heading" || t === "listItem") {
         out.push("\n");
@@ -582,7 +597,7 @@ export class JiraProvider implements TicketingProvider {
     await this.setStatus(issueId, scopeKey, STATUS_VALUES.MERGED);
   }
   async postComment(issueId: string, body: string): Promise<void> {
-    await this.client.addComment(issueId, adfParagraph(body));
+    await this.client.addComment(issueId, markdownToAdf(body));
   }
 
   async fetchPlanningContext(issueId: string): Promise<string> {

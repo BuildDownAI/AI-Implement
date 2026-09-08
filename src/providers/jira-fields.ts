@@ -109,18 +109,6 @@ export const STATUS_VALUES = {
 
 export type StatusValue = (typeof STATUS_VALUES)[keyof typeof STATUS_VALUES];
 
-/** Build a minimal ADF document for a single paragraph. */
-export function adfParagraph(text: string): unknown {
-  return {
-    type: "doc",
-    version: 1,
-    content: [{
-      type: "paragraph",
-      content: [{ type: "text", text }],
-    }],
-  };
-}
-
 /** ADF for a paragraph with a hyperlink. */
 export function adfWithLink(prefix: string, label: string, url: string): unknown {
   return {
