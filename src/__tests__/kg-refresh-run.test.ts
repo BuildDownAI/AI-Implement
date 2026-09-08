@@ -1459,6 +1459,8 @@ describe("applyWiring for kg-snapshot-push", () => {
     expect(inputs.githubToken).toBe("tok");
     expect(inputs.clonedRef).toBe("abc123");
     expect(inputs.defaultBranch).toBe("main");
+    expect(inputs.repoOwner).toBe("org");
+    expect(inputs.repoRepo).toBe("repo");
   });
 });
 
