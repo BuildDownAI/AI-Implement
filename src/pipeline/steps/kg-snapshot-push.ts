@@ -111,16 +111,45 @@ function resolveHeadSha(workspaceDir: string): string | null {
   return r.stdout.toString().trim() || null;
 }
 
-/** Read the stamp from `snapshot/embeddings.stamp` in the working tree. */
+/**
+ * The snapshot's age stamp. The ingest writes it as `age_stamp` in
+ * `snapshot/embeddings.meta.json` — the same value the rail's materialize checks
+ * against the graph's `dcterms:modified`. `snapshot/embeddings.stamp` is the
+ * older companion file that only hand edits ever wrote; it is read as a fallback
+ * so an existing snapshot without metadata still orders.
+ */
+function stampFromMeta(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw) as { age_stamp?: unknown };
+    return typeof parsed.age_stamp === "string" && parsed.age_stamp.trim() ? parsed.age_stamp.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the stamp from the working tree: embeddings.meta.json first, then embeddings.stamp. */
 function readCurrentStamp(workspaceDir: string): string | null {
+  const metaPath = join(workspaceDir, "snapshot", "embeddings.meta.json");
+  if (existsSync(metaPath)) {
+    const fromMeta = stampFromMeta(readFileSync(metaPath, "utf-8"));
+    if (fromMeta) return fromMeta;
+  }
   const stampPath = join(workspaceDir, "snapshot", "embeddings.stamp");
   if (!existsSync(stampPath)) return null;
   return readFileSync(stampPath, "utf-8").trim() || null;
 }
 
-/** Read the stamp from the cloned HEAD via git-show. Returns null if absent in that ref. */
+/** Read the stamp from the cloned HEAD via git-show, same precedence. Returns null if absent in that ref. */
 function readPreviousStamp(workspaceDir: string, clonedRef: string): string | null {
   if (!clonedRef || clonedRef === "unknown") return null;
+  const meta = spawnSync("git", ["show", `${clonedRef}:snapshot/embeddings.meta.json`], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (meta.status === 0) {
+    const fromMeta = stampFromMeta(meta.stdout.toString());
+    if (fromMeta) return fromMeta;
+  }
   const r = spawnSync("git", ["show", `${clonedRef}:snapshot/embeddings.stamp`], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
@@ -290,11 +319,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       throw new KgSnapshotMissingError("snapshot/embeddings.npz is absent");
     }
 
-    // ── 3. Validate stamp (snapshot/embeddings.stamp companion file) ─────────
+    // ── 3. Validate stamp (embeddings.meta.json age_stamp; embeddings.stamp fallback) ──
     const currentStamp = readCurrentStamp(workspaceDir);
     if (!currentStamp) {
       throw new KgSnapshotMissingError(
-        "snapshot/embeddings.stamp is absent — the ingest did not write a stamp",
+        "snapshot/embeddings.meta.json has no age_stamp and snapshot/embeddings.stamp is absent — the ingest did not write a stamp",
       );
     }
     // Reject a malformed stamp rather than silently breaking the ordering check.
@@ -302,7 +331,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const ISO_STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$/;
     if (!ISO_STAMP_RE.test(currentStamp)) {
       throw new KgSnapshotMissingError(
-        `snapshot/embeddings.stamp has unrecognised format "${currentStamp}" — expected YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM`,
+        `snapshot age stamp has unrecognised format "${currentStamp}" — expected YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM`,
       );
     }
     const previousStamp = readPreviousStamp(workspaceDir, clonedRef);
