@@ -1,7 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { parseWorkflowMd } from "../workflow-md.js";
 import { decodeRunConfig } from "../run-config.js";
 import { postRunnerResult } from "../runner-result.js";
 import { DefaultPipelineContext } from "./context.js";
@@ -10,7 +6,6 @@ import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
-import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
@@ -18,7 +13,6 @@ import { ClaudeCliExecutor } from "./executor.js";
 import { resolveLogLevel } from "../run-autonomous.js";
 import type { LLMExecutor, StepReporter, StepModule } from "./types.js";
 
-const PACKAGE_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
 
 export interface RunKgRefreshOptions {
   workspaceDir?: string;
@@ -30,7 +24,6 @@ export interface RunKgRefreshOptions {
     dependencyAuth?: StepModule;
     kgTrackerData?: StepModule;
     kgIngest?: StepModule;
-    feedbackLoop?: StepModule;
     kgSnapshotPush?: StepModule;
   };
 }
@@ -104,55 +97,7 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   };
 }
 
-function buildKgRefreshPrompt(params: {
-  issueIdentifier: string;
-  issueTitle: string;
-  issueDescription: string;
-}): string {
-  const kgRefreshMdPath = join(PACKAGE_ROOT, "workflows", "KG-REFRESH.md");
-  const subs: Record<string, string> = {
-    ISSUE_IDENTIFIER: params.issueIdentifier,
-    ISSUE_TITLE: params.issueTitle,
-    ISSUE_DESCRIPTION: params.issueDescription,
-  };
 
-  if (existsSync(kgRefreshMdPath)) {
-    const parsed = parseWorkflowMd(readFileSync(kgRefreshMdPath, "utf-8"), subs);
-    if (parsed.body.trim()) return parsed.body;
-  }
-
-  // Fallback if workflow file is missing (should not happen in a correctly built image).
-  return `Run the knowledge-graph ingest for ${params.issueIdentifier}. Set up the Python venv, run the ingest, verify the snapshot (snapshot/parts/*.nt and snapshot/embeddings.npz), write snapshot/embeddings.stamp, and leave all changes uncommitted.`;
-}
-
-/**
- * Reviewer rubric injected into the review prompt for kg-refresh runs.
- *
- * The pipeline's kg-ingest step runs the ingest as a deterministic process;
- * Claude's role is to verify the outputs and write the run report. The
- * KG-REFRESH.md playbook instructs the agent to leave all changes uncommitted
- * — the kg-snapshot-push step owns the repository write. Without this rubric
- * the generic reviewer treats untracked snapshot/ and ai-output/ files as a
- * gap and rejects an otherwise successful ingest.
- *
- * Approval for a kg-refresh run is determined entirely by the four ingest
- * checks below, NOT by the working-tree state. Untracked or modified files
- * under snapshot/ and ai-output/ are the expected output of a correct run.
- */
-const KG_REFRESH_REVIEW_RUBRIC = `This is a kg-refresh run. The pipeline's kg-ingest step ran the ingest as a \
-deterministic process — the agent's role is to verify its outputs and write the \
-run report, then leave all changes uncommitted so the pipeline step that follows \
-owns the repository write. Untracked or modified files under snapshot/ and \
-ai-output/ are the expected output of a successful ingest, never a gap.
-
-Approve this run if and only if all four ingest checks pass:
-1. snapshot/parts/ contains at least one non-empty .nt file (RDF triples written by the ingest step).
-2. snapshot/embeddings.npz exists and is non-empty (embeddings rebuilt by the ingest step).
-3. snapshot/embeddings.stamp exists and contains a fresh ISO-8601 timestamp (stamp written by the ingest step).
-4. ai-output/kg-stats.json exists and contains the four required numeric fields: quads, vectors, docPages, durationSec (written by the ingest step and verified in the run report).
-
-Do NOT raise issues about uncommitted files in snapshot/ or ai-output/. Do NOT \
-require git add or git commit — those are pipeline responsibilities.`;
 
 export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunKgRefreshResult> {
   const workspaceDir = opts.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/workspace";
@@ -171,7 +116,6 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     dependencyTokenScope,
   } = resolveKgRefreshInputs(process.env);
 
-  const implementationPrompt = buildKgRefreshPrompt({ issueIdentifier, issueTitle, issueDescription });
   const nonce = process.env.MACHINE_NONCE ?? "";
   const orchestratorUrl = process.env.ORCHESTRATOR_URL ?? "";
 
@@ -185,18 +129,13 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       nonce,
       orchestratorUrl,
       workspaceDir,
-      implementationPrompt,
+      implementationPrompt: "",
       githubOwner,
       githubRepo,
       githubToken,
       branch: defaultBranch,
       provider,
       maxTurns,
-      // The ingest is a deterministic pipeline step; the feedback-loop is report-only.
-      // One iteration is sufficient: Claude reads kg-stats.json, writes the run report,
-      // and answers the reviewer's checks. A second pass is never needed.
-      maxIterations: 1,
-      reviewRubric: KG_REFRESH_REVIEW_RUBRIC,
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
     },
@@ -209,7 +148,6 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
   runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
   runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
-  runner.register("feedback-loop", opts.stepsOverride?.feedbackLoop ?? feedbackLoopStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
 
   const reporter: StepReporter = opts.reporter ?? new NoopStepReporter();

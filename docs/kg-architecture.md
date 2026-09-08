@@ -338,9 +338,10 @@ the start. No new top-level function, no new route branch.
 AII-493 adds a `kg-refresh` runner pipeline. The ingest runs as a **deterministic pipeline step**
 (`src/pipeline/steps/kg-ingest.ts`): `kg-ingest` spawns `python -m kg_ingest refresh` as a
 subprocess, streams its output, and on success writes `ai-output/kg-stats.json` from CLI-emitted
-stats or a fallback `.nt` line count. Claude's role in the feedback-loop step is report-only —
-it reads `kg-stats.json`, reconciles `sources.yml` scope, verifies the snapshot outputs, and writes
-the run report; it does not run the ingest or manage the Python venv. AII-494 adds the two
+stats or a fallback `.nt` line count. No agent runs after it: the step's echoed counters and
+`ai-output/kg-ingest.log` (AII-581) are the run's report, and `kg-snapshot-push` is the guard. The
+report step that once followed was removed on 2026-09-08 after it re-ran the ingest by hand and
+deleted `snapshot/parts/pr.nt`. AII-494 adds the two
 runner-callback endpoints that give this run kind its privileged access without ever vending a
 long-lived credential to the runner. AII-495 wires `POST /api/kg/refresh` to dispatch the runner
 when the source repo has no newer snapshot: the orchestrator mints a run token, encodes a
@@ -425,6 +426,7 @@ Each of these shipped a degraded or blocked deploy, and each is now covered by a
 | 2026-08-18 | Self-deploy v111 built the previous snapshot; v112 minutes later was correct | Remote-builder git-cache lag on a `--depth 1` clone — wait and redeploy |
 | 2026-08-19 | v115 shipped lexical-only after the embed step was OOM-killed at ~21k quads / 1,438 cards | KGB-8 — free the rdflib graph before embedding, pre-allocate the output array, embed in slices of 64 |
 | 2026-08-20 | A degraded build was indistinguishable from a healthy one | AII-422 — `.embeddings-failed` receipt, `KG_EMBEDDINGS_DEGRADED`, `kgDegraded` on health, notification, and `get_tenant_health` |
+| 2026-09-08 | The kg-refresh report step (feedback-loop) re-ran the ingest by hand without a GitHub token and rewrote `snapshot/parts/` without `pr.nt`; the guard refused three runs | The report step is removed from `pipelines/kg-refresh.yml`; the ingest step's counters and `ai-output/kg-ingest.log` (AII-581) plus the snapshot-push guard are the report |
 | 2026-09-08 | Refresh rail's materialize OOM-killed at ~31.6k quads (271 MB RSS beside the serving sidecar on a 512 MB machine); the rail refused the swap and kept serving the old graph | `fly.toml` memory raised to 1 GB — the documented headroom figure, not a code change |
 
 ## KG-refresh outcome visibility (AII-496)
@@ -472,6 +474,6 @@ critical section after the TTL watchdog has already resolved the run.
 | Docs ingestion | KGB-2 through KGB-5, KGA-2, BDS-38 | Crawl, section chunks, citable anchors |
 | Scaling | KGB-8, AII-422 | Bounded-memory embedding, and a receipt when it still fails |
 | Autonomous ingest | AII-493, AII-494 | kg-refresh run kind: runner-callback endpoints vend scoped push token and tracker data |
-| Deterministic ingest step | AII-571 | kg-ingest is now a deterministic pipeline step; Claude's feedback-loop role is report-only (verify snapshot, write run report) |
+| Deterministic ingest step | AII-571 | kg-ingest is a deterministic pipeline step; the report step that followed it was removed on 2026-09-08 (see the history table) — no agent runs in a kg-refresh workspace |
 | Runner dispatch + stage machine | AII-495 | `POST /api/kg/refresh` dispatches the runner when ingest is needed; persisted stage machine (idle → checking → ingest-running → snapshot-landed → staging → terminal) survives restarts; live TTL watchdog; `/admin#deployments` stage badges |
 | KG-visible outcomes | AII-496 | Slack/Teams notification + Linear failure comment on every terminal outcome; TTL-timeout reaches the "hit the time limit" classifier; stuck-watchdog carve-out; exactly-once guarantee via stage guard |

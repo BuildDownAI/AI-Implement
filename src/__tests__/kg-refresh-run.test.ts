@@ -1388,9 +1388,6 @@ steps:
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push
@@ -1495,7 +1492,6 @@ describe("runKgRefresh", () => {
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
@@ -1509,7 +1505,6 @@ describe("runKgRefresh", () => {
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({}, new KgSnapshotMissingError("no parts")),
       },
       reporter: { report: async () => undefined },
@@ -1526,7 +1521,6 @@ describe("runKgRefresh", () => {
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({}, new KgSnapshotTrackerRegressionError("previous snapshot has tracker files")),
       },
       reporter: { report: async () => undefined },
@@ -1548,7 +1542,6 @@ describe("runKgRefresh", () => {
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgTrackerData: makeStepModule({}, new KgTrackerDataFetchError("orchestrator returned 502")),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
@@ -1566,61 +1559,6 @@ describe("runKgRefresh", () => {
     const decoded = decodeRunConfig(encoded);
     expect(decoded.runnerPhase).toBe("kg-refresh");
     expect(decoded.kgSourceRepo).toBe("BuildDownAI/knowledge-graph-ai-implement");
-  });
-
-  it("passes maxIterations=1 to the feedback-loop step (report-only, ingest is a deterministic step)", async () => {
-    let capturedInputs: Record<string, unknown> = {};
-    const capturingFeedbackLoop: StepModule = {
-      run: async (_ctx, inputs) => {
-        capturedInputs = inputs;
-        return { approved: false };
-      },
-    };
-
-    await runKgRefresh({
-      workspaceDir: tmpDir,
-      stepsOverride: {
-        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
-        kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: capturingFeedbackLoop,
-        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
-      },
-      reporter: { report: async () => undefined },
-    });
-
-    expect(capturedInputs.maxIterations).toBe(1);
-  });
-
-  it("passes reviewRubric with snapshot/ and ingest-check clauses to the feedback-loop step", async () => {
-    let capturedInputs: Record<string, unknown> = {};
-    const capturingFeedbackLoop: StepModule = {
-      run: async (_ctx, inputs) => {
-        capturedInputs = inputs;
-        return { approved: false };
-      },
-    };
-
-    await runKgRefresh({
-      workspaceDir: tmpDir,
-      stepsOverride: {
-        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
-        kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: capturingFeedbackLoop,
-        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
-      },
-      reporter: { report: async () => undefined },
-    });
-
-    const rubric = capturedInputs.reviewRubric;
-    expect(typeof rubric).toBe("string");
-    const rubricStr = rubric as string;
-    // Must mention that uncommitted output is expected
-    expect(rubricStr).toContain("snapshot/");
-    expect(rubricStr).toContain("uncommitted");
-    // Must include all four ingest-check criteria
-    expect(rubricStr).toContain("embeddings.npz");
-    expect(rubricStr).toContain("embeddings.stamp");
-    expect(rubricStr).toContain("kg-stats.json");
   });
 });
 
@@ -1780,40 +1718,6 @@ describe("makeKgRefresh — dispatch result threading to updateJobMachine", () =
       logsUrl: "https://fly.io/apps/sessions/machines/machine-abc",
       workflowRunId: undefined,
     });
-  });
-});
-
-// ── KG-REFRESH.md template assertions ────────────────────────────────────────
-
-describe("KG-REFRESH.md template — report-only, no ingest instructions", () => {
-  const playbookPath = join(
-    fileURLToPath(new URL(".", import.meta.url)),
-    "..",
-    "..",
-    "workflows",
-    "KG-REFRESH.md",
-  );
-
-  it("states that the reviewer treats uncommitted snapshot/ output as expected", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("uncommitted");
-    expect(playbook).toContain("reviewer");
-  });
-
-  it("does not instruct Claude to run the ingest (no python/venv/kg_ingest references)", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).not.toContain("python");
-    expect(playbook).not.toContain("venv");
-    expect(playbook).not.toContain("kg_ingest");
-    expect(playbook).not.toContain("--code-repo");
-    expect(playbook).not.toContain("--tracker-data");
-    expect(playbook).not.toContain("TRACKER_DATA_SUPPORTED");
-  });
-
-  it("instructs Claude to read kg-stats.json and write 01-report.md", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("kg-stats.json");
-    expect(playbook).toContain("01-report.md");
   });
 });
 
@@ -2385,7 +2289,7 @@ describe("kgIngestStep — log file and signal echo", () => {
 // ── kg-refresh pipeline order ─────────────────────────────────────────────────
 
 describe("kg-refresh pipeline order", () => {
-  it("step IDs are clone → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → feedback-loop → kg-snapshot-push", () => {
+  it("step IDs are clone → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → kg-snapshot-push (no agent step)", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
     const ids = pipeline.steps.map((s) => s.id);
     expect(ids).toEqual([
@@ -2395,7 +2299,6 @@ describe("kg-refresh pipeline order", () => {
       "clone-secondary-repos",
       "kg-tracker-data",
       "kg-ingest",
-      "feedback-loop",
       "kg-snapshot-push",
     ]);
   });
@@ -3246,9 +3149,6 @@ steps:
   - id: kg-ingest
     type: custom
     moduleId: kg-ingest
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push
@@ -3574,7 +3474,6 @@ describe("kg-refresh pipeline definition step order", () => {
       "clone-secondary-repos",
       "kg-tracker-data",
       "kg-ingest",
-      "feedback-loop",
       "kg-snapshot-push",
     ]);
   });
@@ -3607,9 +3506,6 @@ steps:
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push
@@ -3809,9 +3705,6 @@ steps:
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push
@@ -3956,7 +3849,6 @@ describe("runKgRefresh — dependency-auth step and dependencyTokenScope", () =>
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         dependencyAuth: capturingDepAuth,
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
@@ -3989,7 +3881,6 @@ describe("runKgRefresh — dependency-auth step and dependencyTokenScope", () =>
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         dependencyAuth: capturingDepAuth,
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
@@ -4014,7 +3905,6 @@ describe("runKgRefresh — dependency-auth step and dependencyTokenScope", () =>
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         dependencyAuth: capturingDepAuth,
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
