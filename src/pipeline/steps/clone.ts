@@ -129,7 +129,9 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
               continue;
             }
           }
-          const resetTarget = target.branch ? `origin/${target.branch}` : "FETCH_HEAD";
+          // fetch origin <branch> lands in FETCH_HEAD under a single-branch refspec
+          // (does not create refs/remotes/origin/<branch>), so always reset to FETCH_HEAD.
+          const resetTarget = "FETCH_HEAD";
           const resetResult = spawnSync(
             "git",
             ["reset", "--hard", resetTarget],

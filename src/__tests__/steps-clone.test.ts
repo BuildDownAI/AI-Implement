@@ -911,7 +911,7 @@ describe("cloneStep", () => {
         ]);
       });
 
-      it("existing-dir with branch and depth: 'full' (shallow) runs unshallow then fetch origin branch then reset to origin/branch", async () => {
+      it("existing-dir with branch and depth: 'full' (shallow) runs unshallow then fetch origin branch then reset to FETCH_HEAD", async () => {
         vi.mocked(fs.existsSync).mockReturnValue(true);
         // rev-parse --is-shallow-repository, fetch --unshallow, fetch origin testing, reset
         mockSpawn([
@@ -931,11 +931,11 @@ describe("cloneStep", () => {
         expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
         expect(calls[1][1]).toEqual(["fetch", "--unshallow", "origin"]);
         expect(calls[2][1]).toEqual(["fetch", "origin", "testing"]);
-        expect(calls[3][1]).toEqual(["reset", "--hard", "origin/testing"]);
+        expect(calls[3][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
         expect(outputs.clonedCount).toBe(1);
       });
 
-      it("existing-dir with branch and depth: 'full' (already full) runs fetch origin branch then reset to origin/branch", async () => {
+      it("existing-dir with branch and depth: 'full' (already full) runs fetch origin branch then reset to FETCH_HEAD", async () => {
         vi.mocked(fs.existsSync).mockReturnValue(true);
         // rev-parse --is-shallow-repository, fetch origin testing, reset
         mockSpawn([
@@ -953,11 +953,11 @@ describe("cloneStep", () => {
         const calls = vi.mocked(spawnSync).mock.calls;
         expect(calls[0][1]).toEqual(["rev-parse", "--is-shallow-repository"]);
         expect(calls[1][1]).toEqual(["fetch", "origin", "testing"]);
-        expect(calls[2][1]).toEqual(["reset", "--hard", "origin/testing"]);
+        expect(calls[2][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
         expect(outputs.clonedCount).toBe(1);
       });
 
-      it("existing-dir with branch and no depth uses --depth 1 fetch with branch and resets to origin/branch", async () => {
+      it("existing-dir with branch and no depth uses --depth 1 fetch with branch and resets to FETCH_HEAD", async () => {
         vi.mocked(fs.existsSync).mockReturnValue(true);
         // fetch --depth 1 origin testing, reset
         mockSpawn([{ status: 0 }, { status: 0 }]);
@@ -969,7 +969,7 @@ describe("cloneStep", () => {
 
         const calls = vi.mocked(spawnSync).mock.calls;
         expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "testing"]);
-        expect(calls[1][1]).toEqual(["reset", "--hard", "origin/testing"]);
+        expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
       });
 
       it("existing-dir with no branch and no depth uses --depth 1 fetch and resets to FETCH_HEAD (regression guard)", async () => {
