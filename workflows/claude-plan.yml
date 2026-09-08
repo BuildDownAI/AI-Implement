@@ -192,13 +192,12 @@ jobs:
           role-session-duration: 14400
 
       - name: Mask runner callback tokens
+        env:
+          RUN_TOKEN: ${{ inputs.run_token }}
+          RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
         run: |
-          if [ -n "${{ inputs.run_token }}" ]; then
-            echo "::add-mask::${{ inputs.run_token }}"
-          fi
-          if [ -n "${{ inputs.run_progress_token }}" ]; then
-            echo "::add-mask::${{ inputs.run_progress_token }}"
-          fi
+          if [ -n "$RUN_TOKEN" ]; then echo "::add-mask::$RUN_TOKEN"; fi
+          if [ -n "$RUN_PROGRESS_TOKEN" ]; then echo "::add-mask::$RUN_PROGRESS_TOKEN"; fi
 
       # Container jobs default to sh -e; this step uses bash syntax and requires shell: bash.
       # Reads ONE literal repository secret. Never serialize the whole secrets context: that
