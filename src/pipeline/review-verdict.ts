@@ -106,9 +106,6 @@ export function parseReviewVerdict(value: unknown): ReviewVerdict {
   if (typeof raw.feedback !== "string") throw new Error("expected feedback to be a string");
 
   const blockingIssues = raw.blocking_issues.map(parseIssue);
-  if (!raw.approved && blockingIssues.length === 0) {
-    throw new Error("approved=false requires at least one blocking_issues entry");
-  }
 
   return {
     approved: raw.approved && blockingIssues.length === 0,

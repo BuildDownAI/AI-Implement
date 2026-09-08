@@ -48,9 +48,9 @@ describe("parseReviewVerdict", () => {
     expect(verdict.blockingIssues).toHaveLength(1);
   });
 
-  it("rejects a negative verdict with no blocking issues", () => {
-    expect(() => parseReviewVerdict({ ...validApproved, approved: false }))
-      .toThrow("approved=false requires at least one blocking_issues entry");
+  it("preserves a negative verdict with no internal issues for caller policy", () => {
+    expect(parseReviewVerdict({ ...validApproved, approved: false }))
+      .toMatchObject({ approved: false, blockingIssues: [] });
   });
 
   it("rejects wrong typed fields", () => {

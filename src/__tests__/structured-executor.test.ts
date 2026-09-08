@@ -69,7 +69,6 @@ describe("structured Claude CLI results", () => {
     const result = await executor.invoke({ prompt: "review", model: "m", jsonSchema: schema });
     expect(result.structuredOutput).toBeUndefined();
     expect(result.terminalStatus).toBeUndefined();
-    expect(result.hasTerminalResult).toBe(false);
   });
 
   it("keeps the final failure status even when an earlier result approved", async () => {

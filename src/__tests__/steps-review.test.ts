@@ -49,6 +49,30 @@ describe("reviewStep", () => {
     vi.clearAllMocks();
   });
 
+  it("rejects a negative verdict without actionable implementation issues", async () => {
+    const executor = makeExecutor({ ...APPROVED_VERDICT, approved: false });
+    await expect(reviewStep.run(makeContext(executor), {}, new NoopStepReporter()))
+      .rejects.toThrow("approved=false requires at least one blocking_issues entry");
+  });
+
+  it.each([
+    ["missing terminal event", { terminalStatus: undefined }, "did not return a terminal result event"],
+    ["error terminal event", { terminalStatus: { subtype: "success", isError: true } }, "error terminal result"],
+    ["unsuccessful subtype", { terminalStatus: { subtype: "error_max_turns", isError: false } }, "without a successful terminal result"],
+    ["unsuccessful telemetry", { telemetry: { outcome: "max_turns" } }, "without a successful terminal result"],
+  ])("rejects approval with %s", async (_name, overrides, message) => {
+    const executor: LLMExecutor = {
+      invoke: vi.fn().mockResolvedValue({
+        stdout: "Review complete", exitCode: 0, tokensUsed: 0,
+        structuredOutput: APPROVED_VERDICT,
+        terminalStatus: { subtype: "success", isError: false },
+        ...overrides,
+      }),
+    };
+    await expect(reviewStep.run(makeContext(executor), {}, new NoopStepReporter()))
+      .rejects.toThrow(message);
+  });
+
   it("parses approved=true from structured JSON response", async () => {
     const executor = makeExecutor(APPROVED_VERDICT);
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());

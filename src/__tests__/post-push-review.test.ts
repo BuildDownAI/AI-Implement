@@ -18,7 +18,7 @@ function makeCtx(execMock: any) {
         }
         return {
           ...result,
-          structuredOutput: normalizeLegacyReviewFixture(parsed),
+          structuredOutput: parsed,
           terminalStatus: { subtype: "success", isError: false },
         };
       }),
@@ -27,36 +27,6 @@ function makeCtx(execMock: any) {
     setOutputs: () => {},
     resolveInputs: (i: any) => i,
   } as any;
-}
-
-function normalizeLegacyReviewFixture(parsed: any) {
-  const source = Array.isArray(parsed.blocking_issues)
-    ? parsed.blocking_issues
-    : Array.isArray(parsed.issues)
-      ? parsed.issues
-      : Array.isArray(parsed.findings)
-        ? parsed.findings
-        : [];
-  return {
-    approved: parsed.approved,
-    blocking_issues: source.map((issue: any) => {
-      if (typeof issue === "string") {
-        return { title: "Blocking issue", problem: issue, required_fix: issue };
-      }
-      if (typeof issue.text === "string") {
-        return { title: "Blocking issue", problem: issue.text, required_fix: issue.text };
-      }
-      return {
-        title: issue.title ?? "Blocking issue",
-        ...(issue.location || issue.file || issue.path ? { location: issue.location ?? issue.file ?? issue.path } : {}),
-        problem: issue.problem ?? issue.issue ?? issue.details ?? issue.description ?? issue.title ?? "Blocking issue",
-        required_fix: issue.required_fix ?? issue.requiredFix ?? issue.fix ?? issue.recommendation ?? issue.problem ?? issue.title ?? "Fix the issue",
-      };
-    }),
-    score: parsed.score,
-    progress_delta: parsed.progress_delta,
-    feedback: parsed.feedback,
-  };
 }
 
 function structuredReviewResult(structuredOutput: unknown, stdout = "ignored final text") {
@@ -76,7 +46,7 @@ function countOccurrences(text: string, needle: string): number {
 
 describe("postPushReviewStep", () => {
   it("approves on first iteration, posts ✅ comment, returns approved=true", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -100,7 +70,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("submits a native COMMENT review when merge-ready", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const reviewCalls: string[][] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -126,7 +96,7 @@ describe("postPushReviewStep", () => {
 
   it("logs native review response details and PR context when submission fails", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
@@ -214,7 +184,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("loops to cap then posts ⚠️ comment", async () => {
-    const notApproved = JSON.stringify({ approved: false, issues: ["bug"], feedback: "fix the bug", score: 4, progress_delta: 0 });
+    const notApproved = JSON.stringify({ approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 });
     const ghComments: string[] = [];
     const gitPushCalls: string[][] = [];
     const pushOrder: string[] = [];
@@ -267,7 +237,7 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((c) => c.includes("fix-complete") && c.includes("Fix pass 1/2"))).toBe(false);
     expect(ghComments.some((c) => c.includes("⚠️") && c.includes("cap"))).toBe(true);
     expect(ghComments.some((c) => c.includes("cap") && c.includes("Not ready to merge"))).toBe(true);
-    expect(ghComments.some((c) => c.includes("cap") && c.includes("Blocking issues:\n1. bug"))).toBe(true);
+    expect(ghComments.some((c) => c.includes("cap") && c.includes("Blocking issues:\n1. **bug**"))).toBe(true);
     expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
@@ -282,7 +252,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("defaults to two fix passes plus a final review", async () => {
-    const notApproved = JSON.stringify({ approved: false, issues: ["bug"], feedback: "fix the bug", score: 4, progress_delta: 0 });
+    const notApproved = JSON.stringify({ approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 });
     const ghComments: string[] = [];
     const gitPushCalls: string[][] = [];
     const gitSpawn = vi.fn((args: string[]) => {
@@ -320,7 +290,7 @@ describe("postPushReviewStep", () => {
   it("runs a fix pass when reviewer approves but reports actionable issues", async () => {
     const approvedWithIssues = JSON.stringify({
       approved: true,
-      issues: ["Escape quoted user input"],
+      blocking_issues: [{ title: "Escape quoted user input", problem: "Escape quoted user input", required_fix: "Escape quoted user input" }],
       feedback: "Minor issue worth addressing.",
       score: 8,
       progress_delta: 0,
@@ -478,7 +448,7 @@ describe("postPushReviewStep", () => {
     expect(invoke.mock.calls[1][0].prompt).toContain("Add a regression test.");
   });
 
-  it("runs a fix pass when reviewer uses the findings alias", async () => {
+  it("rejects the findings alias without running a fix pass", async () => {
     const approvedWithFindings = JSON.stringify({
       approved: true,
       findings: [{ title: "Missing guard", problem: "Null input reaches the write path.", required_fix: "Reject null input." }],
@@ -503,15 +473,14 @@ describe("postPushReviewStep", () => {
     );
 
     expect(out.approved).toBe(false);
-    expect(invoke).toHaveBeenCalledTimes(2);
-    expect(invoke.mock.calls[1][0].prompt).toContain("Missing guard");
-    expect(invoke.mock.calls[1][0].prompt).toContain("Reject null input.");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(out.terminationReason).toBe("invalid_review");
   });
 
-  it("runs a fix pass when an external changes-requested review blocks internal approval", async () => {
+  it.each([true, false])("runs an external-findings fix pass with approved=%s and no internal issues", async (approved) => {
     const reviewerJson = JSON.stringify({
-      approved: true,
-      issues: [],
+      approved,
+      blocking_issues: [],
       feedback: "Internal reviewer approves.",
       score: 9,
       progress_delta: 0,
@@ -558,7 +527,7 @@ describe("postPushReviewStep", () => {
   it("runs a fix pass when a Claude issue comment has blocking findings and internal review approves", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Internal reviewer approves.",
       score: 9,
       progress_delta: 0,
@@ -618,7 +587,7 @@ describe("postPushReviewStep", () => {
   it("does not approve when the GitHub Actions Claude review reports a prose blocking finding", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Internal reviewer approves.",
       score: 9,
       progress_delta: 0,
@@ -674,7 +643,7 @@ describe("postPushReviewStep", () => {
   it("preserves opportunistic external collection when reviewProviders is undefined", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Internal reviewer approves.",
       score: 9,
       progress_delta: 0,
@@ -716,7 +685,7 @@ describe("postPushReviewStep", () => {
   it("skips external collection when reviewProviders is an empty array", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Internal reviewer approves.",
       score: 9,
       progress_delta: 0,
@@ -755,7 +724,7 @@ describe("postPushReviewStep", () => {
   it("collects external findings when github-claude-code-review is configured", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Internal reviewer approves.",
       score: 9,
       progress_delta: 0,
@@ -808,7 +777,7 @@ describe("postPushReviewStep", () => {
   it("deduplicates internal issues that repeat external review findings", async () => {
     const reviewerJson = JSON.stringify({
       approved: false,
-      issues: ["Missing UUID validation on path params."],
+      blocking_issues: [{ title: "Missing UUID validation on path params.", problem: "Missing UUID validation on path params.", required_fix: "Missing UUID validation on path params." }],
       feedback: "External blocker is still unresolved.",
       score: 4,
       progress_delta: 0,
@@ -851,7 +820,7 @@ describe("postPushReviewStep", () => {
   it("suppresses duplicate feedback that repeats external review findings", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Missing UUID validation on path params.",
       score: 9,
       progress_delta: 0,
@@ -896,7 +865,7 @@ describe("postPushReviewStep", () => {
   it("does not run a fix pass when approved feedback contains actionable language but issues is empty", async () => {
     const approvedWithFeedback = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Two minor issues worth addressing: escape quotes and use an enum.",
       score: 8,
       progress_delta: 0,
@@ -926,7 +895,7 @@ describe("postPushReviewStep", () => {
   it("does not run a fix pass for deferred future-task concerns", async () => {
     const approvedWithDeferredConcern = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Clean implementation. One thing to watch in later tasks: prompt injection would need to be addressed at the API call layer, but noting it now so it doesn't get missed as the pipeline grows.",
       score: 8,
       progress_delta: 0,
@@ -953,7 +922,7 @@ describe("postPushReviewStep", () => {
   it("does not turn optional cosmetic review notes into blockers", async () => {
     const approvedWithCosmeticNote = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Clean implementation. Minor cosmetic note for a later cleanup pass: consider hover:bg-stone-200 at some point, but that is not required by this task.",
       score: 9,
       progress_delta: 0,
@@ -980,7 +949,7 @@ describe("postPushReviewStep", () => {
   it("requires structured issues when reviewer marks a PR not ready", async () => {
     const notReadyWithoutBlocker = JSON.stringify({
       approved: false,
-      issues: [],
+      blocking_issues: [],
       feedback: "There is a bug in the timer restart flow, so this is not ready.",
       score: 9,
       progress_delta: 0,
@@ -1013,7 +982,7 @@ describe("postPushReviewStep", () => {
   it("does not treat benign should-pass approval language as actionable", async () => {
     const approvedWithShouldPass = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "The implementation is ready; tests should pass and this should be merged as-is.",
       score: 9,
       progress_delta: 0,
@@ -1040,7 +1009,7 @@ describe("postPushReviewStep", () => {
   it("does not treat resolved prior blockers in approval feedback as actionable", async () => {
     const approvedWithResolvedBlockers = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Both Review 1 blockers are resolved. The expired-timer restart bug is fixed and the regression test covers it. Merge readiness: ready to merge.",
       score: 9,
       progress_delta: 0,
@@ -1143,7 +1112,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not fail the job when a post-push fix-pass LLM exits non-zero", async () => {
-    const notApproved = JSON.stringify({ approved: false, issues: ["x"], feedback: "fix", score: 4, progress_delta: 0 });
+    const notApproved = JSON.stringify({ approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 });
     const ghComments: string[] = [];
     const gitSpawn = vi.fn();
     const ghSpawn = vi.fn((args: string[]) => {
@@ -1178,7 +1147,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("throws on git push --force-with-lease rejection", async () => {
-    const notApproved = JSON.stringify({ approved: false, issues: ["x"], feedback: "fix", score: 4, progress_delta: 0 });
+    const notApproved = JSON.stringify({ approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 });
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
       if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
@@ -1199,7 +1168,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("stops without pushing when the fix pass makes no changes", async () => {
-    const notApproved = JSON.stringify({ approved: false, issues: ["x"], feedback: "fix", score: 4, progress_delta: 0 });
+    const notApproved = JSON.stringify({ approved: false, blocking_issues: [{ title: "x", problem: "x", required_fix: "x" }], feedback: "fix", score: 4, progress_delta: 0 });
     const ghComments: string[] = [];
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
@@ -1232,7 +1201,7 @@ describe("postPushReviewStep", () => {
   it("reports unresolved external findings when an externally blocked fix pass makes no changes", async () => {
     const reviewerJson = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Internal reviewer approves.",
       score: 9,
       progress_delta: 0,
@@ -1275,7 +1244,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not parse stdout preamble objects when structured_output is missing", async () => {
-    const reviewerJson = `pre-text {} ${JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "ok" })}`;
+    const reviewerJson = `pre-text {} ${JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "ok" })}`;
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
@@ -1293,7 +1262,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("updates an existing marker comment instead of posting a duplicate", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "ok" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "ok" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args.includes("repos/:owner/:repo/issues/42/comments?per_page=100")) {
         return {
@@ -1331,7 +1300,7 @@ describe("postPushReviewStep", () => {
   it("passes reviewer issues through a guarded fix prompt", async () => {
     const notApproved = JSON.stringify({
       approved: false,
-      issues: ["Fix auth flow", "Add regression test"],
+      blocking_issues: [{ title: "Fix auth flow", problem: "Fix auth flow", required_fix: "Fix auth flow" }, { title: "Add regression test", problem: "Add regression test", required_fix: "Add regression test" }],
       feedback: "The implementation is incomplete.",
       score: 4,
       progress_delta: 0,
@@ -1374,7 +1343,8 @@ describe("postPushReviewStep", () => {
     expect(fixPrompt).toContain("Summary:\nThe implementation is incomplete.");
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
     expect(reviewComment).toContain("fix pass 1/2");
-    expect(reviewComment).toContain("Blocking issues:\n1. Fix auth flow\n2. Add regression test");
+    expect(reviewComment).toContain("Blocking issues:\n1. **Fix auth flow**");
+    expect(reviewComment).toContain("2. **Add regression test**");
     expect(reviewComment).toContain("Reviewer summary:\nThe implementation is incomplete.");
     expect(reviewComment).not.toContain("Feedback:\n");
   });
@@ -1382,14 +1352,14 @@ describe("postPushReviewStep", () => {
   it("asks follow-up reviews to verify previous findings and continue a full review", async () => {
     const firstReview = JSON.stringify({
       approved: false,
-      issues: ["Fix auth flow"],
+      blocking_issues: [{ title: "Fix auth flow", problem: "Fix auth flow", required_fix: "Fix auth flow" }],
       feedback: "Auth is incomplete.",
       score: 4,
       progress_delta: 0,
     });
     const secondReview = JSON.stringify({
       approved: true,
-      issues: [],
+      blocking_issues: [],
       feedback: "Looks good.",
       score: 9,
       progress_delta: 1,
@@ -1531,7 +1501,7 @@ describe("postPushReviewStep", () => {
     expect(fixPrompt).not.toContain(`${requiredFix.slice(0, 80)}...`);
   });
 
-  it("renders text-only blocking issue objects like legacy string issues", async () => {
+  it("rejects text-only blocking issue aliases without running a fix pass", async () => {
     const issueText = "The reviewer returned a legacy text-only object that should stay flat in comments and prompts.";
     const reviewerJson = JSON.stringify({
       approved: false,
@@ -1561,13 +1531,8 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
-    expect(reviewComment).toContain(`Blocking issues:\n1. ${issueText}`);
-    expect(reviewComment).not.toContain("**Blocking issue**");
-
-    const fixPrompt = invoke.mock.calls[1][0].prompt;
-    expect(fixPrompt).toContain(`Issues:\n1. ${issueText}`);
-    expect(fixPrompt).not.toContain("**Blocking issue**");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(ghComments.some((comment) => comment.includes("unexpected field blocking_issues[0].text"))).toBe(true);
   });
 
   it("escapes markdown control characters in structured issue fields", async () => {
@@ -1659,12 +1624,12 @@ describe("postPushReviewStep", () => {
     expect(noChangesComment).toContain(requiredFix);
   });
 
-  it("omits duplicate review summaries without truncating legacy blocking issues in PR comments", async () => {
+  it("omits duplicate review summaries without truncating structured blocking issues in PR comments", async () => {
     const longIssue = "The parse API error path is missing user-visible error handling in app/page.tsx, so failed parse requests leave the user stuck on the input surface without feedback or a retry path. Add an error state, render it near OpenInput, and reset loading after failures.";
     const notApproved = JSON.stringify({
       approved: false,
-      issues: [longIssue],
-      feedback: longIssue,
+      blocking_issues: [{ title: "Parse failure", problem: longIssue, required_fix: "Add error handling" }],
+      feedback: `Parse failure\nProblem: ${longIssue}\nRequired fix: Add error handling`,
       score: 4,
       progress_delta: 0,
     });
@@ -1690,14 +1655,15 @@ describe("postPushReviewStep", () => {
     );
 
     const reviewComment = ghComments.find((comment) => comment.includes("Reviewer found issues"));
-    expect(reviewComment).toContain(`Blocking issues:\n1. ${longIssue}`);
+    expect(reviewComment).toContain("Blocking issues:\n1. **Parse failure**");
+    expect(reviewComment).toContain(`Problem: ${longIssue}`);
     expect(reviewComment).not.toContain("Reviewer summary:");
   });
 
   it("posts a concrete fix summary when the fixer reports one", async () => {
     const notApproved = JSON.stringify({
       approved: false,
-      issues: ["Update hover affordance"],
+      blocking_issues: [{ title: "Update hover affordance", problem: "Update hover affordance", required_fix: "Update hover affordance" }],
       feedback: "Hover state is invisible.",
       score: 4,
       progress_delta: 0,
@@ -1727,7 +1693,7 @@ describe("postPushReviewStep", () => {
       .mockResolvedValueOnce({ stdout: notApproved, exitCode: 0, tokensUsed: 100 })
       .mockResolvedValueOnce({ stdout: fixStdout, exitCode: 0, tokensUsed: 100 })
       .mockResolvedValueOnce({
-        stdout: JSON.stringify({ approved: true, issues: [], feedback: "Looks good.", score: 9, progress_delta: 1 }),
+        stdout: JSON.stringify({ approved: true, blocking_issues: [], feedback: "Looks good.", score: 9, progress_delta: 1 }),
         exitCode: 0,
         tokensUsed: 100,
       });
@@ -1748,7 +1714,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("withholds approval and initiates a fix pass when the verdict has only minor[] entries", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "lgtm", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "lgtm", score: 9, progress_delta: 0 });
     const ghComments: string[] = [];
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     const ghSpawn = vi.fn((args: string[]) => {
@@ -1790,7 +1756,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("withholds approval and initiates a fix pass when the verdict has blocking[] entries", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
     const gitSpawn = vi.fn((args: string[]) => {
       if (args[0] === "status") return { stdout: "", exitCode: 0 };
       return { stdout: "", exitCode: 0 };
@@ -1833,7 +1799,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not include minor external findings in the approval comment when there are none", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "lgtm", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "lgtm", score: 9, progress_delta: 0 });
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -1856,7 +1822,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("waits for the external review check to complete before approving and ingests its late findings", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     let checkProbes = 0;
     let checkCompleted = false;
@@ -1909,7 +1875,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not auto-approve when the external review check never finishes (fail-closed)", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     const ghComments: string[] = [];
     const reviewCalls: string[][] = [];
@@ -1946,7 +1912,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("recognizes 'review' and 'code-review-plugin' check names as the external review gate by default", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     let checkProbes = 0;
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
@@ -1986,7 +1952,7 @@ describe("postPushReviewStep", () => {
 
   it("logs a warning when check runs are present but none match the external review gate", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -2026,7 +1992,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("fails open and approves when no external review check exists for the head SHA", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     let checkRunsQueried = false;
@@ -2056,7 +2022,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not satisfy the gate when the only matching check concluded 'skipped' (fails closed immediately)", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     const ghSpawn = vi.fn((args: string[]) => {
@@ -2090,7 +2056,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("recognizes 'claude-code-review' as the external review gate by default", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     let checkProbes = 0;
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
@@ -2127,7 +2093,7 @@ describe("postPushReviewStep", () => {
 
   it("warns with the head SHA when no check runs are present at all", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -2157,7 +2123,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not satisfy the gate when a matching check concluded 'cancelled'", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     const ghSpawn = vi.fn((args: string[]) => {
@@ -2189,7 +2155,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not satisfy the gate when matching checks concluded 'timed_out' or 'action_required'", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
 
@@ -2223,7 +2189,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("does not satisfy the gate when a matching check has an unrecognised novel conclusion", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
     const ghSpawn = vi.fn((args: string[]) => {
@@ -2255,7 +2221,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("satisfies the gate when a matching check concluded 'failure'", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     let checkProbes = 0;
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
@@ -2291,7 +2257,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("satisfies the gate when a mixed set contains one skipped and one success check", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     let checkProbes = 0;
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
@@ -2330,7 +2296,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("uses configured reviewCheckNames for exact matching, overriding defaults", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], feedback: "ok", score: 9, progress_delta: 0 });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 });
     const sleep = vi.fn(async () => undefined);
     let checkProbes = 0;
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
@@ -2371,7 +2337,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("T-1 (AII-436): GH Actions bot clean verdict + green review check + zero findings → approved=true", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -2425,7 +2391,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("T-2 (KGB-9): internal approval + failing CI check → Not ready to merge, check named", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -2477,7 +2443,7 @@ describe("postPushReviewStep", () => {
     // AII-436: The GH Actions bot posted an approving comment with no structured finding
     // sections and no "no issues found" phrasing. Old code fabricated a finding and blocked
     // approval. New code flags findingsUnavailable and shows a note instead.
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -2536,7 +2502,7 @@ describe("postPushReviewStep", () => {
   it("T-4: 'Not ready to merge' comment lists concrete external findings, not just a banner", async () => {
     // Criterion 3: any Not-ready comment must enumerate the concrete blocking findings.
     // Regression: old externalBlockingCommentBlock posted a banner with no findings listed.
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -2591,7 +2557,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("T-5: CI gate does not block when all non-review checks pass", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
@@ -2689,7 +2655,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("throws OperatorCancelledError when gh pr comment fails with 'issue is locked' and PR is closed-not-merged", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
       if (args[0] === "pr" && args[1] === "comment") {
@@ -2795,7 +2761,7 @@ describe("postPushReviewStep", () => {
     // The most common exit is "approved", and on its last iteration it never pushes. A close
     // that lands while the reviewer LLM call is running must not become a reported success:
     // the probe after the reviewer returns (and at the top of each iteration) catches it.
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghComments: string[] = [];
     let reviewerRan = false;
     const ghSpawn = vi.fn((args: string[]) => {
@@ -2878,7 +2844,7 @@ describe("postPushReviewStep", () => {
     // A locked conversation on an OPEN, unmerged PR is not the merge race: the merged-only
     // guard must fall through to the normal review path. A locked PR that is CLOSED and
     // unmerged is an operator cancel, which assertPrWritable classifies as OPERATOR_CANCELLED.
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args[1]?.includes("/pulls/")) {
         return { stdout: '{"merged":false,"locked":true}', exitCode: 0 };
@@ -2901,7 +2867,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("continues normally when gh api call fails (fail-open)", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args[1]?.includes("/pulls/")) {
         return { stdout: "", exitCode: 1 };
@@ -2924,7 +2890,7 @@ describe("postPushReviewStep", () => {
   });
 
   it("proceeds normally when PR is open and unlocked (regression guard)", async () => {
-    const reviewerJson = JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
+    const reviewerJson = JSON.stringify({ approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" });
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "api" && args[1]?.includes("/pulls/")) {
         return { stdout: '{"merged":false,"locked":false}', exitCode: 0 };

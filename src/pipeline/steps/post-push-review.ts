@@ -710,9 +710,6 @@ function failedReviewOutputs(feedback: string) {
 }
 
 function issueFromVerdictIssue(issue: VerdictReviewIssue): ReviewIssue {
-  if (issue.title === "Blocking issue" && issue.problem === issue.requiredFix) {
-    return issueFromString(issue.problem);
-  }
   return {
     title: issue.title,
     ...(issue.location ? { location: issue.location } : {}),

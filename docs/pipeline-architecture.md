@@ -67,6 +67,8 @@ An unsuccessful or missing terminal result, missing structured output, or invali
 
 The runner pins Claude Code in `Dockerfile.session`. Built-in model fallbacks and newly seeded workflow templates use `claude-sonnet-5`. Explicit model settings retain their existing precedence; already-seeded target-repo `WORKFLOW.md` and `PLANNING.md` files are not overwritten by template sync, so projects that pin an older model keep that model until their configuration changes. Bedrock projects still need a model ID accepted by their configured provider.
 
+Repositories that pin a runner image with `.ai-implement/image.yml` must update that image to include this executor and a Claude Code CLI supporting `--json-schema` and terminal `structured_output` (the bundled runner pins 2.1.263). Updating the orchestrator alone does not update a pinned runner image; an older CLI or executor can leave automated reviews incomplete.
+
 Claude Code documents schema-based output in [programmatic usage](https://code.claude.com/docs/en/headless#get-structured-output). Sonnet 5 migration details, including the changed tokenizer and thinking defaults, are in the [official migration guide](https://platform.claude.com/docs/en/models/sonnet-5/migration-guide).
 
 ## Hook environment and forwarded secrets

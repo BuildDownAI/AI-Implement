@@ -104,7 +104,7 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     if (!result.terminalStatus) {
       throw new Error(`Review LLM invocation did not return a terminal result event${formatLlmResultDetail(result)}`);
     }
-    if (result.terminalStatus?.isError === true) {
+    if (result.terminalStatus.isError === true) {
       throw new Error(`Review LLM invocation returned an error terminal result (subtype=${result.terminalStatus.subtype ?? "unknown"})${formatLlmResultDetail(result)}`);
     }
     if (result.terminalStatus.subtype !== "success") {
@@ -118,6 +118,9 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     }
 
     const verdict = parseReviewVerdict(result.structuredOutput);
+    if (!verdict.approved && verdict.blockingIssues.length === 0) {
+      throw new Error("approved=false requires at least one blocking_issues entry");
+    }
 
     return {
       approved: verdict.approved,
