@@ -101,7 +101,9 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
                 continue;
               }
             }
-            const branchArgs = target.branch ? [target.branch] : [];
+            // A bare branch name would be parsed as a flag if it starts with "-"; an explicit
+            // refspec is unambiguously a ref regardless of its leading character.
+            const branchArgs = target.branch ? [`refs/heads/${target.branch}`] : [];
             const fetchResult = spawnSync(
               "git",
               ["fetch", "origin", ...branchArgs],
@@ -115,7 +117,7 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
               continue;
             }
           } else {
-            const branchArgs = target.branch ? [target.branch] : [];
+            const branchArgs = target.branch ? [`refs/heads/${target.branch}`] : [];
             const fetchResult = spawnSync(
               "git",
               ["fetch", "--depth", String(depth ?? 1), "origin", ...branchArgs],

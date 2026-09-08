@@ -96,10 +96,21 @@ function ownerRepo(v: string): string | null {
 }
 
 /**
+ * Returns true when a trimmed branch value is safe to pass to git as a bare positional
+ * argument: does not start with "-" (would be parsed as a flag) and contains no internal
+ * whitespace or ".." (ref-traversal ambiguity).
+ */
+function isSafeBranch(v: string): boolean {
+  return !v.startsWith("-") && !/\s/.test(v) && !v.includes("..");
+}
+
+/**
  * Reads `secondary_repos[].slug` and optional `branch` from sources.yml.
  * Returns entries where `slug` passes the "owner/repo" validation.
  * When `branch` is present and non-empty after trimming, it is included in the
- * returned entry; otherwise the entry has no `branch` key.
+ * returned entry unless it fails `isSafeBranch` (leading `-`, internal whitespace,
+ * or `..`), in which case it is logged and dropped; otherwise the entry has no
+ * `branch` key.
  * Returns an empty array when the file is absent, the key is missing, the list
  * is empty, or the file cannot be parsed.
  */
@@ -128,7 +139,15 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
             const slug = typeof r.slug === "string" ? ownerRepo(r.slug.trim()) : null;
             if (slug === null) return [];
             const branchRaw = typeof r.branch === "string" ? r.branch.trim() : "";
-            const branch = branchRaw && !branchRaw.startsWith("-") ? branchRaw : undefined;
+            let branch: string | undefined;
+            if (branchRaw.length === 0) {
+              branch = undefined;
+            } else if (isSafeBranch(branchRaw)) {
+              branch = branchRaw;
+            } else {
+              console.warn(`[kg-tracker-data] rejecting unsafe branch for ${slug}: ${JSON.stringify(branchRaw)}`);
+              branch = undefined;
+            }
             return [{ slug, ...(branch !== undefined ? { branch } : {}) }];
           });
       }
@@ -148,8 +167,9 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
  * Returns `{ slug, branch? }` or null when the key is absent, the file
  * is missing, or the file cannot be parsed.
  * When `branch` is present in the mapping form and non-empty after trimming,
- * it is included; values starting with `-` are silently rejected (would be
- * misinterpreted as git flags). The string form never carries a branch.
+ * it is included unless it fails `isSafeBranch` (leading `-`, internal
+ * whitespace, or `..`), in which case it is logged and dropped. The string
+ * form never carries a branch.
  */
 export function readCodeRepoFromSourcesYml(workspaceDir: string): { slug: string; branch?: string } | null {
   const filePath = join(workspaceDir, "sources.yml");
@@ -181,7 +201,15 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): { slug: string
         const branchRaw = typeof (codeRepo as Record<string, unknown>).branch === "string"
           ? ((codeRepo as Record<string, unknown>).branch as string).trim()
           : "";
-        const branch = branchRaw && !branchRaw.startsWith("-") ? branchRaw : undefined;
+        let branch: string | undefined;
+        if (branchRaw.length === 0) {
+          branch = undefined;
+        } else if (isSafeBranch(branchRaw)) {
+          branch = branchRaw;
+        } else {
+          console.warn(`[kg-tracker-data] rejecting unsafe branch for ${slug}: ${JSON.stringify(branchRaw)}`);
+          branch = undefined;
+        }
         return { slug, ...(branch !== undefined ? { branch } : {}) };
       }
     }
