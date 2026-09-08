@@ -1,5 +1,5 @@
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { formatLlmResultDetail } from "../step-utils.js";
+import { formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
 import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, plainIssueText } from "../review-verdict.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
@@ -101,18 +101,8 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
     if (result.exitCode !== 0) {
       throw new Error(`Review LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`);
     }
-    if (!result.terminalStatus) {
-      throw new Error(`Review LLM invocation did not return a terminal result event${formatLlmResultDetail(result)}`);
-    }
-    if (result.terminalStatus.isError === true) {
-      throw new Error(`Review LLM invocation returned an error terminal result (subtype=${result.terminalStatus.subtype ?? "unknown"})${formatLlmResultDetail(result)}`);
-    }
-    if (result.terminalStatus.subtype !== "success") {
-      throw new Error(`Review LLM invocation finished without a successful terminal result (subtype=${result.terminalStatus.subtype ?? "unknown"})${formatLlmResultDetail(result)}`);
-    }
-    if (result.telemetry?.outcome && result.telemetry.outcome !== "success") {
-      throw new Error(`Review LLM invocation finished without a successful terminal result (${result.telemetry.outcome})${formatLlmResultDetail(result)}`);
-    }
+    const terminalFailure = terminalResultFailureMessage(result, "Review LLM invocation");
+    if (terminalFailure) throw new Error(terminalFailure);
     if (result.structuredOutput === undefined) {
       throw new Error(`Review LLM invocation did not return structured_output${formatLlmResultDetail(result)}`);
     }

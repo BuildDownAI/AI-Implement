@@ -54,7 +54,7 @@ function mapOutcome(subtype: unknown): RunTelemetry["outcome"] {
   return "unknown";
 }
 
-export function terminalStatus(events: StreamEvent[]): LLMTerminalStatus | undefined {
+export function extractTerminalStatus(events: StreamEvent[]): LLMTerminalStatus | undefined {
   const result = lastResult(events);
   if (!result) return undefined;
   return {

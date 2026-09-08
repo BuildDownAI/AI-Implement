@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
-import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary, formatLlmResultDetail } from "../step-utils.js";
+import type { LLMResult, PipelineContext, StepModule, StepReporter } from "../types.js";
+import { formatGitNameStatusSummary, terminalResultFailureMessage } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
 import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, type ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
@@ -197,7 +197,7 @@ function issueFromString(text: string): ReviewIssue {
   };
 }
 
-function plainIssueText(issue: ReviewIssue): string {
+function postPushIssueText(issue: ReviewIssue): string {
   if (issue.rawText) return issue.rawText;
   return [
     issue.title,
@@ -257,7 +257,7 @@ function reviewerSummaryBlock(feedback: string, issues: ReviewIssue[]): string {
   const summary = feedback.trim();
   if (!summary) return "";
   const normalizedSummary = normalizeForComparison(summary);
-  const issueTexts = issues.map(plainIssueText);
+  const issueTexts = issues.map(postPushIssueText);
   const repeatsIssue = issueTexts.some((issue) => normalizeForComparison(issue) === normalizedSummary);
   const repeatsAllIssues = normalizeForComparison(issueTexts.join("\n")) === normalizedSummary;
   if (repeatsIssue || repeatsAllIssues) return "";
@@ -327,11 +327,10 @@ function dedupeIssuesAgainstExternalFindings(
   const externalBodies = new Set(externalFindings.map((finding) => normalizeForComparison(finding.body)));
   const seen = new Set<string>();
   return issues.filter((issue) => {
-    const normalized = normalizeForComparison(plainIssueText(issue));
+    const normalized = normalizeForComparison(postPushIssueText(issue));
     const issueParts = [
       normalized,
       normalizeForComparison(issue.problem),
-      normalizeForComparison(issue.requiredFix),
       normalizeForComparison(issue.rawText ?? ""),
     ].filter(Boolean);
     if (!normalized || issueParts.some((part) => externalBodies.has(part)) || seen.has(normalized)) return false;
@@ -704,7 +703,7 @@ function failedReviewOutputs(feedback: string) {
   return {
     approved: false,
     feedback,
-    issues: [plainIssueText(issue)],
+    issues: [postPushIssueText(issue)],
     blockingIssues: [issue],
   };
 }
@@ -718,21 +717,9 @@ function issueFromVerdictIssue(issue: VerdictReviewIssue): ReviewIssue {
   };
 }
 
-function reviewFailureMessage(result: { exitCode: number; terminalStatus?: { subtype: string | null; isError: boolean | null }; telemetry?: { outcome: string }; stdout?: string; stderr?: string }): string | null {
+function reviewFailureMessage(result: LLMResult): string | null {
   if (result.exitCode !== 0) return `Reviewer LLM failed (${llmResultMessage(result)})`;
-  if (!result.terminalStatus) {
-    return `Reviewer LLM did not return a terminal result event${formatLlmResultDetail(result)}`;
-  }
-  if (result.terminalStatus.isError === true) {
-    return `Reviewer LLM returned an error terminal result (subtype=${result.terminalStatus.subtype ?? "unknown"})${formatLlmResultDetail(result)}`;
-  }
-  if (result.terminalStatus.subtype !== "success") {
-    return `Reviewer LLM finished without a successful terminal result (subtype=${result.terminalStatus.subtype ?? "unknown"})${formatLlmResultDetail(result)}`;
-  }
-  if (result.telemetry?.outcome && result.telemetry.outcome !== "success") {
-    return `Reviewer LLM finished without a successful terminal result (${result.telemetry.outcome})${formatLlmResultDetail(result)}`;
-  }
-  return null;
+  return terminalResultFailureMessage(result, "Reviewer LLM");
 }
 
 async function reportInvalidStructuredReview(
@@ -998,7 +985,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         ended_at: new Date().toISOString(),
         parent_step_id: "post-push-review",
         inputs: { iteration, prNumber },
-        outputs: { approved, feedback, issues: issues.map(plainIssueText), blockingIssues: issues },
+        outputs: { approved, feedback, issues: issues.map(postPushIssueText), blockingIssues: issues },
         logs_url: null,
       });
 

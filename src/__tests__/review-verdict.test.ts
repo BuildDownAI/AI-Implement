@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseReviewVerdict } from "../pipeline/review-verdict.js";
+import { parseReviewVerdict, REVIEW_VERDICT_JSON_SCHEMA } from "../pipeline/review-verdict.js";
 
 const validApproved = {
   approved: true,
@@ -10,6 +10,30 @@ const validApproved = {
 };
 
 describe("parseReviewVerdict", () => {
+  it("uses only supported structural constraints in the wire schema", () => {
+    const schema = JSON.stringify(REVIEW_VERDICT_JSON_SCHEMA);
+    for (const keyword of ["minLength", "maxLength", "minimum", "maximum", "multipleOf", "pattern"]) {
+      expect(schema).not.toContain(`"${keyword}":`);
+    }
+  });
+
+  it.each(["score", "progress_delta"])("validates %s bounds locally", (field) => {
+    for (const value of [-1, 101, 1.5, "50", undefined]) {
+      expect(() => parseReviewVerdict({ ...validApproved, [field]: value })).toThrow(`expected ${field}`);
+    }
+    for (const value of [0, 100]) {
+      expect(() => parseReviewVerdict({ ...validApproved, [field]: value })).not.toThrow();
+    }
+  });
+
+  it.each(["title", "problem", "required_fix"])("rejects empty %s locally", (field) => {
+    for (const value of ["", "   "]) {
+      expect(() => parseReviewVerdict({ ...validApproved, approved: false,
+        blocking_issues: [{ title: "Bug", problem: "Fails", required_fix: "Fix it", [field]: value }],
+      })).toThrow(`blocking_issues[0].${field}`);
+    }
+  });
+
   it("accepts a valid approving verdict", () => {
     expect(parseReviewVerdict(validApproved)).toEqual({
       approved: true,
