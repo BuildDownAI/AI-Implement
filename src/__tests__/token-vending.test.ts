@@ -544,7 +544,7 @@ describe("handleKgTrackerDataRequest", () => {
     expect(capturedQuery).toContain("completedAt");
     expect(capturedQuery).toContain("canceledAt");
     expect(capturedQuery).toContain("startedAt");
-    expect(capturedQuery).toContain("assignee");
+    expect(capturedQuery).toContain("assignee { id name email }");
     expect(capturedQuery).toContain("labels");
     expect(capturedQuery).toContain("project");
     expect(capturedQuery).toContain("team { id key name }");
@@ -552,7 +552,7 @@ describe("handleKgTrackerDataRequest", () => {
     expect(capturedQuery).toContain("parent");
     expect(capturedQuery).toContain("relations");
     expect(capturedQuery).toContain("relatedIssue");
-    expect(capturedQuery).toContain("user");
+    expect(capturedQuery).toContain("user { id name email }");
     expect(capturedQuery).toContain("comments(first: 100)");
   });
 

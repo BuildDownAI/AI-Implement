@@ -535,6 +535,8 @@ export async function handleKgTrackerDataRequest(
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
+          // email on assignee and user is intentional: the KG uses it for
+          // identity resolution (matching Linear users to commit authors).
           query: `query($teamKey: String!, $first: Int!, $after: String) {
             issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
               nodes {
