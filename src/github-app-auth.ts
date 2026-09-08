@@ -4,6 +4,7 @@ import { defaultFetchSignal } from "./github.js";
 
 export interface InstallationDetails {
   token: string;
+  expiresAt: number; // Epoch milliseconds; 0 when GitHub omits a valid expiry.
   installationId: number; // Currently inert — no caller reads this yet. Reserved for an OAuth follow-up (if approved), which will add a repo to a "selected repositories" install via the API and needs the installation id to target it
   repositorySelection: "all" | "selected";
 }
@@ -158,10 +159,13 @@ export async function getInstallation(
       message: `Failed to get installation token for owner "${owner}" (${tokenRes.status}): ${body}`,
     });
   }
-  const tokenData = (await tokenRes.json()) as { token: string };
+  const tokenData = (await tokenRes.json()) as { token: string; expires_at?: string };
+  const parsedExpiry = tokenData.expires_at ? Date.parse(tokenData.expires_at) : NaN;
+  const expiresAt = Number.isFinite(parsedExpiry) ? parsedExpiry : 0;
 
   return {
     token: tokenData.token,
+    expiresAt,
     installationId: install.id,
     repositorySelection: install.repository_selection === "all" ? "all" : "selected",
   };
@@ -355,7 +359,7 @@ export async function mintSourceTokenOrJwt(
 
 /**
  * Returns a cached installation access token for the given owner.
- * Tokens are valid for 1 hour; we cache for 50 minutes.
+ * Cache until five minutes before the reported expiry, or 50 minutes if absent.
  *
  * Thin caching layer over getInstallation — the hot dispatch path only needs the token.
  */
@@ -381,8 +385,9 @@ export async function refreshInstallationToken(
   privateKey: string,
   owner: string,
 ): Promise<string> {
-  const { token } = await getInstallation(appId, privateKey, owner);
-  tokenCache.set(owner, { token, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS });
+  const { token, expiresAt } = await getInstallation(appId, privateKey, owner);
+  const cacheExpiry = expiresAt > 0 ? expiresAt - 5 * 60 * 1000 : Date.now() + TOKEN_CACHE_TTL_MS;
+  tokenCache.set(owner, { token, expiresAt: cacheExpiry });
   return token;
 }
 
