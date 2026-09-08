@@ -548,7 +548,7 @@ describe("handleKgTrackerDataRequest", () => {
     expect(capturedQuery).toContain("labels");
     expect(capturedQuery).toContain("project");
     expect(capturedQuery).toContain("team { id key name }");
-    expect(capturedQuery).toContain("cycle");
+    expect(capturedQuery).toContain("cycle { id name number startsAt endsAt }");
     expect(capturedQuery).toContain("parent");
     expect(capturedQuery).toContain("relations");
     expect(capturedQuery).toContain("relatedIssue");
