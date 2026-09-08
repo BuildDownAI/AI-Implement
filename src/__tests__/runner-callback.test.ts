@@ -14,6 +14,7 @@ import { formatFailureComment } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { Step } from "../pipeline/types.js";
+import type { ReferenceRepoResult } from "../pipeline/steps/reference-repos.js";
 
 const SECRET = "test-secret-with-enough-entropy-for-hmac";
 
@@ -540,6 +541,197 @@ describe("handleRunnerResult — implementation", () => {
     });
     expect(res.status).toBe(200);
     expect(log.getJobById(jobId)?.conclusion).not.toBe("runner_approved");
+  });
+});
+
+describe("handleRunnerResult — reference repositories", () => {
+  it("posts a comment naming each missing repo with a human-readable cause", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "no-auth" },
+    ];
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    const comments = fake.commentsFor("i");
+    const refComment = comments.find((c) => c.includes("reference repositor"));
+    expect(refComment).toBeDefined();
+    expect(refComment).toContain("https://github.com/a/b");
+    expect(refComment).toContain("GitHub App is not installed");
+  });
+
+  it("does not post a reference-repo comment when all repos arrived", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+    ];
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    const comments = fake.commentsFor("i");
+    expect(comments.some((c) => c.includes("reference repositor"))).toBe(false);
+  });
+
+  it("does not post a reference-repo comment when referenceRepoResults is absent", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    const comments = fake.commentsFor("i");
+    expect(comments.some((c) => c.includes("reference repositor"))).toBe(false);
+  });
+
+  it("does not change run classification when a reference repo is missing", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "clone-error" },
+    ];
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    const calls = fake.recordedCalls();
+    expect(calls.find((c) => c.method === "markPrReady")).toBeDefined();
+    expect(calls.find((c) => c.method === "markImplementationFailed")).toBeUndefined();
+  });
+
+  it("posts missing-repo comment and preserves failure classification on failure", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "ref-not-found" },
+    ];
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureCode: "REVIEW_UNAPPROVED",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    const calls = fake.recordedCalls();
+    expect(calls.find((c) => c.method === "markImplementationFailed")).toBeDefined();
+    const comments = fake.commentsFor("i");
+    expect(comments.some((c) => c.includes("reference repositor"))).toBe(true);
+  });
+
+  it("names only missed repos in the comment when some arrived and some did not", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: true },
+      { repo: "https://github.com/c/d", path: "refs/d", ref: "main", arrived: false, cause: "token-error" },
+    ];
+
+    await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "success",
+        comments: [],
+        prUrl: "https://github.com/o/r/pull/1",
+        referenceRepoResults,
+      },
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    const comments = fake.commentsFor("i");
+    const refComment = comments.find((c) => c.includes("reference repositor"));
+    expect(refComment).toBeDefined();
+    expect(refComment).toContain("https://github.com/c/d");
+    expect(refComment).not.toContain("https://github.com/a/b");
   });
 });
 

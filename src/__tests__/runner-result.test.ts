@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "../runner-result.js";
+import type { ReferenceRepoResult } from "../pipeline/steps/reference-repos.js";
 
 describe("fetchPlanningContextFromOrchestrator", () => {
   it("GETs /runner/planning-context with the progress token and returns the context", async () => {
@@ -90,6 +91,59 @@ describe("postRunnerResult", () => {
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining("POST ok phase=implementation outcome=success"),
     );
+  });
+
+  it("includes referenceRepoResults in body when non-empty", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    const referenceRepoResults: ReferenceRepoResult[] = [
+      { repo: "https://github.com/a/b", path: "refs/b", ref: undefined, arrived: false, cause: "ref-not-found" },
+    ];
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      referenceRepoResults,
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body.referenceRepoResults).toEqual(referenceRepoResults);
+  });
+
+  it("omits referenceRepoResults from body when array is empty", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      referenceRepoResults: [],
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty("referenceRepoResults");
+  });
+
+  it("omits referenceRepoResults from body when not provided", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+
+    await postRunnerResult({
+      workspaceDir: "/tmp",
+      phase: "implementation",
+      outcome: "success",
+      prUrl: "https://github.com/o/r/pull/1",
+      callbackUrl: "https://cb",
+      fetchImpl,
+    });
+
+    const body = JSON.parse(vi.mocked(fetchImpl).mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty("referenceRepoResults");
   });
 
   it("logs the status and does not claim success when the post is refused", async () => {

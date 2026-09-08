@@ -21,6 +21,7 @@ import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
 import { prepareScratchExclusionIfGit } from "./pipeline/scratch-exclude.js";
 import type { ReferenceRepo } from "./reference-repos.js";
+import type { ReferenceRepoResult } from "./pipeline/steps/reference-repos.js";
 
 type RunAutopsyPasses = Array<{
   iteration: number;
@@ -509,6 +510,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   );
 
   let disposition: string | undefined;
+  let referenceRepoResults: ReferenceRepoResult[] | undefined;
 
   const devHarnessMode = isLocalDevHarness();
   const untilStep = devHarnessMode ? optionalEnv("AI_IMPLEMENT_UNTIL_STEP") ?? undefined : undefined;
@@ -525,6 +527,9 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       disposition = `staged: stopped after step "${untilStep}"`;
       return { exitCode: 0 };
     }
+
+    const refRepoOutputs = context.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] };
+    referenceRepoResults = Array.isArray(refRepoOutputs.results) ? refRepoOutputs.results : undefined;
 
     const fbOutputs = context.getOutputs("feedback-loop");
     const pushOutputs = context.getOutputs("push");
@@ -553,6 +558,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         phase: runnerPhase,
         outcome: "success",
         noWork: true,
+        referenceRepoResults,
         callbackUrl,
         fetchImpl: opts.fetchImpl,
       });
@@ -587,6 +593,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
         phase: runnerPhase,
         outcome: "success",
         prUrl,
+        referenceRepoResults,
         callbackUrl,
         fetchImpl: opts.fetchImpl,
       });
@@ -644,6 +651,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       failureCode,
       failureReason,
       prUrl,
+      referenceRepoResults,
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
@@ -651,6 +659,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
   } catch (err) {
     console.error(`Pipeline failed: ${err}`);
     disposition = `failed: ${err instanceof Error ? err.message : String(err)}`;
+    const catchRefRepoOutputs = context.getOutputs("reference-repos") as { results?: ReferenceRepoResult[] };
+    const catchReferenceRepoResults = Array.isArray(catchRefRepoOutputs.results) ? catchRefRepoOutputs.results : undefined;
     await postRunnerResult({
       workspaceDir,
       phase: runnerPhase,
@@ -659,6 +669,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       failureCode: err instanceof SensitiveFilesError ? err.code
         : err instanceof OperatorCancelledError ? err.code
         : undefined,
+      referenceRepoResults: catchReferenceRepoResults,
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
