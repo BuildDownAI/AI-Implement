@@ -2091,6 +2091,110 @@ describe("kgIngestStep", () => {
     expect(stats.vectors).toBe(0);
     expect(stats.docPages).toBe(0);
   });
+
+  it("passes GH_TOKEN in subprocess env for the ingest process when ghToken is provided", async () => {
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    let callCount = 0;
+    const spawnImpl = (_cmd: string, _args: string[], opts: { cwd: string; env?: NodeJS.ProcessEnv }) => {
+      callCount++;
+      if (callCount === 3) capturedEnv = opts.env; // third call is the main ingest
+      return makeFakeProcess(0, ['{"quads":10}']) as unknown as ChildProcess;
+    };
+
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        codeRepoDir: "/repo",
+        spawnImpl,
+        ghToken: "dep-token-xyz",
+        writeFileSyncImpl: () => undefined,
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: () => false,
+      },
+      noopReporter,
+    );
+
+    expect(capturedEnv?.GH_TOKEN).toBe("dep-token-xyz");
+  });
+
+  it("does not set GH_TOKEN in subprocess env when ghToken is absent", async () => {
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    let callCount = 0;
+    const spawnImpl = (_cmd: string, _args: string[], opts: { cwd: string; env?: NodeJS.ProcessEnv }) => {
+      callCount++;
+      if (callCount === 3) capturedEnv = opts.env;
+      return makeFakeProcess(0, ['{"quads":10}']) as unknown as ChildProcess;
+    };
+
+    await kgIngestStep.run(
+      makeContext(),
+      {
+        workspaceDir: tmpDir,
+        codeRepoDir: "/repo",
+        spawnImpl,
+        writeFileSyncImpl: () => undefined,
+        mkdirSyncImpl: () => undefined,
+        existsSyncImpl: () => false,
+      },
+      noopReporter,
+    );
+
+    // process.env is passed through unchanged — no new object means no injection
+    expect(capturedEnv).toBe(process.env);
+  });
+
+  it("logs exactly one warn line mentioning GH_TOKEN when ghToken is absent", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const spawnImpl = () => makeFakeProcess(0, ['{"quads":10}']) as unknown as ChildProcess;
+      await kgIngestStep.run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/repo",
+          spawnImpl,
+          writeFileSyncImpl: () => undefined,
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      );
+
+      const ghWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes("GH_TOKEN"));
+      expect(ghWarns).toHaveLength(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not log the ghToken value in any console.log output", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const spawnImpl = () => makeFakeProcess(0, ['{"quads":10}']) as unknown as ChildProcess;
+      await kgIngestStep.run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/repo",
+          spawnImpl,
+          ghToken: "super-secret-dep-token",
+          writeFileSyncImpl: () => undefined,
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      );
+
+      for (const call of logSpy.mock.calls) {
+        for (const arg of call) {
+          expect(String(arg)).not.toContain("super-secret-dep-token");
+        }
+      }
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
 });
 
 // ── kg-refresh pipeline order ─────────────────────────────────────────────────
@@ -2196,6 +2300,40 @@ steps:
 
     const inputs = ctx.resolveInputs(step!.inputs);
     expect(inputs.reposRootDir).toBeUndefined();
+  });
+
+  it("includes ghToken from ctx.data.dependencyToken when set", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_INGEST_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-ingest");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext({ dependencyToken: "dep-tok-abc" });
+    ctx.setOutputs("clone", { workspaceDir: "/ws" });
+    ctx.setOutputs("clone-code-repo", { workspaceDir: "/ws/code-repo" });
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.ghToken).toBe("dep-tok-abc");
+  });
+
+  it("omits ghToken when ctx.data.dependencyToken is absent", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_INGEST_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-ingest");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext(); // no dependencyToken
+    ctx.setOutputs("clone", { workspaceDir: "/ws" });
+    ctx.setOutputs("clone-code-repo", {});
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.ghToken).toBeUndefined();
   });
 });
 
@@ -3276,6 +3414,60 @@ describe("applyWiring for clone-code-repo", () => {
 
     expect(inputs.repoOwner).toBe("BuildDownAI");
     expect(inputs.repoRepo).toBe("AI-Implement");
+  });
+
+  it("inputs include depth: 'full' when YAML step declares depth: full", () => {
+    const yamlWithDepth = `id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
+  - id: clone-code-repo
+    type: clone
+    depth: full
+  - id: kg-tracker-data
+    type: custom
+    moduleId: kg-tracker-data
+  - id: feedback-loop
+    type: custom
+    moduleId: feedback-loop
+  - id: kg-snapshot-push
+    type: custom
+    moduleId: kg-snapshot-push
+`;
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => yamlWithDepth,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.depth).toBe("full");
+  });
+
+  it("inputs include depth: undefined when YAML step has no depth field", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.depth).toBeUndefined();
   });
 });
 

@@ -64,7 +64,7 @@ export async function handleDependencyTokenRequest(
       input.githubAppId,
       input.githubAppPrivateKey,
       mapping.owner,
-      { permissions: { contents: "read" }, forceRefresh: true },
+      { permissions: { contents: "read", pull_requests: "read" }, forceRefresh: true },
     );
     return { status: 200, body: { token, expires_at: expiresAt } };
   } catch (err) {
