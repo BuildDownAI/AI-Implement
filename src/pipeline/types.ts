@@ -139,7 +139,6 @@ export interface LLMResult {
   tokensUsed: number;
   telemetry?: RunTelemetry;
   structuredOutput?: unknown;
-  hasTerminalResult?: boolean;
   terminalStatus?: LLMTerminalStatus;
 }
 

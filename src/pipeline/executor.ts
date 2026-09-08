@@ -6,8 +6,7 @@ import {
   formatEvent,
   finalText,
   finalStructuredOutput,
-  hasTerminalResult,
-  terminalStatus,
+  extractTerminalStatus,
   extractTelemetry,
   summaryLine,
   type StreamEvent,
@@ -196,8 +195,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
           tokensUsed: (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0),
           telemetry,
           structuredOutput: finalStructuredOutput(events),
-          hasTerminalResult: hasTerminalResult(events),
-          terminalStatus: terminalStatus(events),
+          terminalStatus: extractTerminalStatus(events),
         });
       });
 

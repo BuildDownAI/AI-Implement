@@ -43,10 +43,6 @@ export function finalStructuredOutput(events: StreamEvent[]): unknown {
   return lastResult(events)?.structured_output;
 }
 
-export function hasTerminalResult(events: StreamEvent[]): boolean {
-  return lastResult(events) !== undefined;
-}
-
 function num(v: unknown): number | null {
   return typeof v === "number" ? v : null;
 }
@@ -58,7 +54,7 @@ function mapOutcome(subtype: unknown): RunTelemetry["outcome"] {
   return "unknown";
 }
 
-export function terminalStatus(events: StreamEvent[]): LLMTerminalStatus | undefined {
+export function extractTerminalStatus(events: StreamEvent[]): LLMTerminalStatus | undefined {
   const result = lastResult(events);
   if (!result) return undefined;
   return {

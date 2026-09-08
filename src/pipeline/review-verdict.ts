@@ -13,6 +13,8 @@ export interface ReviewVerdict {
   feedback: string;
 }
 
+// Keep wire constraints within the provider-supported subset; parseReviewVerdict
+// enforces non-empty strings and numeric bounds locally.
 export const REVIEW_VERDICT_JSON_SCHEMA: Record<string, unknown> = {
   type: "object",
   additionalProperties: false,
@@ -26,15 +28,15 @@ export const REVIEW_VERDICT_JSON_SCHEMA: Record<string, unknown> = {
         additionalProperties: false,
         required: ["title", "problem", "required_fix"],
         properties: {
-          title: { type: "string", minLength: 1 },
+          title: { type: "string", description: "Must contain non-whitespace text." },
           location: { type: "string" },
-          problem: { type: "string", minLength: 1 },
-          required_fix: { type: "string", minLength: 1 },
+          problem: { type: "string", description: "Must contain non-whitespace text." },
+          required_fix: { type: "string", description: "Must contain non-whitespace text." },
         },
       },
     },
-    score: { type: "integer", minimum: 0, maximum: 100 },
-    progress_delta: { type: "integer", minimum: 0, maximum: 100 },
+    score: { type: "integer", description: "Integer from 0 to 100 inclusive." },
+    progress_delta: { type: "integer", description: "Integer from 0 to 100 inclusive." },
     feedback: { type: "string" },
   },
 };
@@ -106,9 +108,6 @@ export function parseReviewVerdict(value: unknown): ReviewVerdict {
   if (typeof raw.feedback !== "string") throw new Error("expected feedback to be a string");
 
   const blockingIssues = raw.blocking_issues.map(parseIssue);
-  if (!raw.approved && blockingIssues.length === 0) {
-    throw new Error("approved=false requires at least one blocking_issues entry");
-  }
 
   return {
     approved: raw.approved && blockingIssues.length === 0,

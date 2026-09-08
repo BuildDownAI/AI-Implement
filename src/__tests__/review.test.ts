@@ -19,7 +19,6 @@ const reviewResult = (structuredOutput: unknown = REVIEW_VERDICT) => ({
   exitCode: 0,
   tokensUsed: 100,
   structuredOutput,
-  hasTerminalResult: true,
   terminalStatus: { subtype: "success", isError: false },
   telemetry: {
     outcome: "success" as const,
@@ -141,7 +140,6 @@ describe("reviewStep", () => {
       stdout: fenced,
       exitCode: 0,
       tokensUsed: 100,
-      hasTerminalResult: true,
       terminalStatus: { subtype: "success", isError: false },
       telemetry: { outcome: "success", numTurns: 1, durationMs: 1, costUsd: null, tokensIn: 1, tokensOut: 1 },
     })));
