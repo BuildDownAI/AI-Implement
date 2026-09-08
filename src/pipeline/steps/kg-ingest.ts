@@ -19,6 +19,18 @@ export class KgIngestError extends Error {
 const MAX_TAIL_LINES = 40;
 const MAX_TAIL_BYTES = 8192;
 
+const SIGNAL_TOKENS = new Set(["commits:", "prs:", "pr_error:", "people:", "issues:", "tracker:"]);
+
+/** Returns true for lines that name a result or a cause worth echoing to the run log. */
+export function isSignalLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith("==")) return true;
+  if (trimmed.includes("SKIPPED")) return true;
+  const firstToken = trimmed.split(/\s+/)[0];
+  return SIGNAL_TOKENS.has(firstToken ?? "");
+}
+
 type SpawnImplFn = (
   command: string,
   args: string[],
@@ -227,33 +239,46 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
       : process.env;
 
     const stdoutLines: string[] = [];
+    const logLines: string[] = [];
+    const aiOutputDir = join(workspaceDir, "ai-output");
+    mkdirFn(aiOutputDir, { recursive: true });
 
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawnFn(venvPython, ingestArgs, {
-        cwd: workspaceDir,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: ingestEnv,
-      });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawnFn(venvPython, ingestArgs, {
+          cwd: workspaceDir,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: ingestEnv,
+        });
 
-      buildLineReader(proc.stdout!, (line) => {
-        pushTail(line);
-        stdoutLines.push(line);
-      });
-      buildLineReader(proc.stderr!, pushTail);
+        buildLineReader(proc.stdout!, (line) => {
+          pushTail(line);
+          stdoutLines.push(line);
+          logLines.push(line);
+          if (isSignalLine(line)) console.log(`[kg-ingest] ${line}`);
+        });
+        buildLineReader(proc.stderr!, (line) => {
+          pushTail(line);
+          logLines.push(line);
+          if (isSignalLine(line)) console.log(`[kg-ingest] ${line}`);
+        });
 
-      proc.on("close", (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          const exitCode = code ?? 1;
-          reject(new KgIngestError(exitCode, currentTail()));
-        }
-      });
+        proc.on("close", (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            const exitCode = code ?? 1;
+            reject(new KgIngestError(exitCode, currentTail()));
+          }
+        });
 
-      proc.on("error", (err) => {
-        reject(new KgIngestError(1, `spawn error: ${err.message}`));
+        proc.on("error", (err) => {
+          reject(new KgIngestError(1, `spawn error: ${err.message}`));
+        });
       });
-    });
+    } finally {
+      writeFn(join(aiOutputDir, "kg-ingest.log"), logLines.join("\n"));
+    }
 
     const durationSec = (Date.now() - start) / 1000;
 
@@ -277,8 +302,6 @@ export const kgIngestStep: StepModule<KgIngestInputs, KgIngestOutputs> = {
       };
     }
 
-    const aiOutputDir = join(workspaceDir, "ai-output");
-    mkdirFn(aiOutputDir, { recursive: true });
     const statsFile = join(aiOutputDir, "kg-stats.json");
     writeFn(statsFile, JSON.stringify(stats));
     console.log(`[kg-ingest] done in ${durationSec.toFixed(1)}s; wrote ${statsFile}`);

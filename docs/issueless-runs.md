@@ -394,6 +394,10 @@ The `dispatch_log` row appears in the admin pipelines table with:
 
 `GET /api/sessions/:machineId/logs` in `src/admin.ts` proxies the Fly machine's log stream via `fetchMachineLogs()`. The response is displayed in a modal dialog. Logs are available while the machine exists; a 404 from the Fly API returns `{ error: "Logs no longer available" }` with HTTP 404.
 
+### Ingest log (`ai-output/kg-ingest.log`)
+
+The `kg-ingest` step writes every line of the ingest subprocess's stdout and stderr to `ai-output/kg-ingest.log` on both success and failure paths. The file captures the full verbatim output — including progress lines the CLI emits during index building — and is collected alongside `kg-stats.json` in the run's artifact output. A subset of lines is also echoed to the runner's run log with a `[kg-ingest]` prefix: section headers (lines starting with `==`), per-repo counter lines whose first token is one of `commits:`, `prs:`, `pr_error:`, `people:`, `issues:`, or `tracker:`, and any line containing `SKIPPED`. These signal lines are what appear in the GitHub Actions or Fly log stream during a run; the full output (including verbose lines such as individual file paths and index-building progress) is available only in `ai-output/kg-ingest.log`. When the snapshot guard refuses the ingest result, `kg-ingest.log` is the primary artifact for diagnosing the cause.
+
 ### `list_in_flight_jobs` MCP tool
 
 `src/mcp.ts`, tool `list_in_flight_jobs` — returns all rows from `getInFlightJobs()` including kg-refresh jobs. A kg-refresh row is distinguishable by `phase: "kg-refresh"` and `issueIdentifier: null`. This is the operator's primary tool for checking whether a refresh is in flight before an operation that the deploy interlock would block.
