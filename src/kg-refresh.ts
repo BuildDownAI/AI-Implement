@@ -1,4 +1,4 @@
-import { mkdir, rm, rename, writeFile, copyFile, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, rename, writeFile, copyFile, readFile } from "node:fs/promises";
 import { existsSync, statfsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -17,6 +17,7 @@ import type { MintInput, MintOutput } from "./runner-tokens.js";
 import { encodeRunConfig } from "./run-config.js";
 import type { RunConfigV1 } from "./run-config.js";
 import { getDb } from "./dedup.js";
+import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./pipeline/steps/kg-tracker-data.js";
 
 const execFile = promisify(execFileCb);
 
@@ -53,8 +54,9 @@ const KG_LAST_REFRESH_SETTINGS_KEY = "kg_refresh_last_refresh";
  * Gates evaluated during refresh. `"staging"` fires before any swap; `"ingest-needed"` fires
  * before staging when the source snapshot is not newer than the served stamp (informational,
  * not a failure in the traditional sense — no stage/restart/revert cycle ran).
+ * `"preflight"` fires synchronously in trigger() when a credential probe fails before dispatch.
  */
-export type RefreshGate = "staging" | "answers" | "vectors" | "canary" | "stamp" | "ingest-needed";
+export type RefreshGate = "staging" | "answers" | "vectors" | "canary" | "stamp" | "ingest-needed" | "preflight";
 
 export interface RefreshOutcome {
   ok: boolean;
@@ -64,6 +66,24 @@ export interface RefreshOutcome {
   detail: string;
   stampBefore: string | null;
   stampAfter: string | null;
+}
+
+/** One probe result from the credential preflight. */
+export interface PreflightCheckResult {
+  ok: boolean;
+  checkedAt: number;
+  results: Array<{ repo: string; grant: string; ok: boolean; status: number }>;
+}
+
+/** Input for the standalone `runKgRefreshPreflight` helper. All network calls are injectable for tests. */
+export interface KgPreflightInput {
+  githubAppId: string;
+  githubAppPrivateKey: string;
+  kgSourceRepo: string;
+  mintToken?: typeof getScopedInstallationToken;
+  fetchTarball?: typeof fetchRepoTarball;
+  fetchDefaultBranch?: (token: string, owner: string, repo: string) => Promise<string>;
+  probeRepo?: (token: string, slug: string, grant: "contents" | "pull_requests") => Promise<{ ok: boolean; status: number }>;
 }
 
 /**
@@ -214,6 +234,9 @@ interface KgRefreshInput {
   /** Load the last persisted terminal refresh outcome. Injectable for tests; returns null when absent. */
   loadLastRefresh?: () => RefreshOutcome | null;
 
+  /** Probe a (token, slug, grant) for the credential preflight. Injectable for tests; defaults to GitHub REST calls. */
+  probeRepo?: (token: string, slug: string, grant: "contents" | "pull_requests") => Promise<{ ok: boolean; status: number }>;
+
   // ---- Outcome reporting (AII-496) ----
 
   /**
@@ -227,6 +250,109 @@ interface KgRefreshInput {
     outcome: "success" | "no-new-data" | "failure",
     data: { failureCode?: string; failureReason?: string; dispatchId?: string; timedOut?: boolean },
   ) => void | Promise<void>;
+}
+
+async function defaultProbeRepo(
+  token: string,
+  slug: string,
+  grant: "contents" | "pull_requests",
+): Promise<{ ok: boolean; status: number }> {
+  const url =
+    grant === "contents"
+      ? `https://api.github.com/repos/${slug}`
+      : `https://api.github.com/repos/${slug}/pulls?per_page=1`;
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
+    });
+    return { ok: res.ok, status: res.status };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
+/**
+ * Credential preflight for a kg-refresh dispatch: mints the primary write token for the KG
+ * source repo, then mints the installation-wide dependency token and probes each code repo and
+ * secondary repo slug found in sources.yml with one GET per (repo, grant) pair. Returns a
+ * result describing every probe. Called synchronously inside trigger() before dispatch and
+ * exposed via get_tenant_health so operators can check before triggering.
+ *
+ * Note: the same probe applies to any project mapping with dependencyTokenScope=installation;
+ * that extension is a future story.
+ */
+export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<PreflightCheckResult> {
+  const mintTokenFn = input.mintToken ?? getScopedInstallationToken;
+  const fetchTarballFn = input.fetchTarball ?? fetchRepoTarball;
+  const fetchDefaultBranchFn = input.fetchDefaultBranch ?? defaultFetchDefaultBranch;
+  const probeRepoFn = input.probeRepo ?? defaultProbeRepo;
+
+  const repo = parseKgSourceRepo(input.kgSourceRepo);
+  const kgRepoSlug = `${repo.owner}/${repo.repo}`;
+  const checkedAt = Date.now();
+  const results: Array<{ repo: string; grant: string; ok: boolean; status: number }> = [];
+
+  // Fetch sources.yml from the KG source repo to discover code_repo and secondary_repos slugs.
+  let codeRepo: string | null = null;
+  let secondaryRepos: Array<{ slug: string }> = [];
+  const tmpDir = await mkdtemp(join(tmpdir(), "kg-preflight-"));
+  try {
+    const { token: readToken } = await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
+      permissions: { contents: "read" },
+      repositories: [repo.repo],
+    });
+    const branch = await fetchDefaultBranchFn(readToken, repo.owner, repo.repo);
+    const tarball = await fetchTarballFn(readToken, repo.owner, repo.repo, branch);
+    const sourceDir = await extractSource(tarball, tmpDir);
+    codeRepo = readCodeRepoFromSourcesYml(sourceDir);
+    secondaryRepos = readSecondaryReposFromSourcesYml(sourceDir);
+  } catch {
+    // Could not fetch sources.yml; proceed with no slug list.
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // Probe primary write token for the KG source repo.
+  try {
+    await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
+      permissions: { contents: "write" },
+      repositories: [repo.repo],
+    });
+    results.push({ repo: kgRepoSlug, grant: "contents:write", ok: true, status: 200 });
+  } catch {
+    results.push({ repo: kgRepoSlug, grant: "contents:write", ok: false, status: 0 });
+  }
+
+  // Probe the installation-wide dependency token against each code/secondary repo slug.
+  const slugs = [
+    ...(codeRepo !== null ? [codeRepo] : []),
+    ...secondaryRepos.map((r) => r.slug),
+  ];
+  if (slugs.length > 0) {
+    let depToken: string | null = null;
+    try {
+      const { token } = await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
+        permissions: { contents: "read", pull_requests: "read" },
+      });
+      depToken = token;
+    } catch {
+      // Can't mint dependency token; all slug probes will report failure.
+    }
+
+    for (const slug of slugs) {
+      if (depToken !== null) {
+        const contentsProbe = await probeRepoFn(depToken, slug, "contents");
+        results.push({ repo: slug, grant: "contents:read", ok: contentsProbe.ok, status: contentsProbe.status });
+        const prProbe = await probeRepoFn(depToken, slug, "pull_requests");
+        results.push({ repo: slug, grant: "pull_requests:read", ok: prProbe.ok, status: prProbe.status });
+      } else {
+        results.push({ repo: slug, grant: "contents:read", ok: false, status: 0 });
+        results.push({ repo: slug, grant: "pull_requests:read", ok: false, status: 0 });
+      }
+    }
+  }
+
+  return { ok: results.every((r) => r.ok), checkedAt, results };
 }
 
 /**
@@ -639,6 +765,45 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         }
       } catch {
         // statfs failing is not a reason to refuse; disk pressure will surface in staging.
+      }
+
+      // Credential preflight: verify the KG write grant and dependency token scope before
+      // committing to dispatch. This runs synchronously inside trigger() so the HTTP caller
+      // gets an immediate 422 naming the failing grant rather than a "git fetch failed" 30+
+      // minutes later. Only runs when the dispatch path is wired up (dispatchRun present).
+      if (input.dispatchRun !== undefined) {
+        const preflightResult = await runKgRefreshPreflight({
+          githubAppId: input.githubAppId,
+          githubAppPrivateKey: input.githubAppPrivateKey,
+          kgSourceRepo: input.kgSourceRepo,
+          mintToken,
+          fetchTarball,
+          fetchDefaultBranch,
+          probeRepo: input.probeRepo,
+        });
+        if (!preflightResult.ok) {
+          const failDetail = preflightResult.results
+            .filter((r) => !r.ok)
+            .map((r) => `${r.repo} — ${r.grant} — HTTP ${r.status}`)
+            .join("\n");
+          lastRefresh = {
+            ok: false,
+            at: preflightResult.checkedAt,
+            gate: "preflight",
+            detail: failDetail,
+            stampBefore: null,
+            stampAfter: null,
+          };
+          persistLastRefreshFn(lastRefresh);
+          return {
+            status: 422,
+            body: {
+              error: "preflight-failed",
+              precondition: "preflight-failed",
+              detail: failDetail,
+            },
+          };
+        }
       }
 
       running = true;

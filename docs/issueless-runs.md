@@ -25,7 +25,9 @@ Nothing in the dispatch or callback path touches the ticketing provider. The lif
 ```mermaid
 flowchart TD
     A["POST /api/kg/refresh"] --> B["trigger()"]
-    B --> C{"snapshot SHA\nup to date?"}
+    B --> PF["credential preflight\nprobe KG write token + code/secondary-repo read tokens"]
+    PF -->|"any grant missing"| PFF["422 preflight-failed\ngate=preflight, no dispatch"]
+    PF -->|"all grants present"| C{"snapshot SHA\nup to date?"}
     C -->|"newer snapshot in source repo"| H["local staging rail\nfetch → stage → swap → verify"]
     C -->|"ingest-needed"| D["mintRunToken phase=kg-refresh\nappendLog issueId=kg-refresh"]
     D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
@@ -76,6 +78,15 @@ What is **absent** vs a normal implementation run:
 - No publication token (there is no target repo to push a PR to)
 
 The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on both Fly Machines and local Docker. The dispatch path is `dispatchKgRefreshRun()` in `src/index.ts` (~line 3019), which is wired into `makeKgRefresh()` as `input.dispatchRun`.
+
+**Credential preflight (AII-585):** When `input.dispatchRun` is defined, `trigger()` calls `runKgRefreshPreflight()` synchronously before setting `running = true`. The preflight:
+1. Fetches `sources.yml` from the KG source repo (via a temporary read-only tarball token) and parses `code_repo` and `secondary_repos[].slug`.
+2. Probes the KG source repo's **write** token (`contents: write`, single-repo): `getScopedInstallationToken` must succeed.
+3. Mints the installation-wide dependency token (`contents: read`, `pull_requests: read`) and probes each slug with `GET /repos/{slug}` and `GET /repos/{slug}/pulls?per_page=1`.
+
+If any probe fails, `trigger()` sets `lastRefresh.gate = "preflight"` and returns `HTTP 422 preflight-failed` with a `detail` field listing every failing (repo, grant) pair. No dispatch occurs. The same function is callable on demand via `get_tenant_health` (MCP) which returns the result as `kgRefreshPreflight: { ok, checkedAt, results }`.
+
+Gate `"preflight"` is added to the `RefreshGate` union in `src/kg-refresh.ts`. `runKgRefreshPreflight` is a standalone exported function; all network calls are injectable for tests (`mintToken`, `fetchTarball`, `fetchDefaultBranch`, `probeRepo`).
 
 **Callback-config guard (422):** The guard at `src/kg-refresh.ts:547` fires *synchronously* inside `trigger()` before any dispatch attempt. If `input.dispatchRun` is defined but `RUNNER_CALLBACK_BASE_URL` or `RUNNER_TOKEN_SECRET` is missing, it returns HTTP 422 (`callback-unconfigured`) immediately — dispatching without a callback URL would stall the refresh with no way to report completion.
 
@@ -536,6 +547,7 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | Concern | File |
 |---------|------|
 | KG refresh state machine and dispatch | `src/kg-refresh.ts` (`makeKgRefresh`) |
+| Credential preflight | `src/kg-refresh.ts` (`runKgRefreshPreflight`) |
 | RunConfigV1 envelope | `src/run-config.ts` |
 | Runner token mint/verify | `src/runner-tokens.ts` |
 | dispatch_log row (schema, write, query) | `src/log.ts` (`appendLog`, `getInFlightJobs`, `getInFlightKgRefreshJobs`) |
