@@ -135,3 +135,13 @@ Both the pipeline definition and the step modules resolve **before the clone ste
 The runner accepts a `stopAfterStep` option, used by the local dev harness's `--until` flag. An unknown step name throws **before any step executes**, rather than running the whole pipeline and then failing to find the boundary. The stop applies to skipped steps too — `--until setup` halts after `setup` whether the hook ran or was skipped for want of a `setup:` entry.
 
 Because `feedback-loop` is step 5, `--until` with any earlier step is a token-free run: no Claude invocation happens.
+
+## kg-refresh phase
+
+The kg-refresh pipeline (`pipelines/kg-refresh.yml`) uses different step wiring from the autonomous pipeline. Its steps, in order: `clone` → `dependency-auth` → `clone-code-repo` → `clone-secondary-repos` → `kg-tracker-data` → `kg-ingest` → `feedback-loop` → `kg-snapshot-push`. The entry point is `src/pipeline/kg-refresh-run.ts` rather than `run-autonomous.js`.
+
+**`dryRun` input on `kg-snapshot-push`.** The step accepts an optional `dryRun?: boolean` input. When true, all regression guards and snapshot validation still run — a tracker regression or missing snapshot still throws — but the commit and push are skipped. The per-part line-count table (printed at the regression guard check) and a dry-run verdict line are the only output. The step returns `{ snapshotPushed: false, commitSha: null }`. This path is used by the dev-harness kg-refresh phase (see below) and is wired in `pipeline-loader.ts` via `dryRun: ctx.data.kgDryRun === true`.
+
+**`file://` clone for local dev.** When `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE` is set (injected by the dev harness), `kg-refresh-run.ts` swaps the standard `clone` step for `devHarnessKgCloneStep`. That step clones from `file:///kg-source` — the path where the harness bind-mounts the operator's KG source checkout read-only — rather than from GitHub. The clone carries full history, so `sources.yml` in the operator's working tree (including uncommitted edits) is what runs. A stub `dependency-auth` step marks `acquired=true` using the override token, satisfying the `clone-secondary-repos` skip condition without contacting the orchestrator.
+
+**Local dev entry point.** `--phase kg-refresh` in the dev harness sets `AI_IMPLEMENT_KG_DRY_RUN=true` and `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE` (from the operator's `GH_TOKEN`), binds the workspace at `/kg-source:ro`, and binds the `--tracker-data` file at `/dev-tracker-data.json:ro`. The `kg-tracker-data` step reads `KG_TRACKER_DATA_FILE=/dev-tracker-data.json` and uses the pre-fetched file rather than calling the orchestrator. `--until` and `--shell` both work for this phase.
