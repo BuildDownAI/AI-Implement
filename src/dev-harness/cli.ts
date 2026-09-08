@@ -41,21 +41,23 @@ export async function runDevHarnessCli(
 ): Promise<number> {
   let workspace = "";
   let task = "";
+  let trackerData = "";
   let image: string | undefined;
   let untilStep: string | undefined;
   let shell = false;
-  let phase: "implementation" | "planning" | "full" = "implementation";
+  let phase: "implementation" | "planning" | "full" | "kg-refresh" = "implementation";
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if ((arg === "--workspace" || arg === "-w") && args[i + 1]) workspace = args[++i] as string;
     else if ((arg === "--task" || arg === "-t") && args[i + 1]) task = args[++i] as string;
+    else if (arg === "--tracker-data" && args[i + 1]) trackerData = args[++i] as string;
     else if (arg === "--image" && args[i + 1]) image = args[++i];
     else if (arg === "--until" && args[i + 1]) untilStep = args[++i];
     else if (arg === "--phase") {
       const value = args[i + 1];
-      if (value !== "implementation" && value !== "planning" && value !== "full") {
-        deps.writeStderr("Invalid --phase: expected implementation, planning, or full\n");
+      if (value !== "implementation" && value !== "planning" && value !== "full" && value !== "kg-refresh") {
+        deps.writeStderr("Invalid --phase: expected implementation, planning, full, or kg-refresh\n");
         return 1;
       }
       phase = value;
@@ -64,20 +66,31 @@ export async function runDevHarnessCli(
     else if (arg === "--shell") shell = true;
   }
 
-  if (!workspace || !task) {
+  if (!workspace) {
+    deps.writeStderr(
+      "Usage: npm run dev:run -- --workspace <dir> [--task <task.md>] [--phase implementation|planning|full|kg-refresh] [--tracker-data <file>] [--image <image>] [--until <step>] [--shell]\n",
+    );
+    return 1;
+  }
+  if (phase !== "kg-refresh" && !task) {
     deps.writeStderr(
       "Usage: npm run dev:run -- --workspace <dir> --task <task.md> [--phase implementation|planning|full] [--image <image>] [--until <step>] [--shell]\n",
     );
     return 1;
   }
-  if (phase !== "implementation" && (untilStep || shell)) {
-    deps.writeStderr("--until and --shell are only supported for --phase implementation\n");
+  if (phase === "kg-refresh" && !trackerData) {
+    deps.writeStderr("--tracker-data <file> is required for --phase kg-refresh\n");
+    return 1;
+  }
+  if (phase !== "implementation" && phase !== "kg-refresh" && (untilStep || shell)) {
+    deps.writeStderr("--until and --shell are only supported for --phase implementation or kg-refresh\n");
     return 1;
   }
 
   const handle = await deps.startDevRun({
     workspace: resolve(workspace),
-    task: resolve(task),
+    task: task ? resolve(task) : undefined,
+    trackerData: trackerData ? resolve(trackerData) : undefined,
     image,
     untilStep,
     shell,

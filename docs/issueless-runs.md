@@ -2,7 +2,7 @@
 
 How to pipeline a run kind that dispatches a runner without a tracker issue or a pull request — the job-store row is the only tracking record, and all credentials and data flow exclusively through authenticated callbacks.
 
-The `kg-refresh` rail (AII-493–521) is the sole concrete implementation; this document uses it as the reference throughout. A future scheduled-refresh or maintenance run kind should extend the checklist in §10 rather than write a separate reference.
+The `kg-refresh` rail (AII-493–521) is the sole concrete implementation; this document uses it as the reference throughout. A future scheduled-refresh or maintenance run kind should extend the checklist in §11 rather than write a separate reference.
 
 ---
 
@@ -460,7 +460,34 @@ The designated tracker issue (if configured) receives failure comments; there is
 
 ---
 
-## 10. How to add a new issueless run kind
+## 10. Local dev path for kg-refresh
+
+The dev harness supports a `--phase kg-refresh` mode that runs the kg-refresh pipeline locally without an orchestrator, without mounted-workspace mode, and without contacting GitHub for the primary clone. It is the fastest way to verify `sources.yml` changes and the snapshot guard locally before dispatching a real run.
+
+```bash
+npm run dev:run -- \
+  --phase kg-refresh \
+  --workspace ../knowledge-graph-ai-implement \
+  --tracker-data td.json \
+  --until clone-secondary-repos
+```
+
+**What differs from a dispatched run:**
+
+- The KG source checkout is bind-mounted read-only at `/kg-source`. The `clone` step is replaced with `devHarnessKgCloneStep`, which clones from `file:///kg-source` into the container's scratch workspace. Uncommitted edits to `sources.yml` therefore take effect immediately.
+- `--tracker-data <file>` is required. The file is the pre-fetched body of `POST /api/runner/kg-tracker-data` (one team's worth). It is bind-mounted at `/dev-tracker-data.json`; the `kg-tracker-data` step detects `KG_TRACKER_DATA_FILE` and uses it rather than calling the orchestrator.
+- The operator's `GH_TOKEN` is injected as `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE`. This swaps in a stub `dependency-auth` step that marks `acquired=true`, satisfying `clone-secondary-repos` without an orchestrator token vend. If the token lacks `contents: read` on a secondary repo, the clone fails with a 404/403 — exactly the parity check the harness is designed to surface.
+- `kg-snapshot-push` runs in dry-run mode (`AI_IMPLEMENT_KG_DRY_RUN=true`). Guards and validation run in full; the per-part line-count table is printed; no commit or push happens.
+
+**`--until` and `--shell`** both work for this phase. The shell opens in `/workspace` (the scratch clone); `git remote -v` shows `file:///kg-source`.
+
+**Artifacts** land in `.dev-runs/<timestamp>/` as usual: `run.log`, `changes.diff`, `diffstat.txt`, `telemetry.json`.
+
+Full reference: `CLAUDE.md` § "kg-refresh phase" and `docs/pipeline-architecture.md` § "kg-refresh phase".
+
+---
+
+## 11. How to add a new issueless run kind
 
 A checklist for implementing a second run kind from scratch, without reading AII-493–521.
 
@@ -542,7 +569,7 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 
 ---
 
-## 11. Where each part lives
+## 12. Where each part lives
 
 | Concern | File |
 |---------|------|
