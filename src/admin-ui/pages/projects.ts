@@ -184,6 +184,23 @@ export const projectsHtml = `
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
           <div class="field">
+            <label class="field-label">Reference Repositories</label>
+            <div style="display:flex;gap:8px;align-items:flex-end">
+              <input class="input mono" id="md-refrepo-repo" style="flex:2;min-width:0" placeholder="repository">
+              <input class="input mono" id="md-refrepo-path" style="flex:2;min-width:0" placeholder="workspace path">
+              <input class="input mono" id="md-refrepo-ref" style="flex:1;min-width:0" placeholder="ref (optional)">
+              <button class="btn btn-icon" style="flex:none;color:var(--accent)" onclick="addRefRepo()" title="Add">+</button>
+            </div>
+            <div id="md-refrepo-list"></div>
+            <div class="field-hint">Cloned read-only into the run's workspace so the agent can check a claim against real source instead of trusting the issue. Blank = none. Up to ten entries.</div>
+            <details class="explain">
+              <summary>What each field accepts</summary>
+              <div class="explain-body">The path is where the clone lands in the runner's workspace, alongside the checked-out target repository, and it is also the address the agent is given &mdash; so it should match whatever the target repo's own instructions call that source. If they say to check claims against <span class="mono">ai-implement-source</span>, that is the path to enter here. Any depth works, and each entry needs its own directory.</div>
+              <div class="explain-body">The repository is either <span class="mono">owner/repo</span> shorthand or a full <span class="mono">https://github.com/owner/repo</span> URL. Private repositories work as long as the App is installed on that owner.</div>
+              <div class="explain-body">The ref pins a branch, a tag, or a full commit hash. Blank clones the default branch.</div>
+            </details>
+          </div>
+          <div class="field">
             <label class="field-label">Dependency Token Scope</label>
             <select class="select" id="md-dep-token-scope">
               <option value="">Off (default)</option>
@@ -422,6 +439,128 @@ export const projectsScript = `
     }
   }
 
+  // Staged like the Access page's allowlist: nothing is written until Save.
+  var refRepoDraft = [];
+
+  // Shown as owner/repo, matching the projects table; the stored URL rides the title.
+  function refRepoLabel(repo) {
+    var host = 'https://github.com/';
+    return repo.indexOf(host) === 0 ? repo.slice(host.length) : repo;
+  }
+
+  // Rows mirror the add row's flex proportions, which is what makes column headers
+  // unnecessary. Shared with the stepper, which passes its own draft and remove handler.
+  function refRepoRowsHtml(draft, removeFn) {
+    var cell = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    return draft.map(function (e, i) {
+      return '<div style="display:flex;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)">'
+        + '<span class="mono" style="flex:2;' + cell + '" title="' + window.escAttr(e.repo) + '">' + window.esc(refRepoLabel(e.repo)) + '</span>'
+        + '<span class="mono" style="flex:2;' + cell + '">' + window.esc(e.path) + '</span>'
+        + '<span class="mono" style="flex:1;color:var(--fg-tertiary);' + cell + '">'
+        + (e.ref ? window.esc(e.ref) : '&mdash;') + '</span>'
+        + '<button class="btn btn-icon btn-danger" style="flex:none" onclick="'
+        + window.escAttr(removeFn) + '(' + i + ')" title="Remove">&times;</button>'
+        + '</div>';
+    }).join('');
+  }
+  window.refRepoRowsHtml = refRepoRowsHtml;
+
+  function renderRefRepos() {
+    document.getElementById('md-refrepo-list').innerHTML = refRepoRowsHtml(refRepoDraft, 'removeRefRepo');
+  }
+
+  // A looser echo of the server's rules, so a mistyped entry fails at the row rather than
+  // at Save. selfIndex is the draft position being re-checked, or -1 for a new entry.
+  function refRepoProblem(repo, path, draft, selfIndex) {
+    if (selfIndex < 0 && draft.length >= 10) return 'Up to ten reference repositories per project.';
+    if (!repo || !path) return 'A reference repository needs both a repository and a workspace path.';
+    var isUrl = repo.indexOf('https://github.com/') === 0;
+    var isShorthand = repo.split('/').length === 2 && repo.indexOf(':') === -1
+      && repo.indexOf('@') === -1 && repo.charAt(0) !== '/' && repo.charAt(repo.length - 1) !== '/';
+    if (!isUrl && !isShorthand) {
+      return 'Repository must be owner/repo or an https://github.com/owner/repo URL, with no credentials in it.';
+    }
+    if (path.charAt(0) === '/' || path.charAt(1) === ':') return 'Path must be relative to the workspace, not absolute.';
+    // Four backslashes here yield one in the emitted script: this module is a template literal.
+    if (path.indexOf('\\\\') !== -1) return 'Path must use forward slashes.';
+    if (path === '..' || path.indexOf('../') === 0 || path.indexOf('/../') !== -1) {
+      return 'Path must stay inside the workspace.';
+    }
+    if (path === '.git' || path.indexOf('.git/') === 0) return 'Path must not write into the repository .git directory.';
+    for (var j = 0; j < draft.length; j++) {
+      if (j !== selfIndex && draft[j].path === path) return 'Another entry already uses the path ' + path + '.';
+    }
+    return null;
+  }
+  window.refRepoProblem = refRepoProblem;
+
+  // Stored entries never pass through the add row, so a value saved before a rule tightened
+  // is only caught here.
+  function refRepoDraftProblem() {
+    for (var i = 0; i < refRepoDraft.length; i++) {
+      var problem = refRepoProblem(refRepoDraft[i].repo, refRepoDraft[i].path, refRepoDraft, i);
+      if (problem) return refRepoLabel(refRepoDraft[i].repo) + ' → ' + refRepoDraft[i].path + ': ' + problem;
+    }
+    return null;
+  }
+
+  // Shared with the stepper, which reads its own inputs and passes raw values so the
+  // trailing-slash rule stays in one place. Returns a problem message, or null on success.
+  function refRepoStage(values, draft) {
+    var repo = (values.repo || '').trim();
+    var path = (values.path || '').trim();
+    while (path.length > 1 && path.charAt(path.length - 1) === '/') path = path.slice(0, -1);
+    var ref = (values.ref || '').trim();
+    var problem = refRepoProblem(repo, path, draft, -1);
+    if (problem) return problem;
+    draft.push(ref ? { repo: repo, path: path, ref: ref } : { repo: repo, path: path });
+    return null;
+  }
+  window.refRepoStage = refRepoStage;
+
+  function stageRefRepo() {
+    var problem = refRepoStage({
+      repo: document.getElementById('md-refrepo-repo').value,
+      path: document.getElementById('md-refrepo-path').value,
+      ref: document.getElementById('md-refrepo-ref').value,
+    }, refRepoDraft);
+    if (problem) return problem;
+    clearRefRepoInputs();
+    renderRefRepos();
+    return null;
+  }
+
+  function addRefRepo() {
+    var problem = stageRefRepo();
+    // No tab argument: switching scrolls the body to the top, moving the row out of view.
+    if (problem) showMappingError(problem);
+    else document.getElementById('md-error').classList.add('hidden');
+  }
+  window.addRefRepo = addRefRepo;
+
+  var REFREPO_INPUTS = ['md-refrepo-repo', 'md-refrepo-path', 'md-refrepo-ref'];
+
+  function clearRefRepoInputs() {
+    for (var k = 0; k < REFREPO_INPUTS.length; k++) document.getElementById(REFREPO_INPUTS[k]).value = '';
+  }
+
+  function pendingRefRepo() {
+    for (var k = 0; k < REFREPO_INPUTS.length; k++) {
+      if (document.getElementById(REFREPO_INPUTS[k]).value.trim()) return true;
+    }
+    return false;
+  }
+
+  function removeRefRepo(i) {
+    refRepoDraft.splice(i, 1);
+    renderRefRepos();
+  }
+  window.removeRefRepo = removeRefRepo;
+
+  function refRepoValue() {
+    return refRepoDraft.length ? refRepoDraft : null;
+  }
+
   function openMappingDialog(key) {
     const isNew = !key;
     document.getElementById('md-title').textContent = isNew ? 'Add Mapping' : 'Edit Mapping: ' + key;
@@ -455,6 +594,11 @@ export const projectsScript = `
     document.getElementById('md-sensitive-add').value = (m.sensitiveAddPatterns || []).join('\\n');
     document.getElementById('md-sensitive-allow').value = (m.sensitiveAllowPatterns || []).join('\\n');
     document.getElementById('md-dep-token-scope').value = m.dependencyTokenScope || '';
+    // slice() so editing the draft never mutates the cached mapping behind it.
+    refRepoDraft = (m.referenceRepos || []).slice();
+    // The add row survives a Cancel, so an abandoned attempt would reappear on the next open.
+    clearRefRepoInputs();
+    renderRefRepos();
 
     // Ticketing provider + Jira config
     const tp = m.ticketingProvider || 'linear';
@@ -789,6 +933,18 @@ export const projectsScript = `
       return;
     }
 
+    // A filled-in add row is staged rather than discarded. Ahead of the payload so
+    // refRepoValue() below picks it up.
+    if (pendingRefRepo()) {
+      const pending = stageRefRepo();
+      if (pending) { showMappingError(pending, 'context'); return; }
+    }
+    const staleRefRepo = refRepoDraftProblem();
+    if (staleRefRepo) {
+      showMappingError(staleRefRepo + ' Remove the entry and add it again.', 'context');
+      return;
+    }
+
     const body = {
       teamKey,
       owner: document.getElementById('md-owner').value.trim(),
@@ -815,6 +971,7 @@ export const projectsScript = `
       sensitiveAddPatterns: (function(){ var v = document.getElementById('md-sensitive-add').value.trim(); return v === '' ? null : v; })(),
       sensitiveAllowPatterns: (function(){ var v = document.getElementById('md-sensitive-allow').value.trim(); return v === '' ? null : v; })(),
       dependencyTokenScope: (function(){ var v = document.getElementById('md-dep-token-scope').value; return v === '' ? null : v; })(),
+      referenceRepos: refRepoValue(),
     };
 
     const ticketingProvider = document.getElementById('md-ticketing-provider').value;

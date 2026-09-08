@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { projectsHtml, projectsScript } from "../admin-ui/pages/projects.js";
-import { stepperHtml } from "../admin-ui/stepper.js";
+import { stepperHtml, stepperScript } from "../admin-ui/stepper.js";
 
 /** Tab keys in the order the strip presents them. */
 const TABS = ["ticketing", "source", "context", "execution", "capacity", "guardrails", "provider"];
@@ -94,6 +94,9 @@ describe("mapping dialog — field placement", () => {
     ["md-branch", "source"],
     ["md-branch-prefix", "source"],
     ["md-skills-repo", "context"],
+    ["md-refrepo-repo", "context"],
+    ["md-refrepo-path", "context"],
+    ["md-refrepo-ref", "context"],
     ["md-dep-token-scope", "context"],
     ["md-exec-mode", "execution"],
     ["md-env", "execution"],
@@ -175,6 +178,170 @@ describe("projects page — owns the surfaces only it opens", () => {
       projectsHtml.indexOf('id="np-stepper-wrap"'),
     );
     expect(projectsHtml.indexOf('id="np-stepper-wrap"')).toBeLessThan(projectsHtml.lastIndexOf("</section>"));
+  });
+});
+
+/**
+ * The page script ships as a string, so its logic cannot be imported. Evaluating it against
+ * stub globals reaches the functions it publishes on `window`, which is the only way to test
+ * the reference-repository rules as behavior instead of as source text. The escaping helpers
+ * are stubbed rather than real — `esc` round-trips through the DOM, and correctness of the
+ * helpers themselves belongs to the escaping ADR's own tests, not here.
+ */
+function loadProjectsGlobals(): Record<string, any> {
+  const win: Record<string, any> = {
+    registerPage: () => {},
+    esc: (s: unknown) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"),
+    escAttr: (s: unknown) => String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;"),
+  };
+  const doc = { getElementById: () => null, querySelectorAll: () => [] };
+  new Function("window", "document", projectsScript)(win, doc);
+  return win;
+}
+
+describe("reference repositories — the rules, exercised", () => {
+  const win = loadProjectsGlobals();
+  const problem = (repo: string, path: string, draft: any[] = [], self = -1) =>
+    win.refRepoProblem(repo, path, draft, self);
+
+  it.each([
+    ["", "refs/docs", "needs both"],
+    ["owner/repo", "", "needs both"],
+    ["owner/repo", "/abs/path", "not absolute"],
+    ["owner/repo", "C:/win", "not absolute"],
+    ["owner/repo", "../escapes", "stay inside"],
+    ["owner/repo", "refs/../../out", "stay inside"],
+    ["owner/repo", ".git/hooks", ".git"],
+    ["owner/repo", "refs\\docs", "forward slashes"],
+    ["https://gitlab.com/a/b", "refs/x", "owner/repo or an https://github.com"],
+    ["https://user:token@github.com/a/b", "refs/x", "owner/repo or an https://github.com"],
+    ["git@github.com:a/b.git", "refs/x", "owner/repo or an https://github.com"],
+  ])("rejects %s → %s", (repo, path, fragment) => {
+    expect(problem(repo, path)).toContain(fragment);
+  });
+
+  it.each([
+    ["owner/repo", "refs/docs"],
+    ["https://github.com/owner/repo", "vendor/upstream/api"],
+    ["owner.name/repo-name", "a/b/c/d"],
+  ])("accepts %s → %s", (repo, path) => {
+    expect(problem(repo, path)).toBeNull();
+  });
+
+  it("rejects a path another entry already holds", () => {
+    const draft = [{ repo: "https://github.com/a/b", path: "refs/docs" }];
+    expect(problem("owner/repo", "refs/docs", draft)).toContain("already uses the path");
+  });
+
+  // Re-checking a stored entry passes its own index; without that it collides with itself
+  // and every entry reads as a duplicate.
+  it("does not measure an existing entry against itself", () => {
+    const draft = [{ repo: "https://github.com/a/b", path: "refs/docs" }];
+    expect(problem("a/b", "refs/docs", draft, 0)).toBeNull();
+  });
+
+  it("caps new entries at ten, and still validates an existing one at the cap", () => {
+    const draft = Array.from({ length: 10 }, (_, i) => ({ repo: "a/b", path: "p" + i }));
+    expect(problem("owner/repo", "refs/new", draft)).toContain("Up to ten");
+    expect(problem("a/b", "p0", draft, 0)).toBeNull();
+  });
+});
+
+describe("reference repositories — staging and rendering", () => {
+  const win = loadProjectsGlobals();
+
+  it("strips a trailing slash, so a duplicate path cannot slip past the check", () => {
+    const draft: any[] = [];
+    expect(win.refRepoStage({ repo: "owner/repo", path: "refs/docs/" }, draft)).toBeNull();
+    expect(draft[0].path).toBe("refs/docs");
+    expect(win.refRepoStage({ repo: "owner/other", path: "refs/docs" }, draft)).toContain("already uses");
+  });
+
+  // An absent ref must be omitted rather than stored empty: the server rejects a present-
+  // but-empty ref, and the runner reads absence as "the default branch".
+  it("omits ref when blank and keeps it when given", () => {
+    const draft: any[] = [];
+    win.refRepoStage({ repo: "owner/repo", path: "a", ref: "   " }, draft);
+    win.refRepoStage({ repo: "owner/repo", path: "b", ref: "testing" }, draft);
+    expect(draft[0]).not.toHaveProperty("ref");
+    expect(draft[1].ref).toBe("testing");
+  });
+
+  it("leaves the draft untouched when the entry is refused", () => {
+    const draft: any[] = [];
+    expect(win.refRepoStage({ repo: "owner/repo", path: "../out" }, draft)).toBeTruthy();
+    expect(draft).toHaveLength(0);
+  });
+
+  it("renders owner/repo, an em dash for no ref, and the caller's remove handler", () => {
+    const html = win.refRepoRowsHtml(
+      [{ repo: "https://github.com/BuildDownAI/docs", path: "refs/docs" }],
+      "npRemoveRefRepo",
+    );
+    expect(html).toContain(">BuildDownAI/docs<");
+    expect(html).not.toContain(">https://github.com/BuildDownAI/docs<");
+    expect(html).toContain('title="https://github.com/BuildDownAI/docs"');
+    expect(html).toContain("&mdash;");
+    expect(html).toContain('onclick="npRemoveRefRepo(0)"');
+  });
+
+  it("indexes remove by position, so the second row removes the second entry", () => {
+    const html = win.refRepoRowsHtml(
+      [{ repo: "a/b", path: "p0" }, { repo: "c/d", path: "p1", ref: "main" }],
+      "removeRefRepo",
+    );
+    expect(html).toContain('onclick="removeRefRepo(1)"');
+    expect(html).toContain(">main<");
+  });
+
+  it("renders nothing at all for an empty draft", () => {
+    expect(win.refRepoRowsHtml([], "removeRefRepo")).toBe("");
+  });
+});
+
+describe("reference repositories — both surfaces", () => {
+  // The stepper reaches the rules through these; a missing publish is a TypeError on click
+  // that no other gate sees, since one module is a string and the other never imports it.
+  it.each([["refRepoRowsHtml"], ["refRepoStage"]])("projects publishes window.%s for the stepper", (fn) => {
+    expect(projectsScript).toContain(`window.${fn} = ${fn}`);
+    expect(stepperScript).toContain(`window.${fn}(`);
+  });
+
+  it("sends the field from the dialog and the stepper alike", () => {
+    expect(projectsScript).toContain("referenceRepos: refRepoValue()");
+    expect(stepperScript).toContain("referenceRepos: data.referenceRepos.length ? data.referenceRepos : null");
+  });
+
+  it("places the field between its two Context neighbours on both surfaces", () => {
+    for (const html of [projectsHtml, stepperHtml]) {
+      const skills = html.indexOf("skills-repo");
+      const refRepo = html.indexOf("refrepo-repo");
+      const depScope = html.indexOf("dep-token-scope");
+      expect(skills).toBeLessThan(refRepo);
+      expect(refRepo).toBeLessThan(depScope);
+    }
+  });
+
+  // The stepper resets data and inputs from two separate lists, so a field added to one and
+  // not the other leaks a previous attempt's text into the next project.
+  it("resets the stepper's draft and its add row together", () => {
+    expect(stepperScript).toContain("data.referenceRepos = []");
+    // Against the reset list itself: these ids appear elsewhere in the script, so asserting
+    // on the whole string would pass with the field missing from the reset.
+    const toClear = stepperScript.match(/const toClear = \[([^\]]*)\]/)?.[1] ?? "";
+    expect(toClear).not.toBe("");
+    for (const id of ["np-refrepo-repo", "np-refrepo-path", "np-refrepo-ref"]) {
+      expect(toClear).toContain(id);
+    }
+  });
+
+  it("reviews the count beside the other Context settings", () => {
+    expect(stepperHtml).toContain('data-review="referenceRepos"');
+    expect(stepperHtml.indexOf('data-review="referenceRepos"')).toBeLessThan(
+      stepperHtml.indexOf('data-review="dependencyTokenScope"'),
+    );
+    expect(stepperScript).toContain("' repository'");
+    expect(stepperScript).toContain("' repositories'");
   });
 });
 
