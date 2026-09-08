@@ -10,7 +10,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 
 | Document | Covers |
 |----------|--------|
-| [pipeline-architecture.md](pipeline-architecture.md) | The step contract, the nine built-in steps, how `applyWiring` supplies inputs, and how a fork overrides steps or the pipeline |
+| [pipeline-architecture.md](pipeline-architecture.md) | The step contract, the built-in steps, how `applyWiring` supplies inputs, and how a fork overrides steps or the pipeline |
 | [review-fix-rail.md](review-fix-rail.md) | The finding ledger, the four `review_*` tables, the webhook events that feed the fix queue, and the drain loop |
 | [feature-branch-grouping.md](feature-branch-grouping.md) | Parent/child issue grouping, cascade branch creation, and automatic roll-up |
 | [workflow-envelope.md](workflow-envelope.md) | The `RunConfigV1` dispatch envelope and the legacy per-field contract |
@@ -19,6 +19,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [deployment.md](deployment.md) | Deploy paths, client instances, and the AWS Bedrock setup |
 | [access-model.md](access-model.md) | Who may sign in and what they may see: the allowlist and its env-to-database handover, the Admin/User split and per-page grants, provider binding, the per-request re-check, the audit trail, and host recovery from lockout |
 | [issueless-runs.md](issueless-runs.md) | The pattern for run kinds dispatched without a tracker issue: envelope shape, jobs-store tracking row, credential flow, state machine lifecycle, reaper reconciliation, operator cancel, observability, and a checklist for adding a new issueless run kind |
+| [runner-context.md](runner-context.md) | Per-project settings that provision something into a run: the shared mapping-to-effect shape, which run phases apply each one, and what enabling each costs |
 
 Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.
 
