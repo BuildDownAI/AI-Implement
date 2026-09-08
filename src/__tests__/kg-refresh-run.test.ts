@@ -143,7 +143,7 @@ describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
 
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "../pipeline/steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError, readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "../pipeline/steps/kg-tracker-data.js";
-import { kgIngestStep, KgIngestError } from "../pipeline/steps/kg-ingest.js";
+import { kgIngestStep, KgIngestError, isSignalLine } from "../pipeline/steps/kg-ingest.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import type { PipelineContextData } from "../pipeline/types.js";
@@ -1885,9 +1885,10 @@ describe("kgIngestStep", () => {
     // main ingest uses the venv python
     expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh", "--code-repo", "/some/code-repo", "--tracker-data", join(tmpDir, "tracker-data.json")]);
     expect(capturedCwd[2]).toBe(tmpDir);
-    expect(writtenFiles).toHaveLength(1);
-    expect(writtenFiles[0][0]).toBe(join(tmpDir, "ai-output", "kg-stats.json"));
-    const stats = JSON.parse(writtenFiles[0][1]) as Record<string, unknown>;
+    expect(writtenFiles).toHaveLength(2);
+    const statsEntry = writtenFiles.find(([p]) => p.endsWith("kg-stats.json"))!;
+    expect(statsEntry[0]).toBe(join(tmpDir, "ai-output", "kg-stats.json"));
+    const stats = JSON.parse(statsEntry[1]) as Record<string, unknown>;
     expect(stats.quads).toBe(100);
     expect(stats.vectors).toBe(50);
   });
@@ -2051,8 +2052,9 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(written).toHaveLength(1);
-    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(written).toHaveLength(2);
+    const statsEntry = written.find(([p]) => p.endsWith("kg-stats.json"))!;
+    const stats = JSON.parse(statsEntry[1]) as Record<string, unknown>;
     expect(stats.quads).toBe(1234);
     expect(stats.vectors).toBe(56);
     expect(stats.docPages).toBe(7);
@@ -2080,8 +2082,9 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(written).toHaveLength(1);
-    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(written).toHaveLength(2);
+    const statsEntry = written.find(([p]) => p.endsWith("kg-stats.json"))!;
+    const stats = JSON.parse(statsEntry[1]) as Record<string, unknown>;
     expect(stats.quads).toBe(150);
     expect(stats.vectors).toBe(0);
     expect(stats.docPages).toBe(0);
@@ -2105,8 +2108,9 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(written).toHaveLength(1);
-    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(written).toHaveLength(2);
+    const statsEntry = written.find(([p]) => p.endsWith("kg-stats.json"))!;
+    const stats = JSON.parse(statsEntry[1]) as Record<string, unknown>;
     expect(stats.quads).toBe(0);
     expect(stats.vectors).toBe(0);
     expect(stats.docPages).toBe(0);
@@ -2211,6 +2215,167 @@ describe("kgIngestStep", () => {
           expect(String(arg)).not.toContain("super-secret-dep-token");
         }
       }
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
+// ── kgIngestStep — log file and signal echo ───────────────────────────────────
+
+describe("isSignalLine", () => {
+  it.each([
+    ["== spine ingest ==", true],
+    ["  == section header  ", true],
+    ["prs: 0", true],
+    ["   prs: 0", true],
+    ["commits: 120", true],
+    ["pr_error: boom", true],
+    ["people: 42", true],
+    ["issues: 7", true],
+    ["tracker: field 'x' missing from 3/10", true],
+    ["secondary repo foo/bar SKIPPED", true],
+    ["some random output line", false],
+    ["people joined the call", false],
+    ['{"quads":100}', false],
+    ["", false],
+  ])("isSignalLine(%s) === %s", (line, expected) => {
+    expect(isSignalLine(line)).toBe(expected);
+  });
+});
+
+describe("kgIngestStep — log file and signal echo", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgingest-log-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("writes kg-ingest.log with all stdout lines and echoes only signal lines", async () => {
+    const lines = ["== spine ingest ==", "   prs: 0", "   pr_error: boom", "noise line"];
+    const spawnImpl = () => makeFakeProcess(0, lines) as unknown as ChildProcess;
+
+    const written: Array<[string, string]> = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await kgIngestStep.run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/fake/code-repo",
+          spawnImpl,
+          writeFileSyncImpl: (p, d) => written.push([p, d]),
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      );
+
+      const logEntry = written.find(([p]) => p.endsWith("kg-ingest.log"));
+      expect(logEntry).toBeDefined();
+      const logContent = logEntry![1].split("\n");
+      expect(logContent).toContain("== spine ingest ==");
+      expect(logContent).toContain("   prs: 0");
+      expect(logContent).toContain("   pr_error: boom");
+      expect(logContent).toContain("noise line");
+
+      expect(logSpy).toHaveBeenCalledWith("[kg-ingest] == spine ingest ==");
+      expect(logSpy).toHaveBeenCalledWith("[kg-ingest]    prs: 0");
+      expect(logSpy).toHaveBeenCalledWith("[kg-ingest]    pr_error: boom");
+      expect(logSpy).not.toHaveBeenCalledWith("[kg-ingest] noise line");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("writes kg-ingest.log on failure (finally path)", async () => {
+    let callCount = 0;
+    const spawnImpl = () => {
+      callCount++;
+      // venv (1) and pip (2) succeed; main ingest (3) fails
+      if (callCount >= 3) {
+        return makeFakeProcess(2, [], ["pr_error: boom", "secondary repo SKIPPED"]) as unknown as ChildProcess;
+      }
+      return makeFakeProcess(0) as unknown as ChildProcess;
+    };
+
+    const written: Array<[string, string]> = [];
+
+    await kgIngestStep
+      .run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/fake/code-repo",
+          spawnImpl,
+          writeFileSyncImpl: (p, d) => written.push([p, d]),
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      )
+      .catch(() => {});
+
+    const logEntry = written.find(([p]) => p.endsWith("kg-ingest.log"));
+    expect(logEntry).toBeDefined();
+    const logContent = logEntry![1].split("\n");
+    expect(logContent).toContain("pr_error: boom");
+    expect(logContent).toContain("secondary repo SKIPPED");
+  });
+
+  it("echoes stderr signal lines to console", async () => {
+    const spawnImpl = () =>
+      makeFakeProcess(0, ['{"quads":0}'], ["tracker: field 'x' missing from 2/5"]) as unknown as ChildProcess;
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await kgIngestStep.run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/fake/code-repo",
+          spawnImpl,
+          writeFileSyncImpl: () => undefined,
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      );
+
+      expect(logSpy).toHaveBeenCalledWith("[kg-ingest] tracker: field 'x' missing from 2/5");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("does not echo noise lines from stdout to console", async () => {
+    const spawnImpl = () =>
+      makeFakeProcess(0, ["building index...", '{"quads":100}']) as unknown as ChildProcess;
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await kgIngestStep.run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/fake/code-repo",
+          spawnImpl,
+          writeFileSyncImpl: () => undefined,
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      );
+
+      expect(logSpy).not.toHaveBeenCalledWith("[kg-ingest] building index...");
+      expect(logSpy).not.toHaveBeenCalledWith('[kg-ingest] {"quads":100}');
     } finally {
       logSpy.mockRestore();
     }
