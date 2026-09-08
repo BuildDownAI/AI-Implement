@@ -79,7 +79,7 @@ describe("extractTelemetry", () => {
     });
   });
   it("maps error_max_turns to outcome=max_turns", () => {
-    const t = extractTelemetry([{ type: "result", subtype: "error_max_turns", num_turns: 50 }]);
+    const t = extractTelemetry([{ type: "result", subtype: "error_max_turns", is_error: true, num_turns: 50 }]);
     expect(t.outcome).toBe("max_turns");
     expect(t.numTurns).toBe(50);
   });
