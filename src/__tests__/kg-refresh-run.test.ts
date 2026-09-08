@@ -3215,7 +3215,18 @@ steps:
     });
     const step = pipeline.steps.find((s) => s.id === "clone");
     expect(step).toBeDefined();
+    // Verify depth is spread onto the StepDefinition
     expect((step as unknown as Record<string, unknown>).depth).toBe("full");
+    // Verify depth is forwarded through the inputs function so clone.ts actually receives it
+    const ctx = makeContext({
+      githubOwner: "BuildDownAI",
+      githubRepo: "AI-Implement",
+      branch: "main",
+      githubToken: "tok",
+      workspaceDir: tmpDir,
+    });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.depth).toBe("full");
   });
 });
 
