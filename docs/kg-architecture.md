@@ -201,8 +201,11 @@ or these steps by hand.
 1. Reconcile scope, ingest, and commit + push the snapshot — steps 1–5 below, unchanged.
 2. **Trigger the refresh**: `POST /api/kg/refresh` with an admin session token (or the
    Deployments page's "Refresh graph now"). `202` = accepted; `409` = a refresh or a deploy is
-   already in progress; `422` = runner callback not configured (see below). The orchestrator
-   first checks whether the source repo snapshot SHA matches the last recorded SHA:
+   already in progress; `422` = callback not configured or credential preflight failed (see below). The orchestrator
+   first runs a **credential preflight** (probing the KG write token and the installation-wide
+   dependency token against every `code_repo` and `secondary_repos` slug in `sources.yml`) and
+   returns `422 preflight-failed` immediately if any grant is missing — before any dispatch or
+   staging attempt. Then it checks whether the source repo snapshot SHA matches the last recorded SHA:
    - **If the SHA differs** (new snapshot available): fetches `KG_SOURCE_REPO`, stages under
      `/data/kg/staging` (materialize with the image's venv — nothing embeds), writes the
      completion marker last, swaps by rename, and restarts the sidecar.
@@ -475,3 +478,4 @@ critical section after the TTL watchdog has already resolved the run.
 | Deterministic ingest step | AII-571 | kg-ingest is now a deterministic pipeline step; Claude's feedback-loop role is report-only (verify snapshot, write run report) |
 | Runner dispatch + stage machine | AII-495 | `POST /api/kg/refresh` dispatches the runner when ingest is needed; persisted stage machine (idle → checking → ingest-running → snapshot-landed → staging → terminal) survives restarts; live TTL watchdog; `/admin#deployments` stage badges |
 | KG-visible outcomes | AII-496 | Slack/Teams notification + Linear failure comment on every terminal outcome; TTL-timeout reaches the "hit the time limit" classifier; stuck-watchdog carve-out; exactly-once guarantee via stage guard |
+| Credential preflight | AII-585 | `runKgRefreshPreflight` probes KG write token and code/secondary-repo read tokens synchronously in `trigger()` before dispatch; returns `422 preflight-failed` on any missing grant; result exposed in `get_tenant_health` as `kgRefreshPreflight`; gate `"preflight"` added to `RefreshGate` |
