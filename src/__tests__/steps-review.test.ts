@@ -4,9 +4,9 @@ import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
 import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
 
-function makeExecutor(stdout = "", exitCode = 0, tokensUsed = 0): LLMExecutor {
+function makeExecutor(structuredOutput: unknown = undefined, exitCode = 0, tokensUsed = 0, stdout = "Review complete"): LLMExecutor {
   return {
-    invoke: vi.fn().mockResolvedValue({ stdout, exitCode, tokensUsed } satisfies LLMResult),
+    invoke: vi.fn().mockResolvedValue({ stdout, exitCode, tokensUsed, structuredOutput, terminalStatus: { subtype: "success", isError: false } } satisfies LLMResult),
   };
 }
 
@@ -25,21 +25,24 @@ function makeContext(executor?: LLMExecutor): DefaultPipelineContext {
   );
 }
 
-const APPROVED_JSON = JSON.stringify({
+const APPROVED_VERDICT = {
   approved: true,
-  issues: [],
+  blocking_issues: [],
   score: 95,
   progress_delta: 100,
   feedback: "Looks good",
-});
+};
 
-const REJECTED_JSON = JSON.stringify({
+const REJECTED_VERDICT = {
   approved: false,
-  issues: ["Missing tests", "No error handling"],
+  blocking_issues: [
+    { title: "Missing tests", problem: "Error paths lack coverage", required_fix: "Add regression tests" },
+    { title: "No error handling", problem: "Failures escape uncaught", required_fix: "Handle request errors" },
+  ],
   score: 40,
   progress_delta: 50,
   feedback: "Needs improvement",
-});
+};
 
 describe("reviewStep", () => {
   beforeEach(() => {
@@ -47,7 +50,7 @@ describe("reviewStep", () => {
   });
 
   it("parses approved=true from structured JSON response", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     expect(outputs.approved).toBe(true);
@@ -58,49 +61,50 @@ describe("reviewStep", () => {
   });
 
   it("parses approved=false with issues from JSON response", async () => {
-    const executor = makeExecutor(REJECTED_JSON);
+    const executor = makeExecutor(REJECTED_VERDICT);
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
-    expect(outputs.issues).toEqual(["Missing tests", "No error handling"]);
+    expect(outputs.issues).toEqual([
+      "Missing tests\nProblem: Error paths lack coverage\nRequired fix: Add regression tests",
+      "No error handling\nProblem: Failures escape uncaught\nRequired fix: Handle request errors",
+    ]);
     expect(outputs.score).toBe(40);
     expect(outputs.progressDelta).toBe(50);
   });
 
   it("fails closed when reviewer returns approved=true with non-empty issues", async () => {
-    const executor = makeExecutor(JSON.stringify({
+    const executor = makeExecutor({
       approved: true,
-      issues: ["Still missing a regression test"],
+      blocking_issues: [{ title: "Still missing a regression test", problem: "No error-path coverage", required_fix: "Add a regression test" }],
       score: 79,
       progress_delta: 85,
       feedback: "Nearly ready, but one blocker remains.",
-    }));
+    });
 
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     expect(outputs.approved).toBe(false);
-    expect(outputs.issues).toEqual(["Still missing a regression test"]);
+    expect(outputs.issues).toHaveLength(1);
+    expect(outputs.issues[0]).toContain("Still missing a regression test");
     expect(outputs.feedback).toContain("Nearly ready");
   });
 
-  it("extracts JSON embedded in surrounding text", async () => {
-    const stdout = `Here is my review:\n${APPROVED_JSON}\nEnd of review.`;
-    const executor = makeExecutor(stdout);
-    const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
-
-    expect(outputs.approved).toBe(true);
+  it("does not recover an approval from prose when structured output is absent", async () => {
+    const stdout = `Here is my review:\n${JSON.stringify(APPROVED_VERDICT)}\nEnd of review.`;
+    const executor = makeExecutor(undefined, 0, 0, stdout);
+    await expect(reviewStep.run(makeContext(executor), {}, new NoopStepReporter()))
+      .rejects.toThrow("structured_output");
   });
 
-  it("defaults to approved=false when JSON cannot be parsed", async () => {
+  it("throws on malformed output instead of returning actionable review feedback", async () => {
     const executor = makeExecutor("not valid json at all");
-    const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
-
-    expect(outputs.approved).toBe(false);
-    expect(outputs.feedback).toBe("not valid json at all");
+    await expect(reviewStep.run(makeContext(executor), {}, new NoopStepReporter()))
+      .rejects.toThrow("structured review output");
   });
 
   it("includes diff in prompt when provided", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     const ctx = makeContext(executor);
 
     await reviewStep.run(
@@ -115,17 +119,17 @@ describe("reviewStep", () => {
   });
 
   it("tells reviewers that any listed issue blocks approval", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
 
     await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     const call = vi.mocked(executor.invoke).mock.calls[0][0];
-    expect(call.prompt).toContain("If issues[] is non-empty, approved must be false");
+    expect(call.prompt).toContain("If blocking_issues[] is non-empty, approved must be false");
     expect(call.prompt).toContain("Do not set approved=true while listing unresolved issues");
   });
 
   it("includes iteration number in prompt", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     await reviewStep.run(
       makeContext(executor),
       { iteration: 3 },
@@ -137,7 +141,7 @@ describe("reviewStep", () => {
   });
 
   it("uses provided model", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     await reviewStep.run(
       makeContext(executor),
       { model: "claude-opus-4-7" },
@@ -150,7 +154,7 @@ describe("reviewStep", () => {
   });
 
   it("constrains review sessions to read-only tools", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
 
     await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
@@ -167,14 +171,14 @@ describe("reviewStep", () => {
   });
 
   it("returns tokensUsed from executor", async () => {
-    const executor = makeExecutor(APPROVED_JSON, 0, 200);
+    const executor = makeExecutor(APPROVED_VERDICT, 0, 200);
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     expect(outputs.tokensUsed).toBe(200);
   });
 
   it("truncates an oversized diff so the prompt stays within the model context window", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     // A regenerated-codegen diff can be hundreds of KB — far past the model's
     // input limit. The review prompt must cap it rather than embed it verbatim.
     const hugeDiff = "+".repeat(500_000);
@@ -187,7 +191,7 @@ describe("reviewStep", () => {
   });
 
   it("truncates an oversized diff at a clean line boundary when one precedes the cap", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     // Oversized diff whose only newline sits before the 200k char cap, so the
     // cut should land on that newline (the `cut > 0` branch) rather than the
     // hard cap. Lengths chosen so the boundary is unambiguous: 150_000.
@@ -207,7 +211,7 @@ describe("reviewStep", () => {
   });
 
   it("does not truncate a normal-sized diff", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     const smallDiff = "diff --git a/foo.ts\n+added line";
 
     await reviewStep.run(makeContext(executor), { diff: smallDiff }, new NoopStepReporter());
@@ -217,11 +221,9 @@ describe("reviewStep", () => {
     expect(call.prompt).not.toContain("diff truncated");
   });
 
-  it("correctly extracts JSON when preamble contains stray braces", async () => {
-    // Greedy regex would match from first '{' in preamble to last '}' → invalid JSON.
-    // Balanced-brace scanner skips the empty preamble '{}' and finds the real object.
-    const stdout = `Result: {} — here is the JSON: ${APPROVED_JSON}`;
-    const executor = makeExecutor(stdout);
+  it("uses structured output independently of stray braces in prose", async () => {
+    const stdout = "Result: {broken prose";
+    const executor = makeExecutor(APPROVED_VERDICT, 0, 0, stdout);
     const outputs = await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     expect(outputs.approved).toBe(true);
@@ -229,7 +231,7 @@ describe("reviewStep", () => {
   });
 
   it("appends reviewRubric to prompt when supplied", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     await reviewStep.run(
       makeContext(executor),
       { reviewRubric: "CUSTOM RUBRIC TEXT FOR THIS RUN TYPE" },
@@ -242,7 +244,7 @@ describe("reviewStep", () => {
   });
 
   it("does not include rubric section when reviewRubric is undefined", async () => {
-    const executor = makeExecutor(APPROVED_JSON);
+    const executor = makeExecutor(APPROVED_VERDICT);
     await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
 
     const call = vi.mocked(executor.invoke).mock.calls[0][0];

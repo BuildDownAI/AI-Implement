@@ -11,7 +11,7 @@ import { capDiff } from "./review.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
-const DEFAULT_MODEL = "claude-sonnet-4-6";
+const DEFAULT_MODEL = "claude-sonnet-5";
 
 const ACCEPTANCE_BAR_HEADER = "## ✅ AI Planning: Acceptance Bar";
 const MAP_HEADER = "## 🗺 AI Planning: Implementation Map";

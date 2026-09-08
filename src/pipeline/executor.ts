@@ -5,6 +5,9 @@ import {
   parseLine,
   formatEvent,
   finalText,
+  finalStructuredOutput,
+  hasTerminalResult,
+  terminalStatus,
   extractTelemetry,
   summaryLine,
   type StreamEvent,
@@ -71,6 +74,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
     model: string;
     maxTurns?: number;
     tools?: string[];
+    jsonSchema?: Record<string, unknown>;
   }): Promise<LLMResult> {
     let restoreOrigin: (() => void) | null = null;
     if (!this.allowRepositoryWrites) {
@@ -98,6 +102,9 @@ export class ClaudeCliExecutor implements LLMExecutor {
       if (params.maxTurns != null) args.push("--max-turns", String(params.maxTurns));
       if (params.tools && params.tools.length > 0) {
         args.push("--allowed-tools", params.tools.join(","));
+      }
+      if (params.jsonSchema) {
+        args.push("--json-schema", JSON.stringify(params.jsonSchema));
       }
       // Pass the prompt on stdin rather than as an argv element. A large prompt
       // (e.g. one carrying full planning context) can exceed the OS single-argument
@@ -188,6 +195,9 @@ export class ClaudeCliExecutor implements LLMExecutor {
           exitCode: code ?? 1,
           tokensUsed: (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0),
           telemetry,
+          structuredOutput: finalStructuredOutput(events),
+          hasTerminalResult: hasTerminalResult(events),
+          terminalStatus: terminalStatus(events),
         });
       });
 

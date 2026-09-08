@@ -6,11 +6,68 @@ import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-canc
 function makeCtx(execMock: any) {
   return {
     data: { issueIdentifier: "AII-200", issueTitle: "X", issueDescription: "Y", model: "claude-sonnet-4-6" },
-    llmExecutor: { invoke: execMock },
+    llmExecutor: {
+      invoke: vi.fn(async (params: any) => {
+        const result = await execMock(params);
+        if (!params.jsonSchema || result.exitCode !== 0 || "structuredOutput" in result) return result;
+        let parsed;
+        try {
+          parsed = JSON.parse(result.stdout);
+        } catch {
+          return { ...result, structuredOutput: undefined, terminalStatus: { subtype: "success", isError: false } };
+        }
+        return {
+          ...result,
+          structuredOutput: normalizeLegacyReviewFixture(parsed),
+          terminalStatus: { subtype: "success", isError: false },
+        };
+      }),
+    },
     getOutputs: () => ({}),
     setOutputs: () => {},
     resolveInputs: (i: any) => i,
   } as any;
+}
+
+function normalizeLegacyReviewFixture(parsed: any) {
+  const source = Array.isArray(parsed.blocking_issues)
+    ? parsed.blocking_issues
+    : Array.isArray(parsed.issues)
+      ? parsed.issues
+      : Array.isArray(parsed.findings)
+        ? parsed.findings
+        : [];
+  return {
+    approved: parsed.approved,
+    blocking_issues: source.map((issue: any) => {
+      if (typeof issue === "string") {
+        return { title: "Blocking issue", problem: issue, required_fix: issue };
+      }
+      if (typeof issue.text === "string") {
+        return { title: "Blocking issue", problem: issue.text, required_fix: issue.text };
+      }
+      return {
+        title: issue.title ?? "Blocking issue",
+        ...(issue.location || issue.file || issue.path ? { location: issue.location ?? issue.file ?? issue.path } : {}),
+        problem: issue.problem ?? issue.issue ?? issue.details ?? issue.description ?? issue.title ?? "Blocking issue",
+        required_fix: issue.required_fix ?? issue.requiredFix ?? issue.fix ?? issue.recommendation ?? issue.problem ?? issue.title ?? "Fix the issue",
+      };
+    }),
+    score: parsed.score,
+    progress_delta: parsed.progress_delta,
+    feedback: parsed.feedback,
+  };
+}
+
+function structuredReviewResult(structuredOutput: unknown, stdout = "ignored final text") {
+  return {
+    stdout,
+    exitCode: 0,
+    tokensUsed: 100,
+    structuredOutput,
+    terminalStatus: { subtype: "success", isError: false },
+    telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 1, costUsd: null, tokensIn: 1, tokensOut: 1 },
+  };
 }
 
 function countOccurrences(text: string, needle: string): number {
@@ -288,6 +345,137 @@ describe("postPushReviewStep", () => {
     expect(out.approved).toBe(false);
     expect(invoke).toHaveBeenCalledTimes(2);
     expect(invoke.mock.calls[1][0].prompt).toContain("1. Escape quoted user input");
+  });
+
+  it("passes the review schema to internal post-push review calls", async () => {
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+    const invoke = vi.fn(async () => structuredReviewResult({
+      approved: true,
+      blocking_issues: [],
+      score: 95,
+      progress_delta: 100,
+      feedback: "Ready.",
+    }));
+
+    await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn, gitSpawn, reviewProviders: [] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
+      jsonSchema: expect.objectContaining({ required: ["approved", "blocking_issues", "score", "progress_delta", "feedback"] }),
+      model: "claude-sonnet-4-6",
+    }));
+  });
+
+  it("fails closed when the reviewer returns text but no structured_output", async () => {
+    const comments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") comments.push(args[args.indexOf("--body") + 1]);
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({
+      stdout: "```json\n{\"approved\":true,\"blocking_issues\":[],\"score\":95,\"progress_delta\":100,\"feedback\":\"ok\"}\n```",
+      exitCode: 0,
+      tokensUsed: 100,
+      structuredOutput: undefined,
+      terminalStatus: { subtype: "success", isError: false },
+    }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("invalid_review");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(comments.some((comment) => comment.includes("returned no structured_output"))).toBe(true);
+  });
+
+  it("fails closed when the terminal result is an error even with exit 0", async () => {
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({
+      stdout: "structured output unavailable",
+      exitCode: 0,
+      tokensUsed: 100,
+      structuredOutput: { approved: true, blocking_issues: [], score: 95, progress_delta: 100, feedback: "ok" },
+      terminalStatus: { subtype: "error_during_execution", isError: true },
+    }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("review_failed");
+    expect(out.finalFeedback).toContain("error_during_execution");
+  });
+
+  it("fails closed when structured output includes legacy verdict aliases", async () => {
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({
+      approved: true,
+      blocking_issues: [],
+      issues: ["Hidden blocker"],
+      score: 95,
+      progress_delta: 100,
+      feedback: "Ready.",
+    }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), reviewProviders: [] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("invalid_review");
+    expect(out.finalFeedback).toContain("unexpected field review.issues");
+  });
+
+  it("runs a fix pass for a valid negative structured review", async () => {
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => structuredReviewResult({
+      approved: false,
+      blocking_issues: [{ title: "Missing test", location: "src/app.ts", problem: "No regression coverage.", required_fix: "Add a regression test." }],
+      score: 65,
+      progress_delta: 70,
+      feedback: "One blocker remains.",
+    }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, reviewProviders: [] },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls[1][0].prompt).toContain("Missing test");
+    expect(invoke.mock.calls[1][0].prompt).toContain("Add a regression test.");
   });
 
   it("runs a fix pass when reviewer uses the findings alias", async () => {
@@ -918,7 +1106,7 @@ describe("postPushReviewStep", () => {
     expect(ghComments.some((comment) => comment.includes("Not ready to merge until manually reviewed"))).toBe(false);
   });
 
-  it("reports invalid non-JSON reviewer output with structured blocking issue outputs", async () => {
+  it("reports missing structured reviewer output with structured blocking issue outputs", async () => {
     const ghComments: string[] = [];
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -945,9 +1133,9 @@ describe("postPushReviewStep", () => {
       id: "post-push-review.1",
       status: "failed",
       outputs: expect.objectContaining({
-        issues: [expect.stringContaining("Reviewer returned non-JSON output")],
+        issues: [expect.stringContaining("Reviewer returned no structured_output")],
         blockingIssues: [expect.objectContaining({
-          rawText: expect.stringContaining("Reviewer returned non-JSON output"),
+          rawText: expect.stringContaining("Reviewer returned no structured_output"),
         })],
       }),
     }));
@@ -1086,7 +1274,7 @@ describe("postPushReviewStep", () => {
     expect(noChangesComment).toContain("Not ready to merge");
   });
 
-  it("skips empty JSON preamble objects when parsing reviewer output", async () => {
+  it("does not parse stdout preamble objects when structured_output is missing", async () => {
     const reviewerJson = `pre-text {} ${JSON.stringify({ approved: true, issues: [], score: 9, progress_delta: 0, feedback: "ok" })}`;
     const ghSpawn = vi.fn((args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
@@ -1100,7 +1288,8 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    expect(out.approved).toBe(true);
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("invalid_review");
   });
 
   it("updates an existing marker comment instead of posting a duplicate", async () => {
@@ -2784,7 +2973,7 @@ describe("postPushReviewStep", () => {
     expect(out.terminationReason).toBe("pr_merged");
     expect(out.iterations).toBe(0);
     expect(invoke).not.toHaveBeenCalled();
-    expect(ghSpawn.mock.calls.some((c) => c[0] === "pr" && c[1] === "comment")).toBe(false);
+    expect(ghSpawn.mock.calls.some(([args]) => args[0] === "pr" && args[1] === "comment")).toBe(false);
   });
   it("exits with pr_merged during a fix pass when assertPrWritable detects the merge before the push", async () => {
     // The PR is open through the first review and fix-pass LLM, then merged. The
@@ -2870,6 +3059,8 @@ describe("postPushReviewStep", () => {
             approved: false,
             blocking_issues: [{ title: "Bug", problem: "Missing null check", required_fix: "Add null guard" }],
             feedback: "found issues",
+            score: 70,
+            progress_delta: 50,
           }),
           exitCode: 0,
           tokensUsed: 100,
@@ -2879,7 +3070,7 @@ describe("postPushReviewStep", () => {
         return { stdout: JSON.stringify({ fixed: ["Added null guard"] }), exitCode: 0, tokensUsed: 100 };
       }
       // Reviewer #2: would approve, but submitPrReview's assertPrWritable detects MERGED first.
-      return { stdout: JSON.stringify({ approved: true, blocking_issues: [], feedback: "lgtm" }), exitCode: 0, tokensUsed: 100 };
+      return { stdout: JSON.stringify({ approved: true, blocking_issues: [], score: 95, progress_delta: 100, feedback: "lgtm" }), exitCode: 0, tokensUsed: 100 };
     });
 
     const out = await postPushReviewStep.run(
@@ -2925,6 +3116,8 @@ describe("postPushReviewStep", () => {
             approved: false,
             blocking_issues: [{ title: "Bug", problem: "Missing null check", required_fix: "Add null guard" }],
             feedback: "found issues",
+            score: 70,
+            progress_delta: 50,
           }),
           exitCode: 0,
           tokensUsed: 100,

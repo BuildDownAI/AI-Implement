@@ -127,12 +127,20 @@ export interface RunTelemetry {
   toolTrace?: string[];
 }
 
+export interface LLMTerminalStatus {
+  subtype: string | null;
+  isError: boolean | null;
+}
+
 export interface LLMResult {
   stdout: string;
   stderr?: string;
   exitCode: number;
   tokensUsed: number;
   telemetry?: RunTelemetry;
+  structuredOutput?: unknown;
+  hasTerminalResult?: boolean;
+  terminalStatus?: LLMTerminalStatus;
 }
 
 export interface LLMExecutor {
@@ -141,6 +149,7 @@ export interface LLMExecutor {
     model: string;
     maxTurns?: number;
     tools?: string[];
+    jsonSchema?: Record<string, unknown>;
   }): Promise<LLMResult>;
 }
 
