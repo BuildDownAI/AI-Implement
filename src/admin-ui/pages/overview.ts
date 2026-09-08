@@ -6,6 +6,7 @@ export const overviewHtml = `
       <div class="page-subtitle" id="overview-subtitle">&mdash;</div>
     </div>
     <div class="page-header-actions">
+      <button class="btn btn-sm" id="overview-poll-now" onclick="pollNowClick()">&#9889; Poll now</button>
       <button class="btn btn-sm" onclick="loadOverview()">&#8635; Refresh</button>
     </div>
   </header>
@@ -182,7 +183,7 @@ export const overviewScript = `
   }
 
   function statusBadge(status) {
-    const map = { running: 'running', review_failed: 'warn', failed: 'fail', 'dispatch-failed': 'fail', completed: 'success' };
+    const map = { running: 'running', review_failed: 'warn', timed_out: 'warn', failed: 'fail', 'dispatch-failed': 'fail', completed: 'success' };
     const kind = map[status] || 'neutral';
     const label = status === 'review_failed' ? 'review failed' : status === 'dispatch-failed' ? 'dispatch failed' : status;
     return '<span class="badge ' + kind + '">' + window.esc(label) + '</span>';
@@ -211,7 +212,7 @@ export const overviewScript = `
   function renderKpis(log, mappings, running) {
     const now = Date.now();
     const failed24h = log.filter(function (e) {
-      return (e.status === 'failed' || e.status === 'review_failed') && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && e.conclusion === 'stuck_giveup')) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     });
 
     const mappingEntries = Object.entries(mappings);
@@ -321,7 +322,7 @@ export const overviewScript = `
     if (!tbody || !empty) return;
     const now = Date.now();
     const failures = log.filter(function (e) {
-      return (e.status === 'failed' || e.status === 'review_failed') && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
+      return (e.status === 'failed' || e.status === 'review_failed' || (e.status === 'timed_out' && e.conclusion === 'stuck_giveup')) && (now - new Date(e.dispatchedAt).getTime()) < 86400000;
     }).sort(function (a, b) {
       return new Date(b.dispatchedAt).getTime() - new Date(a.dispatchedAt).getTime();
     }).slice(0, 8);
@@ -476,6 +477,27 @@ export const overviewScript = `
   }
 
   window.loadOverview = loadOverview;
+
+  async function pollNowClick() {
+    const btn = document.getElementById('overview-poll-now');
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    try {
+      const res = await window.api('/api/poll-now', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) btn.textContent = (data && data.error) || 'Unavailable';
+      else btn.textContent = data.started ? 'Poll started' : 'Poll already running';
+    } catch (err) {
+      btn.textContent = 'Failed';
+      console.error('pollNow failed:', err);
+    }
+    setTimeout(function () {
+      btn.innerHTML = original;
+      btn.disabled = false;
+      loadOverview();
+    }, 2500);
+  }
+  window.pollNowClick = pollNowClick;
 
   window.registerPage('overview', function () {
     loadOverview();

@@ -1,6 +1,7 @@
+import { validateRefSegments } from "../ref-segment-validation.js";
+
 const MAX_BRANCH_SUMMARY_LENGTH = 48;
 const MAX_BRANCH_PREFIX_LENGTH = 64;
-const BRANCH_PREFIX_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function slugify(value: string | undefined, fallback: string): string {
   const slug = (value ?? "")
@@ -27,19 +28,7 @@ export function normalizeBranchPrefix(raw: string | null | undefined): string | 
   if (value.length > MAX_BRANCH_PREFIX_LENGTH) {
     throw new Error(`branchPrefix must be ${MAX_BRANCH_PREFIX_LENGTH} characters or fewer`);
   }
-  if (value.includes("..") || value.includes("//")) {
-    throw new Error("branchPrefix must not contain '..' or '//'");
-  }
-  for (const segment of value.split("/")) {
-    if (!BRANCH_PREFIX_SEGMENT_PATTERN.test(segment)) {
-      throw new Error(
-        "branchPrefix segments may contain only letters, digits, '.', '_', '-' and must each start with a letter or digit",
-      );
-    }
-    if (segment.endsWith(".") || segment.endsWith(".lock")) {
-      throw new Error("branchPrefix segments must not end with '.' or '.lock'");
-    }
-  }
+  validateRefSegments(value, "branchPrefix");
   return value;
 }
 

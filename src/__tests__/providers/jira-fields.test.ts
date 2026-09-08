@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { resolveCustomFieldIds, getCachedFieldIds, clearFieldCache, adfWithLink, STATUS_VALUES } from "../../providers/jira-fields.js";
 
-const baseOverrides = { statusOverride: null, repoOverride: null, profilesOverride: null };
+const baseOverrides = { statusOverride: null, repoOverride: null, profilesOverride: null, baseBranchOverride: null };
 const baseFields = [
   { id: "customfield_10042", name: "AI-Implement Status", custom: true },
   { id: "customfield_10043", name: "AI-Implement Repo", custom: true },
@@ -21,12 +21,13 @@ describe("resolveCustomFieldIds", () => {
     expect(ids.repoFieldId).toBe("customfield_10043");
   });
 
-  it("respects explicit overrides without calling listFields when all three are set", async () => {
+  it("respects explicit overrides without calling listFields when all four are set", async () => {
     const client = { listFields: vi.fn() };
     const ids = await resolveCustomFieldIds(client as any, {
       statusOverride: "customfield_99",
       repoOverride: "customfield_98",
       profilesOverride: "customfield_97",
+      baseBranchOverride: "customfield_96",
     });
     expect(ids.statusFieldId).toBe("customfield_99");
     expect(ids.repoFieldId).toBe("customfield_98");
@@ -131,18 +132,21 @@ describe("resolveCustomFieldIds — profilesFieldId (lenient resolution)", () =>
       statusOverride: null,
       repoOverride: null,
       profilesOverride: "customfield_explicit_profiles",
+      baseBranchOverride: null,
     });
     expect(ids.profilesFieldId).toBe("customfield_explicit_profiles");
   });
 
-  it("does not call listFields when all three overrides are set (profiles included)", async () => {
+  it("does not call listFields when all four overrides are set (profiles and base branch included)", async () => {
     const client = { listFields: vi.fn() };
     const ids = await resolveCustomFieldIds(client as any, {
       statusOverride: "customfield_s",
       repoOverride: "customfield_r",
       profilesOverride: "customfield_p",
+      baseBranchOverride: "customfield_b",
     });
     expect(ids.profilesFieldId).toBe("customfield_p");
+    expect(ids.baseBranchFieldId).toBe("customfield_b");
     expect(client.listFields).not.toHaveBeenCalled();
   });
 });

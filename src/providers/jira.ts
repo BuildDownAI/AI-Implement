@@ -126,6 +126,14 @@ function isTerminalStatus(fields: Record<string, unknown>): boolean {
   return ((fields.status as { statusCategory?: { key?: string } } | null)?.statusCategory?.key) === "done";
 }
 
+/** Preserve a nonblank branch choice so dispatch validation can refuse invalid refs.
+ * Dropping an invalid choice here would silently dispatch against the default branch.
+ * Unexpected Jira field shapes remain absent, matching other optional field readers.
+ */
+function readBaseBranchValue(raw: unknown): string | undefined {
+  return typeof raw === "string" ? raw.trim() || undefined : undefined;
+}
+
 function parseMultiSelectValues(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   return (raw as Array<unknown>)
@@ -216,6 +224,7 @@ export class JiraProvider implements TicketingProvider {
       statusOverride: m.ticketingConfig.statusFieldOverride ?? null,
       repoOverride: m.ticketingConfig.repoFieldOverride ?? null,
       profilesOverride: m.ticketingConfig.profilesFieldOverride ?? null,
+      baseBranchOverride: m.ticketingConfig.baseBranchFieldOverride ?? null,
     });
   }
 
@@ -248,6 +257,7 @@ export class JiraProvider implements TicketingProvider {
         fieldIds.repoFieldId,
         ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
         ...(fieldIds.profilesFieldId ? [fieldIds.profilesFieldId] : []),
+        ...(fieldIds.baseBranchFieldId ? [fieldIds.baseBranchFieldId] : []),
       ];
 
       // Reference the status field by its resolved customfield id, not a hardcoded
@@ -317,6 +327,9 @@ export class JiraProvider implements TicketingProvider {
     const profiles = fieldIds.profilesFieldId
       ? parseMultiSelectValues(raw.fields[fieldIds.profilesFieldId])
       : [];
+    const baseBranch = fieldIds.baseBranchFieldId
+      ? readBaseBranchValue(raw.fields[fieldIds.baseBranchFieldId])
+      : undefined;
     return {
       id: raw.id,
       identifier: raw.key,
@@ -325,6 +338,7 @@ export class JiraProvider implements TicketingProvider {
       scopeKey,
       nativeStatus: statusOption?.value ?? "",
       ...(profiles.length > 0 ? { profiles } : {}),
+      ...(baseBranch ? { baseBranch } : {}),
     };
   }
   /**

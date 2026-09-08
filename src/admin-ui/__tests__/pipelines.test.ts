@@ -68,3 +68,23 @@ describe("pipelines page — kg-refresh row actions (AII-521)", () => {
     expect(pipelinesScript).toContain("loadLog()");
   });
 });
+
+// Evaluate the actual badge function so the warning/failure distinction is behavioral.
+describe("stuck job badge", () => {
+  const start = pipelinesScript.indexOf("function statusBadge(");
+  const end = pipelinesScript.indexOf("function execBadge(", start);
+  const badge = new Function("statusClass", "makeBadge", pipelinesScript.slice(start, end) + "; return statusBadge;")(
+    { timed_out: "warn", completed: "success" },
+    (cls: string, label: string) => ({ cls, label }),
+  );
+  it("shows needs-human only for the give-up conclusion", () => {
+    expect(badge("timed_out", "stuck_giveup")).toEqual({ cls: "fail", label: "Needs human" });
+    expect(badge("timed_out", "stuck_requeued")).toEqual({ cls: "warn", label: "timed_out" });
+    expect(badge("completed", "stuck_giveup")).toEqual({ cls: "success", label: "completed" });
+  });
+  it("keeps grouped plan completion inference and passes each conclusion", () => {
+    expect(pipelinesScript).toContain("statusBadge(planStatus, plan.conclusion)");
+    expect(pipelinesScript).toContain("statusBadge(impl.status, impl.conclusion)");
+    expect(pipelinesScript).toContain("statusBadge(entry.status, entry.conclusion)");
+  });
+});
