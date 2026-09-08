@@ -1,57 +1,85 @@
-# 013. Extend the pipeline by parameter, not by sibling
+# ADR 013: extend the pipeline by parameter, not by sibling file
 
 **Status:** Accepted
-**Date:** 2026-09-08
 
-**References:** AII-555 (consolidation lane), AII-556, AII-557, AII-583; `docs/kg-architecture.md` §"Architecture — what is shared and what is kg-refresh-only"
+**Date:** 2026-09-06
 
----
+**References:** AII-489 (dispatched KG refresh), AII-521 (issueless-run lifecycle), AII-543 / AII-549 (live-run fix groups), AII-548 (callback-URL contract), AII-553 (merge race), AII-560 (merge-ordering guarantee umbrella), AII-555 (consolidation), `docs/issueless-runs.md`, `docs/pipeline-architecture.md`
 
 ## Context
 
-When the kg-refresh run kind was introduced (AII-493, AII-494), several new files were created alongside existing ones rather than parameterizing the originals:
+The dispatched KG refresh (AII-489) was the first run kind that is not keyed to a tracker issue. It was built as a set of files **next to** the implement pipeline's files: a second workflow template (`workflows/claude-kg-refresh.yml`), a second image resolver (`resolveKgRefreshSessionImage`), a second GitHub Actions lifecycle inside the reaper, an inline callback-URL derivation in the entrypoint, and a hand-written YAML parser in a step.
 
-- `workflows/claude-kg-refresh.yml` alongside `workflows/claude-implement.yml`
-- `src/repo-image.ts` `resolveKgRefreshSessionImage` alongside `resolveRunnerImageForDispatch`
-- `session/git-credential-helper-kg-push.sh` + `src/kg-push-token-vending.ts` + `POST /api/runner/kg-push-token` alongside `push.ts` `refreshRunnerGithubCredentials`
+Each of those files re-described behaviour the pipeline already had, and each re-description was wrong in a way only a live run exposed. Between 2026-09-03 and 2026-09-06 the refresh needed eight live runs and fourteen fix issues to reach the snapshot-push step. The seams, in the order found, with what already existed:
 
-Each sibling duplicated behavior the original already provided, diverged from it under maintenance, and created its own failure modes. The kg-push credential helper's independent `/api/runner/kg-push-token` endpoint failed with "Repository not found" on 2026-09-08 (run 34232181245) — a failure path the standard `refreshRunnerGithubCredentials` call never takes, because it never leaves the standard push flow.
+| Seam | New code that failed | What already existed |
+|---|---|---|
+| Backend selection | hard-wired to Fly | `resolveExecutionPath` + the mapping's execution mode |
+| Image on Fly | unpaired image, machine exited at boot | the channel tag every run uses; `build-runner.yml` promotion |
+| Image on GHA | dispatch omitted `runner_image` | `resolveRunnerImageForDispatch` |
+| Phase | template never set `RUNNER_PHASE` | the entrypoint's phase arm and the envelope's `runnerPhase` |
+| Progress token | template lacked the input | `claude-implement.yml` declares and masks it |
+| Callback URL | envelope carried a path; an inline derivation doubled it | `config.runnerCallbackBaseUrl`, the bare base |
+| GHA lifecycle | reaper closed rows; then a second binding path in the reaper | `attachJobRunIdIfMissing` + `monitorGitHubActionsJob` |
+| Review rubric | generic reviewer rejected untracked output | the template's "pipeline owns writes" contract |
+| Stamp format | validator accepted only `Z` | the ingest's own `isoformat()` stamp |
+| Tracker scope | empty team key, then a regex parser | the repo's YAML loader; `sources.yml` |
 
-The pattern repeats the same structural mistake: a run kind that needs a slight variation on an existing behavior copies the whole behavior rather than threading a parameter through the shared code path.
-
----
+Two process causes stood behind every row. Issue bodies described behaviour ("read the file", "derive the URL") instead of naming the module to reuse, so the implementer wrote a parallel version. And the reviews that would have caught the parallel version never posted on grouped child PRs, because auto-merge raced the review (AII-471, fixed for initial runs by AII-553).
 
 ## Decision
 
-**Prefer a parameter of an existing file over a new sibling.** When a new run kind (issueless or otherwise) needs a variant of pipeline behavior, extend the existing step/function/endpoint with an optional parameter rather than creating a new file that duplicates its logic.
+**A new run kind is a parameter of the files the pipeline already has. It is never a sibling file.**
 
-A sibling is justified only when there is genuinely no shared counterpart — a state machine, a dedicated pipeline entrypoint, a tracker-data proxy scoped to one run kind's data contract. Rows in the `docs/kg-architecture.md` shared/kg-only table with no entry in the "Shared / existing path" column are the reference examples of legitimate siblings.
+The pipeline's extension points, and the only places a new run kind may add to:
 
-Data-path proxies that serve one run kind's internal contract (such as `/api/runner/kg-tracker-data`) are a narrow exception to this rule. They are legitimate siblings because no equivalent exists on the shared path — they carry run-kind-specific data (tracker state, not a push credential), and a shared step cannot consume them. A new proxy is justified only when it carries data that has no shared analogue; a proxy that vends a write credential for a path the pipeline already handles is not justified.
+| Subsystem | Extension point | Not this |
+|---|---|---|
+| Dispatch backend | `resolveExecutionPath(runnerMode, mappingMode)`; the same Fly and GHA dispatch calls the implement path uses | a per-kind backend choice |
+| Workflow template | `workflows/claude-implement.yml`, delivered by workflow sync to every mapping; new behaviour is an **optional `workflow_dispatch` input whose default preserves today's run** | a second template, hand-copied |
+| Runner image | `resolveRunnerImageForDispatch` for both backends; the channel tag | a per-kind resolver or pinning policy |
+| Entrypoint | `session/entrypoint.sh` selects the entry script from `RUNNER_PHASE`, which the template and the machine env set | inline derivation of a value the platform already provides |
+| Pipeline definition | `pipelines/<kind>.yml` loaded by `src/pipeline/pipeline-loader.ts`; kind-specific behaviour is a step module under `src/pipeline/steps/` | a second executor or loader |
+| Prompt template | `workflows/<KIND>.md` with the same front-matter and substitution rules as `WORKFLOW.md` | a different assembly path |
+| Callbacks and tokens | `/runner/result`, progress tokens, `runner_tokens`; the envelope's `runnerCallbackUrl` is the **bare base URL** and every client appends its own path | a per-kind callback shape |
+| Lifecycle | one `dispatch_log` row per run; GitHub Actions rows are bound and monitored by the poll loop's lazy bind and `monitorGitHubActionsJob`; Fly rows by the machine monitor and the Fly reaper rules | a per-kind reaper branch or binding loop |
+| Deploy interlock | `dispatch_log` in-flight rows hold the deploy | a per-kind hold |
+| Parsing | the repo's YAML loader (`src/issue-config.ts`, `src/pipeline/pipeline-loader.ts` pattern) | a regex over YAML |
 
----
+A run kind is allowed its own **data-path** modules, because the runner never holds a tracker credential (AII-146): for the KG refresh these are the tracker-read and push-credential proxies (`/api/runner/kg-tracker-data`, `/api/runner/kg-push-token`), the `kg-tracker-data` and `kg-snapshot-push` steps, and the rail in `src/kg-refresh.ts`. Those are new capabilities, not re-descriptions.
+
+**What counts as a violation in review.** Any of these in a PR is a finding, whatever the tests say:
+
+1. A second workflow template, or a template that is not in `ALWAYS_SYNC_FILES`.
+2. A second image resolver, or an image policy that differs by run kind.
+3. A lifecycle branch keyed on the run kind inside the reaper, the monitor, or the dispatch.
+4. An inline derivation, in shell or TypeScript, of a value the template, the envelope, or the machine env already provides.
+5. A hand parser for a format the repo already loads with a library.
+6. A callback URL that carries a path.
+
+**Guards are keyed on data that exists when they run.** AII-471's merge guard joined on `pr_url`, which the result callback writes at the end of the run, so it was blind for every initial run; the issue key had been on the dispatch row since dispatch. AII-560 consolidates the child-PR merge gate onto that run record — one predicate, one guarded write path — and ships the race fixture that fails on the old code. A guard's test exercises the timeline of the data it reads, not a mock of the store.
+
+**Issue bodies name the anchor.** Every touch in a `## Files` block or a Fix section cites the existing module by path — "reuse `resolveRunnerImageForDispatch` as `dispatchGitHubActions` does" — not the behaviour. A body that says "read", "derive", or "resolve" without a path is not ready to file.
 
 ## Alternatives considered
 
-- **Allow siblings freely** — the short-term path of least resistance, but it produces diverging behavior and distinct failure modes as the kg-refresh (and future issueless run kinds) accumulate their own copies of every shared concept. Rejected: the AII-555 consolidation lane exists to unwind exactly this outcome.
-- **Merge all siblings into a single shared entry point** — overcorrects in the other direction; a kg-refresh state machine and pipeline entrypoint have no shared counterpart and genuinely belong as their own files. The rule is directional, not absolute.
-
----
+- **Keep sibling files but sync them.** Adding `claude-kg-refresh.yml` to the sync set removes the manual copy and keeps two files that drift. Rejected: the drift is the defect.
+- **Make the source-commit image pairing universal.** It would unify the policy at the cost of a registry round-trip on every dispatch, to compensate for a channel promotion that is now verified. Rejected.
+- **A generic "run kind" plugin interface.** More surface, and every kind would still need the same ten touches. Rejected: the parameter form already exists in every subsystem above.
 
 ## Consequences
 
-- New issueless run kinds start from the shared step list (`docs/issueless-runs.md`) and extend steps by optional parameter rather than by new file.
-- A code review that finds a new sibling with an existing shared counterpart is a blocking finding, not a style note.
-- The runner-callback endpoint surface stays narrow: `kg-tracker-data` is the one surviving data-path proxy for kg-refresh. A second proxy requires the same justification (no shared analogue, run-kind-specific data contract).
+- AII-560 lands before AII-555 so grouped children no longer merge under their runs; AII-555 removes the second template, the second resolver, the entrypoint derivation, and the reaper's GHA branch, and routes the KG refresh through the shared extension points.
+- Any future issueless run kind (previews, migrations, scheduled jobs) starts from the table above. The expected cost is one optional template input, one `pipelines/<kind>.yml`, one prompt template, and the kind's data-path modules.
+- The acceptance clause "no implement-path test edits" is the mechanical check that a change added a parameter rather than a sibling.
+- The review rail and the driver's smoke both check for the six violations; a green suite does not clear them.
 
----
+## Siblings removed under this rule
 
-## Violations
-
-Violations found and collapsed during the AII-555 consolidation lane. Each row names the sibling that was removed and the shared path it was collapsed into.
-
-| Sibling (removed) | Shared path reused | Collapse issue |
+| Sibling (removed) | Shared path reused | Issue |
 |---|---|---|
 | `workflows/claude-kg-refresh.yml` | `workflows/claude-implement.yml` with `runner_phase: "kg-refresh"` | AII-556 |
 | `resolveKgRefreshSessionImage` in `src/repo-image.ts` | `resolveRunnerImageForDispatch` in `src/repo-image.ts` | AII-557 |
-| `session/git-credential-helper-kg-push.sh` + `src/kg-push-token-vending.ts` + `POST /api/runner/kg-push-token` | `refreshRunnerGithubCredentials` in `src/runner-token.ts`, called from `kg-snapshot-push.ts` | AII-583 |
+| `session/git-credential-helper-kg-push.sh`, `src/kg-push-token-vending.ts`, `POST /api/runner/kg-push-token` | the primary token in the origin URL, as `push.ts` pushes (`kg-snapshot-push.ts`) | AII-583 |
+| The kg-refresh report step (`feedback-loop` in `pipelines/kg-refresh.yml`, `workflows/KG-REFRESH.md`) | the ingest step's counters and `ai-output/kg-ingest.log`; `kg-snapshot-push` is the guard | AII-575 follow-up, 2026-09-08 |
+

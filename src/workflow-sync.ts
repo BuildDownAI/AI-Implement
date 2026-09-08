@@ -29,6 +29,10 @@ const REMOVE_FILES = [
     remote: ".github/workflows/comment-trigger.yml",
     message: "Remove comment-trigger.yml — /ai-implement is now handled by the orchestrator",
   },
+  {
+    remote: ".github/workflows/claude-kg-refresh.yml",
+    message: "Remove claude-kg-refresh.yml — kg-refresh now dispatches claude-implement.yml with runner_phase=kg-refresh",
+  },
 ] as const;
 
 const SEED_ONCE_FILES = [
