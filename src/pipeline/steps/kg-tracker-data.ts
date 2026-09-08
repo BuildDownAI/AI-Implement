@@ -121,7 +121,7 @@ function sanitizeBranch(branchRaw: string, slug: string): string | undefined {
  * Returns entries where `slug` passes the "owner/repo" validation.
  * When `branch` is present and non-empty after trimming, it is included in the
  * returned entry unless it fails `isSafeBranch` (leading `-`, internal whitespace,
- * or `..`), in which case it is logged and dropped; otherwise the entry has no
+ * `..`, or `:`), in which case it is logged and dropped; otherwise the entry has no
  * `branch` key.
  * Returns an empty array when the file is absent, the key is missing, the list
  * is empty, or the file cannot be parsed.
@@ -172,7 +172,7 @@ export function readSecondaryReposFromSourcesYml(workspaceDir: string): Array<{ 
  * is missing, or the file cannot be parsed.
  * When `branch` is present in the mapping form and non-empty after trimming,
  * it is included unless it fails `isSafeBranch` (leading `-`, internal
- * whitespace, or `..`), in which case it is logged and dropped. The string
+ * whitespace, `..`, or `:`), in which case it is logged and dropped. The string
  * form never carries a branch.
  */
 export function readCodeRepoFromSourcesYml(workspaceDir: string): { slug: string; branch?: string } | null {

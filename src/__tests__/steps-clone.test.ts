@@ -476,7 +476,7 @@ describe("cloneStep", () => {
 
       const calls = vi.mocked(spawnSync).mock.calls;
       expect(calls[0][1]).toEqual(["fetch", "--depth", "1", "origin", "refs/heads/testing"]);
-      expect(calls[1][1]).toEqual(["reset", "--hard", "origin/testing"]);
+      expect(calls[1][1]).toEqual(["reset", "--hard", "FETCH_HEAD"]);
     });
 
     it("incremental fetch with a hostile flag-like branch value fetches via explicit refspec, never as a bare positional", async () => {
