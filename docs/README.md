@@ -21,6 +21,8 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [issueless-runs.md](issueless-runs.md) | The pattern for run kinds dispatched without a tracker issue: envelope shape, jobs-store tracking row, credential flow, state machine lifecycle, reaper reconciliation, operator cancel, observability, and a checklist for adding a new issueless run kind |
 | [runner-context.md](runner-context.md) | Per-project settings that provision something into a run: the shared mapping-to-effect shape, which run phases apply each one, and what enabling each costs |
 | [runner-callbacks.md](runner-callbacks.md) | The run tokens and callback endpoints: who mints, carries, reads, verifies, and consumes each credential; the process boundary inside the runner; the blast radius of one stray use |
+| [run-lifecycle.md](run-lifecycle.md) | The five lifecycle steps around the pipeline, the module that implements each today, the six loops that read one run, and the seams a new run kind touches |
+| [run-kind-contract.md](run-kind-contract.md) | Proposed: one registration per run kind (pipeline, dispatch inputs, report, tracker effect), today's kinds expressed in it, and what it deletes |
 
 Two references live outside this directory because they are consumed directly rather than read: `.env.example` is the canonical list of orchestrator environment variables, and `CLAUDE.md` is the index that points at everything here.
 
