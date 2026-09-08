@@ -365,7 +365,7 @@ function the standard implement and planning dispatch paths use. Resolution orde
    (if set) applies, then the workflow's built-in default image.
 
 The source-commit pairing policy that pinned each run to the exact runner image baked at the
-same orchestrator commit (via the deleted `resolveKgRefreshSessionImage`) was removed by AII-555:
+same orchestrator commit (via the deleted `resolveKgRefreshSessionImage`) was removed by AII-557:
 it required an anonymous registry round-trip on every dispatch, and the channel tag (`latest` /
 `next`) already tracks the correct image pair for both the implement and kg-refresh paths.
 
@@ -434,7 +434,7 @@ After both fixes landed, the review of the implementation also identified an arc
 |---|---|---|---|
 | GHA workflow | `workflows/claude-implement.yml` with `runner_phase: "kg-refresh"` | `workflows/claude-kg-refresh.yml` | removed by AII-556 ✓ |
 | Runner-side pipeline | *(step sequence in `WORKFLOW.md`)* | `pipelines/kg-refresh.yml` | present |
-| Session image resolution | `src/repo-image.ts` `resolveRunnerImageForDispatch` | `src/repo-image.ts` `resolveKgRefreshSessionImage` | removed by AII-555 ✓ |
+| Session image resolution | `src/repo-image.ts` `resolveRunnerImageForDispatch` | `src/repo-image.ts` `resolveKgRefreshSessionImage` | removed by AII-557 ✓ |
 | Orchestrator state machine | — | `src/kg-refresh.ts` | present |
 | Pipeline entrypoint | — | `src/pipeline/kg-refresh-run.ts` | present |
 | Tracker data step | — | `src/pipeline/steps/kg-tracker-data.ts` | present |
@@ -443,7 +443,7 @@ After both fixes landed, the review of the implementation also identified an arc
 | Callback routing | `src/runner-callback.ts` (carve-out within shared file) | — | present |
 | Dispatch function | — | `src/index.ts` `dispatchKgRefreshRun` | present |
 
-The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, and `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`. AII-555 collapsed both pairs. Rows with no shared counterpart (the state machine, pipeline steps, token vending) are legitimately kg-refresh-only and belong exactly where they are.
+The rule for future run kinds: prefer a parameter of an existing file over a new sibling. Each row in the "kg-refresh-only" column that has a "shared / existing" counterpart is a finding — `claude-kg-refresh.yml` should have been a parameterized call to `claude-implement.yml`, and `resolveKgRefreshSessionImage` should have been a parameter of `resolveRunnerImageForDispatch`. AII-556 and AII-557 collapsed both pairs. Rows with no shared counterpart (the state machine, pipeline steps, token vending) are legitimately kg-refresh-only and belong exactly where they are.
 
 ## Lineage
 
