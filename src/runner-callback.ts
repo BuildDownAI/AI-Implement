@@ -538,13 +538,18 @@ export async function handleKgTrackerDataRequest(
           query: `query($teamKey: String!, $first: Int!, $after: String) {
             issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
               nodes {
-                id identifier title description branchName
-                state { name type }
-                labels { nodes { name } }
-                project { name }
-                parent { identifier }
-                comments(first: 100) { nodes { body user { name } createdAt } }
-                relations { nodes { type relatedIssue { identifier } } }
+                id identifier title description url branchName
+                priority priorityLabel estimate dueDate
+                createdAt updatedAt completedAt canceledAt startedAt
+                state { id name type }
+                labels { nodes { id name } }
+                assignee { id name email }
+                project { id name }
+                team { id key name }
+                cycle { id name number startsAt endsAt }
+                parent { id identifier }
+                comments(first: 100) { nodes { id body user { id name email } createdAt updatedAt } }
+                relations { nodes { type relatedIssue { id identifier } } }
               }
               pageInfo { hasNextPage endCursor }
             }

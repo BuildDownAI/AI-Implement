@@ -534,8 +534,21 @@ describe("handleKgTrackerDataRequest", () => {
     await callTrackerData({ authorization: `Bearer ${token}` });
 
     expect(capturedQuery).toContain("branchName");
+    expect(capturedQuery).toContain("url");
+    expect(capturedQuery).toContain("priority");
+    expect(capturedQuery).toContain("priorityLabel");
+    expect(capturedQuery).toContain("estimate");
+    expect(capturedQuery).toContain("dueDate");
+    expect(capturedQuery).toContain("createdAt");
+    expect(capturedQuery).toContain("updatedAt");
+    expect(capturedQuery).toContain("completedAt");
+    expect(capturedQuery).toContain("canceledAt");
+    expect(capturedQuery).toContain("startedAt");
+    expect(capturedQuery).toContain("assignee");
     expect(capturedQuery).toContain("labels");
     expect(capturedQuery).toContain("project");
+    expect(capturedQuery).toContain("team { id key name }");
+    expect(capturedQuery).toContain("cycle");
     expect(capturedQuery).toContain("parent");
     expect(capturedQuery).toContain("relations");
     expect(capturedQuery).toContain("relatedIssue");

@@ -32,13 +32,26 @@ interface TrackerIssue {
   identifier: string;
   title: string;
   description: string;
+  url: string;
   branchName: string | null;
-  state: { name: string; type: string };
-  labels: { nodes: Array<{ name: string }> };
-  project: { name: string } | null;
-  parent: { identifier: string } | null;
-  comments: { nodes: Array<{ body: string; user: { name: string } | null; createdAt: string }> };
-  relations: { nodes: Array<{ type: string; relatedIssue: { identifier: string } }> };
+  priority: number | null;
+  priorityLabel: string | null;
+  estimate: number | null;
+  dueDate: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  canceledAt: string | null;
+  startedAt: string | null;
+  state: { id: string; name: string; type: string };
+  labels: { nodes: Array<{ id: string; name: string }> };
+  assignee: { id: string; name: string; email: string } | null;
+  project: { id: string; name: string } | null;
+  team: { id: string; key: string; name: string } | null;
+  cycle: { id: string; name: string; number: number; startsAt: string | null; endsAt: string | null } | null;
+  parent: { id: string; identifier: string } | null;
+  comments: { nodes: Array<{ id: string; body: string; user: { id: string; name: string; email: string } | null; createdAt: string; updatedAt: string }> };
+  relations: { nodes: Array<{ type: string; relatedIssue: { id: string; identifier: string } }> };
 }
 
 interface TrackerDataPage {
