@@ -218,7 +218,7 @@ secondary_repos:
 Each secondary repo is cloned with `--depth 1` using a bare `https://github.com/<slug>.git` URL. Auth is supplied by the same git credential helper installed by `dependency-auth`, so no token appears in the URL. One log line is emitted per repo:
 
 ```
-[clone-secondary-repos] cloning BuildDownAI/bd-knowledge-graph-base into repos/bd-knowledge-graph-base
+[clone] cloning BuildDownAI/bd-knowledge-graph-base into repos/bd-knowledge-graph-base
 ```
 
 **Soft failure:** if a clone fails (repo missing, private, or credential scope too narrow), a warning is logged and the step continues to the next repo rather than aborting the pipeline. A run that clones zero of N repos still proceeds to `kg-ingest` — the ingest tool receives whatever repos were cloned.
@@ -539,7 +539,7 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | KG push token vending | `src/kg-push-token-vending.ts` |
 | Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
 | Tracker-data pipeline step | `src/pipeline/steps/kg-tracker-data.ts` |
-| Secondary repo clone step | `src/pipeline/steps/clone-secondary-repos.ts` |
+| Secondary repo clone step | `src/pipeline/steps/clone.ts` (targets input) |
 | Ingest pipeline step | `src/pipeline/steps/kg-ingest.ts` |
 | KG refresh pipeline definition | `pipelines/kg-refresh.yml` |
 | Fly / local Docker dispatch | `src/index.ts` (`dispatchKgRefreshRun`) |

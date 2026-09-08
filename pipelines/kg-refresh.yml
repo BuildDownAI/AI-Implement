@@ -8,8 +8,7 @@ steps:
   - id: clone-code-repo
     type: clone
   - id: clone-secondary-repos
-    type: custom
-    moduleId: clone-secondary-repos
+    type: clone
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data

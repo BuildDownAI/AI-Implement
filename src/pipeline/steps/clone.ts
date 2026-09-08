@@ -22,16 +22,25 @@ interface CloneInputs extends Record<string, unknown> {
    * Used by the clone-code-repo step to place the code repo alongside the KG source workspace.
    */
   targetDir?: string;
+  /**
+   * When set, clone each entry into its own subdirectory of workspaceDir. Uses the same
+   * bare-URL + credential-helper auth as targetDir. Soft-fails per entry: a failed clone
+   * logs a warning and continues rather than aborting. Returns { clonedCount }.
+   * Used by the clone-secondary-repos step in the kg-refresh pipeline.
+   */
+  targets?: Array<{ repoOwner: string; repoRepo: string; targetDir: string }>;
 }
 
 interface CloneOutputs extends Record<string, unknown> {
-  workspaceDir: string;
-  clonedRef: string;
-  cloneMethod: "fresh" | "incremental" | "mounted";
-  repoOwner: string;
-  repoRepo: string;
-  branch: string;
-  githubToken: string;
+  workspaceDir?: string;
+  clonedRef?: string;
+  cloneMethod?: "fresh" | "incremental" | "mounted";
+  repoOwner?: string;
+  repoRepo?: string;
+  branch?: string;
+  githubToken?: string;
+  /** Present only when targets is set. Count of repos successfully cloned. */
+  clonedCount?: number;
 }
 
 export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
@@ -40,7 +49,75 @@ export const cloneStep: StepModule<CloneInputs, CloneOutputs> = {
     inputs: CloneInputs,
     _reporter: StepReporter,
   ): Promise<CloneOutputs> {
-    const { repoOwner, repoRepo, branch, githubToken, workspaceDir, targetDir } = inputs;
+    const { repoOwner, repoRepo, branch, githubToken, workspaceDir, targetDir, targets } = inputs;
+
+    // Multi-target secondary clone (e.g. clone-secondary-repos in kg-refresh).
+    // Runs the existing bare-URL credential-helper path once per entry, soft-failing
+    // on individual clone failures so one bad repo doesn't abort the pipeline.
+    if (targets !== undefined) {
+      if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
+        console.warn("[clone] mounted mode: skipping secondary clones");
+        return { clonedCount: 0 };
+      }
+
+      let clonedCount = 0;
+      for (const target of targets) {
+        const basename = path.basename(target.targetDir);
+        if (basename === "." || basename === "..") {
+          console.warn(`[clone] skipping ${target.repoOwner}/${target.repoRepo}: targetDir basename '${basename}' is unsafe`);
+          continue;
+        }
+        const effectiveDir = path.join(workspaceDir, target.targetDir);
+        const bareRemote = `https://github.com/${target.repoOwner}/${target.repoRepo}.git`;
+        console.log(`[clone] cloning ${target.repoOwner}/${target.repoRepo} into ${target.targetDir}`);
+
+        // Ensure parent directory exists so git clone can create the target dir.
+        fs.mkdirSync(path.dirname(effectiveDir), { recursive: true });
+
+        if (fs.existsSync(path.join(effectiveDir, ".git"))) {
+          const fetchResult = spawnSync(
+            "git",
+            ["fetch", "--depth", "1", "origin"],
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+          );
+          if (fetchResult.status !== 0) {
+            const stderr = (fetchResult.stderr?.toString() ?? "").trim();
+            console.warn(
+              `[clone] clone failed for ${target.repoOwner}/${target.repoRepo} (exit ${fetchResult.status ?? "null"}): ${stderr} — continuing`,
+            );
+            continue;
+          }
+          const resetResult = spawnSync(
+            "git",
+            ["reset", "--hard", "FETCH_HEAD"],
+            { cwd: effectiveDir, stdio: ["ignore", "pipe", "pipe"] },
+          );
+          if (resetResult.status !== 0) {
+            const stderr = (resetResult.stderr?.toString() ?? "").trim();
+            console.warn(
+              `[clone] clone failed for ${target.repoOwner}/${target.repoRepo} (exit ${resetResult.status ?? "null"}): ${stderr} — continuing`,
+            );
+            continue;
+          }
+        } else {
+          const cloneResult = spawnSync(
+            "git",
+            ["clone", "--depth", "1", bareRemote, effectiveDir],
+            { stdio: ["ignore", "pipe", "pipe"] },
+          );
+          if (cloneResult.status !== 0) {
+            const stderr = (cloneResult.stderr?.toString() ?? "").trim();
+            console.warn(
+              `[clone] clone failed for ${target.repoOwner}/${target.repoRepo} (exit ${cloneResult.status ?? "null"}): ${stderr} — continuing`,
+            );
+            continue;
+          }
+        }
+        clonedCount++;
+      }
+      console.log(`[clone] cloned ${clonedCount}/${targets.length} repos`);
+      return { clonedCount };
+    }
 
     // Secondary clone into a subdirectory (e.g. the clone-code-repo step).
     // The credential helper installed by dependency-auth supplies auth — no token in the URL.

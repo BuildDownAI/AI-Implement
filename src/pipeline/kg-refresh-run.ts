@@ -9,7 +9,6 @@ import { PipelineRunner } from "./runner.js";
 import { loadPipelineDefinition } from "./pipeline-loader.js";
 import { NoopStepReporter } from "./reporter.js";
 import { cloneStep } from "./steps/clone.js";
-import { cloneSecondaryReposStep } from "./steps/clone-secondary-repos.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { feedbackLoopStep } from "./steps/feedback-loop.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
@@ -28,7 +27,6 @@ export interface RunKgRefreshOptions {
   stepsOverride?: {
     clone?: StepModule;
     dependencyAuth?: StepModule;
-    cloneSecondaryRepos?: StepModule;
     kgTrackerData?: StepModule;
     kgIngest?: StepModule;
     feedbackLoop?: StepModule;
@@ -208,7 +206,6 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
   const runner = new PipelineRunner();
   runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
   runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
-  runner.register("clone-secondary-repos", opts.stepsOverride?.cloneSecondaryRepos ?? cloneSecondaryReposStep);
   runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
   runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
   runner.register("feedback-loop", opts.stepsOverride?.feedbackLoop ?? feedbackLoopStep);

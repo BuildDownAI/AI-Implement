@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { PipelineContext, PipelineDefinition, StepDefinition, StepType } from "./types.js";
 import { resolveModule, type ResolveModuleOptions } from "./resolve-module.js";
@@ -308,9 +308,24 @@ function applyWiring(step: YamlStep): StepDefinition {
     case "clone-secondary-repos": {
       return {
         ...step,
-        inputs: (ctx: PipelineContext) => ({
-          workspaceDir: ctx.getOutputs("clone").workspaceDir as string,
-        }),
+        inputs: (ctx: PipelineContext) => {
+          const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
+          const repos = readSecondaryReposFromSourcesYml(workspaceDir);
+          const targets = repos.map(({ slug }) => {
+            const slashIdx = slug.indexOf("/");
+            const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
+            const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
+            return { repoOwner, repoRepo, targetDir: join("repos", basename(slug)) };
+          });
+          return {
+            repoOwner: "",
+            repoRepo: "",
+            branch: "",
+            githubToken: "",
+            workspaceDir,
+            targets,
+          };
+        },
         skip: (ctx: PipelineContext) => {
           // Skip if dependency-auth did not acquire a token: without the git credential
           // helper the clones would fail unauthenticated against private repos.
