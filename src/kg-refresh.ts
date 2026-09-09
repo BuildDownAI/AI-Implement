@@ -18,7 +18,12 @@ import type { MintInput, MintOutput } from "./runner-tokens.js";
 import { encodeRunConfig } from "./run-config.js";
 import type { RunConfigV1 } from "./run-config.js";
 import { getDb } from "./dedup.js";
-import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./pipeline/steps/kg-tracker-data.js";
+import {
+  readCodeRepoFromSourcesYml,
+  readSecondaryReposFromSourcesYml,
+  readBaseRepoFromSourcesYml,
+  DEFAULT_BASE_REPO,
+} from "./pipeline/steps/kg-tracker-data.js";
 
 const execFile = promisify(execFileCb);
 
@@ -91,6 +96,21 @@ export interface KgPreflightInput {
   probeRepo?: (token: string, slug: string, grant: "contents" | "pull_requests") => Promise<{ ok: boolean; status: number }>;
   /** Fetch `.github/workflows/claude-implement.yml` from the KG repo. Injectable for tests. */
   fetchWorkflowFile?: (token: string, owner: string, repo: string, branch: string) => Promise<{ status: number; content: string | null }>;
+  /**
+   * Compare the derivative KG repo's default branch against the base template's, for the
+   * advisory `base:drift` row (AII-598). Returns the HTTP status of the compare call and
+   * `behindBy` (how many commits the derivative is behind base), or `behindBy: null` when
+   * the call didn't resolve to a usable count. Injectable for tests.
+   */
+  fetchCompare?: (
+    token: string,
+    baseOwner: string,
+    baseRepo: string,
+    baseBranch: string,
+    derivativeOwner: string,
+    derivativeRepo: string,
+    derivativeBranch: string,
+  ) => Promise<{ status: number; behindBy: number | null }>;
 }
 
 /**
@@ -253,6 +273,16 @@ interface KgRefreshInput {
   probeRepo?: (token: string, slug: string, grant: "contents" | "pull_requests") => Promise<{ ok: boolean; status: number }>;
   /** Fetch `.github/workflows/claude-implement.yml` from the KG repo for the credential preflight. Injectable for tests. */
   fetchWorkflowFile?: (token: string, owner: string, repo: string, branch: string) => Promise<{ status: number; content: string | null }>;
+  /** Compare derivative vs. base template default branches for the advisory `base:drift` preflight row. Injectable for tests. */
+  fetchCompare?: (
+    token: string,
+    baseOwner: string,
+    baseRepo: string,
+    baseBranch: string,
+    derivativeOwner: string,
+    derivativeRepo: string,
+    derivativeBranch: string,
+  ) => Promise<{ status: number; behindBy: number | null }>;
 
   // ---- Outcome reporting (AII-496) ----
 
@@ -311,6 +341,41 @@ async function defaultFetchWorkflowFile(
 }
 
 /**
+ * Compares the derivative KG repo's default branch against the base template's, using
+ * GitHub's cross-repo compare syntax (`owner:branch` for the base side) scoped to the
+ * derivative repo. `behind_by` is how many commits the base has that the derivative lacks —
+ * exactly "how far behind base" for the advisory `base:drift` row (AII-598).
+ *
+ * `_baseRepo` (the base's repo name) is unused: the cross-repo `owner:branch` compare
+ * syntax only resolves within a shared fork network, which requires the same repo name as
+ * the URL's — a KG repo templated from the base rather than forked from it will 404 either
+ * way, so the name plays no part in the request. Kept in the signature for symmetry with
+ * the base owner/branch and for tests to assert against.
+ */
+async function defaultFetchCompare(
+  token: string,
+  baseOwner: string,
+  _baseRepo: string,
+  baseBranch: string,
+  derivativeOwner: string,
+  derivativeRepo: string,
+  derivativeBranch: string,
+): Promise<{ status: number; behindBy: number | null }> {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${derivativeOwner}/${derivativeRepo}/compare/` +
+        `${encodeURIComponent(baseOwner)}:${encodeURIComponent(baseBranch)}...${encodeURIComponent(derivativeBranch)}`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } },
+    );
+    if (!res.ok) return { status: res.status, behindBy: null };
+    const data = (await res.json()) as { behind_by?: number };
+    return { status: res.status, behindBy: typeof data.behind_by === "number" ? data.behind_by : null };
+  } catch {
+    return { status: 0, behindBy: null };
+  }
+}
+
+/**
  * True when a `claude-implement.yml` body declares `runner_phase` under
  * `on.workflow_dispatch.inputs`. GitHub Actions YAML is looser than a plain config
  * file — `workflow_dispatch` may be null/absent (no inputs at all is legal), and a
@@ -349,6 +414,7 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
   const fetchDefaultBranchFn = input.fetchDefaultBranch ?? defaultFetchDefaultBranch;
   const probeRepoFn = input.probeRepo ?? defaultProbeRepo;
   const fetchWorkflowFileFn = input.fetchWorkflowFile ?? defaultFetchWorkflowFile;
+  const fetchCompareFn = input.fetchCompare ?? defaultFetchCompare;
 
   const repo = parseKgSourceRepo(input.kgSourceRepo);
   const kgRepoSlug = `${repo.owner}/${repo.repo}`;
@@ -362,6 +428,7 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
   let secondaryRepos: Array<{ slug: string }> = [];
   let sourcesReadToken: string | null = null;
   let defaultBranch: string | null = null;
+  let baseRepoSlug: string = DEFAULT_BASE_REPO;
   const tmpDir = await mkdtemp(join(tmpdir(), "kg-preflight-"));
   try {
     const { token: readToken } = await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
@@ -375,6 +442,7 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     const sourceDir = await extractSource(tarball, tmpDir);
     codeRepo = readCodeRepoFromSourcesYml(sourceDir)?.slug ?? null;
     secondaryRepos = readSecondaryReposFromSourcesYml(sourceDir);
+    baseRepoSlug = readBaseRepoFromSourcesYml(sourceDir).slug;
   } catch {
     results.push({ repo: kgRepoSlug, grant: "sources.yml:read", ok: false, status: 0 });
   } finally {
@@ -399,6 +467,56 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     );
   } catch {
     results.push({ repo: kgRepoSlug, grant: "workflow:runner_phase", ok: false, status: 0, hint: WORKFLOW_RUNNER_PHASE_SYNC_HINT });
+  }
+
+  // Advisory base-template drift row (AII-598): how many commits the derivative KG repo is
+  // behind base_repo (sources.yml `base_repo:`, default BuildDownAI/bd-knowledge-graph-base).
+  // `ok` is always true — this row informs operators and must never refuse a refresh. A base
+  // repo the installation can't read (different owner's installation, no grant, 404) or a
+  // thrown compare call reports "base drift unknown" rather than propagating.
+  try {
+    const [baseOwner, baseRepoName] = baseRepoSlug.split("/");
+    const { token: baseToken } = await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
+      permissions: { contents: "read" },
+    });
+
+    const baseBranchResult = await fetchBranchOrStatus(fetchDefaultBranchFn, baseToken, baseOwner, baseRepoName);
+    const derivativeBranchResult = defaultBranch
+      ? { branch: defaultBranch }
+      : await fetchBranchOrStatus(fetchDefaultBranchFn, baseToken, repo.owner, repo.repo);
+
+    if (!("branch" in baseBranchResult)) {
+      results.push({ repo: baseRepoSlug, grant: "base:drift", ok: true, status: baseBranchResult.status, hint: "base drift unknown" });
+    } else if (!("branch" in derivativeBranchResult)) {
+      results.push({ repo: baseRepoSlug, grant: "base:drift", ok: true, status: derivativeBranchResult.status, hint: "base drift unknown" });
+    } else {
+      const compare = await fetchCompareFn(
+        baseToken,
+        baseOwner,
+        baseRepoName,
+        baseBranchResult.branch,
+        repo.owner,
+        repo.repo,
+        derivativeBranchResult.branch,
+      );
+      if (compare.status === 200 && compare.behindBy !== null) {
+        results.push(
+          compare.behindBy > 0
+            ? {
+                repo: baseRepoSlug,
+                grant: "base:drift",
+                ok: true,
+                status: compare.status,
+                hint: `derivative is ${compare.behindBy} commits behind base; run bd-mega-kg-refresh to merge`,
+              }
+            : { repo: baseRepoSlug, grant: "base:drift", ok: true, status: compare.status },
+        );
+      } else {
+        results.push({ repo: baseRepoSlug, grant: "base:drift", ok: true, status: compare.status, hint: "base drift unknown" });
+      }
+    }
+  } catch {
+    results.push({ repo: baseRepoSlug, grant: "base:drift", ok: true, status: 0, hint: "base drift unknown" });
   }
 
   // Probe primary write token for the KG source repo.
@@ -493,6 +611,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const persistLastRefreshFn = input.persistLastRefresh ?? defaultPersistLastRefresh;
   const loadLastRefreshFn = input.loadLastRefresh ?? defaultLoadLastRefresh;
   const fetchWorkflowFile = input.fetchWorkflowFile ?? defaultFetchWorkflowFile;
+  const fetchCompare = input.fetchCompare ?? defaultFetchCompare;
 
   let running = false;
   let lastRefresh: RefreshOutcome | null = null;
@@ -913,6 +1032,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           fetchDefaultBranch,
           probeRepo: input.probeRepo,
           fetchWorkflowFile,
+          fetchCompare,
         });
         if (!preflightResult.ok) {
           const failDetail = preflightResult.results
@@ -1307,9 +1427,38 @@ async function defaultFetchDefaultBranch(token: string, owner: string, repo: str
   const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
   });
-  if (!res.ok) throw new Error(`repo metadata fetch failed: HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`repo metadata fetch failed: HTTP ${res.status}`) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
+  }
   const data = (await res.json()) as { default_branch?: string };
   return data.default_branch || "main";
+}
+
+/** Extracts an HTTP status code from a thrown error when the thrower attached one (e.g. `defaultFetchDefaultBranch`), else 0. */
+function statusFromThrown(err: unknown): number {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" ? status : 0;
+}
+
+/**
+ * Resolves a repo's default branch without throwing, for callers (the advisory `base:drift`
+ * row) that need the real HTTP status of a failure rather than a generic 0 — see AII-598
+ * review: the row must report the base repo's actual "unreadable" status, not lose it to a
+ * catch-all.
+ */
+async function fetchBranchOrStatus(
+  fetchDefaultBranchFn: (token: string, owner: string, repo: string) => Promise<string>,
+  token: string,
+  owner: string,
+  repo: string,
+): Promise<{ branch: string } | { status: number }> {
+  try {
+    return { branch: await fetchDefaultBranchFn(token, owner, repo) };
+  } catch (err) {
+    return { status: statusFromThrown(err) };
+  }
 }
 
 async function defaultFetchSnapshotCommitSha(token: string, owner: string, repo: string, branch: string): Promise<string | null> {

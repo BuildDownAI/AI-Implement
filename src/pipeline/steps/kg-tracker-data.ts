@@ -251,6 +251,69 @@ export function readCodeRepoFromSourcesYml(workspaceDir: string): { slug: string
   return null;
 }
 
+/** Default base template repo when `sources.yml` has no `base_repo:` key (AII-598). */
+export const DEFAULT_BASE_REPO = "BuildDownAI/bd-knowledge-graph-base";
+
+/**
+ * Reads the top-level `base_repo:` key from sources.yml — the base template repo this KG
+ * repo derives from, used for the advisory `base:drift` preflight row (AII-598). Accepts the
+ * same string/mapping forms as `code_repo`. Unlike `readCodeRepoFromSourcesYml`, this reader
+ * never returns null: an absent key, absent file, or unexpected shape all fall back to
+ * `DEFAULT_BASE_REPO` rather than "no base repo configured", since every KG repo has one.
+ */
+export function readBaseRepoFromSourcesYml(workspaceDir: string): { slug: string; branch?: string } {
+  const filePath = join(workspaceDir, "sources.yml");
+  if (!existsSync(filePath)) return { slug: DEFAULT_BASE_REPO };
+
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return { slug: DEFAULT_BASE_REPO };
+  }
+
+  try {
+    const doc = parseYaml(raw) as unknown;
+    if (doc !== null && typeof doc === "object") {
+      const baseRepo = (doc as Record<string, unknown>).base_repo;
+      if (typeof baseRepo === "string") {
+        const slug = ownerRepo(baseRepo.trim());
+        return { slug: slug ?? DEFAULT_BASE_REPO };
+      }
+      if (
+        baseRepo !== null &&
+        typeof baseRepo === "object" &&
+        !Array.isArray(baseRepo) &&
+        typeof (baseRepo as Record<string, unknown>).slug === "string"
+      ) {
+        const slug = ownerRepo(((baseRepo as Record<string, unknown>).slug as string).trim());
+        if (slug === null) return { slug: DEFAULT_BASE_REPO };
+        const branchRaw = typeof (baseRepo as Record<string, unknown>).branch === "string"
+          ? ((baseRepo as Record<string, unknown>).branch as string).trim()
+          : "";
+        const branch = sanitizeBranch(branchRaw, slug);
+        return { slug, ...(branch !== undefined ? { branch } : {}) };
+      }
+    }
+  } catch {
+    // Fall through to regex fallback
+  }
+
+  // String form fallback: base_repo: owner/name (value on the same line)
+  const matchStr = raw.match(/^base_repo:\s+(\S+)/m);
+  if (matchStr) {
+    const slug = ownerRepo(matchStr[1]);
+    if (slug !== null) return { slug };
+  }
+  // Mapping form fallback: base_repo:\n  slug: owner/name
+  const matchMapping = raw.match(/^base_repo:[ \t]*\n[ \t]+slug:[ \t]+(\S+)/m);
+  if (matchMapping) {
+    const slug = ownerRepo(matchMapping[1]);
+    if (slug !== null) return { slug };
+  }
+  return { slug: DEFAULT_BASE_REPO };
+}
+
 export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOutputs> = {
   async run(
     _context: PipelineContext,

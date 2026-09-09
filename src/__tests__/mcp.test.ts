@@ -582,6 +582,13 @@ describe("handleMcpRequest", () => {
             status: 200,
             hint: "re-run workflow sync for the KG repo mapping (POST /api/mappings/<team>/sync-workflows)",
           },
+          {
+            repo: "BuildDownAI/bd-knowledge-graph-base",
+            grant: "base:drift",
+            ok: true,
+            status: 200,
+            hint: "derivative is 12 commits behind base; run bd-mega-kg-refresh to merge",
+          },
         ],
       };
       const runKgRefreshPreflightMock = vi.fn(async () => preflightResult);

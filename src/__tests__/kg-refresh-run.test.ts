@@ -129,7 +129,14 @@ import {
   classifyRefreshAnomaly,
   buildLearningsComment,
 } from "../pipeline/steps/kg-snapshot-push.js";
-import { kgTrackerDataStep, KgTrackerDataFetchError, readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "../pipeline/steps/kg-tracker-data.js";
+import {
+  kgTrackerDataStep,
+  KgTrackerDataFetchError,
+  readCodeRepoFromSourcesYml,
+  readSecondaryReposFromSourcesYml,
+  readBaseRepoFromSourcesYml,
+  DEFAULT_BASE_REPO,
+} from "../pipeline/steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError, isSignalLine } from "../pipeline/steps/kg-ingest.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
@@ -3058,6 +3065,73 @@ code_repo:
   it("string form never carries a branch", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo: org/repo\n");
     expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+});
+
+// ── readBaseRepoFromSourcesYml (AII-598) ──────────────────────────────────────
+
+describe("readBaseRepoFromSourcesYml", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgbrepo-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns the default when sources.yml is absent", () => {
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: DEFAULT_BASE_REPO });
+  });
+
+  it("returns the default when base_repo key is absent", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: org/my-repo\ntrackers:\n  - team: AII\n");
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: DEFAULT_BASE_REPO });
+  });
+
+  it("parses the string form: base_repo: SomeOrg/some-base", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "base_repo: SomeOrg/some-base\n");
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: "SomeOrg/some-base" });
+  });
+
+  it("parses the mapping form: base_repo:\\n  slug: SomeOrg/some-base", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "base_repo:\n  slug: SomeOrg/some-base\n");
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: "SomeOrg/some-base" });
+  });
+
+  it("parses branch from the mapping form", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "base_repo:\n  slug: SomeOrg/some-base\n  branch: testing\n");
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: "SomeOrg/some-base", branch: "testing" });
+  });
+
+  it("falls back to the default when malformed YAML lacks a usable base_repo", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "[broken\n");
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: DEFAULT_BASE_REPO });
+  });
+
+  it("falls back to the default when base_repo has an unexpected shape (array)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "base_repo:\n  - 1\n  - 2\n");
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: DEFAULT_BASE_REPO });
+  });
+
+  it("falls back to the default when base_repo value has no slash (not owner/repo format)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "base_repo: justarepo\n");
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: DEFAULT_BASE_REPO });
+  });
+
+  it("falls back to the default when base_repo mapping has no slug key", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "base_repo:\n  path: ../base\n");
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: DEFAULT_BASE_REPO });
+  });
+
+  it("coexists with code_repo and secondary_repos", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo: org/my-repo\nbase_repo: SomeOrg/some-base\nsecondary_repos:\n  - slug: org/side-repo\n",
+    );
+    expect(readBaseRepoFromSourcesYml(tmpDir)).toEqual({ slug: "SomeOrg/some-base" });
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/my-repo" });
   });
 });
 
