@@ -1,3 +1,5 @@
+import { existsSync, readdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { decodeRunConfig } from "../run-config.js";
 import { postRunnerResult } from "../runner-result.js";
@@ -20,10 +22,19 @@ import type { LLMExecutor, PipelineContext, StepReporter, StepModule } from "./t
  * operator's KG source checkout bind-mounted read-only by the dev harness) rather
  * than from GitHub, so uncommitted edits to sources.yml take effect immediately.
  */
-const devHarnessKgCloneStep: StepModule = {
+export const devHarnessKgCloneStep: StepModule = {
   async run(context: PipelineContext, inputs: Record<string, unknown>): Promise<Record<string, unknown>> {
     const workspaceDir = inputs.workspaceDir as string;
     const kgSourceDir = process.env.KG_SOURCE_DIR ?? "/kg-source";
+    // session/entrypoint.sh clones the repo into the workspace for every non-mounted
+    // run before the pipeline starts. That clone is throwaway here: the operator's
+    // checkout at /kg-source (uncommitted edits included) is the source of truth, and
+    // git refuses to clone into a non-empty directory. Clear the contents, keep the
+    // directory (it may be the container's working dir), then clone.
+    if (existsSync(workspaceDir) && readdirSync(workspaceDir).length > 0) {
+      console.log(`[clone] dev-harness: replacing the entrypoint's clone at ${workspaceDir} with file://${kgSourceDir}`);
+      for (const entry of readdirSync(workspaceDir)) rmSync(join(workspaceDir, entry), { recursive: true, force: true });
+    }
     console.log(`[clone] dev-harness: cloning from file://${kgSourceDir} into ${workspaceDir}`);
     const cloneResult = spawnSync(
       "git",

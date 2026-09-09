@@ -1483,7 +1483,7 @@ describe("applyWiring for kg-tracker-data", () => {
 
 // ── runKgRefresh() happy and failure paths ────────────────────────────────────
 
-import { runKgRefresh } from "../pipeline/kg-refresh-run.js";
+import { runKgRefresh, devHarnessKgCloneStep } from "../pipeline/kg-refresh-run.js";
 import type { StepModule } from "../pipeline/types.js";
 
 function makeStepModule(outputs: Record<string, unknown> = {}, throwErr?: Error): StepModule {
@@ -4760,5 +4760,50 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
     });
 
     expect(capturedKgDryRun).toBe(true);
+  });
+});
+
+
+// ── devHarnessKgCloneStep — replaces the entrypoint's clone (AII-600) ────────
+describe("devHarnessKgCloneStep", () => {
+  let srcDir: string;
+  let wsDir: string;
+  beforeEach(() => {
+    srcDir = mkdtempSync(join(tmpdir(), "kg-src-"));
+    wsDir = mkdtempSync(join(tmpdir(), "kg-ws-"));
+    initGitRepo(srcDir);
+    process.env.KG_SOURCE_DIR = srcDir;
+  });
+  afterEach(() => {
+    delete process.env.KG_SOURCE_DIR;
+    rmSync(srcDir, { recursive: true, force: true });
+    rmSync(wsDir, { recursive: true, force: true });
+  });
+
+  it("clones into an empty workspace", async () => {
+    const ctx = makeContext();
+    const out = await devHarnessKgCloneStep.run(ctx, { workspaceDir: wsDir }, noopReporter);
+    expect(out.clonedRef).toBe(resolveHead(srcDir));
+    expect(existsSync(join(wsDir, "README.md"))).toBe(true);
+  });
+
+  it("clears a workspace the entrypoint already populated, then clones from /kg-source", async () => {
+    // Simulate session/entrypoint.sh: a throwaway clone (any content) already sits in the workspace.
+    writeFileSync(join(wsDir, "stale.txt"), "from the entrypoint clone");
+    mkdirSync(join(wsDir, ".git"), { recursive: true });
+    const ctx = makeContext();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let printed = "";
+    let out: Record<string, unknown>;
+    try {
+      out = await devHarnessKgCloneStep.run(ctx, { workspaceDir: wsDir }, noopReporter);
+      printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(printed).toContain("replacing the entrypoint's clone");
+    expect(existsSync(join(wsDir, "stale.txt"))).toBe(false);
+    expect(existsSync(join(wsDir, "README.md"))).toBe(true);
+    expect(out!.clonedRef).toBe(resolveHead(srcDir));
   });
 });
