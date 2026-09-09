@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { decodeRunConfig } from "../run-config.js";
@@ -21,9 +21,24 @@ import type { LLMExecutor, PipelineContext, StepReporter, StepModule } from "./t
  * Dev-harness clone step for kg-refresh runs: clones from file:///kg-source (the
  * operator's KG source checkout bind-mounted read-only by the dev harness) rather
  * than from GitHub, so uncommitted edits to sources.yml take effect immediately.
+ *
+ * clone-code-repo and clone-secondary-repos declare no moduleId in pipelines/kg-refresh.yml
+ * (by design — see cloneStep), so they resolve to this same "clone" moduleKey as the
+ * primary workspace clone. Only the primary clone (no targetDir/targets in inputs) should
+ * use the file:// override; delegate everything else to the real cloneStep so the harness
+ * exercises production's clone-depth, incremental-fetch, and credential-helper auth logic
+ * instead of drifting from it (AII-601).
  */
 export const devHarnessKgCloneStep: StepModule = {
-  async run(context: PipelineContext, inputs: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async run(
+    context: PipelineContext,
+    inputs: Record<string, unknown>,
+    reporter: StepReporter,
+  ): Promise<Record<string, unknown>> {
+    if (inputs.targetDir !== undefined || inputs.targets !== undefined) {
+      return cloneStep.run(context, inputs as Parameters<typeof cloneStep.run>[1], reporter);
+    }
+
     const workspaceDir = inputs.workspaceDir as string;
     const kgSourceDir = process.env.KG_SOURCE_DIR ?? "/kg-source";
     // session/entrypoint.sh clones the repo into the workspace for every non-mounted
@@ -62,15 +77,51 @@ export const devHarnessKgCloneStep: StepModule = {
   },
 };
 
+/** Installed location of the credential helper shell script (baked into the session image). */
+const DEV_HARNESS_CREDENTIAL_HELPER_PATH = "/opt/ai-implement/git-credential-helper.sh";
+
 /**
  * Dev-harness dependency-auth step for kg-refresh runs: satisfies the
- * clone-secondary-repos skip condition (acquired=true) using the operator's
- * local GH_TOKEN without contacting the orchestrator.
+ * clone-code-repo / clone-secondary-repos skip condition (acquired=true) using the
+ * operator's local GH_TOKEN without contacting the orchestrator. Installs the same
+ * git credential helper the real dependencyAuthStep installs — clone-code-repo and
+ * clone-secondary-repos clone bare https://github.com/... URLs with no token embedded,
+ * relying entirely on that helper for auth, so the stub must give it something to read.
  */
-function makeDevHarnessDependencyAuthStep(token: string): StepModule {
+export function makeDevHarnessDependencyAuthStep(
+  token: string,
+  testOverrides: {
+    spawnSyncImpl?: typeof spawnSync;
+    writeFileSyncImpl?: (path: string, data: string, options?: { mode?: number }) => void;
+    credentialHelperPath?: string;
+  } = {},
+): StepModule {
   return {
     async run(context: PipelineContext): Promise<Record<string, unknown>> {
+      const spawnFn = testOverrides.spawnSyncImpl ?? spawnSync;
+      const writeFn = testOverrides.writeFileSyncImpl ?? writeFileSync;
+      const credentialHelperPath = testOverrides.credentialHelperPath ?? DEV_HARNESS_CREDENTIAL_HELPER_PATH;
+
       context.data.dependencyToken = token;
+
+      // expires_at: null — the credential helper's `jq -r '.expires_at // empty'` treats
+      // null the same as absent and skips its refresh branch, which is correct here:
+      // there is no orchestrator callback to refresh from in the local dev harness.
+      const tokenFilePath = join("/tmp", `ai-implement-dep-token-${process.pid}.json`);
+      writeFn(tokenFilePath, JSON.stringify({ token, expires_at: null }), { mode: 0o600 });
+      process.env.GIT_DEPENDENCY_TOKEN_FILE = tokenFilePath;
+
+      const configResult = spawnFn(
+        "git",
+        ["config", "--global", "credential.https://github.com.helper", credentialHelperPath],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      if ((configResult.status ?? 1) !== 0) {
+        console.warn(
+          `[dependency-auth] failed to register git credential helper (exit ${configResult.status ?? "null"})`,
+        );
+      }
+
       return { acquired: true, expiresAt: null };
     },
   };
@@ -212,8 +263,15 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
 
   // Dev-harness mode: when AI_IMPLEMENT_DEP_TOKEN_OVERRIDE is set, use a file://
   // clone from the bind-mounted KG source dir and a stub dependency-auth that marks
-  // acquired=true using the operator's local token, satisfying clone-secondary-repos.
+  // acquired=true using the operator's local token, satisfying clone-code-repo and
+  // clone-secondary-repos.
   if (depTokenOverride) {
+    // src/dev-harness/index.ts never encodes dependencyTokenScope into
+    // AI_IMPLEMENT_RUN_CONFIG for kg-refresh — force it on here so the shared
+    // dependency-auth skip in pipeline-loader.ts (`!ctx.data.dependencyTokenScope`)
+    // actually lets the stub below run. Without this, dependency-auth skips
+    // silently and clone-code-repo/clone-secondary-repos skip right after it (AII-601).
+    context.data.dependencyTokenScope = "installation";
     runner.register("clone", opts.stepsOverride?.clone ?? devHarnessKgCloneStep);
     runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? makeDevHarnessDependencyAuthStep(depTokenOverride));
   } else {

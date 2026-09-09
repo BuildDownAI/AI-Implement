@@ -332,12 +332,15 @@ function applyWiring(step: YamlStep): StepDefinition {
           const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
           if (readCodeRepoFromSourcesYml(workspaceDir) === null) {
             console.warn("[clone-code-repo] sources.yml has no code_repo.slug — skipping");
-            return true;
+            return "no code_repo configured in sources.yml";
           }
           // Skip if dependency-auth did not acquire a token: without a git credential
           // helper the clone would fail unauthenticated against a private repo, which
           // would abort the entire kg-refresh pipeline instead of degrading gracefully.
-          return ctx.getOutputs("dependency-auth").acquired !== true;
+          if (ctx.getOutputs("dependency-auth").acquired !== true) {
+            return "dependency-auth did not acquire a token";
+          }
+          return false;
         },
       };
     }
@@ -367,12 +370,14 @@ function applyWiring(step: YamlStep): StepDefinition {
         skip: (ctx: PipelineContext) => {
           // Skip if dependency-auth did not acquire a token: without the git credential
           // helper the clones would fail unauthenticated against private repos.
-          if (ctx.getOutputs("dependency-auth").acquired !== true) return true;
+          if (ctx.getOutputs("dependency-auth").acquired !== true) {
+            return "dependency-auth did not acquire a token";
+          }
           const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
           const repos = readSecondaryReposFromSourcesYml(workspaceDir);
           if (repos.length === 0) {
             console.warn("[clone-secondary-repos] no secondary_repos in sources.yml — skipping");
-            return true;
+            return "no secondary_repos configured in sources.yml";
           }
           return false;
         },

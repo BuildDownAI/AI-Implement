@@ -135,6 +135,54 @@ describe("PipelineRunner", () => {
       expect(pushMod.run).not.toHaveBeenCalled();
     });
 
+    it("logs the skip reason when skip() returns a string", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "clone-code-repo", type: "clone", skip: () => "no code_repo configured in sources.yml" },
+        ],
+      };
+
+      const runner = new PipelineRunner();
+      await runner.run(pipeline, makeContext(), new NoopStepReporter());
+
+      expect(logSpy).toHaveBeenCalledWith(
+        "[runner] skipping clone-code-repo: no code_repo configured in sources.yml",
+      );
+      logSpy.mockRestore();
+    });
+
+    it("logs a generic fallback reason when skip() returns bare true", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [
+          { id: "setup", type: "custom", moduleId: "setup", skip: () => true },
+        ],
+      };
+
+      const runner = new PipelineRunner();
+      await runner.run(pipeline, makeContext(), new NoopStepReporter());
+
+      expect(logSpy).toHaveBeenCalledWith("[runner] skipping setup: skip condition met");
+      logSpy.mockRestore();
+    });
+
+    it("does not log a skip line when skip() returns false", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const pipeline: PipelineDefinition = {
+        id: "test",
+        steps: [{ id: "clone", type: "clone", skip: () => false }],
+      };
+
+      const runner = new PipelineRunner().register("clone", makeModule({}));
+      await runner.run(pipeline, makeContext(), new NoopStepReporter());
+
+      expect(logSpy).not.toHaveBeenCalled();
+      logSpy.mockRestore();
+    });
+
     it("reports running then passed for a successful step", async () => {
       const reports: Step[] = [];
       const reporter: StepReporter = { report: async (s) => { reports.push({ ...s }); } };

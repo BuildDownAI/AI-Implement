@@ -1490,7 +1490,7 @@ describe("applyWiring for kg-tracker-data", () => {
 
 // ── runKgRefresh() happy and failure paths ────────────────────────────────────
 
-import { runKgRefresh, devHarnessKgCloneStep } from "../pipeline/kg-refresh-run.js";
+import { runKgRefresh, devHarnessKgCloneStep, makeDevHarnessDependencyAuthStep } from "../pipeline/kg-refresh-run.js";
 import type { StepModule } from "../pipeline/types.js";
 
 function makeStepModule(outputs: Record<string, unknown> = {}, throwErr?: Error): StepModule {
@@ -3372,7 +3372,7 @@ describe("applyWiring for clone-secondary-repos", () => {
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: tmpDir });
     ctx.setOutputs("dependency-auth", { acquired: false });
-    expect(step!.skip!(ctx)).toBe(true);
+    expect(step!.skip!(ctx)).toBe("dependency-auth did not acquire a token");
   });
 
   it("skip returns true when dependency-auth never ran (no outputs)", () => {
@@ -3387,7 +3387,7 @@ describe("applyWiring for clone-secondary-repos", () => {
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: tmpDir });
     // dependency-auth outputs not set
-    expect(step!.skip!(ctx)).toBe(true);
+    expect(step!.skip!(ctx)).toBe("dependency-auth did not acquire a token");
   });
 
   it("skip returns false when dependency-auth acquired and secondary_repos present", () => {
@@ -3418,7 +3418,7 @@ describe("applyWiring for clone-secondary-repos", () => {
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: tmpDir });
     ctx.setOutputs("dependency-auth", { acquired: true });
-    expect(step!.skip!(ctx)).toBe(true);
+    expect(step!.skip!(ctx)).toBe("no secondary_repos configured in sources.yml");
     expect(warnSpy).toHaveBeenCalledWith(
       "[clone-secondary-repos] no secondary_repos in sources.yml — skipping",
     );
@@ -3728,7 +3728,7 @@ describe("applyWiring for clone-code-repo", () => {
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: tmpDir });
     // No sources.yml in tmpDir → skip
-    expect(step!.skip!(ctx)).toBe(true);
+    expect(step!.skip!(ctx)).toBe("no code_repo configured in sources.yml");
   });
 
   it("skip returns false when sources.yml declares code_repo and dependency-auth acquired", () => {
@@ -3760,7 +3760,7 @@ describe("applyWiring for clone-code-repo", () => {
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: tmpDir });
     ctx.setOutputs("dependency-auth", { acquired: false });
-    expect(step!.skip!(ctx)).toBe(true);
+    expect(step!.skip!(ctx)).toBe("dependency-auth did not acquire a token");
   });
 
   it("skip returns true when dependency-auth never ran (no outputs) even with code_repo present", () => {
@@ -3776,7 +3776,7 @@ describe("applyWiring for clone-code-repo", () => {
     const ctx = makeContext();
     ctx.setOutputs("clone", { workspaceDir: tmpDir });
     // dependency-auth outputs deliberately not set (simulates no scope / missing progress token)
-    expect(step!.skip!(ctx)).toBe(true);
+    expect(step!.skip!(ctx)).toBe("dependency-auth did not acquire a token");
   });
 
   it("inputs include repoOwner, repoRepo, targetDir and empty githubToken", () => {
@@ -3813,7 +3813,7 @@ describe("applyWiring for clone-code-repo", () => {
       const ctx = makeContext();
       ctx.setOutputs("clone", { workspaceDir: tmpDir });
       // tmpDir has no sources.yml
-      expect(step!.skip!(ctx)).toBe(true);
+      expect(step!.skip!(ctx)).toBe("no code_repo configured in sources.yml");
       expect(warnSpy).toHaveBeenCalledWith(
         "[clone-code-repo] sources.yml has no code_repo.slug — skipping",
       );
@@ -4810,6 +4810,50 @@ describe("runKgRefresh — dev-harness dep-token-override", () => {
     expect(capturedAcquired).toBe(true);
   });
 
+  it("acquires a dependency token even when run_config omits dependencyTokenScope entirely (matches the real dev harness — AII-601 regression)", async () => {
+    process.env.AI_IMPLEMENT_DEP_TOKEN_OVERRIDE = "operator-gh-token";
+    // src/dev-harness/index.ts's runConfig for --phase kg-refresh never sets
+    // dependencyTokenScope — only runnerPhase, baseBranch, maxTurns, maxIterations,
+    // profiles. Omitting it here is what the previous test at the describe's first
+    // case masked: with dependencyTokenScope absent, the shared dependency-auth skip
+    // in pipeline-loader.ts (`!ctx.data.dependencyTokenScope`) fired and the stub
+    // below never ran, leaving clone-code-repo/clone-secondary-repos to skip silently.
+    const encoded = encodeRunConfig({
+      v: 1,
+      issue: { id: "kg-1", identifier: "KG-REFRESH", title: "KG refresh", description: "" },
+      runnerPhase: "kg-refresh",
+    });
+    process.env.AI_IMPLEMENT_RUN_CONFIG = encoded;
+
+    let capturedDependencyToken: unknown;
+    let capturedAcquired: unknown;
+    let capturedScope: unknown;
+    const capturingKgTrackerData: StepModule = {
+      run: async (ctx) => {
+        capturedDependencyToken = ctx.data.dependencyToken;
+        capturedAcquired = ctx.getOutputs("dependency-auth").acquired;
+        capturedScope = ctx.data.dependencyTokenScope;
+        return { fetched: false, issueCount: 0 };
+      },
+    };
+
+    await runKgRefresh({
+      workspaceDir: tmpDir,
+      stepsOverride: {
+        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
+        // NO dependencyAuth override — let the built-in makeDevHarnessDependencyAuthStep run
+        kgTrackerData: capturingKgTrackerData,
+        kgIngest: makeStepModule({ statsFile: null }),
+        kgSnapshotPush: makeStepModule({ snapshotPushed: false, commitSha: null }),
+      },
+      reporter: { report: async () => undefined },
+    });
+
+    expect(capturedScope).toBe("installation");
+    expect(capturedAcquired).toBe(true);
+    expect(capturedDependencyToken).toBe("operator-gh-token");
+  });
+
   it("propagates kgDryRun=true to pipeline context when AI_IMPLEMENT_KG_DRY_RUN=true", async () => {
     process.env.AI_IMPLEMENT_KG_DRY_RUN = "true";
 
@@ -4879,5 +4923,123 @@ describe("devHarnessKgCloneStep", () => {
     expect(existsSync(join(wsDir, "stale.txt"))).toBe(false);
     expect(existsSync(join(wsDir, "README.md"))).toBe(true);
     expect(out!.clonedRef).toBe(resolveHead(srcDir));
+  });
+
+  // clone-code-repo and clone-secondary-repos resolve to this same moduleKey (no
+  // moduleId in pipelines/kg-refresh.yml). Forcing AI_IMPLEMENT_WORKSPACE_MODE=mounted
+  // routes the real cloneStep's targetDir/targets branches to a deterministic,
+  // network-free early return — a return shape devHarnessKgCloneStep's own
+  // file:///kg-source logic can never produce, since it ignores targetDir/targets and
+  // always reports cloneMethod "fresh". Observing that shape proves delegation (AII-601).
+  it("delegates to the real cloneStep when inputs.targetDir is set (clone-code-repo)", async () => {
+    process.env.AI_IMPLEMENT_WORKSPACE_MODE = "mounted";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const ctx = makeContext();
+      const out = await devHarnessKgCloneStep.run(
+        ctx,
+        {
+          workspaceDir: wsDir,
+          targetDir: "code-repo",
+          repoOwner: "BuildDownAI",
+          repoRepo: "AI-Implement",
+          branch: "testing",
+          githubToken: "",
+        },
+        noopReporter,
+      );
+      expect(out.workspaceDir).toBe(join(wsDir, "code-repo"));
+      expect(out.cloneMethod).toBe("mounted");
+      expect(warnSpy.mock.calls.map((c) => c.join(" ")).join("\n")).toContain(
+        "mounted mode: skipping secondary clone into code-repo",
+      );
+    } finally {
+      warnSpy.mockRestore();
+      delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+    }
+  });
+
+  it("delegates to the real cloneStep when inputs.targets is set (clone-secondary-repos)", async () => {
+    process.env.AI_IMPLEMENT_WORKSPACE_MODE = "mounted";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const ctx = makeContext();
+      const out = await devHarnessKgCloneStep.run(
+        ctx,
+        {
+          workspaceDir: wsDir,
+          targets: [{ repoOwner: "BuildDownAI", repoRepo: "docs", targetDir: join("repos", "docs") }],
+        },
+        noopReporter,
+      );
+      expect(out).toEqual({ clonedCount: 0 });
+      expect(warnSpy.mock.calls.map((c) => c.join(" ")).join("\n")).toContain(
+        "mounted mode: skipping secondary clones",
+      );
+    } finally {
+      warnSpy.mockRestore();
+      delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+    }
+  });
+});
+
+// ── makeDevHarnessDependencyAuthStep — credential-helper parity (AII-601) ────
+describe("makeDevHarnessDependencyAuthStep", () => {
+  afterEach(() => {
+    delete process.env.GIT_DEPENDENCY_TOKEN_FILE;
+  });
+
+  it("sets context.data.dependencyToken to the override token and returns acquired=true, expiresAt=null", async () => {
+    const ctx = makeContext();
+    const step = makeDevHarnessDependencyAuthStep("operator-gh-token", {
+      writeFileSyncImpl: vi.fn(),
+      spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
+    });
+
+    const out = await step.run(ctx, {}, noopReporter);
+
+    expect(ctx.data.dependencyToken).toBe("operator-gh-token");
+    expect(out).toEqual({ acquired: true, expiresAt: null });
+  });
+
+  it("writes a token cache file with expires_at: null and points GIT_DEPENDENCY_TOKEN_FILE at it", async () => {
+    const writeFileSyncImpl = vi.fn();
+    const ctx = makeContext();
+    const step = makeDevHarnessDependencyAuthStep("operator-gh-token", {
+      writeFileSyncImpl,
+      spawnSyncImpl: vi.fn().mockReturnValue({ status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") }),
+    });
+
+    await step.run(ctx, {}, noopReporter);
+
+    expect(writeFileSyncImpl).toHaveBeenCalledTimes(1);
+    const [writtenPath, writtenData] = writeFileSyncImpl.mock.calls[0];
+    expect(writtenPath).toBe(process.env.GIT_DEPENDENCY_TOKEN_FILE);
+    expect(JSON.parse(writtenData)).toEqual({ token: "operator-gh-token", expires_at: null });
+  });
+
+  it("registers the git credential helper via spawnSync, mirroring dependencyAuthStep", async () => {
+    const spawnCalls: Array<{ cmd: string; args: string[] }> = [];
+    const spawnSyncImpl = vi.fn().mockImplementation((cmd: string, args: string[]) => {
+      spawnCalls.push({ cmd, args });
+      return { status: 0, stdout: Buffer.from(""), stderr: Buffer.from("") };
+    });
+    const ctx = makeContext();
+    const step = makeDevHarnessDependencyAuthStep("operator-gh-token", {
+      writeFileSyncImpl: vi.fn(),
+      spawnSyncImpl,
+      credentialHelperPath: "/opt/ai-implement/git-credential-helper.sh",
+    });
+
+    await step.run(ctx, {}, noopReporter);
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0].cmd).toBe("git");
+    expect(spawnCalls[0].args).toEqual([
+      "config",
+      "--global",
+      "credential.https://github.com.helper",
+      "/opt/ai-implement/git-credential-helper.sh",
+    ]);
   });
 });
