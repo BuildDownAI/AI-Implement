@@ -1843,6 +1843,7 @@ describe("kg-refresh", () => {
     let probeRepo: ReturnType<typeof vi.fn>;
     let mintTokenPf: ReturnType<typeof vi.fn>;
     let fetchWorkflowFile: ReturnType<typeof vi.fn>;
+    let fetchCompare: ReturnType<typeof vi.fn>;
     let preflightTarball: Buffer;
 
     // A claude-implement.yml body that declares runner_phase — the happy path.
@@ -1883,6 +1884,9 @@ describe("kg-refresh", () => {
       probeRepo = vi.fn(async () => ({ ok: true, status: 200 }));
       // fetchWorkflowFile defaults to a workflow that accepts runner_phase; overrides can flip this.
       fetchWorkflowFile = vi.fn(async () => ({ status: 200, content: WORKFLOW_WITH_RUNNER_PHASE }));
+      // fetchCompare defaults to no drift; overrides can flip this. Always mocked so these
+      // tests never make a real network call to GitHub's compare API.
+      fetchCompare = vi.fn(async () => ({ status: 200, behindBy: 0 }));
 
       handle = makeKgRefresh({
         sidecar: { restart: restart as unknown as () => Promise<void> },
@@ -1919,6 +1923,7 @@ describe("kg-refresh", () => {
         loadStage: () => null,
         probeRepo: probeRepo as never,
         fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: fetchCompare as never,
         ...overrides,
       });
     }
@@ -2146,6 +2151,7 @@ describe("kg-refresh", () => {
         fetchDefaultBranch: vi.fn(async () => "main") as never,
         probeRepo: probeRepo as never,
         fetchWorkflowFile: failingWorkflowFetch as never,
+        fetchCompare: fetchCompare as never,
       });
 
       const byGrant = (repo: string, grant: string) => result.results.find((r) => r.repo === repo && r.grant === grant);
@@ -2153,6 +2159,189 @@ describe("kg-refresh", () => {
       expect(byGrant("TestOrg/main-repo", "contents:read")).toMatchObject({ ok: true, status: 200 });
       expect(byGrant("TestOrg/secondary-repo", "pull_requests:read")).toMatchObject({ ok: true, status: 200 });
       expect(byGrant("TestOrg/test-kg", "workflow:runner_phase")).toMatchObject({ ok: false, status: 404 });
+      expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "base:drift")).toMatchObject({ ok: true, status: 200 });
+    });
+
+    // ---- AII-598: base:drift row --------------------------------------------------
+
+    it("drift present — hint carries the commit count, row is ok:true", async () => {
+      buildPreflight({ fetchCompare: vi.fn(async () => ({ status: 200, behindBy: 12 })) as never });
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: vi.fn(async () => ({ status: 200, behindBy: 12 })) as never,
+      });
+      const byGrant = (repo: string, grant: string) => result.results.find((r2) => r2.repo === repo && r2.grant === grant);
+      expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "base:drift")).toMatchObject({
+        ok: true,
+        status: 200,
+        hint: "derivative is 12 commits behind base; run bd-mega-kg-refresh to merge",
+      });
+    });
+
+    it("no drift — row is ok:true with no hint key", async () => {
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: vi.fn(async () => ({ status: 200, behindBy: 0 })) as never,
+      });
+      const row = result.results.find((r) => r.grant === "base:drift");
+      expect(row).toMatchObject({ ok: true, status: 200 });
+      expect(row).not.toHaveProperty("hint");
+    });
+
+    it("custom base_repo: — row's repo field reflects the configured slug", async () => {
+      const pfRepo = mkdtempSync(join(tmpdir(), "kgpf-base-"));
+      writeFileSync(
+        join(pfRepo, "sources.yml"),
+        [
+          `namespace: ${NAMESPACE}`,
+          `code_repo: TestOrg/main-repo`,
+          `base_repo: SomeOrg/some-base`,
+        ].join("\n"),
+      );
+      mkdirSync(join(pfRepo, "snapshot"), { recursive: true });
+      const customTarball = makeTarball(pfRepo);
+      rmSync(pfRepo, { recursive: true, force: true });
+
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => customTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: vi.fn(async () => ({ status: 200, behindBy: 0 })) as never,
+      });
+      const row = result.results.find((r) => r.grant === "base:drift");
+      expect(row?.repo).toBe("SomeOrg/some-base");
+    });
+
+    it("no base_repo: in sources.yml — row's repo field defaults to BuildDownAI/bd-knowledge-graph-base", async () => {
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: vi.fn(async () => ({ status: 200, behindBy: 0 })) as never,
+      });
+      const row = result.results.find((r) => r.grant === "base:drift");
+      expect(row?.repo).toBe("BuildDownAI/bd-knowledge-graph-base");
+    });
+
+    it("base repo unreadable (compare 404) — hint is 'base drift unknown', ok:true, no throw", async () => {
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: vi.fn(async () => ({ status: 404, behindBy: null })) as never,
+      });
+      const row = result.results.find((r) => r.grant === "base:drift");
+      expect(row).toMatchObject({ ok: true, status: 404, hint: "base drift unknown" });
+      expect(result.ok).toBe(true);
+    });
+
+    it("base repo's default-branch lookup itself throws — real status surfaces, not 0", async () => {
+      const fetchDefaultBranchBaseThrows = vi.fn(async (_token: string, owner: string, repoName: string) => {
+        if (owner === "BuildDownAI" && repoName === "bd-knowledge-graph-base") {
+          throw Object.assign(new Error("Not Found"), { status: 404 });
+        }
+        return "main";
+      });
+      const compareForThisTest = vi.fn(async () => ({ status: 200, behindBy: 0 }));
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: fetchDefaultBranchBaseThrows as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: compareForThisTest as never,
+      });
+      const row = result.results.find((r) => r.grant === "base:drift");
+      expect(row).toMatchObject({ ok: true, status: 404, hint: "base drift unknown" });
+      expect(result.ok).toBe(true);
+      // The compare call never happens once the base branch can't be resolved.
+      expect(compareForThisTest).not.toHaveBeenCalled();
+    });
+
+    it("compare call throws — status 0, hint 'base drift unknown', no exception propagates", async () => {
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: vi.fn(async () => { throw new Error("network error"); }) as never,
+      });
+      const row = result.results.find((r) => r.grant === "base:drift");
+      expect(row).toMatchObject({ ok: true, status: 0, hint: "base drift unknown" });
+      expect(result.ok).toBe(true);
+    });
+
+    it("drift never refuses POST /api/kg/refresh even when large — dispatch proceeds (202)", async () => {
+      buildPreflight({ fetchCompare: vi.fn(async () => ({ status: 200, behindBy: 500 })) as never });
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      for (let i = 0; i < 200; i++) {
+        if (dispatchRun.mock.calls.length > 0) break;
+        await new Promise((res2) => setTimeout(res2, 10));
+      }
+      expect(dispatchRun).toHaveBeenCalledOnce();
+    });
+
+    it("base:drift row failing (unreadable) does not disturb the other row shapes or overall ok", async () => {
+      buildPreflight({ fetchCompare: vi.fn(async () => ({ status: 404, behindBy: null })) as never });
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: vi.fn(async () => ({ status: 404, behindBy: null })) as never,
+      });
+      expect(result.ok).toBe(true);
+      const byGrant = (repo: string, grant: string) => result.results.find((r2) => r2.repo === repo && r2.grant === grant);
+      expect(byGrant("TestOrg/test-kg", "contents:write")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("TestOrg/main-repo", "contents:read")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("TestOrg/secondary-repo", "pull_requests:read")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("TestOrg/test-kg", "workflow:runner_phase")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "base:drift")).toMatchObject({ ok: true, status: 404, hint: "base drift unknown" });
     });
   });
 });

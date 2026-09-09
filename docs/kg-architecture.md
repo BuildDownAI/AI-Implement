@@ -205,7 +205,10 @@ or these steps by hand.
    first runs a **credential preflight** (probing the KG write token and the installation-wide
    dependency token against every `code_repo` and `secondary_repos` slug in `sources.yml`) and
    returns `422 preflight-failed` immediately if any grant is missing — before any dispatch or
-   staging attempt. Then it checks whether the source repo snapshot SHA matches the last recorded SHA:
+   staging attempt. The preflight also adds an advisory `base:drift` row (AII-598) reporting how
+   many commits the KG repo is behind `sources.yml`'s `base_repo:` key (default
+   `BuildDownAI/bd-knowledge-graph-base` when absent) — it never contributes to the 422 refusal,
+   it only informs. Then it checks whether the source repo snapshot SHA matches the last recorded SHA:
    - **If the SHA differs** (new snapshot available): fetches `KG_SOURCE_REPO`, stages under
      `/data/kg/staging` (materialize with the image's venv — nothing embeds), writes the
      completion marker last, swaps by rename, and restarts the sidecar.
