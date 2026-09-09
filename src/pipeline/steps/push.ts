@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary } from "../step-utils.js";
+import { formatGitNameStatusSummary, openOrFindPullRequest, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
@@ -9,7 +9,7 @@ import { getPublicationCredential } from "../../publication-credential.js";
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
 
-export const UNAPPROVED_TITLE_PREFIX = "[NEEDS REVIEW — unapproved] ";
+export { UNAPPROVED_TITLE_PREFIX };
 
 export interface ReviewSummary extends Record<string, unknown> {
   terminationReason: string;
@@ -256,79 +256,11 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     // Span covers the POST and the 422 list-open-PRs fallback so re-runs (which
     // hit 422 and pay an extra round-trip) are timed in full, not just the POST.
     const pr = await span("pr-create", async () =>
-      createOrFindPullRequest({ repoOwner, repoRepo, githubToken: activeGithubToken, prTitle, branchName, baseBranch, prBody, draft }),
+      openOrFindPullRequest({ repoOwner, repoRepo, githubToken: activeGithubToken, prTitle, branchName, baseBranch, prBody, draft }),
     );
     return { prUrl: pr.url, prNumber: pr.number, branchPushed: true, commitSha, draft: pr.draft };
   },
 };
-
-interface CreatePrInputs {
-  repoOwner: string;
-  repoRepo: string;
-  githubToken: string;
-  prTitle: string;
-  branchName: string;
-  baseBranch: string;
-  prBody: string;
-  draft: boolean;
-}
-
-/** Create the PR, tolerating 422 (already exists) by finding the open PR. */
-async function createOrFindPullRequest(
-  inputs: CreatePrInputs,
-): Promise<{ url: string; number: number; draft: boolean }> {
-  const { repoOwner, repoRepo, githubToken, prTitle, branchName, baseBranch, prBody, draft } = inputs;
-
-  const create = async (title: string, asDraft: boolean): Promise<Response> =>
-    fetch(`https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${githubToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ title, head: branchName, base: baseBranch, body: prBody, ...(asDraft ? { draft: true } : {}) }),
-    });
-
-  const parseCreated = async (res: Response, asDraft: boolean): Promise<{ url: string; number: number; draft: boolean }> => {
-    const pr = (await res.json()) as { html_url?: unknown; number?: unknown };
-    if (typeof pr.html_url !== "string" || typeof pr.number !== "number") {
-      throw new Error("Unexpected PR creation response shape from GitHub API");
-    }
-    return { url: pr.html_url, number: pr.number, draft: asDraft };
-  };
-
-  const prRes = await create(prTitle, draft);
-  if (prRes.ok) return parseCreated(prRes, draft);
-
-  if (prRes.status === 422) {
-    // Ambiguous: either the PR already exists, or the repo plan rejects draft
-    // PRs. Check for an existing open PR first (existing behavior), then — if
-    // we were drafting — retry as a clearly-titled normal PR so the work is
-    // never vaporized on Free-plan private repos.
-    const listRes = await fetch(
-      `https://api.github.com/repos/${repoOwner}/${repoRepo}/pulls?head=${repoOwner}:${branchName}&state=open`,
-      { headers: { Authorization: `Bearer ${githubToken}` } },
-    );
-    if (!listRes.ok) {
-      const listBody = await listRes.text().catch(() => "");
-      throw new Error(`PR already exists (422) but listing open PRs failed with HTTP ${listRes.status}: ${listBody}`);
-    }
-    const prs = (await listRes.json()) as Array<{ html_url?: unknown; number?: unknown; draft?: unknown }>;
-    if (prs.length > 0) {
-      const existing = prs[0];
-      if (typeof existing.html_url === "string" && typeof existing.number === "number") {
-        return { url: existing.html_url, number: existing.number, draft: existing.draft === true };
-      }
-    }
-    if (draft) {
-      const retryRes = await create(`${UNAPPROVED_TITLE_PREFIX}${prTitle}`, false);
-      if (retryRes.ok) return parseCreated(retryRes, false);
-      const retryBody = await retryRes.text().catch(() => "");
-      throw new Error(`Draft PR rejected (422) and non-draft fallback failed with HTTP ${retryRes.status}: ${retryBody}`);
-    }
-    throw new Error(`PR already exists (422) but no open PR found for branch ${branchName}`);
-  }
-
-  const body = await prRes.text().catch(() => "");
-  throw new Error(`PR creation failed with HTTP ${prRes.status}: ${body}`);
-}
 
 /**
  * Build the `git push` argv and spawn env. When `trace` is true (driven by

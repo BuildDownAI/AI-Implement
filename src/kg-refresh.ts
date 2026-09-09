@@ -6,7 +6,7 @@ import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import http from "node:http";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { fetchRepoTarball } from "./github.js";
+import { fetchRepoTarball, mergePullRequest, closePullRequest, postPrComment } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { COMPLETION_MARKER, KG_DIR } from "./kg-sidecar.js";
@@ -128,7 +128,7 @@ export interface KgRefreshHandle {
    */
   onRunnerComplete(
     outcome: "success" | "failure",
-    data: { snapshotCommit?: string; failureCode?: string; failureReason?: string },
+    data: { snapshotCommit?: string; snapshotPr?: number; failureCode?: string; failureReason?: string },
   ): void;
   /**
    * Called by the reaper when the runner machine is found absent from the registry.
@@ -215,6 +215,12 @@ interface KgRefreshInput {
   fetchCommitVisible?: (token: string, owner: string, repo: string, sha: string) => Promise<boolean>;
   /** Delay between snapshot-commit visibility retries (default: 5000ms). */
   snapshotCommitRetryMs?: number;
+  /** Merge the runner-opened snapshot PR. Injectable for tests; defaults to mergePullRequest from github.ts. */
+  mergePullRequestFn?: typeof mergePullRequest;
+  /** Close the snapshot PR on a failed callback. Injectable for tests; defaults to closePullRequest from github.ts. */
+  closePullRequestFn?: typeof closePullRequest;
+  /** Post the closing comment on the snapshot PR. Injectable for tests; defaults to postPrComment from github.ts. */
+  postPrCommentFn?: typeof postPrComment;
   /** Resolve team key + dependency token scope for the mapping whose owner/repo equals the given string. Injectable for tests; defaults to () => undefined. */
   resolveMappingTeamKey?: (ownerRepo: string) => { teamKey: string; dependencyTokenScope: "installation" | null } | undefined;
   /**
@@ -395,6 +401,9 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const mintRunTokenFn = input.mintRunTokenFn ?? mintRunToken;
   const fetchCommitVisible = input.fetchCommitVisible ?? defaultFetchCommitVisible;
   const snapshotCommitRetryMs = input.snapshotCommitRetryMs ?? SNAPSHOT_COMMIT_RETRY_MS;
+  const mergePullRequestFn = input.mergePullRequestFn ?? mergePullRequest;
+  const closePullRequestFn = input.closePullRequestFn ?? closePullRequest;
+  const postPrCommentFn = input.postPrCommentFn ?? postPrComment;
   const persistStageFn = input.persistStage ?? defaultPersistStage;
   const loadStageFn = input.loadStage ?? defaultLoadStage;
   const persistLastRefreshFn = input.persistLastRefresh ?? defaultPersistLastRefresh;
@@ -675,6 +684,29 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       void input.onOutcome?.("failure", { failureReason: outcome.detail, dispatchId: savedId ?? undefined });
     }
     if (savedJobId !== null) input.closeJobLog?.(savedJobId, outcome.ok ? "completed" : "failed");
+  }
+
+  /** Merges the runner-opened snapshot PR with the "merge" method — never squash/rebase, so `sha` (snapshotCommit) is verifiable as an ancestor of the resulting default-branch head. */
+  async function mergeSnapshotPr(owner: string, repoName: string, prNumber: number, sha: string): Promise<"merged" | "blocked" | "conflict"> {
+    const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
+      permissions: { contents: "write", pull_requests: "write" },
+      repositories: [repoName],
+    });
+    return mergePullRequestFn(token, owner, repoName, prNumber, sha, "merge");
+  }
+
+  /** Closes the snapshot PR with a comment naming the failing gate. Called only when the callback carries a snapshotPr. */
+  async function closeSnapshotPr(owner: string, repoName: string, prNumber: number, gate: string): Promise<void> {
+    const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
+      permissions: { contents: "write", pull_requests: "write" },
+      repositories: [repoName],
+    });
+    await postPrCommentFn(
+      token, owner, repoName, prNumber,
+      `AI-Implement: closing this refresh PR — the run failed (\`${gate}\`). The default branch was left untouched.`,
+    );
+    await closePullRequestFn(token, owner, repoName, prNumber);
+    console.log(`[kg-refresh] closed snapshot PR #${prNumber} (gate=${gate})`);
   }
 
   /** Shared terminal path for lost/timed-out ingest runners. No-op when stage ≠ ingest-running. */
@@ -995,6 +1027,15 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         ingestStartedAt = null;
         persistStageFn("failed", Date.now());
         console.error(`[kg-refresh] runner failed: ${detail}`);
+        // A failed callback that still carries a snapshotPr means the runner opened the
+        // refresh PR before whatever failed — leave the default branch untouched, but
+        // close the dangling PR rather than leaving it open and unmerged.
+        if (data.snapshotPr && input.kgSourceRepo) {
+          const repoForClose = parseKgSourceRepo(input.kgSourceRepo);
+          void closeSnapshotPr(repoForClose.owner, repoForClose.repo, data.snapshotPr, detail).catch((err) => {
+            console.error(`[kg-refresh] failed to close snapshot PR #${data.snapshotPr}: ${String(err)}`);
+          });
+        }
         const savedJobIdF = currentJobId;
         currentJobId = null;
         const savedIdF = currentDispatchId;
@@ -1040,8 +1081,83 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       // Verify the snapshot commit is visible (git-cache lag).
       const repo = parseKgSourceRepo(input.kgSourceRepo);
       const snapshotCommit = data.snapshotCommit;
+      const snapshotPr = data.snapshotPr;
 
       void (async () => {
+        if (snapshotPr) {
+          if (!snapshotCommit) {
+            // Can't safely merge without a sha to check the PR head against — refuse.
+            lastRefresh = {
+              ok: false,
+              at: Date.now(),
+              gate: "staging",
+              detail: `snapshot PR #${snapshotPr} reported without a snapshotCommit — refusing to merge`,
+              stampBefore: null,
+              stampAfter: null,
+            };
+            persistLastRefreshFn(lastRefresh);
+            running = false;
+            stage = "failed";
+            persistStageFn("failed", Date.now());
+            console.error(`[kg-refresh] snapshot PR #${snapshotPr} reported without a snapshotCommit — refusing to merge`);
+            const savedJobIdM = currentJobId;
+            currentJobId = null;
+            const savedIdM = currentDispatchId;
+            currentDispatchId = null;
+            void input.onOutcome?.("failure", {
+              failureReason: `snapshot PR #${snapshotPr} reported without a snapshotCommit`,
+              dispatchId: savedIdM ?? undefined,
+            });
+            if (savedJobIdM !== null) input.closeJobLog?.(savedJobIdM, "failed");
+            return;
+          }
+
+          try {
+            const mergeResult = await mergeSnapshotPr(repo.owner, repo.repo, snapshotPr, snapshotCommit);
+            if (mergeResult !== "merged") {
+              lastRefresh = {
+                ok: false,
+                at: Date.now(),
+                gate: "staging",
+                detail: `merging snapshot PR #${snapshotPr} returned '${mergeResult}'`,
+                stampBefore: null,
+                stampAfter: null,
+              };
+              persistLastRefreshFn(lastRefresh);
+              running = false;
+              stage = "failed";
+              persistStageFn("failed", Date.now());
+              console.error(`[kg-refresh] merging snapshot PR #${snapshotPr} returned '${mergeResult}'`);
+              const savedJobIdB = currentJobId;
+              currentJobId = null;
+              const savedIdB = currentDispatchId;
+              currentDispatchId = null;
+              void input.onOutcome?.("failure", {
+                failureReason: `merging snapshot PR #${snapshotPr} returned '${mergeResult}'`,
+                dispatchId: savedIdB ?? undefined,
+              });
+              if (savedJobIdB !== null) input.closeJobLog?.(savedJobIdB, "failed");
+              return;
+            }
+            console.log(`[kg-refresh] merged snapshot PR #${snapshotPr}`);
+          } catch (err) {
+            const msg = `merging snapshot PR #${snapshotPr} failed: ${String(err)}`;
+            lastRefresh = { ok: false, at: Date.now(), gate: "staging", detail: msg, stampBefore: null, stampAfter: null };
+            persistLastRefreshFn(lastRefresh);
+            running = false;
+            stage = "failed";
+            persistStageFn("failed", Date.now());
+            console.error(`[kg-refresh] ${msg}`);
+            const savedJobIdC = currentJobId;
+            currentJobId = null;
+            const savedIdC = currentDispatchId;
+            currentDispatchId = null;
+            void input.onOutcome?.("failure", { failureReason: msg, dispatchId: savedIdC ?? undefined });
+            if (savedJobIdC !== null) input.closeJobLog?.(savedJobIdC, "failed");
+            return;
+          }
+        }
+
         if (snapshotCommit) {
           // Mint a read token for the source repo to verify commit visibility.
           let visible = false;

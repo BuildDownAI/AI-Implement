@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
+import { openOrFindPullRequest } from "../step-utils.js";
+import { readSecondaryReposFromSourcesYml } from "./kg-tracker-data.js";
 
 /** Coded failure raised when the snapshot parts or embeddings file are absent. */
 export class KgSnapshotMissingError extends Error {
@@ -70,6 +72,8 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
 interface KgSnapshotPushOutputs extends Record<string, unknown> {
   snapshotPushed: boolean;
   commitSha: string | null;
+  /** PR number of the opened refresh PR. Null in mounted/dry-run mode or when repoOwner/repoRepo are absent. */
+  prNumber: number | null;
 }
 
 interface KgStats {
@@ -147,6 +151,91 @@ function readPreviousStamp(workspaceDir: string, clonedRef: string): string | nu
   return r.stdout.toString().trim() || null;
 }
 
+/** Compacts a validated ISO-8601 stamp (Z or ±HH:MM offset) to YYYYMMDDTHHMMSSZ for the branch name. */
+function compactStamp(stamp: string): string {
+  return new Date(stamp).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+/** Lines from ai-output/kg-ingest.log tagged WARN(ING) or ERROR — the report's warnings section. */
+function readIngestWarnings(workspaceDir: string): string[] {
+  const logPath = join(workspaceDir, "ai-output", "kg-ingest.log");
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, "utf-8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && /\bWARN(ING)?\b|\bERROR\b/.test(l));
+}
+
+/** Branch + commit for each secondary repo cloned under repos/<name> by clone-secondary-repos. */
+function readSecondaryRepoOutcomes(workspaceDir: string): Array<{ slug: string; branch: string; commit: string }> {
+  const entries = readSecondaryReposFromSourcesYml(workspaceDir);
+  const results: Array<{ slug: string; branch: string; commit: string }> = [];
+  for (const entry of entries) {
+    const dir = join(workspaceDir, "repos", basename(entry.slug));
+    if (!existsSync(dir)) continue;
+    const branchResult = spawnSync("git", ["branch", "--show-current"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+    const commitResult = spawnSync("git", ["rev-parse", "HEAD"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+    results.push({
+      slug: entry.slug,
+      branch: branchResult.status === 0 ? (branchResult.stdout.toString().trim() || "unknown") : "unknown",
+      commit: commitResult.status === 0 ? (commitResult.stdout.toString().trim() || "unknown") : "unknown",
+    });
+  }
+  return results;
+}
+
+interface RefreshReportInputs {
+  stampCompact: string;
+  quads: number | null;
+  partRows: Array<{ part: string; prev: string; next: string; delta: string }>;
+  teamCounts: Array<{ team: string; count: number }>;
+  secondaryRepos: Array<{ slug: string; branch: string; commit: string }>;
+  ingestWarnings: string[];
+  guardVerdict: string;
+}
+
+/**
+ * Markdown report: per-part line-count table, quads, issue counts by team,
+ * secondary-repo outcomes, ingest warnings, and the guard verdict. Becomes the
+ * refresh PR body (real run) or is printed to the log (dry run) — same shape either way.
+ */
+function buildRefreshReport(data: RefreshReportInputs): string {
+  const lines: string[] = [
+    `## kg-refresh report — ${data.stampCompact}`,
+    "",
+    `**Guard verdict:** ${data.guardVerdict}`,
+    "",
+    "### Per-part line counts",
+    "",
+    "| Part | Prev | New | Delta |",
+    "|---|---|---|---|",
+  ];
+  if (data.partRows.length === 0) {
+    lines.push("| _(no previous snapshot to diff against)_ | | | |");
+  } else {
+    for (const row of data.partRows) lines.push(`| ${row.part} | ${row.prev} | ${row.next} | ${row.delta} |`);
+  }
+  lines.push("", `**Quads serialized:** ${data.quads ?? "unknown"}`, "", "### Issues by team", "");
+  if (data.teamCounts.length === 0) {
+    lines.push("_(no tracker data fetched this run)_");
+  } else {
+    for (const tc of data.teamCounts) lines.push(`- ${tc.team}: ${tc.count}`);
+  }
+  lines.push("", "### Secondary repositories", "");
+  if (data.secondaryRepos.length === 0) {
+    lines.push("_(none configured)_");
+  } else {
+    for (const r of data.secondaryRepos) lines.push(`- \`${r.slug}\` @ ${r.branch} (${r.commit})`);
+  }
+  lines.push("", "### Ingest warnings", "");
+  if (data.ingestWarnings.length === 0) {
+    lines.push("_(none)_");
+  } else {
+    for (const w of data.ingestWarnings) lines.push(`- ${w}`);
+  }
+  return lines.join("\n");
+}
+
 function buildCommitMessage(stats: KgStats | null): string {
   const parts: string[] = ["kg-refresh: update snapshot"];
   if (stats) {
@@ -175,10 +264,12 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
       // Dev-harness mounted workspace: never push. Leave snapshot changes in the
       // mount for the developer to inspect.
-      return { snapshotPushed: false, commitSha: null };
+      return { snapshotPushed: false, commitSha: null, prNumber: null };
     }
 
     const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
+    /** Per-part "prev/new/delta" rows for the report table. Populated by guard 0b when a previous snapshot exists. */
+    const partRows: Array<{ part: string; prev: string; next: string; delta: string }> = [];
 
     // ── 0. Tracker regression guard ──────────────────────────────────────────
     // If the tracker-data step did not fetch (fetched=false) and the previous
@@ -251,12 +342,15 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           const newPartPath = join(workspaceDir, "snapshot", "parts", partName);
           if (!existsSync(newPartPath)) {
             partLogLines.push(`${partName} prev=${prevLines} new=missing`);
+            partRows.push({ part: partName, prev: String(prevLines), next: "missing", delta: "—" });
             regressions.push(`${partName}: missing (was ${prevLines} lines)`);
             continue;
           }
 
           const newLines = readFileSync(newPartPath, "utf-8").split("\n").filter(Boolean).length;
           partLogLines.push(`${partName} prev=${prevLines} new=${newLines}`);
+          const delta = newLines - prevLines;
+          partRows.push({ part: partName, prev: String(prevLines), next: String(newLines), delta: `${delta >= 0 ? "+" : ""}${delta}` });
 
           if (TRACKER_NT_FILES.has(partName) && issueCount > 0 && newLines < prevLines) {
             regressions.push(
@@ -336,15 +430,9 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       }
     }
 
-    // ── dry-run exit ─────────────────────────────────────────────────────────
-    // All guards and validation passed. In dry-run mode (dev-harness kg-refresh)
-    // skip the commit and push; the per-part table was already printed above.
-    if (dryRun) {
-      console.log("[kg-snapshot-push] dry-run: all guards passed; skipping commit and push");
-      return { snapshotPushed: false, commitSha: null };
-    }
-
-    // ── 4. Read stats (best-effort) ──────────────────────────────────────────
+    // ── 4. Read stats (best-effort) ───────────────────────────────────────────
+    // Read before the dry-run exit: the report (printed in dry-run, and the PR
+    // body on a real run) needs the quads figure either way.
     let stats: KgStats | null = null;
     const statsPath = join(workspaceDir, "ai-output", "kg-stats.json");
     if (existsSync(statsPath)) {
@@ -355,6 +443,28 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       }
     } else {
       console.warn("[kg-snapshot-push] ai-output/kg-stats.json absent; commit message will be minimal");
+    }
+
+    const stampCompact = compactStamp(currentStamp);
+    const rawTeamCounts = trackerOutputs.teamCounts;
+    const teamCounts = Array.isArray(rawTeamCounts) ? (rawTeamCounts as Array<{ team: string; count: number }>) : [];
+    const reportBody = buildRefreshReport({
+      stampCompact,
+      quads: stats?.quads ?? null,
+      partRows,
+      teamCounts,
+      secondaryRepos: readSecondaryRepoOutcomes(workspaceDir),
+      ingestWarnings: readIngestWarnings(workspaceDir),
+      guardVerdict: dryRun ? "clean (dry-run — no push)" : "clean",
+    });
+
+    // ── dry-run exit ─────────────────────────────────────────────────────────
+    // All guards and validation passed. In dry-run mode (dev-harness kg-refresh)
+    // skip the commit, push, and PR; print the report instead.
+    if (dryRun) {
+      console.log("[kg-snapshot-push] dry-run: all guards passed; skipping commit, push, and PR");
+      console.log(reportBody);
+      return { snapshotPushed: false, commitSha: null, prNumber: null };
     }
 
     // ── 5. Commit snapshot/ ──────────────────────────────────────────────────
@@ -382,7 +492,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     runGit(workspaceDir, ["commit", "-m", commitMessage], githubToken, "git commit");
     const commitSha = resolveHeadSha(workspaceDir);
 
-    // ── 6. Push directly to default branch (no PR, no feature branch) ────────
+    // ── 6. Push to a per-refresh branch and open the refresh PR ──────────────
     // Refresh the dispatch-time token immediately before the push — the same
     // pattern as push.ts. In Fly/local-docker mode the machine nonce re-mints a
     // fresh token; in GHA mode this returns the current token unchanged.
@@ -395,14 +505,13 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       repo: repoRepo ?? "",
       workspaceDir,
     });
+    const branchName = `kg-refresh/${stampCompact}`;
     // Push with that token embedded in the origin URL — the shape push.ts uses.
     // The entrypoint strips the token from origin at start, and in GitHub Actions
     // mode the refresh does not re-embed it, so without this the push falls to
     // whichever credential helper answers first for github.com; on 2026-09-08
     // that was dependency-auth's read-only token (403). Set through git config,
     // never printed; runGit redacts the token.
-    // --force-with-lease compares against refs/remotes/origin/<defaultBranch>
-    // which the clone step populated.
     if (repoOwner && repoRepo) {
       runGit(
         workspaceDir,
@@ -411,9 +520,38 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
         "git remote set-url origin",
       );
     }
-    runGit(workspaceDir, ["push", "origin", `HEAD:refs/heads/${defaultBranch}`, "--force-with-lease"], activeGithubToken, "git push");
+    // The branch is new per refresh (stamped), so the lease's expected value is
+    // "ref must not currently exist" — an explicit empty expected-sha, not the
+    // ambiguous bare form, since there is no local tracking ref for a brand-new branch.
+    runGit(
+      workspaceDir,
+      ["push", "origin", `HEAD:refs/heads/${branchName}`, `--force-with-lease=refs/heads/${branchName}:`],
+      activeGithubToken,
+      "git push",
+    );
 
-    return { snapshotPushed: true, commitSha };
+    if (!repoOwner || !repoRepo) {
+      // Dev/test scenario with no target repo identity: the branch pushed, but there is
+      // nothing to build a GitHub API URL from, so the refresh PR cannot be opened.
+      console.warn("[kg-snapshot-push] repoOwner/repoRepo absent — pushed the branch but skipped opening the refresh PR");
+      return { snapshotPushed: true, commitSha, prNumber: null };
+    }
+
+    const quadsLabel = stats?.quads != null ? String(stats.quads) : "?";
+    const prTitle = `kg-refresh: snapshot @ ${stampCompact} (${quadsLabel} quads)`;
+    const pr = await openOrFindPullRequest({
+      repoOwner,
+      repoRepo,
+      githubToken: activeGithubToken,
+      prTitle,
+      branchName,
+      baseBranch: defaultBranch,
+      prBody: reportBody,
+      draft: false,
+    });
+    console.log(`[kg-snapshot-push] pr opened #${pr.number}`);
+
+    return { snapshotPushed: true, commitSha, prNumber: pr.number };
   },
 };
 

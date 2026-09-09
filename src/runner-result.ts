@@ -51,6 +51,10 @@ export async function postRunnerResult(params: {
   noWork?: boolean;
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
+  /** SHA of the snapshot commit pushed by a kg-refresh runner. Only meaningful for phase=kg-refresh. */
+  snapshotCommit?: string | null;
+  /** Number of the refresh PR opened alongside snapshotCommit. Only meaningful for phase=kg-refresh. */
+  snapshotPr?: number | null;
   /**
    * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
    * Falls back to the legacy RUNNER_CALLBACK_URL env var (never set in GHA envelope mode,
@@ -76,6 +80,8 @@ export async function postRunnerResult(params: {
   if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
     body.referenceRepoResults = params.referenceRepoResults;
   }
+  if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
+  if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
   const fetchFn = params.fetchImpl ?? fetch;
   try {
     const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {

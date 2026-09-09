@@ -248,10 +248,13 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     return { exitCode: 1 };
   }
 
+  const snapshotPushOutputs = context.getOutputs("kg-snapshot-push");
   await postRunnerResult({
     phase: "kg-refresh",
     workspaceDir,
     outcome: "success",
+    snapshotCommit: typeof snapshotPushOutputs.commitSha === "string" ? snapshotPushOutputs.commitSha : undefined,
+    snapshotPr: typeof snapshotPushOutputs.prNumber === "number" ? snapshotPushOutputs.prNumber : undefined,
     callbackUrl,
     fetchImpl: opts.fetchImpl,
   });
