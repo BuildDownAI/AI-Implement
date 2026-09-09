@@ -90,7 +90,7 @@ describe("runDevHarnessCli", () => {
 
     expect(exitCode).toBe(1);
     expect(deps.startDevRun).not.toHaveBeenCalled();
-    expect(deps.writeStderr).toHaveBeenCalledWith(expect.stringContaining("implementation, planning, or full"));
+    expect(deps.writeStderr).toHaveBeenCalledWith(expect.stringContaining("kg-refresh"));
   });
 
   it.each([

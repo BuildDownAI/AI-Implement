@@ -85,6 +85,8 @@ export interface PipelineContextData {
   dependencyToken?: string;
   /** Autonomous runner: expiry timestamp for the dependency token (ISO 8601). */
   dependencyTokenExpiresAt?: string;
+  /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
+  kgDryRun?: boolean;
 }
 
 export interface PipelineContext {

@@ -50,6 +50,12 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
   /** HEAD SHA at clone time — used to read the previous snapshot stamp. */
   clonedRef: string;
   /**
+   * When true (set by the dev-harness kg-refresh phase): run all regression
+   * guards and print the per-part line-count table, but skip commit and push.
+   * Returns { snapshotPushed: false, commitSha: null }.
+   */
+  dryRun?: boolean;
+  /**
    * Target repo, from the clone step's outputs. When both are present the push
    * sets `origin` to a token-in-URL remote with the run's active primary token —
    * the same push shape as `push.ts` — so no credential helper decides the push.
@@ -172,7 +178,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       return { snapshotPushed: false, commitSha: null };
     }
 
-    const { workspaceDir, githubToken, defaultBranch, clonedRef, repoOwner, repoRepo } = inputs;
+    const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
 
     // ── 0. Tracker regression guard ──────────────────────────────────────────
     // If the tracker-data step did not fetch (fetched=false) and the previous
@@ -328,6 +334,14 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           `stamp "${currentStamp}" is not newer than previous "${previousStamp}"`,
         );
       }
+    }
+
+    // ── dry-run exit ─────────────────────────────────────────────────────────
+    // All guards and validation passed. In dry-run mode (dev-harness kg-refresh)
+    // skip the commit and push; the per-part table was already printed above.
+    if (dryRun) {
+      console.log("[kg-snapshot-push] dry-run: all guards passed; skipping commit and push");
+      return { snapshotPushed: false, commitSha: null };
     }
 
     // ── 4. Read stats (best-effort) ──────────────────────────────────────────

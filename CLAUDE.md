@@ -89,7 +89,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
 | Issueless run kinds (kg-refresh lifecycle and pattern) | `src/kg-refresh.ts`, `src/index.ts` | [docs/issueless-runs.md](docs/issueless-runs.md) |
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
-| Runner context settings (skills repo, dependency token scope) | `src/pipeline/steps/install-skills.ts`, `src/pipeline/steps/dependency-auth.ts` | [docs/runner-context.md](docs/runner-context.md) |
+| Runner context settings (skills repo, reference repositories, dependency token scope) | `src/pipeline/steps/install-skills.ts`, `src/pipeline/steps/reference-repos.ts`, `src/pipeline/steps/dependency-auth.ts` | [docs/runner-context.md](docs/runner-context.md) |
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | Knowledge graph end-to-end (ingest → snapshot → image → serve) | `Dockerfile` KG stages, `docker-entrypoint.sh` | [docs/kg-architecture.md](docs/kg-architecture.md) |
 | KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
@@ -141,6 +141,24 @@ The task file is Markdown with front matter: `title` required; `identifier`, `ma
 - The clone and install steps both detect mounted mode and no-op, so uncommitted edits take effect immediately and your `node_modules` is left alone.
 
 Per-run artifacts land in `.dev-runs/<timestamp>/` (gitignored): `run.log`, `changes.diff`, `diffstat.txt`, `telemetry.json`.
+
+### kg-refresh phase
+
+`--phase kg-refresh` runs the kg-refresh pipeline locally without a mounted workspace — the operator's KG source checkout is the workspace, and the container clones it via `file://` rather than binding it directly. This lets the pipeline exercise the real clone and secondary-repo paths (branch selection, depth, credential helper) against uncommitted local edits to `sources.yml`.
+
+```bash
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --tracker-data td.json
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --tracker-data td.json --until clone-secondary-repos
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --tracker-data td.json --until kg-ingest --shell
+```
+
+`--tracker-data <file>` is required for this phase. The file is a pre-fetched tracker-data JSON (shape: the body returned by `POST /api/runner/kg-tracker-data`) and is bind-mounted read-only at `/dev-tracker-data.json`; the `kg-tracker-data` pipeline step detects it via `KG_TRACKER_DATA_FILE` and skips the orchestrator fetch.
+
+The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE`, which activates a stub `dependency-auth` step that satisfies the `clone-secondary-repos` skip condition (`acquired=true`) without contacting the orchestrator.
+
+`kg-snapshot-push` runs in **dry-run mode** for all local kg-refresh runs (`AI_IMPLEMENT_KG_DRY_RUN=true`): all regression guards and validation run, the per-part line-count table is printed to the log, but no commit or push happens. This lets you verify the snapshot guard verdict locally before dispatching to a real run.
+
+`--until` and `--shell` are both supported for this phase. The shell opens in `/workspace` (the scratch clone inside the container); `git remote -v` shows `file:///kg-source` and `cat sources.yml` shows the uncommitted local version.
 
 ## Running tests
 

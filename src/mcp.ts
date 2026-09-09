@@ -1,4 +1,5 @@
 import http from "node:http";
+import type { PreflightCheckResult } from "./kg-refresh.js";
 import { verifyMcpToken } from "./mcp-oauth.js";
 import { getRunnerMode } from "./runner-mode.js";
 import { getMappings } from "./config.js";
@@ -37,7 +38,7 @@ const DIAG_TOOLS = [
   {
     name: "get_tenant_health",
     description:
-      "Returns an orchestrator health summary: runner mode, in-flight job count, pending gap-fill queue count, and project count. Use as a first-pass check before digging deeper.",
+      "Returns an orchestrator health summary: runner mode, in-flight job count, pending gap-fill queue count, project count, and (when a KG source repo is configured) a live credential preflight for the kg-refresh rail (`kgRefreshPreflight` with one row per repo and grant). Use as a first-pass check before digging deeper.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -106,7 +107,7 @@ const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
 async function callDiagnosticTool(
   name: string,
   args: Record<string, unknown>,
-  context: { defaultRunnerImage?: string } = {},
+  context: { defaultRunnerImage?: string; runKgRefreshPreflight?: () => Promise<PreflightCheckResult> } = {},
 ): Promise<unknown> {
   switch (name) {
     case "get_tenant_health": {
@@ -117,7 +118,10 @@ async function callDiagnosticTool(
         .prepare("SELECT COUNT(*) as n FROM comment_gapfill_queue WHERE status = 'pending'")
         .get() as { n: number };
       const projectCount = Object.keys(getMappings()).length;
-      return { runnerMode: { mode, source }, inFlightJobCount: inFlight.length, pendingGapfillCount, projectCount, kgDegraded: isKgDegraded() };
+      const kgRefreshPreflight = context.runKgRefreshPreflight
+        ? await context.runKgRefreshPreflight()
+        : null;
+      return { runnerMode: { mode, source }, inFlightJobCount: inFlight.length, pendingGapfillCount, projectCount, kgDegraded: isKgDegraded(), kgRefreshPreflight };
     }
 
     case "get_runner_mode": {
@@ -144,6 +148,7 @@ async function callDiagnosticTool(
         maxJobMinutes: m.maxJobMinutes,
         branchPrefix: m.branchPrefix,
         skillsRepo: m.skillsRepo,
+        referenceRepos: m.referenceRepos,
         dependencyTokenScope: m.dependencyTokenScope,
         sensitiveAddPatterns: m.sensitiveAddPatterns,
         sensitiveAllowPatterns: m.sensitiveAllowPatterns,
@@ -248,6 +253,7 @@ export async function handleMcpRequest(
   baseUrl: string | null,
   providerDiagnostic?: string | null,
   defaultRunnerImage?: string,
+  runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -312,7 +318,7 @@ export async function handleMcpRequest(
     if (DIAG_TOOL_NAMES.has(toolName)) {
       const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
       try {
-        const result = await callDiagnosticTool(toolName, toolArgs, { defaultRunnerImage });
+        const result = await callDiagnosticTool(toolName, toolArgs, { defaultRunnerImage, runKgRefreshPreflight });
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,

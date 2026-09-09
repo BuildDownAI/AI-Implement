@@ -20,13 +20,17 @@ import { collectPlanningArtifact } from "./planning-artifacts.js";
 
 export type { ParsedTaskFile };
 
-export type DevRunPhase = "implementation" | "planning" | "full";
+export type DevRunPhase = "implementation" | "planning" | "full" | "kg-refresh";
 
 export interface DevRunOptions {
   /** Absolute or relative path to the local target-repo checkout. */
   workspace: string;
-  /** Path to the task markdown file (YAML front matter + body). */
-  task: string;
+  /**
+   * Path to the task markdown file (YAML front matter + body).
+   * Required for implementation, planning, and full phases.
+   * Optional for kg-refresh (synthetic defaults are used when absent).
+   */
+  task?: string;
   /** Runner image. Defaults to LOCAL_RUNNER_IMAGE env var or ai-implement-runner:local. */
   image?: string;
   /** Anthropic API key. Falls back to ANTHROPIC_API_KEY env var. */
@@ -43,6 +47,13 @@ export interface DevRunOptions {
   env?: Record<string, string>;
   /** Runner phase. Defaults to implementation. */
   phase?: DevRunPhase;
+  /**
+   * Path to the pre-fetched tracker-data JSON file. Required when phase=kg-refresh.
+   * Mounted read-only at /dev-tracker-data.json inside the container; the
+   * kg-tracker-data step detects KG_TRACKER_DATA_FILE=/dev-tracker-data.json and
+   * uses the file instead of fetching from the orchestrator.
+   */
+  trackerData?: string;
   /**
    * Run only up through this named step (by step id), then stop. The critical
    * case is "setup": clone/mount → install → setup hook, no Claude invocation,
@@ -123,7 +134,20 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
   const artifactsDir = opts.artifactsDir ?? join(process.cwd(), ".dev-runs", ts);
   await mkdir(artifactsDir, { recursive: true });
 
-  const task = parseTaskFileFromPath(opts.task, `DEV-${Math.floor(Date.now() / 1000)}`);
+  const phase = opts.phase ?? "implementation";
+
+  const task = opts.task
+    ? parseTaskFileFromPath(opts.task, `DEV-${Math.floor(Date.now() / 1000)}`)
+    : {
+        identifier: "KG-DEV",
+        title: "KG refresh (local dev)",
+        description: "Local dev kg-refresh run",
+        maxTurns: undefined,
+        maxIterations: undefined,
+        repo: undefined,
+        branch: undefined,
+        profiles: undefined,
+      };
 
   const anthropicApiKey = opts.anthropicApiKey ?? process.env.ANTHROPIC_API_KEY ?? "";
   const claudeOAuthToken = opts.claudeOAuthToken ?? process.env.CLAUDE_CODE_OAUTH_TOKEN ?? "";
@@ -150,7 +174,6 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
   const issueId = randomUUID();
   const runId = randomUUID();
   const containerName = sanitizeContainerName(task.identifier);
-  const phase = opts.phase ?? "implementation";
   const runnerPhase = phase === "full" ? "implementation" : phase;
   const entryPhase = phase === "planning" ? "local-planning" : phase;
 
@@ -163,6 +186,66 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     ...(task.maxIterations !== undefined ? { maxIterations: task.maxIterations } : {}),
     ...(task.profiles !== undefined ? { profiles: task.profiles } : {}),
   });
+
+  if (phase === "kg-refresh") {
+    // kg-refresh runs non-mounted: the KG source repo is cloned from file:///kg-source
+    // inside the container. AI_IMPLEMENT_DEP_TOKEN_OVERRIDE carries the operator's GH_TOKEN
+    // to satisfy clone-secondary-repos without an orchestrator token vend.
+    const trackerData = opts.trackerData ? resolve(opts.trackerData) : "";
+    const operatorGhToken = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? githubToken;
+
+    const allEnv: Record<string, string> = {
+      AI_IMPLEMENT_MODE: "local",
+      AI_IMPLEMENT_LOG_LEVEL: logLevel,
+      AI_IMPLEMENT_KG_DRY_RUN: "true",
+      AI_IMPLEMENT_RUN_CONFIG: runConfig,
+      KG_TRACKER_DATA_FILE: "/dev-tracker-data.json",
+      ...(opts.untilStep ? { AI_IMPLEMENT_UNTIL_STEP: opts.untilStep } : {}),
+      ...(opts.shell ? { AI_IMPLEMENT_SHELL_MODE: "true" } : {}),
+      ISSUE_ID: issueId,
+      ISSUE_IDENTIFIER: task.identifier,
+      ISSUE_TITLE: task.title,
+      ISSUE_DESCRIPTION: task.description,
+      GITHUB_OWNER: repoOwner,
+      GITHUB_REPO: repoName,
+      GITHUB_DEFAULT_BRANCH: branch,
+      GITHUB_TOKEN: githubToken,
+      SESSION_TOKEN: runId,
+      MACHINE_NONCE: runId,
+      SESSION_MODE: "autonomous",
+      RUNNER_PHASE: entryPhase,
+      AI_IMPLEMENT_DEP_TOKEN_OVERRIDE: operatorGhToken,
+      ...(process.getuid ? { AI_IMPLEMENT_HOST_UID: String(process.getuid()) } : {}),
+      ...(process.getgid ? { AI_IMPLEMENT_HOST_GID: String(process.getgid()) } : {}),
+      ...(anthropicApiKey ? { ANTHROPIC_API_KEY: anthropicApiKey } : {}),
+      ...(claudeOAuthToken ? { CLAUDE_CODE_OAUTH_TOKEN: claudeOAuthToken } : {}),
+      ...(opts.env ?? {}),
+    };
+
+    const { publicEnv, secretEnv } = splitLocalRunnerEnv(allEnv);
+
+    const session = await launchLocalSession({
+      containerName,
+      image,
+      publicEnv,
+      secretEnv,
+      extraVolumes: [
+        `${workspace}:/kg-source:ro`,
+        ...(trackerData ? [`${trackerData}:/dev-tracker-data.json:ro`] : []),
+      ],
+    });
+
+    return {
+      runId,
+      containerId: session.containerId,
+      containerName: session.containerName,
+      artifactsDir,
+      startedAt: session.startedAt,
+      task,
+      workspace,
+      phase,
+    };
+  }
 
   const allEnv: Record<string, string> = {
     AI_IMPLEMENT_MODE: "local",

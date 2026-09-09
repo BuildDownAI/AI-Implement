@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
+import type { PreflightCheckResult } from "../kg-refresh.js";
 
 vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
@@ -233,13 +234,14 @@ async function callMcp(
   method = "POST",
   body?: string,
   providerDiagnostic?: string | null,
+  runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
     tokenValid ? { email: "user@example.com", sub: "sub1", provider: "google" } : null,
   );
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
-  handleMcpRequest(req as never, res as never, provider, baseUrl, providerDiagnostic);
+  handleMcpRequest(req as never, res as never, provider, baseUrl, providerDiagnostic, undefined, runKgRefreshPreflight);
   await res.done;
   return { statusCode: res.statusCode, body: res.body, responseHeaders: res.responseHeaders };
 }
@@ -548,6 +550,51 @@ describe("handleMcpRequest", () => {
       expect(data.kgDegraded).toBe(false);
     });
 
+    it("get_tenant_health kgRefreshPreflight is null when runKgRefreshPreflight is not wired", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 15, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.kgRefreshPreflight).toBeNull();
+    });
+
+    it("get_tenant_health includes kgRefreshPreflight result when runKgRefreshPreflight is wired", async () => {
+      const preflightResult: PreflightCheckResult = {
+        ok: false,
+        checkedAt: 1700000000000,
+        results: [
+          { repo: "org/kg-repo", grant: "contents:write", ok: true, status: 200 },
+          { repo: "org/code-repo", grant: "contents:read", ok: false, status: 404 },
+        ],
+      };
+      const runKgRefreshPreflightMock = vi.fn(async () => preflightResult);
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 16, method: "tools/call", params: { name: "get_tenant_health", arguments: {} } }),
+        undefined,
+        runKgRefreshPreflightMock,
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.kgRefreshPreflight).toEqual(preflightResult);
+      expect(runKgRefreshPreflightMock).toHaveBeenCalledOnce();
+    });
+
     it("handles get_runner_mode", async () => {
       (runnerModeMock.getRunnerMode as ReturnType<typeof vi.fn>).mockReturnValue({ mode: "fly", source: "env" });
 
@@ -636,6 +683,7 @@ describe("handleMcpRequest", () => {
           maxJobMinutes: 60,
           branchPrefix: "feat",
           skillsRepo: "org/skills",
+          referenceRepos: [{ repo: "https://github.com/org/source", path: "refs/source", ref: "v1.1.0" }],
           dependencyTokenScope: "installation",
           sensitiveAddPatterns: ["*.pem", "secrets/**"],
           sensitiveAllowPatterns: ["public/**"],
@@ -670,6 +718,10 @@ describe("handleMcpRequest", () => {
       expect(p.maxJobMinutes).toBe(60);
       expect(p.branchPrefix).toBe("feat");
       expect(p.skillsRepo).toBe("org/skills");
+      // Entries round-trip whole: the tool projects named fields, so a dropped one is silent.
+      expect(p.referenceRepos).toEqual([
+        { repo: "https://github.com/org/source", path: "refs/source", ref: "v1.1.0" },
+      ]);
       expect(p.dependencyTokenScope).toBe("installation");
       expect(p.sensitiveAddPatterns).toEqual(["*.pem", "secrets/**"]);
       expect(p.sensitiveAllowPatterns).toEqual(["public/**"]);
