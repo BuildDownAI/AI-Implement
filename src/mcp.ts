@@ -144,6 +144,7 @@ async function callDiagnosticTool(
         maxJobMinutes: m.maxJobMinutes,
         branchPrefix: m.branchPrefix,
         skillsRepo: m.skillsRepo,
+        referenceRepos: m.referenceRepos,
         dependencyTokenScope: m.dependencyTokenScope,
         sensitiveAddPatterns: m.sensitiveAddPatterns,
         sensitiveAllowPatterns: m.sensitiveAllowPatterns,

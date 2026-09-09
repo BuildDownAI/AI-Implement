@@ -89,7 +89,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
 | Issueless run kinds (kg-refresh lifecycle and pattern) | `src/kg-refresh.ts`, `src/index.ts` | [docs/issueless-runs.md](docs/issueless-runs.md) |
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
-| Runner context settings (skills repo, dependency token scope) | `src/pipeline/steps/install-skills.ts`, `src/pipeline/steps/dependency-auth.ts` | [docs/runner-context.md](docs/runner-context.md) |
+| Runner context settings (skills repo, reference repositories, dependency token scope) | `src/pipeline/steps/install-skills.ts`, `src/pipeline/steps/reference-repos.ts`, `src/pipeline/steps/dependency-auth.ts` | [docs/runner-context.md](docs/runner-context.md) |
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | Knowledge graph end-to-end (ingest → snapshot → image → serve) | `Dockerfile` KG stages, `docker-entrypoint.sh` | [docs/kg-architecture.md](docs/kg-architecture.md) |
 | KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
