@@ -29,7 +29,9 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
-        uses: anthropics/claude-code-action@v1
+        # Pinned: floating @v1 moved to a build (0d0e0876) that broke the native
+        # binary install, failing every review within ~15s from 2026-09-08 22:20Z.
+        uses: anthropics/claude-code-action@5ccc3a35a6367cdb8e6fbd0728287467540ecfe2  # v1.0.219
         with:
           allowed_bots: "*"
           track_progress: true # ✨ Enables tracking comments        
