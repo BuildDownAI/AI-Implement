@@ -870,6 +870,27 @@ export async function mergePullRequest(
   });
 }
 
+/**
+ * Closes an open PR without merging (state: "closed"). Used to close a kg-refresh
+ * snapshot PR whose callback reported failure, leaving a record of what was attempted.
+ */
+export async function closePullRequest(
+  token: string, owner: string, repo: string, prNumber: number,
+): Promise<void> {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+    method: "PATCH", headers: ghHeaders(token),
+    body: JSON.stringify({ state: "closed" }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new GitHubApiError({
+      status: res.status, path: `/repos/${owner}/${repo}/pulls/${prNumber}`,
+      bodyText: body, message: `closePullRequest(#${prNumber}) failed: HTTP ${res.status}: ${body}`,
+    });
+  }
+}
+
 export async function addCommentReaction(
   token: string,
   owner: string,

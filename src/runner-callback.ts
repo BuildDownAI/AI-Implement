@@ -71,6 +71,14 @@ export interface RunnerResultBody {
    * Only present for phase=kg-refresh.
    */
   snapshotCommit?: string;
+  /**
+   * Number of the refresh PR opened by a kg-refresh runner alongside snapshotCommit.
+   * The orchestrator merges it on a successful callback or closes it on a failed one.
+   * Only present for phase=kg-refresh.
+   */
+  snapshotPr?: number;
+  /** The `kg-refresh/<stamp>` branch behind snapshotPr; deleted by the orchestrator after merge or close. */
+  snapshotBranch?: string;
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
 }
@@ -88,7 +96,7 @@ export interface HandleRunnerResultInput {
    */
   onKgRefreshRunnerComplete?: (
     outcome: "success" | "failure",
-    data: { snapshotCommit?: string; failureCode?: string; failureReason?: string },
+    data: { snapshotCommit?: string; snapshotPr?: number; snapshotBranch?: string; failureCode?: string; failureReason?: string },
   ) => void;
 }
 
@@ -272,6 +280,8 @@ export async function handleRunnerResult(
     }
     input.onKgRefreshRunnerComplete?.(input.body.outcome, {
       snapshotCommit: input.body.snapshotCommit,
+      snapshotPr: input.body.snapshotPr,
+      snapshotBranch: input.body.snapshotBranch,
       failureCode: input.body.failureCode,
       failureReason: input.body.failureReason,
     });

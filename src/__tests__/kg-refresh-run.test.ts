@@ -520,7 +520,7 @@ describe("kgSnapshotPushStep", () => {
     }
   });
 
-  it("--force-with-lease rejects a push when the remote advanced concurrently", async () => {
+  it("--force-with-lease rejects a push when the refresh branch already exists on the remote", async () => {
     const bareDir = mkdtempSync(join(tmpdir(), "kgpush-bare2-"));
     // Derive a non-existing path for the clone so git clone creates it fresh.
     const otherDir = `${bareDir}-other`;
@@ -534,16 +534,18 @@ describe("kgSnapshotPushStep", () => {
       execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
       const clonedRef = resolveHead(tmpDir);
 
-      // Simulate a concurrent commit landing on origin after we cloned.
+      // Simulate someone else having already pushed this exact stamp's refresh branch —
+      // the push's "--force-with-lease=refs/heads/kg-refresh/<stamp>:" expects the ref to
+      // be absent, so a concurrent creation must make our push fail the lease check.
       execSync(`git clone "${bareDir}" "${otherDir}"`, { stdio: "ignore" });
       execSync("git config user.name other", { cwd: otherDir, stdio: "ignore" });
       execSync("git config user.email other@example.com", { cwd: otherDir, stdio: "ignore" });
       writeFileSync(join(otherDir, "concurrent.txt"), "concurrent\n");
       execSync("git add concurrent.txt", { cwd: otherDir, stdio: "ignore" });
       execSync("git commit -m concurrent", { cwd: otherDir, stdio: "ignore" });
-      execSync("git push origin HEAD:refs/heads/main", { cwd: otherDir, stdio: "ignore" });
+      // Stamp below is "2026-09-03T10:00:00Z" → compact branch "kg-refresh/20260903T100000Z".
+      execSync("git push origin HEAD:refs/heads/kg-refresh/20260903T100000Z", { cwd: otherDir, stdio: "ignore" });
 
-      // Now origin/main is ahead of our refs/remotes/origin/main tracking ref.
       mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
       writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
       writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
@@ -1043,7 +1045,7 @@ describe("kgTrackerDataStep", () => {
       { callbackUrl: null, workspaceDir: tmpDir, fetchImpl },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
     expect(capturedCalls).toHaveLength(0);
   });
 
@@ -1056,7 +1058,7 @@ describe("kgTrackerDataStep", () => {
       { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
     expect(capturedCalls).toHaveLength(0);
   });
 
@@ -1075,7 +1077,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: true, issueCount: 1 });
+    expect(result).toEqual({ fetched: true, issueCount: 1, teamCounts: [{ team: "AII", count: 1 }] });
     expect(written).toHaveLength(1);
     expect(written[0][0]).toBe(join(tmpDir, "tracker-data.json"));
     expect(JSON.parse(written[0][1])).toEqual(issues);
@@ -1107,7 +1109,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: true, issueCount: 2 });
+    expect(result).toEqual({ fetched: true, issueCount: 2, teamCounts: [{ team: "AII", count: 2 }] });
     expect(fetchCalls).toHaveLength(2);
     expect(fetchCalls[0].cursor).toBeUndefined();
     expect(fetchCalls[0].teamKey).toBe("AII");
@@ -1144,7 +1146,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
   });
 
   it("throws KgTrackerDataFetchError when fetchImpl rejects (network error)", async () => {
@@ -1209,7 +1211,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: true, issueCount: 3 });
+    expect(result).toEqual({ fetched: true, issueCount: 3, teamCounts: [{ team: "AII", count: 1 }, { team: "BDS", count: 2 }] });
     expect(requestBodies).toHaveLength(2);
     expect(requestBodies[0].teamKey).toBe("AII");
     expect(requestBodies[1].teamKey).toBe("BDS");
@@ -1253,7 +1255,7 @@ describe("kgTrackerDataStep", () => {
       },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
     expect(capturedCalls).toHaveLength(0);
   });
 
@@ -1333,7 +1335,7 @@ trackers:
       { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
     expect(capturedCalls).toHaveLength(0);
   });
 
@@ -1361,7 +1363,7 @@ trackers:
       { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
       noopReporter,
     );
-    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
     expect(capturedCalls).toHaveLength(0);
   });
 
@@ -4052,7 +4054,7 @@ describe("kgSnapshotPushStep — dryRun flag", () => {
     };
   }
 
-  it("returns { snapshotPushed: false, commitSha: null } without pushing when dryRun=true", async () => {
+  it("returns { snapshotPushed: false, commitSha: null, prNumber: null } without pushing when dryRun=true", async () => {
     initGitRepo(tmpDir);
     const clonedRef = resolveHead(tmpDir);
 
@@ -4065,6 +4067,48 @@ describe("kgSnapshotPushStep — dryRun flag", () => {
     const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter);
     expect(result.snapshotPushed).toBe(false);
     expect(result.commitSha).toBeNull();
+    expect(result.prNumber).toBeNull();
+  });
+
+  it("prints the refresh report (per-part table, quads, team counts, guard verdict) and opens nothing when dryRun=true", async () => {
+    initGitRepo(tmpDir);
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-05T08:00:00Z");
+    mkdirSync(join(tmpDir, "ai-output"), { recursive: true });
+    writeFileSync(join(tmpDir, "ai-output", "kg-stats.json"), JSON.stringify({ quads: 777 }));
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 2, teamCounts: [{ team: "AII", count: 2 }] });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let result;
+    let printed = "";
+    try {
+      result = await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, dryRun: true, repoOwner: "acme", repoRepo: "kg-repo" }),
+        noopReporter,
+      );
+      // Read the calls before mockRestore — restore resets the recorded calls.
+      printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(result.snapshotPushed).toBe(false);
+    expect(result.prNumber).toBeNull();
+    expect(printed).toContain("kg-refresh report — 20260905T080000Z");
+    expect(printed).toContain("**Quads serialized:** 777");
+    expect(printed).toContain("- AII: 2");
+    expect(printed).toContain("**Guard verdict:** clean (dry-run — no push)");
+
+    // No branch was created locally — dry run touches no git remote state.
+    const branches = execSync("git branch --list", { cwd: tmpDir }).toString();
+    expect(branches).not.toContain("kg-refresh/");
   });
 
   it("still throws KgSnapshotMissingError for missing parts when dryRun=true", async () => {
@@ -4092,6 +4136,177 @@ describe("kgSnapshotPushStep — dryRun flag", () => {
     await expect(
       kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef, dryRun: true }), noopReporter),
     ).rejects.toBeInstanceOf(KgSnapshotTrackerRegressionError);
+  });
+});
+
+// ── kgSnapshotPushStep — refresh PR flow ──────────────────────────────────────
+// Real git throughout (guards, commit, push); only the GitHub REST call for the PR
+// is stubbed. The token-embedded https://github.com/... origin the step sets is
+// redirected to the local bare remote via `git config url.<bare>.insteadOf <url>`,
+// so the push itself is real and inspectable rather than hitting the network.
+
+describe("kgSnapshotPushStep — refresh PR flow", () => {
+  let tmpDir: string;
+  let bareDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgpush-pr-"));
+    bareDir = mkdtempSync(join(tmpdir(), "kgpush-pr-bare-"));
+    execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(bareDir, { recursive: true, force: true });
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+    vi.unstubAllGlobals();
+  });
+
+  function makeInputs(overrides: Record<string, unknown> = {}) {
+    return {
+      workspaceDir: tmpDir,
+      githubToken: "fake-token",
+      defaultBranch: "main",
+      clonedRef: resolveHead(tmpDir),
+      repoOwner: "acme",
+      repoRepo: "kg-repo",
+      ...overrides,
+    };
+  }
+
+  /**
+   * The step embeds a fresh token in the origin URL before pushing (`remote set-url
+   * origin https://x-access-token:<token>@github.com/<owner>/<repo>.git`). Rewrite
+   * that literal URL to the local bare remote so the push lands somewhere real and
+   * inspectable instead of trying to reach github.com.
+   */
+  function redirectGithubRemote(): void {
+    execSync(
+      `git config url."${bareDir}".insteadOf "https://x-access-token:fake-token@github.com/acme/kg-repo.git"`,
+      { cwd: tmpDir, stdio: "ignore" },
+    );
+  }
+
+  function stubPrCreate(number: number, url: string): void {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: url, number }),
+      text: async () => "",
+    } as Response);
+  }
+
+  function branchesOnBare(): string {
+    // argv form: a shell would choke on the `%(` in the format string.
+    return spawnSync("git", ["for-each-ref", "refs/heads", "--format=%(refname)"], { cwd: bareDir }).stdout.toString();
+  }
+
+  it("pushes to kg-refresh/<stamp> and opens a PR whose body carries the report", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-05T08:00:00Z");
+    mkdirSync(join(tmpDir, "ai-output"), { recursive: true });
+    writeFileSync(join(tmpDir, "ai-output", "kg-stats.json"), JSON.stringify({ quads: 4242 }));
+
+    stubPrCreate(17, "https://github.com/acme/kg-repo/pull/17");
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 2, teamCounts: [{ team: "AII", count: 2 }] });
+
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+
+    expect(result.snapshotPushed).toBe(true);
+    expect(result.prNumber).toBe(17);
+    expect(branchesOnBare()).toContain("refs/heads/kg-refresh/20260905T080000Z");
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, req] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toBe("https://api.github.com/repos/acme/kg-repo/pulls");
+    const body = JSON.parse((req as RequestInit).body as string);
+    expect(body.head).toBe("kg-refresh/20260905T080000Z");
+    expect(body.base).toBe("main");
+    expect(body.title).toBe("kg-refresh: snapshot @ 20260905T080000Z (4242 quads)");
+    expect(body.body).toContain("**Quads serialized:** 4242");
+    expect(body.body).toContain("- AII: 2");
+    expect(body.body).toContain("**Guard verdict:** clean");
+    expect(body.draft).toBeUndefined();
+  });
+
+  it("titles the PR with '?' quads when kg-stats.json is absent", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-06T00:00:00Z");
+
+    stubPrCreate(1, "https://github.com/acme/kg-repo/pull/1");
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+    expect(result.prNumber).toBe(1);
+
+    const [, req] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse((req as RequestInit).body as string);
+    expect(body.title).toBe("kg-refresh: snapshot @ 20260906T000000Z (? quads)");
+  });
+
+  it("--force-with-lease refuses the push when the stamp's branch already exists on the remote", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+    // Pre-create the branch this stamp would target — the explicit "must be absent" lease
+    // must refuse rather than silently force-overwriting someone else's push.
+    execSync("git push origin HEAD:refs/heads/kg-refresh/20260907T000000Z", { cwd: tmpDir, stdio: "ignore" });
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-07T00:00:00Z");
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("pushes but skips opening the PR when repoOwner/repoRepo are absent", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-08T00:00:00Z");
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(
+      ctx,
+      makeInputs({ clonedRef, repoOwner: undefined, repoRepo: undefined }),
+      noopReporter,
+    );
+    expect(result.snapshotPushed).toBe(true);
+    expect(result.prNumber).toBeNull();
+    expect(branchesOnBare()).toContain("refs/heads/kg-refresh/20260908T000000Z");
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -4130,7 +4345,7 @@ describe("kgTrackerDataStep — KG_TRACKER_DATA_FILE preload", () => {
       noopReporter,
     );
 
-    expect(result).toEqual({ fetched: true, issueCount: 3 });
+    expect(result).toEqual({ fetched: true, issueCount: 3, teamCounts: [] });
     expect(written).toHaveLength(1);
     expect(written[0][0]).toBe(join(tmpDir, "tracker-data.json"));
     expect(JSON.parse(written[0][1])).toEqual(issues);
@@ -4146,7 +4361,7 @@ describe("kgTrackerDataStep — KG_TRACKER_DATA_FILE preload", () => {
       noopReporter,
     );
 
-    expect(result).toEqual({ fetched: true, issueCount: 0 });
+    expect(result).toEqual({ fetched: true, issueCount: 0, teamCounts: [] });
   });
 
   it("falls through to normal flow when KG_TRACKER_DATA_FILE points to a non-existent file", async () => {
@@ -4159,7 +4374,7 @@ describe("kgTrackerDataStep — KG_TRACKER_DATA_FILE preload", () => {
     );
 
     // callbackUrl is null → normal flow returns fetched=false
-    expect(result).toEqual({ fetched: false, issueCount: 0 });
+    expect(result).toEqual({ fetched: false, issueCount: 0, teamCounts: [] });
   });
 });
 

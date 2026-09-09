@@ -17,6 +17,25 @@ interface KgTrackerDataInputs extends Record<string, unknown> {
 interface KgTrackerDataOutputs extends Record<string, unknown> {
   fetched: boolean;
   issueCount: number;
+  /** Per-team issue counts, for the kg-refresh report. Empty when fetched=false. */
+  teamCounts: Array<{ team: string; count: number }>;
+}
+
+/**
+ * Best-effort per-team breakdown for the dev-harness preloaded-data path, which has
+ * no per-team fetch loop to count against. Groups by the identifier prefix (e.g.
+ * "AII" from "AII-593") — the same convention every tracker identifier follows.
+ */
+function deriveTeamCountsFromIdentifiers(issues: unknown[]): Array<{ team: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const issue of issues) {
+    if (issue === null || typeof issue !== "object") continue;
+    const identifier = (issue as Record<string, unknown>).identifier;
+    if (typeof identifier !== "string") continue;
+    const team = identifier.split("-")[0] || "unknown";
+    counts.set(team, (counts.get(team) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([team, count]) => ({ team, count }));
 }
 
 /** Coded failure raised when the tracker-data fetch fails in a dispatched run. */
@@ -260,7 +279,14 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
       }
       writeFn(join(workspaceDir, "tracker-data.json"), content);
       console.log(`[kg-tracker-data] using pre-fetched data from ${preloadedFile}: ${issueCount} issues`);
-      return { fetched: true, issueCount };
+      let teamCounts: Array<{ team: string; count: number }> = [];
+      try {
+        const parsed = JSON.parse(content) as unknown;
+        teamCounts = deriveTeamCountsFromIdentifiers(Array.isArray(parsed) ? parsed : []);
+      } catch {
+        // malformed JSON — leave teamCounts empty
+      }
+      return { fetched: true, issueCount, teamCounts };
     }
 
     // Read the bearer secret directly from the environment so it never appears
@@ -269,23 +295,24 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
 
     if (!callbackUrl) {
       console.log("[kg-tracker-data] no callback URL; skipping");
-      return { fetched: false, issueCount: 0 };
+      return { fetched: false, issueCount: 0, teamCounts: [] };
     }
     if (!progressToken) {
       console.log("[kg-tracker-data] no progress token (RUN_PROGRESS_TOKEN); skipping");
-      return { fetched: false, issueCount: 0 };
+      return { fetched: false, issueCount: 0, teamCounts: [] };
     }
 
     const teams = readTeams(workspaceDir);
     if (teams.length === 0) {
       console.warn("[kg-tracker-data] no teams found in sources.yml; skipping");
-      return { fetched: false, issueCount: 0 };
+      return { fetched: false, issueCount: 0, teamCounts: [] };
     }
     console.log(`[kg-tracker-data] teams from sources.yml: ${teams.join(", ")}`);
 
     const base = callbackUrl.replace(/\/+$/, "");
     const url = `${base}/api/runner/kg-tracker-data`;
     const allIssues: TrackerIssue[] = [];
+    const teamCounts: Array<{ team: string; count: number }> = [];
 
     for (const team of teams) {
       let cursor: string | null = null;
@@ -305,7 +332,7 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
           });
           if (res.status === 503) {
             console.log("[kg-tracker-data] Tracker not configured (503) — skipping");
-            return { fetched: false, issueCount: 0 };
+            return { fetched: false, issueCount: 0, teamCounts: [] };
           }
           if (!res.ok) {
             console.error(`[kg-tracker-data] ${url} returned HTTP ${res.status}`);
@@ -328,11 +355,12 @@ export const kgTrackerDataStep: StepModule<KgTrackerDataInputs, KgTrackerDataOut
           `team ${team} returned 0 issues — a configured team must not be empty`,
         );
       }
+      teamCounts.push({ team, count: teamIssues.length });
       allIssues.push(...teamIssues);
     }
 
     writeFn(join(workspaceDir, "tracker-data.json"), JSON.stringify(allIssues));
     console.log(`[kg-tracker-data] fetched ${allIssues.length} issues`);
-    return { fetched: true, issueCount: allIssues.length };
+    return { fetched: true, issueCount: allIssues.length, teamCounts };
   },
 };

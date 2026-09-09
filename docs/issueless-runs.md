@@ -33,7 +33,7 @@ flowchart TD
     D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
     E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest\n→ kg-snapshot-push"]
     F --> G["POST /api/runner/result\nphase=kg-refresh"]
-    G --> I["onRunnerComplete()\nverify snapshot commit"]
+    G --> I["onRunnerComplete()\nmerge refresh PR (merge commit)\ndelete the kg-refresh branch\nverify snapshot commit"]
     I --> H
     H -->|"success"| J["stage=serving\nonOutcome('success')\ncloseJobLog(completed)"]
     H -->|"failure / revert"| K["stage=failed or reverted\nonOutcome('failure')\ncloseJobLog(failed)"]
@@ -292,7 +292,7 @@ The endpoint validates that `teamKey` is present in the orchestrator's configure
 
 ### Callback
 
-The runner reports completion to `POST /api/runner/result` with `{ phase: "kg-refresh", outcome: "success"|"failure", snapshotCommit?, failureCode?, failureReason? }`. The routing carve-out in `src/runner-callback.ts` (~line 252):
+The runner reports completion to `POST /api/runner/result` with `{ phase: "kg-refresh", outcome: "success"|"failure", snapshotCommit?, snapshotPr?, snapshotBranch?, failureCode?, failureReason? }`. `snapshotPr` and `snapshotBranch` are set when `kg-snapshot-push` pushed the snapshot and opened the refresh PR (AII-593, below). The routing carve-out in `src/runner-callback.ts` (~line 252):
 
 ```typescript
 if (input.body.phase === "kg-refresh") {
@@ -469,7 +469,11 @@ The comment includes the failure code and dispatch ID for correlation.
 
 ## 9. KG-visible surfaces
 
-The runner produces a new snapshot commit in the KG source repository (`KG_SOURCE_REPO`). That commit is the sole persistent record of what ran. Commit messages should encode enough context for a future reader to identify when and why a given snapshot was produced.
+The runner pushes the new snapshot to a per-refresh branch `kg-refresh/<stamp>` in the KG source repository (`KG_SOURCE_REPO`) and opens a **refresh PR** against the default branch (title `kg-refresh: snapshot @ <stamp> (<N> quads)`). The PR body is the refresh report: the per-part line-count table (prev, new, delta), quads serialized, issue counts by team, each secondary repo with its branch and commit, ingest warnings (`WARN`/`ERROR` lines from `ai-output/kg-ingest.log`), and the guard verdict. The step reuses the implement pipeline's PR helper (`openOrFindPullRequest` in `src/pipeline/step-utils.ts`); no second PR helper exists (ADR 013).
+
+On a successful callback the orchestrator (`onRunnerComplete` in `src/kg-refresh.ts`) merges that PR with the **merge** method — never squash or rebase, because it then verifies `snapshotCommit` is reachable on the default branch — deletes the `kg-refresh/<stamp>` branch, and continues with the local rail (fetch, stage, swap, verify). A merge that returns `blocked` or `conflict`, or a callback that carries `snapshotPr` without `snapshotCommit`, ends the refresh as `failed` with the PR named in `lastRefresh.detail`; the default branch is untouched. On a failed callback that carries `snapshotPr`, the orchestrator posts a comment naming the gate, closes the PR unmerged, and deletes the branch.
+
+The refresh PR is the persistent record of what ran, and the KG ingests PRs, so every refresh becomes searchable. The refresh PR is never picked up by the grouping auto-merge (`src/auto-merge.ts` only considers `ai-implement/feature/*` and `ai-implement/multi-issue/*` bases). The laptop never pushes `snapshot/`: `bd-kg-refresh` triggers the rail, and `bd-mega-kg-refresh` iterates on the ingest locally and PRs manifest changes only.
 
 The designated tracker issue (if configured) receives failure comments; there is no "success" comment posted to it. Success is observable through the KG stamp served by `GET /api/kg/status`.
 
@@ -492,7 +496,7 @@ npm run dev:run -- \
 - The KG source checkout is bind-mounted read-only at `/kg-source`. The `clone` step is replaced with `devHarnessKgCloneStep`, which clones from `file:///kg-source` into the container's scratch workspace. Uncommitted edits to `sources.yml` therefore take effect immediately.
 - `--tracker-data <file>` is required. The file is the pre-fetched body of `POST /api/runner/kg-tracker-data` (one team's worth). It is bind-mounted at `/dev-tracker-data.json`; the `kg-tracker-data` step detects `KG_TRACKER_DATA_FILE` and uses it rather than calling the orchestrator.
 - The operator's `GH_TOKEN` is injected as `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE`. This swaps in a stub `dependency-auth` step that marks `acquired=true`, satisfying `clone-secondary-repos` without an orchestrator token vend. If the token lacks `contents: read` on a secondary repo, the clone fails with a 404/403 — exactly the parity check the harness is designed to surface.
-- `kg-snapshot-push` runs in dry-run mode (`AI_IMPLEMENT_KG_DRY_RUN=true`). Guards and validation run in full; the per-part line-count table is printed; no commit or push happens.
+- `kg-snapshot-push` runs in dry-run mode (`AI_IMPLEMENT_KG_DRY_RUN=true`). Guards and validation run in full; the refresh report (the same markdown that becomes the refresh PR body on a real run) is printed to the log; no commit, push, branch or PR happens.
 
 **`--until` and `--shell`** both work for this phase. The shell opens in `/workspace` (the scratch clone); `git remote -v` shows `file:///kg-source`.
 

@@ -772,6 +772,98 @@ describe("kg-refresh", () => {
       expect(s.stage).toBe("serving");
     });
 
+    // ---- AII-593: refresh PR opened by the runner ----------------------------------
+    it("onRunnerComplete success with snapshotPr merges the PR with the merge method, deletes the branch, then verifies the commit", async () => {
+      const mergePullRequestFn = vi.fn(async () => "merged" as const);
+      const deleteBranchFn = vi.fn(async () => true);
+      buildDispatch({ mergePullRequestFn, deleteBranchFn });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", { snapshotCommit: "abc123", snapshotPr: 7, snapshotBranch: "kg-refresh/20260909T120000Z" });
+      await waitDone();
+      expect(mergePullRequestFn).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", 7, "abc123", "merge");
+      expect(deleteBranchFn).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", "kg-refresh/20260909T120000Z");
+      expect(fetchCommitVisible).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", "abc123");
+      const s = await handle.status();
+      expect(s.lastRefresh?.ok).toBe(true);
+      expect(s.stage).toBe("serving");
+    });
+
+    it("onRunnerComplete success with snapshotPr but no snapshotCommit refuses to merge and fails", async () => {
+      const mergePullRequestFn = vi.fn(async () => "merged" as const);
+      buildDispatch({ mergePullRequestFn });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", { snapshotPr: 7 });
+      await waitDone();
+      expect(mergePullRequestFn).not.toHaveBeenCalled();
+      expect(fetchCommitVisible).not.toHaveBeenCalled();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.running).toBe(false);
+      expect(s.lastRefresh?.ok).toBe(false);
+      expect(s.lastRefresh?.detail).toContain("refusing to merge");
+    });
+
+    it.each(["blocked", "conflict"] as const)("onRunnerComplete success: merge returns %s → failed, detail names the PR, rail does not run", async (result) => {
+      const mergePullRequestFn = vi.fn(async () => result);
+      const deleteBranchFn = vi.fn(async () => true);
+      buildDispatch({ mergePullRequestFn, deleteBranchFn });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", { snapshotCommit: "abc123", snapshotPr: 9, snapshotBranch: "kg-refresh/x" });
+      await waitDone();
+      expect(fetchCommitVisible).not.toHaveBeenCalled();
+      expect(deleteBranchFn).not.toHaveBeenCalled();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.lastRefresh?.detail).toContain("#9");
+      expect(s.lastRefresh?.detail).toContain(result);
+    });
+
+    it("onRunnerComplete success: merge throws → failed with the error in the detail", async () => {
+      const mergePullRequestFn = vi.fn(async () => { throw new Error("HTTP 405"); });
+      buildDispatch({ mergePullRequestFn });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("success", { snapshotCommit: "abc123", snapshotPr: 9 });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.lastRefresh?.detail).toContain("HTTP 405");
+    });
+
+    it("onRunnerComplete failure with snapshotPr posts the gate comment, closes the PR and deletes the branch", async () => {
+      const postPrCommentFn = vi.fn(async () => undefined);
+      const closePullRequestFn = vi.fn(async () => undefined);
+      const deleteBranchFn = vi.fn(async () => true);
+      buildDispatch({ postPrCommentFn, closePullRequestFn, deleteBranchFn });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", { failureCode: "KG_SNAPSHOT_CONTENT_REGRESSION", failureReason: "pr.nt shrank", snapshotPr: 11, snapshotBranch: "kg-refresh/20260909T120000Z" });
+      await waitDone();
+      await vi.waitFor(() => expect(deleteBranchFn).toHaveBeenCalled());
+      expect(postPrCommentFn).toHaveBeenCalledTimes(1);
+      const [, , , prNum, body] = postPrCommentFn.mock.calls[0] as unknown as [string, string, string, number, string];
+      expect(prNum).toBe(11);
+      expect(body).toContain("closing this refresh PR");
+      expect(body).toContain("KG_SNAPSHOT_CONTENT_REGRESSION");
+      expect(closePullRequestFn).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", 11);
+      expect(deleteBranchFn).toHaveBeenCalledWith("tok", "TestOrg", "test-kg", "kg-refresh/20260909T120000Z");
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+    });
+
+    it("onRunnerComplete failure without snapshotPr closes nothing", async () => {
+      const closePullRequestFn = vi.fn(async () => undefined);
+      buildDispatch({ closePullRequestFn });
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", { failureCode: "TIMEOUT", failureReason: "job timed out" });
+      await waitDone();
+      expect(closePullRequestFn).not.toHaveBeenCalled();
+    });
+
     it("git-cache retry: commit visible on second check proceeds to rail", async () => {
       let visibleCalls = 0;
       buildDispatch({
