@@ -63,6 +63,8 @@ import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./wor
 import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
+import { fetchTrackerIssuesPage } from "./runner-callback.js";
+import { isLinearAuthConfigured } from "./linear-app-auth.js";
 import picomatch from "picomatch";
 
 function normalizeSkillsRepo(raw: unknown): string | null {
@@ -134,6 +136,33 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(data));
+}
+
+/**
+ * Loops fetchTrackerIssuesPage across every page for a team, returning the flat
+ * issue array the kg-refresh dev harness's `--tracker-data` file expects
+ * (`Array.isArray(parsed) ? parsed.length : 0` in kg-tracker-data.ts). A
+ * non-200 page short-circuits and its status/error propagate to the caller.
+ */
+async function fetchAllTrackerIssuesForTeam(
+  teamKey: string,
+): Promise<{ ok: true; issues: unknown[] } | { ok: false; status: number; error: string }> {
+  const issues: unknown[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = await fetchTrackerIssuesPage(teamKey, cursor);
+    if (page.status !== 200) {
+      const error = (page.body as { error?: string }).error ?? "Upstream tracker error";
+      return { ok: false, status: page.status, error };
+    }
+    const body = page.body as {
+      issues: unknown[];
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+    };
+    issues.push(...body.issues);
+    cursor = body.pageInfo.hasNextPage ? body.pageInfo.endCursor : null;
+  } while (cursor !== null);
+  return { ok: true, issues };
 }
 
 function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
@@ -311,6 +340,34 @@ export function handleAdminRequest(
       }
       deps.kgRefresh.status().then(
         (body) => json(res, 200, body),
+        (err) => json(res, 500, { error: String(err) }),
+      );
+      return true;
+    }
+
+    // Admin-authenticated export of tracker data for the kg-refresh dev harness's
+    // --tracker-data flag — same underlying Linear read as the runner-only
+    // POST /api/runner/kg-tracker-data, aggregated across pages for one team.
+    if (url.startsWith("/api/kg/tracker-data") && method === "GET") {
+      const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+      const team = new URLSearchParams(qs).get("team");
+      const mappedKeys = Object.keys(getMappings());
+      if (!team || !mappedKeys.includes(team)) {
+        json(res, 403, { error: "Unauthorized" });
+        return true;
+      }
+      if (!isLinearAuthConfigured()) {
+        json(res, 503, { error: "Tracker not configured" });
+        return true;
+      }
+      fetchAllTrackerIssuesForTeam(team).then(
+        (result) => {
+          if (!result.ok) {
+            json(res, result.status, { error: result.error });
+          } else {
+            json(res, 200, result.issues);
+          }
+        },
         (err) => json(res, 500, { error: String(err) }),
       );
       return true;

@@ -519,6 +519,67 @@ export interface HandleKgTrackerDataInput {
 }
 
 /**
+ * Fetches one paginated page of Linear issues (with their comments) for a team.
+ * Shared by the runner-authenticated route (one page per call) and the
+ * admin-authenticated export route (loops this across pages). Performs the
+ * Linear read with the orchestrator's own credential — callers never see it.
+ */
+export async function fetchTrackerIssuesPage(
+  teamKey: string,
+  cursor: string | null | undefined,
+): Promise<HandleRunnerResultOutput> {
+  const FIRST = 50;
+
+  try {
+    const response = await withLinearToken((token) =>
+      fetch("https://api.linear.app/graphql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          query: `query($teamKey: String!, $first: Int!, $after: String) {
+            issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
+              nodes {
+                id identifier title description branchName
+                state { name type }
+                labels { nodes { name } }
+                project { name }
+                parent { identifier }
+                comments(first: 100) { nodes { body user { name } createdAt } }
+                relations { nodes { type relatedIssue { identifier } } }
+              }
+              pageInfo { hasNextPage endCursor }
+            }
+          }`,
+          variables: { teamKey, first: FIRST, after: cursor ?? null },
+        }),
+      })
+    );
+
+    if (!response.ok) {
+      console.error(`[kg-tracker-data] Linear API returned ${response.status}`);
+      return { status: 502, body: { error: "Upstream tracker error" } };
+    }
+
+    const data = (await response.json()) as {
+      data?: { issues?: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } };
+      errors?: Array<{ message: string }>;
+    };
+
+    if (data.errors?.length) {
+      console.error("[kg-tracker-data] Linear GraphQL errors:", data.errors);
+      return { status: 502, body: { error: "Upstream tracker error" } };
+    }
+
+    const issues = data.data?.issues?.nodes ?? [];
+    const pageInfo = data.data?.issues?.pageInfo ?? { hasNextPage: false, endCursor: null };
+    return { status: 200, body: { issues, pageInfo } };
+  } catch (err) {
+    console.error("[kg-tracker-data] Failed to fetch tracker data:", err);
+    return { status: 500, body: { error: "Failed to fetch tracker data" } };
+  }
+}
+
+/**
  * Returns a paginated page of Linear issues (with their comments) for the team
  * associated with the run's mapping.
  *
@@ -553,56 +614,7 @@ export async function handleKgTrackerDataRequest(
     return { status: 503, body: { error: "Tracker not configured" } };
   }
 
-  const teamKey = input.teamKey;
-  const FIRST = 50;
-
-  try {
-    const response = await withLinearToken((token) =>
-      fetch("https://api.linear.app/graphql", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          query: `query($teamKey: String!, $first: Int!, $after: String) {
-            issues(filter: { team: { key: { eq: $teamKey } } }, first: $first, after: $after, orderBy: updatedAt) {
-              nodes {
-                id identifier title description branchName
-                state { name type }
-                labels { nodes { name } }
-                project { name }
-                parent { identifier }
-                comments(first: 100) { nodes { body user { name } createdAt } }
-                relations { nodes { type relatedIssue { identifier } } }
-              }
-              pageInfo { hasNextPage endCursor }
-            }
-          }`,
-          variables: { teamKey, first: FIRST, after: input.cursor ?? null },
-        }),
-      })
-    );
-
-    if (!response.ok) {
-      console.error(`[kg-tracker-data] Linear API returned ${response.status}`);
-      return { status: 502, body: { error: "Upstream tracker error" } };
-    }
-
-    const data = (await response.json()) as {
-      data?: { issues?: { nodes: unknown[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } };
-      errors?: Array<{ message: string }>;
-    };
-
-    if (data.errors?.length) {
-      console.error("[kg-tracker-data] Linear GraphQL errors:", data.errors);
-      return { status: 502, body: { error: "Upstream tracker error" } };
-    }
-
-    const issues = data.data?.issues?.nodes ?? [];
-    const pageInfo = data.data?.issues?.pageInfo ?? { hasNextPage: false, endCursor: null };
-    return { status: 200, body: { issues, pageInfo } };
-  } catch (err) {
-    console.error("[kg-tracker-data] Failed to fetch tracker data:", err);
-    return { status: 500, body: { error: "Failed to fetch tracker data" } };
-  }
+  return fetchTrackerIssuesPage(input.teamKey, input.cursor);
 }
 
 /**

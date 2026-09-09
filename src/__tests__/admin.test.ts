@@ -72,6 +72,14 @@ vi.mock("../github.js", async (importOriginal) => ({
   cancelWorkflowRun: cancelWorkflowRunMock,
 }));
 
+const isLinearAuthConfiguredMock = vi.hoisted(() => vi.fn(() => false));
+const withLinearTokenMock = vi.hoisted(() => vi.fn());
+vi.mock("../linear-app-auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../linear-app-auth.js")>()),
+  isLinearAuthConfigured: isLinearAuthConfiguredMock,
+  withLinearToken: withLinearTokenMock,
+}));
+
 function makeFakeRegistry(provider: FakeProvider): ProviderRegistry {
   return {
     forMapping: async () => provider,
@@ -2977,6 +2985,112 @@ describe("GET /api/deploy-refs", () => {
     expect(res.statusCode).toBe(503);
     // Generic message — must NOT say "install the GitHub App" (that's the install-specific message).
     expect((res.body as { error: string }).error).not.toMatch(/install the GitHub App/i);
+  });
+});
+
+// ---------- GET /api/kg/tracker-data (AII-597) ----------
+
+describe("GET /api/kg/tracker-data", () => {
+  function linearPage(
+    issues: unknown[],
+    pageInfo: { hasNextPage: boolean; endCursor: string | null },
+  ): Response {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { issues: { nodes: issues, pageInfo } } }),
+    } as unknown as Response;
+  }
+
+  async function trackerDataRequest(
+    qs: string,
+    token?: string,
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest(
+      `/api/kg/tracker-data${qs}`,
+      "GET",
+      token ? { authorization: `Bearer ${token}` } : {},
+    );
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  beforeEach(() => {
+    isLinearAuthConfiguredMock.mockReset();
+    withLinearTokenMock.mockReset();
+  });
+
+  it("returns 401 when unauthenticated", async () => {
+    const res = await trackerDataRequest("?team=AII");
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 403 for a team not present in the mapping set", async () => {
+    const token = await login("secret");
+    const res = await trackerDataRequest("?team=ZZZ", token);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("returns 403 when the team query param is missing", async () => {
+    const token = await login("secret");
+    const res = await trackerDataRequest("", token);
+    expect(res.statusCode).toBe(403);
+  });
+
+  it("returns the flat array of issues for a single-page team — the shape the kg-refresh dev harness's --tracker-data file expects", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+    const issues = [{ id: "1", identifier: "AII-1", title: "Test issue" }];
+    withLinearTokenMock.mockResolvedValueOnce(linearPage(issues, { hasNextPage: false, endCursor: null }));
+
+    const res = await trackerDataRequest("?team=AII", token);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual(issues);
+  });
+
+  it("aggregates issues across multiple pages via the same builder the runner route uses", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+    const page1 = [{ id: "1", identifier: "AII-1" }];
+    const page2 = [{ id: "2", identifier: "AII-2" }];
+    withLinearTokenMock
+      .mockResolvedValueOnce(linearPage(page1, { hasNextPage: true, endCursor: "cursor-1" }))
+      .mockResolvedValueOnce(linearPage(page2, { hasNextPage: false, endCursor: null }));
+
+    const res = await trackerDataRequest("?team=AII", token);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual([...page1, ...page2]);
+  });
+
+  it("returns 503 when Linear is not configured", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(false);
+
+    const res = await trackerDataRequest("?team=AII", token);
+
+    expect(res.statusCode).toBe(503);
+  });
+
+  it("propagates an upstream Linear failure as the same status the runner route would return", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+    withLinearTokenMock.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({}),
+    } as unknown as Response);
+
+    const res = await trackerDataRequest("?team=AII", token);
+
+    expect(res.statusCode).toBe(502);
   });
 });
 
