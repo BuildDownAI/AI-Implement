@@ -121,7 +121,14 @@ describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
 
 // ── kg-snapshot-push step ─────────────────────────────────────────────────────
 
-import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "../pipeline/steps/kg-snapshot-push.js";
+import {
+  kgSnapshotPushStep,
+  KgSnapshotMissingError,
+  KgSnapshotStaleError,
+  KgSnapshotTrackerRegressionError,
+  classifyRefreshAnomaly,
+  buildLearningsComment,
+} from "../pipeline/steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError, readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "../pipeline/steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError, isSignalLine } from "../pipeline/steps/kg-ingest.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
@@ -4198,6 +4205,15 @@ describe("kgSnapshotPushStep — refresh PR flow", () => {
     } as Response);
   }
 
+  function stubPrComment(): void {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({}),
+      text: async () => "",
+    } as Response);
+  }
+
   function branchesOnBare(): string {
     // argv form: a shell would choke on the `%(` in the format string.
     return spawnSync("git", ["for-each-ref", "refs/heads", "--format=%(refname)"], { cwd: bareDir }).stdout.toString();
@@ -4307,6 +4323,282 @@ describe("kgSnapshotPushStep — refresh PR flow", () => {
     expect(result.prNumber).toBeNull();
     expect(branchesOnBare()).toContain("refs/heads/kg-refresh/20260908T000000Z");
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("posts a count-step learnings comment when a part's line count moves more than 20%", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), Array.from({ length: 100 }, (_, i) => `<s> <p> <o${i}> .`).join("\n") + "\n");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'previous snapshot'", { cwd: tmpDir, stdio: "ignore" });
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    // 130 lines vs. 100 previous is +30% — clears the 50%-shrink guard (it's growth) but
+    // crosses the 20% learnings threshold.
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), Array.from({ length: 130 }, (_, i) => `<s> <p> <o${i}> .`).join("\n") + "\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-09T00:00:00Z");
+
+    stubPrCreate(21, "https://github.com/acme/kg-repo/pull/21");
+    stubPrComment();
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+
+    expect(result.prNumber).toBe(21);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const [commentUrl, commentReq] = vi.mocked(fetch).mock.calls[1];
+    expect(commentUrl).toBe("https://api.github.com/repos/acme/kg-repo/issues/21/comments");
+    const commentBody = JSON.parse((commentReq as RequestInit).body as string).body as string;
+    expect(commentBody.split("\n")[0]).toBe("# ai-implement-kg-refresh-learnings");
+    expect(commentBody).toContain("**Class:** count-step");
+    expect(commentBody).toContain("docs.nt: 100 → 130 lines");
+  });
+
+  it("posts a source-missing learnings comment when a configured secondary repo has no cloned checkout", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    writeFileSync(join(tmpDir, "sources.yml"), "secondary_repos:\n  - slug: acme/other-repo\n");
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-09T01:00:00Z");
+    // No repos/other-repo directory created — the clone never happened.
+
+    stubPrCreate(22, "https://github.com/acme/kg-repo/pull/22");
+    stubPrComment();
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+
+    expect(result.prNumber).toBe(22);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const [, commentReq] = vi.mocked(fetch).mock.calls[1];
+    const commentBody = JSON.parse((commentReq as RequestInit).body as string).body as string;
+    expect(commentBody.split("\n")[0]).toBe("# ai-implement-kg-refresh-learnings");
+    expect(commentBody).toContain("**Class:** source-missing");
+    expect(commentBody).toContain("acme/other-repo");
+  });
+
+  it("posts a source-missing learnings comment when the configured code repo's checkout is empty", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: acme/code-repo\n");
+    // code-repo/ was cloned (clone-code-repo succeeded, kg-ingest's !codeRepoDir check
+    // passed) but the checkout has no content beyond .git — the reachable half of the
+    // code-repo "came back empty" case.
+    mkdirSync(join(tmpDir, "code-repo", ".git"), { recursive: true });
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-09T01:30:00Z");
+
+    stubPrCreate(25, "https://github.com/acme/kg-repo/pull/25");
+    stubPrComment();
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+
+    expect(result.prNumber).toBe(25);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const [, commentReq] = vi.mocked(fetch).mock.calls[1];
+    const commentBody = JSON.parse((commentReq as RequestInit).body as string).body as string;
+    expect(commentBody.split("\n")[0]).toBe("# ai-implement-kg-refresh-learnings");
+    expect(commentBody).toContain("**Class:** source-missing");
+    expect(commentBody).toContain("acme/code-repo");
+  });
+
+  it("posts an ingest-warnings learnings comment when kg-ingest.log has WARN/ERROR lines", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-09T02:00:00Z");
+    mkdirSync(join(tmpDir, "ai-output"), { recursive: true });
+    writeFileSync(join(tmpDir, "ai-output", "kg-ingest.log"), "INFO starting ingest\nWARN embedding model fell back to CPU\n");
+
+    stubPrCreate(23, "https://github.com/acme/kg-repo/pull/23");
+    stubPrComment();
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+
+    expect(result.prNumber).toBe(23);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const [, commentReq] = vi.mocked(fetch).mock.calls[1];
+    const commentBody = JSON.parse((commentReq as RequestInit).body as string).body as string;
+    expect(commentBody).toContain("**Class:** ingest-warnings");
+    expect(commentBody).toContain("WARN embedding model fell back to CPU");
+  });
+
+  it("posts no learnings comment on a clean refresh", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-09T03:00:00Z");
+
+    stubPrCreate(24, "https://github.com/acme/kg-repo/pull/24");
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+
+    expect(result.prNumber).toBe(24);
+    // Only the PR-create call — no second call for a learnings comment.
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── kg-snapshot-push — learnings classification (pure functions) ─────────────
+
+describe("classifyRefreshAnomaly", () => {
+  const clean = {
+    guardVerdict: "clean",
+    partRows: [{ part: "docs.nt", prev: "100", next: "105", delta: "+5" }],
+    configuredSecondaryRepos: [{ slug: "acme/other" }],
+    secondaryRepoOutcomes: [{ slug: "acme/other", branch: "main", commit: "abc123" }],
+    codeRepo: null as { slug: string; empty: boolean } | null,
+    ingestWarnings: [],
+  };
+
+  it("returns null for a clean run", () => {
+    expect(classifyRefreshAnomaly(clean)).toBeNull();
+  });
+
+  it("classifies guard-refused when the guard verdict is not clean", () => {
+    const result = classifyRefreshAnomaly({ ...clean, guardVerdict: "refused: shrink below threshold" });
+    expect(result?.class).toBe("guard-refused");
+    expect(result?.facts.join(" ")).toContain("refused: shrink below threshold");
+  });
+
+  it("classifies count-step on a >20% growth", () => {
+    const result = classifyRefreshAnomaly({
+      ...clean,
+      partRows: [{ part: "docs.nt", prev: "100", next: "130", delta: "+30" }],
+    });
+    expect(result?.class).toBe("count-step");
+    expect(result?.subjects).toEqual(["docs.nt"]);
+  });
+
+  it("classifies count-step on a >20% shrink that still clears the 50% guard", () => {
+    const result = classifyRefreshAnomaly({
+      ...clean,
+      partRows: [{ part: "docs.nt", prev: "100", next: "70", delta: "-30" }],
+    });
+    expect(result?.class).toBe("count-step");
+  });
+
+  it("does not classify count-step at or below the 20% threshold", () => {
+    const result = classifyRefreshAnomaly({
+      ...clean,
+      partRows: [{ part: "docs.nt", prev: "100", next: "120", delta: "+20" }],
+    });
+    expect(result).toBeNull();
+  });
+
+  it("skips rows where prev or next is 'missing' rather than producing NaN/Infinity matches", () => {
+    const result = classifyRefreshAnomaly({
+      ...clean,
+      partRows: [{ part: "docs.nt", prev: "missing", next: "50", delta: "—" }],
+    });
+    expect(result).toBeNull();
+  });
+
+  it("classifies source-missing when a configured secondary repo has no outcome entry", () => {
+    const result = classifyRefreshAnomaly({ ...clean, secondaryRepoOutcomes: [] });
+    expect(result?.class).toBe("source-missing");
+    expect(result?.subjects).toEqual(["acme/other"]);
+  });
+
+  it("classifies source-missing when the configured code repo's checkout is empty", () => {
+    const result = classifyRefreshAnomaly({ ...clean, codeRepo: { slug: "acme/code-repo", empty: true } });
+    expect(result?.class).toBe("source-missing");
+    expect(result?.subjects).toEqual(["acme/code-repo"]);
+    expect(result?.facts.join(" ")).toContain("code repo `acme/code-repo`");
+    expect(result?.facts.join(" ")).toContain("checkout under code-repo/ has no content");
+  });
+
+  it("does not classify source-missing when the configured code repo's checkout is non-empty", () => {
+    const result = classifyRefreshAnomaly({ ...clean, codeRepo: { slug: "acme/code-repo", empty: false } });
+    expect(result).toBeNull();
+  });
+
+  it("reports both a missing secondary repo and an empty code repo together", () => {
+    const result = classifyRefreshAnomaly({
+      ...clean,
+      secondaryRepoOutcomes: [],
+      codeRepo: { slug: "acme/code-repo", empty: true },
+    });
+    expect(result?.class).toBe("source-missing");
+    expect(result?.subjects).toEqual(["acme/other", "acme/code-repo"]);
+  });
+
+  it("classifies ingest-warnings when warnings exist and nothing else is anomalous", () => {
+    const result = classifyRefreshAnomaly({ ...clean, ingestWarnings: ["ERROR could not embed doc 4"] });
+    expect(result?.class).toBe("ingest-warnings");
+  });
+
+  it("prefers source-missing over count-step over ingest-warnings when several are true at once", () => {
+    const result = classifyRefreshAnomaly({
+      guardVerdict: "clean",
+      partRows: [{ part: "docs.nt", prev: "100", next: "130", delta: "+30" }],
+      configuredSecondaryRepos: [{ slug: "acme/other" }],
+      secondaryRepoOutcomes: [],
+      codeRepo: null,
+      ingestWarnings: ["WARN something"],
+    });
+    expect(result?.class).toBe("source-missing");
+  });
+
+  it("prefers guard-refused over every other class", () => {
+    const result = classifyRefreshAnomaly({
+      guardVerdict: "refused",
+      partRows: [{ part: "docs.nt", prev: "100", next: "130", delta: "+30" }],
+      configuredSecondaryRepos: [{ slug: "acme/other" }],
+      secondaryRepoOutcomes: [],
+      codeRepo: null,
+      ingestWarnings: ["WARN something"],
+    });
+    expect(result?.class).toBe("guard-refused");
+  });
+});
+
+describe("buildLearningsComment", () => {
+  it("renders the marker byte-exact as the first line, followed by the fixed sections in order", () => {
+    const body = buildLearningsComment(
+      { class: "ingest-warnings", facts: ["WARN something happened"], subjects: ["ai-output/kg-ingest.log"] },
+      "20260909T030000Z",
+    );
+    const lines = body.split("\n");
+    expect(lines[0]).toBe("# ai-implement-kg-refresh-learnings");
+    expect(body).toContain("**Refresh:** 20260909T030000Z");
+    expect(body).toContain("**Class:** ingest-warnings");
+    expect(body.indexOf("## What happened")).toBeGreaterThan(0);
+    expect(body.indexOf("## Why (as far as the run knows)")).toBeGreaterThan(body.indexOf("## What happened"));
+    expect(body.indexOf("## Applies to")).toBeGreaterThan(body.indexOf("## Why (as far as the run knows)"));
+    expect(body).toContain("- WARN something happened");
+    expect(body).toContain("- ai-output/kg-ingest.log");
   });
 });
 
