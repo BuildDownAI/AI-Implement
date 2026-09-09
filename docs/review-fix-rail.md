@@ -89,6 +89,8 @@ reviewCheckNames:
 
 External collection can be disabled per repo via `reviewProviders` in `.ai-implement/config.yml`; when it is, the step skips the wait entirely.
 
+The `claude-review`/`claude-code-review`/`claude` workflows pin `anthropics/claude-code-action` to v1.0.217 rather than floating `@v1` — a `@v1` build shipped 2026-09-08 that failed the native binary install on every run, silently starving this gate of a verdict. v1.0.217 is pinned rather than a later build because it's the last version upstream confirms works; move the pin forward only once a newer release is confirmed to fix the installer regression (tracked upstream as issue #1817).
+
 ## Post-run: the drain loop
 
 `processReviewFixQueue` runs once per poll tick. For each pending item, in FIFO order:
