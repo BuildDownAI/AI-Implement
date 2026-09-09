@@ -189,6 +189,18 @@ export class KgSidecar {
       if (existsSync(markerPath)) {
         env.KG_DATA_DIR = this._runtimeDataDir;
         console.error(`[kg] runtime data dir overlay: ${this._runtimeDataDir}`);
+
+        // AII-599: serving backend is derived from what is actually staged, not
+        // re-read from KG_MATERIALIZE_DIRECT — the flag may have flipped since this
+        // overlay was staged, and the sidecar is spawned fresh on every restart().
+        // A staged `parts/` directory means the rail ran `--direct`; its absence
+        // means the rdflib graph.trig path, same as before this issue.
+        const partsDir = join(this._runtimeDataDir, "parts");
+        if (existsSync(partsDir)) {
+          env.KG_BACKEND = "nt_parts";
+          env.KG_PARTS_DIR = partsDir;
+          console.error(`[kg] serving nt_parts backend from ${partsDir}`);
+        }
       } else {
         console.error(
           `[kg] WARNING: ${this._runtimeDataDir} exists without completion marker — using baked copy`,

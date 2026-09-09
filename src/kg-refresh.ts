@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, rename, writeFile, copyFile, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, rename, writeFile, copyFile, readFile, cp } from "node:fs/promises";
 import { existsSync, statfsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -753,7 +753,14 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
       await rm(stagingDir, { recursive: true, force: true });
       await mkdir(stagingDir, { recursive: true });
-      await copyFile(join(source, "out", "graph.trig"), join(stagingDir, "graph.trig"));
+      if (materializeDirectEnabled()) {
+        // KG_MATERIALIZE_DIRECT (AII-599): `--direct` copies snapshot/parts/*.nt straight to
+        // out/parts/ with no rdflib re-serialization. Flatten to stagingDir/parts, matching
+        // the embeddings.npz flattening below rather than the source's out/ prefix.
+        await cp(join(source, "out", "parts"), join(stagingDir, "parts"), { recursive: true });
+      } else {
+        await copyFile(join(source, "out", "graph.trig"), join(stagingDir, "graph.trig"));
+      }
       await copyFile(join(source, "out", "embeddings.npz"), join(stagingDir, "embeddings.npz"));
       if (existsSync(join(source, "sources.yml"))) {
         await copyFile(join(source, "sources.yml"), join(stagingDir, "sources.yml"));
@@ -1563,8 +1570,24 @@ function defaultLoadLastRefresh(): RefreshOutcome | null {
  */
 export const MATERIALIZE_ARGS = ["-m", "kg_ingest.materialize"] as const;
 
+/**
+ * True when the low-memory `--direct` materialize path is enabled (AII-599). Read
+ * directly from process.env at each call site, same convention as every other
+ * feature flag in this codebase (KG_ and AI_IMPLEMENT_ prefixed) — off by default
+ * until the configured KG_SOURCE_REPO derivative carries base PR #34's `--direct`
+ * / `nt_parts` support.
+ */
+function materializeDirectEnabled(): boolean {
+  return process.env.KG_MATERIALIZE_DIRECT === "true";
+}
+
+/** MATERIALIZE_ARGS, with `--direct` appended when KG_MATERIALIZE_DIRECT=true (AII-599). */
+export function materializeArgs(): string[] {
+  return materializeDirectEnabled() ? [...MATERIALIZE_ARGS, "--direct"] : [...MATERIALIZE_ARGS];
+}
+
 async function defaultMaterialize(python: string, cwd: string): Promise<void> {
-  await execFile(python, [...MATERIALIZE_ARGS], {
+  await execFile(python, materializeArgs(), {
     cwd,
     env: { ...process.env, PYTHONPATH: cwd },
     timeout: 5 * 60 * 1000,

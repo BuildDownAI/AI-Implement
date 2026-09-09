@@ -210,8 +210,9 @@ or these steps by hand.
    `BuildDownAI/bd-knowledge-graph-base` when absent) — it never contributes to the 422 refusal,
    it only informs. Then it checks whether the source repo snapshot SHA matches the last recorded SHA:
    - **If the SHA differs** (new snapshot available): fetches `KG_SOURCE_REPO`, stages under
-     `/data/kg/staging` (materialize with the image's venv — nothing embeds), writes the
-     completion marker last, swaps by rename, and restarts the sidecar.
+     `/data/kg/staging` (materialize with the image's venv — nothing embeds; see "Two materialize
+     paths" below for the `KG_MATERIALIZE_DIRECT` flag), writes the completion marker last, swaps
+     by rename, and restarts the sidecar.
    - **If the SHA matches** (AII-495): dispatches a `kg-refresh` Claude runner job to ingest
      and push a new snapshot. Requires `RUNNER_CALLBACK_BASE_URL` and `RUNNER_TOKEN_SECRET`;
      without them the trigger returns `422 callback-unconfigured`. The stage advances from
@@ -310,6 +311,30 @@ flowchart TD
   memory is the tighter budget: the rail's materialize runs as a second Python process beside the
   serving sidecar, and at ~31.6k quads it reached 271 MB RSS — which is what the 512 MB machine
   could not hold on 2026-09-08.
+
+### Two materialize paths (AII-599)
+
+`KG_MATERIALIZE_DIRECT=true` switches the refresh rail to the base repo's low-memory `--direct`
+path (KGB-15, base PR #34), gated behind the flag because it requires the configured
+`KG_SOURCE_REPO` derivative to already carry that base change — an image whose venv predates it
+fails the materialize step and the rail reverts safely, same as any other staging failure.
+
+| | Off (default) — rdflib | On — `--direct` |
+|---|---|---|
+| Materialize command | `python -m kg_ingest.materialize` | `python -m kg_ingest.materialize --direct` |
+| What it does | Parses `snapshot/parts/*.nt` with rdflib, re-serializes to `out/graph.trig` | Copies `snapshot/parts/*.nt` to `out/parts/` — no rdflib re-serialization |
+| Staged as | `stagingDir/graph.trig` | `stagingDir/parts/` |
+| Served with | `KG_BACKEND` unset (start.sh's own `rdflib` default) | `KG_BACKEND=nt_parts`, `KG_PARTS_DIR=<current>/parts` |
+| Peak refresh RSS (31k triples) | ~99 MB | ~29 MB |
+
+The sidecar derives which backend to serve from what is actually staged on disk (a `parts/`
+directory next to the completion marker), not from re-reading the flag — `kg-sidecar.ts` is
+spawned fresh on every `restart()`, so this keeps a `current/` overlay self-describing even if the
+flag changes between refreshes. With the direct path, the refresh process's own footprint drops
+low enough that serving and refreshing together fit comfortably inside the 512 MB the machine
+could not hold on 2026-09-08 with the rdflib path (see the Failure history table) — the 1 GB
+figure above remains the committed setting, but the direct path is what would let that incident's
+fix be reverted instead of the memory bump.
 
 ### The `index.ts` budget
 

@@ -377,6 +377,107 @@ describe("runtime data directory overlay", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 5b. Direct-materialize serving backend (AII-599)
+// ---------------------------------------------------------------------------
+
+describe("nt_parts backend selection", () => {
+  it("current dir has completion marker + parts/ → child receives KG_BACKEND=nt_parts and KG_PARTS_DIR", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+
+    const runtimeDir = makeTmpDir();
+    touch(join(runtimeDir, COMPLETION_MARKER));
+    mkdirSync(join(runtimeDir, "parts"));
+    touch(join(runtimeDir, "parts", "issue.nt"));
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+
+    try {
+      expect(capturedEnv?.KG_DATA_DIR).toBe(runtimeDir);
+      expect(capturedEnv?.KG_BACKEND).toBe("nt_parts");
+      expect(capturedEnv?.KG_PARTS_DIR).toBe(join(runtimeDir, "parts"));
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("current dir has completion marker but no parts/ → KG_BACKEND left unset (start.sh's own rdflib default applies)", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+
+    const runtimeDir = makeTmpDir();
+    touch(join(runtimeDir, COMPLETION_MARKER));
+    touch(join(runtimeDir, "graph.trig"));
+
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+      capturedEnv = (opts as { env?: NodeJS.ProcessEnv }).env;
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+
+    try {
+      expect(capturedEnv?.KG_DATA_DIR).toBe(runtimeDir);
+      expect(capturedEnv?.KG_BACKEND).toBeUndefined();
+      expect(capturedEnv?.KG_PARTS_DIR).toBeUndefined();
+    } finally {
+      await sidecar.stop();
+    }
+  });
+
+  it("restart() after a direct-mode refresh re-spawns with KG_BACKEND=nt_parts in the child env", async () => {
+    const kgDir = makeKgDir();
+    touch(join(kgDir, "out", "embeddings.npz"));
+
+    const runtimeDir = makeTmpDir();
+    touch(join(runtimeDir, COMPLETION_MARKER));
+    mkdirSync(join(runtimeDir, "parts"));
+
+    const capturedEnvs: Array<NodeJS.ProcessEnv | undefined> = [];
+    const spawnCapture = (cmd: string, args: string[], opts: object) => {
+      capturedEnvs.push((opts as { env?: NodeJS.ProcessEnv }).env);
+      return realSpawn("sh", ["-c", "sleep 60"], { ...(opts as Parameters<typeof realSpawn>[2]), stdio: "ignore" });
+    };
+
+    writeScript(join(kgDir, "start.sh"), "sleep 60");
+
+    const sidecar = new KgSidecar(
+      { kgDir, runtimeDataDir: runtimeDir, pollTimeoutMs: 5_000, pollIntervalMs: 10 },
+      { httpGet: async () => true, spawn: spawnCapture },
+    );
+    await sidecar.start();
+    await sidecar.restart();
+
+    try {
+      expect(capturedEnvs).toHaveLength(2);
+      expect(capturedEnvs[1]?.KG_BACKEND).toBe("nt_parts");
+      expect(capturedEnvs[1]?.KG_PARTS_DIR).toBe(join(runtimeDir, "parts"));
+    } finally {
+      await sidecar.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 6. Stop / shutdown behaviour
 // ---------------------------------------------------------------------------
 

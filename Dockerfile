@@ -100,7 +100,7 @@ RUN --mount=type=secret,id=kg_token,required=false \
         && for f in requirements.txt sources.yml; do \
                [ -f /tmp/kg-src/$f ] && cp /tmp/kg-src/$f /app/kg/ || true; \
            done \
-        && printf '#!/bin/sh\ncd "$(dirname "$0")"\nexport KG_HTTP=1 KG_HTTP_PORT=8765 KG_HTTP_HOST=127.0.0.1 KG_BACKEND=rdflib PYTHONPATH=. FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache\nexec .venv/bin/python -m kg_query.server\n' > /app/kg/start.sh \
+        && printf '#!/bin/sh\ncd "$(dirname "$0")"\nexport KG_HTTP=1 KG_HTTP_PORT=8765 KG_HTTP_HOST=127.0.0.1 KG_BACKEND="${KG_BACKEND:-rdflib}" PYTHONPATH=. FASTEMBED_CACHE_PATH=/app/kg/.fastembed-cache\nexec .venv/bin/python -m kg_query.server\n' > /app/kg/start.sh \
         && chmod +x /app/kg/start.sh \
         && rm -rf /tmp/kg-src; \
     else \

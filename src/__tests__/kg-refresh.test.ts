@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { makeKgRefresh, runKgRefreshPreflight, MATERIALIZE_ARGS, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate } from "../kg-refresh.js";
+import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate } from "../kg-refresh.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -292,8 +292,84 @@ describe("kg-refresh", () => {
   });
 
   it("never reaches an embedding path: the staging command is materialize, full pass", () => {
-    expect([...MATERIALIZE_ARGS]).toEqual(["-m", "kg_ingest.materialize"]);
-    expect(MATERIALIZE_ARGS.join(" ")).not.toMatch(/embed|cli/);
+    expect(materializeArgs()).toEqual(["-m", "kg_ingest.materialize"]);
+    expect(materializeArgs().join(" ")).not.toMatch(/embed|cli/);
+  });
+
+  // AII-599: KG_MATERIALIZE_DIRECT gates the low-memory --direct path.
+  describe("KG_MATERIALIZE_DIRECT", () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("appends --direct to materializeArgs() when the flag is true", () => {
+      vi.stubEnv("KG_MATERIALIZE_DIRECT", "true");
+      expect(materializeArgs()).toEqual(["-m", "kg_ingest.materialize", "--direct"]);
+      expect(materializeArgs().join(" ")).not.toMatch(/embed|cli/);
+    });
+
+    it("leaves materializeArgs() unchanged when the flag is unset or any other value", () => {
+      vi.stubEnv("KG_MATERIALIZE_DIRECT", "false");
+      expect(materializeArgs()).toEqual(["-m", "kg_ingest.materialize"]);
+    });
+
+    it("flag off (default): stages graph.trig, no parts/ directory — byte-for-byte today's behaviour", async () => {
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      await waitDone();
+
+      const current = join(dataRoot, "current");
+      expect(existsSync(join(current, "graph.trig"))).toBe(true);
+      expect(existsSync(join(current, "parts"))).toBe(false);
+    });
+
+    it("flag on: stages out/parts/ flattened to current/parts/ instead of graph.trig", async () => {
+      vi.stubEnv("KG_MATERIALIZE_DIRECT", "true");
+      materialize.mockImplementation(async (_python: string, cwd: string) => {
+        mkdirSync(join(cwd, "out", "parts"), { recursive: true });
+        writeFileSync(join(cwd, "out", "parts", "issue.nt"), "<urn:a> <urn:b> <urn:c> .");
+        writeFileSync(join(cwd, "out", "embeddings.npz"), "vectors");
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      await waitDone();
+
+      const s = await handle.status();
+      expect(s.lastRefresh?.ok).toBe(true);
+
+      const current = join(dataRoot, "current");
+      expect(readFileSync(join(current, "parts", "issue.nt"), "utf8")).toBe("<urn:a> <urn:b> <urn:c> .");
+      expect(existsSync(join(current, "graph.trig"))).toBe(false);
+      expect(existsSync(join(current, "embeddings.npz"))).toBe(true);
+      expect(existsSync(join(current, COMPLETION_MARKER))).toBe(true);
+    });
+
+    it("flag on, materialize failure (image venv predates --direct): hits the staging gate and reverts, same as flag off", async () => {
+      vi.stubEnv("KG_MATERIALIZE_DIRECT", "true");
+      const current = join(dataRoot, "current");
+      mkdirSync(current, { recursive: true });
+      writeFileSync(join(current, "graph.trig"), "SERVING");
+      writeFileSync(join(current, COMPLETION_MARKER), "ok");
+
+      materialize.mockImplementationOnce(async () => {
+        throw new Error("unrecognized arguments: --direct");
+      });
+      await handle.trigger();
+      await waitDone();
+
+      const s = await handle.status();
+      expect(s.lastRefresh?.ok).toBe(false);
+      expect(s.lastRefresh?.gate).toBe("staging");
+      expect(readFileSync(join(current, "graph.trig"), "utf8")).toBe("SERVING");
+      expect(existsSync(join(dataRoot, "staging"))).toBe(false);
+      expect(restart).not.toHaveBeenCalled();
+    });
+  });
+
+  it("Dockerfile bakes a default-if-unset KG_BACKEND so a sidecar-set nt_parts value survives start.sh (AII-599)", () => {
+    const dockerfile = readFileSync("Dockerfile", "utf8");
+    expect(dockerfile).toMatch(/KG_BACKEND="\$\{KG_BACKEND:-rdflib\}"/);
   });
 
   it("returns ingest-needed when the snapshot SHA matches the recorded SHA", async () => {
