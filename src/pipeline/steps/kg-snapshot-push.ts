@@ -4,7 +4,8 @@ import { basename, join } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { openOrFindPullRequest } from "../step-utils.js";
-import { readSecondaryReposFromSourcesYml } from "./kg-tracker-data.js";
+import { postPrComment } from "../../github.js";
+import { readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "./kg-tracker-data.js";
 
 /** Coded failure raised when the snapshot parts or embeddings file are absent. */
 export class KgSnapshotMissingError extends Error {
@@ -186,6 +187,20 @@ function readSecondaryRepoOutcomes(workspaceDir: string): Array<{ slug: string; 
   return results;
 }
 
+/**
+ * The configured code repo (sources.yml `code_repo`) and whether its clone-code-repo
+ * checkout under code-repo/ has any content besides .git. Null when no code_repo is
+ * configured — unreachable from this step in practice, since kg-ingest throws before
+ * kg-snapshot-push runs when clone-code-repo produced no output (see classifyRefreshAnomaly).
+ */
+function readCodeRepoOutcome(workspaceDir: string): { slug: string; empty: boolean } | null {
+  const codeRepo = readCodeRepoFromSourcesYml(workspaceDir);
+  if (!codeRepo) return null;
+  const dir = join(workspaceDir, "code-repo");
+  const empty = !existsSync(dir) || readdirSync(dir).filter((f) => f !== ".git").length === 0;
+  return { slug: codeRepo.slug, empty };
+}
+
 interface RefreshReportInputs {
   stampCompact: string;
   quads: number | null;
@@ -236,6 +251,133 @@ function buildRefreshReport(data: RefreshReportInputs): string {
     for (const w of data.ingestWarnings) lines.push(`- ${w}`);
   }
   return lines.join("\n");
+}
+
+/** First line the KG ingest's `kg_ingest/cards.py` matches exactly to classify a comment as a Learning card. */
+const LEARNINGS_MARKER = "# ai-implement-kg-refresh-learnings";
+
+/**
+ * A part's line count moving past this fraction (either direction) against the
+ * served snapshot is a learning, not a refusal — the push guard (section 0b)
+ * only refuses a shrink below PART_SHRINK_THRESHOLD (50%), so this class fires
+ * on runs that already cleared that guard.
+ */
+const COUNT_STEP_LEARNING_THRESHOLD = 0.2;
+
+export type RefreshAnomalyClass = "guard-refused" | "source-missing" | "count-step" | "ingest-warnings";
+
+export interface RefreshAnomaly {
+  class: RefreshAnomalyClass;
+  /** Facts for "## What happened" — drawn only from the report inputs, no speculation. */
+  facts: string[];
+  /** Names for "## Applies to" — the gate, repo slug(s), or part name(s) the anomaly concerns. */
+  subjects: string[];
+}
+
+interface ClassifyRefreshAnomalyInput {
+  /**
+   * "clean" once every push guard has passed. At the one call site in this file
+   * (after openOrFindPullRequest resolves) this is always "clean" — a non-clean
+   * guard verdict throws before any push or PR exists, so nothing survives to be
+   * classified. This param exists so the classifier stays generic for a future
+   * guard that reports a verdict instead of throwing, and so it can be tested in
+   * isolation with a non-clean verdict without needing that guard to exist yet.
+   */
+  guardVerdict: string;
+  partRows: Array<{ part: string; prev: string; next: string; delta: string }>;
+  configuredSecondaryRepos: Array<{ slug: string }>;
+  secondaryRepoOutcomes: Array<{ slug: string; branch: string; commit: string }>;
+  /**
+   * Configured code repo and whether its clone-code-repo checkout is empty. Null
+   * when no code_repo is configured — unreachable at the one call site, since
+   * kg-ingest throws before kg-snapshot-push runs whenever clone-code-repo produced
+   * no output (no code_repo configured, or a clone failure — clone-code-repo throws
+   * on failure rather than soft-failing). Only the "cloned but empty" case is
+   * reachable here; `empty: false` covers everything else.
+   */
+  codeRepo: { slug: string; empty: boolean } | null;
+  ingestWarnings: string[];
+}
+
+/**
+ * Classifies a refresh into at most one of the four learning classes, in the
+ * precedence order the ticket lists them (guard-refused, source-missing,
+ * count-step, ingest-warnings). Returns null for a clean run — nothing to post.
+ */
+export function classifyRefreshAnomaly(input: ClassifyRefreshAnomalyInput): RefreshAnomaly | null {
+  if (input.guardVerdict !== "clean") {
+    return { class: "guard-refused", facts: [`gate verdict: ${input.guardVerdict}`], subjects: [input.guardVerdict] };
+  }
+
+  const clonedSlugs = new Set(input.secondaryRepoOutcomes.map((r) => r.slug));
+  const missingSlugs = input.configuredSecondaryRepos
+    .map((r) => r.slug)
+    .filter((slug) => !clonedSlugs.has(slug));
+  const missingFacts = missingSlugs.map(
+    (slug) => `secondary repo \`${slug}\` is configured in sources.yml but has no cloned checkout under repos/`,
+  );
+  const missingSubjects = [...missingSlugs];
+  if (input.codeRepo?.empty) {
+    missingFacts.push(
+      `code repo \`${input.codeRepo.slug}\` is configured in sources.yml and cloned, but its checkout under code-repo/ has no content`,
+    );
+    missingSubjects.push(input.codeRepo.slug);
+  }
+  if (missingFacts.length > 0) {
+    return { class: "source-missing", facts: missingFacts, subjects: missingSubjects };
+  }
+
+  const stepFacts: string[] = [];
+  const stepParts: string[] = [];
+  for (const row of input.partRows) {
+    if (row.prev === "missing" || row.next === "missing") continue;
+    const prev = Number(row.prev);
+    const next = Number(row.next);
+    if (!Number.isFinite(prev) || prev === 0 || !Number.isFinite(next)) continue;
+    const fraction = Math.abs(next - prev) / prev;
+    if (fraction > COUNT_STEP_LEARNING_THRESHOLD) {
+      stepFacts.push(`${row.part}: ${row.prev} → ${row.next} lines (${row.delta}, ${(fraction * 100).toFixed(0)}% move)`);
+      stepParts.push(row.part);
+    }
+  }
+  if (stepFacts.length > 0) {
+    return { class: "count-step", facts: stepFacts, subjects: stepParts };
+  }
+
+  if (input.ingestWarnings.length > 0) {
+    return { class: "ingest-warnings", facts: [...input.ingestWarnings], subjects: ["ai-output/kg-ingest.log"] };
+  }
+
+  return null;
+}
+
+/** Mechanical, factual explanation per class — never speculation about root cause. */
+const CLASS_WHY: Record<RefreshAnomalyClass, string> = {
+  "guard-refused": "The push guard reported a non-clean verdict; the gate text above is the guard's own reasoning for refusing the push.",
+  "source-missing": "clone-secondary-repos soft-fails per entry rather than aborting the pipeline, so a failed or skipped clone for a secondary repo leaves no repos/<slug> checkout without failing the run; a configured code repo whose checkout has no content is included here too, since kg-ingest only checks that a code-repo directory was produced, not that it has content.",
+  "count-step": `The push guard only refuses a part below ${PART_SHRINK_THRESHOLD * 100}% of its previous line count (or any shrink of a non-empty tracker part); a move past the ${COUNT_STEP_LEARNING_THRESHOLD * 100}% learnings threshold in either direction clears that guard but is still a large enough step to record.`,
+  "ingest-warnings": "ai-output/kg-ingest.log recorded at least one WARN or ERROR line during this run's ingest; the lines above are copied verbatim.",
+};
+
+/** Renders the fixed five-section learnings comment. First line must stay byte-exact for the KG ingest's marker match. */
+export function buildLearningsComment(anomaly: RefreshAnomaly, stampCompact: string): string {
+  return [
+    LEARNINGS_MARKER,
+    `**Refresh:** ${stampCompact}`,
+    `**Class:** ${anomaly.class}`,
+    "",
+    "## What happened",
+    "",
+    ...anomaly.facts.map((f) => `- ${f}`),
+    "",
+    "## Why (as far as the run knows)",
+    "",
+    CLASS_WHY[anomaly.class],
+    "",
+    "## Applies to",
+    "",
+    ...anomaly.subjects.map((s) => `- ${s}`),
+  ].join("\n");
 }
 
 function buildCommitMessage(stats: KgStats | null): string {
@@ -450,13 +592,17 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const stampCompact = compactStamp(currentStamp);
     const rawTeamCounts = trackerOutputs.teamCounts;
     const teamCounts = Array.isArray(rawTeamCounts) ? (rawTeamCounts as Array<{ team: string; count: number }>) : [];
+    // Read once and reuse for both the report and the learnings classification below,
+    // so the two can never disagree about counts.
+    const secondaryRepoOutcomes = readSecondaryRepoOutcomes(workspaceDir);
+    const ingestWarnings = readIngestWarnings(workspaceDir);
     const reportBody = buildRefreshReport({
       stampCompact,
       quads: stats?.quads ?? null,
       partRows,
       teamCounts,
-      secondaryRepos: readSecondaryRepoOutcomes(workspaceDir),
-      ingestWarnings: readIngestWarnings(workspaceDir),
+      secondaryRepos: secondaryRepoOutcomes,
+      ingestWarnings,
       guardVerdict: dryRun ? "clean (dry-run — no push)" : "clean",
     });
 
@@ -552,6 +698,27 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       draft: false,
     });
     console.log(`[kg-snapshot-push] pr opened #${pr.number}`);
+
+    // ── 7. Post a learnings comment when the run teaches something ───────────
+    // Classified from the same data as the report above, so the two never
+    // disagree. Best-effort: the snapshot already pushed and the PR is already
+    // open, so a comment failure should not fail an otherwise-successful refresh.
+    const anomaly = classifyRefreshAnomaly({
+      guardVerdict: "clean",
+      partRows,
+      configuredSecondaryRepos: readSecondaryReposFromSourcesYml(workspaceDir),
+      secondaryRepoOutcomes,
+      codeRepo: readCodeRepoOutcome(workspaceDir),
+      ingestWarnings,
+    });
+    if (anomaly) {
+      try {
+        await postPrComment(activeGithubToken, repoOwner, repoRepo, pr.number, buildLearningsComment(anomaly, stampCompact));
+        console.log(`[kg-snapshot-push] learnings comment posted (${anomaly.class})`);
+      } catch (err) {
+        console.warn(`[kg-snapshot-push] could not post learnings comment (${anomaly.class}): ${String(err)}`);
+      }
+    }
 
     return { snapshotPushed: true, commitSha, prNumber: pr.number, branchName };
   },
