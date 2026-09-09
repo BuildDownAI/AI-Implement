@@ -573,6 +573,13 @@ describe("handleMcpRequest", () => {
         results: [
           { repo: "org/kg-repo", grant: "contents:write", ok: true, status: 200 },
           { repo: "org/code-repo", grant: "contents:read", ok: false, status: 404 },
+          {
+            repo: "org/kg-repo",
+            grant: "workflow:runner_phase",
+            ok: false,
+            status: 200,
+            hint: "re-run workflow sync for the KG repo mapping (POST /api/mappings/<team>/sync-workflows)",
+          },
         ],
       };
       const runKgRefreshPreflightMock = vi.fn(async () => preflightResult);

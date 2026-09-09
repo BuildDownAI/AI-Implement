@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import http from "node:http";
+import { parse as parseYaml } from "yaml";
 import { getScopedInstallationToken } from "./github-app-auth.js";
 import { fetchRepoTarball } from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
@@ -41,6 +42,10 @@ const KG_REFRESH_TTL_MS = 4 * 60 * 60 * 1000;
 /** Delay between snapshot-commit visibility retries (git-cache lag). */
 const SNAPSHOT_COMMIT_RETRY_MS = 5_000;
 
+/** Advisory hint attached to a failing `workflow:runner_phase` preflight row (AII-594). */
+const WORKFLOW_RUNNER_PHASE_SYNC_HINT =
+  "re-run workflow sync for the KG repo mapping (POST /api/mappings/<team>/sync-workflows)";
+
 /** DB settings key for persisting ingest stage across restarts. */
 const KG_STAGE_SETTINGS_KEY = "kg_refresh_stage";
 
@@ -68,11 +73,11 @@ export interface RefreshOutcome {
   stampAfter: string | null;
 }
 
-/** One probe result from the credential preflight. */
+/** One probe result from the credential preflight. `hint` is set only when `ok` is false. */
 export interface PreflightCheckResult {
   ok: boolean;
   checkedAt: number;
-  results: Array<{ repo: string; grant: string; ok: boolean; status: number }>;
+  results: Array<{ repo: string; grant: string; ok: boolean; status: number; hint?: string }>;
 }
 
 /** Input for the standalone `runKgRefreshPreflight` helper. All network calls are injectable for tests. */
@@ -84,6 +89,8 @@ export interface KgPreflightInput {
   fetchTarball?: typeof fetchRepoTarball;
   fetchDefaultBranch?: (token: string, owner: string, repo: string) => Promise<string>;
   probeRepo?: (token: string, slug: string, grant: "contents" | "pull_requests") => Promise<{ ok: boolean; status: number }>;
+  /** Fetch `.github/workflows/claude-implement.yml` from the KG repo. Injectable for tests. */
+  fetchWorkflowFile?: (token: string, owner: string, repo: string, branch: string) => Promise<{ status: number; content: string | null }>;
 }
 
 /**
@@ -236,6 +243,8 @@ interface KgRefreshInput {
 
   /** Probe a (token, slug, grant) for the credential preflight. Injectable for tests; defaults to GitHub REST calls. */
   probeRepo?: (token: string, slug: string, grant: "contents" | "pull_requests") => Promise<{ ok: boolean; status: number }>;
+  /** Fetch `.github/workflows/claude-implement.yml` from the KG repo for the credential preflight. Injectable for tests. */
+  fetchWorkflowFile?: (token: string, owner: string, repo: string, branch: string) => Promise<{ status: number; content: string | null }>;
 
   // ---- Outcome reporting (AII-496) ----
 
@@ -271,6 +280,51 @@ async function defaultProbeRepo(
   }
 }
 
+async function defaultFetchWorkflowFile(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<{ status: number; content: string | null }> {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/contents/.github/workflows/claude-implement.yml?ref=${encodeURIComponent(branch)}`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" } },
+    );
+    if (!res.ok) return { status: res.status, content: null };
+    const body = (await res.json()) as { content?: string; encoding?: string; type?: string };
+    if (body.type !== "file" || body.encoding !== "base64" || !body.content) {
+      return { status: res.status, content: null };
+    }
+    return { status: res.status, content: Buffer.from(body.content, "base64").toString("utf8") };
+  } catch {
+    return { status: 0, content: null };
+  }
+}
+
+/**
+ * True when a `claude-implement.yml` body declares `runner_phase` under
+ * `on.workflow_dispatch.inputs`. GitHub Actions YAML is looser than a plain config
+ * file — `workflow_dispatch` may be null/absent (no inputs at all is legal), and a
+ * parse failure or unexpected shape must never throw. Any of those resolve to false,
+ * same "unexpected shape → treat as absent" convention as `readCodeRepoFromSourcesYml`.
+ */
+function workflowAcceptsRunnerPhase(yamlText: string): boolean {
+  try {
+    const doc = parseYaml(yamlText) as unknown;
+    if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return false;
+    const onBlock = (doc as Record<string, unknown>).on;
+    if (onBlock === null || typeof onBlock !== "object" || Array.isArray(onBlock)) return false;
+    const workflowDispatch = (onBlock as Record<string, unknown>).workflow_dispatch;
+    if (workflowDispatch === null || typeof workflowDispatch !== "object" || Array.isArray(workflowDispatch)) return false;
+    const inputs = (workflowDispatch as Record<string, unknown>).inputs;
+    if (inputs === null || typeof inputs !== "object" || Array.isArray(inputs)) return false;
+    return Object.prototype.hasOwnProperty.call(inputs, "runner_phase");
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Credential preflight for a kg-refresh dispatch: mints the primary write token for the KG
  * source repo, then mints the installation-wide dependency token and probes each code repo and
@@ -286,22 +340,29 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
   const fetchTarballFn = input.fetchTarball ?? fetchRepoTarball;
   const fetchDefaultBranchFn = input.fetchDefaultBranch ?? defaultFetchDefaultBranch;
   const probeRepoFn = input.probeRepo ?? defaultProbeRepo;
+  const fetchWorkflowFileFn = input.fetchWorkflowFile ?? defaultFetchWorkflowFile;
 
   const repo = parseKgSourceRepo(input.kgSourceRepo);
   const kgRepoSlug = `${repo.owner}/${repo.repo}`;
   const checkedAt = Date.now();
-  const results: Array<{ repo: string; grant: string; ok: boolean; status: number }> = [];
+  const results: Array<{ repo: string; grant: string; ok: boolean; status: number; hint?: string }> = [];
 
   // Fetch sources.yml from the KG source repo to discover code_repo and secondary_repos slugs.
+  // The read token and default branch are reused below for the workflow-file probe (AII-594) —
+  // same repo, same permission, no benefit to a second mint.
   let codeRepo: string | null = null;
   let secondaryRepos: Array<{ slug: string }> = [];
+  let sourcesReadToken: string | null = null;
+  let defaultBranch: string | null = null;
   const tmpDir = await mkdtemp(join(tmpdir(), "kg-preflight-"));
   try {
     const { token: readToken } = await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
       permissions: { contents: "read" },
       repositories: [repo.repo],
     });
+    sourcesReadToken = readToken;
     const branch = await fetchDefaultBranchFn(readToken, repo.owner, repo.repo);
+    defaultBranch = branch;
     const tarball = await fetchTarballFn(readToken, repo.owner, repo.repo, branch);
     const sourceDir = await extractSource(tarball, tmpDir);
     codeRepo = readCodeRepoFromSourcesYml(sourceDir)?.slug ?? null;
@@ -310,6 +371,26 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     results.push({ repo: kgRepoSlug, grant: "sources.yml:read", ok: false, status: 0 });
   } finally {
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // Probe whether the KG repo's claude-implement.yml accepts runner_phase (AII-594): the rail
+  // dispatches with runner_phase=kg-refresh, and a repo whose synced copy predates that input
+  // 422s at dispatch. Reuses the read token/branch minted above when available.
+  try {
+    const token = sourcesReadToken ?? (await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
+      permissions: { contents: "read" },
+      repositories: [repo.repo],
+    })).token;
+    const branch = defaultBranch ?? (await fetchDefaultBranchFn(token, repo.owner, repo.repo));
+    const file = await fetchWorkflowFileFn(token, repo.owner, repo.repo, branch);
+    const ok = file.status === 200 && file.content !== null && workflowAcceptsRunnerPhase(file.content);
+    results.push(
+      ok
+        ? { repo: kgRepoSlug, grant: "workflow:runner_phase", ok: true, status: file.status }
+        : { repo: kgRepoSlug, grant: "workflow:runner_phase", ok: false, status: file.status, hint: WORKFLOW_RUNNER_PHASE_SYNC_HINT },
+    );
+  } catch {
+    results.push({ repo: kgRepoSlug, grant: "workflow:runner_phase", ok: false, status: 0, hint: WORKFLOW_RUNNER_PHASE_SYNC_HINT });
   }
 
   // Probe primary write token for the KG source repo.
@@ -399,6 +480,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const loadStageFn = input.loadStage ?? defaultLoadStage;
   const persistLastRefreshFn = input.persistLastRefresh ?? defaultPersistLastRefresh;
   const loadLastRefreshFn = input.loadLastRefresh ?? defaultLoadLastRefresh;
+  const fetchWorkflowFile = input.fetchWorkflowFile ?? defaultFetchWorkflowFile;
 
   let running = false;
   let lastRefresh: RefreshOutcome | null = null;
@@ -780,11 +862,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           fetchTarball,
           fetchDefaultBranch,
           probeRepo: input.probeRepo,
+          fetchWorkflowFile,
         });
         if (!preflightResult.ok) {
           const failDetail = preflightResult.results
             .filter((r) => !r.ok)
-            .map((r) => `${r.repo} — ${r.grant} — HTTP ${r.status}`)
+            .map((r) => `${r.repo} — ${r.grant} — HTTP ${r.status}${r.hint ? ` — ${r.hint}` : ""}`)
             .join("\n");
           lastRefresh = {
             ok: false,

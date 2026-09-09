@@ -1673,6 +1673,10 @@ describe("makeKgRefresh — dispatch result threading to updateJobMachine", () =
       mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
       fetchTarball: vi.fn(async () => tarball) as never,
       fetchDefaultBranch: vi.fn(async () => "main") as never,
+      fetchWorkflowFile: vi.fn(async () => ({
+        status: 200,
+        content: "on:\n  workflow_dispatch:\n    inputs:\n      runner_phase:\n        required: false\n",
+      })) as never,
       // SHA matches recorded SHA → runRefresh() returns ingest-needed → dispatch fires
       fetchSnapshotCommitSha: vi.fn(async () => "sha-abc") as never,
       persistSnapshotSha: vi.fn() as never,
