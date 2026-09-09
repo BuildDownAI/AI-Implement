@@ -1,5 +1,5 @@
 import http from "node:http";
-import type { PreflightCheckResult } from "./kg-refresh.js";
+import type { PreflightCheckResult, KgRefreshStatus } from "./kg-refresh.js";
 import { verifyMcpToken } from "./mcp-oauth.js";
 import { getRunnerMode } from "./runner-mode.js";
 import { getMappings } from "./config.js";
@@ -100,6 +100,12 @@ const DIAG_TOOLS = [
       "Returns the current deploy posture: whether autoDeploy is on, the watched repo/branch, running vs head commit, deploy hold and in-flight state, runner channel image and commit, and a mergeCost field summarising the landing cost of a merge (deploy+image / image / none). Use this before filing or merging to understand the blast radius.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "get_kg_status",
+    description:
+      "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
@@ -107,7 +113,11 @@ const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
 async function callDiagnosticTool(
   name: string,
   args: Record<string, unknown>,
-  context: { defaultRunnerImage?: string; runKgRefreshPreflight?: () => Promise<PreflightCheckResult> } = {},
+  context: {
+    defaultRunnerImage?: string;
+    runKgRefreshPreflight?: () => Promise<PreflightCheckResult>;
+    getKgStatus?: () => Promise<KgRefreshStatus>;
+  } = {},
 ): Promise<unknown> {
   switch (name) {
     case "get_tenant_health": {
@@ -239,6 +249,9 @@ async function callDiagnosticTool(
     case "get_deploy_posture":
       return getDeployPosture({ defaultImage: context.defaultRunnerImage });
 
+    case "get_kg_status":
+      return context.getKgStatus ? await context.getKgStatus() : { error: "KG refresh is not configured" };
+
     default:
       return { error: `Unknown diagnostic tool: ${name}` };
   }
@@ -254,6 +267,7 @@ export async function handleMcpRequest(
   providerDiagnostic?: string | null,
   defaultRunnerImage?: string,
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
+  getKgStatus?: () => Promise<KgRefreshStatus>,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -318,7 +332,7 @@ export async function handleMcpRequest(
     if (DIAG_TOOL_NAMES.has(toolName)) {
       const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
       try {
-        const result = await callDiagnosticTool(toolName, toolArgs, { defaultRunnerImage, runKgRefreshPreflight });
+        const result = await callDiagnosticTool(toolName, toolArgs, { defaultRunnerImage, runKgRefreshPreflight, getKgStatus });
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,

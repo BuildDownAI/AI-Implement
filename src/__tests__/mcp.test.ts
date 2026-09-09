@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleMcpRequest } from "../mcp.js";
 import { SidecarMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
-import type { PreflightCheckResult } from "../kg-refresh.js";
+import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
 
 vi.mock("../mcp-oauth.js", () => ({
   verifyMcpToken: vi.fn(),
@@ -235,13 +235,14 @@ async function callMcp(
   body?: string,
   providerDiagnostic?: string | null,
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
+  getKgStatus?: () => Promise<KgRefreshStatus>,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
     tokenValid ? { email: "user@example.com", sub: "sub1", provider: "google" } : null,
   );
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
-  handleMcpRequest(req as never, res as never, provider, baseUrl, providerDiagnostic, undefined, runKgRefreshPreflight);
+  handleMcpRequest(req as never, res as never, provider, baseUrl, providerDiagnostic, undefined, runKgRefreshPreflight, getKgStatus);
   await res.done;
   return { statusCode: res.statusCode, body: res.body, responseHeaders: res.responseHeaders };
 }
@@ -311,6 +312,7 @@ describe("handleMcpRequest", () => {
         expect.objectContaining({ name: "list_in_flight_jobs" }),
         expect.objectContaining({ name: "get_issue_dispatch_status" }),
         expect.objectContaining({ name: "get_deploy_posture" }),
+        expect.objectContaining({ name: "get_kg_status" }),
       ]));
     });
 
@@ -1035,6 +1037,59 @@ describe("handleMcpRequest", () => {
     });
 
     it("get_deploy_posture — unauthenticated request returns 401", async () => {
+      const result = await callMcp({ authorization: "Bearer invalid" }, false);
+      expect(result.statusCode).toBe(401);
+    });
+
+    it("handles get_kg_status — returns the getKgStatus result verbatim", async () => {
+      const status: KgRefreshStatus = {
+        running: true,
+        deployHeld: false,
+        kgDegraded: false,
+        servedStamp: "2026-09-01T00:00:00Z",
+        lastRefresh: { ok: true, at: 1735689600000, detail: "no diff", stampBefore: "a", stampAfter: "b" },
+        stage: "ingest-running",
+      };
+      const getKgStatusMock = vi.fn(async () => status);
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 22, method: "tools/call", params: { name: "get_kg_status", arguments: {} } }),
+        undefined,
+        undefined,
+        getKgStatusMock,
+      );
+
+      expect(mockHttpRequest).not.toHaveBeenCalled();
+      expect(result.statusCode).toBe(200);
+      expect(getKgStatusMock).toHaveBeenCalledOnce();
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data).toEqual(status);
+    });
+
+    it("get_kg_status — returns a graceful error when getKgStatus is not wired (KG unconfigured)", async () => {
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 23, method: "tools/call", params: { name: "get_kg_status", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.error).toContain("KG refresh is not configured");
+    });
+
+    it("get_kg_status — unauthenticated request returns 401", async () => {
       const result = await callMcp({ authorization: "Bearer invalid" }, false);
       expect(result.statusCode).toBe(401);
     });
