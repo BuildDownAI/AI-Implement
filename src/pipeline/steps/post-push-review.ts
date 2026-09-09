@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { OperatorCancelledError, PrMergedError } from "../operator-cancelled.js";
-import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary } from "../step-utils.js";
+import type { LLMResult, PipelineContext, StepModule, StepReporter } from "../types.js";
+import { formatGitNameStatusSummary, terminalResultFailureMessage } from "../step-utils.js";
 import { extractFirstJsonObject } from "../json-extract.js";
+import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, type ReviewIssue as VerdictReviewIssue } from "../review-verdict.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 import { getPublicationCredential } from "../../publication-credential.js";
 import {
@@ -196,51 +197,7 @@ function issueFromString(text: string): ReviewIssue {
   };
 }
 
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function parseReviewIssue(value: unknown): ReviewIssue | null {
-  if (typeof value === "string") {
-    const text = value.trim();
-    return text ? issueFromString(text) : null;
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-
-  const issue = value as Record<string, unknown>;
-  const title = stringValue(issue.title) || stringValue(issue.summary) || "Blocking issue";
-  const location = stringValue(issue.location) || stringValue(issue.file) || stringValue(issue.path) || undefined;
-  const problem = stringValue(issue.problem) || stringValue(issue.issue) || stringValue(issue.details) || stringValue(issue.description);
-  const requiredFix = stringValue(issue.required_fix) || stringValue(issue.requiredFix) || stringValue(issue.fix) || stringValue(issue.recommendation);
-  const rawText = stringValue(issue.text);
-  if (!problem && !requiredFix && !rawText) return null;
-  if (rawText && !problem && !requiredFix) return issueFromString(rawText);
-
-  return {
-    title,
-    location,
-    problem: problem || rawText || title,
-    requiredFix,
-  };
-}
-
-function parseReviewIssues(parsed: Record<string, unknown>): ReviewIssue[] {
-  const source = Array.isArray(parsed.blocking_issues)
-    ? parsed.blocking_issues
-    : Array.isArray(parsed.blockingIssues)
-      ? parsed.blockingIssues
-      : Array.isArray(parsed.issues)
-        ? parsed.issues
-        : Array.isArray(parsed.findings)
-          ? parsed.findings
-          : [];
-
-  return source
-    .map(parseReviewIssue)
-    .filter((issue): issue is ReviewIssue => issue !== null);
-}
-
-function plainIssueText(issue: ReviewIssue): string {
+function postPushIssueText(issue: ReviewIssue): string {
   if (issue.rawText) return issue.rawText;
   return [
     issue.title,
@@ -300,7 +257,7 @@ function reviewerSummaryBlock(feedback: string, issues: ReviewIssue[]): string {
   const summary = feedback.trim();
   if (!summary) return "";
   const normalizedSummary = normalizeForComparison(summary);
-  const issueTexts = issues.map(plainIssueText);
+  const issueTexts = issues.map(postPushIssueText);
   const repeatsIssue = issueTexts.some((issue) => normalizeForComparison(issue) === normalizedSummary);
   const repeatsAllIssues = normalizeForComparison(issueTexts.join("\n")) === normalizedSummary;
   if (repeatsIssue || repeatsAllIssues) return "";
@@ -370,8 +327,13 @@ function dedupeIssuesAgainstExternalFindings(
   const externalBodies = new Set(externalFindings.map((finding) => normalizeForComparison(finding.body)));
   const seen = new Set<string>();
   return issues.filter((issue) => {
-    const normalized = normalizeForComparison(plainIssueText(issue));
-    if (!normalized || externalBodies.has(normalized) || seen.has(normalized)) return false;
+    const normalized = normalizeForComparison(postPushIssueText(issue));
+    const issueParts = [
+      normalized,
+      normalizeForComparison(issue.problem),
+      normalizeForComparison(issue.rawText ?? ""),
+    ].filter(Boolean);
+    if (!normalized || issueParts.some((part) => externalBodies.has(part)) || seen.has(normalized)) return false;
     seen.add(normalized);
     return true;
   });
@@ -741,9 +703,23 @@ function failedReviewOutputs(feedback: string) {
   return {
     approved: false,
     feedback,
-    issues: [plainIssueText(issue)],
+    issues: [postPushIssueText(issue)],
     blockingIssues: [issue],
   };
+}
+
+function issueFromVerdictIssue(issue: VerdictReviewIssue): ReviewIssue {
+  return {
+    title: issue.title,
+    ...(issue.location ? { location: issue.location } : {}),
+    problem: issue.problem,
+    requiredFix: issue.requiredFix,
+  };
+}
+
+function reviewFailureMessage(result: LLMResult): string | null {
+  if (result.exitCode !== 0) return `Reviewer LLM failed (${llmResultMessage(result)})`;
+  return terminalResultFailureMessage(result, "Reviewer LLM");
 }
 
 async function reportInvalidStructuredReview(
@@ -778,7 +754,7 @@ export const postPushReviewStep: StepModule<PostPushReviewInputs, PostPushReview
     const ghSpawn = inputs.ghSpawn ?? makeDefaultGhSpawn(inputs.workspaceDir);
     const gitSpawn = inputs.gitSpawn ?? makeDefaultGitSpawn(inputs.workspaceDir);
     const maxIterations = inputs.maxIterations ?? DEFAULT_MAX_ITERATIONS;
-    const model = inputs.model ?? context.data.model ?? "claude-sonnet-4-6";
+    const model = inputs.model ?? context.data.model ?? "claude-sonnet-5";
     const prNumber = String(inputs.prNumber ?? "");
     if (!prNumber) throw new Error("post-push-review requires a PR number");
 
@@ -871,12 +847,13 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         model,
         maxTurns: REVIEW_MAX_TURNS,
         tools: READ_ONLY_ALLOWED_TOOLS,
+        jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
       });
-      if (reviewResult.exitCode !== 0) {
+      const reviewFailure = reviewFailureMessage(reviewResult);
+      if (reviewFailure) {
         priorLlmFailure = true;
         terminationReason = "review_failed";
-        const failure = `Reviewer LLM failed (${llmResultMessage(reviewResult)})`;
-        feedback = compactErrorMessage(failure);
+        feedback = compactErrorMessage(reviewFailure);
         await reporter.report({
           id: `post-push-review.${iteration}`,
           type: "custom",
@@ -898,36 +875,20 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         break;
       }
 
-      const parsed = extractFirstJsonObject(reviewResult.stdout) as
-        | { approved?: boolean; feedback?: string; issues?: unknown[]; findings?: unknown[]; blocking_issues?: unknown[]; blockingIssues?: unknown[] }
-        | null;
-      if (!parsed) {
+      if (reviewResult.structuredOutput === undefined) {
         terminationReason = "invalid_review";
-        feedback = compactErrorMessage(`Reviewer returned non-JSON output: ${reviewResult.stdout || "(empty stdout)"}`);
-        await reporter.report({
-          id: `post-push-review.${iteration}`,
-          type: "custom",
-          status: "failed",
-          started_at: new Date().toISOString(),
-          ended_at: new Date().toISOString(),
-          parent_step_id: "post-push-review",
-          inputs: { iteration, prNumber },
-          outputs: failedReviewOutputs(feedback),
-          logs_url: null,
-        });
-        const marker = `<!-- ai-implement post-push iter=${iteration} review-invalid -->`;
-        postPrComment(
-          ghSpawn,
-          prNumber,
-          `${marker}\n⚠️ Post-push review returned invalid output.\n\n${feedback}\n\nThe implementation PR is still available, but this automated review pass did not finish. No actionable code feedback was produced by this review attempt.\n\n**Merge readiness:** Manual review required; automated review did not complete.`,
-          marker,
-        );
+        feedback = compactErrorMessage(`Reviewer returned no structured_output: ${reviewResult.stdout || "(empty stdout)"}`);
+        await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
       }
 
-      if (typeof parsed.approved !== "boolean") {
+      let verdict;
+      try {
+        verdict = parseReviewVerdict(reviewResult.structuredOutput);
+      } catch (err) {
         terminationReason = "invalid_review";
-        feedback = "Reviewer returned invalid structured review output: expected approved:boolean.";
+        const reason = err instanceof Error ? err.message : String(err);
+        feedback = compactErrorMessage(`Reviewer returned invalid structured review output: ${reason}.`);
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
         break;
       }
@@ -962,10 +923,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         ? findFailingCiChecks(ghSpawn, externalReviewResult.headSha, inputs.reviewCheckNames)
         : [];
 
-      feedback = suppressDuplicateExternalFeedback(String(parsed.feedback ?? ""), externalFindings);
-      let issues = parseReviewIssues(parsed);
+      feedback = suppressDuplicateExternalFeedback(verdict.feedback, externalFindings);
+      let issues = verdict.blockingIssues.map(issueFromVerdictIssue);
       issues = dedupeIssuesAgainstExternalFindings(issues, externalFindings);
-      if (issues.length === 0 && parsed.approved === false && !hasExternalFindings) {
+      if (issues.length === 0 && verdict.approved === false && !hasExternalFindings) {
         terminationReason = "invalid_review";
         feedback = "Reviewer returned invalid structured review output: approved=false requires at least one blocking_issues[] entry.";
         await reportInvalidStructuredReview(reporter, ghSpawn, prNumber, iteration, feedback);
@@ -988,7 +949,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
       // Fail closed: the internal verdict is clean and no blockers are visible, but the
       // external review check did not finish within the wait budget. Do not auto-approve
       // against a reviewer that is still in flight — defer to a human.
-      const internalApprovable = parsed.approved === true && issues.length === 0 && !hasExternalFindings;
+      const internalApprovable = verdict.approved === true && issues.length === 0 && !hasExternalFindings;
       if (internalApprovable && externalReviewPending) {
         terminationReason = "external_review_pending";
         feedback = "External review did not complete within the wait budget; not auto-approving.";
@@ -1024,7 +985,7 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         ended_at: new Date().toISOString(),
         parent_step_id: "post-push-review",
         inputs: { iteration, prNumber },
-        outputs: { approved, feedback, issues: issues.map(plainIssueText), blockingIssues: issues },
+        outputs: { approved, feedback, issues: issues.map(postPushIssueText), blockingIssues: issues },
         logs_url: null,
       });
 

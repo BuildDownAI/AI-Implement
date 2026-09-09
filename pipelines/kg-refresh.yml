@@ -2,6 +2,7 @@ id: kg-refresh
 steps:
   - id: clone
     type: clone
+    depth: full
   - id: dependency-auth
     type: custom
     moduleId: dependency-auth
@@ -10,18 +11,16 @@ steps:
     depth: full
   - id: clone-secondary-repos
     type: clone
+    depth: full
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
   - id: kg-ingest
     type: custom
     moduleId: kg-ingest
-  # feedback-loop is report-only (maxIterations: 1 enforced in kg-refresh-run.ts).
-  # The ingest ran as a deterministic step above. Claude reads ai-output/kg-stats.json,
-  # writes the run report, and answers the reviewer's checks — no ingest work here.
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
+  # No agent step: the ingest is deterministic and kg-snapshot-push is the guard and the
+  # report. An agent in this workspace re-ran the ingest without a GitHub token and deleted
+  # snapshot/parts/pr.nt (AII-575 runs 2–4, 2026-09-08).
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push

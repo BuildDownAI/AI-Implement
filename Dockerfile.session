@@ -25,7 +25,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Pinned versions for reproducibility.
 ARG YQ_VERSION=v4.53.2
 ARG AST_GREP_VERSION=0.42.1
-ARG CLAUDE_CODE_VERSION=2.1.114
+ARG CLAUDE_CODE_VERSION=2.1.263
 
 # System dependencies — base tools + power tools for the agent.
 # dbus + libsecret-1-0 are required so Claude Code's startup keychain read

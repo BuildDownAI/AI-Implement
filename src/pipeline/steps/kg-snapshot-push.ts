@@ -54,6 +54,13 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
    * Returns { snapshotPushed: false, commitSha: null }.
    */
   dryRun?: boolean;
+  /**
+   * Target repo, from the clone step's outputs. When both are present the push
+   * sets `origin` to a token-in-URL remote with the run's primary token — the
+   * same push shape as `push.ts` — so no credential helper decides the push.
+   */
+  repoOwner?: string;
+  repoRepo?: string;
 }
 
 interface KgSnapshotPushOutputs extends Record<string, unknown> {
@@ -67,34 +74,6 @@ interface KgStats {
   docPages?: number;
   durationSec?: number;
   notes?: string[];
-}
-
-/**
- * Strip any embedded credentials from the origin remote URL so git consults
- * the registered credential helper rather than using the embedded token.
- *
- * cloneStep:refreshRunnerGithubCredentials re-embeds the standard /api/token
- * credential in the origin URL after entrypoint.sh's setup_kg_push_credential
- * strips it. Calling this immediately before the push restores the clean URL
- * so the scoped kg-push credential helper is actually consulted — including
- * its re-mint-on-expiry logic for long-running ingests.
- */
-function stripEmbeddedTokenFromOrigin(workspaceDir: string): void {
-  const getUrlResult = spawnSync("git", ["remote", "get-url", "origin"], {
-    cwd: workspaceDir,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (getUrlResult.status !== 0) return;
-
-  const currentUrl = getUrlResult.stdout.toString().trim();
-  // Remove the userinfo component (x-access-token:TOKEN@) from the HTTPS URL.
-  const cleanUrl = currentUrl.replace(/^https:\/\/[^@]+@/, "https://");
-  if (cleanUrl === currentUrl) return;
-
-  spawnSync("git", ["remote", "set-url", "origin", cleanUrl], {
-    cwd: workspaceDir,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
 }
 
 function runGit(workspaceDir: string, args: string[], githubToken: string, label: string): void {
@@ -117,16 +96,45 @@ function resolveHeadSha(workspaceDir: string): string | null {
   return r.stdout.toString().trim() || null;
 }
 
-/** Read the stamp from `snapshot/embeddings.stamp` in the working tree. */
+/**
+ * The snapshot's age stamp. The ingest writes it as `age_stamp` in
+ * `snapshot/embeddings.meta.json` — the same value the rail's materialize checks
+ * against the graph's `dcterms:modified`. `snapshot/embeddings.stamp` is the
+ * older companion file that only hand edits ever wrote; it is read as a fallback
+ * so an existing snapshot without metadata still orders.
+ */
+function stampFromMeta(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw) as { age_stamp?: unknown };
+    return typeof parsed.age_stamp === "string" && parsed.age_stamp.trim() ? parsed.age_stamp.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the stamp from the working tree: embeddings.meta.json first, then embeddings.stamp. */
 function readCurrentStamp(workspaceDir: string): string | null {
+  const metaPath = join(workspaceDir, "snapshot", "embeddings.meta.json");
+  if (existsSync(metaPath)) {
+    const fromMeta = stampFromMeta(readFileSync(metaPath, "utf-8"));
+    if (fromMeta) return fromMeta;
+  }
   const stampPath = join(workspaceDir, "snapshot", "embeddings.stamp");
   if (!existsSync(stampPath)) return null;
   return readFileSync(stampPath, "utf-8").trim() || null;
 }
 
-/** Read the stamp from the cloned HEAD via git-show. Returns null if absent in that ref. */
+/** Read the stamp from the cloned HEAD via git-show, same precedence. Returns null if absent in that ref. */
 function readPreviousStamp(workspaceDir: string, clonedRef: string): string | null {
   if (!clonedRef || clonedRef === "unknown") return null;
+  const meta = spawnSync("git", ["show", `${clonedRef}:snapshot/embeddings.meta.json`], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (meta.status === 0) {
+    const fromMeta = stampFromMeta(meta.stdout.toString());
+    if (fromMeta) return fromMeta;
+  }
   const r = spawnSync("git", ["show", `${clonedRef}:snapshot/embeddings.stamp`], {
     cwd: workspaceDir,
     stdio: ["ignore", "pipe", "pipe"],
@@ -166,7 +174,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       return { snapshotPushed: false, commitSha: null };
     }
 
-    const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun } = inputs;
+    const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
 
     // ── 0. Tracker regression guard ──────────────────────────────────────────
     // If the tracker-data step did not fetch (fetched=false) and the previous
@@ -296,11 +304,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       throw new KgSnapshotMissingError("snapshot/embeddings.npz is absent");
     }
 
-    // ── 3. Validate stamp (snapshot/embeddings.stamp companion file) ─────────
+    // ── 3. Validate stamp (embeddings.meta.json age_stamp; embeddings.stamp fallback) ──
     const currentStamp = readCurrentStamp(workspaceDir);
     if (!currentStamp) {
       throw new KgSnapshotMissingError(
-        "snapshot/embeddings.stamp is absent — the ingest did not write a stamp",
+        "snapshot/embeddings.meta.json has no age_stamp and snapshot/embeddings.stamp is absent — the ingest did not write a stamp",
       );
     }
     // Reject a malformed stamp rather than silently breaking the ordering check.
@@ -308,7 +316,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const ISO_STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})$/;
     if (!ISO_STAMP_RE.test(currentStamp)) {
       throw new KgSnapshotMissingError(
-        `snapshot/embeddings.stamp has unrecognised format "${currentStamp}" — expected YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM`,
+        `snapshot age stamp has unrecognised format "${currentStamp}" — expected YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+HH:MM`,
       );
     }
     const previousStamp = readPreviousStamp(workspaceDir, clonedRef);
@@ -371,16 +379,21 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const commitSha = resolveHeadSha(workspaceDir);
 
     // ── 6. Push directly to default branch (no PR, no feature branch) ────────
-    // When the kg-push credential helper is active (GIT_KG_PUSH_TOKEN_FILE set),
-    // strip the embedded token from the origin URL immediately before pushing.
-    // cloneStep:refreshRunnerGithubCredentials re-embeds the /api/token credential
-    // in the remote URL after entrypoint.sh's setup_kg_push_credential strips it,
-    // so we must strip again here to force git to consult the helper — which
-    // vends a contents:write token scoped to the KG repo and re-mints on expiry.
+    // Push with the run's primary token embedded in the origin URL — the shape
+    // push.ts uses. The entrypoint strips the token from origin at start, and in
+    // GitHub Actions mode the credential refresh does not re-embed it, so without
+    // this the push falls to whichever credential helper answers first for
+    // github.com; on 2026-09-08 that was dependency-auth's read-only token (403).
+    // The URL is set through git config, never printed; runGit redacts the token.
     // --force-with-lease compares against refs/remotes/origin/<defaultBranch>
     // which the clone step populated.
-    if (process.env.GIT_KG_PUSH_TOKEN_FILE) {
-      stripEmbeddedTokenFromOrigin(workspaceDir);
+    if (repoOwner && repoRepo) {
+      runGit(
+        workspaceDir,
+        ["remote", "set-url", "origin", `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`],
+        githubToken,
+        "git remote set-url origin",
+      );
     }
     runGit(workspaceDir, ["push", "origin", `HEAD:refs/heads/${defaultBranch}`, "--force-with-lease"], githubToken, "git push");
 

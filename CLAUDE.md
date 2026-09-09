@@ -95,8 +95,9 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
+| Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
 | Execution backends | `src/fly-machines.ts`, `src/local-docker.ts`, `src/github.ts` | |
-| Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | |
+| Runner callbacks and tokens | `src/runner-callback.ts`, `src/runner-token.ts`, `src/token-vending.ts` | [docs/runner-callbacks.md](docs/runner-callbacks.md) |
 | Merge reconciliation | `src/reconciliation.ts`, `src/reconcile-merged.ts`, `src/poll-merged-prs.ts` | |
 | Workflow sync to target repos | `src/workflow-sync.ts`, `src/workflow-sync-queue.ts` | |
 | `/ai-implement` comment rail | `src/webhook.ts`, `src/comment-gapfill-drain.ts` | |

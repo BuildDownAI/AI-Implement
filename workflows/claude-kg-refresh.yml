@@ -151,4 +151,5 @@ jobs:
           RUN_PROGRESS_TOKEN: ${{ inputs.run_progress_token }}
           RUNNER_CALLBACK_URL: ${{ inputs.runner_callback_url }}
           RUNNER_PHASE: kg-refresh
+          AI_IMPLEMENT_LOG_LEVEL: ${{ vars.AI_IMPLEMENT_LOG_LEVEL }}
         run: /opt/ai-implement/entrypoint.sh

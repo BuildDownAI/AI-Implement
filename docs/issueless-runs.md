@@ -31,7 +31,7 @@ flowchart TD
     C -->|"newer snapshot in source repo"| H["local staging rail\nfetch → stage → swap → verify"]
     C -->|"ingest-needed"| D["mintRunToken phase=kg-refresh\nappendLog issueId=kg-refresh"]
     D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
-    E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest → feedback-loop\n→ kg-snapshot-push"]
+    E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest\n→ kg-snapshot-push"]
     F --> G["POST /api/runner/result\nphase=kg-refresh"]
     G --> I["onRunnerComplete()\nverify snapshot commit"]
     I --> H
@@ -103,6 +103,8 @@ Gate `"preflight"` is added to the `RefreshGate` union in `src/kg-refresh.ts`. `
 | `shadow` | collapses to `github-actions` — two concurrent ingest runs would race to push the same snapshot commit |
 
 **GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-kg-refresh.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, and `runner_image`. `run_progress_token` is the HMAC progress token; the workflow masks it immediately and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. `RUNNER_CALLBACK_URL` is not passed as an explicit workflow input — `session/entrypoint.sh` derives it from the `runnerCallbackUrl` field in the decoded `AI_IMPLEMENT_RUN_CONFIG` envelope (always present when the callback-config guard passes). Together these allow the `kg-tracker-data` step and the `setup_kg_push_credential` helper to operate on GHA the same way they do on Fly. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image (`AI_IMPLEMENT_RUNNER_IMAGE`) or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. A testing orchestrator pinned to `:next` therefore steers kg-refresh runs to `:next` automatically — the KG source repo needs no `AI_IMPLEMENT_RUNNER_IMAGE` variable when the orchestrator is pinned. If the workflow file is absent, the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message naming the missing file and the sync instruction. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs. The GHA template must export `RUNNER_PHASE=kg-refresh` in the `Run pipeline` step env; `session/entrypoint.sh` defaults `RUNNER_PHASE` to `implementation` when absent, so an omission silently routes the run to `run-autonomous.js` instead of `pipeline/kg-refresh-run.js`.
+
+The kg-refresh runner reads `AI_IMPLEMENT_LOG_LEVEL` the same way the implement runner does: the synced workflow passes the repo Actions variable into the `Run pipeline` step, and `summary` (default) prints one result line per Claude invocation while `stream` also tees each tool call. The kg-refresh pipeline has no agent step since 2026-09-08: the ingest is deterministic and `kg-snapshot-push` is both the guard and the report. The report step it once had re-ran the ingest by hand without a GitHub token and deleted `snapshot/parts/pr.nt` (AII-575 runs 2–4); `stream` remains useful for any future agent step.
 
 **Run-ID binding lifecycle (GHA path):** After a successful `workflow_dispatch`, GitHub does not return a run ID — it must be discovered by polling the Runs API. `dispatchKgRefreshRun()` polls `findWorkflowRunId()` for up to ~90 s (5 rounds: 5 s, 10 s, 20 s, 30 s, 25 s) before returning. On success the run ID rides the return value; the `updateJobMachine` hook writes it to `dispatch_log.run_id` via `updateJobRunId()`, which also advances the row to `status = "running"`. On exhaustion, the row is left with `run_id = NULL` and a warning is logged — the row stays alive in `"dispatched"` status and the reaper handles it on its next sweep.
 
@@ -195,6 +197,8 @@ A third (`publication`) token is **not** minted: there is no target repository, 
 
 Every kg-refresh dispatch sets `dependencyTokenScope: "installation"` in the envelope. The `dependency-auth` pipeline step reads this field and calls `POST /api/runner/dependency-token` to receive a short-lived installation-wide GitHub App token scoped to `contents: read` and `pull_requests: read`. The step installs it as a git credential helper for `https://github.com` and exports it as `COMPOSER_AUTH`.
 
+The primary workspace clone (the KG source repo itself) is cloned with **full history** (`depth: full` on the `clone` step in `pipelines/kg-refresh.yml`). `sources.yml` in the KG source repo sets `self_ingest: true`, so the ingest tool ingests its own commit graph — a shallow clone would see only 1 commit. If `session/entrypoint.sh` pre-cloned the workspace shallowly (the default), the pipeline's clone step detects shallowness and issues `git fetch --unshallow origin` before resetting.
+
 The subsequent `clone-code-repo` pipeline step reads the `code_repo:` key from `sources.yml` in the cloned KG source repo. Two forms are accepted:
 
 ```yaml
@@ -204,12 +208,13 @@ code_repo: BuildDownAI/AI-Implement
 # Mapping form (canonical)
 code_repo:
   slug: BuildDownAI/AI-Implement        # GitHub owner/name — the field the step reads
+  branch: testing                       # optional: branch to clone; omit for repo default
   path: ../AI-Implement                 # local clone path (used by the ingest tool)
   docs_url: https://docs.builddown.ai/latest/introduction
   doc_globs: [...]
 ```
 
-When the `code_repo:` key is present, `clone-code-repo` clones that repository into `code-repo/` in the workspace using a bare `https://github.com/...` URL — the credential helper supplies the dependency token automatically. When the key is absent, the step emits a warning (`[clone-code-repo] sources.yml has no code_repo.slug — skipping`) and is skipped.
+When the `code_repo:` key is present, `clone-code-repo` clones that repository into `code-repo/` in the workspace using a bare `https://github.com/...` URL — the credential helper supplies the dependency token automatically. When the key is absent, the step emits a warning (`[clone-code-repo] sources.yml has no code_repo.slug — skipping`) and is skipped. The optional `branch` field in the mapping form controls which branch is cloned; when absent the repo's default branch is used. The string form (`code_repo: owner/name`) does not support a branch.
 
 The `clone-code-repo` step clones with **full history** (`depth: full` in `pipelines/kg-refresh.yml`), omitting `--depth`. This ensures the ingest tool sees the complete commit graph — author counts, full `git log`, `gh pr list` queries — rather than the shallow 1-commit view. If the repo directory already exists as a shallow clone from a prior run, the step detects shallowness (`git rev-parse --is-shallow-repository`) and issues `git fetch --unshallow origin` before the branch-targeting fetch.
 
@@ -226,23 +231,29 @@ After `clone-code-repo`, the `clone-secondary-repos` pipeline step reads the `se
 ```yaml
 secondary_repos:
   - slug: BuildDownAI/bd-knowledge-graph-base
+    branch: testing
   - slug: BuildDownAI/docs
   - slug: BuildDownAI/skills
+    branch: testing
 ```
 
-Each secondary repo is cloned with `--depth 1` using a bare `https://github.com/<slug>.git` URL. Auth is supplied by the same git credential helper installed by `dependency-auth`, so no token appears in the URL. One log line is emitted per repo:
+Each entry accepts an optional `branch` field that controls which branch is cloned. When `branch` is set, the clone uses `--branch <branch> --single-branch` (or fetches that specific branch on an existing directory). When absent, the repo's default branch is used.
+
+`pipelines/kg-refresh.yml` sets `depth: full` on both `clone` and `clone-secondary-repos`, so all clones retrieve complete history rather than `--depth 1`. This matches the local ingest behavior and ensures the ingest tool sees the full commit graph. When the directory already exists as a shallow clone from a prior run, the step detects shallowness (`git rev-parse --is-shallow-repository`) and issues `git fetch --unshallow origin` before the branch-targeting fetch.
+
+Each secondary repo is cloned using a bare `https://github.com/<slug>.git` URL. Auth is supplied by the same git credential helper installed by `dependency-auth`, so no token appears in the URL. One log line is emitted per repo:
 
 ```
 [clone] cloning BuildDownAI/bd-knowledge-graph-base into repos/bd-knowledge-graph-base
 ```
 
-**Soft failure:** if a clone fails (repo missing, private, or credential scope too narrow), a warning is logged and the step continues to the next repo rather than aborting the pipeline. A run that clones zero of N repos still proceeds to `kg-ingest` — the ingest tool receives whatever repos were cloned.
+**Soft failure:** if a clone or unshallow fails (repo missing, private, credential scope too narrow, or server does not support unshallow), a warning is logged and the step continues to the next repo rather than aborting the pipeline. A run that clones zero of N repos still proceeds to `kg-ingest` — the ingest tool receives whatever repos were cloned.
 
 **Skip conditions:** the step is skipped when `dependency-auth` did not acquire a token (no credential helper → clones would fail unauthenticated), or when `sources.yml` has no `secondary_repos` entries. Skipping logs a warning.
 
 **Mounted mode:** when `AI_IMPLEMENT_WORKSPACE_MODE=mounted`, all secondary clones are skipped with a warning (the bind-mount covers the KG source repo only).
 
-**Future additions:** adding a fourth secondary repo requires only a `sources.yml` change in the KG source repo — the step reads the list dynamically and no orchestrator change is needed.
+**Future additions:** adding a fourth secondary repo, or changing a branch, requires only a `sources.yml` change in the KG source repo — the step reads the list dynamically and no orchestrator change is needed.
 
 ### `--repos-root` flag to the ingest
 
@@ -404,6 +415,10 @@ The `dispatch_log` row appears in the admin pipelines table with:
 ### Log proxy (`/api/sessions/:id/logs`)
 
 `GET /api/sessions/:machineId/logs` in `src/admin.ts` proxies the Fly machine's log stream via `fetchMachineLogs()`. The response is displayed in a modal dialog. Logs are available while the machine exists; a 404 from the Fly API returns `{ error: "Logs no longer available" }` with HTTP 404.
+
+### Ingest log (`ai-output/kg-ingest.log`)
+
+The `kg-ingest` step writes every line of the ingest subprocess's stdout and stderr to `ai-output/kg-ingest.log` on both success and failure paths. The file captures the full verbatim output — including progress lines the CLI emits during index building — and is collected alongside `kg-stats.json` in the run's artifact output. A subset of lines is also echoed to the runner's run log with a `[kg-ingest]` prefix: section headers (lines starting with `==`), per-repo counter lines whose first token is one of `commits:`, `prs:`, `pr_error:`, `people:`, `issues:`, or `tracker:`, and any line containing `SKIPPED`. These signal lines are what appear in the GitHub Actions or Fly log stream during a run; the full output (including verbose lines such as individual file paths and index-building progress) is available only in `ai-output/kg-ingest.log`. When the snapshot guard refuses the ingest result, `kg-ingest.log` is the primary artifact for diagnosing the cause.
 
 ### `list_in_flight_jobs` MCP tool
 

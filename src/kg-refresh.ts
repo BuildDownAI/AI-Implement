@@ -304,7 +304,7 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     const branch = await fetchDefaultBranchFn(readToken, repo.owner, repo.repo);
     const tarball = await fetchTarballFn(readToken, repo.owner, repo.repo, branch);
     const sourceDir = await extractSource(tarball, tmpDir);
-    codeRepo = readCodeRepoFromSourcesYml(sourceDir);
+    codeRepo = readCodeRepoFromSourcesYml(sourceDir)?.slug ?? null;
     secondaryRepos = readSecondaryReposFromSourcesYml(sourceDir);
   } catch {
     results.push({ repo: kgRepoSlug, grant: "sources.yml:read", ok: false, status: 0 });

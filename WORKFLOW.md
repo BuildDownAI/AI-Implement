@@ -2,7 +2,7 @@
 # Model for implementation and review passes. Passed to `claude --model`
 # verbatim, so any ID this repo's provider accepts works. This repo's mapping
 # runs on the Anthropic provider; replace with a Bedrock model ID if that changes.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 ---
 
 <!--

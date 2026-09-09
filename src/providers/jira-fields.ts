@@ -3,21 +3,26 @@ import type { JiraClient } from "./jira-client.js";
 export const STATUS_FIELD_NAME = "AI-Implement Status";
 export const REPO_FIELD_NAME = "AI-Implement Repo";
 export const PROFILES_FIELD_NAME = "AI-Implement Profiles";
+export const BASE_BRANCH_FIELD_NAME = "AI-Implement Base Branch";
 
 export interface ResolvedFieldIds {
   statusFieldId: string;
   repoFieldId: string;
   /** Classic-project "Epic Link" custom field, when the instance has one. Best-effort:
    *  absent on next-gen/team-managed projects (which use the native parent field) and
-   *  when all three overrides short-circuit the listFields call. */
+   *  when all four overrides short-circuit the listFields call. */
   epicLinkFieldId?: string;
   profilesFieldId: string | null;
+  /** "AI-Implement Base Branch" text field id. null when the field is absent or ambiguous
+   *  (feature inactive, not an error). */
+  baseBranchFieldId: string | null;
 }
 
 interface OverrideOptions {
   statusOverride: string | null;
   repoOverride: string | null;
   profilesOverride: string | null;
+  baseBranchOverride: string | null;
 }
 
 interface ListFieldsClient {
@@ -28,11 +33,12 @@ export async function resolveCustomFieldIds(
   client: ListFieldsClient,
   overrides: OverrideOptions,
 ): Promise<ResolvedFieldIds> {
-  if (overrides.statusOverride && overrides.repoOverride && overrides.profilesOverride) {
+  if (overrides.statusOverride && overrides.repoOverride && overrides.profilesOverride && overrides.baseBranchOverride) {
     return {
       statusFieldId: overrides.statusOverride,
       repoFieldId: overrides.repoOverride,
       profilesFieldId: overrides.profilesOverride,
+      baseBranchFieldId: overrides.baseBranchOverride,
     };
   }
 
@@ -66,11 +72,26 @@ export async function resolveCustomFieldIds(
     }
   }
 
+  let baseBranchFieldId: string | null = overrides.baseBranchOverride;
+  if (baseBranchFieldId === null) {
+    const baseBranchMatches = fields.filter((f) => f.name === BASE_BRANCH_FIELD_NAME);
+    if (baseBranchMatches.length === 0) {
+      console.warn(`[jira] Custom field "${BASE_BRANCH_FIELD_NAME}" not found — base branch will not be populated`);
+    } else if (baseBranchMatches.length > 1) {
+      console.warn(
+        `[jira] Multiple custom fields named "${BASE_BRANCH_FIELD_NAME}" — set an explicit baseBranchFieldOverride to disambiguate`,
+      );
+    } else {
+      baseBranchFieldId = baseBranchMatches[0].id;
+    }
+  }
+
   return {
     statusFieldId: overrides.statusOverride ?? lookup(STATUS_FIELD_NAME),
     repoFieldId: overrides.repoOverride ?? lookup(REPO_FIELD_NAME),
     ...(epicLink ? { epicLinkFieldId: epicLink.id } : {}),
     profilesFieldId,
+    baseBranchFieldId,
   };
 }
 
@@ -82,7 +103,7 @@ export async function getCachedFieldIds(
   overrides: OverrideOptions,
 ): Promise<ResolvedFieldIds> {
   // Override values must participate in the key — changing them on a live mapping otherwise serves stale IDs.
-  const fullKey = `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}`;
+  const fullKey = `${cacheKey}::${overrides.statusOverride ?? ""}::${overrides.repoOverride ?? ""}::${overrides.profilesOverride ?? ""}::${overrides.baseBranchOverride ?? ""}`;
   const existing = cache.get(fullKey);
   if (existing) return existing;
   const ids = await resolveCustomFieldIds(client, overrides);
@@ -108,18 +129,6 @@ export const STATUS_VALUES = {
 } as const;
 
 export type StatusValue = (typeof STATUS_VALUES)[keyof typeof STATUS_VALUES];
-
-/** Build a minimal ADF document for a single paragraph. */
-export function adfParagraph(text: string): unknown {
-  return {
-    type: "doc",
-    version: 1,
-    content: [{
-      type: "paragraph",
-      content: [{ type: "text", text }],
-    }],
-  };
-}
 
 /** ADF for a paragraph with a hyperlink. */
 export function adfWithLink(prefix: string, label: string, url: string): unknown {

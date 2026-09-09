@@ -56,6 +56,11 @@ describe("claude-kg-refresh.yml template", () => {
     expect(step.run).not.toContain("inputs.run_progress_token");
   });
 
+  it("passes AI_IMPLEMENT_LOG_LEVEL from the repo variable into the Run pipeline step env", () => {
+    const step = getPipelineStep();
+    expect(step.env.AI_IMPLEMENT_LOG_LEVEL).toBe("${{ vars.AI_IMPLEMENT_LOG_LEVEL }}");
+  });
+
   it("exports RUN_PROGRESS_TOKEN in the Run pipeline step env", () => {
     const step = getPipelineStep();
     expect(step.env).toHaveProperty("RUN_PROGRESS_TOKEN");

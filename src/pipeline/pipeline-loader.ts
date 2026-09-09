@@ -116,6 +116,7 @@ function applyWiring(step: YamlStep): StepDefinition {
           prNumber: ctx.data.prNumber,
           orchestratorUrl: ctx.data.orchestratorUrl,
           machineNonce: ctx.data.nonce,
+          depth: step.depth,
         }),
       };
 
@@ -312,14 +313,15 @@ function applyWiring(step: YamlStep): StepDefinition {
         ...step,
         inputs: (ctx: PipelineContext) => {
           const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
-          const codeRepo = readCodeRepoFromSourcesYml(workspaceDir) ?? "";
-          const slashIdx = codeRepo.indexOf("/");
-          const repoOwner = slashIdx > 0 ? codeRepo.slice(0, slashIdx) : codeRepo;
-          const repoRepo = slashIdx > 0 ? codeRepo.slice(slashIdx + 1) : "";
+          const codeRepo = readCodeRepoFromSourcesYml(workspaceDir);
+          const slug = codeRepo?.slug ?? "";
+          const slashIdx = slug.indexOf("/");
+          const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
+          const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
           return {
             repoOwner,
             repoRepo,
-            branch: "",
+            branch: codeRepo?.branch ?? "",
             githubToken: "",
             workspaceDir,
             targetDir: "code-repo",
@@ -346,11 +348,11 @@ function applyWiring(step: YamlStep): StepDefinition {
         inputs: (ctx: PipelineContext) => {
           const workspaceDir = ctx.getOutputs("clone").workspaceDir as string;
           const repos = readSecondaryReposFromSourcesYml(workspaceDir);
-          const targets = repos.map(({ slug }) => {
+          const targets = repos.map(({ slug, branch }) => {
             const slashIdx = slug.indexOf("/");
             const repoOwner = slashIdx > 0 ? slug.slice(0, slashIdx) : slug;
             const repoRepo = slashIdx > 0 ? slug.slice(slashIdx + 1) : "";
-            return { repoOwner, repoRepo, targetDir: join("repos", basename(slug)) };
+            return { repoOwner, repoRepo, targetDir: join("repos", basename(slug)), ...(branch !== undefined ? { branch } : {}) };
           });
           return {
             repoOwner: "",
@@ -359,6 +361,7 @@ function applyWiring(step: YamlStep): StepDefinition {
             githubToken: "",
             workspaceDir,
             targets,
+            depth: step.depth,
           };
         },
         skip: (ctx: PipelineContext) => {
@@ -412,6 +415,8 @@ function applyWiring(step: YamlStep): StepDefinition {
           clonedRef: ctx.getOutputs("clone").clonedRef,
           defaultBranch: ctx.data.branch,
           dryRun: ctx.data.kgDryRun === true,
+          repoOwner: ctx.getOutputs("clone").repoOwner,
+          repoRepo: ctx.getOutputs("clone").repoRepo,
         }),
       };
 

@@ -159,10 +159,29 @@ function validateTicketingMapping(body: { ticketingProvider?: unknown; ticketing
     throw new Error(`Invalid ticketingProvider: expected "linear" or "jira", got ${JSON.stringify(provider)}`);
   }
   const config = validateTicketingConfig(provider, body.ticketingConfig ?? null);
+  if (config.kind === "jira") {
+    // A field-id override is interpolated into JQL and into the fields list of a REST
+    // query, so reject anything that is not a bare identifier here rather than letting
+    // it reach Jira as a malformed query. Blank values are already normalized to null
+    // by validateTicketingConfig, so only genuinely malformed ids reach this check.
+    const overrideKeys = [
+      "statusFieldOverride",
+      "repoFieldOverride",
+      "profilesFieldOverride",
+      "baseBranchFieldOverride",
+    ] as const;
+    for (const key of overrideKeys) {
+      const value = config[key];
+      if (value != null && !/^[A-Za-z0-9_]+$/.test(value)) {
+        throw new Error(`Invalid ${key} "${value}" — Jira field ids may only contain letters, digits, and underscores`);
+      }
+    }
+  }
   return { ticketingProvider: provider, ticketingConfig: config };
 }
 
 export interface AdminConfig {
+  pollNow?: () => { started: boolean };
   adminAccessCode: string | null;
   flySessionsToken: string | null;
   flySessionsApp: string | null;
@@ -439,6 +458,16 @@ export function handleAdminRequest(
       const n = parseInt(limitParam ?? "20", 10);
       const limit = Math.min(100, Number.isFinite(n) && n > 0 ? n : 20);
       json(res, 200, listReaperActions(limit));
+      return true;
+    }
+
+    if (url === "/api/poll-now" && method === "POST") {
+      if (!config.pollNow) {
+        json(res, 503, { error: "Poll trigger not available" });
+        return true;
+      }
+      const result = config.pollNow();
+      json(res, 200, result.started ? { started: true } : { started: false, reason: "poll_in_progress" });
       return true;
     }
 

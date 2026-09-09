@@ -54,26 +54,6 @@ const baseIssue = {
   description: "Refresh the knowledge-graph snapshot",
 };
 
-// A dispatched runner sets both of these, and `npm test` inside that container inherits
-// them. postRunnerResult skips the callback when either is absent, so clearing them here
-// is what stops a suite reaching the live orchestrator and consuming the run's single-use
-// result token. File-level so a new describe cannot miss it; the describes that exercise a
-// callback re-arm the pair themselves, pointing it at an unroutable host.
-beforeEach(() => {
-  vi.stubEnv("RUN_TOKEN", "");
-  vi.stubEnv("RUNNER_CALLBACK_URL", "");
-});
-
-describe("runner callback credentials", () => {
-  // Asserting the cleared values rather than an absent fetch: outside a dispatched runner
-  // these variables are unset anyway, so nothing posts with or without the hook and a
-  // network assertion would pass in CI while the hook was missing. This fails anywhere.
-  it("are cleared for every test in this file", () => {
-    expect(process.env.RUN_TOKEN).toBe("");
-    expect(process.env.RUNNER_CALLBACK_URL).toBe("");
-  });
-});
-
 // ── RunConfigV1 envelope roundtrip ────────────────────────────────────────────
 
 describe("RunConfigV1 kg-refresh fields", () => {
@@ -143,7 +123,7 @@ describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
 
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "../pipeline/steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError, readCodeRepoFromSourcesYml, readSecondaryReposFromSourcesYml } from "../pipeline/steps/kg-tracker-data.js";
-import { kgIngestStep, KgIngestError } from "../pipeline/steps/kg-ingest.js";
+import { kgIngestStep, KgIngestError, isSignalLine } from "../pipeline/steps/kg-ingest.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import type { PipelineContextData } from "../pipeline/types.js";
@@ -275,6 +255,47 @@ describe("kgSnapshotPushStep", () => {
     await expect(
       kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
     ).rejects.toBeInstanceOf(KgSnapshotStaleError);
+  });
+
+  it("reads the stamp from embeddings.meta.json age_stamp (the ingest's file) and orders against the committed one", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.meta.json"), JSON.stringify({ count: 2, age_stamp: "2026-09-07T23:58:54+00:00" }));
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'add meta'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.meta.json"), JSON.stringify({ count: 3, age_stamp: "2026-09-08T19:43:09+00:00" }));
+
+    const ctx = makeContext();
+    // No embeddings.stamp at all: the metadata stamp orders the run and it reaches the push.
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
+  });
+
+  it("prefers embeddings.meta.json over a stale legacy embeddings.stamp (the file nothing writes any more)", async () => {
+    initGitRepo(tmpDir);
+    mkdirSync(join(tmpDir, "snapshot"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.meta.json"), JSON.stringify({ age_stamp: "2026-09-07T23:58:54+00:00" }));
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-07T00:28:32+00:00");
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'add meta and legacy stamp'", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "a.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    // The ingest advanced the metadata stamp; the legacy file is untouched and would read as stale.
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.meta.json"), JSON.stringify({ age_stamp: "2026-09-08T19:43:09+00:00" }));
+
+    const ctx = makeContext();
+    await expect(
+      kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter),
+    ).rejects.toThrow(/git push failed/);
   });
 
   it("accepts a new stamp when no previous stamp exists in clonedRef", async () => {
@@ -1388,9 +1409,6 @@ steps:
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push
@@ -1421,6 +1439,8 @@ describe("applyWiring for kg-snapshot-push", () => {
     expect(inputs.githubToken).toBe("tok");
     expect(inputs.clonedRef).toBe("abc123");
     expect(inputs.defaultBranch).toBe("main");
+    expect(inputs.repoOwner).toBe("org");
+    expect(inputs.repoRepo).toBe("repo");
   });
 });
 
@@ -1495,7 +1515,6 @@ describe("runKgRefresh", () => {
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
@@ -1509,7 +1528,6 @@ describe("runKgRefresh", () => {
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({}, new KgSnapshotMissingError("no parts")),
       },
       reporter: { report: async () => undefined },
@@ -1526,7 +1544,6 @@ describe("runKgRefresh", () => {
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({}, new KgSnapshotTrackerRegressionError("previous snapshot has tracker files")),
       },
       reporter: { report: async () => undefined },
@@ -1548,7 +1565,6 @@ describe("runKgRefresh", () => {
       stepsOverride: {
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         kgTrackerData: makeStepModule({}, new KgTrackerDataFetchError("orchestrator returned 502")),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
@@ -1566,61 +1582,6 @@ describe("runKgRefresh", () => {
     const decoded = decodeRunConfig(encoded);
     expect(decoded.runnerPhase).toBe("kg-refresh");
     expect(decoded.kgSourceRepo).toBe("BuildDownAI/knowledge-graph-ai-implement");
-  });
-
-  it("passes maxIterations=1 to the feedback-loop step (report-only, ingest is a deterministic step)", async () => {
-    let capturedInputs: Record<string, unknown> = {};
-    const capturingFeedbackLoop: StepModule = {
-      run: async (_ctx, inputs) => {
-        capturedInputs = inputs;
-        return { approved: false };
-      },
-    };
-
-    await runKgRefresh({
-      workspaceDir: tmpDir,
-      stepsOverride: {
-        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
-        kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: capturingFeedbackLoop,
-        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
-      },
-      reporter: { report: async () => undefined },
-    });
-
-    expect(capturedInputs.maxIterations).toBe(1);
-  });
-
-  it("passes reviewRubric with snapshot/ and ingest-check clauses to the feedback-loop step", async () => {
-    let capturedInputs: Record<string, unknown> = {};
-    const capturingFeedbackLoop: StepModule = {
-      run: async (_ctx, inputs) => {
-        capturedInputs = inputs;
-        return { approved: false };
-      },
-    };
-
-    await runKgRefresh({
-      workspaceDir: tmpDir,
-      stepsOverride: {
-        clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
-        kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: capturingFeedbackLoop,
-        kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
-      },
-      reporter: { report: async () => undefined },
-    });
-
-    const rubric = capturedInputs.reviewRubric;
-    expect(typeof rubric).toBe("string");
-    const rubricStr = rubric as string;
-    // Must mention that uncommitted output is expected
-    expect(rubricStr).toContain("snapshot/");
-    expect(rubricStr).toContain("uncommitted");
-    // Must include all four ingest-check criteria
-    expect(rubricStr).toContain("embeddings.npz");
-    expect(rubricStr).toContain("embeddings.stamp");
-    expect(rubricStr).toContain("kg-stats.json");
   });
 });
 
@@ -1783,40 +1744,6 @@ describe("makeKgRefresh — dispatch result threading to updateJobMachine", () =
   });
 });
 
-// ── KG-REFRESH.md template assertions ────────────────────────────────────────
-
-describe("KG-REFRESH.md template — report-only, no ingest instructions", () => {
-  const playbookPath = join(
-    fileURLToPath(new URL(".", import.meta.url)),
-    "..",
-    "..",
-    "workflows",
-    "KG-REFRESH.md",
-  );
-
-  it("states that the reviewer treats uncommitted snapshot/ output as expected", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("uncommitted");
-    expect(playbook).toContain("reviewer");
-  });
-
-  it("does not instruct Claude to run the ingest (no python/venv/kg_ingest references)", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).not.toContain("python");
-    expect(playbook).not.toContain("venv");
-    expect(playbook).not.toContain("kg_ingest");
-    expect(playbook).not.toContain("--code-repo");
-    expect(playbook).not.toContain("--tracker-data");
-    expect(playbook).not.toContain("TRACKER_DATA_SUPPORTED");
-  });
-
-  it("instructs Claude to read kg-stats.json and write 01-report.md", () => {
-    const playbook = readFileSync(playbookPath, "utf-8");
-    expect(playbook).toContain("kg-stats.json");
-    expect(playbook).toContain("01-report.md");
-  });
-});
-
 // ── kgIngestStep unit tests ───────────────────────────────────────────────────
 
 type FakeProcess = EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
@@ -1885,9 +1812,10 @@ describe("kgIngestStep", () => {
     // main ingest uses the venv python
     expect(capturedArgs[2]).toEqual([join(tmpDir, ".venv", "bin", "python"), "-m", "kg_ingest", "refresh", "--code-repo", "/some/code-repo", "--tracker-data", join(tmpDir, "tracker-data.json")]);
     expect(capturedCwd[2]).toBe(tmpDir);
-    expect(writtenFiles).toHaveLength(1);
-    expect(writtenFiles[0][0]).toBe(join(tmpDir, "ai-output", "kg-stats.json"));
-    const stats = JSON.parse(writtenFiles[0][1]) as Record<string, unknown>;
+    expect(writtenFiles).toHaveLength(2);
+    const statsEntry = writtenFiles.find(([p]) => p.endsWith("kg-stats.json"))!;
+    expect(statsEntry[0]).toBe(join(tmpDir, "ai-output", "kg-stats.json"));
+    const stats = JSON.parse(statsEntry[1]) as Record<string, unknown>;
     expect(stats.quads).toBe(100);
     expect(stats.vectors).toBe(50);
   });
@@ -2051,8 +1979,9 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(written).toHaveLength(1);
-    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(written).toHaveLength(2);
+    const statsEntry = written.find(([p]) => p.endsWith("kg-stats.json"))!;
+    const stats = JSON.parse(statsEntry[1]) as Record<string, unknown>;
     expect(stats.quads).toBe(1234);
     expect(stats.vectors).toBe(56);
     expect(stats.docPages).toBe(7);
@@ -2080,8 +2009,9 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(written).toHaveLength(1);
-    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(written).toHaveLength(2);
+    const statsEntry = written.find(([p]) => p.endsWith("kg-stats.json"))!;
+    const stats = JSON.parse(statsEntry[1]) as Record<string, unknown>;
     expect(stats.quads).toBe(150);
     expect(stats.vectors).toBe(0);
     expect(stats.docPages).toBe(0);
@@ -2105,8 +2035,9 @@ describe("kgIngestStep", () => {
       noopReporter,
     );
 
-    expect(written).toHaveLength(1);
-    const stats = JSON.parse(written[0][1]) as Record<string, unknown>;
+    expect(written).toHaveLength(2);
+    const statsEntry = written.find(([p]) => p.endsWith("kg-stats.json"))!;
+    const stats = JSON.parse(statsEntry[1]) as Record<string, unknown>;
     expect(stats.quads).toBe(0);
     expect(stats.vectors).toBe(0);
     expect(stats.docPages).toBe(0);
@@ -2217,10 +2148,171 @@ describe("kgIngestStep", () => {
   });
 });
 
+// ── kgIngestStep — log file and signal echo ───────────────────────────────────
+
+describe("isSignalLine", () => {
+  it.each([
+    ["== spine ingest ==", true],
+    ["  == section header  ", true],
+    ["prs: 0", true],
+    ["   prs: 0", true],
+    ["commits: 120", true],
+    ["pr_error: boom", true],
+    ["people: 42", true],
+    ["issues: 7", true],
+    ["tracker: field 'x' missing from 3/10", true],
+    ["secondary repo foo/bar SKIPPED", true],
+    ["some random output line", false],
+    ["people joined the call", false],
+    ['{"quads":100}', false],
+    ["", false],
+  ])("isSignalLine(%s) === %s", (line, expected) => {
+    expect(isSignalLine(line)).toBe(expected);
+  });
+});
+
+describe("kgIngestStep — log file and signal echo", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgingest-log-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("writes kg-ingest.log with all stdout lines and echoes only signal lines", async () => {
+    const lines = ["== spine ingest ==", "   prs: 0", "   pr_error: boom", "noise line"];
+    const spawnImpl = () => makeFakeProcess(0, lines) as unknown as ChildProcess;
+
+    const written: Array<[string, string]> = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await kgIngestStep.run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/fake/code-repo",
+          spawnImpl,
+          writeFileSyncImpl: (p, d) => written.push([p, d]),
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      );
+
+      const logEntry = written.find(([p]) => p.endsWith("kg-ingest.log"));
+      expect(logEntry).toBeDefined();
+      const logContent = logEntry![1].split("\n");
+      expect(logContent).toContain("== spine ingest ==");
+      expect(logContent).toContain("   prs: 0");
+      expect(logContent).toContain("   pr_error: boom");
+      expect(logContent).toContain("noise line");
+
+      expect(logSpy).toHaveBeenCalledWith("[kg-ingest] == spine ingest ==");
+      expect(logSpy).toHaveBeenCalledWith("[kg-ingest]    prs: 0");
+      expect(logSpy).toHaveBeenCalledWith("[kg-ingest]    pr_error: boom");
+      expect(logSpy).not.toHaveBeenCalledWith("[kg-ingest] noise line");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("writes kg-ingest.log on failure (finally path)", async () => {
+    let callCount = 0;
+    const spawnImpl = () => {
+      callCount++;
+      // venv (1) and pip (2) succeed; main ingest (3) fails
+      if (callCount >= 3) {
+        return makeFakeProcess(2, [], ["pr_error: boom", "secondary repo SKIPPED"]) as unknown as ChildProcess;
+      }
+      return makeFakeProcess(0) as unknown as ChildProcess;
+    };
+
+    const written: Array<[string, string]> = [];
+
+    await kgIngestStep
+      .run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/fake/code-repo",
+          spawnImpl,
+          writeFileSyncImpl: (p, d) => written.push([p, d]),
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      )
+      .catch(() => {});
+
+    const logEntry = written.find(([p]) => p.endsWith("kg-ingest.log"));
+    expect(logEntry).toBeDefined();
+    const logContent = logEntry![1].split("\n");
+    expect(logContent).toContain("pr_error: boom");
+    expect(logContent).toContain("secondary repo SKIPPED");
+  });
+
+  it("echoes stderr signal lines to console", async () => {
+    const spawnImpl = () =>
+      makeFakeProcess(0, ['{"quads":0}'], ["tracker: field 'x' missing from 2/5"]) as unknown as ChildProcess;
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await kgIngestStep.run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/fake/code-repo",
+          spawnImpl,
+          writeFileSyncImpl: () => undefined,
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      );
+
+      expect(logSpy).toHaveBeenCalledWith("[kg-ingest] tracker: field 'x' missing from 2/5");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("does not echo noise lines from stdout to console", async () => {
+    const spawnImpl = () =>
+      makeFakeProcess(0, ["building index...", '{"quads":100}']) as unknown as ChildProcess;
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      await kgIngestStep.run(
+        makeContext(),
+        {
+          workspaceDir: tmpDir,
+          codeRepoDir: "/fake/code-repo",
+          spawnImpl,
+          writeFileSyncImpl: () => undefined,
+          mkdirSyncImpl: () => undefined,
+          existsSyncImpl: () => false,
+        },
+        noopReporter,
+      );
+
+      expect(logSpy).not.toHaveBeenCalledWith("[kg-ingest] building index...");
+      expect(logSpy).not.toHaveBeenCalledWith('[kg-ingest] {"quads":100}');
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
 // ── kg-refresh pipeline order ─────────────────────────────────────────────────
 
 describe("kg-refresh pipeline order", () => {
-  it("step IDs are clone → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → feedback-loop → kg-snapshot-push", () => {
+  it("step IDs are clone → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → kg-snapshot-push (no agent step)", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
     const ids = pipeline.steps.map((s) => s.id);
     expect(ids).toEqual([
@@ -2230,7 +2322,6 @@ describe("kg-refresh pipeline order", () => {
       "clone-secondary-repos",
       "kg-tracker-data",
       "kg-ingest",
-      "feedback-loop",
       "kg-snapshot-push",
     ]);
   });
@@ -2722,6 +2813,14 @@ describe("GHA kg-refresh dispatch — run ID polling (pollForKgWorkflowRunId)", 
 //
 // The distinction matters: tsx never touches /app/dist; only the CI gate does.
 
+describe("kg-refresh runner log level", () => {
+  it("builds its executor from AI_IMPLEMENT_LOG_LEVEL through resolveLogLevel, like run-autonomous", () => {
+    const src = readFileSync(join(fileURLToPath(new URL(".", import.meta.url)), "..", "pipeline", "kg-refresh-run.ts"), "utf8");
+    expect(src).toContain("new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL))");
+    expect(src).not.toContain('new ClaudeCliExecutor(workspaceDir, "summary")');
+  });
+});
+
 describe("pipeline/kg-refresh-run.ts module-load (entrypoint smoke test)", () => {
   it("exits with env validation error, not Cannot find module, when GITHUB_TOKEN is absent", () => {
     const workspaceRoot = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
@@ -2774,9 +2873,9 @@ describe("readCodeRepoFromSourcesYml", () => {
     expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
   });
 
-  it("returns owner/repo when code_repo key is present", () => {
+  it("returns { slug } when code_repo string key is present", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement" });
   });
 
   it("returns null when code_repo key is absent", () => {
@@ -2786,7 +2885,7 @@ describe("readCodeRepoFromSourcesYml", () => {
 
   it("trims trailing comments from the code_repo value", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement  # main code repo\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement" });
   });
 
   it("returns null for malformed YAML that lacks code_repo", () => {
@@ -2794,11 +2893,11 @@ describe("readCodeRepoFromSourcesYml", () => {
     expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
   });
 
-  it("returns owner/repo when code_repo is present alongside trackers block", () => {
+  it("returns { slug } when code_repo is present alongside trackers block", () => {
     writeFileSync(join(tmpDir, "sources.yml"),
       "code_repo: org/my-repo\ntrackers:\n  - team: AII\n",
     );
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/my-repo" });
   });
 
   it("returns null when code_repo value has no slash (not owner/repo format)", () => {
@@ -2821,14 +2920,14 @@ code_repo:
   doc_globs: []
 `;
 
-  it("returns slug from the real verbatim mapping form", () => {
+  it("returns { slug } from the real verbatim mapping form", () => {
     writeFileSync(join(tmpDir, "sources.yml"), REAL_CODE_REPO_BLOCK);
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("BuildDownAI/AI-Implement");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement" });
   });
 
-  it("returns slug when code_repo is a mapping with only the slug key", () => {
+  it("returns { slug } when code_repo is a mapping with only the slug key", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: org/my-repo\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/my-repo" });
   });
 
   it("returns null when code_repo mapping has no slug key", () => {
@@ -2843,25 +2942,109 @@ code_repo:
 
   it("strips trailing comment from slug line", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: org/my-repo  # main repo\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/my-repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/my-repo" });
   });
 
-  it("returns slug when mapping form coexists with trackers block", () => {
+  it("returns { slug } when mapping form coexists with trackers block", () => {
     writeFileSync(
       join(tmpDir, "sources.yml"),
       "code_repo:\n  slug: org/repo\ntrackers:\n  - team: AII\n",
     );
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
   });
 
-  it("returns slug via regex fallback when YAML is malformed but mapping hint present", () => {
+  it("returns { slug } via regex fallback when YAML is malformed but mapping hint present", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "[broken\ncode_repo:\n  slug: org/repo\n");
-    expect(readCodeRepoFromSourcesYml(tmpDir)).toBe("org/repo");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
   });
 
   it("returns null when code_repo mapping slug value is numeric (42)", () => {
     writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: 42\n");
     expect(readCodeRepoFromSourcesYml(tmpDir)).toBeNull();
+  });
+
+  // ── branch field ───────────────────────────────────────────────────────────
+
+  it("returns { slug, branch } when mapping form has branch key", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n  branch: testing\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement", branch: "testing" });
+  });
+
+  it("returns { slug } without branch when mapping form has no branch key", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: BuildDownAI/AI-Implement\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "BuildDownAI/AI-Implement" });
+  });
+
+  it("trims whitespace from branch value", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch:  testing \n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo", branch: "testing" });
+  });
+
+  it("omits branch when branch value starts with a dash (would be misread as git flag)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch: -f\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
+  it("omits branch when value starts with a flag-injection string", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch: \"--upload-pack=x\"\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
+  it("omits branch when value contains '..'", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch: \"main..evil\"\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
+  it("omits branch when value has internal whitespace", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch: \"main evil\"\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
+  it("omits branch when value contains ':' (would form a two-sided refspec)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch: \"main:refs/heads/other\"\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
+  it("accepts a branch containing a hyphen mid-string", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: org/repo\n  branch: feature-branch\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo", branch: "feature-branch" });
+  });
+
+  it("returns { slug } without branch via regex fallback (branch not captured by regex)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "[broken\ncode_repo:\n  slug: org/repo\n  branch: testing\n",
+    );
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
+  });
+
+  it("string form never carries a branch", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: org/repo\n");
+    expect(readCodeRepoFromSourcesYml(tmpDir)).toEqual({ slug: "org/repo" });
   });
 });
 
@@ -2960,6 +3143,98 @@ describe("readSecondaryReposFromSourcesYml", () => {
     );
     expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([{ slug: "org/extra" }]);
   });
+
+  it("returns branch when secondary_repos entry has a branch key", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: testing\n  - slug: BuildDownAI/docs\n",
+    );
+    expect(readSecondaryReposFromSourcesYml(tmpDir)).toEqual([
+      { slug: "BuildDownAI/skills", branch: "testing" },
+      { slug: "BuildDownAI/docs" },
+    ]);
+  });
+
+  it("trims branch value and returns trimmed string", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"  testing  \"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0].branch).toBe("testing");
+  });
+
+  it("omits branch when value is an empty string", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when branch key is absent from entry", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when value starts with dash (flag-injection guard)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"--upload-pack=evil\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when value starts with a flag-injection string", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"--upload-pack=x\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when value contains '..'", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"main..evil\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when value has internal whitespace", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"main evil\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("omits branch when value contains ':' (would form a two-sided refspec)", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: \"main:refs/heads/other\"\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).not.toHaveProperty("branch");
+  });
+
+  it("accepts a branch containing a hyphen mid-string", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: feature-branch\n",
+    );
+    const result = readSecondaryReposFromSourcesYml(tmpDir);
+    expect(result[0]).toEqual({ slug: "BuildDownAI/skills", branch: "feature-branch" });
+  });
 });
 
 
@@ -2982,9 +3257,6 @@ steps:
   - id: kg-ingest
     type: custom
     moduleId: kg-ingest
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push
@@ -3094,6 +3366,101 @@ describe("applyWiring for clone-secondary-repos", () => {
     const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
     expect(step?.type).toBe("clone");
     expect(step?.moduleId).toBeUndefined();
+  });
+
+  it("inputs include branch on targets when sources.yml declares branch for a secondary repo", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "secondary_repos:\n  - slug: BuildDownAI/skills\n    branch: testing\n  - slug: BuildDownAI/docs\n",
+    );
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    const targets = inputs.targets as Array<{ repoOwner: string; repoRepo: string; targetDir: string; branch?: string }>;
+    expect(targets).toHaveLength(2);
+    expect(targets[0].branch).toBe("testing");
+    expect(targets[1]).not.toHaveProperty("branch");
+  });
+
+  it("inputs include depth: 'full' when clone-secondary-repos step declares depth: full", () => {
+    const KG_WITH_DEPTH_YAML = `id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+  - id: dependency-auth
+    type: custom
+    moduleId: dependency-auth
+  - id: clone-secondary-repos
+    type: clone
+    depth: full
+  - id: kg-snapshot-push
+    type: custom
+    moduleId: kg-snapshot-push
+`;
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_WITH_DEPTH_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.depth).toBe("full");
+  });
+
+  it("inputs have depth: undefined when clone-secondary-repos step omits depth", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), REAL_SECONDARY_REPOS_BLOCK);
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_WITH_SECONDARY_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-secondary-repos");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.depth).toBeUndefined();
+  });
+
+  it("clone step in kg-refresh.yml declares depth: full and loader preserves it", () => {
+    const KG_WITH_CLONE_DEPTH_YAML = `id: kg-refresh
+steps:
+  - id: clone
+    type: clone
+    depth: full
+  - id: kg-snapshot-push
+    type: custom
+    moduleId: kg-snapshot-push
+`;
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_WITH_CLONE_DEPTH_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone");
+    expect(step).toBeDefined();
+    // Verify depth is spread onto the StepDefinition
+    expect((step as unknown as Record<string, unknown>).depth).toBe("full");
+    // Verify depth is forwarded through the inputs function so clone.ts actually receives it
+    const ctx = makeContext({
+      githubOwner: "BuildDownAI",
+      githubRepo: "AI-Implement",
+      branch: "main",
+      githubToken: "tok",
+      workspaceDir: tmpDir,
+    });
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.depth).toBe("full");
   });
 });
 
@@ -3215,7 +3582,6 @@ describe("kg-refresh pipeline definition step order", () => {
       "clone-secondary-repos",
       "kg-tracker-data",
       "kg-ingest",
-      "feedback-loop",
       "kg-snapshot-push",
     ]);
   });
@@ -3248,9 +3614,6 @@ steps:
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push
@@ -3450,9 +3813,6 @@ steps:
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
-  - id: feedback-loop
-    type: custom
-    moduleId: feedback-loop
   - id: kg-snapshot-push
     type: custom
     moduleId: kg-snapshot-push
@@ -3488,6 +3848,65 @@ steps:
     const inputs = ctx.resolveInputs(step!.inputs);
 
     expect(inputs.depth).toBeUndefined();
+  });
+
+  it("inputs carry branch from mapping-form code_repo.branch", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n  branch: testing\n",
+    );
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.branch).toBe("testing");
+    expect(inputs.repoOwner).toBe("BuildDownAI");
+    expect(inputs.repoRepo).toBe("AI-Implement");
+  });
+
+  it("inputs carry branch: '' when mapping-form code_repo has no branch field", () => {
+    writeFileSync(
+      join(tmpDir, "sources.yml"),
+      "code_repo:\n  slug: BuildDownAI/AI-Implement\n",
+    );
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.branch).toBe("");
+  });
+
+  it("inputs carry branch: '' for string-form code_repo (no branch in string form)", () => {
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo: BuildDownAI/AI-Implement\n");
+
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_FULL_PIPELINE_YAML,
+    });
+    const step = pipeline.steps.find((s) => s.id === "clone-code-repo");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext();
+    ctx.setOutputs("clone", { workspaceDir: tmpDir });
+    const inputs = ctx.resolveInputs(step!.inputs);
+
+    expect(inputs.branch).toBe("");
   });
 });
 
@@ -3538,7 +3957,6 @@ describe("runKgRefresh — dependency-auth step and dependencyTokenScope", () =>
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         dependencyAuth: capturingDepAuth,
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
@@ -3571,7 +3989,6 @@ describe("runKgRefresh — dependency-auth step and dependencyTokenScope", () =>
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         dependencyAuth: capturingDepAuth,
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },
@@ -3596,7 +4013,6 @@ describe("runKgRefresh — dependency-auth step and dependencyTokenScope", () =>
         clone: makeStepModule({ workspaceDir: tmpDir, repoOwner: "org", repoRepo: "repo", githubToken: "tok", clonedRef: "abc" }),
         dependencyAuth: capturingDepAuth,
         kgIngest: makeStepModule({ statsFile: null }),
-        feedbackLoop: makeStepModule({ approved: false }),
         kgSnapshotPush: makeStepModule({ snapshotPushed: true, commitSha: "sha123" }),
       },
       reporter: { report: async () => undefined },

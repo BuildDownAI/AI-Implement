@@ -4,6 +4,7 @@
 **Date:** 2026-06-17
 **Supersedes:** [PR #84](https://github.com/builddownai/AI-Implement/pull/84) (`ci: derive runner image org from repo owner instead of hardcoding`)
 **Builds on:** [2026-04-18 AII-54](2026-04-18-aii-54-base-image-overlay-design.md) (`.ai-implement/image.yml` override + `SESSION_IMAGE`)
+**Successor proposal (not implemented):** [2026-06-19 Orchestrator as the single runner-image resolver](2026-06-19-orchestrator-single-image-resolver-design.md) would drop the target-repo/org `AI_IMPLEMENT_RUNNER_IMAGE` variable and the in-workflow shell resolution. It has not shipped — **this document still describes the behaviour in the repo.**
 
 ## Summary
 
