@@ -161,6 +161,23 @@ export const stepperHtml = `
             <div class="field-hint">Cloned at dispatch and installed into the runner's ~/.claude/skills. Blank = none. Requires the target repo to re-sync claude-implement.yml.</div>
           </div>
           <div class="field">
+            <label class="field-label">Reference Repositories <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
+            <div style="display:flex;gap:8px;align-items:flex-end">
+              <input class="input mono" id="np-refrepo-repo" style="flex:2;min-width:0" placeholder="repository" autocomplete="off">
+              <input class="input mono" id="np-refrepo-path" style="flex:2;min-width:0" placeholder="workspace path" autocomplete="off">
+              <input class="input mono" id="np-refrepo-ref" style="flex:1;min-width:0" placeholder="ref (optional)" autocomplete="off">
+              <button class="btn btn-icon" style="flex:none;color:var(--accent)" onclick="npAddRefRepo()" title="Add">+</button>
+            </div>
+            <div id="np-refrepo-list"></div>
+            <div class="field-hint">Cloned read-only into the run's workspace so the agent can check a claim against real source instead of trusting the issue. Blank = none. Up to ten entries.</div>
+            <details class="explain">
+              <summary>What each field accepts</summary>
+              <div class="explain-body">The path is where the clone lands in the runner's workspace, alongside the checked-out target repository, and it is also the address the agent is given &mdash; so it should match whatever the target repo's own instructions call that source. If they say to check claims against <span class="mono">ai-implement-source</span>, that is the path to enter here. Any depth works, and each entry needs its own directory.</div>
+              <div class="explain-body">The repository is either <span class="mono">owner/repo</span> shorthand or a full <span class="mono">https://github.com/owner/repo</span> URL. Private repositories work as long as the App is installed on that owner.</div>
+              <div class="explain-body">The ref pins a branch, a tag, or a full commit hash. Blank clones the default branch.</div>
+            </details>
+          </div>
+          <div class="field">
             <label class="field-label">Dependency Token Scope <span style="font-weight:400;color:var(--fg-tertiary)">(optional)</span></label>
             <select class="input" id="np-dep-token-scope">
               <option value="">Off (default)</option>
@@ -349,6 +366,10 @@ export const stepperHtml = `
             <div data-review="skillsRepo"></div>
           </div>
           <div class="np-review-row">
+            <div class="np-review-label">Reference repositories</div>
+            <div data-review="referenceRepos"></div>
+          </div>
+          <div class="np-review-row">
             <div class="np-review-label">Dependency token scope</div>
             <div data-review="dependencyTokenScope"></div>
           </div>
@@ -436,7 +457,7 @@ export const stepperScript = `
     jiraProfilesFieldOverride: '',
     jiraBaseBranchFieldOverride: '',
     teamKey: '', owner: '', repo: '', defaultBranch: '', branchPrefix: '', sensitiveAddPatterns: '', sensitiveAllowPatterns: '',
-    skillsRepo: '', dependencyTokenScope: null,
+    skillsRepo: '', referenceRepos: [], dependencyTokenScope: null,
     executionMode: 'github-actions', machineCpus: 2, machineMemoryMb: 4096, sessionMode: 'autonomous',
     provider: 'anthropic', awsRegion: '',
     planningEnabled: true, autoApprovePlans: true, autoMerge: false,
@@ -461,6 +482,7 @@ export const stepperScript = `
     data.defaultBranch = '';
     data.branchPrefix = '';
     data.skillsRepo = '';
+    data.referenceRepos = [];
     data.sensitiveAddPatterns = '';
     data.sensitiveAllowPatterns = '';
     data.dependencyTokenScope = null;
@@ -480,13 +502,15 @@ export const stepperScript = `
     data.secrets = [];
 
     // Clear inputs. Not derived from the initializer above — a new field needs both.
-    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-maxJobMinutes'];
+    const toClear = ['np-teamKey', 'np-owner', 'np-repo', 'np-defaultBranch', 'np-branch-prefix', 'np-skills-repo', 'np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref', 'np-sensitive-add', 'np-sensitive-allow', 'np-awsRegion', 'np-maxTurns', 'np-maxIterations', 'np-maxJobMinutes'];
     const depScopeEl = document.getElementById('np-dep-token-scope');
     if (depScopeEl) depScopeEl.value = '';
     for (const id of toClear) {
       const el = document.getElementById(id);
       if (el) el.value = '';
     }
+    refRepoPending = null;
+    npRenderRefRepos();
     const cpusEl = document.getElementById('np-cpus');
     if (cpusEl) cpusEl.value = '2';
     const memEl = document.getElementById('np-mem');
@@ -709,6 +733,52 @@ export const stepperScript = `
     if (btn) btn.textContent = 'Check installation';
   }
 
+  // Row markup and rules come from the Projects page; this side owns its inputs and draft.
+  // refRepoPending carries the last staging attempt's message for validateStep.
+  let refRepoPending = null;
+  const NP_REFREPO_INPUTS = ['np-refrepo-repo', 'np-refrepo-path', 'np-refrepo-ref'];
+
+  function npRenderRefRepos() {
+    const el = document.getElementById('np-refrepo-list');
+    if (el) el.innerHTML = window.refRepoRowsHtml(data.referenceRepos, 'npRemoveRefRepo');
+  }
+
+  function npStageRefRepo() {
+    const value = function (id) {
+      const el = document.getElementById(id);
+      return el ? el.value : '';
+    };
+    const problem = window.refRepoStage(
+      { repo: value(NP_REFREPO_INPUTS[0]), path: value(NP_REFREPO_INPUTS[1]), ref: value(NP_REFREPO_INPUTS[2]) },
+      data.referenceRepos,
+    );
+    if (problem) return problem;
+    for (const id of NP_REFREPO_INPUTS) {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    }
+    npRenderRefRepos();
+    return null;
+  }
+
+  function npPendingRefRepo() {
+    return NP_REFREPO_INPUTS.some(function (id) {
+      const el = document.getElementById(id);
+      return !!(el && el.value.trim());
+    });
+  }
+
+  function npAddRefRepo() {
+    const problem = npStageRefRepo();
+    if (problem) showError(problem);
+    else hideError();
+  }
+
+  function npRemoveRefRepo(i) {
+    data.referenceRepos.splice(i, 1);
+    npRenderRefRepos();
+  }
+
   function stepperBack() {
     collectStep(step);
     step--;
@@ -783,6 +853,8 @@ export const stepperScript = `
       const dtsEl = document.getElementById('np-dep-token-scope');
       if (srEl) data.skillsRepo = srEl.value.trim();
       if (dtsEl) data.dependencyTokenScope = dtsEl.value || null;
+      // A filled add row is staged rather than discarded, as on the edit dialog.
+      refRepoPending = npPendingRefRepo() ? npStageRefRepo() : null;
     } else if (n === 4) {
       const smEl = document.getElementById('np-sessionMode');
       const cpEl = document.getElementById('np-cpus');
@@ -849,7 +921,8 @@ export const stepperScript = `
       if (!data.repo) { showError('Repository Name is required.'); return false; }
       if (!data.defaultBranch) { showError('Default Branch is required.'); return false; }
     } else if (n === 3) {
-      // Both Context fields are optional — always valid
+      // Every Context setting is optional; only an add row that cannot be staged blocks.
+      if (refRepoPending) { showError(refRepoPending); return false; }
     } else if (n === 4) {
       // executionMode is set via card selection — always valid
     } else if (n === 5) {
@@ -916,6 +989,11 @@ export const stepperScript = `
     set('skillsRepo', monoOr(data.skillsRepo));
     set('sensitiveAddPatterns', data.sensitiveAddPatterns ? (data.sensitiveAddPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' pattern(s)') : '&mdash;');
     set('sensitiveAllowPatterns', data.sensitiveAllowPatterns ? (data.sensitiveAllowPatterns.split('\\n').filter(function(l){return l.trim();}).length + ' exception(s)') : '&mdash;');
+    // Counted rather than listed, like the glob rows above.
+    const refRepoCount = data.referenceRepos.length;
+    set('referenceRepos', refRepoCount
+      ? (refRepoCount + (refRepoCount === 1 ? ' repository' : ' repositories'))
+      : '&mdash;');
     set('dependencyTokenScope', data.dependencyTokenScope ? window.esc(data.dependencyTokenScope) : '&mdash;');
 
     let runnerText = window.esc(data.executionMode);
@@ -1267,6 +1345,7 @@ export const stepperScript = `
       maxIterations: data.maxIterations,
       maxJobMinutes: data.maxJobMinutes,
       skillsRepo: data.skillsRepo || null,
+      referenceRepos: data.referenceRepos.length ? data.referenceRepos : null,
       sensitiveAddPatterns: data.sensitiveAddPatterns || null,
       sensitiveAllowPatterns: data.sensitiveAllowPatterns || null,
       dependencyTokenScope: data.dependencyTokenScope || null,
@@ -1336,6 +1415,8 @@ export const stepperScript = `
   window.selectProvider = selectProvider;
   window.addSecretRow = addSecretRow;
   window.removeSecretRow = removeSecretRow;
+  window.npAddRefRepo = npAddRefRepo;
+  window.npRemoveRefRepo = npRemoveRefRepo;
   window.onStepperTicketingProviderChange = onStepperTicketingProviderChange;
   window.onStepperRepoFieldChange = onStepperRepoFieldChange;
   window.stepperValidateJql = stepperValidateJql;
