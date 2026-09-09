@@ -4082,19 +4082,21 @@ describe("kgSnapshotPushStep — dryRun flag", () => {
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     let result;
+    let printed = "";
     try {
       result = await kgSnapshotPushStep.run(
         ctx,
         makeInputs({ clonedRef, dryRun: true, repoOwner: "acme", repoRepo: "kg-repo" }),
         noopReporter,
       );
+      // Read the calls before mockRestore — restore resets the recorded calls.
+      printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     } finally {
       logSpy.mockRestore();
     }
 
     expect(result.snapshotPushed).toBe(false);
     expect(result.prNumber).toBeNull();
-    const printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(printed).toContain("kg-refresh report — 20260905T080000Z");
     expect(printed).toContain("**Quads serialized:** 777");
     expect(printed).toContain("- AII: 2");
@@ -4193,7 +4195,8 @@ describe("kgSnapshotPushStep — refresh PR flow", () => {
   }
 
   function branchesOnBare(): string {
-    return execSync("git for-each-ref refs/heads --format=%(refname)", { cwd: bareDir }).toString();
+    // argv form: a shell would choke on the `%(` in the format string.
+    return spawnSync("git", ["for-each-ref", "refs/heads", "--format=%(refname)"], { cwd: bareDir }).stdout.toString();
   }
 
   it("pushes to kg-refresh/<stamp> and opens a PR whose body carries the report", async () => {

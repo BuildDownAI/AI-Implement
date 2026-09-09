@@ -74,6 +74,8 @@ interface KgSnapshotPushOutputs extends Record<string, unknown> {
   commitSha: string | null;
   /** PR number of the opened refresh PR. Null in mounted/dry-run mode or when repoOwner/repoRepo are absent. */
   prNumber: number | null;
+  /** The per-refresh branch (`kg-refresh/<stamp>`) the snapshot was pushed to. Null when nothing was pushed. */
+  branchName: string | null;
 }
 
 interface KgStats {
@@ -264,7 +266,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     if (process.env.AI_IMPLEMENT_WORKSPACE_MODE === "mounted") {
       // Dev-harness mounted workspace: never push. Leave snapshot changes in the
       // mount for the developer to inspect.
-      return { snapshotPushed: false, commitSha: null, prNumber: null };
+      return { snapshotPushed: false, commitSha: null, prNumber: null, branchName: null };
     }
 
     const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
@@ -464,7 +466,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     if (dryRun) {
       console.log("[kg-snapshot-push] dry-run: all guards passed; skipping commit, push, and PR");
       console.log(reportBody);
-      return { snapshotPushed: false, commitSha: null, prNumber: null };
+      return { snapshotPushed: false, commitSha: null, prNumber: null, branchName: null };
     }
 
     // ── 5. Commit snapshot/ ──────────────────────────────────────────────────
@@ -534,7 +536,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       // Dev/test scenario with no target repo identity: the branch pushed, but there is
       // nothing to build a GitHub API URL from, so the refresh PR cannot be opened.
       console.warn("[kg-snapshot-push] repoOwner/repoRepo absent — pushed the branch but skipped opening the refresh PR");
-      return { snapshotPushed: true, commitSha, prNumber: null };
+      return { snapshotPushed: true, commitSha, prNumber: null, branchName };
     }
 
     const quadsLabel = stats?.quads != null ? String(stats.quads) : "?";
@@ -551,7 +553,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     });
     console.log(`[kg-snapshot-push] pr opened #${pr.number}`);
 
-    return { snapshotPushed: true, commitSha, prNumber: pr.number };
+    return { snapshotPushed: true, commitSha, prNumber: pr.number, branchName };
   },
 };
 

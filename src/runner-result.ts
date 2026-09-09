@@ -55,6 +55,8 @@ export async function postRunnerResult(params: {
   snapshotCommit?: string | null;
   /** Number of the refresh PR opened alongside snapshotCommit. Only meaningful for phase=kg-refresh. */
   snapshotPr?: number | null;
+  /** The `kg-refresh/<stamp>` branch the snapshot was pushed to; the orchestrator deletes it after merge or close. */
+  snapshotBranch?: string | null;
   /**
    * Resolved callback URL, e.g. from resolveRunnerInputs()/the envelope's runnerCallbackUrl.
    * Falls back to the legacy RUNNER_CALLBACK_URL env var (never set in GHA envelope mode,
@@ -82,6 +84,7 @@ export async function postRunnerResult(params: {
   }
   if (params.snapshotCommit) body.snapshotCommit = params.snapshotCommit;
   if (params.snapshotPr) body.snapshotPr = params.snapshotPr;
+  if (params.snapshotBranch) body.snapshotBranch = params.snapshotBranch;
   const fetchFn = params.fetchImpl ?? fetch;
   try {
     const res = await fetchFn(`${callbackUrl.replace(/\/$/, "")}/runner/result`, {

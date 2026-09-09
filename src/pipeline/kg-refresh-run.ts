@@ -255,6 +255,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     outcome: "success",
     snapshotCommit: typeof snapshotPushOutputs.commitSha === "string" ? snapshotPushOutputs.commitSha : undefined,
     snapshotPr: typeof snapshotPushOutputs.prNumber === "number" ? snapshotPushOutputs.prNumber : undefined,
+    snapshotBranch: typeof snapshotPushOutputs.branchName === "string" ? snapshotPushOutputs.branchName : undefined,
     callbackUrl,
     fetchImpl: opts.fetchImpl,
   });

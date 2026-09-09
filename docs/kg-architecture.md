@@ -41,8 +41,8 @@ the newest committed snapshot. **The graph's age stamp can change without anyone
 An operator who deploys a code fix and then finds the graph newer than they left it is seeing this,
 not a bug.
 
-The reverse also holds, and it is the sequencing rule in `bd-kg-refresh`: confirm the snapshot push
-has landed *before* triggering the deploy. The deploy is the only thing that picks it up.
+The reverse also holds: a deploy picks up whatever snapshot is on the default branch when it builds.
+The rail (`POST /api/kg/refresh`) is the only path that writes `snapshot/`; the laptop never pushes it.
 
 ### A broken snapshot blocks unrelated code deploys
 
@@ -198,7 +198,7 @@ builder's git cache served a stale `--depth 1` clone. Both are benign. Wait, red
 With the refresh rail (AII-426), publishing data no longer rides a release. Run `bd-kg-refresh`,
 or these steps by hand.
 
-1. Reconcile scope, ingest, and commit + push the snapshot — steps 1–5 below, unchanged.
+1. Reconcile scope in `sources.yml` (through a PR on the KG repo when it changes) — the rail runs the ingest and pushes the snapshot itself; no laptop ingest, no laptop push.
 2. **Trigger the refresh**: `POST /api/kg/refresh` with an admin session token (or the
    Deployments page's "Refresh graph now"). `202` = accepted; `409` = a refresh or a deploy is
    already in progress; `422` = callback not configured or credential preflight failed (see below). The orchestrator
@@ -237,22 +237,20 @@ blocking all future refreshes for the remainder of the 4-hour ingest TTL. A live
 dispatched a runner and received no callback within the TTL self-heals at the next `POST
 /api/kg/refresh` call.
 
-**Redeploy remains the fallback** — an orchestrator predating the rail (the route answers 404),
-or a change that touches the sidecar's code rather than its data, still refreshes by deploy:
+**Redeploy remains the path for code, not data** — a change that touches the sidecar's code rather
+than its data ships by deploy, and the image build reads whatever snapshot is on the KG repo's default
+branch at that moment (the rail keeps it current):
 
-1. **Reconcile scope.** Call `list_projects` on the orchestrator MCP, diff against `sources.yml`, and
-   commit the manifest before ingesting.
-2. **Ingest** in the KG checkout:
-   `./.venv/bin/python -m kg_ingest.cli --repo ../AI-Implement --tracker --secondary`
-3. **Read the report.** Quads, cards, `SHACL conforms`, the age stamp, and the docs-crawl line. Treat
-   `embeddings SKIPPED` as a warning, not an aside.
-4. **Commit and push** `snapshot/` to `main`. Generated data goes straight to the default branch.
-5. **Confirm the push landed** with `git log origin/main`. This is the monolith's sequencing rule:
-   the deploy is what reads the snapshot, so a deploy that races the push builds the old graph.
-6. **Self-deploy** — `POST /api/deploy` with an admin session token. Expect `202`, or `409` if one is
+1. **Refresh the data first if it must be current** — `POST /api/kg/refresh`, wait for `serving`.
+2. **Self-deploy** — `POST /api/deploy` with an admin session token. Expect `202`, or `409` if one is
    already running. Never a plain `fly deploy`; see [deployment.md](deployment.md#deploy-paths).
-7. **Verify live.** Non-empty results, `degraded: false`, and an age stamp equal to step 3. Check
-   `kgDegraded` on `GET /` as well — a lexical-only image answers queries and looks healthy.
+3. **Verify live.** Non-empty results, `degraded: false`, and an age stamp equal to the served stamp
+   from step 1. Check `kgDegraded` on `GET /` as well — a lexical-only image answers queries and looks
+   healthy.
+
+An orchestrator that predates the rail (the route answers 404) is upgraded, not worked around: the
+laptop ingest-and-push path is retired (AII-593), and `snapshot/` on the default branch is written by
+the rail alone.
 
 Steps 5 to 7 exist entirely because of the monolith. In a two-service design the data would be
 reloadable on its own; here it rides a release, so the release has to be sequenced and verified.
@@ -369,9 +367,9 @@ callback URL, local run, or fetch failure), `clone-code-repo` is skipped gracefu
 proceeds without the code repo rather than aborting the pipeline. When the clone succeeds, the
 `kg-ingest` step passes `--code-repo <path>` to `python -m kg_ingest refresh`, giving the ingest
 access to git history, commits, PRs, and files from the implementation repo. If `sources.yml`
-contains no `code_repo` field, the step is also skipped silently. Local `bd-kg-refresh` skill runs
-never carry a dispatch token and therefore always skip `clone-code-repo`; the local operator
-supplies the code repo checkout directly via `--repo` if needed.
+contains no `code_repo` field, the step is also skipped silently. The dev-harness `--phase kg-refresh`
+run (`docs/issueless-runs.md` § 10) exercises the same clone steps locally against the operator's
+GitHub token; it never pushes.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
