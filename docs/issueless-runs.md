@@ -67,7 +67,6 @@ Both run tokens are minted with the team key of the KG source repo's own project
 |---|---|---|
 | `runner-result.ts` `postRunnerResult` | `/runner/result` | `POST /runner/result` |
 | `pipeline/steps/kg-tracker-data.ts` | `/api/runner/kg-tracker-data` | `POST /api/runner/kg-tracker-data` |
-| `session/lib.sh` `setup_kg_push_credential` | `/api/runner/kg-push-token` | `POST /api/runner/kg-push-token` |
 | `runner-result.ts` `fetchPlanningContextFromOrchestrator` | `/runner/planning-context` | `GET /runner/planning-context` |
 
 The route `/api/runner/result` does **not** exist. Any value that appends a path to `runnerCallbackUrl` before passing it to these clients will produce a double-path URL that hits the admin-auth 401 wall.
@@ -102,23 +101,18 @@ Gate `"preflight"` is added to the `RefreshGate` union in `src/kg-refresh.ts`. `
 | `local` | `local-docker` (requires `LOCAL_RUNNER_IMAGE`) |
 | `shadow` | collapses to `github-actions` — two concurrent ingest runs would race to push the same snapshot commit |
 
-**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-kg-refresh.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, and `runner_image`. `run_progress_token` is the HMAC progress token; the workflow masks it immediately and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. `RUNNER_CALLBACK_URL` is not passed as an explicit workflow input — `session/entrypoint.sh` derives it from the `runnerCallbackUrl` field in the decoded `AI_IMPLEMENT_RUN_CONFIG` envelope (always present when the callback-config guard passes). Together these allow the `kg-tracker-data` step and the `setup_kg_push_credential` helper to operate on GHA the same way they do on Fly. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image (`AI_IMPLEMENT_RUNNER_IMAGE`) or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. A testing orchestrator pinned to `:next` therefore steers kg-refresh runs to `:next` automatically — the KG source repo needs no `AI_IMPLEMENT_RUNNER_IMAGE` variable when the orchestrator is pinned. If the workflow file is absent, the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message naming the missing file and the sync instruction. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs. The GHA template must export `RUNNER_PHASE=kg-refresh` in the `Run pipeline` step env; `session/entrypoint.sh` defaults `RUNNER_PHASE` to `implementation` when absent, so an omission silently routes the run to `run-autonomous.js` instead of `pipeline/kg-refresh-run.js`.
+**GitHub Actions backend:** dispatches `workflow_dispatch` to `claude-implement.yml` in the KG source repo (`KG_SOURCE_REPO`) with inputs `run_config`, `run_token`, `run_progress_token`, `runner_phase: "kg-refresh"`, `job_timeout_minutes: "240"`, and optionally `runner_image` and `runner_callback_url`. `run_progress_token` is the HMAC progress token; the workflow masks it and exports it as `RUN_PROGRESS_TOKEN` in the `Run pipeline` step env. `runner_phase: "kg-refresh"` is forwarded as `RUNNER_PHASE`, which routes `session/entrypoint.sh` to `pipeline/kg-refresh-run.js`. `runner_callback_url` is passed when `RUNNER_CALLBACK_BASE_URL` is set on the orchestrator; the `kg-tracker-data` step reads it from `RUNNER_CALLBACK_URL`. `job_timeout_minutes: "240"` preserves the 240-minute ceiling that `claude-kg-refresh.yml` formerly hard-coded; the implement template defaults to 90 minutes when the input is absent. `runner_image` is computed by the same channel-policy helper (`resolveRunnerImageForDispatch`) used by the standard implement dispatch: it is forwarded only when the orchestrator has an explicitly-pinned image or the KG repo has a per-repo `.ai-implement/image.yml` override; when neither is true the input is omitted and the workflow's own `AI_IMPLEMENT_RUNNER_IMAGE` variable (if set) applies. `claude-implement.yml` is in `ALWAYS_SYNC_FILES` and is delivered to the KG source repo mapping automatically by workflow sync — no manual copy step is needed. If the workflow file is absent (e.g. the KG repo mapping predates the sync that delivered `claude-implement.yml`), the dispatch returns HTTP 422; `dispatchKgRefreshRun()` throws with a message directing the operator to re-run workflow sync for the KG source repo mapping. After a successful dispatch, `findWorkflowRunId()` is attempted (30-second look-back, best-effort) and the resulting run ID is stored on the `dispatch_log` row via `updateJobRunId()`. The `dispatch_log` row has no `machine_nonce` for GHA-backed runs.
 
 The kg-refresh runner reads `AI_IMPLEMENT_LOG_LEVEL` the same way the implement runner does: the synced workflow passes the repo Actions variable into the `Run pipeline` step, and `summary` (default) prints one result line per Claude invocation while `stream` also tees each tool call. The kg-refresh pipeline has no agent step since 2026-09-08: the ingest is deterministic and `kg-snapshot-push` is both the guard and the report. The report step it once had re-ran the ingest by hand without a GitHub token and deleted `snapshot/parts/pr.nt` (AII-575 runs 2–4); `stream` remains useful for any future agent step.
 
-**Run-ID binding lifecycle (GHA path):** After a successful `workflow_dispatch`, GitHub does not return a run ID — it must be discovered by polling the Runs API. `dispatchKgRefreshRun()` polls `findWorkflowRunId()` for up to ~90 s (5 rounds: 5 s, 10 s, 20 s, 30 s, 25 s) before returning. On success the run ID rides the return value; the `updateJobMachine` hook writes it to `dispatch_log.run_id` via `updateJobRunId()`, which also advances the row to `status = "running"`. On exhaustion, the row is left with `run_id = NULL` and a warning is logged — the row stays alive in `"dispatched"` status and the reaper handles it on its next sweep.
-
-The reaper's `reconcileGhaKgRefreshJob` function (in `src/reaper.ts`) applies a **lazy-bind** step before declaring `dispatch_lost`: once the 5-minute grace window has elapsed and `run_id` is still `NULL`, it calls `helpers.bindGhaRunId(job)` — which runs a `findWorkflowRunId` lookup and, on success, calls `attachJobRunIdIfMissing()` to persist the run ID. If the lazy-bind succeeds the job is left alive and will be reconciled by the run-status check on the next sweep. Only when `bindGhaRunId` returns `null` (or is absent) does the reaper declare `dispatch_lost` and call `failKgRefreshMachine` with `detail: "no workflow run appeared within 5 min of dispatch"`. Lazy-bind is skipped in dry-run mode.
-
 **Late-callback handling:** If the reaper declares `dispatch_lost` but the GHA run was actually in progress, the runner's result callback eventually arrives at `POST /api/runner/result`. `onRunnerComplete()` detects that `stage` is already `"failed"` and — rather than silently discarding the result — supersedes the reaper's synthetic outcome: it updates `lastRefresh` with the runner's actual conclusion, persists it, and logs `"[kg-refresh] late callback after reaper close — updating lastRefresh"`. The `dispatch_log` row itself remains closed (no re-open); only the in-memory and persisted `lastRefresh` is updated. `onOutcome` is not fired a second time.
+
 
 **Fly Machines backend:** unchanged from the original implementation. Creates a session machine with `phase: "kg-refresh"`. Returns `machineId + machineNonce`.
 
 **Local Docker backend:** starts a local container via `startLocalRunnerContainer()`. Returns `machineNonce` only.
 
 If the resolved path requires a backend that is not configured (e.g. `fly-machines` but no sessions app), `dispatchKgRefreshRun()` throws immediately. The throw is caught by the async IIFE catch block in `trigger()`, which sets `stage = "failed"` and fires `onOutcome("failure", ...)`.
-
-The `claude-kg-refresh.yml` workflow lives in `workflows/` and must be added to the KG source repo before GHA dispatch can succeed. Unlike `claude-implement.yml`, it is not automatically synced — it is a one-time manual step per KG source repo.
 
 **The KG source repo also needs the runner secrets.** It is not an onboarded project mapping, so nothing seeds them; a fresh KG repo has zero secrets and a dispatched run fails at auth even though the `workflow_dispatch` itself succeeds. Set these once on the KG source repo (mirror the values the orchestrator's target repos use):
 
@@ -363,18 +357,11 @@ The stuck-watchdog path re-queues issues through the ticketing system. Since the
 
 ### Reaper reconciliation
 
-`src/reaper.ts`: at the end of each `sweepOrphanedMachines()` call, `sweepOrphanedKgRefreshJobs()` is invoked. It branches on `job.executionMode`:
+`src/reaper.ts`: at the end of each `sweepOrphanedMachines()` call, `sweepOrphanedKgRefreshJobs()` is invoked. It is **Fly-mode and local-Docker only**; GHA rows are skipped (`continue`) because the implement-path monitor owns them. For GHA rows that never receive a run ID, the equivalent of the 5-minute Fly bootstrap deadline is handled by `monitorKgRefreshGhaJob`'s `GHA_DISPATCH_GRACE_MS` (10 minutes) in the poll cycle — see "GHA monitor" above.
 
-**Fly-mode rows** (existing behaviour): the already-fetched machine set is consulted. For each row whose `machine_id` is absent from the active set, `helpers.failKgRefreshMachine(job)` is called. A row still in `"dispatched"` state past the 5-minute bootstrap deadline is closed with `failureCode: "bootstrap_timeout"` regardless of machine presence. Local-Docker rows (no `machine_id`) are skipped.
+**Fly-mode rows**: the already-fetched machine set is consulted. For each row whose `machine_id` is absent from the active set, `helpers.failKgRefreshMachine(job)` is called. A row still in `"dispatched"` state past the 5-minute bootstrap deadline is closed with `failureCode: "bootstrap_timeout"` regardless of machine presence. Local-Docker rows (no `machine_id`) are skipped.
 
-**GHA rows** (`executionMode = "github-actions"`): machine-absent and bootstrap-deadline rules never apply. Instead, `helpers.checkGhaRunStatus(job)` queries the GitHub Actions workflow run:
-- `status` is `"queued"` or `"in_progress"` → leave the row alone
-- `status` is `"completed"` → call `helpers.failKgRefreshMachine(job, { failureCode: conclusion })` to close the chain
-- API error (helper returns `null`) → leave the row alone (fail-safe; avoid releasing the deploy interlock on ambiguous signal)
-- `run_id` is `null` and the row is within the 5-minute dispatch grace window → leave alone
-- `run_id` is `null` and past the grace window → close with `failureCode: "dispatch_lost"`
-
-All paths converge on `kgRefresh.onMachineLost()`:
+All Fly paths converge on `kgRefresh.onMachineLost()`:
 
 ```typescript
 onMachineLost(opts?: { failureCode?: string }) {
@@ -385,7 +372,19 @@ onMachineLost(opts?: { failureCode?: string }) {
 
 `failIngestRunner()` closes the chain: sets `stage = "failed"`, clears `running`, fires `onOutcome("failure", { timedOut: true })`, and calls `closeJobLog(jobId, "timed_out")`.
 
-New `ruleMatched` values written to `reaper_actions`: `kg-refresh-gha-run-complete`, `kg-refresh-gha-dispatch-lost`.
+### GHA monitor (lazy bind and run closure)
+
+GHA kg-refresh rows are monitored by `monitorKgRefreshGhaJob` in `src/monitor-gha.ts`. `monitorGitHubActionsJob` in `src/index.ts` delegates to it immediately for any row where `job.phase === "kg-refresh"`. `getInFlightJobs()` returns kg-refresh rows because it is phase-agnostic; the main monitor loop routes all non-Fly, non-local-Docker rows through `monitorGitHubActionsJob`, which then delegates.
+
+**Lazy bind (run_id IS NULL):** `monitorKgRefreshGhaJob` resolves the workflow file as `"claude-implement.yml"` (the file kg-refresh dispatches to) and the ref via `getRepoDefaultBranch()`, bypassing the `teamRepoMap` lookup that would return nothing for the KG source repo. It calls `attachJobRunIdIfMissing` and adds to `claimedRunIds`, which are shared with implement rows in the same poll cycle. If `findWorkflowRunId` returns null and the dispatch is older than `GHA_DISPATCH_GRACE_MS` (10 minutes, matching `RUN_ID_TIMEOUT_MS` for issue-keyed runs), `onHandleLost({ failureCode: "dispatch_lost" })` is called to close the chain — covering the case where a `workflow_dispatch` was silently rejected (e.g. workflow file absent) and no run ever appeared.
+
+**Run closure:** once `run_id` is set, `monitorKgRefreshGhaJob` polls `getWorkflowRunStatus()` and calls `updateJobStatus(job.id, jobStatus, conclusion, null)` on completion. kg-refresh rows are issueless — no PR URL, no ticket side effects. Issue-keyed side effects (ticket comments, labels) are suppressed by the existing `shouldSkipCompletionNotice(job)` guard in `reportJobCompletion` (AII-539). The reaper is **Fly-only** for kg-refresh; GHA rows are owned entirely by the monitor.
+
+**`onHandleLost` wiring:** `monitorKgRefreshGhaJob` receives `onHandleLost` from its caller in `src/index.ts`, wired as `(opts) => activeKgRefresh?.onMachineLost(opts)`. It is called on three paths: (1) dispatch-lost (no run ID after `GHA_DISPATCH_GRACE_MS`), (2) watchdog-overdue (run stuck in non-terminal state past the threshold), and (3) run-conclusion (GHA run completed but runner callback never arrived). All three paths release the in-memory `running` lock and advance `stage` out of `"ingest-running"` so a new refresh can be triggered without waiting for the TTL. `onMachineLost` is idempotent (no-op when `stage ≠ "ingest-running"`), so calling it after the callback already landed is safe.
+
+**Conclusion-then-handle-lost overwrite:** on the run-conclusion path, `updateJobStatus` first writes the accurate terminal status (`completed`, `failed`, or `timed_out` from the GHA conclusion). `onHandleLost` then calls `onMachineLost` → `failIngestRunner` → `closeJobLog(jobId, "timed_out")`, which unconditionally overwrites the row to `status="timed_out"`, `conclusion=NULL` if the runner callback never arrived. This matches the pre-existing Fly-machine-lost path and is intentional: when the callback is absent, the pipeline's success or failure is unknown and `timed_out` is the conservative classification.
+
+**Late-callback safety:** `onRunnerComplete` in `KgRefreshHandle` checks the in-memory `stage`, not the DB row status. If the monitor has already called `updateJobStatus` before the runner's own callback arrives, `stage` is still `"ingest-running"` and the callback proceeds normally, recording `lastRefresh` and calling `closeJobLog` (a no-op re-update on an already-terminal row). `onHandleLost` and `updateJobStatus` are co-atomic in the monitor — both are called synchronously with no `await` between them — so there is no window where `updateJobStatus` has written but `onHandleLost` has not yet fired.
 
 ### Deploy interlock
 
@@ -504,6 +503,8 @@ Full reference: `CLAUDE.md` § "kg-refresh phase" and `docs/pipeline-architectur
 
 ## 11. How to add a new issueless run kind
 
+**Prefer a parameter of an existing file over a new file next to it. A new template, resolver, or lifecycle branch for a run kind is a finding in review.** See the [kg-refresh retrospective](kg-architecture.md#retrospective-the-dispatched-refresh-2026-09-03--09-06) for the concrete example.
+
 A checklist for implementing a second run kind from scratch, without reading AII-493–521.
 
 **1. Pick a synthetic `issueId` string constant**
@@ -521,7 +522,7 @@ Do not include `prNumber`, `baseBranch`, `branchPrefix`, `profiles`, `planningCo
 **4. Mint the required run token(s)**
 Always mint a result token (`audience: "result"`, `mappingTeamKey: ""`) and set `ttlSeconds` to the TTL you will enforce. Do **not** mint a `publication` audience token — there is no target repository.
 
-If your run kind needs to call any orchestrator vending endpoint — analogous to `GET /api/runner/kg-push-token` or `POST /api/runner/kg-tracker-data` — those endpoints verify `audience = "progress"`. You must also mint a progress token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv` when building the machine config:
+If your run kind needs to call any orchestrator vending endpoint — analogous to `POST /api/runner/kg-tracker-data` — those endpoints verify `audience = "progress"`. You must also mint a progress token and pass it as `RUN_PROGRESS_TOKEN` in `extraEnv` when building the machine config:
 
 ```typescript
 const { token: progressToken } = mintRunToken({
@@ -536,12 +537,12 @@ const { token: progressToken } = mintRunToken({
 extraEnv.RUN_PROGRESS_TOKEN = progressToken;
 ```
 
-Without the progress token, vending endpoints return 403 and dependent pipeline steps skip silently — the same degraded state the current kg-refresh dispatch exhibits for its kg-push-token and kg-tracker-data steps.
+Without the progress token, vending endpoints return 403 and dependent pipeline steps skip silently — the same degraded state kg-refresh exhibited before AII-544 was fixed.
 
 **5. Write a dispatch function with all three backends**
 Follows the pattern of `dispatchKgRefreshRun()` in `src/index.ts`. Call `resolveExecutionPath(getRunnerMode().mode, <defaultMode>)` to select the backend. Choose `<defaultMode>` based on what is "universally available" for the run kind (`"github-actions"` is the safest default). Passes `AI_IMPLEMENT_RUN_CONFIG` (the base64-encoded `RunConfigV1`) in `extraEnv` for Fly/local. For GHA, passes `run_config` + `run_token` as workflow_dispatch inputs. Returns `{ machineId?, machineNonce?, logsUrl?, workflowRunId? }` — `machineNonce` is present only for Fly/local, `workflowRunId` only for GHA.
 
-If a GHA backend is needed, create a dedicated `workflows/<your-kind>.yml` workflow (see `workflows/claude-kg-refresh.yml` as the reference). Unlike `claude-implement.yml`, issueless run kind workflows are not auto-synced and must be added to the target repo manually.
+If a GHA backend is needed, dispatch to `claude-implement.yml` with `runner_phase: "<your-phase>"` and `job_timeout_minutes` set to your TTL ceiling. `claude-implement.yml` is auto-synced by workflow sync, so no manual copy step is required. Add a case arm in `session/entrypoint.sh` to route the new phase to your runner entry point.
 
 **6. Record a `dispatch_log` row**
 Call `appendLog()` from `src/log.ts` with:
@@ -594,7 +595,6 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | Runner token mint/verify | `src/runner-tokens.ts` |
 | dispatch_log row (schema, write, query) | `src/log.ts` (`appendLog`, `getInFlightJobs`, `getInFlightKgRefreshJobs`) |
 | Callback routing carve-out | `src/runner-callback.ts` (~line 252) |
-| KG push token vending | `src/kg-push-token-vending.ts` |
 | Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
 | Tracker-data pipeline step | `src/pipeline/steps/kg-tracker-data.ts` |
 | Secondary repo clone step | `src/pipeline/steps/clone.ts` (targets input) |

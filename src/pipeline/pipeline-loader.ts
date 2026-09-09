@@ -417,6 +417,9 @@ function applyWiring(step: YamlStep): StepDefinition {
           dryRun: ctx.data.kgDryRun === true,
           repoOwner: ctx.getOutputs("clone").repoOwner,
           repoRepo: ctx.getOutputs("clone").repoRepo,
+          orchestratorUrl: ctx.data.orchestratorUrl,
+          machineNonce: ctx.data.nonce,
+          callbackUrl: ctx.data.callbackUrl,
         }),
       };
 

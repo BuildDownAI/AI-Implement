@@ -267,32 +267,6 @@ export function buildEnvelopeDispatchInputs(
   };
 }
 
-/**
- * Builds the raw JSON body for a GHA kg-refresh workflow_dispatch call.
- * `runner_image` is omitted when `runnerImage` is undefined (no forwarding needed).
- * `runner_callback_url` is omitted when `runnerCallbackUrl` is undefined; the
- * entrypoint falls back to extracting it from AI_IMPLEMENT_RUN_CONFIG in that case.
- */
-export function buildKgRefreshGhaDispatchBody(opts: {
-  ref: string;
-  runConfig: string;
-  runToken: string;
-  runProgressToken: string;
-  runnerImage: string | undefined;
-  runnerCallbackUrl?: string | undefined;
-}): string {
-  return JSON.stringify({
-    ref: opts.ref,
-    inputs: {
-      run_config: opts.runConfig,
-      run_token: opts.runToken,
-      run_progress_token: opts.runProgressToken,
-      ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
-      ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
-    },
-  });
-}
-
 export async function dispatchWorkflow(
   token: string,
   mapping: RepoMapping,
@@ -473,6 +447,35 @@ export const KG_GHA_POLL_DELAYS_MS: readonly number[] = [5_000, 10_000, 20_000, 
  * Polls for a kg-refresh workflow run ID up to ~90 s after dispatch.
  * Injectable findRunId and pollDelaysMs for testability.
  */
+/**
+ * Body for a GHA-backed kg-refresh `workflow_dispatch`. The envelope's
+ * `runnerCallbackUrl` is the bare base URL (AII-548); `runner_phase` selects the
+ * kg-refresh entry in the shared claude-implement.yml template (AII-556).
+ */
+export function buildKgRefreshGhaDispatchBody(opts: {
+  ref: string;
+  runConfig: string;
+  runToken: string;
+  runProgressToken: string;
+  runnerImage: string | undefined;
+  runnerCallbackUrl?: string | undefined;
+  runnerPhase?: string;
+  jobTimeoutMinutes?: string;
+}): string {
+  return JSON.stringify({
+    ref: opts.ref,
+    inputs: {
+      run_config: opts.runConfig,
+      run_token: opts.runToken,
+      run_progress_token: opts.runProgressToken,
+      ...(opts.runnerPhase ? { runner_phase: opts.runnerPhase } : {}),
+      ...(opts.jobTimeoutMinutes ? { job_timeout_minutes: opts.jobTimeoutMinutes } : {}),
+      ...(opts.runnerImage ? { runner_image: opts.runnerImage } : {}),
+      ...(opts.runnerCallbackUrl ? { runner_callback_url: opts.runnerCallbackUrl } : {}),
+    },
+  });
+}
+
 export async function pollForKgWorkflowRunId(opts: {
   token: string;
   owner: string;

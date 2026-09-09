@@ -73,3 +73,13 @@ A run kind is allowed its own **data-path** modules, because the runner never ho
 - Any future issueless run kind (previews, migrations, scheduled jobs) starts from the table above. The expected cost is one optional template input, one `pipelines/<kind>.yml`, one prompt template, and the kind's data-path modules.
 - The acceptance clause "no implement-path test edits" is the mechanical check that a change added a parameter rather than a sibling.
 - The review rail and the driver's smoke both check for the six violations; a green suite does not clear them.
+
+## Siblings removed under this rule
+
+| Sibling (removed) | Shared path reused | Issue |
+|---|---|---|
+| `workflows/claude-kg-refresh.yml` | `workflows/claude-implement.yml` with `runner_phase: "kg-refresh"` | AII-556 |
+| `resolveKgRefreshSessionImage` in `src/repo-image.ts` | `resolveRunnerImageForDispatch` in `src/repo-image.ts` | AII-557 |
+| `session/git-credential-helper-kg-push.sh`, `src/kg-push-token-vending.ts`, `POST /api/runner/kg-push-token` | the primary token in the origin URL, as `push.ts` pushes (`kg-snapshot-push.ts`) | AII-583 |
+| The kg-refresh report step (`feedback-loop` in `pipelines/kg-refresh.yml`, `workflows/KG-REFRESH.md`) | the ingest step's counters and `ai-output/kg-ingest.log`; `kg-snapshot-push` is the guard | AII-575 follow-up, 2026-09-08 |
+

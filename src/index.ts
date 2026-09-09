@@ -45,12 +45,11 @@ import { getRunnerMode, getFlySecretsMinVersion, getFlyProcessLevelSecrets, init
 import { handleGitHubWebhook } from "./webhook.js";
 import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable } from "./reconciliation.js";
 import { runReconciliations } from "./reconcile-merged.js";
-import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, resolveKgRefreshSessionImage, type SessionImageStatus } from "./repo-image.js";
+import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
-import { handleKgPushTokenRequest } from "./kg-push-token-vending.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
 import { handleMcpRequest } from "./mcp.js";
@@ -93,6 +92,7 @@ import { KgSidecar } from "./kg-sidecar.js";
 import { makeKgRefresh, runKgRefreshPreflight } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
+import { monitorKgRefreshGhaJob } from "./monitor-gha.js";
 
 /** Set by startServer(); read by poll() to wire the reaper's kg-refresh failure callback. */
 let activeKgRefresh: KgRefreshHandle | null = null;
@@ -694,32 +694,6 @@ async function poll(config: AppConfig, registry: ProviderRegistry): Promise<void
     findPrForIssue: async (repo, issueIdentifier) =>
       (await findPrForIssue(config, repo, issueIdentifier))?.url ?? null,
     failKgRefreshMachine: (_job, opts) => { activeKgRefresh?.onMachineLost(opts); },
-    checkGhaRunStatus: async (job) => {
-      if (!job.repo || !job.runId) return null;
-      const [owner, repo] = job.repo.split("/");
-      if (!owner || !repo) return null;
-      const token = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, owner);
-      return getWorkflowRunStatus(token, owner, repo, job.runId);
-    },
-    bindGhaRunId: async (job) => {
-      if (!config.kgSourceRepo) return null;
-      const kgRepo = parseKgSourceRepo(config.kgSourceRepo);
-      try {
-        const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, kgRepo.owner);
-        const defaultBranch = (await getRepoDefaultBranch(ghToken, kgRepo.owner, kgRepo.repo)) ?? "main";
-        const dispatchTime = new Date(job.dispatchedAt - 30_000);
-        const runId = await findWorkflowRunId(ghToken, kgRepo.owner, kgRepo.repo, KG_REFRESH_WORKFLOW_FILE, defaultBranch, dispatchTime);
-        if (!runId) return null;
-        const bound = attachJobRunIdIfMissing(job.id, runId);
-        if (bound) {
-          console.log(`[reaper] kg-refresh job=${job.id} lazy-bound to GHA run ${runId}`);
-        }
-        return runId;
-      } catch (err) {
-        console.error(`[reaper] bindGhaRunId failed for job=${job.id}:`, err);
-        return null;
-      }
-    },
   });
 
   // Guaranteed (webhook-independent) merge detector: enqueue reconciliations
@@ -2053,11 +2027,18 @@ async function monitorGitHubActionsJob(
     notifyWebhookUrl: config.notifyWebhookUrl,
   };
 
+  // kg-refresh GHA rows are handled by their own monitor (no teamRepoMap entry, no issue).
+  if (job.phase === "kg-refresh") {
+    await monitorKgRefreshGhaJob(ghToken, owner, repo, job, claimedRunIds,
+      (opts) => activeKgRefresh?.onMachineLost(opts));
+    return;
+  }
+
   // If we don't have a run ID yet, try to find it
   if (!job.runId) {
-    const dispatchTime = new Date(job.dispatchedAt - 30_000);
     if (!mapping) return;
 
+    const dispatchTime = new Date(job.dispatchedAt - 30_000);
     const workflowFile = workflowFileForJob(job, mapping);
 
     const runId = await findWorkflowRunId(
@@ -3174,15 +3155,15 @@ async function handleKgRefreshOutcome(
   }
 }
 
-/** Workflow file expected in the KG source repo for GHA-backed kg-refresh dispatch. */
-const KG_REFRESH_WORKFLOW_FILE = "claude-kg-refresh.yml";
-
 /**
  * Default per-mapping execution mode for kg-refresh. kg-refresh has no project
  * mapping, so we pass "github-actions" as the fallback: on a GHA-primary
  * orchestrator (runnerMode="default"), resolveExecutionPath returns "github-actions".
  */
 const KG_REFRESH_DEFAULT_EXECUTION_MODE = "github-actions" as const;
+
+/** Workflow file dispatched in the KG source repo for GHA-backed kg-refresh: the shared implement template, selected by `runner_phase` (AII-556). */
+const KG_REFRESH_WORKFLOW_FILE = "claude-implement.yml";
 
 async function dispatchKgRefreshRun(
   config: AppConfig,
@@ -3205,8 +3186,8 @@ async function dispatchKgRefreshRun(
   })();
 
   if (executionPath === "github-actions") {
-    // Dispatch to the kg-refresh workflow in the KG source repo.
-    const dispatchUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/actions/workflows/${KG_REFRESH_WORKFLOW_FILE}/dispatches`;
+    // Dispatch to claude-implement.yml in the KG source repo with runner_phase=kg-refresh.
+    const dispatchUrl = `https://api.github.com/repos/${repo.owner}/${repo.repo}/actions/workflows/claude-implement.yml/dispatches`;
     const runnerImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
@@ -3215,7 +3196,7 @@ async function dispatchKgRefreshRun(
       runnerImageExplicit: config.runnerImageExplicit,
     });
     const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
-    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl });
+    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240" });
     const dispatchedAt = Date.now();
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
@@ -3228,8 +3209,8 @@ async function dispatchKgRefreshRun(
       const errorBody = await dispatchRes.text().catch(() => "");
       if (dispatchRes.status === 422) {
         throw new Error(
-          `[kg-refresh] GHA dispatch failed (HTTP 422): ${KG_REFRESH_WORKFLOW_FILE} not found in ` +
-          `${repo.owner}/${repo.repo} — sync workflows/${KG_REFRESH_WORKFLOW_FILE} to the KG source repo first. ` +
+          `[kg-refresh] GHA dispatch failed (HTTP 422): claude-implement.yml not found in ` +
+          `${repo.owner}/${repo.repo} — re-run workflow sync for the KG source repo mapping. ` +
           `Body: ${errorBody}`,
         );
       }
@@ -3274,16 +3255,13 @@ async function dispatchKgRefreshRun(
       AI_IMPLEMENT_RUN_CONFIG: opts.runConfig,
       RUN_PROGRESS_TOKEN: opts.runProgressToken,
     };
-    // Pair the session machine to the same pipeline generation as the orchestrator:
-    // resolve via image.yml override first, then try <base>:<AI_IMPLEMENT_SOURCE_COMMIT>
-    // (verified against the registry), finally fall back to config.sessionImage.
-    const { image: flySessionImage } = await resolveKgRefreshSessionImage({
+    const flySessionImage = await resolveRunnerImageForDispatch({
       owner: repo.owner,
       repo: repo.repo,
       token: ghToken,
       defaultImage: config.sessionImage,
-      sourceCommit: process.env.AI_IMPLEMENT_SOURCE_COMMIT,
-    });
+      runnerImageExplicit: config.runnerImageExplicit,
+    }) ?? config.sessionImage;
     const machineConfig = buildSessionMachineConfig({
       image: flySessionImage,
       issueId: "kg-refresh",
@@ -3501,33 +3479,6 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[reference-token] Unhandled error:", err);
-        if (!res.headersSent) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-      });
-      return;
-    }
-
-    // KG push token vending — progress token authenticated, scoped contents:write to kgSourceRepo only
-    if (url === "/api/runner/kg-push-token" && req.method === "POST") {
-      (async () => {
-        if (!config.runnerTokenSecret) {
-          res.writeHead(501, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Runner callback not configured" }));
-          return;
-        }
-        const result = await handleKgPushTokenRequest({
-          authorization: req.headers.authorization,
-          secret: config.runnerTokenSecret,
-          githubAppId: config.githubAppId,
-          githubAppPrivateKey: config.githubAppPrivateKey,
-          kgSourceRepo: config.kgSourceRepo,
-        });
-        res.writeHead(result.status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result.body));
-      })().catch((err) => {
-        console.error("[kg-push-token] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

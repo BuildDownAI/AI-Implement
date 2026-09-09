@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import { refreshRunnerGithubCredentials } from "../../runner-token.js";
 
 /** Coded failure raised when the snapshot parts or embeddings file are absent. */
 export class KgSnapshotMissingError extends Error {
@@ -56,11 +57,14 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
   dryRun?: boolean;
   /**
    * Target repo, from the clone step's outputs. When both are present the push
-   * sets `origin` to a token-in-URL remote with the run's primary token — the
-   * same push shape as `push.ts` — so no credential helper decides the push.
+   * sets `origin` to a token-in-URL remote with the run's active primary token —
+   * the same push shape as `push.ts` — so no credential helper decides the push.
    */
   repoOwner?: string;
   repoRepo?: string;
+  orchestratorUrl?: string;
+  machineNonce?: string;
+  callbackUrl?: string;
 }
 
 interface KgSnapshotPushOutputs extends Record<string, unknown> {
@@ -379,23 +383,35 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const commitSha = resolveHeadSha(workspaceDir);
 
     // ── 6. Push directly to default branch (no PR, no feature branch) ────────
-    // Push with the run's primary token embedded in the origin URL — the shape
-    // push.ts uses. The entrypoint strips the token from origin at start, and in
-    // GitHub Actions mode the credential refresh does not re-embed it, so without
-    // this the push falls to whichever credential helper answers first for
-    // github.com; on 2026-09-08 that was dependency-auth's read-only token (403).
-    // The URL is set through git config, never printed; runGit redacts the token.
+    // Refresh the dispatch-time token immediately before the push — the same
+    // pattern as push.ts. In Fly/local-docker mode the machine nonce re-mints a
+    // fresh token; in GHA mode this returns the current token unchanged.
+    const activeGithubToken = await refreshRunnerGithubCredentials({
+      currentToken: githubToken,
+      orchestratorUrl: inputs.orchestratorUrl,
+      machineNonce: inputs.machineNonce,
+      callbackUrl: inputs.callbackUrl,
+      owner: repoOwner ?? "",
+      repo: repoRepo ?? "",
+      workspaceDir,
+    });
+    // Push with that token embedded in the origin URL — the shape push.ts uses.
+    // The entrypoint strips the token from origin at start, and in GitHub Actions
+    // mode the refresh does not re-embed it, so without this the push falls to
+    // whichever credential helper answers first for github.com; on 2026-09-08
+    // that was dependency-auth's read-only token (403). Set through git config,
+    // never printed; runGit redacts the token.
     // --force-with-lease compares against refs/remotes/origin/<defaultBranch>
     // which the clone step populated.
     if (repoOwner && repoRepo) {
       runGit(
         workspaceDir,
-        ["remote", "set-url", "origin", `https://x-access-token:${githubToken}@github.com/${repoOwner}/${repoRepo}.git`],
-        githubToken,
+        ["remote", "set-url", "origin", `https://x-access-token:${activeGithubToken}@github.com/${repoOwner}/${repoRepo}.git`],
+        activeGithubToken,
         "git remote set-url origin",
       );
     }
-    runGit(workspaceDir, ["push", "origin", `HEAD:refs/heads/${defaultBranch}`, "--force-with-lease"], githubToken, "git push");
+    runGit(workspaceDir, ["push", "origin", `HEAD:refs/heads/${defaultBranch}`, "--force-with-lease"], activeGithubToken, "git push");
 
     return { snapshotPushed: true, commitSha };
   },
