@@ -152,7 +152,7 @@ npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implemen
 npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --tracker-data td.json --until kg-ingest --shell
 ```
 
-`--tracker-data <file>` is required for this phase. The file is a pre-fetched tracker-data JSON (shape: the body returned by `POST /api/runner/kg-tracker-data`) and is bind-mounted read-only at `/dev-tracker-data.json`; the `kg-tracker-data` pipeline step detects it via `KG_TRACKER_DATA_FILE` and skips the orchestrator fetch.
+`--tracker-data <file>` is required for this phase. The file is a pre-fetched tracker-data JSON (shape: the body returned by `POST /api/runner/kg-tracker-data`) and is bind-mounted read-only at `/dev-tracker-data.json`; the `kg-tracker-data` pipeline step detects it via `KG_TRACKER_DATA_FILE` and skips the orchestrator fetch. To produce that file, see `docs/issueless-runs.md` § "Local dev path for kg-refresh" for the admin-authenticated `GET /api/kg/tracker-data?team=<teamKey>` export.
 
 The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE`, which activates a stub `dependency-auth` step that satisfies the `clone-secondary-repos` skip condition (`acquired=true`) without contacting the orchestrator.
 

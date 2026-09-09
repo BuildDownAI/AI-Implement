@@ -126,6 +126,69 @@ async function callPlanningContextRoute(opts: {
   });
 }
 
+/**
+ * Mirror of the POST /runner/kg-tracker-data route wrapper in src/index.ts:
+ * 501 when unconfigured, 400 on invalid JSON, else parses cursor/teamKey and
+ * delegates to handleKgTrackerDataRequest.
+ */
+async function callKgTrackerDataRoute(opts: {
+  runnerTokenSecret: string | null;
+  authorization?: string;
+  rawBody: string;
+  getMappings?: () => Record<string, unknown>;
+}): Promise<{ status: number; body: Record<string, unknown> }> {
+  if (!opts.runnerTokenSecret) {
+    return { status: 501, body: { error: "Runner callback not configured" } };
+  }
+  let cursor: string | null = null;
+  let teamKey = "";
+  try {
+    if (opts.rawBody.trim()) {
+      const parsed = JSON.parse(opts.rawBody) as { cursor?: unknown; teamKey?: unknown };
+      if (typeof parsed.cursor === "string") cursor = parsed.cursor;
+      if (typeof parsed.teamKey === "string") teamKey = parsed.teamKey;
+    }
+  } catch {
+    return { status: 400, body: { error: "Invalid JSON" } };
+  }
+  return runnerCallback.handleKgTrackerDataRequest({
+    authorization: opts.authorization,
+    secret: opts.runnerTokenSecret,
+    cursor,
+    teamKey,
+    getMappings: opts.getMappings ?? (() => ({})),
+  });
+}
+
+describe("/runner/kg-tracker-data route wrapper", () => {
+  it("returns 501 when RUNNER_TOKEN_SECRET is unset", async () => {
+    const res = await callKgTrackerDataRoute({
+      runnerTokenSecret: null,
+      rawBody: JSON.stringify({ teamKey: "AII" }),
+    });
+    expect(res.status).toBe(501);
+    expect(res.body.error).toBe("Runner callback not configured");
+  });
+
+  it("returns 400 on invalid JSON body", async () => {
+    const res = await callKgTrackerDataRoute({
+      runnerTokenSecret: "secret",
+      rawBody: "{not json",
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid JSON");
+  });
+
+  it("returns 403 when bearer is missing (after parse) — unchanged after the fetchTrackerIssuesPage extraction", async () => {
+    const res = await callKgTrackerDataRoute({
+      runnerTokenSecret: "secret",
+      rawBody: JSON.stringify({ teamKey: "AII" }),
+    });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Unauthorized");
+  });
+});
+
 describe("/runner/planning-context route wrapper", () => {
   it("returns 501 when RUNNER_TOKEN_SECRET is unset", async () => {
     const res = await callPlanningContextRoute({ runnerTokenSecret: null });

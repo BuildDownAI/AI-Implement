@@ -479,6 +479,14 @@ The designated tracker issue (if configured) receives failure comments; there is
 
 The dev harness supports a `--phase kg-refresh` mode that runs the kg-refresh pipeline locally without an orchestrator, without mounted-workspace mode, and without contacting GitHub for the primary clone. It is the fastest way to verify `sources.yml` changes and the snapshot guard locally before dispatching a real run.
 
+**Producing `td.json`:** `GET /api/kg/tracker-data?team=<teamKey>` is an admin-bearer-authenticated route (same gate as `GET /api/kg/status`) that loops `fetchTrackerIssuesPage` — the same Linear-fetching function `POST /api/runner/kg-tracker-data` uses — across every page for the team and returns the flat JSON array of issues that `KG_TRACKER_DATA_FILE` expects, so an operator can produce `td.json` without a runner progress token:
+
+```bash
+curl -H "Authorization: Bearer <admin>" "http://localhost:8080/api/kg/tracker-data?team=AII" > td.json
+```
+
+An unmapped `team` returns 403; a missing/invalid admin bearer returns 401.
+
 ```bash
 npm run dev:run -- \
   --phase kg-refresh \
