@@ -228,6 +228,19 @@ describe("reference repositories — the rules, exercised", () => {
     expect(problem(repo, path)).toBeNull();
   });
 
+  // These checks only hold their contract while they stay looser than the server's. Each of
+  // the two below is a value normalizeReferenceRepos accepts, so rejecting it here would
+  // block a save the server would have allowed.
+  it("matches the server's case-insensitive host rather than the literal prefix", () => {
+    expect(problem("https://GitHub.com/owner/repo", "refs/docs")).toBeNull();
+  });
+
+  it("treats only a drive letter as absolute, not any second-character colon", () => {
+    expect(problem("owner/repo", "1:30/notes")).toBeNull();
+    expect(problem("owner/repo", "C:/win")).toContain("not absolute");
+    expect(problem("owner/repo", "c:/win")).toContain("not absolute");
+  });
+
   it("rejects a path another entry already holds", () => {
     const draft = [{ repo: "https://github.com/a/b", path: "refs/docs" }];
     expect(problem("owner/repo", "refs/docs", draft)).toContain("already uses the path");

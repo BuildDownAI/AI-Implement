@@ -474,13 +474,17 @@ export const projectsScript = `
   function refRepoProblem(repo, path, draft, selfIndex) {
     if (selfIndex < 0 && draft.length >= 10) return 'Up to ten reference repositories per project.';
     if (!repo || !path) return 'A reference repository needs both a repository and a workspace path.';
-    var isUrl = repo.indexOf('https://github.com/') === 0;
+    // Lowercased for the test only: the server compares a parsed, lowercased hostname.
+    var isUrl = repo.toLowerCase().indexOf('https://github.com/') === 0;
     var isShorthand = repo.split('/').length === 2 && repo.indexOf(':') === -1
       && repo.indexOf('@') === -1 && repo.charAt(0) !== '/' && repo.charAt(repo.length - 1) !== '/';
     if (!isUrl && !isShorthand) {
       return 'Repository must be owner/repo or an https://github.com/owner/repo URL, with no credentials in it.';
     }
-    if (path.charAt(0) === '/' || path.charAt(1) === ':') return 'Path must be relative to the workspace, not absolute.';
+    // A drive letter, matching the server's [A-Za-z]: rather than any second-character colon.
+    var head = path.charAt(0);
+    var isDrive = path.charAt(1) === ':' && ((head >= 'a' && head <= 'z') || (head >= 'A' && head <= 'Z'));
+    if (head === '/' || isDrive) return 'Path must be relative to the workspace, not absolute.';
     // Four backslashes here yield one in the emitted script: this module is a template literal.
     if (path.indexOf('\\\\') !== -1) return 'Path must use forward slashes.';
     if (path === '..' || path.indexOf('../') === 0 || path.indexOf('/../') !== -1) {
