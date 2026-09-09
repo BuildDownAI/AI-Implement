@@ -455,8 +455,10 @@ export const projectsScript = `
     return draft.map(function (e, i) {
       return '<div style="display:flex;gap:8px;align-items:center;padding:7px 0;font-size:12.5px;border-top:1px solid var(--border-subtle)">'
         + '<span class="mono" style="flex:2;' + cell + '" title="' + window.escAttr(e.repo) + '">' + window.esc(refRepoLabel(e.repo)) + '</span>'
-        + '<span class="mono" style="flex:2;' + cell + '">' + window.esc(e.path) + '</span>'
-        + '<span class="mono" style="flex:1;color:var(--fg-tertiary);' + cell + '">'
+        + '<span class="mono" style="flex:2;' + cell + '" title="' + window.escAttr(e.path) + '">'
+        + window.esc(e.path) + '</span>'
+        + '<span class="mono" style="flex:1;color:var(--fg-tertiary);' + cell + '"'
+        + (e.ref ? ' title="' + window.escAttr(e.ref) + '"' : '') + '>'
         + (e.ref ? window.esc(e.ref) : '&mdash;') + '</span>'
         + '<button class="btn btn-icon btn-danger" style="flex:none" onclick="'
         + window.escAttr(removeFn) + '(' + i + ')" title="Remove">&times;</button>'

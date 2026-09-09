@@ -295,6 +295,8 @@ describe("reference repositories — staging and rendering", () => {
     expect(html).not.toContain(">https://github.com/BuildDownAI/docs<");
     expect(html).toContain('title="https://github.com/BuildDownAI/docs"');
     expect(html).toContain("&mdash;");
+    // Every cell ellipsis-truncates, so each value that can be long needs hover recovery.
+    expect(html).toContain('title="refs/docs"');
     expect(html).toContain('onclick="npRemoveRefRepo(0)"');
   });
 
@@ -305,6 +307,7 @@ describe("reference repositories — staging and rendering", () => {
     );
     expect(html).toContain('onclick="removeRefRepo(1)"');
     expect(html).toContain(">main<");
+    expect(html).toContain('title="main"');
   });
 
   it("renders nothing at all for an empty draft", () => {
@@ -345,6 +348,19 @@ describe("reference repositories — both surfaces", () => {
     expect(toClear).not.toBe("");
     for (const id of ["np-refrepo-repo", "np-refrepo-path", "np-refrepo-ref"]) {
       expect(toClear).toContain(id);
+    }
+  });
+
+  // The scripts reach every input by id, and a rename on one side is silent — the lookup
+  // just returns null and the field stops working.
+  it.each([
+    ["dialog", projectsHtml, projectsScript, "md-refrepo"],
+    ["stepper", stepperHtml, stepperScript, "np-refrepo"],
+  ])("declares every %s element its script looks up", (_name, html, script, prefix) => {
+    const referenced = [...script.matchAll(new RegExp(`'(${prefix}-[a-z-]+)'`, "g"))].map((m) => m[1]);
+    expect(referenced.length).toBeGreaterThan(0);
+    for (const id of new Set(referenced)) {
+      expect(html, `${id} is looked up but never declared`).toContain(`id="${id}"`);
     }
   });
 
