@@ -503,7 +503,7 @@ npm run dev:run -- \
 
 **What differs from a dispatched run:**
 
-- The KG source checkout is bind-mounted read-only at `/kg-source`. The `clone` step is replaced with `devHarnessKgCloneStep`, which clones from `file:///kg-source` into the container's scratch workspace. Uncommitted edits to `sources.yml` therefore take effect immediately.
+- The KG source checkout is bind-mounted read-only at `/kg-source`. The `clone` step is replaced with `devHarnessKgCloneStep`, which clones from `file:///kg-source` into the container's scratch workspace. The runner entrypoint has already cloned the repo from GitHub into `/workspace` by then (it does so for every non-mounted run); the harness step clears that throwaway clone and replaces it with the `file:///kg-source` clone (AII-600). Uncommitted edits to `sources.yml` therefore take effect immediately.
 - `--tracker-data <file>` is required. The file is the pre-fetched body of `POST /api/runner/kg-tracker-data` (one team's worth). It is bind-mounted at `/dev-tracker-data.json`; the `kg-tracker-data` step detects `KG_TRACKER_DATA_FILE` and uses it rather than calling the orchestrator.
 - The operator's `GH_TOKEN` is injected as `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE`. This swaps in a stub `dependency-auth` step that marks `acquired=true`, satisfying `clone-secondary-repos` without an orchestrator token vend. If the token lacks `contents: read` on a secondary repo, the clone fails with a 404/403 — exactly the parity check the harness is designed to surface.
 - `kg-snapshot-push` runs in dry-run mode (`AI_IMPLEMENT_KG_DRY_RUN=true`). Guards and validation run in full; the refresh report (the same markdown that becomes the refresh PR body on a real run) is printed to the log; no commit, push, branch or PR happens.
