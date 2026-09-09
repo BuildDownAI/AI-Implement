@@ -90,7 +90,7 @@ import { listOpenReviewFindings } from "./review-ledger-store.js";
 import { detectMergedPrs, prNumberFromUrl } from "./poll-merged-prs.js";
 import { githubActionsWatchdogDecision } from "./github-actions-watchdog.js";
 import { KgSidecar } from "./kg-sidecar.js";
-import { makeKgRefresh } from "./kg-refresh.js";
+import { makeKgRefresh, runKgRefreshPreflight } from "./kg-refresh.js";
 import type { KgRefreshHandle } from "./kg-refresh.js";
 import { beginCycle, isCurrentCycle, getPollStats, runWithDeadline } from "./poll-cycle.js";
 
@@ -3864,7 +3864,10 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
 
     // MCP endpoint — OAuth bearer token authenticated
     if (pathname === "/mcp") {
-      handleMcpRequest(req, res, memoryProvider, config.oauthRedirectBaseUrl, memoryProviderDiagnostic, config.sessionImage).catch((err) => {
+      const kgPreflightFn = config.kgSourceRepo
+        ? () => runKgRefreshPreflight({ githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, kgSourceRepo: config.kgSourceRepo! })
+        : undefined;
+      handleMcpRequest(req, res, memoryProvider, config.oauthRedirectBaseUrl, memoryProviderDiagnostic, config.sessionImage, kgPreflightFn).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });

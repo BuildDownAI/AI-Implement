@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { makeKgRefresh, MATERIALIZE_ARGS, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome } from "../kg-refresh.js";
+import { makeKgRefresh, MATERIALIZE_ARGS, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate } from "../kg-refresh.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -1713,6 +1713,195 @@ describe("kg-refresh", () => {
         const [failResult] = persistLastRefresh.mock.calls[0] as [RefreshOutcome];
         expect(failResult.ok).toBe(false);
       });
+    });
+  });
+
+  // ---- AII-585: credential preflight gate ----------------------------------------
+
+  describe("preflight gate", () => {
+    let dispatchRun: ReturnType<typeof vi.fn>;
+    let probeRepo: ReturnType<typeof vi.fn>;
+    let mintTokenPf: ReturnType<typeof vi.fn>;
+    let preflightTarball: Buffer;
+
+    function buildPreflight(overrides: Record<string, unknown> = {}) {
+      // Build a fixture tarball whose sources.yml includes code_repo and a secondary repo.
+      const pfRepo = mkdtempSync(join(tmpdir(), "kgpf-"));
+      writeFileSync(
+        join(pfRepo, "sources.yml"),
+        [
+          `namespace: ${NAMESPACE}`,
+          `code_repo: TestOrg/main-repo`,
+          `secondary_repos:`,
+          `  - slug: TestOrg/secondary-repo`,
+        ].join("\n"),
+      );
+      mkdirSync(join(pfRepo, "snapshot"), { recursive: true });
+      preflightTarball = makeTarball(pfRepo);
+      rmSync(pfRepo, { recursive: true, force: true });
+
+      dispatchRun = vi.fn(async () => ({ machineNonce: "pf-nonce" }));
+      // mintTokenPf always succeeds; overrides can make specific calls fail.
+      mintTokenPf = vi.fn(async () => ({ token: "tok", expiresAt: "" }));
+      // probeRepo defaults to success; overrides can make specific slugs fail.
+      probeRepo = vi.fn(async () => ({ ok: true, status: 200 }));
+
+      handle = makeKgRefresh({
+        sidecar: { restart: restart as unknown as () => Promise<void> },
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        dataRoot,
+        kgDir: "/nonexistent-kg",
+        sidecarMcpUrl: "http://127.0.0.1:1/mcp",
+        minFreeBytes: 1000,
+        deployHeld: () => deployHeld,
+        freeBytes: () => free,
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        fetchSnapshotCommitSha: vi.fn(async () => SNAPSHOT_SHA) as never,
+        persistSnapshotSha: vi.fn() as never,
+        loadSnapshotSha: vi.fn(() => SNAPSHOT_SHA) as never,
+        materialize: materialize as never,
+        mcpToolCall: mcpToolCall as never,
+        canaryDeadlineMs: 300,
+        canaryRetryMs: 30,
+        runnerCallbackBaseUrl: "http://localhost:8080",
+        runnerTokenSecret: "secret",
+        resolveMappingTeamKey: (repo: string) =>
+          repo === "TestOrg/test-kg" ? { teamKey: "KGA", dependencyTokenScope: "installation" } : undefined,
+        mintRunTokenFn: vi.fn()
+          .mockReturnValueOnce({ token: "run-tok", dispatchId: "pf-disp-1" })
+          .mockReturnValue({ token: "progress-tok", dispatchId: "pf-disp-1" }) as never,
+        dispatchRun: dispatchRun as never,
+        fetchCommitVisible: vi.fn(async () => true) as never,
+        snapshotCommitRetryMs: 0,
+        persistStage: vi.fn() as never,
+        loadStage: () => null,
+        probeRepo: probeRepo as never,
+        ...overrides,
+      });
+    }
+
+    it("secondary repo denied — gate=preflight, detail names repo and grant, no dispatch", async () => {
+      buildPreflight({
+        probeRepo: vi.fn(async (_tok: string, slug: string, grant: "contents" | "pull_requests") => {
+          if (slug === "TestOrg/secondary-repo" && grant === "contents") {
+            return { ok: false, status: 403 };
+          }
+          return { ok: true, status: 200 };
+        }) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      expect((r.body as { precondition?: string }).precondition).toBe("preflight-failed");
+      const s = await handle.status();
+      expect((s.lastRefresh?.gate as RefreshGate)).toBe("preflight");
+      expect(s.lastRefresh?.ok).toBe(false);
+      expect(s.lastRefresh?.detail).toContain("TestOrg/secondary-repo");
+      expect(s.lastRefresh?.detail).toContain("contents:read");
+      expect(s.running).toBe(false);
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("primary KG write token denied — gate=preflight, detail names KG repo and grant", async () => {
+      buildPreflight({
+        mintToken: vi.fn(async (_id: string, _key: string, _owner: string, opts: Record<string, unknown>) => {
+          if ((opts.permissions as Record<string, string>)?.contents === "write") {
+            throw new Error("422 Unprocessable Entity");
+          }
+          return { token: "tok", expiresAt: "" };
+        }) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect((s.lastRefresh?.gate as RefreshGate)).toBe("preflight");
+      expect(s.lastRefresh?.detail).toContain("TestOrg/test-kg");
+      expect(s.lastRefresh?.detail).toContain("contents:write");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("pull_requests:read probe fails — gate=preflight, detail names grant", async () => {
+      buildPreflight({
+        probeRepo: vi.fn(async (_tok: string, slug: string, grant: "contents" | "pull_requests") => {
+          if (slug === "TestOrg/secondary-repo" && grant === "pull_requests") {
+            return { ok: false, status: 404 };
+          }
+          return { ok: true, status: 200 };
+        }) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect((s.lastRefresh?.gate as RefreshGate)).toBe("preflight");
+      expect(s.lastRefresh?.detail).toContain("pull_requests:read");
+      expect(s.lastRefresh?.detail).toContain("TestOrg/secondary-repo");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("multiple failures — detail lists all failing repos", async () => {
+      buildPreflight({
+        probeRepo: vi.fn(async (_tok: string, slug: string) => {
+          // Both secondary-repo probes fail AND code repo contents probe fails
+          if (slug === "TestOrg/secondary-repo") return { ok: false, status: 403 };
+          if (slug === "TestOrg/main-repo") return { ok: false, status: 404 };
+          return { ok: true, status: 200 };
+        }) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect(s.lastRefresh?.detail).toContain("TestOrg/secondary-repo");
+      expect(s.lastRefresh?.detail).toContain("TestOrg/main-repo");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("all grants present — dispatch proceeds as before", async () => {
+      buildPreflight();
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      // Preflight passed; dispatch fires in the async IIFE.
+      for (let i = 0; i < 200; i++) {
+        if (dispatchRun.mock.calls.length > 0) break;
+        await new Promise((res2) => setTimeout(res2, 10));
+      }
+      expect(dispatchRun).toHaveBeenCalledOnce();
+    });
+
+    it("preflight skipped when dispatchRun absent — no probeRepo calls", async () => {
+      // Local-rail path: no dispatchRun, no preflight.
+      buildPreflight({ dispatchRun: undefined });
+      await handle.trigger();
+      await waitDone();
+      expect(probeRepo).not.toHaveBeenCalled();
+    });
+
+    it("kgSourceRepo null — preflight not reached (501 returned)", async () => {
+      buildPreflight({ kgSourceRepo: null });
+      const r = await handle.trigger();
+      expect(r.status).toBe(501);
+      expect(probeRepo).not.toHaveBeenCalled();
+    });
+
+    it("sources.yml fetch throws — gate=preflight, ok=false, no dispatch", async () => {
+      buildPreflight({
+        fetchTarball: vi.fn(async () => { throw new Error("network error"); }) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect((s.lastRefresh?.gate as RefreshGate)).toBe("preflight");
+      expect(s.lastRefresh?.ok).toBe(false);
+      expect(s.lastRefresh?.detail).toContain("TestOrg/test-kg");
+      expect(s.lastRefresh?.detail).toContain("sources.yml:read");
+      expect(dispatchRun).not.toHaveBeenCalled();
     });
   });
 });

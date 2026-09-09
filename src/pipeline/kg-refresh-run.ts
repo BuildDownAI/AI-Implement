@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { decodeRunConfig } from "../run-config.js";
 import { postRunnerResult } from "../runner-result.js";
 import { DefaultPipelineContext } from "./context.js";
@@ -11,8 +12,58 @@ import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-d
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
 import { ClaudeCliExecutor } from "./executor.js";
 import { resolveLogLevel } from "../run-autonomous.js";
-import type { LLMExecutor, StepReporter, StepModule } from "./types.js";
+import type { LLMExecutor, PipelineContext, StepReporter, StepModule } from "./types.js";
 
+
+/**
+ * Dev-harness clone step for kg-refresh runs: clones from file:///kg-source (the
+ * operator's KG source checkout bind-mounted read-only by the dev harness) rather
+ * than from GitHub, so uncommitted edits to sources.yml take effect immediately.
+ */
+const devHarnessKgCloneStep: StepModule = {
+  async run(context: PipelineContext, inputs: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const workspaceDir = inputs.workspaceDir as string;
+    const kgSourceDir = process.env.KG_SOURCE_DIR ?? "/kg-source";
+    console.log(`[clone] dev-harness: cloning from file://${kgSourceDir} into ${workspaceDir}`);
+    const cloneResult = spawnSync(
+      "git",
+      ["clone", `file://${kgSourceDir}`, workspaceDir],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    if (cloneResult.status !== 0) {
+      const stderr = cloneResult.stderr?.toString().trim() ?? "";
+      throw new Error(`git clone from ${kgSourceDir} failed (exit ${cloneResult.status ?? "null"}): ${stderr}`);
+    }
+    const headResult = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: workspaceDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const clonedRef = headResult.status === 0 ? headResult.stdout.toString().trim() : "unknown";
+    return {
+      workspaceDir,
+      clonedRef,
+      cloneMethod: "fresh",
+      repoOwner: context.data.githubOwner,
+      repoRepo: context.data.githubRepo,
+      branch: context.data.branch,
+      githubToken: context.data.githubToken,
+    };
+  },
+};
+
+/**
+ * Dev-harness dependency-auth step for kg-refresh runs: satisfies the
+ * clone-secondary-repos skip condition (acquired=true) using the operator's
+ * local GH_TOKEN without contacting the orchestrator.
+ */
+function makeDevHarnessDependencyAuthStep(token: string): StepModule {
+  return {
+    async run(context: PipelineContext): Promise<Record<string, unknown>> {
+      context.data.dependencyToken = token;
+      return { acquired: true, expiresAt: null };
+    },
+  };
+}
 
 export interface RunKgRefreshOptions {
   workspaceDir?: string;
@@ -116,6 +167,8 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     dependencyTokenScope,
   } = resolveKgRefreshInputs(process.env);
 
+  const kgDryRun = process.env.AI_IMPLEMENT_KG_DRY_RUN === "true";
+  const depTokenOverride = process.env.AI_IMPLEMENT_DEP_TOKEN_OVERRIDE?.trim() || null;
   const nonce = process.env.MACHINE_NONCE ?? "";
   const orchestratorUrl = process.env.ORCHESTRATOR_URL ?? "";
 
@@ -138,14 +191,24 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       maxTurns,
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
+      kgDryRun,
     },
     opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
   );
 
   const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
   const runner = new PipelineRunner();
-  runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
-  runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
+
+  // Dev-harness mode: when AI_IMPLEMENT_DEP_TOKEN_OVERRIDE is set, use a file://
+  // clone from the bind-mounted KG source dir and a stub dependency-auth that marks
+  // acquired=true using the operator's local token, satisfying clone-secondary-repos.
+  if (depTokenOverride) {
+    runner.register("clone", opts.stepsOverride?.clone ?? devHarnessKgCloneStep);
+    runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? makeDevHarnessDependencyAuthStep(depTokenOverride));
+  } else {
+    runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
+    runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
+  }
   runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
   runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);
