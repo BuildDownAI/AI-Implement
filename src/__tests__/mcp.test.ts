@@ -636,6 +636,7 @@ describe("handleMcpRequest", () => {
           maxJobMinutes: 60,
           branchPrefix: "feat",
           skillsRepo: "org/skills",
+          referenceRepos: [{ repo: "https://github.com/org/source", path: "refs/source", ref: "v1.1.0" }],
           dependencyTokenScope: "installation",
           sensitiveAddPatterns: ["*.pem", "secrets/**"],
           sensitiveAllowPatterns: ["public/**"],
@@ -670,6 +671,10 @@ describe("handleMcpRequest", () => {
       expect(p.maxJobMinutes).toBe(60);
       expect(p.branchPrefix).toBe("feat");
       expect(p.skillsRepo).toBe("org/skills");
+      // Entries round-trip whole: the tool projects named fields, so a dropped one is silent.
+      expect(p.referenceRepos).toEqual([
+        { repo: "https://github.com/org/source", path: "refs/source", ref: "v1.1.0" },
+      ]);
       expect(p.dependencyTokenScope).toBe("installation");
       expect(p.sensitiveAddPatterns).toEqual(["*.pem", "secrets/**"]);
       expect(p.sensitiveAllowPatterns).toEqual(["public/**"]);
