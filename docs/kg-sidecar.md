@@ -218,6 +218,7 @@ These tools are served directly by the orchestrator and are always present in `t
 | Tool | Description |
 |---|---|
 | `get_tenant_health` | Runner mode, in-flight job count, pending gap-fill queue count, project count, KG degraded flag |
+| `get_kg_status` | KG refresh rail state — stage, served snapshot stamp, last refresh outcome and gate. Same object as `GET /api/kg/status`, callable without an admin token |
 | `get_runner_mode` | Global runner mode and its source (env / db / default) |
 | `list_projects` | All project mappings with per-project settings |
 | `list_in_flight_jobs` | Currently dispatching or running jobs with elapsed time |

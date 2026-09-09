@@ -3818,7 +3818,8 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
       const kgPreflightFn = config.kgSourceRepo
         ? () => runKgRefreshPreflight({ githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, kgSourceRepo: config.kgSourceRepo! })
         : undefined;
-      handleMcpRequest(req, res, memoryProvider, config.oauthRedirectBaseUrl, memoryProviderDiagnostic, config.sessionImage, kgPreflightFn).catch((err) => {
+      const getKgStatusFn = () => kgRefresh.status();
+      handleMcpRequest(req, res, memoryProvider, config.oauthRedirectBaseUrl, memoryProviderDiagnostic, config.sessionImage, kgPreflightFn, getKgStatusFn).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
