@@ -3,6 +3,7 @@ import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
 import path from "node:path";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import { normalizeReferenceRepos, type ReferenceRepo, type ReferenceRepoResult, type ReferenceRepoResultCause } from "../../reference-repos.js";
+import type { ReferenceTokenOwnerEntry } from "../../reference-token-vending.js";
 import { appendExcludePaths } from "../scratch-exclude.js";
 
 export type SpawnSyncFn = (
@@ -24,13 +25,6 @@ interface ReferenceReposInputs extends Record<string, unknown> {
 
 interface ReferenceReposOutputs extends Record<string, unknown> {
   results: ReferenceRepoResult[];
-}
-
-interface ReferenceTokenOwnerEntry {
-  owner: string;
-  token: string | null;
-  expiresAt: string | null;
-  authMode: "installation" | "public" | "error";
 }
 
 async function fetchReferenceTokens(params: {
