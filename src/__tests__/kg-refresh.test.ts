@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { makeKgRefresh, MATERIALIZE_ARGS, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate } from "../kg-refresh.js";
+import { makeKgRefresh, runKgRefreshPreflight, MATERIALIZE_ARGS, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate } from "../kg-refresh.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
 
 const NAMESPACE = "https://kg.test.example/";
@@ -607,6 +607,10 @@ describe("kg-refresh", () => {
         mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
         fetchTarball: vi.fn(async () => tarball) as never,
         fetchDefaultBranch: vi.fn(async () => "main") as never,
+        fetchWorkflowFile: vi.fn(async () => ({
+          status: 200,
+          content: "on:\n  workflow_dispatch:\n    inputs:\n      runner_phase:\n        required: false\n",
+        })) as never,
         fetchSnapshotCommitSha: makeSnapshotShaMock() as never,
         persistSnapshotSha: vi.fn() as never,
         loadSnapshotSha: vi.fn().mockReturnValue(SNAPSHOT_SHA) as never,
@@ -1746,7 +1750,23 @@ describe("kg-refresh", () => {
     let dispatchRun: ReturnType<typeof vi.fn>;
     let probeRepo: ReturnType<typeof vi.fn>;
     let mintTokenPf: ReturnType<typeof vi.fn>;
+    let fetchWorkflowFile: ReturnType<typeof vi.fn>;
     let preflightTarball: Buffer;
+
+    // A claude-implement.yml body that declares runner_phase — the happy path.
+    const WORKFLOW_WITH_RUNNER_PHASE = [
+      "on:",
+      "  workflow_dispatch:",
+      "    inputs:",
+      "      run_config:",
+      "        required: true",
+      "      runner_phase:",
+      "        required: false",
+      "jobs:",
+      "  implement:",
+      "    runs-on: ubuntu-latest",
+      "    steps: []",
+    ].join("\n");
 
     function buildPreflight(overrides: Record<string, unknown> = {}) {
       // Build a fixture tarball whose sources.yml includes code_repo and a secondary repo.
@@ -1769,6 +1789,8 @@ describe("kg-refresh", () => {
       mintTokenPf = vi.fn(async () => ({ token: "tok", expiresAt: "" }));
       // probeRepo defaults to success; overrides can make specific slugs fail.
       probeRepo = vi.fn(async () => ({ ok: true, status: 200 }));
+      // fetchWorkflowFile defaults to a workflow that accepts runner_phase; overrides can flip this.
+      fetchWorkflowFile = vi.fn(async () => ({ status: 200, content: WORKFLOW_WITH_RUNNER_PHASE }));
 
       handle = makeKgRefresh({
         sidecar: { restart: restart as unknown as () => Promise<void> },
@@ -1804,6 +1826,7 @@ describe("kg-refresh", () => {
         persistStage: vi.fn() as never,
         loadStage: () => null,
         probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
         ...overrides,
       });
     }
@@ -1926,6 +1949,118 @@ describe("kg-refresh", () => {
       expect(s.lastRefresh?.detail).toContain("TestOrg/test-kg");
       expect(s.lastRefresh?.detail).toContain("sources.yml:read");
       expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    // ---- AII-594: workflow:runner_phase row ----------------------------------------
+
+    it("workflow file declares runner_phase — row ok, dispatch proceeds", async () => {
+      buildPreflight();
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      for (let i = 0; i < 200; i++) {
+        if (dispatchRun.mock.calls.length > 0) break;
+        await new Promise((res2) => setTimeout(res2, 10));
+      }
+      expect(dispatchRun).toHaveBeenCalledOnce();
+      expect(fetchWorkflowFile).toHaveBeenCalled();
+    });
+
+    it("workflow file present but missing runner_phase input — gate=preflight, detail carries sync hint", async () => {
+      buildPreflight({
+        fetchWorkflowFile: vi.fn(async () => ({
+          status: 200,
+          content: ["on:", "  workflow_dispatch:", "    inputs:", "      run_config:", "        required: true"].join("\n"),
+        })) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      expect((r.body as { detail?: string }).detail).toContain(
+        "re-run workflow sync for the KG repo mapping (POST /api/mappings/<team>/sync-workflows)",
+      );
+      const s = await handle.status();
+      expect((s.lastRefresh?.gate as RefreshGate)).toBe("preflight");
+      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(s.lastRefresh?.detail).toContain(
+        "re-run workflow sync for the KG repo mapping (POST /api/mappings/<team>/sync-workflows)",
+      );
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("workflow file missing entirely (404) — row fails with sync hint", async () => {
+      buildPreflight({
+        fetchWorkflowFile: vi.fn(async () => ({ status: 404, content: null })) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(s.lastRefresh?.detail).toContain("re-run workflow sync");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("workflow file unparseable YAML — row fails closed, no throw", async () => {
+      buildPreflight({
+        fetchWorkflowFile: vi.fn(async () => ({ status: 200, content: "not: valid: yaml: [unterminated" })) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("workflow_dispatch present but no inputs block — row fails closed", async () => {
+      buildPreflight({
+        fetchWorkflowFile: vi.fn(async () => ({
+          status: 200,
+          content: "on:\n  workflow_dispatch: null\njobs:\n  implement:\n    runs-on: ubuntu-latest\n    steps: []\n",
+        })) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("workflow file fetch throws — row fails with status 0 and sync hint", async () => {
+      buildPreflight({
+        fetchWorkflowFile: vi.fn(async () => { throw new Error("network error"); }) as never,
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(422);
+      const s = await handle.status();
+      expect(s.lastRefresh?.detail).toContain("workflow:runner_phase");
+      expect(s.lastRefresh?.detail).toContain("HTTP 0");
+      expect(s.lastRefresh?.detail).toContain("re-run workflow sync");
+      expect(dispatchRun).not.toHaveBeenCalled();
+    });
+
+    it("workflow row failing does not disturb the other row shapes", async () => {
+      const failingWorkflowFetch = vi.fn(async () => ({ status: 404, content: null }));
+      buildPreflight({ fetchWorkflowFile: failingWorkflowFetch as never });
+
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: failingWorkflowFetch as never,
+      });
+
+      const byGrant = (repo: string, grant: string) => result.results.find((r) => r.repo === repo && r.grant === grant);
+      expect(byGrant("TestOrg/test-kg", "contents:write")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("TestOrg/main-repo", "contents:read")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("TestOrg/secondary-repo", "pull_requests:read")).toMatchObject({ ok: true, status: 200 });
+      expect(byGrant("TestOrg/test-kg", "workflow:runner_phase")).toMatchObject({ ok: false, status: 404 });
     });
   });
 });

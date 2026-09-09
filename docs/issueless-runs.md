@@ -82,8 +82,9 @@ The envelope travels as the `AI_IMPLEMENT_RUN_CONFIG` environment variable on bo
 1. Fetches `sources.yml` from the KG source repo (via a temporary read-only tarball token) and parses `code_repo` and `secondary_repos[].slug`.
 2. Probes the KG source repo's **write** token (`contents: write`, single-repo): `getScopedInstallationToken` must succeed.
 3. Mints the installation-wide dependency token (`contents: read`, `pull_requests: read`) and probes each slug with `GET /repos/{slug}` and `GET /repos/{slug}/pulls?per_page=1`.
+4. **(AII-594)** Fetches `.github/workflows/claude-implement.yml` from the KG source repo's default branch (reusing the read token/branch from step 1) and checks whether `on.workflow_dispatch.inputs` declares `runner_phase` — the input the rail dispatches with. A repo whose synced copy predates that input would otherwise 422 at dispatch time; this row (`grant: "workflow:runner_phase"`) catches it beforehand and, on failure, carries a `hint` naming the fix: re-run workflow sync for the KG repo mapping.
 
-If any probe fails, `trigger()` sets `lastRefresh.gate = "preflight"` and returns `HTTP 422 preflight-failed` with a `detail` field listing every failing (repo, grant) pair. No dispatch occurs. The same function is callable on demand via `get_tenant_health` (MCP) which returns the result as `kgRefreshPreflight: { ok, checkedAt, results }`.
+If any probe fails, `trigger()` sets `lastRefresh.gate = "preflight"` and returns `HTTP 422 preflight-failed` with a `detail` field listing every failing (repo, grant) pair — appending the row's `hint`, when present, after the HTTP status. No dispatch occurs. The same function is callable on demand via `get_tenant_health` (MCP) which returns the result as `kgRefreshPreflight: { ok, checkedAt, results }`, each row's optional `hint` included verbatim.
 
 Gate `"preflight"` is added to the `RefreshGate` union in `src/kg-refresh.ts`. `runKgRefreshPreflight` is a standalone exported function; all network calls are injectable for tests (`mintToken`, `fetchTarball`, `fetchDefaultBranch`, `probeRepo`).
 
