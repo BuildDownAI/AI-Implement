@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { resolveBaseBranch } from "../feature-branch.js";
+import { resolveBaseBranch, nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
 import type { RepoMapping } from "../config.js";
 import type { FeatureBranchChainEntry, TicketIssue } from "../providers/types.js";
 
@@ -38,6 +38,39 @@ function makeIssue(featureBranchChain?: FeatureBranchChainEntry[]): TicketIssue 
     ...(featureBranchChain ? { featureBranchChain } : {}),
   };
 }
+
+// AII-609: "terminal" means the tracker's own workflow state — completed or cancelled —
+// independent of whether an orchestrator job row exists for the child. A child mid
+// implementation (planning done, run dispatched, tracker state still non-terminal) must
+// still be reported as blocking.
+describe("nonTerminalDesignatedChildren", () => {
+  const child = (identifier: string, designated: boolean, terminal: boolean): FeatureChildState => ({
+    identifier,
+    designated,
+    terminal,
+  });
+
+  it("blocks on the exact AII-604/607/608 shape: one child Done, one In Progress with a running job", () => {
+    // The job row is irrelevant to this predicate — it isn't part of FeatureChildState at
+    // all, so a caller cannot accidentally let a running job masquerade as terminal.
+    const children = [child("AII-607", true, true), child("AII-608", true, false)];
+    expect(nonTerminalDesignatedChildren(children).map((c) => c.identifier)).toEqual(["AII-608"]);
+  });
+
+  it("is ready once every designated child reaches a terminal state (mix of completed and cancelled)", () => {
+    const children = [child("A-1", true, true), child("A-2", true, true)];
+    expect(nonTerminalDesignatedChildren(children)).toEqual([]);
+  });
+
+  it("never blocks on a non-designated child, terminal or not", () => {
+    const children = [child("A-1", true, true), child("A-2", false, false)];
+    expect(nonTerminalDesignatedChildren(children)).toEqual([]);
+  });
+
+  it("is ready for an empty child list", () => {
+    expect(nonTerminalDesignatedChildren([])).toEqual([]);
+  });
+});
 
 describe("resolveBaseBranch", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });

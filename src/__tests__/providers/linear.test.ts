@@ -641,10 +641,10 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
   it("returns feature nodes with parent target; non-feature parent → null (base)", async () => {
     mockResponse([
       { identifier: "OOL-107", team: { key: "OOL" },
-        children: { nodes: [{ identifier: "OOL-child1", labels: labels("AI-Implement") }] },
+        children: { nodes: [{ identifier: "OOL-child1", state: { type: "completed" }, labels: labels("AI-Implement") }] },
         parent: { identifier: "OOL-106", labels: labels("AI-Implement") } },
       { identifier: "OOL-106", team: { key: "OOL" },
-        children: { nodes: [{ identifier: "OOL-child2", labels: labels("AI-Implement") }] },
+        children: { nodes: [{ identifier: "OOL-child2", state: { type: "canceled" }, labels: labels("AI-Implement") }] },
         parent: null },
     ]);
     const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
@@ -672,7 +672,7 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
         identifier: "OOL-78",
         description: MULTI_YML,
         team: { key: "OOL" },
-        children: { nodes: [{ identifier: "OOL-87", labels: labels("AI-Implement") }] },
+        children: { nodes: [{ identifier: "OOL-87", state: { type: "completed" }, labels: labels("AI-Implement") }] },
         parent: { identifier: "OOL-70", description: null, labels: labels("AI-Implement") },
       },
     ]);
@@ -680,6 +680,21 @@ describe("LinearProvider.fetchFeatureNodeRollUps", () => {
     expect(rollUp.mode).toBe("multi-issue");
     expect(rollUp.parent).toEqual({ identifier: "OOL-70", mode: "feature" });
     expect(rollUp.childIdentifiers).toEqual(["OOL-87"]);
+  });
+
+  // AII-609: a node's own tracker state reaching "completed" must not be trusted as a
+  // proxy for "all its children are terminal too" — the roll-up gate re-checks live.
+  it("defers the roll-up while a designated child is not yet terminal (AII-609)", async () => {
+    mockResponse([
+      { identifier: "AII-604", team: { key: "AII" },
+        children: { nodes: [
+          { identifier: "AII-607", state: { type: "completed" }, labels: labels("AI-Implement") },
+          { identifier: "AII-608", state: { type: "started" }, labels: labels("AI-Implement") }, // still in flight
+        ] },
+        parent: null },
+    ]);
+    const rollUps = await new LinearProvider({}).fetchFeatureNodeRollUps();
+    expect(rollUps).toEqual([]);
   });
 });
 

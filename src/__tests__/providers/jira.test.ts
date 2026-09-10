@@ -827,6 +827,27 @@ describe("JiraProvider.fetchAIImplementSnapshot — feature branches", () => {
     expect(snap.readyForImplementation).toEqual([]);
   });
 
+  // AII-609: the dispatch-gate skip log must name the specific non-terminal child so a
+  // stuck Jira feature node is as diagnosable as a stuck Linear one.
+  it("names the blocking child in the skip log for a feature-node parent with an in-flight child", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const client = fakeClient([
+      { when: /in \(Ready/, issues: [issue("AII-604", "Ready", "acme/x")] },
+      {
+        when: /parent in/,
+        issues: [
+          issue("AII-607", "PR Ready", "acme/x", { parentKey: "AII-604", statusCategory: "done" }),
+          issue("AII-608", "Implementing", "acme/x", { parentKey: "AII-604", statusCategory: "indeterminate" }),
+        ],
+      },
+    ]);
+    await makeProvider(client).fetchAIImplementSnapshot();
+    expect(logSpy.mock.calls.map((c) => c[0])).toContainEqual(
+      expect.stringContaining("Skipping AII-604: grouping parent waiting on in-flight AI-Implement children: AII-608"),
+    );
+    logSpy.mockRestore();
+  });
+
   it("dispatches a feature-node parent once all designated children are terminal, onto its own branch", async () => {
     const parentWithSpec = { ...issue("OOL-78", "Ready", "acme/x"), fields: { ...issue("OOL-78", "Ready", "acme/x").fields, description: "Closing work spec." } };
     const client = fakeClient([
@@ -1072,7 +1093,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
   it("rolls a completed feature node into its designated parent (auto-merge → parentIdentifier set)", async () => {
     const client = fakeClient([
       { when: /statusCategory = Done/, issues: [issue("OOL-90", "PR Ready", "acme/x", "OOL-78")] }, // completed node w/ parent
-      { when: /parent in/, issues: [issue("OOL-90-c", "PR Ready", "acme/x", "OOL-90")] },           // it has a designated child → feature node
+      { when: /parent in/, issues: [issue("OOL-90-c", "Merged", "acme/x", "OOL-90")] },             // designated child, terminal → feature node
       { when: /key in/, issues: [issue("OOL-78", "Ready", "acme/x", null)] },                       // parent is designated
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
@@ -1082,7 +1103,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
   it("top-of-tree feature node → parentIdentifier null (human feature→base PR)", async () => {
     const client = fakeClient([
       { when: /statusCategory = Done/, issues: [issue("OOL-78", "PR Ready", "acme/x", null)] },
-      { when: /parent in/, issues: [issue("OOL-78-c", "PR Ready", "acme/x", "OOL-78")] },
+      { when: /parent in/, issues: [issue("OOL-78-c", "Merged", "acme/x", "OOL-78")] },
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([{ issueId: "id-OOL-78", identifier: "OOL-78", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-78-c"] }]);
@@ -1099,7 +1120,7 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
   it("excludes a completed issue whose own AI-Implement Status is unset (not a designated node)", async () => {
     const client = fakeClient([
       { when: /statusCategory = Done/, issues: [issue("OOL-5", "", "acme/x", null)] },
-      { when: /parent in/, issues: [issue("OOL-5-c", "PR Ready", "acme/x", "OOL-5")] },
+      { when: /parent in/, issues: [issue("OOL-5-c", "Merged", "acme/x", "OOL-5")] },
     ]);
     expect(await makeProvider(client).fetchFeatureNodeRollUps()).toEqual([]);
   });
@@ -1107,11 +1128,24 @@ describe("JiraProvider.fetchFeatureNodeRollUps", () => {
   it("sets parentIdentifier null when the parent exists but is not itself designated", async () => {
     const client = fakeClient([
       { when: /statusCategory = Done/, issues: [issue("OOL-90", "PR Ready", "acme/x", "OOL-70")] },
-      { when: /parent in/, issues: [issue("OOL-90-c", "PR Ready", "acme/x", "OOL-90")] },
+      { when: /parent in/, issues: [issue("OOL-90-c", "Merged", "acme/x", "OOL-90")] },
       { when: /key in/, issues: [issue("OOL-70", "", "acme/x", null)] },
     ]);
     const rollUps = await makeProvider(client).fetchFeatureNodeRollUps();
     expect(rollUps).toEqual([{ issueId: "id-OOL-90", identifier: "OOL-90", scopeKey: "m1", mode: "feature", parent: null, childIdentifiers: ["OOL-90-c"] }]);
+  });
+
+  // AII-609: the parent's own status reaching Done is not a proxy for its children's —
+  // a designated child still short of a terminal status must defer the roll-up.
+  it("defers the roll-up while a designated child is not yet terminal (AII-609)", async () => {
+    const client = fakeClient([
+      { when: /statusCategory = Done/, issues: [issue("AII-604", "PR Ready", "acme/x", null)] },
+      { when: /parent in/, issues: [
+        issue("AII-607", "Merged", "acme/x", "AII-604"),
+        issue("AII-608", "Implementing", "acme/x", "AII-604"), // still in flight
+      ] },
+    ]);
+    expect(await makeProvider(client).fetchFeatureNodeRollUps()).toEqual([]);
   });
 });
 
@@ -1279,7 +1313,7 @@ describe("JiraProvider — grouping mode from ai-implement.yml", () => {
       },
       {
         when: /parent in/,
-        issues: [rollupIssue("BAC-2", "PR Ready", "acme/x", "BAC-1")],
+        issues: [rollupIssue("BAC-2", "Merged", "acme/x", "BAC-1")],
       },
     ]);
     const provider = makeProvider(client);
