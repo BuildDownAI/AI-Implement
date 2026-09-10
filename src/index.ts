@@ -48,7 +48,7 @@ import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
 import { getOrchestratorSettings } from "./orchestrator-settings.js";
-import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, planningDispatchBlockReason } from "./runner-callback.js";
+import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
 import { handleGapFillTrigger } from "./gap-fill-trigger.js";
@@ -3526,6 +3526,32 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         res.end(JSON.stringify(result.body));
       })().catch((err) => {
         console.error("[kg-tracker-data] Unhandled error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // KG scope proxy — progress token authenticated, kg-refresh phase only. Returns the
+    // orchestrator's full mapping set so kg-scope-reconcile can reconcile sources.yml.
+    if (url === "/api/runner/kg-scope" && req.method === "POST") {
+      (async () => {
+        if (!config.runnerTokenSecret) {
+          res.writeHead(501, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Runner callback not configured" }));
+          return;
+        }
+        const result = await handleKgScopeRequest({
+          authorization: req.headers.authorization,
+          secret: config.runnerTokenSecret,
+          getMappings,
+        });
+        res.writeHead(result.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result.body));
+      })().catch((err) => {
+        console.error("[kg-scope] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));

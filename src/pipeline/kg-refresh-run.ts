@@ -11,6 +11,7 @@ import { cloneStep } from "./steps/clone.js";
 import { dependencyAuthStep } from "./steps/dependency-auth.js";
 import { kgSnapshotPushStep, KgSnapshotMissingError, KgSnapshotStaleError, KgSnapshotTrackerRegressionError } from "./steps/kg-snapshot-push.js";
 import { kgTrackerDataStep, KgTrackerDataFetchError } from "./steps/kg-tracker-data.js";
+import { kgScopeReconcileStep } from "./steps/kg-scope-reconcile.js";
 import { kgIngestStep, KgIngestError } from "./steps/kg-ingest.js";
 import { ClaudeCliExecutor } from "./executor.js";
 import { resolveLogLevel } from "../run-autonomous.js";
@@ -135,6 +136,7 @@ export interface RunKgRefreshOptions {
   stepsOverride?: {
     clone?: StepModule;
     dependencyAuth?: StepModule;
+    kgScopeReconcile?: StepModule;
     kgTrackerData?: StepModule;
     kgIngest?: StepModule;
     kgSnapshotPush?: StepModule;
@@ -278,6 +280,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     runner.register("clone", opts.stepsOverride?.clone ?? cloneStep);
     runner.register("dependency-auth", opts.stepsOverride?.dependencyAuth ?? dependencyAuthStep);
   }
+  runner.register("kg-scope-reconcile", opts.stepsOverride?.kgScopeReconcile ?? kgScopeReconcileStep);
   runner.register("kg-tracker-data", opts.stepsOverride?.kgTrackerData ?? kgTrackerDataStep);
   runner.register("kg-ingest", opts.stepsOverride?.kgIngest ?? kgIngestStep);
   runner.register("kg-snapshot-push", opts.stepsOverride?.kgSnapshotPush ?? kgSnapshotPushStep);

@@ -3,6 +3,9 @@ steps:
   - id: clone
     type: clone
     depth: full
+  - id: kg-scope-reconcile
+    type: custom
+    moduleId: kg-scope-reconcile
   - id: dependency-auth
     type: custom
     moduleId: dependency-auth
