@@ -617,6 +617,57 @@ export async function handleKgTrackerDataRequest(
   return fetchTrackerIssuesPage(input.teamKey, input.cursor);
 }
 
+export interface KgScopeEntry {
+  teamKey: string;
+  repo: string;
+  defaultBranch: string;
+  ticketingProvider: string;
+}
+
+export interface HandleKgScopeInput {
+  authorization: string | undefined;
+  secret: string;
+  /** Returns the orchestrator's configured mappings, keyed by team key. */
+  getMappings: () => Record<string, { owner: string; repo: string; defaultBranch: string; ticketingProvider: string }>;
+}
+
+export interface HandleKgScopeOutput {
+  status: number;
+  body: KgScopeEntry[] | { error: string };
+}
+
+/**
+ * Returns the orchestrator's full mapping set as `{ teamKey, repo, defaultBranch,
+ * ticketingProvider }` — the scope a kg-refresh's kg-scope-reconcile step reconciles
+ * sources.yml against. Callable only by kg-refresh runs; any other phase or a missing/
+ * invalid token gets 403 with no distinguishing body. Only these four fields cross the
+ * boundary — no credential (ticketingConfig, tokens) ever leaves the orchestrator.
+ */
+export async function handleKgScopeRequest(input: HandleKgScopeInput): Promise<HandleKgScopeOutput> {
+  const bearerToken = parseBearerToken(input.authorization);
+  if (!bearerToken) {
+    console.warn("[kg-scope] Missing or malformed Authorization header");
+    return { status: 403, body: { error: "Unauthorized" } };
+  }
+
+  const verified = verifyRunToken(bearerToken, input.secret, "progress", { consume: false });
+  if (!verified.ok) {
+    console.warn(`[kg-scope] Token verification failed: ${verified.reason}`);
+    return { status: 403, body: { error: "Unauthorized" } };
+  }
+
+  if (verified.claims.phase !== "kg-refresh") return { status: 403, body: { error: "Unauthorized" } };
+
+  const mappings = input.getMappings();
+  const scope: KgScopeEntry[] = Object.entries(mappings).map(([teamKey, m]) => ({
+    teamKey,
+    repo: `${m.owner}/${m.repo}`,
+    defaultBranch: m.defaultBranch,
+    ticketingProvider: m.ticketingProvider,
+  }));
+  return { status: 200, body: scope };
+}
+
 /**
  * Serves the planning context for a run to the runner, provider-agnostically.
  * The runner authenticates with its reusable progress token (it never holds a

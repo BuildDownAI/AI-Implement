@@ -3137,10 +3137,11 @@ describe("GET /api/kg/tracker-data", () => {
     expect(res.statusCode).toBe(403);
   });
 
-  it("returns 403 when the team query param is missing", async () => {
+  it("treats a missing team as the default all-teams scope rather than 403 — 503 here since Linear is unconfigured", async () => {
     const token = await login("secret");
+    isLinearAuthConfiguredMock.mockReturnValue(false);
     const res = await trackerDataRequest("", token);
-    expect(res.statusCode).toBe(403);
+    expect(res.statusCode).toBe(503);
   });
 
   it("returns the flat array of issues for a single-page team — the shape the kg-refresh dev harness's --tracker-data file expects", async () => {
@@ -3195,6 +3196,151 @@ describe("GET /api/kg/tracker-data", () => {
     const res = await trackerDataRequest("?team=AII", token);
 
     expect(res.statusCode).toBe(502);
+  });
+});
+
+// ---------- GET /api/kg/tracker-data — no-team default scope (AII-608) ----------
+
+describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () => {
+  function linearPage(
+    issues: unknown[],
+    pageInfo: { hasNextPage: boolean; endCursor: string | null },
+  ): Response {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { issues: { nodes: issues, pageInfo } } }),
+    } as unknown as Response;
+  }
+
+  async function trackerDataRequest(
+    qs: string,
+    token?: string,
+    overrides?: Partial<Parameters<typeof admin.handleAdminRequest>[2]>,
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest(
+      `/api/kg/tracker-data${qs}`,
+      "GET",
+      token ? { authorization: `Bearer ${token}` } : {},
+    );
+    const res = new MockResponse();
+    admin.handleAdminRequest(
+      req as never,
+      res as never,
+      { ...adminConfig("secret"), ...overrides },
+      makeFakeRegistry(provider),
+    );
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  beforeEach(() => {
+    isLinearAuthConfiguredMock.mockReset();
+    withLinearTokenMock.mockReset();
+  });
+
+  it("returns 200 with an empty array when no teams are in scope", async () => {
+    const token = await login("secret");
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+
+    const res = await trackerDataRequest("", token);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual([]);
+  });
+
+  it("returns 503 when Linear is not configured, before any per-team fetch is attempted", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(false);
+
+    const res = await trackerDataRequest("", token);
+
+    expect(res.statusCode).toBe(503);
+    expect(withLinearTokenMock).not.toHaveBeenCalled();
+  });
+
+  it("unions issues across every Linear-mapped team", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+    const aiiIssues = [{ id: "1", identifier: "AII-1" }];
+    const buiIssues = [{ id: "2", identifier: "BUI-1" }];
+    withLinearTokenMock
+      .mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }))
+      .mockResolvedValueOnce(linearPage(buiIssues, { hasNextPage: false, endCursor: null }));
+
+    const res = await trackerDataRequest("", token);
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body).toHaveLength(2);
+    expect(body).toEqual(expect.arrayContaining([...aiiIssues, ...buiIssues]));
+  });
+
+  it("dedups an issue id appearing under more than one team", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+    const shared = { id: "shared-1", identifier: "AII-1" };
+    withLinearTokenMock
+      .mockResolvedValueOnce(linearPage([shared], { hasNextPage: false, endCursor: null }))
+      .mockResolvedValueOnce(linearPage([shared], { hasNextPage: false, endCursor: null }));
+
+    const res = await trackerDataRequest("", token);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual([shared]);
+  });
+
+  it("excludes a Jira-mapped team from the union without failing the whole request", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    await request("/api/mappings", "POST", "secret", {
+      teamKey: "JIRA1", owner: "org", repo: "jira-app",
+      ticketingProvider: "jira",
+      ticketingConfig: { kind: "jira", jql: "project = ACME", repoFieldValue: "org/jira-app" },
+    }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+    const aiiIssues = [{ id: "1", identifier: "AII-1" }];
+    withLinearTokenMock.mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }));
+
+    const res = await trackerDataRequest("", token);
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual(aiiIssues);
+    expect(withLinearTokenMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("short-circuits with a single coherent error when one team's fetch fails upstream, rather than a partial 200", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+    withLinearTokenMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: async () => ({}),
+    } as unknown as Response);
+
+    const res = await trackerDataRequest("", token);
+
+    expect(res.statusCode).toBe(502);
+  });
+
+  it("degrades to mapped-teams-only when the KG manifest fetch fails (e.g. a malformed kgSourceRepo)", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    isLinearAuthConfiguredMock.mockReturnValue(true);
+    const aiiIssues = [{ id: "1", identifier: "AII-1" }];
+    withLinearTokenMock.mockResolvedValueOnce(linearPage(aiiIssues, { hasNextPage: false, endCursor: null }));
+
+    const res = await trackerDataRequest("", token, { kgSourceRepo: "not-a-valid-repo-slug" });
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual(aiiIssues);
   });
 });
 

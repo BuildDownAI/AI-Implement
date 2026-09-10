@@ -308,6 +308,26 @@ function applyWiring(step: YamlStep): StepDefinition {
         }),
       };
 
+    case "kg-scope-reconcile":
+      return {
+        ...step,
+        inputs: (ctx: PipelineContext) => ({
+          callbackUrl: ctx.data.callbackUrl,
+          workspaceDir: ctx.getOutputs("clone").workspaceDir,
+          dryRun: ctx.data.kgDryRun === true,
+          // The KG repo is mapped in the orchestrator too; it must not become its own secondary.
+          selfRepoSlug: (() => {
+            const c = ctx.getOutputs("clone");
+            return typeof c.repoOwner === "string" && typeof c.repoRepo === "string" && c.repoOwner && c.repoRepo
+              ? `${c.repoOwner}/${c.repoRepo}`
+              : undefined;
+          })(),
+          // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
+          // persist it to the step log and expose it via the admin API. The step
+          // reads it directly from process.env instead.
+        }),
+      };
+
     case "clone-code-repo": {
       return {
         ...step,
@@ -414,18 +434,26 @@ function applyWiring(step: YamlStep): StepDefinition {
     case "kg-snapshot-push":
       return {
         ...step,
-        inputs: (ctx: PipelineContext) => ({
-          workspaceDir: ctx.getOutputs("clone").workspaceDir,
-          githubToken: ctx.getOutputs("clone").githubToken,
-          clonedRef: ctx.getOutputs("clone").clonedRef,
-          defaultBranch: ctx.data.branch,
-          dryRun: ctx.data.kgDryRun === true,
-          repoOwner: ctx.getOutputs("clone").repoOwner,
-          repoRepo: ctx.getOutputs("clone").repoRepo,
-          orchestratorUrl: ctx.data.orchestratorUrl,
-          machineNonce: ctx.data.nonce,
-          callbackUrl: ctx.data.callbackUrl,
-        }),
+        inputs: (ctx: PipelineContext) => {
+          const scopeOutputs = ctx.getOutputs("kg-scope-reconcile");
+          return {
+            workspaceDir: ctx.getOutputs("clone").workspaceDir,
+            githubToken: ctx.getOutputs("clone").githubToken,
+            clonedRef: ctx.getOutputs("clone").clonedRef,
+            defaultBranch: ctx.data.branch,
+            dryRun: ctx.data.kgDryRun === true,
+            repoOwner: ctx.getOutputs("clone").repoOwner,
+            repoRepo: ctx.getOutputs("clone").repoRepo,
+            orchestratorUrl: ctx.data.orchestratorUrl,
+            machineNonce: ctx.data.nonce,
+            callbackUrl: ctx.data.callbackUrl,
+            scope: {
+              addedRepos: Array.isArray(scopeOutputs.addedRepoSlugs) ? (scopeOutputs.addedRepoSlugs as string[]) : [],
+              addedTeams: Array.isArray(scopeOutputs.addedTeamNames) ? (scopeOutputs.addedTeamNames as string[]) : [],
+              mappedProjectCount: typeof scopeOutputs.mappedProjectCount === "number" ? scopeOutputs.mappedProjectCount : 0,
+            },
+          };
+        },
       };
 
     default:

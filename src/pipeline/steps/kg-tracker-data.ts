@@ -109,8 +109,52 @@ function readTrackerTeams(workspaceDir: string): string[] {
   return matches.map((m) => m[1]);
 }
 
+/**
+ * Reads `trackers[].{team,kind}` from sources.yml — the full records, unlike
+ * `readTrackerTeams` (team names only). Used by kg-scope-reconcile to diff the mapped
+ * team set against what's already configured. Returns entries with a non-empty `team`
+ * after trimming; `kind` defaults to "unknown" when absent. No regex fallback: this is
+ * a best-effort diffing input, and an unparseable file already degrades to "no teams
+ * configured" the same way every other reader here does.
+ */
+export function readTrackerRecords(workspaceDir: string): Array<{ team: string; kind: string }> {
+  const filePath = join(workspaceDir, "sources.yml");
+  if (!existsSync(filePath)) return [];
+
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+
+  try {
+    const doc = parseYaml(raw) as unknown;
+    if (
+      doc !== null &&
+      typeof doc === "object" &&
+      Array.isArray((doc as Record<string, unknown>).trackers)
+    ) {
+      return ((doc as Record<string, unknown>).trackers as unknown[])
+        .filter(
+          (t): t is Record<string, unknown> =>
+            t !== null && typeof t === "object" && !Array.isArray(t),
+        )
+        .flatMap((t) => {
+          const team = typeof t.team === "string" ? t.team.trim() : "";
+          if (!team) return [];
+          const kind = typeof t.kind === "string" && t.kind.trim() ? t.kind.trim() : "unknown";
+          return [{ team, kind }];
+        });
+    }
+  } catch {
+    // malformed YAML → empty
+  }
+  return [];
+}
+
 /** Returns v when it looks like "owner/repo" (non-empty on both sides, no whitespace), else null. */
-function ownerRepo(v: string): string | null {
+export function ownerRepo(v: string): string | null {
   return /^[^\s/]+\/[^\s/]+$/.test(v) ? v : null;
 }
 
@@ -120,7 +164,7 @@ function ownerRepo(v: string): string | null {
  * parsed as a flag), and contains no internal whitespace, ".." (ref-traversal ambiguity),
  * or ":" (would turn a refspec into a two-sided source:destination mapping).
  */
-function isSafeBranch(v: string): boolean {
+export function isSafeBranch(v: string): boolean {
   return !v.startsWith("-") && !/\s/.test(v) && !v.includes("..") && !v.includes(":");
 }
 

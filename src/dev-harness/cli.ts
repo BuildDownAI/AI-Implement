@@ -78,24 +78,26 @@ export async function runDevHarnessCli(
     );
     return 1;
   }
-  if (phase === "kg-refresh" && !trackerData) {
-    deps.writeStderr("--tracker-data <file> is required for --phase kg-refresh\n");
-    return 1;
-  }
   if (phase !== "implementation" && phase !== "kg-refresh" && (untilStep || shell)) {
     deps.writeStderr("--until and --shell are only supported for --phase implementation or kg-refresh\n");
     return 1;
   }
 
-  const handle = await deps.startDevRun({
-    workspace: resolve(workspace),
-    task: task ? resolve(task) : undefined,
-    trackerData: trackerData ? resolve(trackerData) : undefined,
-    image,
-    untilStep,
-    shell,
-    phase,
-  });
+  let handle;
+  try {
+    handle = await deps.startDevRun({
+      workspace: resolve(workspace),
+      task: task ? resolve(task) : undefined,
+      trackerData: trackerData ? resolve(trackerData) : undefined,
+      image,
+      untilStep,
+      shell,
+      phase,
+    });
+  } catch (err) {
+    deps.writeStderr(`${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
 
   deps.writeStderr(
     `[dev:run] task=${handle.task.identifier} "${handle.task.title}"\n` +

@@ -145,12 +145,15 @@ Per-run artifacts land in `.dev-runs/<timestamp>/` (gitignored): `run.log`, `cha
 `--phase kg-refresh` runs the kg-refresh pipeline locally without a mounted workspace — the operator's KG source checkout is the workspace, and the container clones it via `file://` rather than binding it directly. This lets the pipeline exercise the real clone and secondary-repo paths (branch selection, depth, credential helper) against uncommitted local edits to `sources.yml`.
 
 ```bash
-npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --tracker-data td.json
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --until clone-secondary-repos
+npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --until kg-ingest --shell
 npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --tracker-data td.json --until clone-secondary-repos
-npm run dev:run -- --phase kg-refresh --workspace ../knowledge-graph-ai-implement --tracker-data td.json --until kg-ingest --shell
 ```
 
-`--tracker-data <file>` is required for this phase. The file is a pre-fetched tracker-data JSON (shape: the body returned by `POST /api/runner/kg-tracker-data`) and is bind-mounted read-only at `/dev-tracker-data.json`; the `kg-tracker-data` pipeline step detects it via `KG_TRACKER_DATA_FILE` and skips the orchestrator fetch. To produce that file, see `docs/issueless-runs.md` § "Local dev path for kg-refresh" for the admin-authenticated `GET /api/kg/tracker-data?team=<teamKey>` export.
+**The harness fetches tracker data itself by default.** When `--tracker-data` is omitted, `startDevRun` reads `ORCHESTRATOR_URL` plus an admin credential (`ADMIN_ACCESS_CODE`, or a bearer in `AI_IMPLEMENT_ADMIN_TOKEN`) from the operator's env, mints an admin session the way the admin UI does, calls `GET /api/kg/tracker-data` with no `team` — the union of every team in scope, deduplicated by issue id — and writes it to `.dev-runs/<timestamp>/tracker-data.json` before bind-mounting it read-only at `/dev-tracker-data.json`; the `kg-tracker-data` pipeline step detects the mount via `KG_TRACKER_DATA_FILE` and skips the orchestrator fetch from inside the container. The harness logs which source supplied the data. Neither `--tracker-data` nor a usable orchestrator env present fails fast, naming both options.
+
+`--tracker-data <file>` is the offline path and always wins when given, regardless of the orchestrator env. The file is a pre-fetched tracker-data JSON — the same shape `GET /api/kg/tracker-data` returns, single-team (`?team=<teamKey>`) or the default all-teams export; see `docs/issueless-runs.md` § "Local dev path for kg-refresh". **A single-team file is partial relative to the default export and trips the snapshot guard** the same way a stale one would — prefer the no-`team` export or the harness's automatic fetch for anything beyond a single-team smoke test.
 
 The operator's `GH_TOKEN` (or `GITHUB_TOKEN`) is injected as `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE`, which activates a stub `dependency-auth` step that satisfies the `clone-secondary-repos` skip condition (`acquired=true`) without contacting the orchestrator.
 

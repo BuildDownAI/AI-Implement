@@ -68,6 +68,8 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
   orchestratorUrl?: string;
   machineNonce?: string;
   callbackUrl?: string;
+  /** Slugs/teams kg-scope-reconcile added to sources.yml this run. Absent when that step didn't run. */
+  scope?: { addedRepos: string[]; addedTeams: string[]; mappedProjectCount: number };
 }
 
 interface KgSnapshotPushOutputs extends Record<string, unknown> {
@@ -209,6 +211,7 @@ interface RefreshReportInputs {
   secondaryRepos: Array<{ slug: string; branch: string; commit: string }>;
   ingestWarnings: string[];
   guardVerdict: string;
+  scope: { addedRepos: string[]; addedTeams: string[]; mappedProjectCount: number };
 }
 
 /**
@@ -243,6 +246,17 @@ function buildRefreshReport(data: RefreshReportInputs): string {
     lines.push("_(none configured)_");
   } else {
     for (const r of data.secondaryRepos) lines.push(`- \`${r.slug}\` @ ${r.branch} (${r.commit})`);
+  }
+  lines.push("", "### Scope", "");
+  if (data.scope.addedRepos.length === 0 && data.scope.addedTeams.length === 0) {
+    lines.push(`_(in sync with ${data.scope.mappedProjectCount} mapped projects)_`);
+  } else {
+    if (data.scope.addedRepos.length > 0) {
+      lines.push(`- repos added: ${data.scope.addedRepos.map((r) => `\`${r}\``).join(", ")}`);
+    }
+    if (data.scope.addedTeams.length > 0) {
+      lines.push(`- teams added: ${data.scope.addedTeams.join(", ")}`);
+    }
   }
   lines.push("", "### Ingest warnings", "");
   if (data.ingestWarnings.length === 0) {
@@ -596,6 +610,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     // so the two can never disagree about counts.
     const secondaryRepoOutcomes = readSecondaryRepoOutcomes(workspaceDir);
     const ingestWarnings = readIngestWarnings(workspaceDir);
+    const scope = inputs.scope ?? { addedRepos: [], addedTeams: [], mappedProjectCount: 0 };
     const reportBody = buildRefreshReport({
       stampCompact,
       quads: stats?.quads ?? null,
@@ -604,6 +619,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       secondaryRepos: secondaryRepoOutcomes,
       ingestWarnings,
       guardVerdict: dryRun ? "clean (dry-run — no push)" : "clean",
+      scope,
     });
 
     // ── dry-run exit ─────────────────────────────────────────────────────────
@@ -624,6 +640,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       "git config user.email",
     );
     runGit(workspaceDir, ["add", "snapshot/"], githubToken, "git add snapshot/");
+    if (scope.addedRepos.length > 0 || scope.addedTeams.length > 0) {
+      // kg-scope-reconcile already wrote sources.yml earlier in this run; stage it
+      // alongside the snapshot so a scope-only refresh still counts as staged below.
+      runGit(workspaceDir, ["add", "sources.yml"], githubToken, "git add sources.yml");
+    }
 
     const staged = spawnSync("git", ["diff", "--cached", "--quiet"], {
       cwd: workspaceDir,

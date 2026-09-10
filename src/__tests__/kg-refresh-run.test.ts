@@ -138,6 +138,7 @@ import {
   DEFAULT_BASE_REPO,
 } from "../pipeline/steps/kg-tracker-data.js";
 import { kgIngestStep, KgIngestError, isSignalLine } from "../pipeline/steps/kg-ingest.js";
+import { kgScopeReconcileStep } from "../pipeline/steps/kg-scope-reconcile.js";
 import { modelProcessEnv } from "../pipeline/process-env.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import type { PipelineContextData } from "../pipeline/types.js";
@@ -1414,6 +1415,340 @@ describe("AII-458 regression: RUN_PROGRESS_TOKEN stripped from model env", () =>
   });
 });
 
+// ── kgScopeReconcileStep ───────────────────────────────────────────────────
+
+describe("kgScopeReconcileStep", () => {
+  let tmpDir: string;
+  let savedToken: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgscope-"));
+    savedToken = process.env.RUN_PROGRESS_TOKEN;
+    process.env.RUN_PROGRESS_TOKEN = "tok";
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (savedToken === undefined) delete process.env.RUN_PROGRESS_TOKEN;
+    else process.env.RUN_PROGRESS_TOKEN = savedToken;
+  });
+
+  type ScopeMapping = { teamKey: string; repo: string; defaultBranch: string; ticketingProvider: string };
+
+  function makeMappingFetch(mappings: ScopeMapping[]): typeof fetch {
+    return (async () => ({
+      ok: true,
+      status: 200,
+      json: async () => mappings,
+    })) as unknown as typeof fetch;
+  }
+
+  function writeSources(content: string): void {
+    writeFileSync(join(tmpDir, "sources.yml"), content);
+  }
+
+  function readSources(): string {
+    return readFileSync(join(tmpDir, "sources.yml"), "utf-8");
+  }
+
+  it("returns zero outputs and skips the fetch when callbackUrl is absent", async () => {
+    const calls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { calls.push(args); return {} as Response; };
+    const result = await kgScopeReconcileStep.run(
+      makeContext(),
+      { callbackUrl: null, workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(result).toEqual({ addedRepos: 0, addedTeams: 0, addedRepoSlugs: [], addedTeamNames: [], mappedProjectCount: 0 });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("never adds the KG repo itself as a secondary (selfRepoSlug), case-insensitively", async () => {
+    writeSources("namespace: https://example.org/kg/\ncode_repo:\n  slug: Acme/app\n  path: .\ntrackers: []\n");
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "KGA", repo: "acme/knowledge-graph-app", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "DOC", repo: "Acme/docs", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let result: Record<string, unknown>;
+    let printed = "";
+    try {
+      result = await kgScopeReconcileStep.run(
+        makeContext(),
+        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, selfRepoSlug: "Acme/Knowledge-Graph-App" },
+        noopReporter,
+      );
+      printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(result!.addedRepoSlugs).toEqual(["Acme/docs"]);
+    expect(readSources()).not.toContain("knowledge-graph-app");
+    expect(printed).toContain("skipping acme/knowledge-graph-app: it is this KG repo");
+    // The self repo's team is still a valid tracker to add.
+    expect(result!.addedTeamNames).toEqual(["KGA", "DOC"]);
+  });
+
+  it("returns zero outputs and skips the fetch when RUN_PROGRESS_TOKEN is absent", async () => {
+    delete process.env.RUN_PROGRESS_TOKEN;
+    const calls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { calls.push(args); return {} as Response; };
+    const result = await kgScopeReconcileStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+    expect(result.addedRepos).toBe(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("logs 'scope in sync' and writes nothing when every mapping is already configured", async () => {
+    const before = [
+      "code_repo:",
+      "  slug: org/code-repo",
+      "secondary_repos:",
+      "  - slug: org/already-there",
+      "    branch: main",
+      "trackers:",
+      "  - kind: linear",
+      "    team: AII",
+      "  - kind: linear",
+      "    team: BDS",
+      "",
+    ].join("\n");
+    writeSources(before);
+
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/code-repo", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "BDS", repo: "org/already-there", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let result;
+    try {
+      result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] scope in sync");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(result).toEqual({ addedRepos: 0, addedTeams: 0, addedRepoSlugs: [], addedTeamNames: [], mappedProjectCount: 2 });
+    expect(readSources()).toBe(before);
+  });
+
+  it("adds a missing repo as a secondary_repos entry and logs added repos=1 teams=0", async () => {
+    writeSources("trackers:\n  - kind: linear\n    team: AII\n");
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/new-repo", defaultBranch: "testing", ticketingProvider: "linear" },
+    ]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let result;
+    try {
+      result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] added repos=1 teams=0");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(result.addedRepos).toBe(1);
+    expect(result.addedTeams).toBe(0);
+    expect(result.addedRepoSlugs).toEqual(["org/new-repo"]);
+    const after = readSources();
+    expect(after).toContain("slug: org/new-repo");
+    expect(after).toContain("branch: testing");
+  });
+
+  it("adds a missing team as a trackers entry and logs added repos=0 teams=1", async () => {
+    writeSources("code_repo:\n  slug: org/code-repo\n");
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "NEW", repo: "org/code-repo", defaultBranch: "main", ticketingProvider: "jira" },
+    ]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let result;
+    try {
+      result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] added repos=0 teams=1");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(result.addedRepos).toBe(0);
+    expect(result.addedTeams).toBe(1);
+    expect(result.addedTeamNames).toEqual(["NEW"]);
+    const after = readSources();
+    expect(after).toContain("team: NEW");
+    expect(after).toContain("kind: jira");
+    expect(after).toContain("tier: secondary");
+  });
+
+  it("never adds the code_repo slug to secondary_repos even though it isn't literally in the list", async () => {
+    writeSources("code_repo:\n  slug: org/code-repo\n");
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/code-repo", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    expect(result.addedRepos).toBe(0);
+    expect(readSources()).not.toContain("secondary_repos");
+  });
+
+  it("two-mapping case: one already in sync, the other needs both a repo and a team addition (counts not conflated)", async () => {
+    writeSources([
+      "code_repo:",
+      "  slug: org/code-repo",
+      "trackers:",
+      "  - kind: linear",
+      "    team: AII",
+      "",
+    ].join("\n"));
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/code-repo", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "BDS", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    expect(result.addedRepos).toBe(1);
+    expect(result.addedTeams).toBe(1);
+    expect(result.addedRepoSlugs).toEqual(["org/new-repo"]);
+    expect(result.addedTeamNames).toEqual(["BDS"]);
+  });
+
+  it("preserves comments, docs_sites, and existing entry order — new entries are strictly appended", async () => {
+    const before = [
+      "# top-level operator comment",
+      "code_repo:",
+      "  slug: org/code-repo",
+      "",
+      "secondary_repos:",
+      "  - slug: org/existing-one # keep me",
+      "    branch: testing",
+      "",
+      "trackers:",
+      "  - kind: linear",
+      "    team: AII",
+      "",
+      "docs_sites:",
+      "  - url: https://docs.example.com",
+      "    doc_globs:",
+      "      - \"**/*.md\"",
+      "      - \"guides/**\"",
+      "",
+    ].join("\n");
+    writeSources(before);
+
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/code-repo", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "BDS", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    expect(result.addedRepos).toBe(1);
+    expect(result.addedTeams).toBe(1);
+
+    const after = readSources();
+    // Every pre-existing line survives byte-for-byte, in order.
+    for (const line of before.split("\n")) {
+      if (line.length === 0) continue;
+      expect(after).toContain(line);
+    }
+    // docs_sites block is untouched, including its nested block sequence.
+    const docsSitesBefore = before.slice(before.indexOf("docs_sites:"));
+    const docsSitesAfter = after.slice(after.indexOf("docs_sites:"));
+    expect(docsSitesAfter.startsWith(docsSitesBefore.trimEnd())).toBe(true);
+    // New entries land after the existing ones in each list.
+    expect(after.indexOf("org/existing-one")).toBeLessThan(after.indexOf("org/new-repo"));
+    expect(after.indexOf("team: AII")).toBeLessThan(after.indexOf("team: BDS"));
+  });
+
+  it("dry run: computes and logs the diff but never writes sources.yml", async () => {
+    writeSources("trackers:\n  - kind: linear\n    team: AII\n");
+    const before = readSources();
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "BDS", repo: "org/other-repo", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    let writeCalled = false;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let result;
+    try {
+      result = await kgScopeReconcileStep.run(
+        makeContext(),
+        {
+          callbackUrl: "http://orch",
+          workspaceDir: tmpDir,
+          dryRun: true,
+          fetchImpl,
+          writeFileSyncImpl: () => { writeCalled = true; },
+        },
+        noopReporter,
+      );
+      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] dry-run: would add repos=2 teams=1");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(writeCalled).toBe(false);
+    expect(readSources()).toBe(before);
+    expect(result.addedRepos).toBe(2);
+    expect(result.addedTeams).toBe(1);
+  });
+
+  it("malformed sources.yml does not throw and reconciles from an empty manifest", async () => {
+    writeSources("[broken\n  team: AII\n");
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    expect(result.addedRepos).toBe(1);
+    expect(result.addedTeams).toBe(1);
+    const after = readSources();
+    expect(after).toContain("slug: org/new-repo");
+    expect(after).toContain("team: AII");
+  });
+
+  it("drops a mapping with an unsafe/invalid repo slug and warns, without adding it", async () => {
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "not-a-repo-slug", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let result;
+    try {
+      result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("unsafe/invalid repo"));
+    } finally {
+      warnSpy.mockRestore();
+    }
+    // The team is still new and gets added even though the repo was dropped.
+    expect(result.addedRepos).toBe(0);
+    expect(result.addedTeams).toBe(1);
+  });
+
+  it("drops an unsafe branch but still adds the repo without a branch key", async () => {
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/new-repo", defaultBranch: "-not-safe", ticketingProvider: "linear" },
+    ]);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let result;
+    try {
+      result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    } finally {
+      warnSpy.mockRestore();
+    }
+    expect(result.addedRepos).toBe(1);
+    const after = readSources();
+    expect(after).toContain("slug: org/new-repo");
+    expect(after).not.toContain("-not-safe");
+  });
+
+  it("soft-fails without throwing when the endpoint returns a non-2xx status", async () => {
+    const fetchImpl: typeof fetch = async () => ({ ok: false, status: 500, json: async () => ({}) }) as Response;
+    const result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    expect(result).toEqual({ addedRepos: 0, addedTeams: 0, addedRepoSlugs: [], addedTeamNames: [], mappedProjectCount: 0 });
+  });
+
+  it("soft-fails without throwing when the fetch rejects (network error)", async () => {
+    const fetchImpl: typeof fetch = async () => { throw new Error("network down"); };
+    const result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    expect(result.addedRepos).toBe(0);
+  });
+});
+
 // ── pipeline-loader wiring for kg-snapshot-push ───────────────────────────────
 
 import { loadPipelineDefinition } from "../pipeline/pipeline-loader.js";
@@ -1422,6 +1757,9 @@ const KG_REFRESH_PIPELINE_YAML = `id: kg-refresh
 steps:
   - id: clone
     type: clone
+  - id: kg-scope-reconcile
+    type: custom
+    moduleId: kg-scope-reconcile
   - id: kg-tracker-data
     type: custom
     moduleId: kg-tracker-data
@@ -1457,6 +1795,62 @@ describe("applyWiring for kg-snapshot-push", () => {
     expect(inputs.defaultBranch).toBe("main");
     expect(inputs.repoOwner).toBe("org");
     expect(inputs.repoRepo).toBe("repo");
+  });
+
+  it("wires scope from kg-scope-reconcile outputs", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-snapshot-push");
+    const ctx = makeContext({ branch: "main" });
+    ctx.setOutputs("clone", { workspaceDir: "/ws" });
+    ctx.setOutputs("kg-scope-reconcile", {
+      addedRepos: 1,
+      addedTeams: 1,
+      addedRepoSlugs: ["org/new-repo"],
+      addedTeamNames: ["BDS"],
+      mappedProjectCount: 3,
+    });
+
+    const inputs = ctx.resolveInputs(step!.inputs) as { scope: { addedRepos: string[]; addedTeams: string[]; mappedProjectCount: number } };
+    expect(inputs.scope).toEqual({ addedRepos: ["org/new-repo"], addedTeams: ["BDS"], mappedProjectCount: 3 });
+  });
+
+  it("defaults scope to empty when kg-scope-reconcile did not run (skipped, no outputs)", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-snapshot-push");
+    const ctx = makeContext({ branch: "main" });
+    ctx.setOutputs("clone", { workspaceDir: "/ws" });
+    // kg-scope-reconcile outputs not set — step was skipped
+
+    const inputs = ctx.resolveInputs(step!.inputs) as { scope: { addedRepos: string[]; addedTeams: string[]; mappedProjectCount: number } };
+    expect(inputs.scope).toEqual({ addedRepos: [], addedTeams: [], mappedProjectCount: 0 });
+  });
+});
+
+describe("applyWiring for kg-scope-reconcile", () => {
+  it("wires callbackUrl, workspaceDir, and dryRun from context", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-scope-reconcile");
+    expect(step).toBeDefined();
+
+    const ctx = makeContext({ callbackUrl: "http://orchestrator", kgDryRun: true });
+    ctx.setOutputs("clone", { workspaceDir: "/ws" });
+
+    const inputs = ctx.resolveInputs(step!.inputs);
+    expect(inputs.callbackUrl).toBe("http://orchestrator");
+    expect(inputs.workspaceDir).toBe("/ws");
+    expect(inputs.dryRun).toBe(true);
   });
 });
 
@@ -2332,11 +2726,12 @@ describe("kgIngestStep — log file and signal echo", () => {
 // ── kg-refresh pipeline order ─────────────────────────────────────────────────
 
 describe("kg-refresh pipeline order", () => {
-  it("step IDs are clone → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → kg-snapshot-push (no agent step)", () => {
+  it("step IDs are clone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos → kg-tracker-data → kg-ingest → kg-snapshot-push (no agent step)", () => {
     const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml");
     const ids = pipeline.steps.map((s) => s.id);
     expect(ids).toEqual([
       "clone",
+      "kg-scope-reconcile",
       "dependency-auth",
       "clone-code-repo",
       "clone-secondary-repos",
@@ -3664,6 +4059,7 @@ describe("kg-refresh pipeline definition step order", () => {
     const ids = pipeline.steps.map((s) => s.id);
     expect(ids).toEqual([
       "clone",
+      "kg-scope-reconcile",
       "dependency-auth",
       "clone-code-repo",
       "clone-secondary-repos",
@@ -4192,6 +4588,65 @@ describe("kgSnapshotPushStep — dryRun flag", () => {
     expect(branches).not.toContain("kg-refresh/");
   });
 
+  it("Scope section reads 'in sync' with the mapped project count when scope input is absent/empty", async () => {
+    initGitRepo(tmpDir);
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-05T08:00:00Z");
+
+    const ctx = makeContext();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let printed = "";
+    try {
+      await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, dryRun: true, scope: { addedRepos: [], addedTeams: [], mappedProjectCount: 4 } }),
+        noopReporter,
+      );
+      printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(printed).toContain("### Scope");
+    expect(printed).toContain("in sync with 4 mapped projects");
+  });
+
+  it("Scope section lists added repos and teams when scope input is non-empty", async () => {
+    initGitRepo(tmpDir);
+    const clonedRef = resolveHead(tmpDir);
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-05T08:00:00Z");
+
+    const ctx = makeContext();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let printed = "";
+    try {
+      await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({
+          clonedRef,
+          dryRun: true,
+          scope: { addedRepos: ["org/new-repo"], addedTeams: ["BDS"], mappedProjectCount: 4 },
+        }),
+        noopReporter,
+      );
+      printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(printed).toContain("### Scope");
+    expect(printed).toContain("repos added: `org/new-repo`");
+    expect(printed).toContain("teams added: BDS");
+  });
+
   it("still throws KgSnapshotMissingError for missing parts when dryRun=true", async () => {
     initGitRepo(tmpDir);
     const ctx = makeContext();
@@ -4329,6 +4784,70 @@ describe("kgSnapshotPushStep — refresh PR flow", () => {
     expect(body.body).toContain("- AII: 2");
     expect(body.body).toContain("**Guard verdict:** clean");
     expect(body.draft).toBeUndefined();
+  });
+
+  it("stages and commits sources.yml alongside snapshot/ when scope has additions, and the report names them", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-05T08:00:00Z");
+    // kg-scope-reconcile already ran earlier in the pipeline and wrote sources.yml —
+    // simulate that by writing it directly into the (uncommitted) working tree.
+    writeFileSync(join(tmpDir, "sources.yml"), "secondary_repos:\n  - slug: org/new-repo\n");
+
+    stubPrCreate(18, "https://github.com/acme/kg-repo/pull/18");
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(
+      ctx,
+      makeInputs({ clonedRef, scope: { addedRepos: ["org/new-repo"], addedTeams: [], mappedProjectCount: 3 } }),
+      noopReporter,
+    );
+
+    expect(result.snapshotPushed).toBe(true);
+    expect(result.prNumber).toBe(18);
+
+    const committedFiles = execSync("git show --name-only --pretty=format: HEAD", { cwd: tmpDir }).toString();
+    expect(committedFiles).toContain("sources.yml");
+    expect(committedFiles).toContain("snapshot/");
+
+    const [, req] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse((req as RequestInit).body as string);
+    expect(body.body).toContain("### Scope");
+    expect(body.body).toContain("repos added: `org/new-repo`");
+  });
+
+  it("does not stage sources.yml when scope has no additions", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), "<s> <p> <o> .\n");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-05T08:00:00Z");
+    // An uncommitted, untracked sources.yml with no scope additions declared must not be staged.
+    writeFileSync(join(tmpDir, "sources.yml"), "code_repo:\n  slug: org/code-repo\n");
+
+    stubPrCreate(19, "https://github.com/acme/kg-repo/pull/19");
+
+    const ctx = makeContext();
+    await kgSnapshotPushStep.run(
+      ctx,
+      makeInputs({ clonedRef, scope: { addedRepos: [], addedTeams: [], mappedProjectCount: 1 } }),
+      noopReporter,
+    );
+
+    const committedFiles = execSync("git show --name-only --pretty=format: HEAD", { cwd: tmpDir }).toString();
+    expect(committedFiles).not.toContain("sources.yml");
   });
 
   it("titles the PR with '?' quads when kg-stats.json is absent", async () => {

@@ -19,6 +19,7 @@ import fs from "node:fs";
 import type * as DedupModule from "../dedup.js";
 import type * as RunnerCallbackModule from "../runner-callback.js";
 import type * as GapFillModule from "../gap-fill-trigger.js";
+import type * as RunnerTokensModule from "../runner-tokens.js";
 import type { RepoMapping } from "../config.js";
 import { FakeProvider } from "./providers/fake.js";
 import type { TicketingProvider } from "../providers/types.js";
@@ -27,6 +28,7 @@ let dbPath: string;
 let dedup: typeof DedupModule;
 let runnerCallback: typeof RunnerCallbackModule;
 let gapFill: typeof GapFillModule;
+let runnerTokens: typeof RunnerTokensModule;
 
 beforeEach(async () => {
   vi.resetModules();
@@ -38,6 +40,7 @@ beforeEach(async () => {
   dedup = await import("../dedup.js");
   runnerCallback = await import("../runner-callback.js");
   gapFill = await import("../gap-fill-trigger.js");
+  runnerTokens = await import("../runner-tokens.js");
   dedup.getDb();
 });
 
@@ -186,6 +189,85 @@ describe("/runner/kg-tracker-data route wrapper", () => {
     });
     expect(res.status).toBe(403);
     expect(res.body.error).toBe("Unauthorized");
+  });
+});
+
+/**
+ * Mirror of the POST /runner/kg-scope route wrapper in src/index.ts:
+ * 501 when unconfigured, else delegates straight to handleKgScopeRequest
+ * (no request body is parsed for this route).
+ */
+async function callKgScopeRoute(opts: {
+  runnerTokenSecret: string | null;
+  authorization?: string;
+  getMappings?: () => Record<string, { owner: string; repo: string; defaultBranch: string; ticketingProvider: string }>;
+}): Promise<{ status: number; body: unknown }> {
+  if (!opts.runnerTokenSecret) {
+    return { status: 501, body: { error: "Runner callback not configured" } };
+  }
+  return runnerCallback.handleKgScopeRequest({
+    authorization: opts.authorization,
+    secret: opts.runnerTokenSecret,
+    getMappings: opts.getMappings ?? (() => ({})),
+  });
+}
+
+describe("/runner/kg-scope route wrapper", () => {
+  it("returns 501 when RUNNER_TOKEN_SECRET is unset", async () => {
+    const res = await callKgScopeRoute({ runnerTokenSecret: null });
+    expect(res.status).toBe(501);
+    expect(res.body).toEqual({ error: "Runner callback not configured" });
+  });
+
+  it("returns 403 when the bearer is missing", async () => {
+    const res = await callKgScopeRoute({ runnerTokenSecret: "secret" });
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns 403 when the token's phase is not kg-refresh", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "AII",
+      phase: "implementation",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: "secret",
+    });
+
+    const res = await callKgScopeRoute({
+      runnerTokenSecret: "secret",
+      authorization: `Bearer ${token}`,
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "Unauthorized" });
+  });
+
+  it("returns exactly {teamKey, repo, defaultBranch, ticketingProvider} per mapping on the happy path", async () => {
+    const { token } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "AII",
+      phase: "kg-refresh",
+      audience: "progress",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: "secret",
+    });
+
+    const res = await callKgScopeRoute({
+      runnerTokenSecret: "secret",
+      authorization: `Bearer ${token}`,
+      getMappings: () => ({
+        AII: { owner: "BuildDownAI", repo: "AI-Implement", defaultBranch: "main", ticketingProvider: "linear" },
+        ENG: { owner: "acme", repo: "widgets", defaultBranch: "develop", ticketingProvider: "jira" },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      { teamKey: "AII", repo: "BuildDownAI/AI-Implement", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "ENG", repo: "acme/widgets", defaultBranch: "develop", ticketingProvider: "jira" },
+    ]);
   });
 });
 
