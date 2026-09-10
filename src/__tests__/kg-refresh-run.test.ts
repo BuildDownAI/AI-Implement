@@ -1463,6 +1463,32 @@ describe("kgScopeReconcileStep", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("never adds the KG repo itself as a secondary (selfRepoSlug), case-insensitively", async () => {
+    writeSources("namespace: https://example.org/kg/\ncode_repo:\n  slug: Acme/app\n  path: .\ntrackers: []\n");
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "KGA", repo: "acme/knowledge-graph-app", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "DOC", repo: "Acme/docs", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let result: Record<string, unknown>;
+    let printed = "";
+    try {
+      result = await kgScopeReconcileStep.run(
+        makeContext(),
+        { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl, selfRepoSlug: "Acme/Knowledge-Graph-App" },
+        noopReporter,
+      );
+      printed = logSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(result!.addedRepoSlugs).toEqual(["Acme/docs"]);
+    expect(readSources()).not.toContain("knowledge-graph-app");
+    expect(printed).toContain("skipping acme/knowledge-graph-app: it is this KG repo");
+    // The self repo's team is still a valid tracker to add.
+    expect(result!.addedTeamNames).toEqual(["KGA", "DOC"]);
+  });
+
   it("returns zero outputs and skips the fetch when RUN_PROGRESS_TOKEN is absent", async () => {
     delete process.env.RUN_PROGRESS_TOKEN;
     const calls: unknown[] = [];

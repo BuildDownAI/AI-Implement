@@ -265,7 +265,8 @@ The orchestrator's project mappings are the scope for `sources.yml`. The `kg-sco
 pipeline step (`src/pipeline/steps/kg-scope-reconcile.ts`, [docs/issueless-runs.md](issueless-runs.md)
 §5 "Scope endpoint") runs on every refresh, on the refresh branch, before ingest: it fetches the
 mapping set from `POST /api/runner/kg-scope` and additively maintains the manifest — each mapped
-repo not already `code_repo` or an existing `secondary_repos` entry is added as a secondary, and
+repo not already `code_repo` or an existing `secondary_repos` entry is added as a secondary (the KG
+repo itself is skipped — it self-ingests and is never its own secondary), and
 each mapped team not already present is added to `trackers`. It **never removes** an entry (a
 repo or team decommissioned on the orchestrator side stays in `sources.yml` until an operator
 prunes it by hand) and **never touches `docs_sites` or `code_repo`'s `docs_url`** — doc roots stay

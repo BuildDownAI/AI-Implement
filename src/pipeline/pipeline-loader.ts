@@ -315,6 +315,13 @@ function applyWiring(step: YamlStep): StepDefinition {
           callbackUrl: ctx.data.callbackUrl,
           workspaceDir: ctx.getOutputs("clone").workspaceDir,
           dryRun: ctx.data.kgDryRun === true,
+          // The KG repo is mapped in the orchestrator too; it must not become its own secondary.
+          selfRepoSlug: (() => {
+            const c = ctx.getOutputs("clone");
+            return typeof c.repoOwner === "string" && typeof c.repoRepo === "string" && c.repoOwner && c.repoRepo
+              ? `${c.repoOwner}/${c.repoRepo}`
+              : undefined;
+          })(),
           // RUN_PROGRESS_TOKEN is a live bearer secret — placing it here would
           // persist it to the step log and expose it via the admin API. The step
           // reads it directly from process.env instead.

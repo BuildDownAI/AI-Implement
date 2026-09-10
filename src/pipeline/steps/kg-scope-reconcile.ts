@@ -22,6 +22,12 @@ interface KgScopeReconcileInputs extends Record<string, unknown> {
   workspaceDir: string;
   /** Dev-harness / dry-run mode: compute and log the diff but never write sources.yml. */
   dryRun?: boolean;
+  /**
+   * The KG source repo itself (`owner/name`, from the clone step). A KG repo is usually
+   * mapped in the orchestrator too (its own issues run through the pipeline), and it
+   * already self-ingests; it must never be added as its own secondary.
+   */
+  selfRepoSlug?: string;
   /** Test-only injectable fetch implementation. */
   fetchImpl?: typeof fetch;
   /** Test-only injectable fs.writeFileSync implementation. */
@@ -144,6 +150,7 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
     }
 
     const codeRepoSlug = readCodeRepoFromSourcesYml(workspaceDir)?.slug ?? null;
+    const selfSlug = typeof inputs.selfRepoSlug === "string" ? inputs.selfRepoSlug.trim().toLowerCase() : null;
     const existingSecondarySlugs = new Set(readSecondaryReposFromSourcesYml(workspaceDir).map((r) => r.slug));
     const existingTeams = new Set(readTrackerRecords(workspaceDir).map((t) => t.team));
 
@@ -156,6 +163,8 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
       const slug = typeof m.repo === "string" ? ownerRepo(m.repo.trim()) : null;
       if (slug === null) {
         console.warn(`[kg-scope-reconcile] dropping mapping team=${m.teamKey ?? "?"} with unsafe/invalid repo: ${JSON.stringify(m.repo)}`);
+      } else if (selfSlug !== null && slug.toLowerCase() === selfSlug) {
+        console.log(`[kg-scope-reconcile] skipping ${slug}: it is this KG repo (self-ingested, never a secondary of itself)`);
       } else if (slug !== codeRepoSlug && !existingSecondarySlugs.has(slug) && !seenRepoSlugs.has(slug)) {
         const branchRaw = typeof m.defaultBranch === "string" ? m.defaultBranch.trim() : "";
         const branch = sanitizeBranch(branchRaw, slug);
