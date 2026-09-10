@@ -52,8 +52,6 @@ Bindings for the KG skills (bd-kg-search, kg recon — format: skills `plugin/sk
 - kg.mcp_server:   orch-ai-implement-testing
 - kg.search_tool:  mcp__orch-ai-implement-testing__kg_hybrid_search
 - kg.source_repo:  BuildDownAI/knowledge-graph-ai-implement
-- kg.local_mcp_server:  ai-implement-kg
-- kg.local_search_tool: mcp__ai-implement-kg__kg_hybrid_search
 - kg.prefer:       orchestrator
 
 Project-specific orchestrator instances can override the bundled graph with `KG_SOURCE_REPO=owner/repo`.
