@@ -54,6 +54,9 @@ export interface DevRunOptions {
    * uses the file instead of fetching from the orchestrator. When absent and
    * phase=kg-refresh, startDevRun fetches the export itself from ORCHESTRATOR_URL
    * (see resolveKgTrackerDataFile) using an admin credential from the operator's env.
+   * The kg-scope-reconcile dry run is resolved separately and unconditionally (see
+   * resolveKgScopeFile): whenever the same ORCHESTRATOR_URL/admin credential are set,
+   * GET /api/kg/scope is fetched and mounted regardless of whether trackerData is given.
    */
   trackerData?: string;
   /**
@@ -116,11 +119,35 @@ function sanitizeContainerName(identifier: string): string {
 }
 
 /**
+ * Mints an admin bearer for the orchestrator at `base`: AI_IMPLEMENT_ADMIN_TOKEN is used
+ * directly when set, otherwise mints a session via POST /api/auth the way the admin UI
+ * does with ADMIN_ACCESS_CODE. Shared by every fetch-from-orchestrator dev-harness path
+ * (tracker data, KG scope) so each mints independently but identically.
+ */
+async function mintAdminBearer(base: string): Promise<string> {
+  const adminToken = process.env.AI_IMPLEMENT_ADMIN_TOKEN?.trim();
+  if (adminToken) return adminToken;
+
+  const accessCode = process.env.ADMIN_ACCESS_CODE?.trim();
+  const authRes = await fetch(`${base}/api/auth`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code: accessCode }),
+  });
+  if (!authRes.ok) {
+    throw new Error(`Failed to mint an admin session from ${base}/api/auth: HTTP ${authRes.status}`);
+  }
+  const authBody = (await authRes.json()) as { token?: string };
+  if (!authBody.token) {
+    throw new Error(`Admin session mint at ${base}/api/auth did not return a token`);
+  }
+  return authBody.token;
+}
+
+/**
  * Resolves the tracker-data file to mount for a kg-refresh run: `opts.trackerData`
  * when given (the offline path, always wins), otherwise fetches the export from the
- * orchestrator using an admin credential from the operator's env — never both. Mints
- * a session via POST /api/auth the way the admin UI does when only ADMIN_ACCESS_CODE
- * is set; AI_IMPLEMENT_ADMIN_TOKEN is used directly as an already-valid bearer.
+ * orchestrator using an admin credential from the operator's env — never both.
  * Neither `opts.trackerData` nor the orchestrator env present throws, naming both
  * options. Logs which source supplied the data.
  */
@@ -143,24 +170,7 @@ async function resolveKgTrackerDataFile(opts: DevRunOptions, artifactsDir: strin
   }
 
   const base = orchestratorUrl.replace(/\/+$/, "");
-  let bearer: string;
-  if (adminToken) {
-    bearer = adminToken;
-  } else {
-    const authRes = await fetch(`${base}/api/auth`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code: accessCode }),
-    });
-    if (!authRes.ok) {
-      throw new Error(`Failed to mint an admin session from ${base}/api/auth: HTTP ${authRes.status}`);
-    }
-    const authBody = (await authRes.json()) as { token?: string };
-    if (!authBody.token) {
-      throw new Error(`Admin session mint at ${base}/api/auth did not return a token`);
-    }
-    bearer = authBody.token;
-  }
+  const bearer = await mintAdminBearer(base);
 
   const res = await fetch(`${base}/api/kg/tracker-data`, {
     headers: { Authorization: `Bearer ${bearer}` },
@@ -173,6 +183,50 @@ async function resolveKgTrackerDataFile(opts: DevRunOptions, artifactsDir: strin
   await writeFile(filePath, body);
   console.log(`[dev-harness] tracker data source: fetched from ${base}/api/kg/tracker-data`);
   return filePath;
+}
+
+/**
+ * Resolves the KG-scope file to mount for a kg-refresh run's kg-scope-reconcile dry run:
+ * fetches GET /api/kg/scope from the orchestrator (same ORCHESTRATOR_URL + admin credential
+ * as resolveKgTrackerDataFile) and mounts it so the step reads it via KG_SCOPE_FILE instead
+ * of calling back — the harness has no live orchestrator for the runner to call back to.
+ * Unlike tracker data, this is optional and never required: with no orchestrator env
+ * configured, or the fetch failing, this logs and returns null — kg-scope-reconcile then
+ * runs its normal "no callback URL" skip inside the container, same as today.
+ */
+async function resolveKgScopeFile(artifactsDir: string): Promise<string | null> {
+  const orchestratorUrl = process.env.ORCHESTRATOR_URL?.trim();
+  const adminToken = process.env.AI_IMPLEMENT_ADMIN_TOKEN?.trim();
+  const accessCode = process.env.ADMIN_ACCESS_CODE?.trim();
+
+  if (!orchestratorUrl || (!adminToken && !accessCode)) {
+    console.log(
+      "[dev-harness] ORCHESTRATOR_URL/admin credential not set — kg-scope-reconcile dry run will skip (no scope to diff against)",
+    );
+    return null;
+  }
+
+  const base = orchestratorUrl.replace(/\/+$/, "");
+  try {
+    const bearer = await mintAdminBearer(base);
+    const res = await fetch(`${base}/api/kg/scope`, {
+      headers: { Authorization: `Bearer ${bearer}` },
+    });
+    if (!res.ok) {
+      console.warn(`[dev-harness] GET ${base}/api/kg/scope failed: HTTP ${res.status} — kg-scope-reconcile dry run will skip`);
+      return null;
+    }
+    const body = await res.text();
+    const filePath = join(artifactsDir, "kg-scope.json");
+    await writeFile(filePath, body);
+    console.log(`[dev-harness] kg scope source: fetched from ${base}/api/kg/scope`);
+    return filePath;
+  } catch (err) {
+    console.warn(
+      `[dev-harness] kg-scope fetch failed: ${err instanceof Error ? err.message : String(err)} — kg-scope-reconcile dry run will skip`,
+    );
+    return null;
+  }
 }
 
 /**
@@ -254,6 +308,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     // inside the container. AI_IMPLEMENT_DEP_TOKEN_OVERRIDE carries the operator's GH_TOKEN
     // to satisfy clone-secondary-repos without an orchestrator token vend.
     const trackerData = await resolveKgTrackerDataFile(opts, artifactsDir);
+    const scopeFile = await resolveKgScopeFile(artifactsDir);
     const operatorGhToken = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? githubToken;
 
     const allEnv: Record<string, string> = {
@@ -262,6 +317,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
       AI_IMPLEMENT_KG_DRY_RUN: "true",
       AI_IMPLEMENT_RUN_CONFIG: runConfig,
       KG_TRACKER_DATA_FILE: "/dev-tracker-data.json",
+      ...(scopeFile ? { KG_SCOPE_FILE: "/dev-kg-scope.json" } : {}),
       ...(opts.untilStep ? { AI_IMPLEMENT_UNTIL_STEP: opts.untilStep } : {}),
       ...(opts.shell ? { AI_IMPLEMENT_SHELL_MODE: "true" } : {}),
       ISSUE_ID: issueId,
@@ -294,6 +350,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
       extraVolumes: [
         `${workspace}:/kg-source:ro`,
         `${trackerData}:/dev-tracker-data.json:ro`,
+        ...(scopeFile ? [`${scopeFile}:/dev-kg-scope.json:ro`] : []),
       ],
     });
 

@@ -115,38 +115,56 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
       writeFileSyncImpl: writeFn = writeFileSync,
     } = inputs;
 
-    if (!callbackUrl) {
-      console.log("[kg-scope-reconcile] no callback URL; scope reconcile skipped");
-      return EMPTY_OUTPUTS;
-    }
-
-    // Read the bearer secret directly from the environment so it never appears
-    // in step inputs, which are persisted to the step log and exposed via the admin API.
-    const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
-    if (!progressToken) {
-      console.log("[kg-scope-reconcile] no progress token (RUN_PROGRESS_TOKEN); scope reconcile skipped");
-      return EMPTY_OUTPUTS;
-    }
-
-    const base = callbackUrl.replace(/\/+$/, "");
-    const url = `${base}/api/runner/kg-scope`;
     let mappings: KgScopeMapping[];
-    try {
-      const res = await fetchFn(url, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${progressToken}` },
-      });
-      if (!res.ok) {
-        console.warn(`[kg-scope-reconcile] ${url} returned HTTP ${res.status}; scope reconcile skipped`);
+
+    // Dev-harness kg-refresh: when KG_SCOPE_FILE points to a pre-fetched export (mirrors
+    // KG_TRACKER_DATA_FILE in kg-tracker-data.ts), read the mapping list from there and
+    // skip the callback entirely — the harness has no live orchestrator to call back to.
+    const preloadedFile = process.env.KG_SCOPE_FILE?.trim() || null;
+    if (preloadedFile && existsSync(preloadedFile)) {
+      try {
+        const parsed = JSON.parse(readFileSync(preloadedFile, "utf-8")) as unknown;
+        mappings = Array.isArray(parsed) ? (parsed as KgScopeMapping[]) : [];
+        console.log(`[kg-scope-reconcile] using pre-fetched scope from ${preloadedFile}: ${mappings.length} mapping(s)`);
+      } catch (err) {
+        console.warn(
+          `[kg-scope-reconcile] failed to parse KG_SCOPE_FILE=${preloadedFile}: ${err instanceof Error ? err.message : String(err)}; scope reconcile skipped`,
+        );
         return EMPTY_OUTPUTS;
       }
-      const parsed = (await res.json()) as unknown;
-      mappings = Array.isArray(parsed) ? (parsed as KgScopeMapping[]) : [];
-    } catch (err) {
-      console.warn(
-        `[kg-scope-reconcile] fetch failed: ${err instanceof Error ? err.message : String(err)}; scope reconcile skipped`,
-      );
-      return EMPTY_OUTPUTS;
+    } else {
+      if (!callbackUrl) {
+        console.log("[kg-scope-reconcile] no callback URL; scope reconcile skipped");
+        return EMPTY_OUTPUTS;
+      }
+
+      // Read the bearer secret directly from the environment so it never appears
+      // in step inputs, which are persisted to the step log and exposed via the admin API.
+      const progressToken = process.env.RUN_PROGRESS_TOKEN?.trim() || null;
+      if (!progressToken) {
+        console.log("[kg-scope-reconcile] no progress token (RUN_PROGRESS_TOKEN); scope reconcile skipped");
+        return EMPTY_OUTPUTS;
+      }
+
+      const base = callbackUrl.replace(/\/+$/, "");
+      const url = `${base}/api/runner/kg-scope`;
+      try {
+        const res = await fetchFn(url, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${progressToken}` },
+        });
+        if (!res.ok) {
+          console.warn(`[kg-scope-reconcile] ${url} returned HTTP ${res.status}; scope reconcile skipped`);
+          return EMPTY_OUTPUTS;
+        }
+        const parsed = (await res.json()) as unknown;
+        mappings = Array.isArray(parsed) ? (parsed as KgScopeMapping[]) : [];
+      } catch (err) {
+        console.warn(
+          `[kg-scope-reconcile] fetch failed: ${err instanceof Error ? err.message : String(err)}; scope reconcile skipped`,
+        );
+        return EMPTY_OUTPUTS;
+      }
     }
 
     const codeRepoSlug = readCodeRepoFromSourcesYml(workspaceDir)?.slug ?? null;

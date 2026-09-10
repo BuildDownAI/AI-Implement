@@ -255,6 +255,11 @@ describe("startDevRun — kg-refresh phase", () => {
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
     vi.stubEnv("GH_TOKEN", "ghs-operator-token");
     vi.stubEnv("GITHUB_TOKEN", "");
+    // No orchestrator env in this block: kg-scope-reconcile's dry-run fetch is exercised
+    // separately below (AII-608 follow-up); here it must resolve to a no-op.
+    vi.stubEnv("ORCHESTRATOR_URL", "");
+    vi.stubEnv("ADMIN_ACCESS_CODE", "");
+    vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "");
   });
 
   afterEach(() => {
@@ -297,6 +302,13 @@ describe("startDevRun — kg-refresh phase", () => {
     await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json" });
     const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
     expect(opts.publicEnv["KG_TRACKER_DATA_FILE"]).toBe("/dev-tracker-data.json");
+  });
+
+  it("sets no KG_SCOPE_FILE and mounts no scope volume when the orchestrator env is absent", async () => {
+    const opts0 = await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json" })
+      .then(() => vi.mocked(launchLocalSession).mock.calls[0]![0]);
+    expect(opts0.publicEnv["KG_SCOPE_FILE"]).toBeUndefined();
+    expect((opts0.extraVolumes ?? []).some((v) => v.includes("dev-kg-scope.json"))).toBe(false);
   });
 
   it("injects GH_TOKEN as AI_IMPLEMENT_DEP_TOKEN_OVERRIDE", async () => {
@@ -343,7 +355,9 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
     vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "");
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "session-token" }) })
-      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([{ id: "1" }]) });
+      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([{ id: "1" }]) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "session-token-2" }) })
+      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([]) });
     vi.stubGlobal("fetch", fetchMock);
 
     const handle = await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", artifactsDir: "/tmp/artifacts" });
@@ -369,28 +383,49 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "");
     vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "bearer-token");
-    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([]) });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([]) })
+      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([]) });
     vi.stubGlobal("fetch", fetchMock);
 
     await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", artifactsDir: "/tmp/artifacts" });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith("https://orch.example.com/api/kg/tracker-data", {
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "https://orch.example.com/api/kg/tracker-data", {
+      headers: { Authorization: "Bearer bearer-token" },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "https://orch.example.com/api/kg/scope", {
       headers: { Authorization: "Bearer bearer-token" },
     });
   });
 
-  it("--tracker-data always wins over the orchestrator env when both are present", async () => {
+  it("--tracker-data always wins over the orchestrator env for tracker data; scope is still fetched independently", async () => {
     vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
     vi.stubEnv("ADMIN_ACCESS_CODE", "secret-code");
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "session-token" }) })
+      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([{ teamKey: "AII" }]) });
     vi.stubGlobal("fetch", fetchMock);
 
-    await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json" });
+    const handle = await startDevRun({
+      workspace: "/tmp/repo",
+      phase: "kg-refresh",
+      trackerData: "/tmp/td.json",
+      artifactsDir: "/tmp/artifacts",
+    });
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    // Tracker data is never fetched — the file always wins.
+    expect(fetchMock).not.toHaveBeenCalledWith("https://orch.example.com/api/kg/tracker-data", expect.anything());
     const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
     expect(opts.extraVolumes).toContain("/tmp/td.json:/dev-tracker-data.json:ro");
+
+    // Scope is an independent axis: it is fetched whenever the orchestrator env is set.
+    expect(fetchMock).toHaveBeenCalledWith("https://orch.example.com/api/kg/scope", {
+      headers: { Authorization: "Bearer session-token" },
+    });
+    expect(opts.extraVolumes).toContain("/tmp/artifacts/kg-scope.json:/dev-kg-scope.json:ro");
+    expect(opts.publicEnv["KG_SCOPE_FILE"]).toBe("/dev-kg-scope.json");
+    expect(handle.phase).toBe("kg-refresh");
   });
 
   it("rejects when the tracker-data fetch fails", async () => {
@@ -413,6 +448,20 @@ describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", 
     await expect(
       startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh" }),
     ).rejects.toThrow(/api\/auth.*403/);
+  });
+
+  it("does not fail the run when the scope fetch fails — it only skips the scope mount", async () => {
+    vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
+    vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "bearer-token");
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 500 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const handle = await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json" });
+
+    expect(handle.phase).toBe("kg-refresh");
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.publicEnv["KG_SCOPE_FILE"]).toBeUndefined();
+    expect((opts.extraVolumes ?? []).some((v) => v.includes("dev-kg-scope.json"))).toBe(false);
   });
 });
 

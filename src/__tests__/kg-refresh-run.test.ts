@@ -5263,6 +5263,118 @@ describe("kgTrackerDataStep — KG_TRACKER_DATA_FILE preload", () => {
   });
 });
 
+// ── kgScopeReconcileStep — KG_SCOPE_FILE preload (AII-604 gap-fill) ──────────
+//
+// Mirrors the KG_TRACKER_DATA_FILE preload above: this is the dev-harness's offline
+// path for kg-scope-reconcile, exercised when the container has no live orchestrator
+// to call back to. Without it, --phase kg-refresh's dry-run diff print was unreachable
+// through the documented local workflow (see docs/issueless-runs.md § harness).
+
+describe("kgScopeReconcileStep — KG_SCOPE_FILE preload", () => {
+  let tmpDir: string;
+  let preloadFile: string;
+  let savedEnv: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgscope-preload-"));
+    preloadFile = join(tmpDir, "kg-scope.json");
+    savedEnv = process.env.KG_SCOPE_FILE;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (savedEnv === undefined) delete process.env.KG_SCOPE_FILE;
+    else process.env.KG_SCOPE_FILE = savedEnv;
+  });
+
+  it("reconciles from KG_SCOPE_FILE and never calls the callback fetch, even when callbackUrl is set", async () => {
+    writeFileSync(
+      preloadFile,
+      JSON.stringify([{ teamKey: "AII", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" }]),
+    );
+    process.env.KG_SCOPE_FILE = preloadFile;
+    writeFileSync(join(tmpDir, "sources.yml"), "trackers:\n  - kind: linear\n    team: AII\n");
+
+    const calls: unknown[] = [];
+    const fetchImpl: typeof fetch = async (...args) => { calls.push(args); return {} as Response; };
+
+    const result = await kgScopeReconcileStep.run(
+      makeContext(),
+      { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl },
+      noopReporter,
+    );
+
+    expect(calls).toHaveLength(0);
+    expect(result.addedRepos).toBe(1);
+    expect(result.addedRepoSlugs).toEqual(["org/new-repo"]);
+    expect(readFileSync(join(tmpDir, "sources.yml"), "utf-8")).toContain("slug: org/new-repo");
+  });
+
+  it("dry run: prints the would-be diff from KG_SCOPE_FILE and changes nothing — the local harness's documented dry-run path", async () => {
+    writeFileSync(
+      preloadFile,
+      JSON.stringify([
+        { teamKey: "AII", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" },
+        { teamKey: "BDS", repo: "org/other-repo", defaultBranch: "main", ticketingProvider: "linear" },
+      ]),
+    );
+    process.env.KG_SCOPE_FILE = preloadFile;
+    const sourcesPath = join(tmpDir, "sources.yml");
+    writeFileSync(sourcesPath, "trackers:\n  - kind: linear\n    team: AII\n");
+    const before = readFileSync(sourcesPath, "utf-8");
+
+    // No callbackUrl at all — the dev harness never wires RUNNER_CALLBACK_URL/RUN_PROGRESS_TOKEN
+    // for kg-refresh runs; KG_SCOPE_FILE must work with callbackUrl absent.
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let result;
+    try {
+      result = await kgScopeReconcileStep.run(
+        makeContext(),
+        { callbackUrl: null, workspaceDir: tmpDir, dryRun: true },
+        noopReporter,
+      );
+      expect(logSpy).toHaveBeenCalledWith("[kg-scope-reconcile] dry-run: would add repos=2 teams=1");
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(result.addedRepos).toBe(2);
+    expect(result.addedTeams).toBe(1);
+    expect(readFileSync(sourcesPath, "utf-8")).toBe(before);
+  });
+
+  it("falls through to normal flow (and skips, absent a callback) when KG_SCOPE_FILE points to a non-existent file", async () => {
+    process.env.KG_SCOPE_FILE = join(tmpDir, "no-such-file.json");
+
+    const result = await kgScopeReconcileStep.run(
+      makeContext(),
+      { callbackUrl: null, workspaceDir: tmpDir },
+      noopReporter,
+    );
+
+    expect(result).toEqual({ addedRepos: 0, addedTeams: 0, addedRepoSlugs: [], addedTeamNames: [], mappedProjectCount: 0 });
+  });
+
+  it("warns and skips (without throwing) when KG_SCOPE_FILE contains invalid JSON", async () => {
+    writeFileSync(preloadFile, "{not valid json");
+    process.env.KG_SCOPE_FILE = preloadFile;
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let result;
+    try {
+      result = await kgScopeReconcileStep.run(
+        makeContext(),
+        { callbackUrl: "http://orch", workspaceDir: tmpDir },
+        noopReporter,
+      );
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("failed to parse KG_SCOPE_FILE"));
+    } finally {
+      warnSpy.mockRestore();
+    }
+    expect(result).toEqual({ addedRepos: 0, addedTeams: 0, addedRepoSlugs: [], addedTeamNames: [], mappedProjectCount: 0 });
+  });
+});
+
 // ── runKgRefresh — dev-harness mode (AI_IMPLEMENT_DEP_TOKEN_OVERRIDE) ─────────
 
 describe("runKgRefresh — dev-harness dep-token-override", () => {
