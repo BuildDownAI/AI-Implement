@@ -259,6 +259,19 @@ the rail alone.
 Steps 5 to 7 exist entirely because of the monolith. In a two-service design the data would be
 reloadable on its own; here it rides a release, so the release has to be sequenced and verified.
 
+### Scope contract
+
+The orchestrator's project mappings are the scope for `sources.yml`. The `kg-scope-reconcile`
+pipeline step (`src/pipeline/steps/kg-scope-reconcile.ts`, [docs/issueless-runs.md](issueless-runs.md)
+§5 "Scope endpoint") runs on every refresh, on the refresh branch, before ingest: it fetches the
+mapping set from `POST /api/runner/kg-scope` and additively maintains the manifest — each mapped
+repo not already `code_repo` or an existing `secondary_repos` entry is added as a secondary, and
+each mapped team not already present is added to `trackers`. It **never removes** an entry (a
+repo or team decommissioned on the orchestrator side stays in `sources.yml` until an operator
+prunes it by hand) and **never touches `docs_sites` or `code_repo`'s `docs_url`** — doc roots stay
+entirely operator-owned, maintained through `bd-mega-kg-refresh` rather than this rail. A refresh
+with nothing to add logs `scope in sync` and leaves the file byte-for-byte unchanged.
+
 ## Refresh rail implementation (AII-426, AII-495)
 
 [AII-426](https://linear.app/eudoxus/issue/AII-426) shipped the local refresh rail; the "Planned"
