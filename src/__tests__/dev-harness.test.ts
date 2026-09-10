@@ -32,6 +32,7 @@ vi.mock("../local/session.js", () => ({
 }));
 
 import { spawnSync } from "node:child_process";
+import { writeFile } from "node:fs/promises";
 import { launchLocalSession } from "../local/session.js";
 import { startDevRun } from "../dev-harness/index.js";
 import { parseTaskFileFromPath } from "../dev-harness/task-file.js";
@@ -311,6 +312,110 @@ describe("startDevRun — kg-refresh phase", () => {
   });
 });
 
+describe("startDevRun — kg-refresh tracker-data source resolution (AII-608)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    makeSpawnSyncMock("main");
+    vi.mocked(launchLocalSession).mockResolvedValue(DEFAULT_SESSION_HANDLE);
+    vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "");
+    vi.stubEnv("GH_TOKEN", "ghs-operator-token");
+    vi.stubEnv("GITHUB_TOKEN", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("rejects naming both options when neither --tracker-data nor the orchestrator env is available", async () => {
+    vi.stubEnv("ORCHESTRATOR_URL", "");
+    vi.stubEnv("ADMIN_ACCESS_CODE", "");
+    vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "");
+
+    await expect(
+      startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh" }),
+    ).rejects.toThrow(/--tracker-data[\s\S]*ORCHESTRATOR_URL/);
+  });
+
+  it("mints an admin session via POST /api/auth when only ADMIN_ACCESS_CODE is set, then fetches the export", async () => {
+    vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
+    vi.stubEnv("ADMIN_ACCESS_CODE", "secret-code");
+    vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "");
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ token: "session-token" }) })
+      .mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([{ id: "1" }]) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const handle = await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", artifactsDir: "/tmp/artifacts" });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "https://orch.example.com/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: "secret-code" }),
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "https://orch.example.com/api/kg/tracker-data", {
+      headers: { Authorization: "Bearer session-token" },
+    });
+    expect(vi.mocked(writeFile)).toHaveBeenCalledWith(
+      "/tmp/artifacts/tracker-data.json",
+      JSON.stringify([{ id: "1" }]),
+    );
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.extraVolumes).toContain("/tmp/artifacts/tracker-data.json:/dev-tracker-data.json:ro");
+    expect(handle.phase).toBe("kg-refresh");
+  });
+
+  it("uses AI_IMPLEMENT_ADMIN_TOKEN directly as a bearer, without minting a session", async () => {
+    vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
+    vi.stubEnv("ADMIN_ACCESS_CODE", "");
+    vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "bearer-token");
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: true, text: async () => JSON.stringify([]) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", artifactsDir: "/tmp/artifacts" });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("https://orch.example.com/api/kg/tracker-data", {
+      headers: { Authorization: "Bearer bearer-token" },
+    });
+  });
+
+  it("--tracker-data always wins over the orchestrator env when both are present", async () => {
+    vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
+    vi.stubEnv("ADMIN_ACCESS_CODE", "secret-code");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh", trackerData: "/tmp/td.json" });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    const opts = vi.mocked(launchLocalSession).mock.calls[0]![0];
+    expect(opts.extraVolumes).toContain("/tmp/td.json:/dev-tracker-data.json:ro");
+  });
+
+  it("rejects when the tracker-data fetch fails", async () => {
+    vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
+    vi.stubEnv("AI_IMPLEMENT_ADMIN_TOKEN", "bearer-token");
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 500 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh" }),
+    ).rejects.toThrow(/kg\/tracker-data.*500/);
+  });
+
+  it("rejects when the admin session mint fails", async () => {
+    vi.stubEnv("ORCHESTRATOR_URL", "https://orch.example.com");
+    vi.stubEnv("ADMIN_ACCESS_CODE", "bad-code");
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 403 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      startDevRun({ workspace: "/tmp/repo", phase: "kg-refresh" }),
+    ).rejects.toThrow(/api\/auth.*403/);
+  });
+});
+
 import { runDevHarnessCli } from "../dev-harness/cli.js";
 import type { DevHarnessCliDependencies } from "../dev-harness/cli.js";
 
@@ -344,29 +449,44 @@ describe("runDevHarnessCli — kg-refresh phase", () => {
     vi.unstubAllEnvs();
   });
 
-  it("exits 1 with --tracker-data message when --tracker-data is missing for kg-refresh", async () => {
+  it("passes trackerData=undefined through when --tracker-data is omitted for kg-refresh — startDevRun decides whether a source is available", async () => {
+    const deps = makeCliDeps();
+    const result = await runDevHarnessCli(
+      ["--workspace", "/tmp/repo", "--phase", "kg-refresh"],
+      deps,
+    );
+    expect(result).toBe(0);
+    expect(deps.startDevRun).toHaveBeenCalledWith(expect.objectContaining({ trackerData: undefined }));
+  });
+
+  it("surfaces a startDevRun rejection (e.g. no tracker data source available) as exit 1 with a stderr message, not an unhandled rejection", async () => {
     const writeStderr = vi.fn();
     const result = await runDevHarnessCli(
       ["--workspace", "/tmp/repo", "--phase", "kg-refresh"],
-      makeCliDeps({ writeStderr }),
+      makeCliDeps({
+        writeStderr,
+        startDevRun: vi.fn().mockRejectedValue(new Error(
+          "kg-refresh needs tracker data: pass --tracker-data <file>, or set ORCHESTRATOR_URL plus " +
+          "ADMIN_ACCESS_CODE or AI_IMPLEMENT_ADMIN_TOKEN in the operator's env so the harness can fetch it.",
+        )),
+      }),
     );
     expect(result).toBe(1);
     expect(writeStderr).toHaveBeenCalledWith(expect.stringContaining("--tracker-data"));
+    expect(writeStderr).toHaveBeenCalledWith(expect.stringContaining("ORCHESTRATOR_URL"));
   });
 
   it("does not block --until for kg-refresh (guard only applies to planning/full)", async () => {
-    const writeStderr = vi.fn();
+    const deps = makeCliDeps();
     const result = await runDevHarnessCli(
       ["--workspace", "/tmp/repo", "--phase", "kg-refresh", "--until", "clone"],
-      makeCliDeps({ writeStderr }),
+      deps,
     );
-    // Should fail because --tracker-data is missing, NOT because of the --until guard
-    expect(result).toBe(1);
-    const calls = writeStderr.mock.calls.map((c) => c[0] as string);
+    expect(result).toBe(0);
+    const calls = vi.mocked(deps.writeStderr).mock.calls.map((c) => c[0] as string);
     const hasUntilGuard = calls.some((msg) => msg.includes("--until and --shell are only supported"));
     expect(hasUntilGuard).toBe(false);
-    const hasTrackerDataMsg = calls.some((msg) => msg.includes("--tracker-data"));
-    expect(hasTrackerDataMsg).toBe(true);
+    expect(deps.startDevRun).toHaveBeenCalledWith(expect.objectContaining({ untilStep: "clone" }));
   });
 
   it("still blocks --until for --phase planning", async () => {

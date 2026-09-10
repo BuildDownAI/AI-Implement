@@ -48,10 +48,12 @@ export interface DevRunOptions {
   /** Runner phase. Defaults to implementation. */
   phase?: DevRunPhase;
   /**
-   * Path to the pre-fetched tracker-data JSON file. Required when phase=kg-refresh.
+   * Path to a pre-fetched tracker-data JSON file — the offline path for phase=kg-refresh.
    * Mounted read-only at /dev-tracker-data.json inside the container; the
    * kg-tracker-data step detects KG_TRACKER_DATA_FILE=/dev-tracker-data.json and
-   * uses the file instead of fetching from the orchestrator.
+   * uses the file instead of fetching from the orchestrator. When absent and
+   * phase=kg-refresh, startDevRun fetches the export itself from ORCHESTRATOR_URL
+   * (see resolveKgTrackerDataFile) using an admin credential from the operator's env.
    */
   trackerData?: string;
   /**
@@ -111,6 +113,66 @@ function detectRepoFromOrigin(workspaceDir: string): { owner: string; repo: stri
 function sanitizeContainerName(identifier: string): string {
   const slug = identifier.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
   return `ai-implement-dev-${slug || "task"}-${Date.now().toString(36)}`;
+}
+
+/**
+ * Resolves the tracker-data file to mount for a kg-refresh run: `opts.trackerData`
+ * when given (the offline path, always wins), otherwise fetches the export from the
+ * orchestrator using an admin credential from the operator's env — never both. Mints
+ * a session via POST /api/auth the way the admin UI does when only ADMIN_ACCESS_CODE
+ * is set; AI_IMPLEMENT_ADMIN_TOKEN is used directly as an already-valid bearer.
+ * Neither `opts.trackerData` nor the orchestrator env present throws, naming both
+ * options. Logs which source supplied the data.
+ */
+async function resolveKgTrackerDataFile(opts: DevRunOptions, artifactsDir: string): Promise<string> {
+  if (opts.trackerData) {
+    const filePath = resolve(opts.trackerData);
+    console.log(`[dev-harness] tracker data source: file ${filePath}`);
+    return filePath;
+  }
+
+  const orchestratorUrl = process.env.ORCHESTRATOR_URL?.trim();
+  const adminToken = process.env.AI_IMPLEMENT_ADMIN_TOKEN?.trim();
+  const accessCode = process.env.ADMIN_ACCESS_CODE?.trim();
+
+  if (!orchestratorUrl || (!adminToken && !accessCode)) {
+    throw new Error(
+      "kg-refresh needs tracker data: pass --tracker-data <file>, or set ORCHESTRATOR_URL plus " +
+      "ADMIN_ACCESS_CODE or AI_IMPLEMENT_ADMIN_TOKEN in the operator's env so the harness can fetch it.",
+    );
+  }
+
+  const base = orchestratorUrl.replace(/\/+$/, "");
+  let bearer: string;
+  if (adminToken) {
+    bearer = adminToken;
+  } else {
+    const authRes = await fetch(`${base}/api/auth`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: accessCode }),
+    });
+    if (!authRes.ok) {
+      throw new Error(`Failed to mint an admin session from ${base}/api/auth: HTTP ${authRes.status}`);
+    }
+    const authBody = (await authRes.json()) as { token?: string };
+    if (!authBody.token) {
+      throw new Error(`Admin session mint at ${base}/api/auth did not return a token`);
+    }
+    bearer = authBody.token;
+  }
+
+  const res = await fetch(`${base}/api/kg/tracker-data`, {
+    headers: { Authorization: `Bearer ${bearer}` },
+  });
+  if (!res.ok) {
+    throw new Error(`GET ${base}/api/kg/tracker-data failed: HTTP ${res.status}`);
+  }
+  const body = await res.text();
+  const filePath = join(artifactsDir, "tracker-data.json");
+  await writeFile(filePath, body);
+  console.log(`[dev-harness] tracker data source: fetched from ${base}/api/kg/tracker-data`);
+  return filePath;
 }
 
 /**
@@ -191,7 +253,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
     // kg-refresh runs non-mounted: the KG source repo is cloned from file:///kg-source
     // inside the container. AI_IMPLEMENT_DEP_TOKEN_OVERRIDE carries the operator's GH_TOKEN
     // to satisfy clone-secondary-repos without an orchestrator token vend.
-    const trackerData = opts.trackerData ? resolve(opts.trackerData) : "";
+    const trackerData = await resolveKgTrackerDataFile(opts, artifactsDir);
     const operatorGhToken = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? githubToken;
 
     const allEnv: Record<string, string> = {
@@ -231,7 +293,7 @@ export async function startDevRun(opts: DevRunOptions): Promise<DevRunHandle> {
       secretEnv,
       extraVolumes: [
         `${workspace}:/kg-source:ro`,
-        ...(trackerData ? [`${trackerData}:/dev-tracker-data.json:ro`] : []),
+        `${trackerData}:/dev-tracker-data.json:ro`,
       ],
     });
 
