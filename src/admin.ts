@@ -71,7 +71,7 @@ import { enqueueWorkflowSync, runWorkflowSync, getWorkflowSyncById } from "./wor
 import type { KgRefreshStatus } from "./kg-refresh.js";
 import { normalizeBranchPrefix } from "./pipeline/branch-name.js";
 import { normalizeGitHubRepo, normalizeReferenceRepos, type ReferenceRepo } from "./reference-repos.js";
-import { fetchTrackerIssuesPage } from "./runner-callback.js";
+import { fetchTrackerIssuesPage, buildKgScopeEntries } from "./runner-callback.js";
 import { isLinearAuthConfigured } from "./linear-app-auth.js";
 import picomatch from "picomatch";
 
@@ -528,6 +528,15 @@ export function handleAdminRequest(
           json(res, 500, { error: String(err) });
         }
       })();
+      return true;
+    }
+
+    // Admin-authenticated export of the orchestrator's mapping list for the kg-refresh dev
+    // harness's local kg-scope-reconcile dry run — same four-field shape and projection
+    // (buildKgScopeEntries) as the runner-only POST /api/runner/kg-scope, just gated by an
+    // admin session instead of a progress token minted for a live dispatch.
+    if (url === "/api/kg/scope" && method === "GET") {
+      json(res, 200, buildKgScopeEntries(getMappings()));
       return true;
     }
 

@@ -3344,6 +3344,50 @@ describe("GET /api/kg/tracker-data — no team (default all-teams scope)", () =>
   });
 });
 
+// ---------- GET /api/kg/scope (AII-604 gap-fill) ----------
+//
+// Admin-authenticated mirror of POST /api/runner/kg-scope: same four-field projection
+// (buildKgScopeEntries), gated by an admin session instead of a progress token, so the
+// kg-refresh dev harness can fetch it and let kg-scope-reconcile's dry run exercise a
+// real diff without a live orchestrator callback.
+
+describe("GET /api/kg/scope", () => {
+  async function scopeRequest(token?: string): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest("/api/kg/scope", "GET", token ? { authorization: `Bearer ${token}` } : {});
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider));
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  it("returns 401 when unauthenticated", async () => {
+    const res = await scopeRequest();
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("returns 200 with an empty array when there are no mappings", async () => {
+    const token = await login("secret");
+    const res = await scopeRequest(token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual([]);
+  });
+
+  it("returns the same four-field shape as the runner-authenticated route, for every mapping", async () => {
+    const token = await login("secret");
+    await request("/api/mappings", "POST", "secret", { teamKey: "AII", owner: "org", repo: "aii" }, token);
+    await request("/api/mappings", "POST", "secret", { teamKey: "BUI", owner: "org", repo: "bui" }, token);
+
+    const res = await scopeRequest(token);
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as Array<Record<string, unknown>>;
+    expect(body).toHaveLength(2);
+    const aii = body.find((m) => m.teamKey === "AII");
+    expect(aii).toMatchObject({ teamKey: "AII", repo: "org/aii", ticketingProvider: "linear" });
+    expect(Object.keys(aii!).sort()).toEqual(["defaultBranch", "repo", "teamKey", "ticketingProvider"]);
+  });
+});
+
 // ---------- admin sessions — kg-refresh destroy (AII-521) ----------
 
 describe("admin sessions — kg-refresh destroy", () => {

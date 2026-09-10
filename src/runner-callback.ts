@@ -637,6 +637,24 @@ export interface HandleKgScopeOutput {
 }
 
 /**
+ * Projects the orchestrator's mapping set down to `{ teamKey, repo, defaultBranch,
+ * ticketingProvider }` — the four fields a kg-scope-reconcile diff needs and the only
+ * ones ever allowed to cross the runner boundary (no credential, no ticketingConfig).
+ * Shared by the runner-authenticated `/api/runner/kg-scope` route and the admin-authenticated
+ * `GET /api/kg/scope` export so the two callers can never drift on shape.
+ */
+export function buildKgScopeEntries(
+  mappings: Record<string, { owner: string; repo: string; defaultBranch: string; ticketingProvider: string }>,
+): KgScopeEntry[] {
+  return Object.entries(mappings).map(([teamKey, m]) => ({
+    teamKey,
+    repo: `${m.owner}/${m.repo}`,
+    defaultBranch: m.defaultBranch,
+    ticketingProvider: m.ticketingProvider,
+  }));
+}
+
+/**
  * Returns the orchestrator's full mapping set as `{ teamKey, repo, defaultBranch,
  * ticketingProvider }` — the scope a kg-refresh's kg-scope-reconcile step reconciles
  * sources.yml against. Callable only by kg-refresh runs; any other phase or a missing/
@@ -658,14 +676,7 @@ export async function handleKgScopeRequest(input: HandleKgScopeInput): Promise<H
 
   if (verified.claims.phase !== "kg-refresh") return { status: 403, body: { error: "Unauthorized" } };
 
-  const mappings = input.getMappings();
-  const scope: KgScopeEntry[] = Object.entries(mappings).map(([teamKey, m]) => ({
-    teamKey,
-    repo: `${m.owner}/${m.repo}`,
-    defaultBranch: m.defaultBranch,
-    ticketingProvider: m.ticketingProvider,
-  }));
-  return { status: 200, body: scope };
+  return { status: 200, body: buildKgScopeEntries(input.getMappings()) };
 }
 
 /**
