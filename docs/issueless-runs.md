@@ -486,15 +486,20 @@ After the refresh PR is open, `kg-snapshot-push` classifies the run and, for exa
 
 The dev harness supports a `--phase kg-refresh` mode that runs the kg-refresh pipeline locally without an orchestrator, without mounted-workspace mode, and without contacting GitHub for the primary clone. It is the fastest way to verify `sources.yml` changes and the snapshot guard locally before dispatching a real run.
 
-**Producing `td.json`:** `GET /api/kg/tracker-data?team=<teamKey>` is an admin-bearer-authenticated route (same gate as `GET /api/kg/status`) that loops `fetchTrackerIssuesPage` — the same Linear-fetching function `POST /api/runner/kg-tracker-data` uses — across every page for the team and returns the flat JSON array of issues that `KG_TRACKER_DATA_FILE` expects, so an operator can produce `td.json` without a runner progress token:
+**The harness fetches tracker data itself by default (AII-608).** When `--tracker-data` is omitted, `startDevRun` reads `ORCHESTRATOR_URL` plus an admin credential (`ADMIN_ACCESS_CODE`, or a bearer in `AI_IMPLEMENT_ADMIN_TOKEN`) from the operator's env, mints an admin session the way the admin UI does (or uses the bearer directly when `AI_IMPLEMENT_ADMIN_TOKEN` is set), calls `GET /api/kg/tracker-data` with no `team` — the union of every team in scope, deduplicated by issue id — and writes the result to `.dev-runs/<timestamp>/tracker-data.json` before mounting it exactly where a file passed via `--tracker-data` would be mounted. The harness logs which source supplied the data (`file <path>` vs `fetched from <url>/api/kg/tracker-data`). Neither option present (no `--tracker-data` and no usable orchestrator env) fails fast, naming both options.
+
+```bash
+npm run dev:run -- \
+  --phase kg-refresh \
+  --workspace ../knowledge-graph-ai-implement \
+  --until clone-secondary-repos
+# ORCHESTRATOR_URL and ADMIN_ACCESS_CODE (or AI_IMPLEMENT_ADMIN_TOKEN) must be set in the shell.
+```
+
+**`--tracker-data <file>` stays the offline path** and always wins when given, regardless of whether the orchestrator env is also set. `GET /api/kg/tracker-data` with no `team` is what the harness calls above; `?team=<teamKey>` (unchanged single-team behavior, same admin-bearer gate as `GET /api/kg/status`) still exists for producing a one-team file by hand:
 
 ```bash
 curl -H "Authorization: Bearer <admin>" "http://localhost:8080/api/kg/tracker-data?team=AII" > td.json
-```
-
-An unmapped `team` returns 403; a missing/invalid admin bearer returns 401.
-
-```bash
 npm run dev:run -- \
   --phase kg-refresh \
   --workspace ../knowledge-graph-ai-implement \
@@ -502,10 +507,12 @@ npm run dev:run -- \
   --until clone-secondary-repos
 ```
 
+An unmapped `team` returns 403; a missing/invalid admin bearer returns 401; an unconfigured tracker (no Linear auth) returns 503 for either form. A `td.json` produced by hand from a single team is a **partial file relative to the default export** — a partial file trips the snapshot guard the same way a genuinely stale one would (the regression guard cannot tell "this team was never fetched" from "this team lost issues"), so prefer the no-`team` export or the harness's automatic fetch for anything beyond a single-team smoke test.
+
 **What differs from a dispatched run:**
 
 - The KG source checkout is bind-mounted read-only at `/kg-source`. The `clone` step is replaced with `devHarnessKgCloneStep`, which clones from `file:///kg-source` into the container's scratch workspace. The runner entrypoint has already cloned the repo from GitHub into `/workspace` by then (it does so for every non-mounted run); the harness step clears that throwaway clone and replaces it with the `file:///kg-source` clone (AII-600). Uncommitted edits to `sources.yml` therefore take effect immediately.
-- `--tracker-data <file>` is required. The file is the pre-fetched body of `POST /api/runner/kg-tracker-data` (one team's worth). It is bind-mounted at `/dev-tracker-data.json`; the `kg-tracker-data` step detects `KG_TRACKER_DATA_FILE` and uses it rather than calling the orchestrator.
+- The tracker-data file (from either source above) is bind-mounted at `/dev-tracker-data.json`; the `kg-tracker-data` step detects `KG_TRACKER_DATA_FILE` and uses it rather than calling the orchestrator itself.
 - The operator's `GH_TOKEN` is injected as `AI_IMPLEMENT_DEP_TOKEN_OVERRIDE`, which forces `dependencyTokenScope` on for the run (the dev harness never encodes it into the `AI_IMPLEMENT_RUN_CONFIG` envelope the way a dispatched run's project mapping does) and swaps in a stub `dependency-auth` step that marks `acquired=true`. The stub authenticates the code and secondary repos exactly the way a dispatched run does: it caches the operator's token at `/tmp/ai-implement-dep-token-<pid>.json` with `expires_at: null` and registers the same `session/git-credential-helper.sh` as the global `https://github.com` credential helper, which `clone-code-repo` and `clone-secondary-repos` rely on since they clone bare `https://github.com/...` URLs with no token embedded. `devHarnessKgCloneStep` only overrides the primary workspace clone (`file:///kg-source`); calls carrying `targetDir` or `targets` (the code-repo and secondary-repo clones) delegate straight through to the real `cloneStep`. If the token lacks `contents: read` on a secondary repo, the clone fails with a 404/403 — exactly the parity check the harness is designed to surface. `expires_at: null` is deliberate: the credential helper's refresh branch is a no-op without a callback URL and progress token, both absent locally, so there is nothing to refresh against.
 - A skipped step now logs `[runner] skipping <id>: <reason>` — useful here since a misconfigured `sources.yml` or a token that never got registered shows up as a specific line instead of quietly producing no output.
 - `kg-snapshot-push` runs in dry-run mode (`AI_IMPLEMENT_KG_DRY_RUN=true`). Guards and validation run in full; the refresh report (the same markdown that becomes the refresh PR body on a real run) is printed to the log; no commit, push, branch or PR happens.

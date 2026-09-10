@@ -3885,6 +3885,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         flySessionsRegion: config.flySessionsRegion,
         githubAppId: config.githubAppId,
         githubAppPrivateKey: config.githubAppPrivateKey,
+        kgSourceRepo: config.kgSourceRepo,
         pollNow: () => {
           // poll() claims beginCycle synchronously before its first await.
           const before = getPollStats().pollCount;

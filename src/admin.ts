@@ -1,4 +1,9 @@
 import http from "node:http";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 import {
   getMappings,
   DEFAULT_MAX_IN_PROGRESS_AI_ISSUES,
@@ -35,6 +40,7 @@ import { getEffectiveAllowlist, getEnvAllowlist, listAccessEntries, parseAccessE
 import { listAccessChanges } from "./access-audit.js";
 import { listGrantedPages, PAGE_ROUTES, savePageGrants } from "./access-page-grants.js";
 import type { DeployStart } from "./deploy.js";
+import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { getDeployOutcome } from "./deploy-notify.js";
 import { getAvailability, refreshAvailability, resolveDeployTarget, type SelfDeployTarget } from "./deploy-availability.js";
 import { getDeployPolicy, getLastActedCommit, setDeployPolicy, type DeployPolicy } from "./deploy-policy.js";
@@ -50,9 +56,9 @@ import type { ProviderRegistry } from "./providers/registry.js";
 import { resolveInFlightSiblings, selectBlockers, selectFileOverlapDeferrals, getOrFetchPlanningContexts } from "./poll-selection.js";
 import { adminHtml } from "./admin-html.js";
 import { getOrchestratorSettings, setOrchestratorSetting } from "./orchestrator-settings.js";
-import { getInstallationToken, mintSourceTokenOrJwt } from "./github-app-auth.js";
+import { getInstallationToken, mintSourceTokenOrJwt, getScopedInstallationToken } from "./github-app-auth.js";
 import { GitHubApiError } from "./github-errors.js";
-import { listRepoBranchesAndTags, getRepoDefaultBranch, cancelWorkflowRun } from "./github.js";
+import { listRepoBranchesAndTags, getRepoDefaultBranch, cancelWorkflowRun, fetchRepoTarball } from "./github.js";
 import { probeInstallState } from "./github-install-state.js";
 import { listCustomizations } from "./customizations.js";
 import { getFleetReport } from "./report-card.js";
@@ -165,6 +171,103 @@ async function fetchAllTrackerIssuesForTeam(
   return { ok: true, issues };
 }
 
+/**
+ * Reads `trackers[].team` from an extracted sources.yml, same parsing rules as the
+ * runner-side reader in pipeline/steps/kg-tracker-data.ts (YAML first, indented
+ * `team:` regex fallback for a malformed file). Duplicated rather than imported
+ * because that reader is workspace/fs-oriented for a runner checkout, while this
+ * one reads a scratch dir populated from a GitHub tarball fetch outside a runner.
+ */
+function readTrackerTeamsFromSourceDir(sourceDir: string): string[] {
+  const filePath = join(sourceDir, "sources.yml");
+  if (!existsSync(filePath)) return [];
+
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+
+  try {
+    const doc = parseYaml(raw) as unknown;
+    if (
+      doc !== null &&
+      typeof doc === "object" &&
+      Array.isArray((doc as Record<string, unknown>).trackers)
+    ) {
+      const teams = ((doc as Record<string, unknown>).trackers as unknown[])
+        .filter(
+          (t): t is Record<string, unknown> =>
+            t !== null && typeof t === "object" && !Array.isArray(t),
+        )
+        .map((t) => (typeof t.team === "string" ? t.team.trim() : null))
+        .filter((t): t is string => t !== null && t.length > 0);
+      if (teams.length > 0) return teams;
+    }
+  } catch {
+    // Fall through to regex fallback
+  }
+
+  const matches = [...raw.matchAll(/^\s+team:\s+(\S+)/gm)];
+  return matches.map((m) => m[1]);
+}
+
+/**
+ * Resolves the team-in-scope manifest half of the union for the no-team
+ * GET /api/kg/tracker-data path: fetches the KG source repo's sources.yml off its
+ * default branch (same read-token/tarball/extract pattern as runKgRefreshPreflight)
+ * and reads trackers[].team from it. Fails soft to an empty list — no KG source repo
+ * configured, or any step of the fetch failing, both just mean "no manifest teams",
+ * so the union falls back to mapped teams alone rather than 500ing the request.
+ */
+async function resolveKgManifestTeams(
+  kgSourceRepo: string | null | undefined,
+  githubAppId: string,
+  githubAppPrivateKey: string,
+): Promise<string[]> {
+  if (!kgSourceRepo) return [];
+  let tmpDir: string | null = null;
+  try {
+    const repo = parseKgSourceRepo(kgSourceRepo);
+    const { token } = await getScopedInstallationToken(githubAppId, githubAppPrivateKey, repo.owner, {
+      permissions: { contents: "read" },
+      repositories: [repo.repo],
+    });
+    const branch = await getRepoDefaultBranch(token, repo.owner, repo.repo);
+    if (!branch) return [];
+    const tarball = await fetchRepoTarball(token, repo.owner, repo.repo, branch);
+    tmpDir = await mkdtemp(join(tmpdir(), "kg-scope-teams-"));
+    const sourceDir = await extractSource(tarball, tmpDir);
+    return readTrackerTeamsFromSourceDir(sourceDir);
+  } catch (err) {
+    console.warn(
+      `[admin] failed to read KG manifest teams from sources.yml: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return [];
+  } finally {
+    if (tmpDir) await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Union of every team currently in scope for the KG: the KG repo's sources.yml
+ * trackers: manifest, plus every mapped team with a Linear ticketing provider (the
+ * only provider fetchAllTrackerIssuesForTeam supports). Jira-mapped teams are
+ * silently excluded rather than attempted and failed.
+ */
+async function resolveKgScopeTeams(
+  kgSourceRepo: string | null | undefined,
+  githubAppId: string,
+  githubAppPrivateKey: string,
+): Promise<string[]> {
+  const manifestTeams = await resolveKgManifestTeams(kgSourceRepo, githubAppId, githubAppPrivateKey);
+  const linearMappedTeams = Object.entries(getMappings())
+    .filter(([, m]) => m.ticketingProvider === "linear")
+    .map(([key]) => key);
+  return [...new Set([...manifestTeams, ...linearMappedTeams])];
+}
+
 function shapeIssue(i: TicketIssue, bucket: "ready" | "needs-planning") {
   return {
     id: i.id,
@@ -219,6 +322,8 @@ export interface AdminConfig {
   githubAppPrivateKey: string;
   /** AII-306: runner-mode swaps fire a plain-text notification when set. */
   notifyWebhookUrl?: string | null;
+  /** KG source repo (owner/repo), when configured. Used to read sources.yml's trackers: list for the default no-team scope of GET /api/kg/tracker-data. */
+  kgSourceRepo?: string | null;
 }
 
 export interface AdminDeps {
@@ -348,28 +453,60 @@ export function handleAdminRequest(
     // Admin-authenticated export of tracker data for the kg-refresh dev harness's
     // --tracker-data flag — same underlying Linear read as the runner-only
     // POST /api/runner/kg-tracker-data, aggregated across pages for one team.
+    // With no ?team=, exports the union of every team in scope (the KG repo's
+    // sources.yml manifest plus every Linear-mapped team), deduplicated by issue id —
+    // the harness's default fetch when no --tracker-data file is given (AII-608).
     if (url.startsWith("/api/kg/tracker-data") && method === "GET") {
       const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
       const team = new URLSearchParams(qs).get("team");
       const mappedKeys = Object.keys(getMappings());
-      if (!team || !mappedKeys.includes(team)) {
-        json(res, 403, { error: "Unauthorized" });
+
+      if (team) {
+        if (!mappedKeys.includes(team)) {
+          json(res, 403, { error: "Unauthorized" });
+          return true;
+        }
+        if (!isLinearAuthConfigured()) {
+          json(res, 503, { error: "Tracker not configured" });
+          return true;
+        }
+        fetchAllTrackerIssuesForTeam(team).then(
+          (result) => {
+            if (!result.ok) {
+              json(res, result.status, { error: result.error });
+            } else {
+              json(res, 200, result.issues);
+            }
+          },
+          (err) => json(res, 500, { error: String(err) }),
+        );
         return true;
       }
+
       if (!isLinearAuthConfigured()) {
         json(res, 503, { error: "Tracker not configured" });
         return true;
       }
-      fetchAllTrackerIssuesForTeam(team).then(
-        (result) => {
-          if (!result.ok) {
-            json(res, result.status, { error: result.error });
-          } else {
-            json(res, 200, result.issues);
+      (async () => {
+        try {
+          const scopeTeams = await resolveKgScopeTeams(config.kgSourceRepo, config.githubAppId, config.githubAppPrivateKey);
+          const byId = new Map<string, unknown>();
+          for (const scopeTeam of scopeTeams) {
+            const result = await fetchAllTrackerIssuesForTeam(scopeTeam);
+            if (!result.ok) {
+              json(res, result.status, { error: result.error });
+              return;
+            }
+            for (const issue of result.issues) {
+              const id = issue !== null && typeof issue === "object" ? (issue as Record<string, unknown>).id : undefined;
+              byId.set(typeof id === "string" ? id : JSON.stringify(issue), issue);
+            }
           }
-        },
-        (err) => json(res, 500, { error: String(err) }),
-      );
+          json(res, 200, [...byId.values()]);
+        } catch (err) {
+          json(res, 500, { error: String(err) });
+        }
+      })();
       return true;
     }
 
