@@ -31,7 +31,7 @@ flowchart TD
     C -->|"newer snapshot in source repo"| H["local staging rail\nfetch → stage → swap → verify"]
     C -->|"ingest-needed"| D["mintRunToken phase=kg-refresh\nappendLog issueId=kg-refresh"]
     D --> E["Fly Machine or\nlocal Docker\nrunConfig + runToken"]
-    E --> F["runner pipeline\nclone → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest\n→ kg-snapshot-push"]
+    E --> F["runner pipeline\nclone → kg-scope-reconcile → dependency-auth → clone-code-repo → clone-secondary-repos\n→ kg-tracker-data → kg-ingest\n→ kg-snapshot-push"]
     F --> G["POST /api/runner/result\nphase=kg-refresh"]
     G --> I["onRunnerComplete()\nmerge refresh PR (merge commit)\ndelete the kg-refresh branch\nverify snapshot commit"]
     I --> H
@@ -66,6 +66,7 @@ Both run tokens are minted with the team key of the KG source repo's own project
 | Client | Appends | Served route |
 |---|---|---|
 | `runner-result.ts` `postRunnerResult` | `/runner/result` | `POST /runner/result` |
+| `pipeline/steps/kg-scope-reconcile.ts` | `/api/runner/kg-scope` | `POST /api/runner/kg-scope` |
 | `pipeline/steps/kg-tracker-data.ts` | `/api/runner/kg-tracker-data` | `POST /api/runner/kg-tracker-data` |
 | `runner-result.ts` `fetchPlanningContextFromOrchestrator` | `/runner/planning-context` | `GET /runner/planning-context` |
 
@@ -262,6 +263,25 @@ The runner calls `GET /api/runner/kg-push-token` to receive a `contents: write` 
 - Verifies the bearer token with `audience = "progress"` (multi-use, non-consuming, so the git credential helper can re-mint on expiry)
 - Phase-gates: only `phase === "kg-refresh"` tokens are accepted
 - Returns a token scoped exclusively to `owner/repo` of `KG_SOURCE_REPO`
+
+### Scope endpoint
+
+The `kg-scope-reconcile` pipeline step (`src/pipeline/steps/kg-scope-reconcile.ts`) runs immediately after `clone`, before `dependency-auth`, and calls `POST /api/runner/kg-scope` once per refresh to fetch the orchestrator's full mapping set:
+
+```
+POST /api/runner/kg-scope
+Authorization: Bearer <RUN_PROGRESS_TOKEN>
+```
+
+The endpoint (`handleKgScopeRequest` in `src/runner-callback.ts`) is gated the same way as the tracker-data endpoint: bearer required (403 if missing/invalid), `audience = "progress"` verified against `RUNNER_TOKEN_SECRET`, and `phase !== "kg-refresh"` rejected with 403. There is no per-team membership check — the route returns every configured mapping, not one team's data. The response body is a flat array, one entry per mapping and nothing else:
+
+```json
+[
+  { "teamKey": "AII", "repo": "BuildDownAI/AI-Implement", "defaultBranch": "main", "ticketingProvider": "linear" }
+]
+```
+
+Only these four fields cross the boundary — no `ticketingConfig`, token, or other credential-shaped field ever leaves the orchestrator. The step diffs this scope against `secondary_repos`/`trackers` already present in the cloned `sources.yml` and appends any missing entries (see `docs/kg-architecture.md`'s "Scope contract" section for what the rail will and will not touch).
 
 ### Tracker-data endpoint
 
@@ -612,6 +632,8 @@ Persist stage + start time to the `settings` table. On orchestrator boot, load t
 | Runner token mint/verify | `src/runner-tokens.ts` |
 | dispatch_log row (schema, write, query) | `src/log.ts` (`appendLog`, `getInFlightJobs`, `getInFlightKgRefreshJobs`) |
 | Callback routing carve-out | `src/runner-callback.ts` (~line 252) |
+| Scope endpoint | `src/index.ts` (`/api/runner/kg-scope` handler), `src/runner-callback.ts` (`handleKgScopeRequest`) |
+| Scope reconcile pipeline step | `src/pipeline/steps/kg-scope-reconcile.ts` |
 | Tracker-data endpoint | `src/index.ts` (`/api/runner/kg-tracker-data` handler) |
 | Tracker-data pipeline step | `src/pipeline/steps/kg-tracker-data.ts` |
 | Secondary repo clone step | `src/pipeline/steps/clone.ts` (targets input) |
