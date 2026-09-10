@@ -26,6 +26,8 @@ import {
   checkForcedPathEligibility,
   getFlyProcessLevelSecrets,
   setFlyProcessLevelSecrets,
+  getKgMaterializeDirect,
+  setKgMaterializeDirect,
   type RunnerMode,
 } from "./runner-mode.js";
 import { listDispatched, deleteDispatched, getReaperSummary, listReaperActions, getDispatchedIds } from "./dedup.js";
@@ -342,6 +344,25 @@ export function handleAdminRequest(
         (body) => json(res, 200, body),
         (err) => json(res, 500, { error: String(err) }),
       );
+      return true;
+    }
+
+    if (url === "/api/kg/materialize-mode" && method === "GET") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      const status = getKgMaterializeDirect();
+      json(res, 200, { direct: status.enabled, source: status.source });
+      return true;
+    }
+
+    if (url === "/api/kg/materialize-mode" && method === "POST") {
+      if (!deps.kgRefresh) {
+        json(res, 501, { error: "KG refresh is not configured" });
+        return true;
+      }
+      handleSetKgMaterializeMode(req, res);
       return true;
     }
 
@@ -895,6 +916,38 @@ async function handleSetRunnerMode(
     }
 
     json(res, 200, { ...modeStatus, flyProcessLevelSecrets: secretsStatus });
+  } catch {
+    json(res, 400, { error: "Invalid request body" });
+  }
+}
+
+async function handleSetKgMaterializeMode(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as { direct?: boolean };
+    if (typeof body.direct !== "boolean") {
+      json(res, 400, { error: "direct must be a boolean" });
+      return;
+    }
+
+    setKgMaterializeDirect(body.direct);
+    const status = getKgMaterializeDirect();
+
+    // The DB write succeeded but an env var still wins at runtime. Return 409
+    // so direct API callers can tell their write was overridden.
+    if (status.source === "env") {
+      json(res, 409, {
+        error: "KG_MATERIALIZE_DIRECT env var is set; persisted to DB but has no effect at runtime until the env var is unset",
+        persisted: body.direct,
+        direct: status.enabled,
+        source: status.source,
+      });
+      return;
+    }
+
+    json(res, 200, { direct: status.enabled, source: status.source });
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }

@@ -102,6 +102,15 @@ export const deploymentsHtml = `
           <button class="btn btn-sm" id="kg-refresh-btn" onclick="window.triggerKgRefresh()">Refresh graph now</button>
           <span class="kpi-trend text-secondary" style="margin-left: 8px">Fetches the KG source repo's committed snapshot and restarts the sidecar — no deploy, no dispatch pause.</span>
         </div>
+        <div id="kg-materialize-env-warning" class="warning hidden">&#x26A0; KG_MATERIALIZE_DIRECT env var is set &#x2014; UI toggle has no effect until it is unset.</div>
+        <div style="margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap">
+          <span class="kpi-trend text-secondary">Materialize:</span>
+          <span class="seg" id="kg-materialize-controls">
+            <button class="btn btn-sm" id="btn-kg-materialize-rdflib" data-materialize="rdflib" onclick="window.setKgMaterializeDirect(false)">rdflib</button>
+            <button class="btn btn-sm" id="btn-kg-materialize-direct" data-materialize="direct" onclick="window.setKgMaterializeDirect(true)">direct</button>
+          </span>
+          <span class="kpi-trend text-secondary" id="kg-materialize-source"></span>
+        </div>
       </div>
     </div>
 
@@ -663,6 +672,47 @@ export const deploymentsScript = `
     setTimeout(loadKgStatus, 1000);
   };
 
-  window.registerPage('deployments', function () { loadDeployments(); loadKgStatus(); setInterval(loadDeployments, 30000); setInterval(loadKgStatus, 15000); });
+  async function loadKgMaterializeMode() {
+    try {
+      const res = await window.api('/api/kg/materialize-mode');
+      if (!res.ok) return;
+      const data = await res.json();
+      const direct = !!data.direct;
+      const envPinned = data.source === 'env';
+      document.getElementById('btn-kg-materialize-rdflib').classList.toggle('btn-primary', !direct);
+      document.getElementById('btn-kg-materialize-direct').classList.toggle('btn-primary', direct);
+      document.getElementById('btn-kg-materialize-rdflib').disabled = envPinned;
+      document.getElementById('btn-kg-materialize-direct').disabled = envPinned;
+      document.getElementById('kg-materialize-source').textContent = '(' + data.source + ')';
+      const warning = document.getElementById('kg-materialize-env-warning');
+      if (envPinned) {
+        warning.classList.remove('hidden');
+      } else {
+        warning.classList.add('hidden');
+      }
+    } catch (e) { /* transient \u2014 next poll retries */ }
+  }
+
+  window.setKgMaterializeDirect = async function (direct) {
+    try {
+      const res = await window.api('/api/kg/materialize-mode', { method: 'POST', body: JSON.stringify({ direct: direct }) });
+      if (!res.ok && res.status !== 401) {
+        const body = await res.json().catch(function () { return {}; });
+        showMessage('warning', 'Could not change materialize mode \u2014 ' + (body.error || res.status));
+      }
+    } catch (err) {
+      showMessage('warning', 'Could not change materialize mode \u2014 ' + String(err));
+    }
+    loadKgMaterializeMode();
+  };
+
+  window.registerPage('deployments', function () {
+    loadDeployments();
+    loadKgStatus();
+    loadKgMaterializeMode();
+    setInterval(loadDeployments, 30000);
+    setInterval(loadKgStatus, 15000);
+    setInterval(loadKgMaterializeMode, 15000);
+  });
 })();
 `;

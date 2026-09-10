@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeKgRefresh, runKgRefreshPreflight, materializeArgs, type KgRefreshHandle, type KgRefreshStage, type RefreshOutcome, type RefreshGate } from "../kg-refresh.js";
 import { COMPLETION_MARKER } from "../kg-sidecar.js";
+import * as runnerMode from "../runner-mode.js";
 
 const NAMESPACE = "https://kg.test.example/";
 const OLD_STAMP = "2026-08-20T00:10:10+00:00";
@@ -300,6 +301,7 @@ describe("kg-refresh", () => {
   describe("KG_MATERIALIZE_DIRECT", () => {
     afterEach(() => {
       vi.unstubAllEnvs();
+      vi.restoreAllMocks();
     });
 
     it("appends --direct to materializeArgs() when the flag is true", () => {
@@ -343,6 +345,32 @@ describe("kg-refresh", () => {
       expect(existsSync(join(current, "graph.trig"))).toBe(false);
       expect(existsSync(join(current, "embeddings.npz"))).toBe(true);
       expect(existsSync(join(current, COMPLETION_MARKER))).toBe(true);
+    });
+
+    it("resolves via getKgMaterializeDirect (DB-sourced setting), not just the raw env var (AII-602)", async () => {
+      vi.spyOn(runnerMode, "getKgMaterializeDirect").mockReturnValue({ enabled: true, source: "db" });
+      materialize.mockImplementation(async (_python: string, cwd: string) => {
+        mkdirSync(join(cwd, "out", "parts"), { recursive: true });
+        writeFileSync(join(cwd, "out", "parts", "issue.nt"), "<urn:a> <urn:b> <urn:c> .");
+        writeFileSync(join(cwd, "out", "embeddings.npz"), "vectors");
+      });
+
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
+      await waitDone();
+
+      const s = await handle.status();
+      expect(s.lastRefresh?.ok).toBe(true);
+      expect(s.materialize).toBe("direct");
+
+      const current = join(dataRoot, "current");
+      expect(existsSync(join(current, "parts", "issue.nt"))).toBe(true);
+      expect(existsSync(join(current, "graph.trig"))).toBe(false);
+    });
+
+    it("status() reports materialize: 'rdflib' when the flag is off", async () => {
+      const s = await handle.status();
+      expect(s.materialize).toBe("rdflib");
     });
 
     it("flag on, materialize failure (image venv predates --direct): hits the staging gate and reverts, same as flag off", async () => {

@@ -336,6 +336,18 @@ could not hold on 2026-09-08 with the rdflib path (see the Failure history table
 figure above remains the committed setting, but the direct path is what would let that incident's
 fix be reverted instead of the memory bump.
 
+**The flag is a seed, not the only control (AII-602).** `KG_MATERIALIZE_DIRECT` resolves through
+the same `db | env | default` precedence as `RUNNER_MODE` (`getKgMaterializeDirect()` /
+`setKgMaterializeDirect()` in `src/runner-mode.ts`): the env var wins outright when set, else the
+`settings` table row, else `false` (rdflib). `materializeDirectEnabled()` in `src/kg-refresh.ts`
+reads the resolved setting rather than `process.env` directly. The Deployments page
+(`/admin#deployments`) exposes a `Materialize: rdflib | direct` control next to "Refresh graph
+now" — `GET`/`POST /api/kg/materialize-mode` — that flips the DB row; while the env var is set,
+the control is disabled and the write comes back `409`, same as the `RUNNER_MODE` /
+`FLY_PROCESS_LEVEL_SECRETS` pattern on the Runners page. The toggle only affects the *next*
+refresh, not whatever the sidecar is currently serving — `GET /api/kg/status` and the `get_kg_status`
+MCP tool both report the resolved setting as `materialize: "rdflib" | "direct"` for observability.
+
 ### The `index.ts` budget
 
 Full separation from `index.ts` is not achievable, because reuse forbids it: admin auth reaches

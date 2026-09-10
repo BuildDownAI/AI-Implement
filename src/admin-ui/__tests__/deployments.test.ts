@@ -583,6 +583,51 @@ describe("kg refresh card", () => {
   });
 });
 
+describe("kg materialize-mode control (AII-602)", () => {
+  it("declares the materialize control element ids", () => {
+    for (const id of [
+      "kg-materialize-env-warning",
+      "kg-materialize-controls",
+      "btn-kg-materialize-rdflib",
+      "btn-kg-materialize-direct",
+      "kg-materialize-source",
+    ]) {
+      expect(deploymentsHtml).toContain(`id="${id}"`);
+    }
+  });
+
+  it("shows the env-pinned warning with the standard house wording", () => {
+    expect(deploymentsHtml).toContain('class="warning hidden"');
+    expect(deploymentsHtml).toContain("KG_MATERIALIZE_DIRECT env var is set");
+    expect(deploymentsHtml).toContain("UI toggle has no effect until it is unset.");
+  });
+
+  it("fetches /api/kg/materialize-mode for the current mode", () => {
+    expect(deploymentsScript).toContain("/api/kg/materialize-mode");
+  });
+
+  it("posts direct: true/false to /api/kg/materialize-mode when toggled", () => {
+    expect(deploymentsScript).toContain("window.setKgMaterializeDirect");
+    expect(deploymentsScript).toContain("{ method: 'POST', body: JSON.stringify({ direct: direct }) }");
+  });
+
+  it("wires the rdflib and direct buttons to setKgMaterializeDirect with the right argument", () => {
+    expect(deploymentsHtml).toContain("onclick=\"window.setKgMaterializeDirect(false)\"");
+    expect(deploymentsHtml).toContain("onclick=\"window.setKgMaterializeDirect(true)\"");
+  });
+
+  it("disables both buttons and shows the warning when source is env", () => {
+    expect(deploymentsScript).toContain("envPinned = data.source === 'env'");
+    expect(deploymentsScript).toContain("btn-kg-materialize-rdflib').disabled = envPinned");
+    expect(deploymentsScript).toContain("btn-kg-materialize-direct').disabled = envPinned");
+  });
+
+  it("registers loadKgMaterializeMode on page load and on a poll interval", () => {
+    expect(deploymentsScript).toContain("loadKgMaterializeMode();");
+    expect(deploymentsScript).toContain("setInterval(loadKgMaterializeMode, 15000)");
+  });
+});
+
 describe("fmtElapsed", () => {
   // The page ships as one concatenated script string, so its helpers are only reachable
   // by extraction. Worth the reach here: the interesting behaviour is the 60s and 60m
