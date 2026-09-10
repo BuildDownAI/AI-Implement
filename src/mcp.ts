@@ -103,7 +103,7 @@ const DIAG_TOOLS = [
   {
     name: "get_kg_status",
     description:
-      "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.",
+      "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.",
     inputSchema: { type: "object", properties: {} },
   },
 ];

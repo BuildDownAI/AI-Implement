@@ -18,6 +18,7 @@ import type { MintInput, MintOutput } from "./runner-tokens.js";
 import { encodeRunConfig } from "./run-config.js";
 import type { RunConfigV1 } from "./run-config.js";
 import { getDb } from "./dedup.js";
+import { getKgMaterializeDirect } from "./runner-mode.js";
 import {
   readCodeRepoFromSourcesYml,
   readSecondaryReposFromSourcesYml,
@@ -142,6 +143,8 @@ export interface KgRefreshStatus {
   servedStamp: string | null;
   lastRefresh: RefreshOutcome | null;
   stage: KgRefreshStage;
+  /** Which materialize path the next refresh will stage (AII-602). */
+  materialize: "rdflib" | "direct";
 }
 
 export interface KgRefreshHandle {
@@ -1413,6 +1416,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         servedStamp: await readServedStamp(await readNamespace(servedDir)),
         lastRefresh,
         stage,
+        materialize: materializeDirectEnabled() ? "direct" : "rdflib",
       };
     },
 
@@ -1571,14 +1575,14 @@ function defaultLoadLastRefresh(): RefreshOutcome | null {
 export const MATERIALIZE_ARGS = ["-m", "kg_ingest.materialize"] as const;
 
 /**
- * True when the low-memory `--direct` materialize path is enabled (AII-599). Read
- * directly from process.env at each call site, same convention as every other
- * feature flag in this codebase (KG_ and AI_IMPLEMENT_ prefixed) — off by default
- * until the configured KG_SOURCE_REPO derivative carries base PR #34's `--direct`
- * / `nt_parts` support.
+ * True when the low-memory `--direct` materialize path is enabled (AII-599, AII-602).
+ * Resolved via the same db | env | default precedence as runner mode — KG_MATERIALIZE_DIRECT
+ * seeds the setting, but an admin can flip it from the Deployments page without a redeploy.
+ * Off by default until the configured KG_SOURCE_REPO derivative carries base PR #34's
+ * `--direct` / `nt_parts` support.
  */
 function materializeDirectEnabled(): boolean {
-  return process.env.KG_MATERIALIZE_DIRECT === "true";
+  return getKgMaterializeDirect().enabled;
 }
 
 /** MATERIALIZE_ARGS, with `--direct` appended when KG_MATERIALIZE_DIRECT=true (AII-599). */

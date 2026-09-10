@@ -1456,6 +1456,110 @@ describe("admin runner-mode", () => {
   });
 });
 
+describe("admin kg materialize-mode", () => {
+  const kgRefreshDeps = { trigger: vi.fn(), status: vi.fn(), onMachineLost: vi.fn() };
+
+  beforeEach(() => {
+    delete process.env.KG_MATERIALIZE_DIRECT;
+  });
+
+  afterEach(() => {
+    delete process.env.KG_MATERIALIZE_DIRECT;
+  });
+
+  async function kgRequest(
+    url: string,
+    method: string,
+    token: string,
+    body?: unknown,
+    withKgRefresh = true,
+  ): Promise<{ statusCode: number; body: string }> {
+    const req = new MockRequest(url, method, { authorization: `Bearer ${token}` }, body === undefined ? undefined : JSON.stringify(body));
+    const res = new MockResponse();
+    admin.handleAdminRequest(
+      req as never,
+      res as never,
+      adminConfig("secret"),
+      makeFakeRegistry(provider),
+      withKgRefresh ? { kgRefresh: kgRefreshDeps } : {},
+    );
+    await res.done;
+    return { statusCode: res.statusCode, body: res.body };
+  }
+
+  it("GET /api/kg/materialize-mode returns 501 when KG refresh is not configured", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/materialize-mode", "GET", token, undefined, false);
+    expect(res.statusCode).toBe(501);
+  });
+
+  it("POST /api/kg/materialize-mode returns 501 when KG refresh is not configured", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: true }, false);
+    expect(res.statusCode).toBe(501);
+  });
+
+  it("GET /api/kg/materialize-mode returns the disabled default with nothing configured", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/materialize-mode", "GET", token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.direct).toBe(false);
+    expect(body.source).toBe("default");
+  });
+
+  it("POST /api/kg/materialize-mode persists and returns 200, and a follow-up GET confirms it", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: true });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.direct).toBe(true);
+    expect(body.source).toBe("db");
+
+    const get = await kgRequest("/api/kg/materialize-mode", "GET", token);
+    expect(JSON.parse(get.body).direct).toBe(true);
+  });
+
+  it("POST /api/kg/materialize-mode rejects a non-boolean direct with 400", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: "yes" });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("POST /api/kg/materialize-mode rejects a missing direct field with 400", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/materialize-mode", "POST", token, {});
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("POST /api/kg/materialize-mode returns 409 when KG_MATERIALIZE_DIRECT env var is set", async () => {
+    process.env.KG_MATERIALIZE_DIRECT = "true";
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/materialize-mode", "POST", token, { direct: false });
+    expect(res.statusCode).toBe(409);
+    const body = JSON.parse(res.body);
+    expect(body.error).toContain("KG_MATERIALIZE_DIRECT env var");
+    expect(body.persisted).toBe(false);
+    // Runtime value is still locked by the env var
+    expect(body.direct).toBe(true);
+    expect(body.source).toBe("env");
+
+    // And the DB write actually happened — clearing the env var should
+    // surface the persisted value.
+    delete process.env.KG_MATERIALIZE_DIRECT;
+    const get = await kgRequest("/api/kg/materialize-mode", "GET", token);
+    expect(JSON.parse(get.body).direct).toBe(false);
+  });
+
+  it("rejects an unauthenticated request with 401", async () => {
+    const req = new MockRequest("/api/kg/materialize-mode", "GET");
+    const res = new MockResponse();
+    admin.handleAdminRequest(req as never, res as never, adminConfig("secret"), makeFakeRegistry(provider), { kgRefresh: kgRefreshDeps });
+    await res.done;
+    expect(res.statusCode).toBe(401);
+  });
+});
+
 describe("admin secrets", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.restoreAllMocks(); });

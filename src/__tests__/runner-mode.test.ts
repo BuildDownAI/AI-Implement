@@ -14,6 +14,7 @@ beforeEach(async () => {
   process.env.DEDUP_DB_PATH = dbPath;
   delete process.env.RUNNER_MODE;
   delete process.env.FLY_PROCESS_LEVEL_SECRETS;
+  delete process.env.KG_MATERIALIZE_DIRECT;
   // Fresh module imports each test so DB singleton is reset
   const { vi } = await import("vitest");
   vi.resetModules();
@@ -26,6 +27,7 @@ afterEach(() => {
   dedup.closeDb();
   delete process.env.RUNNER_MODE;
   delete process.env.FLY_PROCESS_LEVEL_SECRETS;
+  delete process.env.KG_MATERIALIZE_DIRECT;
   try { fs.unlinkSync(dbPath); } catch { /* ignore */ }
 });
 
@@ -252,6 +254,89 @@ describe("runner-mode", () => {
 
       const { enabled, source } = runnerMode.getFlyProcessLevelSecrets();
       expect(enabled).toBe(true);
+      expect(source).toBe("default");
+    });
+  });
+
+  describe("parseKgMaterializeDirectEnv", () => {
+    it("returns true only for the exact value 'true'", () => {
+      expect(runnerMode.parseKgMaterializeDirectEnv("true")).toBe(true);
+    });
+
+    it("returns false for any other non-blank value", () => {
+      for (const val of ["false", "1", "yes", "TRUE", "anything-else"]) {
+        expect(runnerMode.parseKgMaterializeDirectEnv(val)).toBe(false);
+      }
+    });
+
+    it("returns undefined for absent or blank values", () => {
+      for (const val of [undefined, "", " "]) {
+        expect(runnerMode.parseKgMaterializeDirectEnv(val)).toBeUndefined();
+      }
+    });
+  });
+
+  describe("getKgMaterializeDirect / setKgMaterializeDirect", () => {
+    it("returns disabled default when neither env var nor DB entry is present", () => {
+      const { enabled, source } = runnerMode.getKgMaterializeDirect();
+      expect(enabled).toBe(false);
+      expect(source).toBe("default");
+    });
+
+    it("stores true and retrieves from DB", () => {
+      runnerMode.setKgMaterializeDirect(true);
+      const { enabled, source } = runnerMode.getKgMaterializeDirect();
+      expect(enabled).toBe(true);
+      expect(source).toBe("db");
+    });
+
+    it("stores false and retrieves from DB", () => {
+      runnerMode.setKgMaterializeDirect(false);
+      const { enabled, source } = runnerMode.getKgMaterializeDirect();
+      expect(enabled).toBe(false);
+      expect(source).toBe("db");
+    });
+
+    it("overwrites a previous DB setting", () => {
+      runnerMode.setKgMaterializeDirect(true);
+      runnerMode.setKgMaterializeDirect(false);
+      const { enabled } = runnerMode.getKgMaterializeDirect();
+      expect(enabled).toBe(false);
+    });
+
+    it("env var wins over DB", () => {
+      runnerMode.setKgMaterializeDirect(false);
+      process.env.KG_MATERIALIZE_DIRECT = "true";
+      const { enabled, source } = runnerMode.getKgMaterializeDirect();
+      expect(enabled).toBe(true);
+      expect(source).toBe("env");
+    });
+
+    it("a non-'true' env value is an explicit off, still sourced from env", () => {
+      runnerMode.setKgMaterializeDirect(true);
+      process.env.KG_MATERIALIZE_DIRECT = "false";
+      const { enabled, source } = runnerMode.getKgMaterializeDirect();
+      expect(enabled).toBe(false);
+      expect(source).toBe("env");
+    });
+
+    it.each(["", " "])(
+      "env var value %j is blank, falls through to DB/default",
+      (val) => {
+        process.env.KG_MATERIALIZE_DIRECT = val;
+        const { source } = runnerMode.getKgMaterializeDirect();
+        expect(source).not.toBe("env");
+      },
+    );
+
+    it("returns disabled default when DB is unavailable", () => {
+      dedup.closeDb();
+      vi.spyOn(dedup, "getDb").mockImplementation(() => {
+        throw new Error("db unavailable");
+      });
+
+      const { enabled, source } = runnerMode.getKgMaterializeDirect();
+      expect(enabled).toBe(false);
       expect(source).toBe("default");
     });
   });
