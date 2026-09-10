@@ -17,6 +17,38 @@ import { buildGroupingBranchName } from "./pipeline/branch-name.js";
  */
 
 /**
+ * One child's state for feature-node readiness: whether it carries the AI-Implement
+ * label ("designated") and whether it has reached a terminal tracker workflow state
+ * (completed or cancelled). This is the canonical definition of "terminal" — see
+ * docs/feature-branch-grouping.md §3 — read live from the tracker on every check; it
+ * must never be inferred from the presence or absence of an orchestrator job row, which
+ * can lag behind (dispatched but not yet terminal) or simply not exist (a human moved
+ * the child to Done outside the pipeline).
+ *
+ * `nonTerminalDesignatedChildren` below is called directly by both providers' roll-up
+ * gates, by Linear's dispatch gate, and by Jira's dispatch gate (which also uses it to
+ * name the children blocking a `feature-node-blocked` classification). Jira's
+ * classification itself still comes from its own `classifyByChildren`
+ * (jira-hierarchy.ts), because that check additionally races on non-designated children
+ * mid-labeling (AII-349) — a case this type doesn't model. Keep Jira's per-field
+ * `isChildTerminal` (jira.ts) as the one place that reads "terminal" off raw Jira
+ * fields, so both of Jira's gates agree with each other and with this definition.
+ */
+export type FeatureChildState = {
+  identifier: string;
+  designated: boolean;
+  terminal: boolean;
+};
+
+/** Designated children that have not reached a terminal tracker state — the set that
+ *  holds a feature node back. Non-designated children never appear here (they're a
+ *  separate race guard; see the AII-349 "waiting parent" check in each provider). An
+ *  empty result means the feature node is ready to dispatch. */
+export function nonTerminalDesignatedChildren(children: FeatureChildState[]): FeatureChildState[] {
+  return children.filter((c) => c.designated && !c.terminal);
+}
+
+/**
  * Resolves the branch a dispatched issue's PR should target, creating any feature
  * branches in `issue.featureBranchChain` that don't yet exist.
  *

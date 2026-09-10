@@ -12,6 +12,7 @@ import { fetchPlanningContext as fetchLinearPlanningContext } from "../linear-pl
 import { isLinearAuthConfigured, withLinearToken } from "../linear-app-auth.js";
 import { defaultFetchSignal } from "../github.js";
 import { parseIssueConfig } from "../issue-config.js";
+import { nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
 
 interface GraphQLResponse<T> {
   data?: T;
@@ -42,6 +43,19 @@ type AncestorNode = {
  * branch from its identifier + mode. The walk stops at the first unlabeled ancestor (its child
  * cuts from the base branch, not a grouping branch).
  */
+/** Maps a Linear children-query node list to the provider-agnostic child-readiness shape
+ *  (see src/feature-branch.ts). Designated = carries the AI-Implement label; terminal =
+ *  tracker state is completed or cancelled — never inferred from a job row. */
+function childFeatureStates(
+  children: Array<{ identifier: string; state?: { type: string } | null; labels?: { nodes: Array<{ name: string }> } }>,
+): FeatureChildState[] {
+  return children.map((c) => ({
+    identifier: c.identifier,
+    designated: (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
+    terminal: c.state?.type === "completed" || c.state?.type === "canceled",
+  }));
+}
+
 function labeledAncestorChain(parent: AncestorNode): FeatureBranchChainEntry[] {
   const collected: FeatureBranchChainEntry[] = [];
   let node = parent;
@@ -320,11 +334,11 @@ export class LinearProvider implements TicketingProvider {
         // Leaf. Its own ai-implement.yml (if any) is irrelevant — it owns no branch.
         featureBranchChain = ancestorChain.length > 0 ? ancestorChain : undefined;
       } else if (aiChildren.length > 0) {
-        const allAIChildrenTerminal = aiChildren.every(
-          (c) => c.state?.type === "completed" || c.state?.type === "canceled",
-        );
-        if (!allAIChildrenTerminal) {
-          console.log(`[linear] Skipping ${issue.identifier}: ${mode} grouping parent waiting on in-flight AI-Implement children`);
+        const blockingChildren = nonTerminalDesignatedChildren(childFeatureStates(children));
+        if (blockingChildren.length > 0) {
+          console.log(
+            `[linear] Skipping ${issue.identifier}: ${mode} grouping parent waiting on in-flight AI-Implement children: ${blockingChildren.map((c) => c.identifier).join(", ")}`,
+          );
           continue;
         }
         // AII-349 race guard: if any child without the AI-Implement label is still active, the
@@ -388,7 +402,7 @@ export class LinearProvider implements TicketingProvider {
           identifier: string;
           description: string | null;
           team: { key: string };
-          children: { nodes: Array<{ identifier: string; labels: { nodes: Array<{ name: string }> } }> };
+          children: { nodes: Array<{ identifier: string; state: { type: string }; labels: { nodes: Array<{ name: string }> } }> };
           parent: { identifier: string; description: string | null; labels: { nodes: Array<{ name: string }> } } | null;
         }>;
       };
@@ -407,7 +421,7 @@ export class LinearProvider implements TicketingProvider {
             identifier
             description
             team { key }
-            children(first: 50) { nodes { identifier labels { nodes { name } } } }
+            children(first: 50) { nodes { identifier state { type } labels { nodes { name } } } }
             parent { identifier description labels { nodes { name } } }
           }
         }
@@ -417,10 +431,20 @@ export class LinearProvider implements TicketingProvider {
 
     const rollUps: FeatureNodeRollUp[] = [];
     for (const node of data.issues?.nodes ?? []) {
-      const aiChildren = (node.children?.nodes ?? []).filter((c) =>
-        (c.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL),
-      );
+      const childStates = childFeatureStates(node.children?.nodes ?? []);
+      const aiChildren = childStates.filter((c) => c.designated);
       if (aiChildren.length === 0) continue;
+      // A node's own tracker state reaching "completed" doesn't guarantee its children
+      // have too — the dispatch gate and this roll-up gate run independently, so a node
+      // can complete its own closing work while a child is still mid-implementation.
+      // Re-check live rather than trusting "parent completed" as a proxy (AII-609).
+      const blockingChildren = nonTerminalDesignatedChildren(childStates);
+      if (blockingChildren.length > 0) {
+        console.log(
+          `[linear] Deferring roll-up for ${node.identifier}: waiting on in-flight AI-Implement children: ${blockingChildren.map((c) => c.identifier).join(", ")}`,
+        );
+        continue;
+      }
       const parentIsFeatureNode =
         !!node.parent && (node.parent.labels?.nodes ?? []).some((l) => l.name === AI_IMPLEMENT_LABEL);
       rollUps.push({

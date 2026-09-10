@@ -15,7 +15,8 @@ import {
   type ResolvedFieldIds,
 } from "./jira-fields.js";
 import type { RepoMapping } from "../config.js";
-import { classifyByChildren, ancestorChain, type ChildState } from "./jira-hierarchy.js";
+import { classifyByChildren, ancestorChain } from "./jira-hierarchy.js";
+import { nonTerminalDesignatedChildren, type FeatureChildState } from "../feature-branch.js";
 import { parseIssueConfig } from "../issue-config.js";
 import { markdownToAdf } from "./markdown-to-adf.js";
 import type { FeatureBranchMode } from "../pipeline/branch-name.js";
@@ -124,6 +125,18 @@ function effectiveParentKey(fields: Record<string, unknown>, fieldIds: ResolvedF
 
 function isTerminalStatus(fields: Record<string, unknown>): boolean {
   return ((fields.status as { statusCategory?: { key?: string } } | null)?.statusCategory?.key) === "done";
+}
+
+/** A child is finished when its native status reached the Done category (a human moved
+ *  it) OR its AI-Implement Status is "Merged" — the orchestrator's done-on-merge path
+ *  (markMerged) only sets the custom field and never transitions native status. This is
+ *  Jira's field-level reading of the same "terminal" definition src/feature-branch.ts
+ *  centralizes for both providers (completed or cancelled tracker state); it feeds both
+ *  the dispatch gate (enrichFeatureBranches, via jira-hierarchy.ts's classifyByChildren,
+ *  which additionally races on non-designated children) and the roll-up gate
+ *  (fetchFeatureNodeRollUps, via the shared nonTerminalDesignatedChildren). */
+function isChildTerminal(fields: Record<string, unknown>, fieldIds: ResolvedFieldIds): boolean {
+  return isTerminalStatus(fields) || readStatusValue(fields, fieldIds.statusFieldId) === STATUS_VALUES.MERGED;
 }
 
 /** Preserve a nonblank branch choice so dispatch validation can refuse invalid refs.
@@ -364,16 +377,6 @@ export class JiraProvider implements TicketingProvider {
       readStatusValue(fields, fieldIds.statusFieldId) !== "" &&
       readRepoFieldValue(fields[fieldIds.repoFieldId]) === repoFieldValue;
 
-    // A child is finished when its native status reached the Done category (a human
-    // moved it) OR its AI-Implement Status is "Merged" — the orchestrator's
-    // done-on-merge path (markMerged) only sets the custom field and never
-    // transitions native status, the same asymmetry the completed-node roll-up
-    // query in fetchFeatureNodeRollUps handles with its OR. Without this, a child
-    // merged through the normal flow would gate its feature-node parent forever.
-    const childTerminal = (fields: Record<string, unknown>): boolean =>
-      isTerminalStatus(fields) ||
-      readStatusValue(fields, fieldIds.statusFieldId) === STATUS_VALUES.MERGED;
-
     const childFields = [
       fieldIds.statusFieldId,
       fieldIds.repoFieldId,
@@ -390,7 +393,7 @@ export class JiraProvider implements TicketingProvider {
     //    once the query has failed, so all candidates are deferred. Children are attributed to
     //    their parent via effectiveParentKey, so Epic-Link children (no native `parent`) are
     //    bucketed under their epic instead of dropped.
-    const childrenByParent = new Map<string, ChildState[]>();
+    const childrenByParent = new Map<string, FeatureChildState[]>();
     try {
       const children = await this.client.searchJql(
         this.childrenJql(candidates.map((c) => c.key), fieldIds),
@@ -400,7 +403,11 @@ export class JiraProvider implements TicketingProvider {
         const parentKey = effectiveParentKey(ch.fields, fieldIds);
         if (!parentKey) continue;
         const list = childrenByParent.get(parentKey) ?? [];
-        list.push({ designated: designated(ch.fields), terminal: childTerminal(ch.fields) });
+        list.push({
+          identifier: ch.key,
+          designated: designated(ch.fields),
+          terminal: isChildTerminal(ch.fields, fieldIds),
+        });
         childrenByParent.set(parentKey, list);
       }
     } catch (err) {
@@ -446,7 +453,15 @@ export class JiraProvider implements TicketingProvider {
     // 3. Per-candidate classification + chain.
     for (const cand of candidates) {
       const cls = classifyByChildren(childrenByParent.get(cand.key) ?? []);
-      if (cls.kind === "waiting-parent" || cls.kind === "feature-node-blocked") {
+      if (cls.kind === "feature-node-blocked") {
+        const blockingChildren = nonTerminalDesignatedChildren(childrenByParent.get(cand.key) ?? []);
+        out.set(cand.key, { skip: true });
+        console.log(
+          `[jira] Skipping ${cand.key}: grouping parent waiting on in-flight AI-Implement children: ${blockingChildren.map((c) => c.identifier).join(", ")}`,
+        );
+        continue;
+      }
+      if (cls.kind === "waiting-parent") {
         out.set(cand.key, { skip: true });
         console.log(`[jira] Skipping ${cand.key}: grouping parent not ready (${cls.kind})`);
         continue;
@@ -507,19 +522,36 @@ export class JiraProvider implements TicketingProvider {
 
       // Which completed issues are feature nodes (≥1 designated child)? Children are
       // attributed to their parent via effectiveParentKey so Epic-Link children count.
+      // "status" is fetched so isChildTerminal can read the native status category —
+      // a completed node's own state is not a proxy for its children's (AII-609).
       const children = await this.client.searchJql(
         this.childrenJql(completed.map((c) => c.key), fieldIds),
-        [fieldIds.statusFieldId, fieldIds.repoFieldId, "parent", ...epicLinkFields],
+        [fieldIds.statusFieldId, fieldIds.repoFieldId, "status", "parent", ...epicLinkFields],
       );
-      const designatedChildrenByParent = new Map<string, string[]>();
+      // Mapped to the provider-agnostic FeatureChildState shape (src/feature-branch.ts) —
+      // every entry here is already known-designated (filtered above), so the gate below
+      // is the same nonTerminalDesignatedChildren call linear.ts's fetchFeatureNodeRollUps
+      // uses, not a second, independently-maintained definition.
+      const designatedChildrenByParent = new Map<string, FeatureChildState[]>();
       for (const ch of children) {
         const pk = effectiveParentKey(ch.fields, fieldIds);
         if (!pk || !designated(ch.fields)) continue;
         const list = designatedChildrenByParent.get(pk) ?? [];
-        list.push(ch.key);
+        list.push({ identifier: ch.key, designated: true, terminal: isChildTerminal(ch.fields, fieldIds) });
         designatedChildrenByParent.set(pk, list);
       }
-      const featureNodes = completed.filter((c) => designatedChildrenByParent.has(c.key));
+      const featureNodes = completed.filter((c) => {
+        const kids = designatedChildrenByParent.get(c.key);
+        if (!kids || kids.length === 0) return false;
+        const blocking = nonTerminalDesignatedChildren(kids);
+        if (blocking.length > 0) {
+          console.log(
+            `[jira] Deferring roll-up for ${c.key}: waiting on in-flight AI-Implement children: ${blocking.map((k) => k.identifier).join(", ")}`,
+          );
+          return false;
+        }
+        return true;
+      });
       if (featureNodes.length === 0) continue;
 
       // Is each feature node's parent itself designated (→ auto-merge) or not (→ human PR)?
@@ -551,7 +583,7 @@ export class JiraProvider implements TicketingProvider {
           parent: hasGroupingParent
             ? { identifier: parentKey!, mode: parentMode.get(parentKey!) ?? "feature" }
             : null,
-          childIdentifiers: designatedChildrenByParent.get(node.key) ?? [],
+          childIdentifiers: (designatedChildrenByParent.get(node.key) ?? []).map((k) => k.identifier),
         });
       }
     }

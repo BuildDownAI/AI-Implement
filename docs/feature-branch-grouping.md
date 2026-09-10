@@ -91,6 +91,15 @@ children`). Only once **all** its labelled children reach a terminal state does 
 work dispatch — onto its own feature branch. "Terminal" means completed *or* cancelled, so
 a cancelled child doesn't block the parent forever.
 
+"Terminal" is read live from each labelled child's own tracker workflow state on every
+roll-up check for both providers, and on Linear's poll dispatch check, via
+`nonTerminalDesignatedChildren` in `src/feature-branch.ts` (Jira's poll dispatch check
+classifies through its own `classifyByChildren` in `src/providers/jira-hierarchy.ts`,
+applying the identical definition, and also calls `nonTerminalDesignatedChildren` to name
+the blocking children in its skip log) — never inferred from the presence or absence of an
+orchestrator job row, and never assumed from the parent's own state reaching a terminal
+value ([AII-609](https://linear.app/eudoxus/issue/AII-609)).
+
 ---
 
 ## 4. Feature branches: naming and the cascade
