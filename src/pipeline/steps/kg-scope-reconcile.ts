@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseDocument, YAMLSeq, isSeq } from "yaml";
+import { parseDocument, YAMLSeq, isSeq, isMap, isScalar } from "yaml";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
 import {
   readCodeRepoFromSourcesYml,
@@ -58,29 +58,121 @@ function sanitizeBranch(branchRaw: string, slug: string): string | undefined {
   return undefined;
 }
 
+/** Number of spaces before the `-` on a fresh, top-level seq item, e.g. `  - slug: x`. */
+const DEFAULT_DASH_INDENT = 2;
+
 /**
- * Appends `entries` to the YAMLSeq at `key`, creating the seq if the key is entirely
- * absent. Uses the yaml package's Document API rather than parse+stringify so untouched
- * keys, comments, and formatting survive byte-for-byte — sources.yml is an operator-owned,
- * hand-edited manifest (docs/kg-architecture.md), and a full round-trip would reformat it.
- * Note: flow-style collections elsewhere in the file (e.g. `globs: [a, b]`) may still be
- * reformatted by `doc.toString()` even when untouched — this codebase's sources.yml fixtures
- * use block style throughout, which round-trips losslessly.
+ * Renders `entries` as standalone `- key: value` YAML fragment text (no leading key line),
+ * indented so each item's dash sits `dashIndent` spaces in. Values are stringified through a
+ * scratch `Document` — separate from the real one — so quoting matches the rest of the file
+ * without ever touching an existing node.
  */
-function appendSeqEntries(
+function renderSeqEntries(entries: Array<Record<string, unknown>>, dashIndent: number): string {
+  const scratch = parseDocument("");
+  const seq = new YAMLSeq();
+  for (const entry of entries) seq.items.push(scratch.createNode(entry));
+  scratch.set("_", seq);
+  const rendered = scratch.toString();
+  const body = rendered.slice(rendered.indexOf("\n") + 1);
+  const delta = dashIndent - DEFAULT_DASH_INDENT;
+  if (delta === 0) return body;
+  return body
+    .split("\n")
+    .map((line) => {
+      if (line.length === 0) return line;
+      const leading = line.match(/^ */)?.[0].length ?? 0;
+      return " ".repeat(Math.max(0, leading + delta)) + line.slice(leading);
+    })
+    .join("\n");
+}
+
+/** Number of spaces before the `-` on the seq item's own source line, e.g. 2 for `  - slug: x`. */
+function dashIndentOf(raw: string, item: { range: readonly [number, number, number] }): number {
+  const lineStart = raw.lastIndexOf("\n", item.range[0] - 1) + 1;
+  const dashIdx = raw.slice(lineStart, item.range[0]).indexOf("-");
+  return dashIdx === -1 ? DEFAULT_DASH_INDENT : dashIdx;
+}
+
+type Splice = { start: number; end: number; text: string };
+
+/**
+ * Computes how to add `entries` under `key` without re-serializing the document: a splice
+ * into the existing raw text — appended after the last item, or replacing an empty/absent
+ * value with a fresh block — or, when the key doesn't exist at all, a block to append once at
+ * the end of the file. Returns null when there's nothing to add.
+ */
+function planSeqAddition(
+  raw: string,
   doc: ReturnType<typeof parseDocument>,
   key: string,
   entries: Array<Record<string, unknown>>,
-): void {
-  if (entries.length === 0) return;
-  let seq = doc.get(key, true) as unknown;
-  if (!isSeq(seq)) {
-    seq = new YAMLSeq();
-    doc.set(key, seq);
+): { splice: Splice } | { appendBlock: string } | null {
+  if (entries.length === 0) return null;
+
+  const contents = doc.contents;
+  const pair = isMap(contents) ? contents.items.find((p) => isScalar(p.key) && p.key.value === key) : undefined;
+
+  if (!pair) {
+    return { appendBlock: `${key}:\n${renderSeqEntries(entries, DEFAULT_DASH_INDENT)}` };
   }
-  for (const entry of entries) {
-    (seq as YAMLSeq).items.push(doc.createNode(entry));
+
+  const value = pair.value;
+  if (isSeq(value) && value.items.length > 0) {
+    const dashIndent = dashIndentOf(raw, value.items[0] as { range: readonly [number, number, number] });
+    const insertAt = (value.range as readonly [number, number, number])[1];
+    const needsLeadingNewline = raw[insertAt - 1] !== "\n";
+    const text = (needsLeadingNewline ? "\n" : "") + renderSeqEntries(entries, dashIndent);
+    return { splice: { start: insertAt, end: insertAt, text } };
   }
+
+  const isEmptyValue = (isSeq(value) && value.items.length === 0) || (isScalar(value) && value.value === null);
+  if (!isEmptyValue) {
+    console.warn(`[kg-scope-reconcile] "${key}" is not a sequence; skipping ${entries.length} addition(s)`);
+    return null;
+  }
+
+  // Block-empty (`key:`) or flow-empty (`key: []`) — nothing to preserve, so replace the
+  // value span with a freshly rendered block at the default indent.
+  const start = (pair.key as { range: readonly [number, number, number] }).range[1];
+  const end = (value as { range: readonly [number, number, number] }).range[2];
+  return { splice: { start, end, text: `\n${renderSeqEntries(entries, DEFAULT_DASH_INDENT)}` } };
+}
+
+/**
+ * Applies additions for several keys to `raw` by splicing new text around the untouched
+ * original, never re-stringifying the whole document — so comment alignment, flow-style
+ * collections, and every unrelated line survive byte-for-byte. `doc` is used only to locate
+ * insertion points and sibling formatting; it is never serialized. Splices are computed
+ * against the original `raw` for every key, then applied highest-offset-first so one splice
+ * never invalidates another's offset.
+ */
+function applySeqAdditions(
+  raw: string,
+  doc: ReturnType<typeof parseDocument>,
+  additions: Array<{ key: string; entries: Array<Record<string, unknown>> }>,
+): string {
+  const splices: Splice[] = [];
+  const appendBlocks: string[] = [];
+
+  for (const { key, entries } of additions) {
+    const plan = planSeqAddition(raw, doc, key, entries);
+    if (plan === null) continue;
+    if ("splice" in plan) splices.push(plan.splice);
+    else appendBlocks.push(plan.appendBlock);
+  }
+
+  splices.sort((a, b) => b.start - a.start);
+  let out = raw;
+  for (const { start, end, text } of splices) {
+    out = out.slice(0, start) + text + out.slice(end);
+  }
+
+  if (appendBlocks.length > 0) {
+    if (out.length > 0 && !out.endsWith("\n")) out += "\n";
+    out += appendBlocks.join("");
+  }
+
+  return out;
 }
 
 function readSourcesYmlRaw(workspaceDir: string): string {
@@ -198,15 +290,19 @@ export const kgScopeReconcileStep: StepModule<KgScopeReconcileInputs, KgScopeRec
 
     const raw = readSourcesYmlRaw(workspaceDir);
     let doc = parseDocument(raw);
+    let baseRaw = raw;
     if (doc.errors.length > 0) {
       console.warn(`[kg-scope-reconcile] sources.yml has ${doc.errors.length} parse error(s); reconciling from an empty manifest`);
       doc = parseDocument("");
+      baseRaw = "";
     }
 
-    appendSeqEntries(doc, "secondary_repos", repoAdditions);
-    appendSeqEntries(doc, "trackers", teamAdditions);
+    const output = applySeqAdditions(baseRaw, doc, [
+      { key: "secondary_repos", entries: repoAdditions },
+      { key: "trackers", entries: teamAdditions },
+    ]);
 
-    writeFn(join(workspaceDir, "sources.yml"), doc.toString());
+    writeFn(join(workspaceDir, "sources.yml"), output);
     console.log(`[kg-scope-reconcile] added repos=${repoAdditions.length} teams=${teamAdditions.length}`);
     return { addedRepos: repoAdditions.length, addedTeams: teamAdditions.length, addedRepoSlugs, addedTeamNames, mappedProjectCount };
   },

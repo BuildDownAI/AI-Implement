@@ -1656,6 +1656,64 @@ describe("kgScopeReconcileStep", () => {
     expect(after.indexOf("team: AII")).toBeLessThan(after.indexOf("team: BDS"));
   });
 
+  it("AII-613: preserves column-aligned trailing comments byte-for-byte on addition", async () => {
+    const before = [
+      "code_repo:",
+      "  slug: org/code-repo",
+      "",
+      "secondary_repos:",
+      "  - slug: org/existing-one        # keep aligned",
+      "    branch: testing",
+      "  - slug: org/second               # also aligned",
+      "    branch: main",
+      "",
+      "trackers:",
+      "  - kind: linear",
+      "    team: AII                      # aligned too",
+      "",
+    ].join("\n");
+    writeSources(before);
+
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/code-repo", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "AII", repo: "org/existing-one", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "AII", repo: "org/second", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "BDS", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    expect(result.addedRepos).toBe(1);
+    expect(result.addedTeams).toBe(1);
+
+    const beforeLines = before.split("\n");
+    const afterLines = readSources().split("\n");
+
+    // Every pre-existing line survives byte-for-byte, in original relative order — additions
+    // land at two splice points (secondary_repos, trackers), so the match isn't one contiguous
+    // block, but each line's exact text and relative order must be preserved.
+    let cursor = 0;
+    for (const line of beforeLines) {
+      const idx = afterLines.indexOf(line, cursor);
+      expect(idx).toBeGreaterThanOrEqual(cursor);
+      cursor = idx + 1;
+    }
+
+    // Only the new entries' lines were added (2 for the secondary, 3 for the tracker).
+    expect(afterLines.length).toBe(beforeLines.length + 5);
+  });
+
+  it("AII-613: splices a new entry after a trailing comment on the last item", async () => {
+    writeSources("secondary_repos:\n  - slug: org/only-one   # trailing comment\ntrackers:\n  - kind: linear\n    team: AII\n");
+    const fetchImpl = makeMappingFetch([
+      { teamKey: "AII", repo: "org/only-one", defaultBranch: "main", ticketingProvider: "linear" },
+      { teamKey: "AII", repo: "org/new-repo", defaultBranch: "main", ticketingProvider: "linear" },
+    ]);
+    const result = await kgScopeReconcileStep.run(makeContext(), { callbackUrl: "http://orch", workspaceDir: tmpDir, fetchImpl }, noopReporter);
+    expect(result.addedRepos).toBe(1);
+
+    const after = readSources();
+    expect(after).toContain("  - slug: org/only-one   # trailing comment\n  - slug: org/new-repo\n");
+  });
+
   it("dry run: computes and logs the diff but never writes sources.yml", async () => {
     writeSources("trackers:\n  - kind: linear\n    team: AII\n");
     const before = readSources();
