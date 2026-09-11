@@ -236,15 +236,37 @@ async function callMcp(
   providerDiagnostic?: string | null,
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
   getKgStatus?: () => Promise<KgRefreshStatus>,
+  triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
     tokenValid ? { email: "user@example.com", sub: "sub1", provider: "google" } : null,
   );
   const req = new MockRequest(method, headers, body);
   const res = new MockResponse();
-  handleMcpRequest(req as never, res as never, provider, baseUrl, providerDiagnostic, undefined, runKgRefreshPreflight, getKgStatus);
+  handleMcpRequest(req as never, res as never, provider, baseUrl, providerDiagnostic, undefined, runKgRefreshPreflight, getKgStatus, triggerKgRefresh);
   await res.done;
   return { statusCode: res.statusCode, body: res.body, responseHeaders: res.responseHeaders };
+}
+
+/**
+ * Override the recheckIdentity mock for one test's role. `null` simulates an entry-less
+ * identity (a service-class token, per AII-442) — RecheckResult's "ok" variant types `entry`
+ * as required, but the mock is untyped and the write-tier code must treat a missing role
+ * defensively regardless.
+ */
+function mockRole(role: "user" | "admin" | null): void {
+  (accessMock.recheckIdentity as ReturnType<typeof vi.fn>).mockReturnValue({
+    status: "ok",
+    entry: {
+      kind: "address",
+      value: "user@example.com",
+      role,
+      provider: null,
+      subject: null,
+      addedAt: 0,
+      addedBy: null,
+    },
+  });
 }
 
 describe("handleMcpRequest", () => {
@@ -1106,6 +1128,243 @@ describe("handleMcpRequest", () => {
     it("get_kg_status — unauthenticated request returns 401", async () => {
       const result = await callMcp({ authorization: "Bearer invalid" }, false);
       expect(result.statusCode).toBe(401);
+    });
+
+    it("get_session_identity returns email, provider, and role for a user identity", async () => {
+      mockRole("user");
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "get_session_identity", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data).toEqual({ email: "user@example.com", provider: "google", role: "user" });
+    });
+
+    it("get_session_identity returns role: null for an entry-less identity", async () => {
+      mockRole(null);
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "get_session_identity", arguments: {} } }),
+      );
+      expect(result.statusCode).toBe(200);
+      const data = JSON.parse(JSON.parse(result.body).result.content[0].text);
+      expect(data).toEqual({ email: "user@example.com", provider: "google", role: null });
+    });
+  });
+
+  describe("tools/list — write tier", () => {
+    it("includes trigger_kg_refresh for an admin identity", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
+      expect(names).toContain("trigger_kg_refresh");
+    });
+
+    it("omits trigger_kg_refresh for a user identity", async () => {
+      mockRole("user");
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
+      expect(names).not.toContain("trigger_kg_refresh");
+    });
+
+    it("lists get_session_identity and every existing read tool for both roles", async () => {
+      const expectedReads = [
+        "get_tenant_health",
+        "get_runner_mode",
+        "list_projects",
+        "list_in_flight_jobs",
+        "get_issue_dispatch_status",
+        "get_issue_report_card",
+        "get_fleet_report",
+        "get_deploy_posture",
+        "get_kg_status",
+        "get_session_identity",
+      ];
+
+      mockRole("admin");
+      const adminResult = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const adminNames = JSON.parse(adminResult.body).result.tools.map((t: { name: string }) => t.name);
+
+      mockRole("user");
+      const userResult = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const userNames = JSON.parse(userResult.body).result.tools.map((t: { name: string }) => t.name);
+
+      for (const name of expectedReads) {
+        expect(adminNames).toContain(name);
+        expect(userNames).toContain(name);
+      }
+    });
+  });
+
+  describe("tools/call — write tier (trigger_kg_refresh)", () => {
+    it("WRITE_TOOLS has exactly one entry: trigger_kg_refresh", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      );
+      const names = JSON.parse(result.body).result.tools.map((t: { name: string }) => t.name);
+      const writeToolNames = names.filter((n: string) => n === "trigger_kg_refresh");
+      expect(writeToolNames).toEqual(["trigger_kg_refresh"]);
+    });
+
+    it("as admin, returns the injected triggerKgRefresh result verbatim", async () => {
+      mockRole("admin");
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 40, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data).toEqual({ status: 202, body: { accepted: true } });
+      expect(triggerMock).toHaveBeenCalledOnce();
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=admin result=202/),
+      );
+    });
+
+    it("as user, returns isError forbidden and never calls triggerKgRefresh", async () => {
+      mockRole("user");
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("forbidden: trigger_kg_refresh requires the admin role");
+      expect(triggerMock).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/\[mcp\] write tool=trigger_kg_refresh actor=user@example\.com role=user result=forbidden/),
+      );
+    });
+
+    it("with an entry-less identity (role null), returns the same forbidden result", async () => {
+      mockRole(null);
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 42, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("forbidden: trigger_kg_refresh requires the admin role");
+      expect(triggerMock).not.toHaveBeenCalled();
+    });
+
+    it("when triggerKgRefresh is not wired, returns isError with 'KG refresh is not configured'", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 43, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toContain("KG refresh is not configured");
+    });
+
+    it("unauthenticated request returns 401 before any tool dispatch", async () => {
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+      const result = await callMcp(
+        { authorization: "Bearer invalid" },
+        false,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 44, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+      expect(result.statusCode).toBe(401);
+      expect(triggerMock).not.toHaveBeenCalled();
     });
   });
 

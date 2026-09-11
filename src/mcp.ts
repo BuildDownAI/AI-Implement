@@ -7,7 +7,7 @@ import { getInFlightJobs, getRunRecordMergeVerdict } from "./log.js";
 import { getDb } from "./dedup.js";
 import { getIssueReportCard, getFleetReport } from "./report-card.js";
 import { isKgDegraded } from "./deploy-notify.js";
-import { recheckIdentity } from "./access-entries.js";
+import { recheckIdentity, type AccessRole } from "./access-entries.js";
 import { type MemoryProvider, KG_TOOL_CAPABILITY } from "./kg-provider.js";
 import { getDeployPosture } from "./deploy-posture.js";
 
@@ -106,9 +106,47 @@ const DIAG_TOOLS = [
       "Returns the KG refresh rail state: stage (idle | staging | ingest-running | serving | reverted | failed), the served snapshot stamp, the materialize path the next refresh will stage (rdflib | direct), and the last refresh outcome with its gate. Poll it after `POST /api/kg/refresh`.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "get_session_identity",
+    description:
+      "Returns the caller's email, sign-in provider, and role (user | admin | null when the identity has no allowlist entry) as the allowlist resolves them now. Admin-only skills call this first.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
+
+// ---- Orchestrator-native write tools ----
+// The entire write surface of /mcp: a tool is a write only if it is declared here, and each
+// declaration names the role required to call it. See docs/adr/015-mcp-reads-open-writes-declared.md.
+
+interface WriteToolContext {
+  triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>;
+}
+
+interface WriteTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  role: AccessRole;
+  run: (context: WriteToolContext) => Promise<{ status: number; body: Record<string, unknown> }>;
+}
+
+const WRITE_TOOLS: WriteTool[] = [
+  {
+    name: "trigger_kg_refresh",
+    description:
+      "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards.",
+    inputSchema: { type: "object", properties: {} },
+    role: "admin",
+    run: async (context) => {
+      if (!context.triggerKgRefresh) {
+        throw new Error("KG refresh is not configured");
+      }
+      return context.triggerKgRefresh();
+    },
+  },
+];
 
 async function callDiagnosticTool(
   name: string,
@@ -117,6 +155,7 @@ async function callDiagnosticTool(
     defaultRunnerImage?: string;
     runKgRefreshPreflight?: () => Promise<PreflightCheckResult>;
     getKgStatus?: () => Promise<KgRefreshStatus>;
+    sessionIdentity?: { email: string; provider: string; role: AccessRole | null };
   } = {},
 ): Promise<unknown> {
   switch (name) {
@@ -252,6 +291,9 @@ async function callDiagnosticTool(
     case "get_kg_status":
       return context.getKgStatus ? await context.getKgStatus() : { error: "KG refresh is not configured" };
 
+    case "get_session_identity":
+      return context.sessionIdentity ?? { email: null, provider: null, role: null };
+
     default:
       return { error: `Unknown diagnostic tool: ${name}` };
   }
@@ -268,6 +310,7 @@ export async function handleMcpRequest(
   defaultRunnerImage?: string,
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
   getKgStatus?: () => Promise<KgRefreshStatus>,
+  triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>,
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -295,6 +338,8 @@ export async function handleMcpRequest(
   }
   if (recheck.status === "denied") return unauthorized();
 
+  const role: AccessRole | null = recheck.status === "ok" ? recheck.entry?.role ?? null : null;
+
   let body: Buffer;
   try {
     body = await bufferBody(req);
@@ -317,22 +362,66 @@ export async function handleMcpRequest(
   }
 
   if (rpc?.method === "tools/list") {
-    // Merge native diagnostic tools with kg_* tools from the provider
+    // Merge native diagnostic tools with kg_* tools from the provider. Hiding a write tool the
+    // caller's role cannot use is a courtesy — the check in tools/call below is the boundary.
     const kgTools = provider ? await provider.listTools(body, req.headers) : [];
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,
-      result: { tools: [...DIAG_TOOLS, ...kgTools] },
+      result: { tools: [...DIAG_TOOLS, ...WRITE_TOOLS.filter((t) => role === t.role), ...kgTools] },
     });
     return;
   }
 
   if (rpc?.method === "tools/call") {
     const toolName = (rpc.params?.name as string) ?? "";
+
+    const writeTool = WRITE_TOOLS.find((t) => t.name === toolName);
+    if (writeTool) {
+      const actor = identity.email;
+      if (role !== writeTool.role) {
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role ?? "null"} result=forbidden`);
+        json(res, 200, {
+          jsonrpc: "2.0",
+          id: rpc.id ?? null,
+          result: {
+            content: [{ type: "text", text: `forbidden: ${toolName} requires the ${writeTool.role} role` }],
+            isError: true,
+          },
+        });
+        return;
+      }
+      try {
+        const result = await writeTool.run({ triggerKgRefresh });
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=${result.status}`);
+        json(res, 200, {
+          jsonrpc: "2.0",
+          id: rpc.id ?? null,
+          result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
+        });
+      } catch (err) {
+        console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=error`);
+        json(res, 200, {
+          jsonrpc: "2.0",
+          id: rpc.id ?? null,
+          result: {
+            content: [{ type: "text", text: (err as Error).message }],
+            isError: true,
+          },
+        });
+      }
+      return;
+    }
+
     if (DIAG_TOOL_NAMES.has(toolName)) {
       const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
       try {
-        const result = await callDiagnosticTool(toolName, toolArgs, { defaultRunnerImage, runKgRefreshPreflight, getKgStatus });
+        const result = await callDiagnosticTool(toolName, toolArgs, {
+          defaultRunnerImage,
+          runKgRefreshPreflight,
+          getKgStatus,
+          sessionIdentity: { email: identity.email, provider: identity.provider, role },
+        });
         json(res, 200, {
           jsonrpc: "2.0",
           id: rpc.id ?? null,
