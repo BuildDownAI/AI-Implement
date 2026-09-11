@@ -146,6 +146,11 @@ function json(res: http.ServerResponse, status: number, data: unknown): void {
   res.end(JSON.stringify(data));
 }
 
+export function clearDedupEntryAction(issueId: string): { status: number; body: Record<string, unknown> } {
+  const deleted = deleteDispatched(issueId);
+  return { status: deleted ? 200 : 404, body: { deleted } };
+}
+
 /**
  * Loops fetchTrackerIssuesPage across every page for a team, returning the flat
  * issue array the kg-refresh dev harness's `--tracker-data` file expects
@@ -693,8 +698,8 @@ export function handleAdminRequest(
 
     if (url.startsWith("/api/dedup/") && method === "DELETE") {
       const issueId = decodeURIComponent(url.slice("/api/dedup/".length));
-      const deleted = deleteDispatched(issueId);
-      json(res, deleted ? 200 : 404, { deleted });
+      const result = clearDedupEntryAction(issueId);
+      json(res, result.status, result.body);
       return true;
     }
 
@@ -982,6 +987,76 @@ async function handleListIssues(
   }
 }
 
+export function setRunnerModeAction(
+  config: AdminConfig,
+  patch: { mode?: string; flyProcessLevelSecrets?: boolean },
+): { status: number; body: Record<string, unknown> } {
+  const hasMode = patch.mode !== undefined;
+  const hasFlySecrets = patch.flyProcessLevelSecrets !== undefined;
+
+  if (!hasMode && !hasFlySecrets) {
+    return { status: 400, body: { error: `mode must be one of: ${VALID_RUNNER_MODES.join(", ")}` } };
+  }
+
+  if (hasMode && !isRunnerMode(patch.mode)) {
+    return { status: 400, body: { error: `mode must be one of: ${VALID_RUNNER_MODES.join(", ")}` } };
+  }
+
+  if (hasMode) {
+    const previous = getRunnerMode();
+    setRunnerMode(patch.mode as RunnerMode);
+    const status = getRunnerMode();
+    // AII-306: swap observability — an execution-mode change is an operational
+    // event, not a quiet preference. Log it and fire the notify hook best-effort.
+    if (previous.mode !== status.mode) {
+      console.log(`[admin] Runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`);
+      if (config.notifyWebhookUrl) {
+        notifyText(
+          config.notifyWebhookUrl,
+          `⚙️ AI-Implement runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`,
+        ).catch((err) => console.error("[admin] runner-mode notify failed:", err));
+      }
+    }
+  }
+
+  if (hasFlySecrets) {
+    const previousSecrets = getFlyProcessLevelSecrets();
+    setFlyProcessLevelSecrets(patch.flyProcessLevelSecrets!);
+    const secretsStatus = getFlyProcessLevelSecrets();
+    if (previousSecrets.enabled !== secretsStatus.enabled) {
+      console.log(`[admin] Fly process-level secrets changed: ${previousSecrets.enabled} → ${secretsStatus.enabled} (via admin API)`);
+      if (config.notifyWebhookUrl) {
+        notifyText(
+          config.notifyWebhookUrl,
+          `⚙️ AI-Implement Fly process-level secrets changed: ${previousSecrets.enabled} → ${secretsStatus.enabled} (via admin API)`,
+        ).catch((err) => console.error("[admin] fly-process-level-secrets notify failed:", err));
+      }
+    }
+  }
+
+  const modeStatus = getRunnerMode();
+  const secretsStatus = getFlyProcessLevelSecrets();
+
+  // The DB write succeeded but an env var still wins at runtime. Return 409
+  // so direct API callers can tell their write was overridden.
+  if ((hasMode && modeStatus.source === "env") || (hasFlySecrets && secretsStatus.source === "env")) {
+    const modeConflict = hasMode && modeStatus.source === "env";
+    return {
+      status: 409,
+      body: {
+        error: modeConflict
+          ? "RUNNER_MODE env var is set; persisted to DB but has no effect at runtime until the env var is unset"
+          : "FLY_PROCESS_LEVEL_SECRETS env var is set; persisted to DB but has no effect at runtime until the env var is unset",
+        ...(hasMode ? { persisted: patch.mode } : {}),
+        ...modeStatus,
+        flyProcessLevelSecrets: secretsStatus,
+      },
+    };
+  }
+
+  return { status: 200, body: { ...modeStatus, flyProcessLevelSecrets: secretsStatus } };
+}
+
 async function handleSetRunnerMode(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -989,70 +1064,8 @@ async function handleSetRunnerMode(
 ): Promise<void> {
   try {
     const body = JSON.parse(await readBody(req)) as { mode?: string; flyProcessLevelSecrets?: boolean };
-    const hasMode = body.mode !== undefined;
-    const hasFlySecrets = body.flyProcessLevelSecrets !== undefined;
-
-    if (!hasMode && !hasFlySecrets) {
-      json(res, 400, { error: `mode must be one of: ${VALID_RUNNER_MODES.join(", ")}` });
-      return;
-    }
-
-    if (hasMode && !isRunnerMode(body.mode)) {
-      json(res, 400, { error: `mode must be one of: ${VALID_RUNNER_MODES.join(", ")}` });
-      return;
-    }
-
-    if (hasMode) {
-      const previous = getRunnerMode();
-      setRunnerMode(body.mode as RunnerMode);
-      const status = getRunnerMode();
-      // AII-306: swap observability — an execution-mode change is an operational
-      // event, not a quiet preference. Log it and fire the notify hook best-effort.
-      if (previous.mode !== status.mode) {
-        console.log(`[admin] Runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`);
-        if (config.notifyWebhookUrl) {
-          notifyText(
-            config.notifyWebhookUrl,
-            `⚙️ AI-Implement runner mode changed: ${previous.mode} → ${status.mode} (via admin API)`,
-          ).catch((err) => console.error("[admin] runner-mode notify failed:", err));
-        }
-      }
-    }
-
-    if (hasFlySecrets) {
-      const previousSecrets = getFlyProcessLevelSecrets();
-      setFlyProcessLevelSecrets(body.flyProcessLevelSecrets!);
-      const secretsStatus = getFlyProcessLevelSecrets();
-      if (previousSecrets.enabled !== secretsStatus.enabled) {
-        console.log(`[admin] Fly process-level secrets changed: ${previousSecrets.enabled} → ${secretsStatus.enabled} (via admin API)`);
-        if (config.notifyWebhookUrl) {
-          notifyText(
-            config.notifyWebhookUrl,
-            `⚙️ AI-Implement Fly process-level secrets changed: ${previousSecrets.enabled} → ${secretsStatus.enabled} (via admin API)`,
-          ).catch((err) => console.error("[admin] fly-process-level-secrets notify failed:", err));
-        }
-      }
-    }
-
-    const modeStatus = getRunnerMode();
-    const secretsStatus = getFlyProcessLevelSecrets();
-
-    // The DB write succeeded but an env var still wins at runtime. Return 409
-    // so direct API callers can tell their write was overridden.
-    if ((hasMode && modeStatus.source === "env") || (hasFlySecrets && secretsStatus.source === "env")) {
-      const modeConflict = hasMode && modeStatus.source === "env";
-      json(res, 409, {
-        error: modeConflict
-          ? "RUNNER_MODE env var is set; persisted to DB but has no effect at runtime until the env var is unset"
-          : "FLY_PROCESS_LEVEL_SECRETS env var is set; persisted to DB but has no effect at runtime until the env var is unset",
-        ...(hasMode ? { persisted: body.mode } : {}),
-        ...modeStatus,
-        flyProcessLevelSecrets: secretsStatus,
-      });
-      return;
-    }
-
-    json(res, 200, { ...modeStatus, flyProcessLevelSecrets: secretsStatus });
+    const result = setRunnerModeAction(config, body);
+    json(res, result.status, result.body);
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }
@@ -1296,6 +1309,17 @@ async function handleAuth(
   }
 }
 
+export function pauseProjectAction(
+  teamKey: string,
+  paused: boolean,
+): { status: number; body: Record<string, unknown> } {
+  const updated = setMappingPaused(teamKey, paused);
+  if (!updated) {
+    return { status: 404, body: { error: "Team not found" } };
+  }
+  return { status: 200, body: { updated, paused } };
+}
+
 async function handlePatchMapping(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -1313,12 +1337,8 @@ async function handlePatchMapping(
       return;
     }
     if (hasPaused) {
-      const updated = setMappingPaused(teamKey, body.paused as boolean);
-      if (!updated) {
-        json(res, 404, { error: "Team not found" });
-        return;
-      }
-      json(res, 200, { updated, paused: body.paused });
+      const result = pauseProjectAction(teamKey, body.paused as boolean);
+      json(res, result.status, result.body);
       return;
     }
     const max = body.maxInProgressAiIssues;
@@ -1333,22 +1353,29 @@ async function handlePatchMapping(
   }
 }
 
-function handleSyncWorkflows(
-  res: http.ServerResponse,
+export function triggerWorkflowSyncAction(
   config: AdminConfig,
   teamKey: string,
-): void {
+): { status: number; body: Record<string, unknown> } {
   const mappings = getMappings();
   const mapping = mappings[teamKey];
   if (!mapping) {
-    json(res, 404, { error: "Team not found" });
-    return;
+    return { status: 404, body: { error: "Team not found" } };
   }
   const { id } = enqueueWorkflowSync(teamKey);
   void runWorkflowSync(id, config).catch((err) =>
     console.error(`[admin] workflow sync failed for ${teamKey}:`, err)
   );
-  json(res, 202, { teamKey, syncJobId: id });
+  return { status: 202, body: { teamKey, syncJobId: id } };
+}
+
+function handleSyncWorkflows(
+  res: http.ServerResponse,
+  config: AdminConfig,
+  teamKey: string,
+): void {
+  const result = triggerWorkflowSyncAction(config, teamKey);
+  json(res, result.status, result.body);
 }
 
 async function handleDeployTrigger(
@@ -1900,6 +1927,248 @@ async function handleUnsetGlobalSecret(
   }
 }
 
+export interface UpsertMappingBody {
+  teamKey?: string;
+  owner?: string;
+  repo?: string;
+  workflowFile?: string;
+  defaultBranch?: string;
+  maxInProgressAiIssues?: number;
+  executionMode?: string;
+  sessionMode?: string;
+  machineCpus?: number;
+  machineMemoryMb?: number;
+  planningEnabled?: boolean;
+  planningWorkflowFile?: string;
+  autoApprovePlans?: boolean;
+  autoMerge?: boolean;
+  extraEnv?: Record<string, string>;
+  provider?: string;
+  awsRegion?: string | null;
+  ticketingProvider?: string;
+  ticketingConfig?: unknown;
+  paused?: boolean;
+  maxTurns?: number | null;
+  maxIterations?: number | null;
+  maxJobMinutes?: number | null;
+  branchPrefix?: string | null;
+  skillsRepo?: string | null;
+  referenceRepos?: unknown;
+  sensitiveAddPatterns?: string | string[] | null;
+  sensitiveAllowPatterns?: string | string[] | null;
+  dependencyTokenScope?: string | null;
+}
+
+export function upsertMappingAction(
+  body: UpsertMappingBody,
+  config: AdminConfig,
+  registry: ProviderRegistry,
+): { status: number; body: Record<string, unknown> } {
+  if (!body.teamKey || !body.owner || !body.repo) {
+    return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
+  }
+
+  const existingMapping = getMappings()[body.teamKey];
+  const defaultBranch = typeof body.defaultBranch === "string"
+    ? body.defaultBranch.trim()
+    : (existingMapping?.defaultBranch ?? "");
+  if (!defaultBranch) {
+    return { status: 400, body: { error: "defaultBranch is required" } };
+  }
+
+  const maxInProgressAiIssues =
+    body.maxInProgressAiIssues ?? DEFAULT_MAX_IN_PROGRESS_AI_ISSUES;
+  if (!Number.isInteger(maxInProgressAiIssues) || maxInProgressAiIssues < 1) {
+    return { status: 400, body: { error: "maxInProgressAiIssues must be a positive integer" } };
+  }
+
+  const validExecutionModes: ExecutionMode[] = ["github-actions", "fly-machines"];
+  const executionMode = (body.executionMode ?? DEFAULT_EXECUTION_MODE) as ExecutionMode;
+  if (!validExecutionModes.includes(executionMode)) {
+    return { status: 400, body: { error: "executionMode must be 'github-actions' or 'fly-machines'" } };
+  }
+
+  const validSessionModes: SessionMode[] = ["autonomous", "interactive", "hybrid"];
+  const sessionMode = (body.sessionMode ?? DEFAULT_SESSION_MODE) as SessionMode;
+  if (!validSessionModes.includes(sessionMode)) {
+    return { status: 400, body: { error: "sessionMode must be 'autonomous', 'interactive', or 'hybrid'" } };
+  }
+
+  const machineCpus = body.machineCpus ?? DEFAULT_MACHINE_CPUS;
+  if (!Number.isInteger(machineCpus) || machineCpus < 1) {
+    return { status: 400, body: { error: "machineCpus must be a positive integer" } };
+  }
+
+  const machineMemoryMb = body.machineMemoryMb ?? DEFAULT_MACHINE_MEMORY_MB;
+  if (!Number.isInteger(machineMemoryMb) || machineMemoryMb < 256) {
+    return { status: 400, body: { error: "machineMemoryMb must be an integer >= 256" } };
+  }
+
+  const planningEnabled = body.planningEnabled ?? DEFAULT_PLANNING_ENABLED;
+  const planningWorkflowFile = body.planningWorkflowFile ?? DEFAULT_PLANNING_WORKFLOW_FILE;
+  const autoApprovePlans = body.autoApprovePlans ?? DEFAULT_AUTO_APPROVE_PLANS;
+  const autoMerge = body.autoMerge ?? DEFAULT_AUTO_MERGE;
+
+  if (planningEnabled && !planningWorkflowFile) {
+    return { status: 400, body: { error: "planningWorkflowFile is required when planningEnabled is true" } };
+  }
+
+  let extraEnv: Record<string, string> = {};
+  if (body.extraEnv !== undefined) {
+    if (typeof body.extraEnv !== "object" || Array.isArray(body.extraEnv) || body.extraEnv === null) {
+      return { status: 400, body: { error: "extraEnv must be a plain object" } };
+    }
+    if (!Object.values(body.extraEnv).every((v) => typeof v === "string")) {
+      return { status: 400, body: { error: "extraEnv values must all be strings" } };
+    }
+    extraEnv = body.extraEnv as Record<string, string>;
+  }
+
+  const validProviders: ClaudeProvider[] = ["anthropic", "bedrock"];
+  const provider = (body.provider ?? DEFAULT_PROVIDER) as ClaudeProvider;
+  if (!validProviders.includes(provider)) {
+    return { status: 400, body: { error: "provider must be 'anthropic' or 'bedrock'" } };
+  }
+
+  const awsRegionRaw = typeof body.awsRegion === "string" ? body.awsRegion.trim() : "";
+  const awsRegion = awsRegionRaw.length > 0 ? awsRegionRaw : null;
+  if (provider === "bedrock" && !awsRegion) {
+    return { status: 400, body: { error: "awsRegion is required when provider is 'bedrock'" } };
+  }
+  if (provider === "bedrock" && executionMode === "fly-machines") {
+    return {
+      status: 400,
+      body: { error: "provider 'bedrock' is not supported with executionMode 'fly-machines'" },
+    };
+  }
+
+  let ticketing: ValidatedTicketing;
+  try {
+    ticketing = validateTicketingMapping(body);
+  } catch (err) {
+    return { status: 400, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+
+  const resolveCap = (
+    name: string,
+    value: number | null | undefined,
+  ): number | null => {
+    if (value === undefined || value === null) return null;
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`${name} must be a positive integer or null`);
+    }
+    return value;
+  };
+
+  let maxTurns: number | null;
+  let maxIterations: number | null;
+  let maxJobMinutes: number | null;
+  try {
+    maxTurns = resolveCap("maxTurns", body.maxTurns);
+    maxIterations = resolveCap("maxIterations", body.maxIterations);
+    maxJobMinutes = resolveCap("maxJobMinutes", body.maxJobMinutes);
+  } catch (err) {
+    return { status: 400, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+
+  let branchPrefix: string | null;
+  try {
+    branchPrefix = normalizeBranchPrefix(body.branchPrefix);
+  } catch (err) {
+    return { status: 400, body: { error: `branchPrefix invalid: ${err instanceof Error ? err.message : String(err)}` } };
+  }
+
+  let skillsRepo: string | null;
+  try {
+    skillsRepo = normalizeSkillsRepo(body.skillsRepo);
+  } catch (err) {
+    return { status: 400, body: { error: `skillsRepo invalid: ${err instanceof Error ? err.message : String(err)}` } };
+  }
+
+  let referenceRepos: ReferenceRepo[] | null;
+  try {
+    referenceRepos = normalizeReferenceRepos(body.referenceRepos);
+  } catch (err) {
+    return { status: 400, body: { error: `referenceRepos invalid: ${err instanceof Error ? err.message : String(err)}` } };
+  }
+
+  let sensitiveAddPatterns: string[] | null;
+  try {
+    sensitiveAddPatterns = normalizeSensitiveGlobs(body.sensitiveAddPatterns);
+  } catch (err) {
+    return { status: 400, body: { error: `sensitiveAddPatterns invalid: ${err instanceof Error ? err.message : String(err)}` } };
+  }
+
+  let sensitiveAllowPatterns: string[] | null;
+  try {
+    sensitiveAllowPatterns = normalizeSensitiveGlobs(body.sensitiveAllowPatterns);
+  } catch (err) {
+    return { status: 400, body: { error: `sensitiveAllowPatterns invalid: ${err instanceof Error ? err.message : String(err)}` } };
+  }
+
+  let dependencyTokenScope: "installation" | null;
+  const rawScope = body.dependencyTokenScope;
+  if (rawScope === undefined) {
+    // Preserve stored value on omit — silently clearing an opt-in permission grant is the worse failure mode.
+    dependencyTokenScope = existingMapping?.dependencyTokenScope ?? null;
+  } else if (rawScope === null || rawScope === "") {
+    dependencyTokenScope = null;
+  } else if (rawScope === "installation") {
+    dependencyTokenScope = "installation";
+  } else {
+    return { status: 400, body: { error: `dependencyTokenScope invalid: must be null or "installation"` } };
+  }
+
+  const mapping: RepoMapping = {
+    owner: body.owner,
+    repo: body.repo,
+    workflowFile: body.workflowFile || "claude-implement.yml",
+    defaultBranch,
+    maxInProgressAiIssues,
+    executionMode,
+    sessionMode,
+    machineCpus,
+    machineMemoryMb,
+    planningEnabled,
+    planningWorkflowFile,
+    autoApprovePlans,
+    autoMerge,
+    extraEnv,
+    provider,
+    ticketingProvider: ticketing.ticketingProvider,
+    ticketingConfig: ticketing.ticketingConfig,
+    awsRegion,
+    // Preserve current paused state if the request didn't include it,
+    // so an Edit form that omits `paused` doesn't silently resume the project.
+    paused: body.paused !== undefined
+      ? body.paused === true
+      : (existingMapping?.paused ?? false),
+    maxTurns,
+    maxIterations,
+    maxJobMinutes,
+    branchPrefix,
+    skillsRepo,
+    referenceRepos,
+    sensitiveAddPatterns,
+    sensitiveAllowPatterns,
+    dependencyTokenScope,
+    memoryProviderId: existingMapping?.memoryProviderId ?? null,
+  };
+
+  upsertMapping(body.teamKey, mapping);
+  registry.invalidate();
+
+  // Kick the workflow sync off in the background and return immediately
+  // - the client polls GET /api/mappings/:teamKey/sync-status/:id for the outcome
+  // - the mapping is already persisted above, so the save itself succeeds regardless of how the sync resolves
+  const { id } = enqueueWorkflowSync(body.teamKey);
+  void runWorkflowSync(id, config).catch((err) =>
+    console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
+  );
+
+  return { status: 202, body: { teamKey: body.teamKey, ...mapping, syncJobId: id } };
+}
+
 async function handleUpsertMapping(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -1907,261 +2176,9 @@ async function handleUpsertMapping(
   registry: ProviderRegistry,
 ): Promise<void> {
   try {
-    const body = JSON.parse(await readBody(req)) as {
-      teamKey?: string;
-      owner?: string;
-      repo?: string;
-      workflowFile?: string;
-      defaultBranch?: string;
-      maxInProgressAiIssues?: number;
-      executionMode?: string;
-      sessionMode?: string;
-      machineCpus?: number;
-      machineMemoryMb?: number;
-      planningEnabled?: boolean;
-      planningWorkflowFile?: string;
-      autoApprovePlans?: boolean;
-      autoMerge?: boolean;
-      extraEnv?: Record<string, string>;
-      provider?: string;
-      awsRegion?: string | null;
-      ticketingProvider?: string;
-      ticketingConfig?: unknown;
-      paused?: boolean;
-      maxTurns?: number | null;
-      maxIterations?: number | null;
-      maxJobMinutes?: number | null;
-      branchPrefix?: string | null;
-      skillsRepo?: string | null;
-      referenceRepos?: unknown;
-      sensitiveAddPatterns?: string | string[] | null;
-      sensitiveAllowPatterns?: string | string[] | null;
-      dependencyTokenScope?: string | null;
-    };
-
-    if (!body.teamKey || !body.owner || !body.repo) {
-      json(res, 400, { error: "teamKey, owner, and repo are required" });
-      return;
-    }
-
-    const existingMapping = getMappings()[body.teamKey];
-    const defaultBranch = typeof body.defaultBranch === "string"
-      ? body.defaultBranch.trim()
-      : (existingMapping?.defaultBranch ?? "");
-    if (!defaultBranch) {
-      json(res, 400, { error: "defaultBranch is required" });
-      return;
-    }
-
-    const maxInProgressAiIssues =
-      body.maxInProgressAiIssues ?? DEFAULT_MAX_IN_PROGRESS_AI_ISSUES;
-    if (!Number.isInteger(maxInProgressAiIssues) || maxInProgressAiIssues < 1) {
-      json(res, 400, { error: "maxInProgressAiIssues must be a positive integer" });
-      return;
-    }
-
-    const validExecutionModes: ExecutionMode[] = ["github-actions", "fly-machines"];
-    const executionMode = (body.executionMode ?? DEFAULT_EXECUTION_MODE) as ExecutionMode;
-    if (!validExecutionModes.includes(executionMode)) {
-      json(res, 400, { error: "executionMode must be 'github-actions' or 'fly-machines'" });
-      return;
-    }
-
-    const validSessionModes: SessionMode[] = ["autonomous", "interactive", "hybrid"];
-    const sessionMode = (body.sessionMode ?? DEFAULT_SESSION_MODE) as SessionMode;
-    if (!validSessionModes.includes(sessionMode)) {
-      json(res, 400, { error: "sessionMode must be 'autonomous', 'interactive', or 'hybrid'" });
-      return;
-    }
-
-    const machineCpus = body.machineCpus ?? DEFAULT_MACHINE_CPUS;
-    if (!Number.isInteger(machineCpus) || machineCpus < 1) {
-      json(res, 400, { error: "machineCpus must be a positive integer" });
-      return;
-    }
-
-    const machineMemoryMb = body.machineMemoryMb ?? DEFAULT_MACHINE_MEMORY_MB;
-    if (!Number.isInteger(machineMemoryMb) || machineMemoryMb < 256) {
-      json(res, 400, { error: "machineMemoryMb must be an integer >= 256" });
-      return;
-    }
-
-    const planningEnabled = body.planningEnabled ?? DEFAULT_PLANNING_ENABLED;
-    const planningWorkflowFile = body.planningWorkflowFile ?? DEFAULT_PLANNING_WORKFLOW_FILE;
-    const autoApprovePlans = body.autoApprovePlans ?? DEFAULT_AUTO_APPROVE_PLANS;
-    const autoMerge = body.autoMerge ?? DEFAULT_AUTO_MERGE;
-
-    if (planningEnabled && !planningWorkflowFile) {
-      json(res, 400, { error: "planningWorkflowFile is required when planningEnabled is true" });
-      return;
-    }
-
-    let extraEnv: Record<string, string> = {};
-    if (body.extraEnv !== undefined) {
-      if (typeof body.extraEnv !== "object" || Array.isArray(body.extraEnv) || body.extraEnv === null) {
-        json(res, 400, { error: "extraEnv must be a plain object" });
-        return;
-      }
-      if (!Object.values(body.extraEnv).every((v) => typeof v === "string")) {
-        json(res, 400, { error: "extraEnv values must all be strings" });
-        return;
-      }
-      extraEnv = body.extraEnv as Record<string, string>;
-    }
-
-    const validProviders: ClaudeProvider[] = ["anthropic", "bedrock"];
-    const provider = (body.provider ?? DEFAULT_PROVIDER) as ClaudeProvider;
-    if (!validProviders.includes(provider)) {
-      json(res, 400, { error: "provider must be 'anthropic' or 'bedrock'" });
-      return;
-    }
-
-    const awsRegionRaw = typeof body.awsRegion === "string" ? body.awsRegion.trim() : "";
-    const awsRegion = awsRegionRaw.length > 0 ? awsRegionRaw : null;
-    if (provider === "bedrock" && !awsRegion) {
-      json(res, 400, { error: "awsRegion is required when provider is 'bedrock'" });
-      return;
-    }
-    if (provider === "bedrock" && executionMode === "fly-machines") {
-      json(res, 400, {
-        error: "provider 'bedrock' is not supported with executionMode 'fly-machines'",
-      });
-      return;
-    }
-
-    let ticketing: ValidatedTicketing;
-    try {
-      ticketing = validateTicketingMapping(body);
-    } catch (err) {
-      json(res, 400, { error: err instanceof Error ? err.message : String(err) });
-      return;
-    }
-
-    const resolveCap = (
-      name: string,
-      value: number | null | undefined,
-    ): number | null => {
-      if (value === undefined || value === null) return null;
-      if (!Number.isInteger(value) || value < 1) {
-        throw new Error(`${name} must be a positive integer or null`);
-      }
-      return value;
-    };
-
-    let maxTurns: number | null;
-    let maxIterations: number | null;
-    let maxJobMinutes: number | null;
-    try {
-      maxTurns = resolveCap("maxTurns", body.maxTurns);
-      maxIterations = resolveCap("maxIterations", body.maxIterations);
-      maxJobMinutes = resolveCap("maxJobMinutes", body.maxJobMinutes);
-    } catch (err) {
-      json(res, 400, { error: err instanceof Error ? err.message : String(err) });
-      return;
-    }
-
-    let branchPrefix: string | null;
-    try {
-      branchPrefix = normalizeBranchPrefix(body.branchPrefix);
-    } catch (err) {
-      json(res, 400, { error: `branchPrefix invalid: ${err instanceof Error ? err.message : String(err)}` });
-      return;
-    }
-
-    let skillsRepo: string | null;
-    try {
-      skillsRepo = normalizeSkillsRepo(body.skillsRepo);
-    } catch (err) {
-      json(res, 400, { error: `skillsRepo invalid: ${err instanceof Error ? err.message : String(err)}` });
-      return;
-    }
-
-    let referenceRepos: ReferenceRepo[] | null;
-    try {
-      referenceRepos = normalizeReferenceRepos(body.referenceRepos);
-    } catch (err) {
-      json(res, 400, { error: `referenceRepos invalid: ${err instanceof Error ? err.message : String(err)}` });
-      return;
-    }
-
-    let sensitiveAddPatterns: string[] | null;
-    try {
-      sensitiveAddPatterns = normalizeSensitiveGlobs(body.sensitiveAddPatterns);
-    } catch (err) {
-      json(res, 400, { error: `sensitiveAddPatterns invalid: ${err instanceof Error ? err.message : String(err)}` });
-      return;
-    }
-
-    let sensitiveAllowPatterns: string[] | null;
-    try {
-      sensitiveAllowPatterns = normalizeSensitiveGlobs(body.sensitiveAllowPatterns);
-    } catch (err) {
-      json(res, 400, { error: `sensitiveAllowPatterns invalid: ${err instanceof Error ? err.message : String(err)}` });
-      return;
-    }
-
-    let dependencyTokenScope: "installation" | null;
-    const rawScope = body.dependencyTokenScope;
-    if (rawScope === undefined) {
-      // Preserve stored value on omit — silently clearing an opt-in permission grant is the worse failure mode.
-      dependencyTokenScope = existingMapping?.dependencyTokenScope ?? null;
-    } else if (rawScope === null || rawScope === "") {
-      dependencyTokenScope = null;
-    } else if (rawScope === "installation") {
-      dependencyTokenScope = "installation";
-    } else {
-      json(res, 400, { error: `dependencyTokenScope invalid: must be null or "installation"` });
-      return;
-    }
-
-    const mapping: RepoMapping = {
-      owner: body.owner,
-      repo: body.repo,
-      workflowFile: body.workflowFile || "claude-implement.yml",
-      defaultBranch,
-      maxInProgressAiIssues,
-      executionMode,
-      sessionMode,
-      machineCpus,
-      machineMemoryMb,
-      planningEnabled,
-      planningWorkflowFile,
-      autoApprovePlans,
-      autoMerge,
-      extraEnv,
-      provider,
-      ticketingProvider: ticketing.ticketingProvider,
-      ticketingConfig: ticketing.ticketingConfig,
-      awsRegion,
-      // Preserve current paused state if the request didn't include it,
-      // so an Edit form that omits `paused` doesn't silently resume the project.
-      paused: body.paused !== undefined
-        ? body.paused === true
-        : (existingMapping?.paused ?? false),
-      maxTurns,
-      maxIterations,
-      maxJobMinutes,
-      branchPrefix,
-      skillsRepo,
-      referenceRepos,
-      sensitiveAddPatterns,
-      sensitiveAllowPatterns,
-      dependencyTokenScope,
-      memoryProviderId: existingMapping?.memoryProviderId ?? null,
-    };
-
-    upsertMapping(body.teamKey, mapping);
-    registry.invalidate();
-
-    // Kick the workflow sync off in the background and return immediately
-    // - the client polls GET /api/mappings/:teamKey/sync-status/:id for the outcome
-    // - the mapping is already persisted above, so the save itself succeeds regardless of how the sync resolves
-    const { id } = enqueueWorkflowSync(body.teamKey);
-    void runWorkflowSync(id, config).catch((err) =>
-      console.error(`[admin] workflow sync failed for ${body.teamKey}:`, err),
-    );
-
-    json(res, 202, { teamKey: body.teamKey, ...mapping, syncJobId: id });
+    const body = JSON.parse(await readBody(req)) as UpsertMappingBody;
+    const result = upsertMappingAction(body, config, registry);
+    json(res, result.status, result.body);
   } catch {
     json(res, 400, { error: "Invalid request body" });
   }

@@ -39,7 +39,6 @@ const groups: NavGroup[] = [
       grantBlocker: "Exposes global secrets and infrastructure settings." },
   ]},
   { label: "Developer", items: [
-    { key: "mcp",            label: "MCP server",     icon: "plug" },
     { key: "webhooks",       label: "Webhooks",       icon: "webhook" },
     { key: "audit",          label: "Audit log",      icon: "history" },
     { key: "customizations", label: "Customizations", icon: "fork" },
