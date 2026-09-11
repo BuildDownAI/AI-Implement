@@ -59,7 +59,7 @@ An address entry outranks a domain entry: it is the more specific grant, and the
 
 ## Roles
 
-`admin` may use every admin route. `user` may sign in and reach `/mcp`, plus the read paths of whichever admin pages have been granted; every other `/api/` route answers 403, except the identity probe the SPA needs in order to know it is signed in. Nothing is granted until someone grants it, so a new deployment starts with `user` meaning `/mcp` and nothing else. See [Page grants](#page-grants).
+`admin` may use every admin route and every declared `/mcp` write tool. `user` may sign in, reach every `/mcp` read tool, and open the read paths of whichever admin pages have been granted; every other `/api/` route answers 403, except the identity probe the SPA needs in order to know it is signed in, and a declared `/mcp` write above the caller's role answers a role error. Nothing is granted until someone grants it, so a new deployment starts with `user` meaning `/mcp` reads and nothing else. See [Page grants](#page-grants).
 
 **A domain never confers `admin`, at any point — including while the environment seed is in force.** A domain grant asserts only that someone shares a domain with an operator, which an identity provider will issue to anyone it admits there: contractors, service accounts, a departed employee whose account still resolves. Granting administration on that basis turns authorization from a decision about a person into an attribute check, and the audit trail then records who acted while nobody ever decided that person could act. Adding one address is the entire cost of avoiding that.
 
@@ -85,7 +85,7 @@ Currently grantable: Issues, Pipelines, Pull requests, Blockers, Reports, Pipeli
 
 ### What grants do not restrict
 
-**Page grants govern the admin UI. They do not govern what a user can read.** `/mcp` is role-blind by design — a `user` granted nothing still reaches every MCP tool, including the project inventory, fleet report, tenant health, runner mode, and in-flight jobs. "Granted nothing" therefore means "no admin pages", never "sees nothing", and an operator deciding what to grant should treat MCP as the floor rather than the ceiling.
+**Page grants govern the admin UI. They do not govern what a user can read.** `/mcp` reads are open to every allowlisted identity — a `user` granted nothing still reaches every read tool, including the project inventory, fleet report, tenant health, runner mode, and in-flight jobs. "Granted nothing" therefore means "no admin pages", never "sees nothing", and an operator deciding what to grant should treat MCP reads as the floor rather than the ceiling. What a `user` cannot do over `/mcp` is write: the few write tools that exist there are on a declared list in `src/mcp.ts`, each with a required role resolved on every call, and everything else that mutates stays on the admin API (see [mcp-server.md](mcp-server.md), ADR 015).
 
 This does not defeat the credential rule below: MCP's project listing selects its fields explicitly and omits `extraEnv`, so the runner environment values never leave through it.
 

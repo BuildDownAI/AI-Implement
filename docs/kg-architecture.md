@@ -199,8 +199,9 @@ With the refresh rail (AII-426), publishing data no longer rides a release. Run 
 or these steps by hand.
 
 1. Reconcile scope in `sources.yml` (through a PR on the KG repo when it changes) — the rail runs the ingest and pushes the snapshot itself; no laptop ingest, no laptop push.
-2. **Trigger the refresh**: `POST /api/kg/refresh` with an admin session token (or the
-   Deployments page's "Refresh graph now"). `202` = accepted; `409` = a refresh or a deploy is
+2. **Trigger the refresh**: the `trigger_kg_refresh` MCP tool (admin role; this is what `bd-kg-refresh` calls),
+   `POST /api/kg/refresh` with an admin session token, or the Deployments page's "Refresh graph now" — all three
+   run the same handler. `202` = accepted; `409` = a refresh or a deploy is
    already in progress; `422` = callback not configured or credential preflight failed (see below). The orchestrator
    first runs a **credential preflight** (probing the KG write token and the installation-wide
    dependency token against every `code_repo` and `secondary_repos` slug in `sources.yml`) and
