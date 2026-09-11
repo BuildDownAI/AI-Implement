@@ -91,7 +91,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | Knowledge graph end-to-end (ingest → snapshot → image → serve) | `Dockerfile` KG stages, `docker-entrypoint.sh` | [docs/kg-architecture.md](docs/kg-architecture.md) |
 | KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
-| MCP server: tools, roles, the declared write list | src/mcp.ts | [docs/mcp-server.md](docs/mcp-server.md) |
+| MCP server: tools, roles, the declared write list | `src/mcp.ts` | [docs/mcp-server.md](docs/mcp-server.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
