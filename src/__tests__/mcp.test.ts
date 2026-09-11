@@ -15,6 +15,7 @@ vi.mock("../access-entries.js", () => ({
 }));
 
 vi.mock("../runner-mode.js", () => ({
+  VALID_RUNNER_MODES: ["default", "gha", "fly", "local", "shadow"],
   getRunnerMode: vi.fn(),
 }));
 
@@ -1538,6 +1539,56 @@ describe("handleMcpRequest", () => {
       );
     });
 
+    it("set_runner_mode: as admin, passes mode \"local\" through to setRunnerMode unchanged (the action validates the mode, not the tool)", async () => {
+      mockRole("admin");
+      const setRunnerModeMock = vi.fn(() => ({ status: 200, body: { mode: "local", source: "db" } }));
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 62, method: "tools/call", params: { name: "set_runner_mode", arguments: { mode: "local" } } }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { setRunnerMode: setRunnerModeMock },
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 200, body: { mode: "local", source: "db" } });
+      expect(setRunnerModeMock).toHaveBeenCalledWith({ mode: "local" });
+    });
+
+    it("set_runner_mode: as admin, an unknown mode reaches setRunnerMode and returns the action's own 400", async () => {
+      mockRole("admin");
+      const setRunnerModeMock = vi.fn(() => ({ status: 400, body: { error: "mode must be one of: default, gha, fly, local, shadow" } }));
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 63, method: "tools/call", params: { name: "set_runner_mode", arguments: { mode: "bogus" } } }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { setRunnerMode: setRunnerModeMock },
+      );
+
+      const parsed = JSON.parse(result.body);
+      expect(JSON.parse(parsed.result.content[0].text)).toEqual({ status: 400, body: { error: "mode must be one of: default, gha, fly, local, shadow" } });
+      expect(setRunnerModeMock).toHaveBeenCalledWith({ mode: "bogus" });
+    });
+
     it("set_runner_mode: as user, returns isError forbidden and never calls setRunnerMode", async () => {
       mockRole("user");
       const setRunnerModeMock = vi.fn(() => ({ status: 200, body: { mode: "gha", source: "db" } }));
@@ -1815,30 +1866,6 @@ describe("handleMcpRequest", () => {
       const data = JSON.parse(parsed.result.content[0].text);
       expect(data.status).toBe(400);
       expect(data.body.error).toContain("mode is required");
-      expect(setRunnerModeMock).not.toHaveBeenCalled();
-    });
-
-    it("set_runner_mode: an unrecognised mode returns 400 and never calls setRunnerMode", async () => {
-      mockRole("admin");
-      const setRunnerModeMock = vi.fn(() => ({ status: 200, body: { mode: "gha", source: "db" } }));
-
-      const result = await callMcp(
-        { authorization: "Bearer tok" },
-        true,
-        null,
-        BASE_URL,
-        "POST",
-        JSON.stringify({ jsonrpc: "2.0", id: 71, method: "tools/call", params: { name: "set_runner_mode", arguments: { mode: "bogus" } } }),
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { setRunnerMode: setRunnerModeMock },
-      );
-
-      const parsed = JSON.parse(result.body);
-      const data = JSON.parse(parsed.result.content[0].text);
-      expect(data.status).toBe(400);
       expect(setRunnerModeMock).not.toHaveBeenCalled();
     });
 

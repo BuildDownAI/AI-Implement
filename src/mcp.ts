@@ -1,7 +1,7 @@
 import http from "node:http";
 import type { PreflightCheckResult, KgRefreshStatus } from "./kg-refresh.js";
 import { verifyMcpToken } from "./mcp-oauth.js";
-import { getRunnerMode } from "./runner-mode.js";
+import { getRunnerMode, VALID_RUNNER_MODES } from "./runner-mode.js";
 import { getMappings } from "./config.js";
 import { getInFlightJobs, getRunRecordMergeVerdict } from "./log.js";
 import { getDb } from "./dedup.js";
@@ -170,8 +170,8 @@ export const WRITE_TOOLS: WriteTool[] = [
       properties: {
         mode: {
           type: "string",
-          enum: ["default", "gha", "fly", "shadow"],
-          description: "Global runner mode: default restores per-project modes, gha/fly force that execution path, shadow dispatches to both without acting on either result.",
+          enum: [...VALID_RUNNER_MODES],
+          description: "Global runner mode: default restores per-project modes, gha/fly force that execution path, shadow dispatches to both without acting on either result, local runs dispatches in local Docker (a developer-machine mode the admin UI does not offer). Validated by the same check as POST /api/runner-mode.",
         },
       },
       required: ["mode"],
@@ -181,10 +181,11 @@ export const WRITE_TOOLS: WriteTool[] = [
       if (!context.setRunnerMode) {
         throw new Error("set_runner_mode is not configured");
       }
-      const validModes = ["default", "gha", "fly", "shadow"];
-      if (typeof args.mode !== "string" || !validModes.includes(args.mode)) {
-        return { status: 400, body: { error: `mode is required and must be one of: ${validModes.join(", ")}` } };
+      if (typeof args.mode !== "string") {
+        return { status: 400, body: { error: "mode is required" } };
       }
+      // The mode set is not repeated here: setRunnerModeAction validates with isRunnerMode,
+      // the same check POST /api/runner-mode runs, so the tool answers what the route answers.
       return context.setRunnerMode({ mode: args.mode });
     },
   },

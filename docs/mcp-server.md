@@ -49,7 +49,7 @@ Writes, declared:
 | Tool | Role | Does |
 | -- | -- | -- |
 | `trigger_kg_refresh` | admin | Same as `POST /api/kg/refresh`: preflight, then dispatch the refresh rail. Answers accepted (202), already-running (409), or the named preflight refusal (422). |
-| `set_runner_mode` | admin | Same as `POST /api/runner-mode`'s mode update: forces (or restores) the global execution path. |
+| `set_runner_mode` | admin | Same as `POST /api/runner-mode`'s mode update: forces (or restores) the global execution path. Accepts every value of `VALID_RUNNER_MODES` (`default`, `gha`, `fly`, `shadow`, `local`), validated by the action, not the tool; `local` is a developer-machine mode the admin UI's buttons do not offer. |
 | `pause_project` | admin | Same as the `paused` update of `PATCH /api/mappings/<teamKey>`. |
 | `add_project` | admin | Same as `POST /api/mappings`: create or update a project mapping, the upsert behind the admin UI's New project stepper. |
 | `trigger_workflow_sync` | admin | Same as `POST /api/mappings/<teamKey>/sync-workflows`: re-sync the workflow templates for one project. |
