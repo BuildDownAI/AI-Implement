@@ -49,6 +49,11 @@ Writes, declared:
 | Tool | Role | Does |
 | -- | -- | -- |
 | `trigger_kg_refresh` | admin | Same as `POST /api/kg/refresh`: preflight, then dispatch the refresh rail. Answers accepted (202), already-running (409), or the named preflight refusal (422). |
+| `set_runner_mode` | admin | Same as `POST /api/runner-mode`'s mode update: forces (or restores) the global execution path. |
+| `pause_project` | admin | Same as the `paused` update of `PATCH /api/mappings/<teamKey>`. |
+| `add_project` | admin | Same as `POST /api/mappings`: create or update a project mapping, the upsert behind the admin UI's New project stepper. |
+| `trigger_workflow_sync` | admin | Same as `POST /api/mappings/<teamKey>/sync-workflows`: re-sync the workflow templates for one project. |
+| `clear_dispatch_dedup` | admin | Same as `DELETE /api/dedup/<issueId>`: clear a dedup entry so the issue can be re-dispatched. |
 
 ## How the skills use it
 

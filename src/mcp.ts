@@ -122,6 +122,11 @@ const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
 
 interface WriteToolContext {
   triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>;
+  setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
+  pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
+  addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
+  triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> };
+  clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> };
 }
 
 export interface WriteTool {
@@ -129,7 +134,10 @@ export interface WriteTool {
   description: string;
   inputSchema: Record<string, unknown>;
   role: AccessRole;
-  run: (context: WriteToolContext) => Promise<{ status: number; body: Record<string, unknown> }>;
+  run: (
+    args: Record<string, unknown>,
+    context: WriteToolContext,
+  ) => Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
 // admin is a strict superset of user (docs/access-model.md § Roles): an entry's role satisfies
@@ -146,11 +154,143 @@ export const WRITE_TOOLS: WriteTool[] = [
       "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards.",
     inputSchema: { type: "object", properties: {} },
     role: "admin",
-    run: async (context) => {
+    run: async (_args, context) => {
       if (!context.triggerKgRefresh) {
         throw new Error("KG refresh is not configured");
       }
       return context.triggerKgRefresh();
+    },
+  },
+  {
+    name: "set_runner_mode",
+    description:
+      "Set the global runner mode (admin role). Same handler as POST /api/runner-mode: forces all new dispatches onto the given execution path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["default", "gha", "fly", "shadow"],
+          description: "Global runner mode: default restores per-project modes, gha/fly force that execution path, shadow dispatches to both without acting on either result.",
+        },
+      },
+      required: ["mode"],
+    },
+    role: "admin",
+    run: async (args, context) => {
+      if (!context.setRunnerMode) {
+        throw new Error("set_runner_mode is not configured");
+      }
+      return context.setRunnerMode({ mode: args.mode as string | undefined });
+    },
+  },
+  {
+    name: "pause_project",
+    description:
+      "Pause or resume a project mapping (admin role). Same as the paused update of PATCH /api/mappings/<teamKey>.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        teamKey: { type: "string", description: "Team key of the mapping" },
+        paused: { type: "boolean", description: "Whether dispatch for this project should be paused" },
+      },
+      required: ["teamKey", "paused"],
+    },
+    role: "admin",
+    run: async (args, context) => {
+      if (!context.pauseProject) {
+        throw new Error("pause_project is not configured");
+      }
+      return context.pauseProject(args.teamKey as string, args.paused as boolean);
+    },
+  },
+  {
+    name: "add_project",
+    description:
+      "Create or update a project mapping (admin role). Same as POST /api/mappings, the mapping upsert behind the admin UI's New project stepper.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        teamKey: { type: "string", description: "Team key, e.g. the Linear team key or Jira project key" },
+        owner: { type: "string", description: "GitHub repo owner/org" },
+        repo: { type: "string", description: "GitHub repo name" },
+        defaultBranch: { type: "string", description: "Base branch PRs are opened against" },
+        workflowFile: { type: "string" },
+        maxInProgressAiIssues: { type: "number" },
+        executionMode: { type: "string", enum: ["github-actions", "fly-machines"] },
+        sessionMode: { type: "string", enum: ["autonomous", "interactive", "hybrid"] },
+        machineCpus: { type: "number" },
+        machineMemoryMb: { type: "number" },
+        planningEnabled: { type: "boolean" },
+        planningWorkflowFile: { type: "string" },
+        autoApprovePlans: { type: "boolean" },
+        autoMerge: { type: "boolean" },
+        extraEnv: { type: "object", description: "Passed through to the model process; visible to the agent" },
+        provider: { type: "string", enum: ["anthropic", "bedrock"] },
+        awsRegion: { type: "string", description: "Required when provider is 'bedrock'" },
+        ticketingProvider: { type: "string" },
+        ticketingConfig: { type: "object" },
+        paused: { type: "boolean" },
+        maxTurns: { type: "number" },
+        maxIterations: { type: "number" },
+        maxJobMinutes: { type: "number" },
+        branchPrefix: { type: "string" },
+        skillsRepo: { type: "string" },
+        referenceRepos: { type: "array" },
+        sensitiveAddPatterns: {
+          description: "String or array of glob strings",
+        },
+        sensitiveAllowPatterns: {
+          description: "String or array of glob strings",
+        },
+        dependencyTokenScope: { type: "string", enum: ["installation"] },
+      },
+      required: ["teamKey", "owner", "repo", "defaultBranch"],
+    },
+    role: "admin",
+    run: async (args, context) => {
+      if (!context.addProject) {
+        throw new Error("add_project is not configured");
+      }
+      return context.addProject(args);
+    },
+  },
+  {
+    name: "trigger_workflow_sync",
+    description:
+      "Trigger a workflow-template sync for a project (admin role). Same as POST /api/mappings/<teamKey>/sync-workflows.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        teamKey: { type: "string", description: "Team key of the mapping" },
+      },
+      required: ["teamKey"],
+    },
+    role: "admin",
+    run: async (args, context) => {
+      if (!context.triggerWorkflowSync) {
+        throw new Error("trigger_workflow_sync is not configured");
+      }
+      return context.triggerWorkflowSync(args.teamKey as string);
+    },
+  },
+  {
+    name: "clear_dispatch_dedup",
+    description:
+      "Clear a dedup entry so the issue can be re-dispatched (admin role). Same as DELETE /api/dedup/<issueId>.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueId: { type: "string", description: "The tracker issue id (not the human identifier) of the dedup entry" },
+      },
+      required: ["issueId"],
+    },
+    role: "admin",
+    run: async (args, context) => {
+      if (!context.clearDispatchDedup) {
+        throw new Error("clear_dispatch_dedup is not configured");
+      }
+      return context.clearDispatchDedup(args.issueId as string);
     },
   },
 ];
@@ -318,6 +458,11 @@ export async function handleMcpRequest(
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
   getKgStatus?: () => Promise<KgRefreshStatus>,
   triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>,
+  setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> },
+  pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> },
+  addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> },
+  triggerWorkflowSync?: (teamKey: string) => { status: number; body: Record<string, unknown> },
+  clearDispatchDedup?: (issueId: string) => { status: number; body: Record<string, unknown> },
 ): Promise<void> {
   if (!baseUrl) {
     json(res, 503, { error: "MCP endpoint not configured: OAUTH_REDIRECT_BASE_URL is not set" });
@@ -382,6 +527,7 @@ export async function handleMcpRequest(
 
   if (rpc?.method === "tools/call") {
     const toolName = (rpc.params?.name as string) ?? "";
+    const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
 
     const writeTool = WRITE_TOOLS.find((t) => t.name === toolName);
     if (writeTool) {
@@ -399,7 +545,14 @@ export async function handleMcpRequest(
         return;
       }
       try {
-        const result = await writeTool.run({ triggerKgRefresh });
+        const result = await writeTool.run(toolArgs, {
+          triggerKgRefresh,
+          setRunnerMode,
+          pauseProject,
+          addProject,
+          triggerWorkflowSync,
+          clearDispatchDedup,
+        });
         console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role} result=${result.status}`);
         json(res, 200, {
           jsonrpc: "2.0",
@@ -421,7 +574,6 @@ export async function handleMcpRequest(
     }
 
     if (DIAG_TOOL_NAMES.has(toolName)) {
-      const toolArgs = (rpc.params?.arguments as Record<string, unknown>) ?? {};
       try {
         const result = await callDiagnosticTool(toolName, toolArgs, {
           defaultRunnerImage,
