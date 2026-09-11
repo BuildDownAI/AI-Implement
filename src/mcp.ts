@@ -181,7 +181,11 @@ export const WRITE_TOOLS: WriteTool[] = [
       if (!context.setRunnerMode) {
         throw new Error("set_runner_mode is not configured");
       }
-      return context.setRunnerMode({ mode: args.mode as string | undefined });
+      const validModes = ["default", "gha", "fly", "shadow"];
+      if (typeof args.mode !== "string" || !validModes.includes(args.mode)) {
+        return { status: 400, body: { error: `mode is required and must be one of: ${validModes.join(", ")}` } };
+      }
+      return context.setRunnerMode({ mode: args.mode });
     },
   },
   {
@@ -201,7 +205,13 @@ export const WRITE_TOOLS: WriteTool[] = [
       if (!context.pauseProject) {
         throw new Error("pause_project is not configured");
       }
-      return context.pauseProject(args.teamKey as string, args.paused as boolean);
+      if (typeof args.teamKey !== "string" || !args.teamKey) {
+        return { status: 400, body: { error: "teamKey is required" } };
+      }
+      if (typeof args.paused !== "boolean") {
+        return { status: 400, body: { error: "paused is required" } };
+      }
+      return context.pauseProject(args.teamKey, args.paused);
     },
   },
   {
@@ -252,6 +262,16 @@ export const WRITE_TOOLS: WriteTool[] = [
       if (!context.addProject) {
         throw new Error("add_project is not configured");
       }
+      if (
+        typeof args.teamKey !== "string" || !args.teamKey ||
+        typeof args.owner !== "string" || !args.owner ||
+        typeof args.repo !== "string" || !args.repo
+      ) {
+        return { status: 400, body: { error: "teamKey, owner, and repo are required" } };
+      }
+      if (typeof args.defaultBranch !== "string" || !args.defaultBranch) {
+        return { status: 400, body: { error: "defaultBranch is required" } };
+      }
       return context.addProject(args);
     },
   },
@@ -271,7 +291,10 @@ export const WRITE_TOOLS: WriteTool[] = [
       if (!context.triggerWorkflowSync) {
         throw new Error("trigger_workflow_sync is not configured");
       }
-      return context.triggerWorkflowSync(args.teamKey as string);
+      if (typeof args.teamKey !== "string" || !args.teamKey) {
+        return { status: 400, body: { error: "teamKey is required" } };
+      }
+      return context.triggerWorkflowSync(args.teamKey);
     },
   },
   {
@@ -290,7 +313,10 @@ export const WRITE_TOOLS: WriteTool[] = [
       if (!context.clearDispatchDedup) {
         throw new Error("clear_dispatch_dedup is not configured");
       }
-      return context.clearDispatchDedup(args.issueId as string);
+      if (typeof args.issueId !== "string" || !args.issueId) {
+        return { status: 400, body: { error: "issueId is required" } };
+      }
+      return context.clearDispatchDedup(args.issueId);
     },
   },
 ];

@@ -312,7 +312,7 @@ The SPA at `/admin` is composed from string-exporting modules under `src/admin-u
 
 `window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first, and `window.raw(markup)` opts out for pre-built HTML. **No page module uses it** — every call site concatenates strings with explicit `esc()`/`escAttr()`, because nesting a template literal inside the page's own script template means escaping every backtick and `${`. Follow the call sites. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. And when a URL is assembled in a variable before being interpolated, no helper can detect the URL context — call `safeUrl()` explicitly there.
 
-Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
+Five routes (`channels`, `policies`, `secrets`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
 
 ## Backend outage playbook
 

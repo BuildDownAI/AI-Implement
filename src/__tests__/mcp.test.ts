@@ -1790,6 +1790,217 @@ describe("handleMcpRequest", () => {
         expect.stringMatching(/\[mcp\] write tool=clear_dispatch_dedup actor=user@example\.com role=user result=forbidden/),
       );
     });
+
+    it("set_runner_mode: missing mode returns 400 and never calls setRunnerMode", async () => {
+      mockRole("admin");
+      const setRunnerModeMock = vi.fn(() => ({ status: 200, body: { mode: "gha", source: "db" } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 70, method: "tools/call", params: { name: "set_runner_mode", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { setRunnerMode: setRunnerModeMock },
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.status).toBe(400);
+      expect(data.body.error).toContain("mode is required");
+      expect(setRunnerModeMock).not.toHaveBeenCalled();
+    });
+
+    it("set_runner_mode: an unrecognised mode returns 400 and never calls setRunnerMode", async () => {
+      mockRole("admin");
+      const setRunnerModeMock = vi.fn(() => ({ status: 200, body: { mode: "gha", source: "db" } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 71, method: "tools/call", params: { name: "set_runner_mode", arguments: { mode: "bogus" } } }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { setRunnerMode: setRunnerModeMock },
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.status).toBe(400);
+      expect(setRunnerModeMock).not.toHaveBeenCalled();
+    });
+
+    it("pause_project: missing teamKey returns 400 and never calls pauseProject", async () => {
+      mockRole("admin");
+      const pauseProjectMock = vi.fn(() => ({ status: 200, body: { updated: true, paused: true } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 72, method: "tools/call", params: { name: "pause_project", arguments: { paused: true } } }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { pauseProject: pauseProjectMock },
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.status).toBe(400);
+      expect(data.body.error).toContain("teamKey is required");
+      expect(pauseProjectMock).not.toHaveBeenCalled();
+    });
+
+    it("pause_project: missing paused returns 400 and never calls pauseProject", async () => {
+      mockRole("admin");
+      const pauseProjectMock = vi.fn(() => ({ status: 200, body: { updated: true, paused: true } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 73, method: "tools/call", params: { name: "pause_project", arguments: { teamKey: "AII" } } }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { pauseProject: pauseProjectMock },
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.status).toBe(400);
+      expect(data.body.error).toContain("paused is required");
+      expect(pauseProjectMock).not.toHaveBeenCalled();
+    });
+
+    it("add_project: missing owner returns 400 and never calls addProject", async () => {
+      mockRole("admin");
+      const addProjectMock = vi.fn(() => ({ status: 202, body: { teamKey: "AII", syncJobId: 5 } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0", id: 74, method: "tools/call",
+          params: { name: "add_project", arguments: { teamKey: "AII", repo: "repo", defaultBranch: "main" } },
+        }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { addProject: addProjectMock },
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.status).toBe(400);
+      expect(data.body.error).toContain("teamKey, owner, and repo are required");
+      expect(addProjectMock).not.toHaveBeenCalled();
+    });
+
+    it("add_project: missing defaultBranch returns 400 and never calls addProject", async () => {
+      mockRole("admin");
+      const addProjectMock = vi.fn(() => ({ status: 202, body: { teamKey: "AII", syncJobId: 5 } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({
+          jsonrpc: "2.0", id: 75, method: "tools/call",
+          params: { name: "add_project", arguments: { teamKey: "AII", owner: "org", repo: "repo" } },
+        }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { addProject: addProjectMock },
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.status).toBe(400);
+      expect(data.body.error).toContain("defaultBranch is required");
+      expect(addProjectMock).not.toHaveBeenCalled();
+    });
+
+    it("trigger_workflow_sync: missing teamKey returns 400 and never calls triggerWorkflowSync", async () => {
+      mockRole("admin");
+      const triggerWorkflowSyncMock = vi.fn(() => ({ status: 202, body: { teamKey: "AII", syncJobId: 7 } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 76, method: "tools/call", params: { name: "trigger_workflow_sync", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { triggerWorkflowSync: triggerWorkflowSyncMock },
+      );
+
+      const parsed = JSON.parse(result.body);
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.status).toBe(400);
+      expect(data.body.error).toContain("teamKey is required");
+      expect(triggerWorkflowSyncMock).not.toHaveBeenCalled();
+    });
+
+    it("clear_dispatch_dedup: missing issueId returns 400 and never calls clearDispatchDedup", async () => {
+      mockRole("admin");
+      const clearDispatchDedupMock = vi.fn(() => ({ status: 200, body: { deleted: true } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 77, method: "tools/call", params: { name: "clear_dispatch_dedup", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { clearDispatchDedup: clearDispatchDedupMock },
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(parsed.result.content[0].text).toContain('"status": 400');
+      expect(parsed.result.content[0].text).toContain("issueId is required");
+      const data = JSON.parse(parsed.result.content[0].text);
+      expect(data.status).toBe(400);
+      expect(data.body.error).toContain("issueId is required");
+      expect(clearDispatchDedupMock).not.toHaveBeenCalled();
+    });
   });
 
   describe("tools/call — capability enforcement", () => {
