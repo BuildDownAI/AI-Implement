@@ -1,7 +1,7 @@
 import { PassThrough, Writable } from "node:stream";
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleMcpRequest } from "../mcp.js";
+import { handleMcpRequest, WRITE_TOOLS } from "../mcp.js";
 import { SidecarMemoryProvider } from "../kg-provider.js";
 import type { MemoryProvider } from "../kg-provider.js";
 import type { PreflightCheckResult, KgRefreshStatus } from "../kg-refresh.js";
@@ -1365,6 +1365,77 @@ describe("handleMcpRequest", () => {
       );
       expect(result.statusCode).toBe(401);
       expect(triggerMock).not.toHaveBeenCalled();
+    });
+
+    it("admin is a superset of user: a role: \"user\" write tool is listed and callable by both roles, refused for null", async () => {
+      const userTool = {
+        name: "test_only_user_write",
+        description: "temporary role: user write entry for the admin-superset test",
+        inputSchema: { type: "object", properties: {} },
+        role: "user" as const,
+        run: async () => ({ status: 200, body: { ok: true } }),
+      };
+      WRITE_TOOLS.push(userTool);
+      try {
+        mockRole("admin");
+        const adminList = await callMcp(
+          { authorization: "Bearer tok" },
+          true,
+          null,
+          BASE_URL,
+          "POST",
+          '{"jsonrpc":"2.0","id":50,"method":"tools/list","params":{}}',
+        );
+        const adminNames = JSON.parse(adminList.body).result.tools.map((t: { name: string }) => t.name);
+        expect(adminNames).toContain("test_only_user_write");
+
+        const adminCall = await callMcp(
+          { authorization: "Bearer tok" },
+          true,
+          null,
+          BASE_URL,
+          "POST",
+          JSON.stringify({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
+        );
+        expect(JSON.parse(adminCall.body).result.isError).not.toBe(true);
+
+        mockRole("user");
+        const userList = await callMcp(
+          { authorization: "Bearer tok" },
+          true,
+          null,
+          BASE_URL,
+          "POST",
+          '{"jsonrpc":"2.0","id":52,"method":"tools/list","params":{}}',
+        );
+        const userNames = JSON.parse(userList.body).result.tools.map((t: { name: string }) => t.name);
+        expect(userNames).toContain("test_only_user_write");
+
+        const userCall = await callMcp(
+          { authorization: "Bearer tok" },
+          true,
+          null,
+          BASE_URL,
+          "POST",
+          JSON.stringify({ jsonrpc: "2.0", id: 53, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
+        );
+        expect(JSON.parse(userCall.body).result.isError).not.toBe(true);
+
+        mockRole(null);
+        const nullCall = await callMcp(
+          { authorization: "Bearer tok" },
+          true,
+          null,
+          BASE_URL,
+          "POST",
+          JSON.stringify({ jsonrpc: "2.0", id: 54, method: "tools/call", params: { name: "test_only_user_write", arguments: {} } }),
+        );
+        const nullParsed = JSON.parse(nullCall.body);
+        expect(nullParsed.result.isError).toBe(true);
+        expect(nullParsed.result.content[0].text).toBe("forbidden: test_only_user_write requires the user role");
+      } finally {
+        WRITE_TOOLS.splice(WRITE_TOOLS.indexOf(userTool), 1);
+      }
     });
   });
 

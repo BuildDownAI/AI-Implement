@@ -124,7 +124,7 @@ interface WriteToolContext {
   triggerKgRefresh?: () => Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
-interface WriteTool {
+export interface WriteTool {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
@@ -132,7 +132,14 @@ interface WriteTool {
   run: (context: WriteToolContext) => Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
-const WRITE_TOOLS: WriteTool[] = [
+// admin is a strict superset of user (docs/access-model.md § Roles): an entry's role satisfies
+// a requirement when it matches exactly or is admin.
+const roleAllows = (have: AccessRole | null, need: AccessRole): boolean =>
+  have === "admin" || have === need;
+
+// Exported so tests can verify the admin-superset rule against a role: "user" entry without a
+// second write tool existing in production — see mcp.test.ts's "admin is a superset of user" case.
+export const WRITE_TOOLS: WriteTool[] = [
   {
     name: "trigger_kg_refresh",
     description:
@@ -368,7 +375,7 @@ export async function handleMcpRequest(
     json(res, 200, {
       jsonrpc: "2.0",
       id: rpc.id ?? null,
-      result: { tools: [...DIAG_TOOLS, ...WRITE_TOOLS.filter((t) => role === t.role), ...kgTools] },
+      result: { tools: [...DIAG_TOOLS, ...WRITE_TOOLS.filter((t) => roleAllows(role, t.role)), ...kgTools] },
     });
     return;
   }
@@ -379,7 +386,7 @@ export async function handleMcpRequest(
     const writeTool = WRITE_TOOLS.find((t) => t.name === toolName);
     if (writeTool) {
       const actor = identity.email;
-      if (role !== writeTool.role) {
+      if (!roleAllows(role, writeTool.role)) {
         console.log(`[mcp] write tool=${toolName} actor=${actor} role=${role ?? "null"} result=forbidden`);
         json(res, 200, {
           jsonrpc: "2.0",
