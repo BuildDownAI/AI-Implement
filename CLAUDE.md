@@ -91,6 +91,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Runner image selection | `src/repo-image.ts` | [docs/runner-images.md](docs/runner-images.md) |
 | Knowledge graph end-to-end (ingest → snapshot → image → serve) | `Dockerfile` KG stages, `docker-entrypoint.sh` | [docs/kg-architecture.md](docs/kg-architecture.md) |
 | KG sidecar and `/mcp` | `src/mcp.ts`, `src/mcp-oauth.ts` | [docs/kg-sidecar.md](docs/kg-sidecar.md) |
+| MCP server: tools, roles, the declared write list | `src/mcp.ts` | [docs/mcp-server.md](docs/mcp-server.md) |
 | Deploying, clients, Bedrock | `src/deploy.ts` and its `deploy-*` siblings | [docs/deployment.md](docs/deployment.md) |
 | Ticketing provider abstraction | `src/providers/` — `linear.ts`, `jira.ts`, `registry.ts` | |
 | Jira base branch (per-issue PR target) | `src/base-branch.ts` | [docs/jira-base-branch.md](docs/jira-base-branch.md) |
@@ -296,7 +297,7 @@ Two paths feed one `reconciliation_queue` → `markMerged` worker: a **poll dete
 
 SSO via OIDC (Google, Microsoft) with a deprecated `ADMIN_ACCESS_CODE` fallback; the UI 503s when neither is configured. The fail-closed allowlist is **database-backed and edited at `/admin#access`** — `OAUTH_ALLOWED_*` seed it and apply until the first save, which hands authority to the stored list permanently. Every entry carries a role: `admin` reaches everything, `user` reaches `/mcp` plus whichever pages have been granted — none, until someone grants some.
 
-Four things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`** — so a domain-only seed admits everyone and lets nobody administer, a misconfiguration the boot log and the sign-in page both flag. An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing — and re-pointing a bound entry takes two saves, not one. **Page grants restrict the admin UI, not what a user can read**: `/mcp` is role-blind, so a user granted nothing still reaches every MCP tool. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
+Four things here are easy to state backwards. **A domain admits as `user`; only a listed address can be `admin`** — so a domain-only seed admits everyone and lets nobody administer, a misconfiguration the boot log and the sign-in page both flag. An entry is *declared* by address but **matched by provider + `sub` once bound** at first sign-in, so a rename keeps its role and a reassigned address inherits nothing — and re-pointing a bound entry takes two saves, not one. **Page grants restrict the admin UI, not what a user can read**: `/mcp` reads are open to every allowlisted identity, so a user granted nothing still reaches every read tool; the declared write tools (`src/mcp.ts` `WRITE_TOOLS`) require the role each entry names. And an unreadable list answers **503, never 401** — the SPA logs out on 401, so a database fault must not eject everyone.
 
 Every authenticated request re-checks against an in-memory list, so a removal ends a session on the next request rather than at token expiry. **Full reference: [docs/access-model.md](docs/access-model.md)** — precedence, the audit trail, and the host command that recovers from lockout.
 
@@ -312,7 +313,7 @@ The SPA at `/admin` is composed from string-exporting modules under `src/admin-u
 
 `window.html` is a tagged template that calls `escAttr()` on every interpolation by default; when the preceding static chunk ends with `href=` or `src=` (with an optional opening quote), it also runs `safeUrl()` on the value first, and `window.raw(markup)` opts out for pre-built HTML. **No page module uses it** — every call site concatenates strings with explicit `esc()`/`escAttr()`, because nesting a template literal inside the page's own script template means escaping every backtick and `${`. Follow the call sites. Do **not** use `esc()` inside a quoted attribute — that is the bug this rule prevents. And when a URL is assembled in a variable before being interpolated, no helper can detect the URL context — call `safeUrl()` explicitly there.
 
-Six routes (`channels`, `policies`, `secrets`, `mcp`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
+Five routes (`channels`, `policies`, `secrets`, `webhooks`, `updates`) are still "Coming soon" stubs in `pages/stubs.ts`.
 
 ## Backend outage playbook
 

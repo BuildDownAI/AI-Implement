@@ -16,6 +16,7 @@ Two tiers, distinguished by what a file *is* rather than what it covers.
 | [workflow-envelope.md](workflow-envelope.md) | The `RunConfigV1` dispatch envelope and the legacy per-field contract |
 | [runner-images.md](runner-images.md) | The image resolution ladder, publishing channels, and why a private image constrains the execution mode |
 | [kg-sidecar.md](kg-sidecar.md) | The knowledge-graph sidecar, the `/mcp` proxy and its OAuth flow, and the image build |
+| [mcp-server.md](mcp-server.md) | The /mcp endpoint: JSON-RPC shape, OAuth and the per-request re-check, reads open by default, the declared write list and roles, every tool with its role, failure behaviour |
 | [deployment.md](deployment.md) | Deploy paths, client instances, and the AWS Bedrock setup |
 | [access-model.md](access-model.md) | Who may sign in and what they may see: the allowlist and its env-to-database handover, the Admin/User split and per-page grants, provider binding, the per-request re-check, the audit trail, and host recovery from lockout |
 | [issueless-runs.md](issueless-runs.md) | The pattern for run kinds dispatched without a tracker issue: envelope shape, jobs-store tracking row, credential flow, state machine lifecycle, reaper reconciliation, operator cancel, observability, and a checklist for adding a new issueless run kind |

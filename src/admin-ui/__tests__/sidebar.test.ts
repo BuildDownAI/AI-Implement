@@ -37,7 +37,7 @@ describe("sidebar", () => {
       "overview", "issues", "jobs", "pulls", "blockers",
       "projects", "pipelines", "models", "channels", "policies",
       "runners", "sessions", "reaper", "secrets", "settings",
-      "mcp", "webhooks", "audit", "customizations", "updates",
+      "webhooks", "audit", "customizations", "updates",
     ]));
   });
 });

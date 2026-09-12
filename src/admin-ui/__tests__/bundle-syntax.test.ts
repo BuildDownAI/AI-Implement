@@ -119,7 +119,7 @@ describe("pageScript name to data-page route alignment", () => {
   // Sections that intentionally have no script wrapper (stub routes + utility page)
   const UNSCRIPTED_ROUTES = new Set([
     "no-access",
-    "channels", "policies", "secrets", "mcp", "webhooks", "updates",
+    "channels", "policies", "secrets", "webhooks", "updates",
   ]);
 
   it("every scripted page section's data-page value has a matching pageScript(name) call", () => {

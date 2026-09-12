@@ -21,7 +21,16 @@ import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastA
 import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
 import type { StuckWatchdogConfig } from "./stuck-watchdog.js";
-import { handleAdminRequest } from "./admin.js";
+import {
+  handleAdminRequest,
+  setRunnerModeAction,
+  pauseProjectAction,
+  upsertMappingAction,
+  triggerWorkflowSyncAction,
+  clearDedupEntryAction,
+  type UpsertMappingBody,
+  type AdminConfig,
+} from "./admin.js";
 import { initLogTable, appendLog, countPriorDispatches, completeOrphanedPlanningJobs, attachJobRunIdIfMissing, updateJobRunId, updateJobStatus, updateJobPrUrl, updateJobMachineDetails, markJobNotified, getInFlightJobs, getInFlightIssueIds, getUnnotifiedTerminalJobs, getClaimedRunIds, suppressStaleNotifications, invalidateNonce, getJobById, getJobByMachineId, resetStuckAttempts, getRecentFailedRunUrls } from "./log.js";
 import { isParked, recordDispatchFailure, recordDispatchSuccess, initDispatchBreakerTable } from "./dispatch-breaker.js";
 import type { Job, JobStatus } from "./log.js";
@@ -3845,7 +3854,41 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         ? () => runKgRefreshPreflight({ githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, kgSourceRepo: config.kgSourceRepo! })
         : undefined;
       const getKgStatusFn = () => kgRefresh.status();
-      handleMcpRequest(req, res, memoryProvider, config.oauthRedirectBaseUrl, memoryProviderDiagnostic, config.sessionImage, kgPreflightFn, getKgStatusFn).catch((err) => {
+      const triggerKgRefreshFn = () => kgRefresh.trigger();
+      // Same AdminConfig shape the /admin routes build (line ~3908) — the five write
+      // tools below reuse the admin route's own action functions.
+      const mcpAdminConfig: AdminConfig = {
+        adminAccessCode: config.adminAccessCode,
+        flySessionsToken: config.flySessionsToken,
+        flySessionsApp: config.flySessionsApp,
+        flySessionsRegion: config.flySessionsRegion,
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+        kgSourceRepo: config.kgSourceRepo,
+        notifyWebhookUrl: config.notifyWebhookUrl,
+      };
+      const setRunnerModeFn = (patch: { mode?: string }) => setRunnerModeAction(mcpAdminConfig, patch);
+      const pauseProjectFn = (teamKey: string, paused: boolean) => pauseProjectAction(teamKey, paused);
+      const addProjectFn = (body: Record<string, unknown>) =>
+        upsertMappingAction(body as UpsertMappingBody, mcpAdminConfig, registry);
+      const triggerWorkflowSyncFn = (teamKey: string) => triggerWorkflowSyncAction(mcpAdminConfig, teamKey);
+      const clearDispatchDedupFn = (issueId: string) => clearDedupEntryAction(issueId);
+      handleMcpRequest(
+        req,
+        res,
+        memoryProvider,
+        config.oauthRedirectBaseUrl,
+        memoryProviderDiagnostic,
+        config.sessionImage,
+        kgPreflightFn,
+        getKgStatusFn,
+        triggerKgRefreshFn,
+        setRunnerModeFn,
+        pauseProjectFn,
+        addProjectFn,
+        triggerWorkflowSyncFn,
+        clearDispatchDedupFn,
+      ).catch((err) => {
         console.error("[mcp] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
