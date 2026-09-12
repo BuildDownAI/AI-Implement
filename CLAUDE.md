@@ -85,6 +85,7 @@ Entry points for areas that are easy to miss. Each names the module to start fro
 | Pipeline, steps, custom overrides | `src/pipeline/` | [docs/pipeline-architecture.md](docs/pipeline-architecture.md) |
 | Review findings → fix dispatches | `src/review-fix-queue.ts` | [docs/review-fix-rail.md](docs/review-fix-rail.md) |
 | Parent/child grouping and roll-up | `src/feature-branch.ts`, `src/merge-up.ts` | [docs/feature-branch-grouping.md](docs/feature-branch-grouping.md) |
+| Run lifecycle and run kinds (the glue around the pipeline) | the `dispatch*` functions in `src/index.ts`, `src/runner-callback.ts` | [docs/run-lifecycle.md](docs/run-lifecycle.md), [docs/run-kind-contract.md](docs/run-kind-contract.md) (proposed) |
 | Issueless run kinds (kg-refresh lifecycle and pattern) | `src/kg-refresh.ts`, `src/index.ts` | [docs/issueless-runs.md](docs/issueless-runs.md) |
 | Dispatch envelope (`RunConfigV1`) | `src/run-config.ts` | [docs/workflow-envelope.md](docs/workflow-envelope.md) |
 | Runner context settings (skills repo, reference repositories, dependency token scope) | `src/pipeline/steps/install-skills.ts`, `src/pipeline/steps/reference-repos.ts`, `src/pipeline/steps/dependency-auth.ts` | [docs/runner-context.md](docs/runner-context.md) |
