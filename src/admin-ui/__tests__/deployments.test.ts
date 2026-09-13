@@ -551,6 +551,9 @@ describe("kg refresh card", () => {
     expect(deploymentsScript).toContain("if (!confirm(");
     expect(deploymentsScript).toContain("JSON.stringify({ acceptNewBaseline: true })");
     expect(deploymentsScript).toContain("document.getElementById('kg-accept-baseline-btn').disabled = busy");
+    // All three buttons share one refusal-to-message mapping and disable each other while a request is in flight.
+    expect(deploymentsScript).toContain("function showKgRefreshRefusal(res, body)");
+    expect((deploymentsScript.match(/showKgRefreshRefusal\(res, await/g) || []).length).toBe(2);
   });
 
   it("posts to /api/kg/refresh for the refresh trigger", () => {

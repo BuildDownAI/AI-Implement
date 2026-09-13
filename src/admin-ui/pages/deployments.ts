@@ -704,25 +704,29 @@ export const deploymentsScript = `
     const dryBtn = document.getElementById('kg-dry-run-btn');
     btn.disabled = true;
     dryBtn.disabled = true;
+    document.getElementById('kg-accept-baseline-btn').disabled = true;
     try {
       const res = dryRun
         ? await window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ dryRun: true }) })
         : await window.api('/api/kg/refresh', { method: 'POST' });
-      if (!res.ok) {
-        const body = await res.json().catch(function () { return {}; });
-        if (res.status === 422 && body.precondition === 'callback-unconfigured') {
-          showMessage('warning', 'Refresh requires a configured runner callback \u2014 set RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET on the orchestrator.');
-        } else if (res.status === 409 && body.error === 'deploy-in-progress') {
-          showMessage('warning', 'A deploy is in progress \u2014 try again after it completes.');
-        } else if (res.status === 409) {
-          showMessage('warning', 'A refresh is already in progress.');
-        } else {
-          showMessage('warning', 'Refresh refused \u2014 ' + (body.error || String(res.status)));
-        }
-      }
+      if (!res.ok) showKgRefreshRefusal(res, await res.json().catch(function () { return {}; }));
     } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
     setTimeout(loadKgStatus, 1000);
   };
+
+  // One refusal-to-message mapping for all three refresh buttons (real, dry-run, accept-baseline):
+  // the same preconditions (callback-unconfigured, deploy-in-progress, already-running) apply to each.
+  function showKgRefreshRefusal(res, body) {
+    if (res.status === 422 && body.precondition === 'callback-unconfigured') {
+      showMessage('warning', 'Refresh requires a configured runner callback \u2014 set RUNNER_CALLBACK_BASE_URL and RUNNER_TOKEN_SECRET on the orchestrator.');
+    } else if (res.status === 409 && body.error === 'deploy-in-progress') {
+      showMessage('warning', 'A deploy is in progress \u2014 try again after it completes.');
+    } else if (res.status === 409) {
+      showMessage('warning', 'A refresh is already in progress.');
+    } else {
+      showMessage('warning', 'Refresh refused \u2014 ' + (body.error || String(res.status)));
+    }
+  }
 
   // AII-628: a one-shot override of the zero-shrink/50% push guards, gated by the same
   // native confirm() this page uses for every other consequential action (see "Deploy now").
@@ -735,10 +739,7 @@ export const deploymentsScript = `
     document.getElementById('kg-accept-baseline-btn').disabled = true;
     try {
       const res = await window.api('/api/kg/refresh', { method: 'POST', body: JSON.stringify({ acceptNewBaseline: true }) });
-      if (!res.ok) {
-        const body = await res.json().catch(function () { return {}; });
-        showMessage('warning', 'Refresh refused \u2014 ' + (body.error || String(res.status)));
-      }
+      if (!res.ok) showKgRefreshRefusal(res, await res.json().catch(function () { return {}; }));
     } catch (err) { showMessage('warning', 'Refresh failed \u2014 ' + String(err)); }
     setTimeout(loadKgStatus, 1000);
   };
