@@ -1122,6 +1122,10 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
           category: "invalid_output",
           code: "REVIEWER_TURNS_EXHAUSTED",
           retryable: false,
+          // Stamped here, the one place the configured cap is actually known — the
+          // callback and monitor paths both read it back off the persisted record
+          // rather than guessing at DEFAULT_RETRY_POLICY.reviewMaxTurns.
+          reviewMaxTurns,
         };
         // Carry the previous iteration's blockers forward instead of dropping them: on
         // iteration >= 2 the reviewer had already found (and the fix pass already acted on)

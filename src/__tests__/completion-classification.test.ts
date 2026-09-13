@@ -15,6 +15,7 @@ import type { Job, JobStatus } from "../log.js";
 import { GUARDRAIL_REASON_MAX_CHARS, redactAndCap } from "../pipeline/failure-classification.js";
 import type { FailureRecord } from "../pipeline/failure-classification.js";
 import { formatSensitiveFilesError } from "../pipeline/sensitive-files.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 
 const PR = "https://github.com/org/repo/pull/1";
 
@@ -352,6 +353,148 @@ describe("classificationForFailure — PR phrasing", () => {
     expect(c?.detail).toContain(`PR: ${PR}`);
     expect(c?.detail).not.toContain("preserved in a draft PR");
     expect(c?.detail).not.toContain("existing PR is unchanged");
+  });
+});
+
+describe("classificationForFailure — PROVIDER_UNAVAILABLE", () => {
+  function providerUnavailableFailure(stage: string): FailureRecord {
+    return {
+      category: "transient",
+      code: "PROVIDER_UNAVAILABLE",
+      stage,
+      attempt: 2,
+      retryable: false,
+      message: "overloaded_error",
+      evidence: { stderrTail: "line one", truncated: false },
+    };
+  }
+
+  it("reads as partially implemented for the implement stage with a dirty tree (a draft PR opened)", () => {
+    const c = classificationForFailure(providerUnavailableFailure("implement"), PR);
+    expect(c.summary).toContain("partially implemented");
+    expect(c.detail).toContain(`The work so far is preserved in a draft PR: ${PR}`);
+    expect(c.remediation).toContain("re-trigger the run once the provider recovers");
+    // Never the generic branch's transient wording — this is not a re-dispatch-after-fixing-nothing.
+    expect(c.remediation).not.toContain("retry budget was exhausted");
+    expect(c.summary).not.toContain("Failed at stage");
+  });
+
+  it("reads as not implemented for the implement stage with a clean tree (no PR)", () => {
+    const c = classificationForFailure(providerUnavailableFailure("implement"), undefined);
+    expect(c.summary).toContain("not implemented");
+    expect(c.detail).toContain("No PR was opened.");
+  });
+
+  it("reads as not reviewed for the post-push-review stage, never partially/not implemented, even with a PR", () => {
+    const c = classificationForFailure(providerUnavailableFailure("post-push-review"), PR);
+    expect(c.summary).toContain("not reviewed");
+    expect(c.summary).not.toContain("implemented");
+  });
+
+  it("reads as not reviewed for the bare in-loop review stage regardless of prUrl", () => {
+    expect(classificationForFailure(providerUnavailableFailure("review"), PR).summary).toContain("not reviewed");
+    expect(classificationForFailure(providerUnavailableFailure("review"), undefined).summary).toContain(
+      "not reviewed",
+    );
+  });
+
+  it("carries the run URL through like the generic branch does", () => {
+    const c = classificationForFailure(providerUnavailableFailure("implement"), PR, "https://example.com/run/1");
+    expect(c.runUrl).toBe("https://example.com/run/1");
+    expect(c.docsUrl).toBe(TROUBLESHOOTING_URL);
+  });
+});
+
+describe("classificationForFailure — REVIEWER_TURNS_EXHAUSTED", () => {
+  function reviewerTurnsExhaustedFailure(reviewMaxTurns?: number): FailureRecord {
+    return {
+      category: "invalid_output",
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "post-push-review/review-1",
+      attempt: 1,
+      retryable: false,
+      message: "max_turns",
+      evidence: { truncated: false },
+      ...(reviewMaxTurns !== undefined ? { reviewMaxTurns } : {}),
+    };
+  }
+
+  it("names the configured cap, not the DEFAULT_RETRY_POLICY fallback, when a non-default cap is on the record", () => {
+    const c = classificationForFailure(reviewerTurnsExhaustedFailure(45), PR);
+    expect(c.summary).toContain("(45)");
+    expect(c.summary).not.toContain(`(${DEFAULT_RETRY_POLICY.reviewMaxTurns})`);
+  });
+
+  it("falls back to DEFAULT_RETRY_POLICY.reviewMaxTurns when the field is absent (a record from before this change)", () => {
+    const c = classificationForFailure(reviewerTurnsExhaustedFailure(undefined), PR);
+    expect(c.summary).toContain(`(${DEFAULT_RETRY_POLICY.reviewMaxTurns})`);
+  });
+
+  it("links the PR when present, and says no PR was opened when absent", () => {
+    expect(classificationForFailure(reviewerTurnsExhaustedFailure(30), PR).detail).toContain(PR);
+    expect(classificationForFailure(reviewerTurnsExhaustedFailure(30), undefined).detail).toContain(
+      "No PR was opened.",
+    );
+  });
+
+  it("points at the admin Settings page to raise the cap, not a generic re-dispatch instruction", () => {
+    const c = classificationForFailure(reviewerTurnsExhaustedFailure(30), PR);
+    expect(c.remediation).toContain("/admin#settings");
+    expect(c.remediation).toContain("Review Max Turns");
+  });
+});
+
+describe("PROVIDER_UNAVAILABLE / REVIEWER_TURNS_EXHAUSTED — callback path equals monitor path (AII-647)", () => {
+  it("renders byte-identically for PROVIDER_UNAVAILABLE with a draft PR (dirty tree)", () => {
+    const failure: FailureRecord = {
+      category: "transient",
+      code: "PROVIDER_UNAVAILABLE",
+      stage: "implement",
+      attempt: 2,
+      retryable: false,
+      message: "overloaded_error",
+      evidence: { stderrTail: "line one", truncated: false },
+    };
+    const job = makeJob("failed", "implementation", "exit_1", PR, failure);
+    const monitorRendered = renderClassification(classifyCompletion(job)!);
+    const callbackRendered = formatFailureComment("PROVIDER_UNAVAILABLE", "unused", { prUrl: PR, failure });
+    expect(monitorRendered).toContain("partially implemented");
+    expect(monitorRendered).toBe(callbackRendered);
+  });
+
+  it("renders byte-identically for PROVIDER_UNAVAILABLE with no PR (clean tree)", () => {
+    const failure: FailureRecord = {
+      category: "transient",
+      code: "PROVIDER_UNAVAILABLE",
+      stage: "implement",
+      attempt: 2,
+      retryable: false,
+      message: "overloaded_error",
+      evidence: { truncated: false },
+    };
+    const job = makeJob("failed", "implementation", "exit_1", null, failure);
+    const monitorRendered = renderClassification(classifyCompletion(job)!);
+    const callbackRendered = formatFailureComment("PROVIDER_UNAVAILABLE", "unused", { failure });
+    expect(monitorRendered).toContain("not implemented");
+    expect(monitorRendered).toBe(callbackRendered);
+  });
+
+  it("renders byte-identically for REVIEWER_TURNS_EXHAUSTED with a non-default cap", () => {
+    const failure: FailureRecord = {
+      category: "invalid_output",
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      stage: "post-push-review/review-1",
+      attempt: 1,
+      retryable: false,
+      message: "max_turns",
+      evidence: { truncated: false },
+      reviewMaxTurns: 45,
+    };
+    const job = makeJob("failed", "implementation", "exit_1", PR, failure);
+    const monitorRendered = renderClassification(classifyCompletion(job)!);
+    const callbackRendered = formatFailureComment("REVIEWER_TURNS_EXHAUSTED", "unused", { prUrl: PR, failure });
+    expect(monitorRendered).toContain("(45)");
+    expect(monitorRendered).toBe(callbackRendered);
   });
 });
 

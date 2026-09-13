@@ -1,6 +1,7 @@
 import type { Job } from "./log.js";
-import { GUARDRAIL_REASON_MAX_CHARS, redactAndCap } from "./pipeline/failure-classification.js";
+import { GUARDRAIL_REASON_MAX_CHARS, providerUnavailablePhrase, redactAndCap } from "./pipeline/failure-classification.js";
 import type { FailureCategory, FailureRecord } from "./pipeline/failure-classification.js";
+import { DEFAULT_RETRY_POLICY } from "./pipeline/retry-backoff.js";
 
 export const TROUBLESHOOTING_URL = "https://docs.builddown.ai/reference/troubleshooting";
 
@@ -226,6 +227,77 @@ export function redactedGuardrailReason(reason: string | undefined): string | un
  * boolean; the planning callback never passes it at all, which is safe only because planning
  * never has a `prUrl` for the ambiguity to apply to.
  */
+/** Shared by every branch of `classificationForFailure` below. */
+function statusLineFor(failure: FailureRecord, lastSuccessfulStage?: string | null): string {
+  return [
+    failure.elapsedMs != null ? `Failing stage ran for ${formatElapsed(failure.elapsedMs)}.` : null,
+    lastSuccessfulStage ? `Last successful stage: \`${lastSuccessfulStage}\`.` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+/**
+ * PROVIDER_UNAVAILABLE — the stage-retry rail exhausted its budget against a transient
+ * provider outage (BAC-27134). Not a code problem, so the summary/remediation deliberately
+ * avoid the generic branch's "Failed at stage" framing and CATEGORY_NEXT_STEPS wording —
+ * the fix here is time, not a re-dispatch after changing anything. `providerUnavailablePhrase`
+ * is the same helper `formatRunAutopsy` (run-autopsy.ts) uses for its own wording, so the two
+ * surfaces describe the same outage consistently even though they render to different places.
+ */
+function providerUnavailableClassification(
+  failure: FailureRecord,
+  prUrl?: string,
+  runUrl?: string | null,
+  lastSuccessfulStage?: string | null,
+): Classification {
+  const { stageLabel, codeState } = providerUnavailablePhrase(failure.stage, Boolean(prUrl));
+  const detailParts: string[] = [];
+  const statusLine = statusLineFor(failure, lastSuccessfulStage);
+  if (statusLine) detailParts.push(statusLine);
+  detailParts.push(prUrl ? `The work so far is preserved in a draft PR: ${prUrl}` : "No PR was opened.");
+  detailParts.push(`\`\`\`\n${evidenceExcerpt(failure)}\n\`\`\``);
+
+  return {
+    summary: `🟠 The model provider was unavailable during ${stageLabel}; the code was ${codeState}.`,
+    detail: detailParts.join("\n\n"),
+    remediation: "This was a provider outage, not a code problem — re-trigger the run once the provider recovers.",
+    docsUrl: TROUBLESHOOTING_URL,
+    ...(runUrl ? { runUrl } : {}),
+  };
+}
+
+/**
+ * REVIEWER_TURNS_EXHAUSTED — the post-push reviewer burned its whole turn cap
+ * (`retryPolicy.reviewMaxTurns`, stamped onto the record by post-push-review.ts) without
+ * reaching a verdict. Never a rejection, so — like PROVIDER_UNAVAILABLE above — this bypasses
+ * CATEGORY_NEXT_STEPS: the actionable step is raising the cap in Settings, not fixing code.
+ * `failure.reviewMaxTurns` is only absent for a record from before this field existed, or one
+ * that failed validation and was stripped — DEFAULT_RETRY_POLICY.reviewMaxTurns is the same
+ * fallback `formatRunAutopsy` uses for the same gap.
+ */
+function reviewerTurnsExhaustedClassification(
+  failure: FailureRecord,
+  prUrl?: string,
+  runUrl?: string | null,
+  lastSuccessfulStage?: string | null,
+): Classification {
+  const cap = failure.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns;
+  const detailParts: string[] = [];
+  const statusLine = statusLineFor(failure, lastSuccessfulStage);
+  if (statusLine) detailParts.push(statusLine);
+  detailParts.push(prUrl ? `The PR is open and ready for human review: ${prUrl}` : "No PR was opened.");
+  detailParts.push(`\`\`\`\n${evidenceExcerpt(failure)}\n\`\`\``);
+
+  return {
+    summary: `🟠 The post-push reviewer ran out of turns at the configured cap (${cap}); the code was not reviewed.`,
+    detail: detailParts.join("\n\n"),
+    remediation: `Manual review required. If this is a recurring pattern, raise Review Max Turns at /admin#settings, then re-dispatch.`,
+    docsUrl: TROUBLESHOOTING_URL,
+    ...(runUrl ? { runUrl } : {}),
+  };
+}
+
 export function classificationForFailure(
   failure: FailureRecord,
   prUrl?: string,
@@ -233,14 +305,16 @@ export function classificationForFailure(
   lastSuccessfulStage?: string | null,
   isInitialRun?: boolean | null,
 ): Classification {
+  if (failure.code === "PROVIDER_UNAVAILABLE") {
+    return providerUnavailableClassification(failure, prUrl, runUrl, lastSuccessfulStage);
+  }
+  if (failure.code === "REVIEWER_TURNS_EXHAUSTED") {
+    return reviewerTurnsExhaustedClassification(failure, prUrl, runUrl, lastSuccessfulStage);
+  }
+
   const attemptSuffix = failure.attempt > 1 ? ` after ${failure.attempt} attempt(s)` : "";
   const detailParts: string[] = [];
-  const statusLine = [
-    failure.elapsedMs != null ? `Failing stage ran for ${formatElapsed(failure.elapsedMs)}.` : null,
-    lastSuccessfulStage ? `Last successful stage: \`${lastSuccessfulStage}\`.` : null,
-  ]
-    .filter(Boolean)
-    .join(" ");
+  const statusLine = statusLineFor(failure, lastSuccessfulStage);
   if (statusLine) detailParts.push(statusLine);
   detailParts.push(
     prUrl

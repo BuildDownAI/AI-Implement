@@ -38,6 +38,10 @@ export interface FailureRecord {
   elapsedMs?: number;
   /** Human-readable one-liner, redacted. */
   message: string;
+  /** Set only when code is REVIEWER_TURNS_EXHAUSTED — the configured `retryPolicy.reviewMaxTurns`
+   *  cap the reviewer hit, stamped on at the one place it's known (post-push-review.ts) so both
+   *  the callback path and the monitor path render the same cap from the persisted record. */
+  reviewMaxTurns?: number;
   evidence: {
     stdoutTail?: string; // redacted, <= EVIDENCE_TAIL_BYTES
     stderrTail?: string; // redacted, <= EVIDENCE_TAIL_BYTES
@@ -365,6 +369,7 @@ export function isFailureRecord(value: unknown): value is FailureRecord {
   if (typeof value.attempt !== "number") return false;
   if (typeof value.retryable !== "boolean") return false;
   if (typeof value.message !== "string") return false;
+  if (value.reviewMaxTurns !== undefined && typeof value.reviewMaxTurns !== "number") return false;
   if (!isPlainObject(value.evidence) || typeof value.evidence.truncated !== "boolean") return false;
   const { stdoutTail, stderrTail, captureError, llmOutcome } = value.evidence;
   // Reject the wrong type outright rather than only checking length when it
@@ -404,6 +409,7 @@ export function projectFailureRecord(value: FailureRecord): FailureRecord {
     ...(value.signal !== undefined ? { signal: value.signal } : {}),
     ...(value.elapsedMs !== undefined ? { elapsedMs: value.elapsedMs } : {}),
     message: value.message,
+    ...(value.reviewMaxTurns !== undefined ? { reviewMaxTurns: value.reviewMaxTurns } : {}),
     evidence: {
       ...(evidence.stdoutTail !== undefined ? { stdoutTail: evidence.stdoutTail } : {}),
       ...(evidence.stderrTail !== undefined ? { stderrTail: evidence.stderrTail } : {}),
