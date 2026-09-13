@@ -537,30 +537,30 @@ describe("findPullRequestByBranches", () => {
   it("returns merged PR when merged_at is set", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
-      json: async () => [{ number: 5, html_url: "https://gh/pr/5", state: "closed", merged_at: "2026-06-30T12:00:00Z" }],
+      json: async () => [{ number: 5, html_url: "https://gh/pr/5", state: "closed", merged_at: "2026-06-30T12:00:00Z", head: { sha: "sha-5" } }],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "head-branch", "base-branch")).toEqual({
-      number: 5, url: "https://gh/pr/5", state: "closed", merged: true,
+      number: 5, url: "https://gh/pr/5", state: "closed", merged: true, headSha: "sha-5",
     });
   });
 
   it("returns open PR with merged=false", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
-      json: async () => [{ number: 3, html_url: "https://gh/pr/3", state: "open", merged_at: null }],
+      json: async () => [{ number: 3, html_url: "https://gh/pr/3", state: "open", merged_at: null, head: { sha: "sha-3" } }],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 3, url: "https://gh/pr/3", state: "open", merged: false,
+      number: 3, url: "https://gh/pr/3", state: "open", merged: false, headSha: "sha-3",
     });
   });
 
   it("returns closed-unmerged PR with merged=false", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
-      json: async () => [{ number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null }],
+      json: async () => [{ number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, head: { sha: "sha-2" } }],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+      number: 2, url: "https://gh/pr/2", state: "closed", merged: false, headSha: "sha-2",
     });
   });
 
@@ -573,24 +573,24 @@ describe("findPullRequestByBranches", () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       json: async () => [
-        { number: 9, html_url: "https://gh/pr/9", state: "closed", merged_at: null },
-        { number: 8, html_url: "https://gh/pr/8", state: "closed", merged_at: "2026-06-30T12:00:00Z" },
+        { number: 9, html_url: "https://gh/pr/9", state: "closed", merged_at: null, head: { sha: "sha-9" } },
+        { number: 8, html_url: "https://gh/pr/8", state: "closed", merged_at: "2026-06-30T12:00:00Z", head: { sha: "sha-8" } },
       ],
     })));
     const result = await findPullRequestByBranches("tok", "owner", "repo", "h", "b");
-    expect(result).toMatchObject({ number: 8, merged: true });
+    expect(result).toMatchObject({ number: 8, merged: true, headSha: "sha-8" });
   });
 
   it("prefers an open PR over a newer closed-unmerged one (reopened PRs keep their created date)", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       json: async () => [
-        { number: 12, html_url: "https://gh/pr/12", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
-        { number: 7, html_url: "https://gh/pr/7", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z" },
+        { number: 12, html_url: "https://gh/pr/12", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z", head: { sha: "sha-12" } },
+        { number: 7, html_url: "https://gh/pr/7", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z", head: { sha: "sha-7" } },
       ],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 7, url: "https://gh/pr/7", state: "open", merged: false,
+      number: 7, url: "https://gh/pr/7", state: "open", merged: false, headSha: "sha-7",
     });
   });
 
@@ -598,12 +598,12 @@ describe("findPullRequestByBranches", () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       json: async () => [
-        { number: 12, html_url: "https://gh/pr/12", state: "open", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
-        { number: 7, html_url: "https://gh/pr/7", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z" },
+        { number: 12, html_url: "https://gh/pr/12", state: "open", merged_at: null, updated_at: "2026-07-02T09:00:00Z", head: { sha: "sha-12" } },
+        { number: 7, html_url: "https://gh/pr/7", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z", head: { sha: "sha-7" } },
       ],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 7, url: "https://gh/pr/7", state: "closed", merged: true,
+      number: 7, url: "https://gh/pr/7", state: "closed", merged: true, headSha: "sha-7",
     });
   });
 
@@ -611,13 +611,13 @@ describe("findPullRequestByBranches", () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       json: async () => [
-        { number: 4, html_url: "https://gh/pr/4", state: "closed", merged_at: null, updated_at: "2026-06-20T10:00:00Z" },
-        { number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, updated_at: "2026-07-05T10:00:00Z" },
-        { number: 3, html_url: "https://gh/pr/3", state: "closed", merged_at: null, updated_at: "2026-06-28T10:00:00Z" },
+        { number: 4, html_url: "https://gh/pr/4", state: "closed", merged_at: null, updated_at: "2026-06-20T10:00:00Z", head: { sha: "sha-4" } },
+        { number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, updated_at: "2026-07-05T10:00:00Z", head: { sha: "sha-2" } },
+        { number: 3, html_url: "https://gh/pr/3", state: "closed", merged_at: null, updated_at: "2026-06-28T10:00:00Z", head: { sha: "sha-3" } },
       ],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+      number: 2, url: "https://gh/pr/2", state: "closed", merged: false, headSha: "sha-2",
     });
   });
 

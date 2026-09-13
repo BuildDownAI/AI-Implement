@@ -13,6 +13,7 @@ vi.mock("../github-app-auth.js", () => ({
 }));
 vi.mock("../github.js", () => ({
   compareBranches: vi.fn(),
+  getBranchSha: vi.fn(async () => null),
   findOpenPullRequest: vi.fn(async () => null),
   findPullRequestByBranches: vi.fn(async () => null),
   createPullRequest: vi.fn(async () => ({ number: 7, url: "https://gh/pr/7" })),
@@ -25,6 +26,7 @@ import {
   createPullRequest,
   mergeBranch,
   findPullRequestByBranches,
+  getBranchSha,
   deleteBranch,
 } from "../github.js";
 
@@ -52,6 +54,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   resetRollUpHandledMarkers();
   vi.mocked(findPullRequestByBranches).mockResolvedValue(null);
+  vi.mocked(getBranchSha).mockResolvedValue(null);
   vi.mocked(createPullRequest).mockResolvedValue({ number: 7, url: "https://gh/pr/7" });
   vi.mocked(mergeBranch).mockResolvedValue("merged");
   vi.mocked(deleteBranch).mockResolvedValue(true);
@@ -91,7 +94,7 @@ describe("runMergeUps — multi-level feature trees", () => {
   it("only the top-of-tree node finalizes when its PR is detected as merged", async () => {
     vi.mocked(compareBranches).mockResolvedValue(1);
     vi.mocked(findPullRequestByBranches).mockResolvedValue({
-      number: 42, url: "https://gh/pr/42", state: "closed", merged: true,
+      number: 42, url: "https://gh/pr/42", state: "closed", merged: true, headSha: "sha-42",
     });
 
     const finalizeMerged = vi.fn(async () => {});
