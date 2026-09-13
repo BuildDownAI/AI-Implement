@@ -62,6 +62,16 @@ interface KgSnapshotPushInputs extends Record<string, unknown> {
    */
   dryRun?: boolean;
   /**
+   * When true (AII-628): downgrade the zero-shrink and 50%-shrink content regressions
+   * (guard 0b) from a refusal to a warning for this one run — the shrink still appears
+   * in the printed table and the refresh PR's ### Baseline section, but the push proceeds.
+   * Does not affect the "missing part" rule or the fetched=false tracker guard (guard 0),
+   * both of which stay hard refusals regardless of this flag.
+   */
+  acceptNewBaseline?: boolean;
+  /** Email of the admin who set acceptNewBaseline — logged and written into the ### Baseline section. */
+  baselineActor?: string;
+  /**
    * Target repo, from the clone step's outputs. When both are present the push
    * sets `origin` to a token-in-URL remote with the run's active primary token —
    * the same push shape as `push.ts` — so no credential helper decides the push.
@@ -219,6 +229,8 @@ interface RefreshReportInputs {
   ingestWarnings: string[];
   guardVerdict: string;
   scope: { addedRepos: string[]; addedTeams: string[]; mappedProjectCount: number };
+  /** Set only when acceptNewBaseline overrode a content regression this run (AII-628). */
+  baseline?: { actor: string; shrunkParts: string[] };
 }
 
 /**
@@ -240,7 +252,19 @@ function buildRefreshReport(data: RefreshReportInputs): string {
   if (data.partRows.length === 0) {
     lines.push("| _(no previous snapshot to diff against)_ | | | |");
   } else {
-    for (const row of data.partRows) lines.push(`| ${row.part} | ${row.prev} | ${row.next} | ${row.delta} |`);
+    for (const row of data.partRows) {
+      // AII-628: mark the row whose shrink acceptNewBaseline overrode, so the table itself says which part was accepted.
+      const accepted = data.baseline?.shrunkParts.includes(row.part) ? " ← accepted" : "";
+      lines.push(`| ${row.part} | ${row.prev} | ${row.next} | ${row.delta}${accepted} |`);
+    }
+  }
+  if (data.baseline) {
+    lines.push(
+      "",
+      "### Baseline",
+      "",
+      `Accepted by ${data.baseline.actor}. This run pushed despite a content regression the zero-shrink/50% guards would otherwise have refused — shrunk part(s): ${data.baseline.shrunkParts.join(", ")}.`,
+    );
   }
   lines.push("", `**Quads serialized:** ${data.quads ?? "unknown"}`, "", "### Issues by team", "");
   if (data.teamCounts.length === 0) {
@@ -432,9 +456,11 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       return { snapshotPushed: false, commitSha: null, prNumber: null, branchName: null };
     }
 
-    const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, repoOwner, repoRepo } = inputs;
+    const { workspaceDir, githubToken, defaultBranch, clonedRef, dryRun, acceptNewBaseline, baselineActor, repoOwner, repoRepo } = inputs;
     /** Per-part "prev/new/delta" rows for the report table. Populated by guard 0b when a previous snapshot exists. */
     const partRows: Array<{ part: string; prev: string; next: string; delta: string }> = [];
+    /** Part names whose shrink was overridden by acceptNewBaseline this run (AII-628); populated by guard 0b. */
+    const acceptedShrinkParts: string[] = [];
 
     // ── 0. Tracker regression guard ──────────────────────────────────────────
     // If the tracker-data step did not fetch (fetched=false) and the previous
@@ -485,7 +511,10 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       if (previousParts.length > 0) {
         const issueCount =
           typeof trackerOutputs.issueCount === "number" ? trackerOutputs.issueCount : 0;
-        const regressions: string[] = [];
+        // "missing" (a part vanishing entirely) is never overridable by acceptNewBaseline —
+        // only the content-shrink rules (zero-shrink, 50%) are (AII-628).
+        const hardRegressions: string[] = [];
+        const softRegressions: string[] = [];
         const partLogLines: string[] = [];
 
         for (const partPath of previousParts) {
@@ -508,7 +537,7 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           if (!existsSync(newPartPath)) {
             partLogLines.push(`${partName} prev=${prevLines} new=missing`);
             partRows.push({ part: partName, prev: String(prevLines), next: "missing", delta: "—" });
-            regressions.push(`${partName}: missing (was ${prevLines} lines)`);
+            hardRegressions.push(`${partName}: missing (was ${prevLines} lines)`);
             continue;
           }
 
@@ -518,26 +547,40 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
           partRows.push({ part: partName, prev: String(prevLines), next: String(newLines), delta: `${delta >= 0 ? "+" : ""}${delta}` });
 
           if (TRACKER_NT_FILES.has(partName) && issueCount > 0 && newLines < prevLines) {
-            regressions.push(
+            softRegressions.push(
               `${partName}: shrank from ${prevLines} to ${newLines} lines (issueCount=${issueCount}; zero-shrink enforced)`,
             );
+            if (acceptNewBaseline) acceptedShrinkParts.push(partName);
             continue;
           }
 
           if (prevLines > 0 && newLines < prevLines * PART_SHRINK_THRESHOLD) {
-            regressions.push(
+            softRegressions.push(
               `${partName}: shrank from ${prevLines} to ${newLines} lines (below ${PART_SHRINK_THRESHOLD * 100}% threshold)`,
             );
+            if (acceptNewBaseline) acceptedShrinkParts.push(partName);
           }
         }
 
         console.log(`[kg-snapshot-push] parts: ${partLogLines.join(", ")}`);
 
-        if (regressions.length > 0) {
+        if (hardRegressions.length > 0) {
           throw new KgSnapshotTrackerRegressionError(
-            `content regression detected — ${regressions.join("; ")}`,
+            `content regression detected — ${[...hardRegressions, ...softRegressions].join("; ")}`,
             partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })),
           );
+        }
+
+        if (softRegressions.length > 0) {
+          if (!acceptNewBaseline) {
+            throw new KgSnapshotTrackerRegressionError(
+              `content regression detected — ${softRegressions.join("; ")}`,
+              partRows.map((row) => ({ part: row.part, prev: row.prev, new: row.next })),
+            );
+          }
+          // acceptNewBaseline downgrades the zero-shrink/50% rules to a warning: the
+          // table above already shows the shrink, so just log who accepted it and continue.
+          console.log(`[kg-refresh] baseline accepted by ${baselineActor || "unknown"}`);
         }
       }
     }
@@ -619,6 +662,10 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
     const secondaryRepoOutcomes = readSecondaryRepoOutcomes(workspaceDir);
     const ingestWarnings = readIngestWarnings(workspaceDir);
     const scope = inputs.scope ?? { addedRepos: [], addedTeams: [], mappedProjectCount: 0 };
+    const baselineAccepted = acceptedShrinkParts.length > 0;
+    const guardVerdictText = dryRun
+      ? (baselineAccepted ? "clean (dry-run — no push; baseline accepted)" : "clean (dry-run — no push)")
+      : (baselineAccepted ? "clean (baseline accepted)" : "clean");
     const reportBody = buildRefreshReport({
       stampCompact,
       quads: stats?.quads ?? null,
@@ -626,8 +673,9 @@ export const kgSnapshotPushStep: StepModule<KgSnapshotPushInputs, KgSnapshotPush
       teamCounts,
       secondaryRepos: secondaryRepoOutcomes,
       ingestWarnings,
-      guardVerdict: dryRun ? "clean (dry-run — no push)" : "clean",
+      guardVerdict: guardVerdictText,
       scope,
+      ...(baselineAccepted ? { baseline: { actor: baselineActor || "unknown", shrunkParts: acceptedShrinkParts } } : {}),
     });
 
     // ── dry-run exit ─────────────────────────────────────────────────────────

@@ -317,6 +317,134 @@ export async function postPrComment(
 }
 
 /**
+ * Lists all comments on a PR/issue (unified GitHub comment API), paginated to
+ * completion via the response's `Link: rel="next"` header — a PR with more than
+ * 100 comments before the sticky one must still be found, or `postOrUpdateStickyComment`
+ * duplicates it instead of updating it in place. Used to find a previously-posted
+ * sticky comment to update in place.
+ */
+export async function listPrComments(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<Array<{ id: number; body: string }>> {
+  const comments: Array<{ id: number; body: string }> = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) break;
+    const data = (await res.json()) as Array<{ id: number; body?: string }>;
+    comments.push(...data.map((c) => ({ id: c.id, body: c.body ?? "" })));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return comments;
+}
+
+/**
+ * Updates the body of an existing PR/issue comment.
+ */
+export async function updatePrComment(
+  token: string,
+  owner: string,
+  repo: string,
+  commentId: number,
+  body: string,
+): Promise<void> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/comments/${commentId}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ body }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`updatePrComment failed: HTTP ${res.status}: ${text}`);
+  }
+}
+
+/**
+ * Posts `body` as a new PR comment, or edits a prior one in place when a comment
+ * already starts with `markerPrefix` — e.g. a stable "## kg-refresh dry-run" heading
+ * whose trailing sha changes on every push, so the match is a prefix, not exact text.
+ */
+export async function postOrUpdateStickyComment(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  markerPrefix: string,
+  body: string,
+): Promise<void> {
+  const comments = await listPrComments(token, owner, repo, prNumber);
+  const existing = comments.find((c) => c.body.startsWith(markerPrefix));
+  if (existing) {
+    await updatePrComment(token, owner, repo, existing.id, body);
+  } else {
+    await postPrComment(token, owner, repo, prNumber, body);
+  }
+}
+
+/**
+ * Sets a commit status (the legacy Statuses API, not a check-run — no check-run
+ * creation exists in this codebase yet). Requires the App's `statuses: write`
+ * permission on the target repo; callers gate on that grant before calling.
+ */
+export async function setCommitStatus(
+  token: string,
+  owner: string,
+  repo: string,
+  sha: string,
+  opts: { state: "success" | "failure" | "pending" | "error"; context: string; description?: string; targetUrl?: string },
+): Promise<void> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/statuses/${sha}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({
+      state: opts.state,
+      context: opts.context,
+      ...(opts.description ? { description: opts.description } : {}),
+      ...(opts.targetUrl ? { target_url: opts.targetUrl } : {}),
+    }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`setCommitStatus failed: HTTP ${res.status}: ${text}`);
+  }
+}
+
+/**
+ * Lists the changed file paths of a PR, following `Link: rel="next"` across pages (AII-639)
+ * so a guard-relevant path past the first 100 files is still seen. Throws on a non-OK page so
+ * the webhook can report `files_fetch_failed` rather than treating it as "no change".
+ */
+export async function listPullRequestFiles(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  // Follows `Link: rel="next"` like listPrComments (AII-639): a guard-relevant file past the
+  // first 100 must not be treated as "no guard-relevant change".
+  const files: string[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`listPullRequestFiles failed: HTTP ${res.status}: ${text}`);
+    }
+    const data = (await res.json()) as Array<{ filename?: string }>;
+    files.push(...data.map((f) => f.filename).filter((f): f is string => typeof f === "string"));
+    url = parseLinkNext(res.headers.get("link"));
+  }
+  return files;
+}
+
+/**
  * Returns the commit SHA a branch points at, or null if the branch does not exist.
  */
 export async function getBranchSha(

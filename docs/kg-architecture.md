@@ -276,6 +276,66 @@ the rail alone.
 Steps 5 to 7 exist entirely because of the monolith. In a two-service design the data would be
 reloadable on its own; here it rides a release, so the release has to be sequenced and verified.
 
+### PR check (AII-633)
+
+A PR that touches `kg_ingest/**`, `sources.yml`, `ontology/**`, or `snapshot/**` on the bound KG
+source repo (`kg.source_repo`) or the configured base template repo (Settings → KG Refresh · "Base
+template repo", seeded once from `KG_BASE_REPO`), or whose head branch matches `kg-upstream/*` or
+`sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it happens to touch),
+gets the same dry run described above run against the PR's head instead of the default branch: the
+webhook (`opened` / `synchronize`) dispatches `trigger({ dryRun: true, ref: <head branch>, report })`,
+which runs `kg-snapshot-push`'s guards without committing or pushing, exactly as a manual dry run
+does. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
+all.
+
+The verdict always lands as a sticky PR comment headed `## kg-refresh dry-run — <sha>`, updated in
+place (not duplicated) on every subsequent push, carrying the same per-part line-count table
+`get_kg_status` shows for a manual dry run. A `kg-refresh/dry-run` **commit status** is set alongside
+it, but only when the GitHub App has been granted `statuses: write` on the PR's repo — see "Manual
+step" below. Losing that grant degrades the check to comment-only; it never blocks the dispatch or
+the PR.
+
+The `accept-baseline` label changes only what the comment says, never what the guard decides: applying
+it to a PR whose dry run refused a tracker-file shrink changes the report's wording to "refused,
+accepted by label" (and, symmetrically, the commit status to success) without re-running anything —
+a `labeled` webhook event just re-posts the last computed verdict. The label is **report-only**. It
+is a distinct mechanism from an admin accepting a new baseline at refresh time (AII-628): a real
+refresh against that same source still refuses the shrink unless that refresh-time acceptance has
+happened. Treat the label as "we've seen this and it's expected," not as a bypass.
+
+Outcomes are stored per PR, keyed by `repo#prNumber` and pinned to the head sha they ran against
+(AII-636), so a `labeled` re-report can only ever surface that PR's own verdict — never another PR's
+— and is a no-op once a new push supersedes the stored sha. The cache is bounded (`MAX_TRACKED_PRS`)
+and evicted immediately on PR close. A webhook head queued behind a 409 is woken by
+`onRefreshSettled` on every `running → false` transition, not only a dry-run's — a real refresh, a
+failure, a revert, TTL expiry, or a deploy hold clearing all wake it.
+
+**Manual step — granting the status.** The GitHub App needs `statuses: write` granted on the KG
+source repo and on the base template repo for the commit status to appear — this is not requestable
+through code, and there is no way to detect the gap from inside the PR itself. Grant it via the
+GitHub App's permissions page for each repo's installation. Until granted, the sticky comment is the
+only signal; nothing errors or blocks in the meantime. The preflight's `statuses:write` rows probe
+this grant against the same two repos the webhook actually posts to — the KG source repo, and
+whichever repo is configured as "Base template repo" (see the note on the two "base repo" notions
+below), not sources.yml's `base_repo:`.
+
+**Manual step — making the check required.** Setting `statuses: write` only lets the status *appear*;
+by itself it is advisory and a PR can be merged straight through it regardless of the guard's verdict.
+The ticket's "required check" only exists once a repo admin adds `kg-refresh/dry-run` as a required
+context in that repo's branch protection settings (Settings → Branches → Branch protection rule →
+"Require status checks to pass" → add `kg-refresh/dry-run`), on both the KG source repo and the base
+template repo. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
+— it stays a one-time, per-repo manual step alongside granting `statuses: write`. Until that step is
+done on a given repo, `kg-refresh/dry-run` is informational only there, no matter how the guard votes.
+
+**Two notions of "base repo."** The "Base template repo" Settings field (`kgBaseRepo`, seeded once
+from `KG_BASE_REPO`) is what this webhook check uses to decide whether an incoming PR's repository
+should be treated as a base-template PR — a global, admin-configured value. It is a distinct thing
+from sources.yml's own `base_repo:` field, which the advisory `base:drift` preflight row (AII-598)
+reads to compare a derivative KG repo against its template. The two should normally agree, but they
+are read from different places and are not reconciled automatically; a `statuses:write` preflight row
+for the base repo reflects the Settings value, while `base:drift` reflects sources.yml's.
+
 ### Scope contract
 
 The orchestrator's project mappings are the scope for `sources.yml`. The `kg-scope-reconcile`
@@ -401,6 +461,44 @@ pre-dispatch stage are written into the same persisted stage envelope as `dispat
 kept only in memory), so a callback arriving after an orchestrator restart mid-`ingest-running` is
 still recognized and handled as a dry run instead of falling through to the real staging rail.
 
+### Accept-new-baseline plumbing (AII-628)
+
+`trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role), `POST /api/kg/refresh`
+with body `{ "acceptNewBaseline": true }`, and the Deployments page's **Accept new baseline &
+refresh** button (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
+refresh** — deliberately not a third argument to the existing refresh button, so accepting a shrink
+is always a distinct, deliberate click after reading the guard table, never the default path) all
+carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
+sets `kgAcceptNewBaseline: true` on the `RunConfigV1` it builds, along with `kgBaselineActor` (the
+caller's email — from `identity.email` on the MCP path, from the admin session on the REST path) —
+`resolveKgRefreshInputs` in `kg-refresh-run.ts` decodes both back out and puts them on
+`PipelineContextData` as `kgAcceptNewBaseline`/`kgBaselineActor`, and `pipeline-loader.ts` forwards
+them into `kg-snapshot-push`'s `acceptNewBaseline`/`baselineActor` inputs, the same shape as
+`kgDryRun`/`dryRun`.
+
+**The actor rides the envelope because the guard runs inside the runner, not the orchestrator.**
+`dryRun` never needed to attribute anything to a person; this flag does, and the code that decides
+whether to push (and writes the refresh PR body) runs in the dispatched container, a separate
+process from whichever door the operator called.
+
+Inside `kg-snapshot-push.ts`, guard 0b's regressions split into two classes: a part missing
+entirely is a **hard regression** and always refuses, flag or not; a part shrinking (the zero-shrink
+rule or the general 50% rule) is a **soft regression** — when `acceptNewBaseline` is set, these are
+logged (`[kg-refresh] baseline accepted by <email>`) and the run proceeds instead of throwing. The
+per-part table already prints unconditionally before either check fires, so an accepted run's table
+looks identical to a refused one; only the guard verdict and the new `### Baseline` section in the
+refresh report (which becomes the PR body on a real push, or is printed on a dry run) distinguish
+them. Guard 0 (the `fetched=false` tracker-regression check, a different failure — the tracker
+fetch itself failed, not a content reclassification) is never overridden by this flag.
+
+**The flag is never persisted** (unlike `dryRun`, which is written into the same stage envelope as
+`dispatchId`/`jobId` so a callback arriving after an orchestrator restart is still recognized as a
+dry run). `acceptNewBaseline` only changes runner-side guard evaluation inside the one dispatched
+job; there is no "callback arrives after restart and needs reclassifying" case for it, because the
+orchestrator's own handling of the callback (success or failure) does not change based on whether a
+shrink was accepted — only the pushed content and the PR body do, and those are already decided by
+the time the callback lands.
+
 ### The `index.ts` budget
 
 Full separation from `index.ts` is not achievable, because reuse forbids it: admin auth reaches
@@ -483,6 +581,12 @@ following hold:
 | Missing part | A part file present in the previous snapshot is absent from the working tree |
 | General shrink | Any part file's line count is below `PART_SHRINK_THRESHOLD` (50 %) of its previous count |
 | `issue.nt` / `comment.nt` zero-shrink | `issue.nt` or `comment.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
+
+The general-shrink and zero-shrink rules — but never the missing-part rule, nor the separate
+`fetched=false` tracker guard above them — can be overridden for one dispatch with
+`acceptNewBaseline` (AII-628, below): an intentional change in what the ingest emits (a base-repo
+classification change, for example) also shrinks these files, and the guard has no way to
+distinguish that from data loss on its own.
 
 One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
 pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a

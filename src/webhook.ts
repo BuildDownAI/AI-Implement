@@ -10,8 +10,9 @@ import { getMappings } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
-import { addCommentReaction } from "./github.js";
+import { addCommentReaction, listPullRequestFiles } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
+import { MAX_TRACKED_PRS } from "./kg-refresh.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -43,12 +44,281 @@ interface PullRequestPayload {
     number?: number;
     merged?: boolean;
     html_url?: string;
-    head?: { ref?: string };
+    head?: { ref?: string; sha?: string };
     merge_commit_sha?: string;
+    labels?: Array<{ name?: string }>;
   };
+  /** The single label added or removed by a `labeled`/`unlabeled` action — distinct from `pull_request.labels`, the cumulative list. */
+  label?: { name?: string };
   repository?: {
     full_name?: string;
   };
+}
+
+/**
+ * KG PR-triggered dry-run rail (AII-633): wired by the caller when a kg-refresh handle
+ * exists. `trigger`/`reportDryRun` are `KgRefreshHandle` methods; kept as a narrow
+ * structural type here to avoid an import cycle with kg-refresh.ts.
+ */
+export interface KgDryRunReportTarget {
+  repo: string;
+  prNumber: number;
+  sha: string;
+  acceptBaseline?: boolean;
+}
+
+export interface KgPrCheckConfig {
+  /** The bound KG source repo (`kg.source_repo`), owner/repo. Null disables the check for it. */
+  kgSourceRepo: string | null;
+  /** The configured base template repo (Settings → KG Refresh), owner/repo. Null disables the check for it. */
+  kgBaseRepo: string | null;
+  githubAppId?: string;
+  githubAppPrivateKey?: string;
+  trigger: (opts: {
+    dryRun?: boolean;
+    ref?: string;
+    report?: KgDryRunReportTarget;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  /** Returns whether it actually posted — false on a silent no-op (AII-636). */
+  reportDryRun: (report: KgDryRunReportTarget) => Promise<boolean>;
+  /**
+   * Registers a listener fired whenever a kg-refresh dispatch settles for any reason —
+   * a dry-run completion, a real refresh completion, a failure, or a deploy hold
+   * clearing (`KgRefreshHandle.onRefreshSettled`, AII-636). Used to dispatch a
+   * superseding head queued while some refresh was already in flight (AII-633).
+   */
+  onRefreshSettled?: (cb: () => void) => () => void;
+  /**
+   * Evicts `KgRefreshHandle`'s stored dry-run outcome for `repo`#`prNumber` (AII-636).
+   * Called from this module's own `closed` handling below, alongside its own
+   * `kgDryRunLastSha`/`kgDryRunPending` eviction for the same PR.
+   */
+  forgetKgPr?: (repo: string, prNumber: number) => void;
+}
+
+/** Paths whose change on a KG repo PR proves the dry-run rail before merge (AII-633). */
+const KG_GUARD_PATH_PATTERNS: RegExp[] = [/^kg_ingest\//, /^sources\.yml$/, /^ontology\//, /^snapshot\//];
+/** Head branch names that indicate an upstream merge, guard-relevant regardless of changed files. */
+const KG_GUARD_BRANCH_PATTERNS: RegExp[] = [/^kg-upstream\//, /^sync\/upstream-/];
+const KG_ACCEPT_BASELINE_LABEL = "accept-baseline";
+
+function matchesKgGuard(files: string[], headRef: string): boolean {
+  if (KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) return true;
+  return files.some((f) => KG_GUARD_PATH_PATTERNS.some((re) => re.test(f)));
+}
+
+function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
+  return (payload.pull_request?.labels ?? []).some((l) => l.name === KG_ACCEPT_BASELINE_LABEL);
+}
+
+/**
+ * Tracks the last sha a dry-run was dispatched for, per PR, so a redelivered/duplicate
+ * webhook does not re-dispatch. Bounded to MAX_TRACKED_PRS entries (shared with
+ * kg-refresh.ts's own per-PR cache, AII-636) — oldest evicted first on insert past the
+ * cap — and cleared per-PR on PR close via forgetKgPr().
+ */
+const kgDryRunLastSha = new Map<string, string>();
+
+interface KgDryRunPendingEntry {
+  ref: string;
+  report: KgDryRunReportTarget;
+}
+
+/**
+ * Heads queued while a dry-run was already in flight for the same PR, keyed by
+ * `repo#prNumber` (AII-633). At most one entry per PR — a newer head replaces the
+ * pending one rather than queuing alongside it, so only the latest ever dispatches.
+ * Bounded and evicted the same way as kgDryRunLastSha (AII-636).
+ */
+const kgDryRunPending = new Map<string, KgDryRunPendingEntry>();
+
+/**
+ * Evicts `repo`#`prNumber`'s entries from both webhook-local caches, plus the
+ * kg-refresh handle's own stored dry-run outcome for the same PR when
+ * `kgPrCheck.forgetKgPr` is wired (AII-636). Called on `pull_request` `closed` — a
+ * closed PR can never legitimately receive another `labeled` re-report, so there is
+ * no reason to wait for the MAX_TRACKED_PRS cap to evict it naturally.
+ */
+function forgetKgPr(kgPrCheck: KgPrCheckConfig | undefined, repoFullName: string, prNumber: number): void {
+  const key = `${repoFullName}#${prNumber}`;
+  kgDryRunLastSha.delete(key);
+  kgDryRunPending.delete(key);
+  kgPrCheck?.forgetKgPr?.(repoFullName, prNumber);
+}
+
+/**
+ * Queues `entry` as the pending dispatch for `key`, replacing any earlier pending
+ * head, and arms a one-shot listener that dispatches it on the next dry-run
+ * completion. Called both when a fresh webhook delivery collides with an in-flight
+ * dry-run (trigger() → 409) and when a queued dispatch itself races into another
+ * in-flight run.
+ */
+function queueKgDryRun(kgPrCheck: KgPrCheckConfig, key: string, entry: KgDryRunPendingEntry): void {
+  kgDryRunPending.delete(key);
+  kgDryRunPending.set(key, entry);
+  if (kgDryRunPending.size > MAX_TRACKED_PRS) {
+    const oldestKey = kgDryRunPending.keys().next().value;
+    if (oldestKey !== undefined) kgDryRunPending.delete(oldestKey);
+  }
+  if (!kgPrCheck.onRefreshSettled) return;
+  const unregister = kgPrCheck.onRefreshSettled(() => {
+    unregister();
+    void dispatchPendingKgDryRun(kgPrCheck, key);
+  });
+}
+
+/** Dispatches the pending head for `key`, if any, once the in-flight dry-run has settled. */
+async function dispatchPendingKgDryRun(kgPrCheck: KgPrCheckConfig, key: string): Promise<void> {
+  const entry = kgDryRunPending.get(key);
+  if (!entry) return;
+  kgDryRunPending.delete(key);
+
+  const result = await kgPrCheck.trigger({ dryRun: true, ref: entry.ref, report: entry.report }).catch((err) => {
+    console.error(`[webhook] kg-refresh dry-run: failed to dispatch queued head for ${key}:`, err);
+    return { status: 500, body: {} as Record<string, unknown> };
+  });
+
+  if (result.status === 409) {
+    // Still busy — another dispatch raced in ahead of this one. Re-queue and wait
+    // for the next completion rather than dropping the superseding head.
+    queueKgDryRun(kgPrCheck, key, entry);
+    return;
+  }
+
+  console.log(`[kg-refresh] dry-run for ${entry.report.repo}@${entry.report.sha} (queued dispatch)`);
+}
+
+/**
+ * Handles a `pull_request` event against the KG PR-triggered dry-run rail (AII-633).
+ * Returns true when it owns the HTTP response (matched and handled, or matched and
+ * explicitly ignored); false when the caller should fall through to the existing
+ * pull_request handling (repo isn't the bound KG source or base template repo, or
+ * the action isn't one this check cares about).
+ */
+async function handleKgPrCheckWebhook(
+  payload: PullRequestPayload,
+  res: http.ServerResponse,
+  kgPrCheck: KgPrCheckConfig | undefined,
+): Promise<boolean> {
+  if (!kgPrCheck) return false;
+  if (payload.action !== "opened" && payload.action !== "synchronize" && payload.action !== "labeled") return false;
+
+  const repoFullName = payload.repository?.full_name;
+  const prNumber = payload.pull_request?.number;
+  if (!repoFullName || !prNumber) return false;
+  if (repoFullName !== kgPrCheck.kgSourceRepo && repoFullName !== kgPrCheck.kgBaseRepo) return false;
+
+  const sha = payload.pull_request?.head?.sha;
+  const headRef = payload.pull_request?.head?.ref;
+
+  // AII-639: this check owns the HTTP response only for events nothing else handles
+  // (`opened`, `labeled`). On `synchronize` it runs as a side effect and returns false,
+  // so the existing pull_request handling (gap-fill matching via findMatchingDispatch,
+  // merge reconciliation) still runs for the KG repos — they are ordinary onboarded
+  // projects too. Outcomes on `synchronize` go to the log instead of the response.
+  const owns = payload.action !== "synchronize";
+  const answer = (status: number, body: Record<string, unknown>, note: string): boolean => {
+    if (owns) {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    } else {
+      console.log(`[webhook] kg-refresh dry-run: ${note} for ${repoFullName}#${prNumber} (falling through to pull_request handling)`);
+    }
+    return owns;
+  };
+
+  if (payload.action === "labeled") {
+    // Only the accept-baseline label re-reports anything — any other label on any
+    // other PR must never touch the check (AII-636: a stray label on an unrelated
+    // PR previously re-posted whatever the process had last computed, for any PR).
+    if (payload.label?.name !== KG_ACCEPT_BASELINE_LABEL) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ignored: true, reason: "not_accept_baseline_label" }));
+      return true;
+    }
+    // Re-report the last computed verdict for this PR — never re-runs the rail.
+    // reportDryRun() itself is scoped to (and no-ops outside of) this PR's own
+    // stored outcome, so this can never surface another PR's verdict.
+    const posted = await kgPrCheck.reportDryRun({
+      repo: repoFullName,
+      prNumber,
+      sha: sha ?? "",
+      acceptBaseline: hasAcceptBaselineLabel(payload),
+    });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      posted
+        ? JSON.stringify({ reported: true })
+        : JSON.stringify({ ignored: true, reason: "no_dry_run_outcome" }),
+    );
+    return true;
+  }
+
+  if (!sha || !headRef) {
+    return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
+  }
+
+  const key = `${repoFullName}#${prNumber}`;
+  if (kgDryRunLastSha.get(key) === sha) {
+    return answer(200, { ignored: true, reason: "duplicate_sha" }, "duplicate sha");
+  }
+
+  if (!kgPrCheck.githubAppId || !kgPrCheck.githubAppPrivateKey) {
+    return answer(200, { ignored: true, reason: "no_app_credentials" }, "no App credentials");
+  }
+
+  const slashIdx = repoFullName.indexOf("/");
+  const owner = repoFullName.slice(0, slashIdx);
+  const repo = repoFullName.slice(slashIdx + 1);
+
+  // A branch-pattern match (upstream merge) is guard-relevant regardless of which
+  // files it touches, so it never needs the files fetch — a transient failure of
+  // that fetch must not cost it the dispatch it would otherwise unconditionally get.
+  let files: string[] = [];
+  if (!KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) {
+    try {
+      const token = await getInstallationToken(kgPrCheck.githubAppId, kgPrCheck.githubAppPrivateKey, owner);
+      files = await listPullRequestFiles(token, owner, repo, prNumber);
+    } catch (err) {
+      console.warn(`[webhook] kg-refresh dry-run: failed to fetch changed files for ${repoFullName}#${prNumber}:`, err);
+      return answer(200, { ignored: true, reason: "files_fetch_failed" }, "files fetch failed");
+    }
+  }
+
+  if (!matchesKgGuard(files, headRef)) {
+    return answer(200, { ignored: true, reason: "no_guard_relevant_change" }, "no guard-relevant change");
+  }
+
+  // Record before dispatch (not after) so a burst of redeliveries for the same sha
+  // while the trigger call is in flight still collapses to one dispatch.
+  kgDryRunLastSha.delete(key);
+  kgDryRunLastSha.set(key, sha);
+  if (kgDryRunLastSha.size > MAX_TRACKED_PRS) {
+    const oldestKey = kgDryRunLastSha.keys().next().value;
+    if (oldestKey !== undefined) kgDryRunLastSha.delete(oldestKey);
+  }
+
+  const report: KgDryRunReportTarget = {
+    repo: repoFullName,
+    prNumber,
+    sha,
+    acceptBaseline: hasAcceptBaselineLabel(payload),
+  };
+
+  const result = await kgPrCheck.trigger({ dryRun: true, ref: headRef, report }).catch((err) => {
+    console.error(`[webhook] kg-refresh dry-run trigger failed for ${repoFullName}#${prNumber}:`, err);
+    return { status: 500, body: {} as Record<string, unknown> };
+  });
+
+  if (result.status === 409) {
+    // A refresh is already running — supersede any previously queued head for this
+    // PR with this one and dispatch it once the in-flight dry-run completes.
+    queueKgDryRun(kgPrCheck, key, { ref: headRef, report });
+    return answer(202, { queued: true }, "queued behind the running refresh");
+  }
+
+  console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}`);
+  return answer(result.status === 202 ? 202 : 200, { triggered: result.status === 202, status: result.status }, `dispatched (status ${result.status})`);
 }
 
 interface ReviewPayload {
@@ -163,6 +433,7 @@ export async function handleGitHubWebhook(
   appId?: string,
   privateKey?: string,
   selfDeploy?: SelfDeployTarget,
+  kgPrCheck?: KgPrCheckConfig,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -210,9 +481,28 @@ export async function handleGitHubWebhook(
     return;
   }
 
+  if (payload.action === "opened" || payload.action === "synchronize" || payload.action === "labeled") {
+    // The KG PR check owns `opened` and `labeled` responses; on `synchronize` it runs as a
+    // side effect and returns false so handlePullRequestSynchronize below still runs (AII-639).
+    const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck);
+    if (handled) return;
+  }
+
   if (payload.action === "synchronize") {
     handlePullRequestSynchronize(payload, res);
     return;
+  }
+
+  if (payload.action === "closed") {
+    // Evict this PR's KG PR-check state regardless of merged status — a closed PR
+    // (merged or not) can never legitimately receive another `labeled` re-report, and
+    // holding its entry until the MAX_TRACKED_PRS cap evicts it naturally only widens
+    // the window a stray `labeled` redelivery could exploit (AII-636).
+    const kgRepoFullName = payload.repository?.full_name;
+    const kgPrNumber = payload.pull_request?.number;
+    if (kgRepoFullName && kgPrNumber && (kgRepoFullName === kgPrCheck?.kgSourceRepo || kgRepoFullName === kgPrCheck?.kgBaseRepo)) {
+      forgetKgPr(kgPrCheck, kgRepoFullName, kgPrNumber);
+    }
   }
 
   // Only process merged PRs

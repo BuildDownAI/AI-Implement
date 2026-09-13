@@ -154,6 +154,32 @@ describe("run-config envelope", () => {
     expect(decoded.kgDryRun).toBe(true);
     expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
   });
+
+  it("round-trips kgSourceRef", () => {
+    const cfg: RunConfigV1 = {
+      v: 1,
+      issue: { id: "i", identifier: "AII-633", title: "t", description: "" },
+      kgSourceRef: "pr-head-branch",
+    };
+    expect(decodeRunConfig(encodeRunConfig(cfg)).kgSourceRef).toBe("pr-head-branch");
+  });
+
+  it("absent kgSourceRef decodes as undefined (no key materialized)", () => {
+    const min: RunConfigV1 = { v: 1, issue: { id: "i", identifier: "AII-633", title: "t", description: "" } };
+    const decoded = decodeRunConfig(encodeRunConfig(min));
+    expect(decoded.kgSourceRef).toBeUndefined();
+    expect("kgSourceRef" in decoded).toBe(false);
+  });
+
+  it("pickKnownKeys preserves kgSourceRef alongside kgSourceRepo and kgDryRun", () => {
+    const withKg = { ...full, kgSourceRepo: "org/kg", kgDryRun: true as const, kgSourceRef: "feature/head", bogusKey: "dropped" };
+    const b64 = Buffer.from(JSON.stringify(withKg), "utf-8").toString("base64");
+    const decoded = decodeRunConfig(b64);
+    expect(decoded.kgSourceRepo).toBe("org/kg");
+    expect(decoded.kgDryRun).toBe(true);
+    expect(decoded.kgSourceRef).toBe("feature/head");
+    expect((decoded as Record<string, unknown>).bogusKey).toBeUndefined();
+  });
 });
 
 describe("runConfigFromTaskDocument", () => {

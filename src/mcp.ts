@@ -121,7 +121,9 @@ const DIAG_TOOL_NAMES = new Set(DIAG_TOOLS.map((t) => t.name));
 // declaration names the role required to call it. See docs/adr/015-mcp-reads-open-writes-declared.md.
 
 interface WriteToolContext {
-  triggerKgRefresh?: (dryRun?: boolean) => Promise<{ status: number; body: Record<string, unknown> }>;
+  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>;
+  /** Caller's email, for write tools (trigger_kg_refresh's acceptNewBaseline) that need to attribute a consequential action. */
+  actorEmail?: string;
   setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> };
   pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> };
   addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> };
@@ -151,11 +153,12 @@ export const WRITE_TOOLS: WriteTool[] = [
   {
     name: "trigger_kg_refresh",
     description:
-      "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes.",
+      "Trigger the KG refresh rail (admin role). Same handler as POST /api/kg/refresh: runs the credential preflight, then dispatches the refresh. Poll get_kg_status afterwards. dryRun=true runs the same runner job with kg-snapshot-push's push skipped — all guards run and the guard verdict plus per-part table are reported via get_kg_status, but nothing is pushed, no PR opens, and the served graph never changes. acceptNewBaseline=true downgrades the zero-shrink and 50%-shrink content guards to warnings for this one dispatch and pushes anyway — use only after reviewing a guard refusal's part table and confirming the shrink is an intentional reclassification, not data loss; the accepting identity's email is logged and written into the refresh PR's ### Baseline section.",
     inputSchema: {
       type: "object",
       properties: {
         dryRun: { type: "boolean", description: "Run the rail without pushing the snapshot or touching the served graph; reports the guard table via get_kg_status." },
+        acceptNewBaseline: { type: "boolean", description: "Push even though a tracked part (issue.nt/comment.nt) shrank or a part dropped below 50% of its previous size — a one-shot override of the zero-shrink guard, applied to this dispatch only." },
       },
     },
     role: "admin",
@@ -163,7 +166,7 @@ export const WRITE_TOOLS: WriteTool[] = [
       if (!context.triggerKgRefresh) {
         throw new Error("KG refresh is not configured");
       }
-      return context.triggerKgRefresh(args.dryRun === true);
+      return context.triggerKgRefresh(args.dryRun === true, args.acceptNewBaseline === true, context.actorEmail);
     },
   },
   {
@@ -489,7 +492,7 @@ export async function handleMcpRequest(
   defaultRunnerImage?: string,
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
   getKgStatus?: () => Promise<KgRefreshStatus>,
-  triggerKgRefresh?: (dryRun?: boolean) => Promise<{ status: number; body: Record<string, unknown> }>,
+  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
   setRunnerMode?: (patch: { mode?: string }) => { status: number; body: Record<string, unknown> },
   pauseProject?: (teamKey: string, paused: boolean) => { status: number; body: Record<string, unknown> },
   addProject?: (body: Record<string, unknown>) => { status: number; body: Record<string, unknown> },
@@ -579,6 +582,7 @@ export async function handleMcpRequest(
       try {
         const result = await writeTool.run(toolArgs, {
           triggerKgRefresh,
+          actorEmail: actor,
           setRunnerMode,
           pauseProject,
           addProject,
