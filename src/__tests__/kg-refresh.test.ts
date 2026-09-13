@@ -1296,6 +1296,14 @@ describe("kg-refresh", () => {
           await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
           expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
         });
+
+        it("a wrong-shaped persisted blob (valid JSON, not an entry list) is ignored at boot instead of throwing", async () => {
+          const loadDryRunOutcomes = vi.fn((): DryRunOutcomeEntry[] | null => ({ not: "an array" }) as never);
+          expect(() => buildDispatch({ persistDryRunOutcomes: vi.fn(), loadDryRunOutcomes })).not.toThrow();
+
+          await expect(handle.reportDryRun(REPORT)).resolves.toBe(false);
+          expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+        });
       });
     });
 

@@ -843,9 +843,15 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
   // Restore persisted state on construction (crash recovery).
   lastRefresh = loadLastRefreshFn();
-  const persistedDryRunOutcomes = loadDryRunOutcomesFn();
-  if (persistedDryRunOutcomes) {
-    for (const [key, value] of persistedDryRunOutcomes) dryRunOutcomesByPr.set(key, value);
+  // Guarded like the other boot-time restores: an injected loader returning a wrong shape
+  // must not abort makeKgRefresh() (it runs synchronously from startServer()).
+  try {
+    const persistedDryRunOutcomes = loadDryRunOutcomesFn();
+    if (Array.isArray(persistedDryRunOutcomes)) {
+      for (const [key, value] of persistedDryRunOutcomes) dryRunOutcomesByPr.set(key, value);
+    }
+  } catch (err) {
+    console.warn("[kg-refresh] ignoring unreadable persisted dry-run outcomes:", err);
   }
   const persisted = loadStageFn();
   if (persisted && persisted.stage === "ingest-running") {
@@ -1993,7 +1999,15 @@ function defaultLoadDryRunOutcomes(): DryRunOutcomeEntry[] | null {
       .prepare("SELECT value FROM settings WHERE key = ?")
       .get(KG_DRY_RUN_OUTCOMES_SETTINGS_KEY) as { value: string } | undefined;
     if (!row) return null;
-    return JSON.parse(row.value) as DryRunOutcomeEntry[];
+    const parsed: unknown = JSON.parse(row.value);
+    // A blob that is valid JSON but not the persisted shape (roll-up #538 review): treat it
+    // like every other bad persisted blob in this module — acceptable to lose, never a boot
+    // failure. The restore loop below iterates entries, so a bare object would throw there.
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter(
+      (e): e is DryRunOutcomeEntry =>
+        Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && e[1] !== null && typeof e[1] === "object",
+    );
   } catch {
     return null;
   }
