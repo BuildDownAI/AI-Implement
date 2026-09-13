@@ -19,11 +19,15 @@ not fail boot; it fails the feature that needs it, late and quietly (a 4xx insid
 | Pull requests | Read and write | reading PRs for gap-fill matching and dependency tokens (read); opening the refresh PR, roll-up PRs and posting PR comments (write) |
 | Workflows | Read and write | the publication token used to push workflow-carrying commits from a run |
 | Commit statuses | Read and write | the `kg-refresh/dry-run` commit status set by the PR-triggered KG dry-run check (AII-633); without it the check is comment-only |
+| Actions | Read and write | `workflow_dispatch` of the planning/implementation/kg-refresh workflows on the GitHub Actions runner path, and reading run status |
+| Checks | Read-only | reading check runs on a PR head (`…/commits/{sha}/check-runs`) for the post-push review's external-review wait gate and the roll-up gate. **Not granted on the testing App as of 2026-09-13** — the calls run with the App's grants; confirm they succeed or grant it |
+| Issues | Read and write | issue comments and labels on GitHub-tracker projects (Linear projects do not use it) |
 | Metadata | Read-only | granted to every App automatically |
 
 Plus whatever the runner's own GitHub Actions workflows need on each project repo (those are
 declared in the workflow files, not here). The list above is the set of `permissions: {…}`
-scopes requested in `src/`; a change that mints a token for a new permission must add a row
+scopes requested in `src/` plus the grants the per-run installation token relies on (it carries the
+App's full permission set scoped to one repository); a change that mints a token for a new permission must add a row
 here and grant it on the App before the feature is switched on (tracked for automation in
 AII-645: one declared table, probed on `get_tenant_health`, shown on the admin page, and an
 App manifest for new installs).
