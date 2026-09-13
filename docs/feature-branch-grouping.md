@@ -209,6 +209,17 @@ Idempotency is handled differently per path:
 - **Internal level:** `compareBranches` returning 0 (branch already merged into parent) or `null` (branch missing) causes an early return.
 - **Top of the tree:** `findPullRequestByBranches` is checked first. If the `feature → base` PR is **merged** — by any method (merge-commit, squash, or rebase) — the orchestrator deletes the feature branch (`deleteBranch`) and calls `markMerged` to idempotently finalize the parent node in the tracker, but **only when nothing on the branch is missing from the base**: it fetches the branch's current tip (`getBranchSha`) and deletes when that tip equals the merged PR's recorded head SHA, or — as a secondary fallback, for a real merge-commit strategy or a branch already gone — when `compareBranches` confirms 0 commits ahead. SHA equality is checked first because it is strategy-agnostic (unlike ancestry, it doesn't get confused by a squash/rebase merge); the ahead-count fallback exists for a fully-absorbed merge-commit branch or a since-deleted one, not as the primary defense against a squash/rebase false-ahead reading. A merged PR does not by itself mean the branch is safe to delete: a long-lived feature node's roll-up can merge early (an interim roll-up), after which more children merge into the same branch by hand or via the cascade — the branch's tip then moves past the PR's recorded head and it also shows genuinely ahead of the base. In that case the branch is kept, the already-merged roll-up is still finalized, and a further roll-up PR is opened for the new commits instead of deleting the branch ([AII-642](https://linear.app/eudoxus/issue/AII-642)). If the PR is still open, the step returns and awaits the human. Only when no PR exists (or the last one merged but the branch has since moved on) is a new one opened (guarded by the same ahead-check so a missing branch exits early). The ahead-count fallback is a narrower version of the old git-ancestry-only heuristic that once gated the top-of-tree path, which misread squash/rebase merges as "still ahead" and re-opened the PR on each poll tick ([AII-188](https://linear.app/eudoxus/issue/AII-188)) — the SHA check now covers that case directly instead of relying on ancestry alone.
 
+**`/ai-implement` on the roll-up PR.** Merge-up opens the top-of-tree PR directly, never
+through a dispatch, so it has no `dispatch_log` row of its own and the comment-gapfill drain's
+`getLatestDispatchForPr` lookup finds nothing. Rather than refuse with "AI-Implement has no
+record of this PR", the drain falls back to the PR's head branch: `ai-implement/<mode>/<key-slug>`
+encodes the feature-node parent's key (`parseGroupingBranchIdentifier`), and the parent's own
+latest dispatch (`getLatestDispatchForIssueIdentifier`, case-insensitive) supplies the tracker
+identity. The gap-fill then runs against the roll-up branch with `prNumber` = the roll-up PR
+and reports against the parent issue. The fallback is best-effort — a failed PR lookup or a
+parent with no dispatch in the log degrades to the existing refusal — and hand-created PRs
+are still refused, since nothing on them names a tracker issue to report against.
+
 > ⚠️ **Auto-roll-up needs the runner callback.** A feature node only completes when its
 > closing-work PR merges and Linear marks it Done; the roll-up keys off that completed
 > state. Planning's `Plan-Complete` transition is delivered by the runner callback

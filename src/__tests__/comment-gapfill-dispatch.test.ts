@@ -37,8 +37,18 @@ afterEach(() => {
   } catch {
     /* ignore */
   }
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
+
+/** Stub the GitHub PR lookup the roll-up fallback performs (drain calls
+ *  getPullRequestState directly, not through the injected deps). */
+function stubPrLookup(headRef: string | null): void {
+  vi.stubGlobal("fetch", vi.fn(async () => ({
+    ok: true,
+    json: async () => ({ merged: false, state: "open", head: headRef ? { ref: headRef } : undefined }),
+  }) as Response));
+}
 
 function makeMapping(overrides: Partial<RepoMapping> = {}): RepoMapping {
   return {
@@ -186,7 +196,9 @@ describe("drainCommentGapfillQueue", () => {
       commenter: "carol",
       instruction: "something",
     });
-    // No dispatch_log row for PR #99
+    // No dispatch_log row for PR #99, and the PR's head is not a grouping branch,
+    // so the roll-up fallback finds nothing either.
+    stubPrLookup("feature/manual-branch");
 
     const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
     const postCommentSpy = vi.fn(async () => undefined);
@@ -477,5 +489,108 @@ describe("drainCommentGapfillQueue", () => {
     const decoded = decodeRunConfig(inputs.run_config);
     expect(decoded.maxTurns).toBe(20);
     expect(decoded.maxIterations).toBe(2);
+  });
+});
+
+describe("roll-up PR fallback (grouping feature→base PRs have no dispatch row)", () => {
+  it("recovers the feature-node parent's identity from the head branch and dispatches", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+
+    // The parent's own closing-work dispatch — the identity source. Its pr_url points
+    // at the parent's OWN PR (#70), not the roll-up PR (#89).
+    seedDispatchLog("parent-uuid", "TSAI-196", "Wave 1 parent", "acme", "billing", 70);
+
+    queue.enqueueCommentGapfill({
+      owner: "acme",
+      repo: "billing",
+      prNumber: 89,
+      commentId: 3001,
+      commenter: "carol",
+      instruction: "widen the create-demo form",
+    });
+    stubPrLookup("ai-implement/feature/tsai-196");
+
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+    const postCommentSpy = vi.fn(async () => undefined);
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+      postComment: postCommentSpy,
+    }));
+
+    // Dispatched, not refused.
+    expect(postCommentSpy).not.toHaveBeenCalled();
+    expect(dispatchSpy).toHaveBeenCalledTimes(1);
+    const inputs = dispatchSpy.mock.calls[0][2] as Record<string, string>;
+    const runConfig = JSON.parse(Buffer.from(inputs.run_config, "base64").toString("utf8"));
+    expect(runConfig.issue.identifier).toBe("TSAI-196");
+    expect(runConfig.issue.id).toBe("parent-uuid");
+    expect(runConfig.prNumber).toBe("89"); // the roll-up PR, not the parent's own PR
+  });
+
+  it("still refuses when the grouping parent has no dispatch in the log", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+
+    queue.enqueueCommentGapfill({
+      owner: "acme",
+      repo: "billing",
+      prNumber: 89,
+      commentId: 3002,
+      commenter: "carol",
+      instruction: "something",
+    });
+    stubPrLookup("ai-implement/feature/tsai-999");
+
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+    const postCommentSpy = vi.fn(async () => undefined);
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+      postComment: postCommentSpy,
+    }));
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses when the PR lookup itself fails (fallback is best-effort)", async () => {
+    const mapping = makeMapping({ owner: "acme", repo: "billing" });
+
+    queue.enqueueCommentGapfill({
+      owner: "acme",
+      repo: "billing",
+      prNumber: 89,
+      commentId: 3003,
+      commenter: "carol",
+      instruction: "something",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("network down"); }));
+
+    const dispatchSpy = vi.fn(async () => ({ success: true, status: 204 }));
+    const postCommentSpy = vi.fn(async () => undefined);
+
+    await drain.drainCommentGapfillQueue(makeBaseDrainOpts({
+      getMappings: () => ({ TEAM: mapping }),
+      dispatch: dispatchSpy,
+      postComment: postCommentSpy,
+    }));
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(postCommentSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("parseGroupingBranchIdentifier", () => {
+  it("parses feature and multi-issue grouping branches", () => {
+    expect(drain.parseGroupingBranchIdentifier("ai-implement/feature/tsai-196")).toBe("tsai-196");
+    expect(drain.parseGroupingBranchIdentifier("ai-implement/multi-issue/proj-5")).toBe("proj-5");
+  });
+
+  it("returns null for leaf branches, base branches, and null", () => {
+    expect(drain.parseGroupingBranchIdentifier("ai-implement/tsai-197-add-thing")).toBe(null);
+    expect(drain.parseGroupingBranchIdentifier("main")).toBe(null);
+    expect(drain.parseGroupingBranchIdentifier(null)).toBe(null);
   });
 });
