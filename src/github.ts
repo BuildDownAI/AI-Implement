@@ -317,6 +317,132 @@ export async function postPrComment(
 }
 
 /**
+ * Lists the comments on a PR/issue (unified GitHub comment API), newest-API-page-order.
+ * Used to find a previously-posted sticky comment to update in place.
+ */
+export async function listPrComments(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<Array<{ id: number; body: string }>> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments?per_page=100`;
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) return [];
+  const data = (await res.json()) as Array<{ id: number; body?: string }>;
+  return data.map((c) => ({ id: c.id, body: c.body ?? "" }));
+}
+
+/**
+ * Updates the body of an existing PR/issue comment.
+ */
+export async function updatePrComment(
+  token: string,
+  owner: string,
+  repo: string,
+  commentId: number,
+  body: string,
+): Promise<void> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/comments/${commentId}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: ghHeaders(token),
+    body: JSON.stringify({ body }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`updatePrComment failed: HTTP ${res.status}: ${text}`);
+  }
+}
+
+/**
+ * Posts `body` as a new PR comment, or edits a prior one in place when a comment
+ * already starts with `markerPrefix` — e.g. a stable "## kg-refresh dry-run" heading
+ * whose trailing sha changes on every push, so the match is a prefix, not exact text.
+ */
+export async function postOrUpdateStickyComment(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  markerPrefix: string,
+  body: string,
+): Promise<void> {
+  const comments = await listPrComments(token, owner, repo, prNumber);
+  const existing = comments.find((c) => c.body.startsWith(markerPrefix));
+  if (existing) {
+    await updatePrComment(token, owner, repo, existing.id, body);
+  } else {
+    await postPrComment(token, owner, repo, prNumber, body);
+  }
+}
+
+/**
+ * Sets a commit status (the legacy Statuses API, not a check-run — no check-run
+ * creation exists in this codebase yet). Requires the App's `statuses: write`
+ * permission on the target repo; callers gate on that grant before calling.
+ */
+export async function setCommitStatus(
+  token: string,
+  owner: string,
+  repo: string,
+  sha: string,
+  opts: { state: "success" | "failure" | "pending" | "error"; context: string; description?: string; targetUrl?: string },
+): Promise<void> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/statuses/${sha}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: ghHeaders(token),
+    body: JSON.stringify({
+      state: opts.state,
+      context: opts.context,
+      ...(opts.description ? { description: opts.description } : {}),
+      ...(opts.targetUrl ? { target_url: opts.targetUrl } : {}),
+    }),
+    signal: defaultFetchSignal(),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`setCommitStatus failed: HTTP ${res.status}: ${text}`);
+  }
+}
+
+/**
+ * Lists the file paths changed by a PR (first 100 — sufficient for the guard-path
+ * match; a KG PR touching more than 100 files would already be dispatch-worthy on
+ * its first page of matches).
+ */
+export async function listPullRequestFiles(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`;
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) return [];
+  const data = (await res.json()) as Array<{ filename?: string }>;
+  return data.map((f) => f.filename).filter((f): f is string => typeof f === "string");
+}
+
+/**
+ * Returns the labels on a PR/issue (unified GitHub label API).
+ */
+export async function listPrLabels(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string[]> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/labels?per_page=100`;
+  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+  if (!res.ok) return [];
+  const data = (await res.json()) as Array<{ name?: string }>;
+  return data.map((l) => l.name).filter((n): n is string => typeof n === "string");
+}
+
+/**
  * Returns the commit SHA a branch points at, or null if the branch does not exist.
  */
 export async function getBranchSha(

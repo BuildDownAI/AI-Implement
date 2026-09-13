@@ -10,7 +10,7 @@ import { getMappings } from "./config.js";
 import { getInstallationToken } from "./github-app-auth.js";
 import { resolveWorkflowContract } from "./workflow-probe.js";
 import { enqueueCommentGapfill } from "./comment-gapfill-queue.js";
-import { addCommentReaction } from "./github.js";
+import { addCommentReaction, listPullRequestFiles } from "./github.js";
 import { refreshAvailability, type SelfDeployTarget } from "./deploy-availability.js";
 
 function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
@@ -43,12 +43,151 @@ interface PullRequestPayload {
     number?: number;
     merged?: boolean;
     html_url?: string;
-    head?: { ref?: string };
+    head?: { ref?: string; sha?: string };
     merge_commit_sha?: string;
+    labels?: Array<{ name?: string }>;
   };
   repository?: {
     full_name?: string;
   };
+}
+
+/**
+ * KG PR-triggered dry-run rail (AII-633): wired by the caller when a kg-refresh handle
+ * exists. `trigger`/`reportDryRun` are `KgRefreshHandle` methods; kept as a narrow
+ * structural type here to avoid an import cycle with kg-refresh.ts.
+ */
+export interface KgDryRunReportTarget {
+  repo: string;
+  prNumber: number;
+  sha: string;
+  acceptBaseline?: boolean;
+}
+
+export interface KgPrCheckConfig {
+  /** The bound KG source repo (`kg.source_repo`), owner/repo. Null disables the check for it. */
+  kgSourceRepo: string | null;
+  /** The configured base template repo (Settings → KG Refresh), owner/repo. Null disables the check for it. */
+  kgBaseRepo: string | null;
+  githubAppId?: string;
+  githubAppPrivateKey?: string;
+  trigger: (opts: {
+    dryRun?: boolean;
+    ref?: string;
+    report?: KgDryRunReportTarget;
+  }) => Promise<{ status: number; body: Record<string, unknown> }>;
+  reportDryRun: (report: KgDryRunReportTarget) => Promise<void>;
+}
+
+/** Paths whose change on a KG repo PR proves the dry-run rail before merge (AII-633). */
+const KG_GUARD_PATH_PATTERNS: RegExp[] = [/^kg_ingest\//, /^sources\.yml$/, /^ontology\//, /^snapshot\//];
+/** Head branch names that indicate an upstream merge, guard-relevant regardless of changed files. */
+const KG_GUARD_BRANCH_PATTERNS: RegExp[] = [/^kg-upstream\//, /^sync\/upstream-/];
+const KG_ACCEPT_BASELINE_LABEL = "accept-baseline";
+
+function matchesKgGuard(files: string[], headRef: string): boolean {
+  if (KG_GUARD_BRANCH_PATTERNS.some((re) => re.test(headRef))) return true;
+  return files.some((f) => KG_GUARD_PATH_PATTERNS.some((re) => re.test(f)));
+}
+
+function hasAcceptBaselineLabel(payload: PullRequestPayload): boolean {
+  return (payload.pull_request?.labels ?? []).some((l) => l.name === KG_ACCEPT_BASELINE_LABEL);
+}
+
+/** Tracks the last sha a dry-run was dispatched for, per PR, so a redelivered/duplicate webhook does not re-dispatch. */
+const kgDryRunLastSha = new Map<string, string>();
+
+/**
+ * Handles a `pull_request` event against the KG PR-triggered dry-run rail (AII-633).
+ * Returns true when it owns the HTTP response (matched and handled, or matched and
+ * explicitly ignored); false when the caller should fall through to the existing
+ * pull_request handling (repo isn't the bound KG source or base template repo, or
+ * the action isn't one this check cares about).
+ */
+async function handleKgPrCheckWebhook(
+  payload: PullRequestPayload,
+  res: http.ServerResponse,
+  kgPrCheck: KgPrCheckConfig | undefined,
+): Promise<boolean> {
+  if (!kgPrCheck) return false;
+  if (payload.action !== "opened" && payload.action !== "synchronize" && payload.action !== "labeled") return false;
+
+  const repoFullName = payload.repository?.full_name;
+  const prNumber = payload.pull_request?.number;
+  if (!repoFullName || !prNumber) return false;
+  if (repoFullName !== kgPrCheck.kgSourceRepo && repoFullName !== kgPrCheck.kgBaseRepo) return false;
+
+  const sha = payload.pull_request?.head?.sha;
+  const headRef = payload.pull_request?.head?.ref;
+
+  if (payload.action === "labeled") {
+    // Re-report the last computed verdict (e.g. accept-baseline was just applied) —
+    // never re-runs the rail.
+    await kgPrCheck.reportDryRun({
+      repo: repoFullName,
+      prNumber,
+      sha: sha ?? "",
+      acceptBaseline: hasAcceptBaselineLabel(payload),
+    });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ reported: true }));
+    return true;
+  }
+
+  if (!sha || !headRef) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "missing_pr_fields" }));
+    return true;
+  }
+
+  const key = `${repoFullName}#${prNumber}`;
+  if (kgDryRunLastSha.get(key) === sha) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "duplicate_sha" }));
+    return true;
+  }
+
+  if (!kgPrCheck.githubAppId || !kgPrCheck.githubAppPrivateKey) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "no_app_credentials" }));
+    return true;
+  }
+
+  const slashIdx = repoFullName.indexOf("/");
+  const owner = repoFullName.slice(0, slashIdx);
+  const repo = repoFullName.slice(slashIdx + 1);
+
+  let files: string[] = [];
+  try {
+    const token = await getInstallationToken(kgPrCheck.githubAppId, kgPrCheck.githubAppPrivateKey, owner);
+    files = await listPullRequestFiles(token, owner, repo, prNumber);
+  } catch (err) {
+    console.error(`[webhook] kg-refresh dry-run: failed to fetch changed files for ${repoFullName}#${prNumber}:`, err);
+  }
+
+  if (!matchesKgGuard(files, headRef)) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ignored: true, reason: "no_guard_relevant_change" }));
+    return true;
+  }
+
+  // Record before dispatch (not after) so a burst of redeliveries for the same sha
+  // while the trigger call is in flight still collapses to one dispatch.
+  kgDryRunLastSha.set(key, sha);
+
+  const result = await kgPrCheck.trigger({
+    dryRun: true,
+    ref: headRef,
+    report: { repo: repoFullName, prNumber, sha, acceptBaseline: hasAcceptBaselineLabel(payload) },
+  }).catch((err) => {
+    console.error(`[webhook] kg-refresh dry-run trigger failed for ${repoFullName}#${prNumber}:`, err);
+    return { status: 500, body: {} as Record<string, unknown> };
+  });
+
+  console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}`);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ triggered: result.status === 202, status: result.status }));
+  return true;
 }
 
 interface ReviewPayload {
@@ -163,6 +302,7 @@ export async function handleGitHubWebhook(
   appId?: string,
   privateKey?: string,
   selfDeploy?: SelfDeployTarget,
+  kgPrCheck?: KgPrCheckConfig,
 ): Promise<void> {
   const body = await readRawBody(req);
   const signature = req.headers["x-hub-signature-256"] as string | undefined;
@@ -208,6 +348,11 @@ export async function handleGitHubWebhook(
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ignored: true }));
     return;
+  }
+
+  if (payload.action === "opened" || payload.action === "synchronize" || payload.action === "labeled") {
+    const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck);
+    if (handled) return;
   }
 
   if (payload.action === "synchronize") {

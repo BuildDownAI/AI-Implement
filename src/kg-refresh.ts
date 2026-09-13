@@ -7,7 +7,10 @@ import { promisify } from "node:util";
 import http from "node:http";
 import { parse as parseYaml } from "yaml";
 import { getScopedInstallationToken } from "./github-app-auth.js";
-import { fetchRepoTarball, mergePullRequest, closePullRequest, postPrComment, deleteBranch } from "./github.js";
+import {
+  fetchRepoTarball, mergePullRequest, closePullRequest, postPrComment, deleteBranch,
+  postOrUpdateStickyComment, setCommitStatus,
+} from "./github.js";
 import { extractSource, parseKgSourceRepo } from "./deploy.js";
 import { isDeployHeld } from "./deploy-hold.js";
 import { COMPLETION_MARKER, KG_DIR } from "./kg-sidecar.js";
@@ -83,6 +86,29 @@ export interface RefreshOutcome {
   partTable?: Array<{ part: string; prev: string; new: string }>;
 }
 
+/**
+ * PR to report a dry-run's verdict against (AII-633). `acceptBaseline` is set by the
+ * webhook when the PR carries the `accept-baseline` label at trigger time — it only
+ * changes the report's wording, never the underlying guard outcome (a real refresh
+ * still refuses the shrink unless an admin accepts the new baseline at refresh time).
+ */
+export interface KgDryRunReportTarget {
+  repo: string;
+  prNumber: number;
+  sha: string;
+  acceptBaseline?: boolean;
+}
+
+/** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633). */
+export const KG_DRY_RUN_COMMENT_MARKER = "## kg-refresh dry-run";
+
+/** Commit-status context for the PR-triggered dry-run check (AII-633). */
+export const KG_DRY_RUN_STATUS_CONTEXT = "kg-refresh/dry-run";
+
+/** Advisory hint attached to a failing `statuses:write` preflight row (AII-633). */
+const STATUSES_WRITE_HINT =
+  "grant the GitHub App `statuses: write` on this repo to enable the kg-refresh dry-run check — the PR comment still posts without it";
+
 /** One probe result from the credential preflight. `hint` is set only when `ok` is false. */
 export interface PreflightCheckResult {
   ok: boolean;
@@ -153,12 +179,17 @@ export interface KgRefreshStatus {
 
 export interface KgRefreshHandle {
   /**
-   * POST /api/kg/refresh behind admin auth, and the `trigger_kg_refresh` MCP tool.
-   * Returns the HTTP status + body to send. opts.dryRun (AII-632) carries through to
-   * the dispatched runner's envelope so kg-snapshot-push runs its guards without
-   * pushing; the local rail (fetch/stage/swap/canary) never runs for a dry-run trigger.
+   * POST /api/kg/refresh behind admin auth, the `trigger_kg_refresh` MCP tool, and the
+   * PR-triggered dry-run webhook (AII-633). Returns the HTTP status + body to send.
+   * opts.dryRun (AII-632) carries through to the dispatched runner's envelope so
+   * kg-snapshot-push runs its guards without pushing; the local rail (fetch/stage/
+   * swap/canary) never runs for a dry-run trigger. opts.ref (AII-633) dispatches
+   * against that branch instead of the KG source repo's default branch — used to
+   * run the rail against a PR's head. opts.report (AII-633), when set, posts the
+   * dry-run's verdict to that PR (sticky comment always; commit status only when
+   * the App has `statuses: write` on the PR's repo) once the dispatch completes.
    */
-  trigger(opts?: { dryRun?: boolean }): Promise<{ status: number; body: Record<string, unknown> }>;
+  trigger(opts?: { dryRun?: boolean; ref?: string; report?: KgDryRunReportTarget }): Promise<{ status: number; body: Record<string, unknown> }>;
   /** GET /api/kg/status behind admin auth. */
   status(): Promise<KgRefreshStatus>;
   /**
@@ -182,6 +213,13 @@ export interface KgRefreshHandle {
    * opts.failureCode propagates through onOutcome so the caller can suppress default notification.
    */
   onMachineLost(opts?: { failureCode?: string; detail?: string }): void;
+  /**
+   * Re-posts the last dry-run outcome's comment/status to `report` without triggering
+   * a new run (AII-633). Called on a `labeled` PR event (e.g. `accept-baseline` applied
+   * after the fact) so the report's wording updates without spending another dispatch.
+   * A no-op when `lastRefresh` is absent or is not a dry-run outcome.
+   */
+  reportDryRun(report: KgDryRunReportTarget): Promise<void>;
 }
 
 interface KgRefreshInput {
@@ -269,6 +307,10 @@ interface KgRefreshInput {
   deleteBranchFn?: typeof deleteBranch;
   /** Post the closing comment on the snapshot PR. Injectable for tests; defaults to postPrComment from github.ts. */
   postPrCommentFn?: typeof postPrComment;
+  /** Post or update the sticky dry-run PR comment (AII-633). Injectable for tests; defaults to postOrUpdateStickyComment from github.ts. */
+  postOrUpdateStickyCommentFn?: typeof postOrUpdateStickyComment;
+  /** Set the dry-run commit status (AII-633). Injectable for tests; defaults to setCommitStatus from github.ts. */
+  setCommitStatusFn?: typeof setCommitStatus;
   /** Resolve team key + dependency token scope for the mapping whose owner/repo equals the given string. Injectable for tests; defaults to () => undefined. */
   resolveMappingTeamKey?: (ownerRepo: string) => { teamKey: string; dependencyTokenScope: "installation" | null } | undefined;
   /**
@@ -282,13 +324,13 @@ interface KgRefreshInput {
   persistStage?: (
     stage: KgRefreshStage,
     startedAt: number,
-    envelope?: { dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage },
+    envelope?: { dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage; report?: KgDryRunReportTarget | null },
   ) => void;
   /**
    * Load persisted stage. Injectable for tests.
    * Default: reads from the DB settings table; returns null when absent or unreadable.
    */
-  loadStage?: () => { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage } | null;
+  loadStage?: () => { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage; report?: KgDryRunReportTarget | null } | null;
   /** Persist the last terminal refresh outcome across restarts. Injectable for tests. */
   persistLastRefresh?: (outcome: RefreshOutcome) => void;
   /** Load the last persisted terminal refresh outcome. Injectable for tests; returns null when absent. */
@@ -555,6 +597,32 @@ export async function runKgRefreshPreflight(input: KgPreflightInput): Promise<Pr
     results.push({ repo: kgRepoSlug, grant: "contents:write", ok: false, status: 0 });
   }
 
+  // Advisory `statuses:write` rows for the PR-triggered dry-run check (AII-633): the
+  // commit status is additive to the always-posted sticky PR comment, so a repo that
+  // hasn't granted the App `statuses: write` yet must never fail the whole preflight —
+  // `ok` is always true here, same convention as the `base:drift` row above, with the
+  // real grant/denial surfaced via `hint`. Probed the same way as `contents:write`:
+  // attempt to mint a token scoped to the permission and see whether it throws.
+  try {
+    await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, repo.owner, {
+      permissions: { statuses: "write" },
+      repositories: [repo.repo],
+    });
+    results.push({ repo: kgRepoSlug, grant: "statuses:write", ok: true, status: 200 });
+  } catch {
+    results.push({ repo: kgRepoSlug, grant: "statuses:write", ok: true, status: 0, hint: STATUSES_WRITE_HINT });
+  }
+  try {
+    const [baseOwner, baseRepoName] = baseRepoSlug.split("/");
+    await mintTokenFn(input.githubAppId, input.githubAppPrivateKey, baseOwner, {
+      permissions: { statuses: "write" },
+      repositories: [baseRepoName],
+    });
+    results.push({ repo: baseRepoSlug, grant: "statuses:write", ok: true, status: 200 });
+  } catch {
+    results.push({ repo: baseRepoSlug, grant: "statuses:write", ok: true, status: 0, hint: STATUSES_WRITE_HINT });
+  }
+
   // Probe the installation-wide dependency token against each code/secondary repo slug.
   const slugs = [
     ...(codeRepo !== null ? [codeRepo] : []),
@@ -631,6 +699,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const closePullRequestFn = input.closePullRequestFn ?? closePullRequest;
   const deleteBranchFn = input.deleteBranchFn ?? deleteBranch;
   const postPrCommentFn = input.postPrCommentFn ?? postPrComment;
+  const postOrUpdateStickyCommentFn = input.postOrUpdateStickyCommentFn ?? postOrUpdateStickyComment;
+  const setCommitStatusFn = input.setCommitStatusFn ?? setCommitStatus;
   const persistStageFn = input.persistStage ?? defaultPersistStage;
   const loadStageFn = input.loadStage ?? defaultLoadStage;
   const persistLastRefreshFn = input.persistLastRefresh ?? defaultPersistLastRefresh;
@@ -651,6 +721,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   let currentDispatchIsDryRun = false;
   /** `stage` as it stood immediately before the in-flight dispatch — restored on a dry-run completion instead of advancing to serving/reverted. */
   let stageBeforeCurrentDispatch: KgRefreshStage = "idle";
+  /** PR to report the in-flight dispatch's dry-run verdict to (AII-633); cleared on every terminal outcome. */
+  let currentReport: KgDryRunReportTarget | null = null;
   /** Timer re-armed on boot when an ingest-running run is re-adopted; null otherwise. */
   let ttlWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -671,6 +743,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       // staging rail — mirrors dispatchId/jobId re-adoption above.
       currentDispatchIsDryRun = persisted.dryRun === true;
       stageBeforeCurrentDispatch = persisted.stageBeforeDispatch ?? "idle";
+      currentReport = persisted.report ?? null;
       // Re-arm the TTL watchdog for the remaining window; the live-process check
       // inside trigger() only fires if trigger() is called, so a standalone timer
       // is needed to expire an adopted run that never receives a new trigger() call.
@@ -969,6 +1042,78 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
     if (branch) await deleteSnapshotBranch(owner, repoName, branch);
   }
 
+  /** Renders the per-part {part, prev, new} rows as a markdown table, or a placeholder when absent. */
+  function renderPartTable(partTable?: Array<{ part: string; prev: string; new: string }>): string {
+    if (!partTable || partTable.length === 0) return "_no per-part counts reported_";
+    const rows = partTable.map((p) => `| ${p.part} | ${p.prev} | ${p.new} |`).join("\n");
+    return `| part | prev | new |\n| --- | --- | --- |\n${rows}`;
+  }
+
+  /** True when the outcome represents a dry-run guard refusal (as opposed to a plain runner failure). */
+  function isDryRunRefusal(outcome: RefreshOutcome): boolean {
+    return outcome.dryRun === true && !outcome.ok && outcome.detail.includes("guard refused");
+  }
+
+  /** Builds the sticky comment body for a dry-run outcome. */
+  function buildDryRunCommentBody(report: KgDryRunReportTarget, outcome: RefreshOutcome): string {
+    const acceptedByLabel = isDryRunRefusal(outcome) && report.acceptBaseline === true;
+    const verdict = acceptedByLabel
+      ? `refused, accepted by label \`accept-baseline\` — ${outcome.detail}`
+      : outcome.detail;
+    const note = acceptedByLabel
+      ? "\n\n_The label only changes what this check reports — a real refresh still refuses this shrink unless an admin accepts the new baseline at refresh time._"
+      : "";
+    return `${KG_DRY_RUN_COMMENT_MARKER} — ${report.sha}\n\n${verdict}\n\n${renderPartTable(outcome.partTable)}${note}`;
+  }
+
+  /**
+   * Posts (or updates) the sticky dry-run comment on `report`'s PR, and — only when
+   * the App has been granted `statuses: write` on that repo — sets the
+   * `kg-refresh/dry-run` commit status (AII-633). Best-effort: a failure here is
+   * logged, never thrown, so a PR-reporting problem cannot fail the refresh itself.
+   */
+  async function postDryRunReport(report: KgDryRunReportTarget, outcome: RefreshOutcome): Promise<void> {
+    let owner: string;
+    let repoName: string;
+    try {
+      const parsed = parseKgSourceRepo(report.repo);
+      owner = parsed.owner;
+      repoName = parsed.repo;
+    } catch (err) {
+      console.error(`[kg-refresh] dry-run report: invalid repo "${report.repo}": ${String(err)}`);
+      return;
+    }
+
+    const body = buildDryRunCommentBody(report, outcome);
+    try {
+      const { token } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
+        permissions: { pull_requests: "write" },
+        repositories: [repoName],
+      });
+      await postOrUpdateStickyCommentFn(token, owner, repoName, report.prNumber, KG_DRY_RUN_COMMENT_MARKER, body);
+    } catch (err) {
+      console.error(`[kg-refresh] failed to post dry-run comment on ${report.repo}#${report.prNumber}: ${String(err)}`);
+    }
+
+    const acceptedByLabel = isDryRunRefusal(outcome) && report.acceptBaseline === true;
+    const statusOk = outcome.ok || acceptedByLabel;
+    try {
+      const { token: statusToken } = await mintToken(input.githubAppId, input.githubAppPrivateKey, owner, {
+        permissions: { statuses: "write" },
+        repositories: [repoName],
+      });
+      await setCommitStatusFn(statusToken, owner, repoName, report.sha, {
+        state: statusOk ? "success" : "failure",
+        context: KG_DRY_RUN_STATUS_CONTEXT,
+        description: outcome.detail.slice(0, 140),
+      });
+    } catch (err) {
+      // Not granted, or the mint/status call failed — the comment above already
+      // carries the verdict, so this degrades to comment-only rather than failing.
+      console.log(`[kg-refresh] dry-run commit status not set for ${report.repo}#${report.prNumber}: ${String(err)}`);
+    }
+  }
+
   /** Shared terminal path for lost/timed-out ingest runners. No-op when stage ≠ ingest-running. */
   function failIngestRunner(reason: string, failureCode?: string): void {
     if (stage !== "ingest-running") return;
@@ -1000,7 +1145,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   }
 
   return {
-    async trigger(opts?: { dryRun?: boolean }) {
+    async trigger(opts?: { dryRun?: boolean; ref?: string; report?: KgDryRunReportTarget }) {
       // Self-heal: if a dispatched runner never reported back and the TTL has elapsed
       // in the live process, expire the lock so the operator can trigger a new refresh.
       if (running && stage === "ingest-running" && ingestStartedAt !== null &&
@@ -1147,6 +1292,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               runnerCallbackUrl,
               ...(kgDependencyTokenScope != null ? { dependencyTokenScope: kgDependencyTokenScope } : {}),
               ...(opts?.dryRun ? { kgDryRun: true as const } : {}),
+              ...(opts?.ref ? { kgSourceRef: opts.ref } : {}),
             };
 
             // Write the row before starting the machine so waitForQuiet cannot
@@ -1175,6 +1321,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
             currentDispatchId = dispatchId;
             currentDispatchIsDryRun = opts?.dryRun === true;
             stageBeforeCurrentDispatch = stageBeforeThisTrigger;
+            currentReport = opts?.report ?? null;
             stage = "ingest-running";
             ingestStartedAt = Date.now();
             persistStageFn("ingest-running", ingestStartedAt, {
@@ -1182,6 +1329,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               jobId: currentJobId,
               dryRun: currentDispatchIsDryRun,
               stageBeforeDispatch: stageBeforeCurrentDispatch,
+              report: currentReport,
             });
             console.log(`[kg-refresh] dispatched kg-refresh runner (dispatchId=${dispatchId})`);
             // running stays true — onRunnerComplete clears it when the runner reports back
@@ -1267,6 +1415,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         const savedId = currentDispatchId;
         currentDispatchId = null;
         currentDispatchIsDryRun = false;
+        const savedReport = currentReport;
+        currentReport = null;
 
         const ok = runnerOutcome === "success" || data.failureCode === "KG_SNAPSHOT_STALE";
         const detail = runnerOutcome === "success"
@@ -1291,6 +1441,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
         stage = restoreStage;
         persistStageFn(stage, Date.now());
         console.log(`[kg-refresh] ${detail}`);
+        if (savedReport) void postDryRunReport(savedReport, lastRefresh);
         void input.onOutcome?.(ok ? "success" : "failure", {
           failureReason: ok ? undefined : detail,
           dispatchId: savedId ?? undefined,
@@ -1507,6 +1658,11 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       console.log("[kg-refresh] machine absent — reaper closed the ingest runner job");
       failIngestRunner(opts?.detail ?? "ingest runner machine absent — closed by reaper sweep", opts?.failureCode);
     },
+
+    async reportDryRun(report: KgDryRunReportTarget): Promise<void> {
+      if (!lastRefresh || lastRefresh.dryRun !== true) return;
+      await postDryRunReport(report, lastRefresh);
+    },
   };
 }
 
@@ -1605,7 +1761,7 @@ async function defaultFetchCommitVisible(token: string, owner: string, repo: str
 function defaultPersistStage(
   stage: KgRefreshStage,
   startedAt: number,
-  envelope?: { dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage },
+  envelope?: { dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage; report?: KgDryRunReportTarget | null },
 ): void {
   try {
     const value: Record<string, unknown> = { stage, startedAt };
@@ -1613,6 +1769,7 @@ function defaultPersistStage(
     if (envelope?.jobId != null) value.jobId = envelope.jobId;
     if (envelope?.dryRun) value.dryRun = true;
     if (envelope?.stageBeforeDispatch != null) value.stageBeforeDispatch = envelope.stageBeforeDispatch;
+    if (envelope?.report != null) value.report = envelope.report;
     getDb()
       .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
       .run(KG_STAGE_SETTINGS_KEY, JSON.stringify(value));
@@ -1621,13 +1778,13 @@ function defaultPersistStage(
   }
 }
 
-function defaultLoadStage(): { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage } | null {
+function defaultLoadStage(): { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage; report?: KgDryRunReportTarget | null } | null {
   try {
     const row = getDb()
       .prepare("SELECT value FROM settings WHERE key = ?")
       .get(KG_STAGE_SETTINGS_KEY) as { value: string } | undefined;
     if (!row) return null;
-    return JSON.parse(row.value) as { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage };
+    return JSON.parse(row.value) as { stage: KgRefreshStage; startedAt: number; dispatchId?: string | null; jobId?: number | null; dryRun?: boolean; stageBeforeDispatch?: KgRefreshStage; report?: KgDryRunReportTarget | null };
   } catch {
     return null;
   }

@@ -680,6 +680,8 @@ describe("kg-refresh", () => {
     let fetchCommitVisible: ReturnType<typeof vi.fn>;
     let stageStore: { stage: KgRefreshStage; startedAt: number } | null;
     let persistedStages: Array<{ stage: KgRefreshStage; startedAt: number }>;
+    let postOrUpdateStickyCommentFn: ReturnType<typeof vi.fn>;
+    let setCommitStatusFn: ReturnType<typeof vi.fn>;
 
     // fetchSnapshotCommitSha: matches recorded SHA on first call (→ ingest-needed → dispatch),
     // returns a new SHA on subsequent calls (→ rail proceeds after runner pushes commit).
@@ -691,6 +693,8 @@ describe("kg-refresh", () => {
 
     function buildDispatch(overrides: Record<string, unknown> = {}) {
       dispatchRun = vi.fn(async () => ({ machineNonce: "test-nonce" }));
+      postOrUpdateStickyCommentFn = vi.fn(async () => {});
+      setCommitStatusFn = vi.fn(async () => {});
       mintRunTokenFn = vi.fn()
         .mockReturnValueOnce({ token: "run-tok", dispatchId: "disp-1" })
         .mockReturnValue({ token: "progress-tok", dispatchId: "disp-1" });
@@ -734,6 +738,8 @@ describe("kg-refresh", () => {
           persistedStages.push({ stage: s, startedAt: t });
         },
         loadStage: () => stageStore,
+        postOrUpdateStickyCommentFn: postOrUpdateStickyCommentFn as never,
+        setCommitStatusFn: setCommitStatusFn as never,
         ...overrides,
       });
     }
@@ -982,6 +988,151 @@ describe("kg-refresh", () => {
         handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
         await waitDone();
         expect((await handle.status()).stage).toBe("failed");
+      });
+    });
+
+    describe("PR-triggered dry-run report (AII-633)", () => {
+      const REPORT = { repo: "TestOrg/test-kg", prNumber: 42, sha: "deadbeef" };
+
+      it("runConfig envelope carries kgSourceRef when trigger({ ref }) is called", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch" });
+        await waitForStage("ingest-running");
+        const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+        const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+        expect(decoded.kgSourceRef).toBe("pr-head-branch");
+      });
+
+      it("runConfig envelope omits kgSourceRef when trigger() is called without ref", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+        const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+        expect(decoded).not.toHaveProperty("kgSourceRef");
+      });
+
+      it("a dry-run success completion with report posts the sticky comment and sets a success commit status", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [{ part: "comment.nt", prev: "9995", new: "9995" }] });
+        await waitDone();
+
+        expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
+        const [, owner, repo, prNumber, marker, body] = postOrUpdateStickyCommentFn.mock.calls[0] as [string, string, string, number, string, string];
+        expect(owner).toBe("TestOrg");
+        expect(repo).toBe("test-kg");
+        expect(prNumber).toBe(42);
+        expect(marker).toBe("## kg-refresh dry-run");
+        expect(body).toContain("## kg-refresh dry-run — deadbeef");
+        expect(body).toContain("comment.nt");
+
+        expect(setCommitStatusFn).toHaveBeenCalledTimes(1);
+        const statusCall = setCommitStatusFn.mock.calls[0] as [string, string, string, string, { state: string; context: string }];
+        expect(statusCall[3]).toBe("deadbeef");
+        expect(statusCall[4].state).toBe("success");
+        expect(statusCall[4].context).toBe("kg-refresh/dry-run");
+      });
+
+      it("a dry-run refusal completion with report posts a failing status and plain refusal wording", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", {
+          failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+          failureReason: "content regression detected — comment.nt: shrank from 9995 to 3793 lines",
+          guardVerdict: "refused",
+          partTable: [{ part: "comment.nt", prev: "9995", new: "3793" }],
+        });
+        await waitDone();
+
+        const body = postOrUpdateStickyCommentFn.mock.calls[0][5] as string;
+        expect(body).toContain("guard refused");
+        expect(body).not.toContain("accepted by label");
+        const statusCall = setCommitStatusFn.mock.calls[0] as [string, string, string, string, { state: string }];
+        expect(statusCall[4].state).toBe("failure");
+      });
+
+      it("a dry-run refusal with acceptBaseline reports 'refused, accepted by label' and a success status, without changing the underlying outcome", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: { ...REPORT, acceptBaseline: true } });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", {
+          failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+          failureReason: "content regression detected — comment.nt: shrank from 9995 to 3793 lines",
+          guardVerdict: "refused",
+          partTable: [{ part: "comment.nt", prev: "9995", new: "3793" }],
+        });
+        await waitDone();
+
+        const body = postOrUpdateStickyCommentFn.mock.calls[0][5] as string;
+        expect(body).toContain("refused, accepted by label");
+        const statusCall = setCommitStatusFn.mock.calls[0] as [string, string, string, string, { state: string }];
+        expect(statusCall[4].state).toBe("success");
+        // The underlying guard outcome is still a refusal — the label only changed the report.
+        const s = await handle.status();
+        expect(s.lastRefresh?.ok).toBe(false);
+      });
+
+      it("does not set a commit status when statuses:write is not granted, but still posts the comment", async () => {
+        buildDispatch({
+          mintToken: vi.fn(async (_id: string, _key: string, _owner: string, opts: Record<string, unknown>) => {
+            if ((opts.permissions as Record<string, string>)?.statuses === "write") {
+              throw new Error("403 Forbidden");
+            }
+            return { token: "tok", expiresAt: "" };
+          }) as never,
+        });
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+
+        expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
+        expect(setCommitStatusFn).not.toHaveBeenCalled();
+      });
+
+      it("no report configured — no comment and no status posted", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch" });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+        expect(setCommitStatusFn).not.toHaveBeenCalled();
+      });
+
+      it("reportDryRun() re-posts the last dry-run outcome without dispatching a new run", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [{ part: "comment.nt", prev: "9995", new: "9995" }] });
+        await waitDone();
+        expect(dispatchRun).toHaveBeenCalledOnce();
+        postOrUpdateStickyCommentFn.mockClear();
+        setCommitStatusFn.mockClear();
+
+        await handle.reportDryRun({ ...REPORT, acceptBaseline: true });
+
+        expect(dispatchRun).toHaveBeenCalledOnce(); // still just the one dispatch
+        expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
+        // Outcome was a success (no shrink), so the label has no wording effect here.
+        const body = postOrUpdateStickyCommentFn.mock.calls[0][5] as string;
+        expect(body).not.toContain("accepted by label");
+      });
+
+      it("reportDryRun() is a no-op when lastRefresh is not a dry-run outcome", async () => {
+        buildDispatch();
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { snapshotCommit: "abc123" });
+        await waitDone();
+        expect((await handle.status()).lastRefresh?.dryRun).toBeUndefined();
+
+        await handle.reportDryRun(REPORT);
+        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+        expect(setCommitStatusFn).not.toHaveBeenCalled();
       });
     });
 
@@ -2456,6 +2607,64 @@ describe("kg-refresh", () => {
       expect(byGrant("TestOrg/secondary-repo", "pull_requests:read")).toMatchObject({ ok: true, status: 200 });
       expect(byGrant("TestOrg/test-kg", "workflow:runner_phase")).toMatchObject({ ok: false, status: 404 });
       expect(byGrant("BuildDownAI/bd-knowledge-graph-base", "base:drift")).toMatchObject({ ok: true, status: 200 });
+    });
+
+    // ---- AII-633: statuses:write rows (advisory — never fail the preflight) --------
+
+    it("statuses:write granted on both repos — both rows ok:true with no hint", async () => {
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintTokenPf as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: fetchCompare as never,
+      });
+      const byGrant = (repo: string, grant: string) => result.results.find((r) => r.repo === repo && r.grant === grant);
+      expect(byGrant("TestOrg/test-kg", "statuses:write")).toMatchObject({ ok: true, status: 200 });
+      const baseRow = byGrant("BuildDownAI/bd-knowledge-graph-base", "statuses:write");
+      expect(baseRow).toMatchObject({ ok: true, status: 200 });
+      expect(baseRow).not.toHaveProperty("hint");
+    });
+
+    it("statuses:write denied on the KG source repo — row still ok:true, with a hint, and does not fail the overall preflight", async () => {
+      const mintDenyStatuses = vi.fn(async (_id: string, _key: string, _owner: string, opts: Record<string, unknown>) => {
+        if ((opts.permissions as Record<string, string>)?.statuses === "write") {
+          throw new Error("403 Forbidden");
+        }
+        return { token: "tok", expiresAt: "" };
+      });
+      const result = await runKgRefreshPreflight({
+        githubAppId: "1",
+        githubAppPrivateKey: "key",
+        kgSourceRepo: "TestOrg/test-kg",
+        mintToken: mintDenyStatuses as never,
+        fetchTarball: vi.fn(async () => preflightTarball) as never,
+        fetchDefaultBranch: vi.fn(async () => "main") as never,
+        probeRepo: probeRepo as never,
+        fetchWorkflowFile: fetchWorkflowFile as never,
+        fetchCompare: fetchCompare as never,
+      });
+      const row = result.results.find((r) => r.repo === "TestOrg/test-kg" && r.grant === "statuses:write");
+      expect(row).toMatchObject({ ok: true, status: 0 });
+      expect(row?.hint).toContain("statuses: write");
+      expect(result.ok).toBe(true);
+    });
+
+    it("statuses:write denied does not block dispatch", async () => {
+      buildPreflight({
+        mintToken: vi.fn(async (_id: string, _key: string, _owner: string, opts: Record<string, unknown>) => {
+          if ((opts.permissions as Record<string, string>)?.statuses === "write") {
+            throw new Error("403 Forbidden");
+          }
+          return { token: "tok", expiresAt: "" };
+        }) as never,
+      });
+      const r = await handle.trigger();
+      expect(r.status).toBe(202);
     });
 
     // ---- AII-598: base:drift row --------------------------------------------------
