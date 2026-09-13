@@ -393,7 +393,10 @@ dry-run flag: it skips `runRefreshAndSettle()` entirely, restores `stage` to the
 before the dispatch, and builds `lastRefresh.detail` from `data.guardVerdict` — `"refused"` yields
 `"dry-run: guard refused: ..."`, a clean success yields `"dry-run: guard passed: no shrink"`, and a
 runner failure that never reached the guard (clone, ingest, callback) yields
-`"dry-run: failed: ..."` rather than being mislabeled as a guard refusal.
+`"dry-run: failed: ..."` rather than being mislabeled as a guard refusal. The dry-run flag and the
+pre-dispatch stage are written into the same persisted stage envelope as `dispatchId`/`jobId` (not
+kept only in memory), so a callback arriving after an orchestrator restart mid-`ingest-running` is
+still recognized and handled as a dry run instead of falling through to the real staging rail.
 
 ### The `index.ts` budget
 

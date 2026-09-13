@@ -851,6 +851,19 @@ describe("kg-refresh", () => {
         expect(decoded.kgDryRun).toBe(true);
       });
 
+      it("persists dryRun and the pre-dispatch stage in the same stage envelope as dispatchId/jobId (AII-632 gap-fill)", async () => {
+        const persistStageCapture = vi.fn();
+        buildDispatch({ persistStage: persistStageCapture, loadStage: () => null });
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        const ingestRunningCall = persistStageCapture.mock.calls.find((c) => c[0] === "ingest-running");
+        expect(ingestRunningCall).toBeTruthy();
+        const envelope = ingestRunningCall![2] as { dispatchId?: string; jobId?: number; dryRun?: boolean; stageBeforeDispatch?: string };
+        expect(envelope.dryRun).toBe(true);
+        expect(envelope.stageBeforeDispatch).toBe("idle");
+        expect(envelope.dispatchId).toBeTruthy();
+      });
+
       it("runConfig envelope omits kgDryRun for a plain trigger() call", async () => {
         buildDispatch();
         await handle.trigger();
@@ -1936,6 +1949,54 @@ describe("kg-refresh", () => {
         expect(s1.running).toBe(false);
         expect(s1.lastRefresh?.ok).toBe(true);
         expect(lastRefreshStore?.ok).toBe(true);
+      });
+
+      // ---- AII-632 gap-fill: dry-run tracking must survive a restart, or a callback
+      // for a dry-run dispatch is mishandled as a real completion after re-adoption. ----
+
+      it("restart with persisted dry-run envelope re-adopts as a dry run — onRunnerComplete restores the pre-dispatch stage and reports the guard table instead of running the real staging rail", async () => {
+        const closeJobLog = vi.fn();
+        const persistLastRefresh = vi.fn();
+        const recentTime = Date.now() - 30_000; // 30s ago — well within TTL
+
+        // Simulates a process restart while a dry-run dispatch sat in ingest-running:
+        // loadStage returns the envelope a real defaultPersistStage would have written,
+        // including dryRun and stageBeforeDispatch, with no prior trigger() call on
+        // this handle instance.
+        buildDispatch({
+          closeJobLog,
+          persistLastRefresh,
+          loadStage: () => ({
+            stage: "ingest-running" as KgRefreshStage,
+            startedAt: recentTime,
+            dispatchId: "adopted-dry-run-dispatch",
+            jobId: 91,
+            dryRun: true,
+            stageBeforeDispatch: "reverted" as KgRefreshStage,
+          }),
+        });
+
+        expect((await handle.status()).stage).toBe("ingest-running");
+        expect((await handle.status()).running).toBe(true);
+
+        handle.onRunnerComplete("success", {
+          guardVerdict: "clean",
+          partTable: [{ part: "comment.nt", prev: "9995", new: "9995" }],
+        });
+        await waitDone();
+
+        // The real staging rail (fetch/stage/swap/canary) must never run: no sidecar
+        // restart, and stage lands on the pre-dispatch value ("reverted"), not on
+        // "serving"/"snapshot-landed" from runRefreshAndSettle.
+        expect(restart).not.toHaveBeenCalled();
+        const s = await handle.status();
+        expect(s.stage).toBe("reverted");
+        expect(s.running).toBe(false);
+        expect(s.lastRefresh?.ok).toBe(true);
+        expect(s.lastRefresh?.dryRun).toBe(true);
+        expect(s.lastRefresh?.detail).toBe("dry-run: guard passed: no shrink");
+        expect(s.lastRefresh?.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "9995" }]);
+        expect(closeJobLog).toHaveBeenCalledWith(91, "completed");
       });
 
       it("lastRefresh persisted and restored across restart", async () => {
