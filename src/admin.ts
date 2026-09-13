@@ -464,7 +464,9 @@ export function handleAdminRequest(
           if (dryRun) opts.dryRun = true;
           if (acceptNewBaseline) {
             opts.acceptNewBaseline = true;
-            if (gate.identity?.email) opts.actorEmail = gate.identity.email;
+            // An access-code session has no email; name it so the log line and the
+            // ### Baseline section never read "unknown" for a real press.
+            opts.actorEmail = gate.identity?.email ?? "access-code session";
           }
           const pending = (dryRun || acceptNewBaseline) ? kgRefresh.trigger(opts) : kgRefresh.trigger();
           return pending.then(

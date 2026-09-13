@@ -1231,10 +1231,14 @@ describe("kgSnapshotPushStep — acceptNewBaseline flag (AII-628)", () => {
       noopReporter,
     );
 
-    expect(fetch).toHaveBeenCalledTimes(1);
-    const [, req] = vi.mocked(fetch).mock.calls[0];
+    // The step also posts a learnings comment; assert on the PR-create call, not the count.
+    const prCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).includes("/pulls"));
+    expect(prCall).toBeTruthy();
+    const [, req] = prCall!;
     const body = JSON.parse((req as RequestInit).body as string);
     expect(body.body).toContain("### Baseline");
+    // The accepted shrink is marked inline on its own table row (AII-628).
+    expect(body.body).toMatch(/\| comment\.nt \|[^\n]*← accepted \|/);
     expect(body.body).toContain("operator@example.com");
     expect(body.body).toContain("comment.nt");
     expect(body.body).toContain("**Guard verdict:** clean (baseline accepted)");

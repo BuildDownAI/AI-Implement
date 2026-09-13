@@ -544,6 +544,15 @@ describe("kg refresh card", () => {
     expect(deploymentsScript).toContain("document.getElementById('kg-dry-run-btn').disabled = busy");
   });
 
+  it("declares the accept-baseline button and gates it behind confirm() (AII-628)", () => {
+    expect(deploymentsHtml).toContain('id="kg-accept-baseline-btn"');
+    expect(deploymentsHtml).toContain('onclick="window.triggerKgAcceptBaseline()"');
+    expect(deploymentsScript).toContain("window.triggerKgAcceptBaseline = ");
+    expect(deploymentsScript).toContain("if (!confirm(");
+    expect(deploymentsScript).toContain("JSON.stringify({ acceptNewBaseline: true })");
+    expect(deploymentsScript).toContain("document.getElementById('kg-accept-baseline-btn').disabled = busy");
+  });
+
   it("posts to /api/kg/refresh for the refresh trigger", () => {
     expect(deploymentsScript).toContain("window.api('/api/kg/refresh', { method: 'POST' })");
   });

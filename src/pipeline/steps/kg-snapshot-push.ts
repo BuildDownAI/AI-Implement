@@ -252,7 +252,11 @@ function buildRefreshReport(data: RefreshReportInputs): string {
   if (data.partRows.length === 0) {
     lines.push("| _(no previous snapshot to diff against)_ | | | |");
   } else {
-    for (const row of data.partRows) lines.push(`| ${row.part} | ${row.prev} | ${row.next} | ${row.delta} |`);
+    for (const row of data.partRows) {
+      // AII-628: mark the row whose shrink acceptNewBaseline overrode, so the table itself says which part was accepted.
+      const accepted = data.baseline?.shrunkParts.includes(row.part) ? " ← accepted" : "";
+      lines.push(`| ${row.part} | ${row.prev} | ${row.next} | ${row.delta}${accepted} |`);
+    }
   }
   if (data.baseline) {
     lines.push(
