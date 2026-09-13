@@ -255,7 +255,13 @@ function providerUnavailableClassification(
   const detailParts: string[] = [];
   const statusLine = statusLineFor(failure, lastSuccessfulStage);
   if (statusLine) detailParts.push(statusLine);
-  detailParts.push(prUrl ? `The work so far is preserved in a draft PR: ${prUrl}` : "No PR was opened.");
+  detailParts.push(
+    prUrl
+      ? failure.stage === "post-push-review"
+        ? `The PR is open and ready for human review: ${prUrl}`
+        : `The work so far is preserved in a draft PR: ${prUrl}`
+      : "No PR was opened.",
+  );
   detailParts.push(`\`\`\`\n${evidenceExcerpt(failure)}\n\`\`\``);
 
   return {

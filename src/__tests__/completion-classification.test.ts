@@ -391,6 +391,12 @@ describe("classificationForFailure — PROVIDER_UNAVAILABLE", () => {
     expect(c.summary).not.toContain("implemented");
   });
 
+  it("says the PR is open and ready for human review for the post-push-review stage, not that a draft PR preserved the work — the PR predates this failure (BAC-27134 follow-up)", () => {
+    const c = classificationForFailure(providerUnavailableFailure("post-push-review"), PR);
+    expect(c.detail).toContain(`The PR is open and ready for human review: ${PR}`);
+    expect(c.detail).not.toContain("preserved in a draft PR");
+  });
+
   it("reads as not reviewed for the bare in-loop review stage regardless of prUrl", () => {
     expect(classificationForFailure(providerUnavailableFailure("review"), PR).summary).toContain("not reviewed");
     expect(classificationForFailure(providerUnavailableFailure("review"), undefined).summary).toContain(
