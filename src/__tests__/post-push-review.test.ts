@@ -2037,6 +2037,275 @@ describe("postPushReviewStep", () => {
     expect(warnings).toContain("lint");
   });
 
+  // ─── the gate must not approve on evidence it never actually got ────────────────
+  // Five shapes that used to approve silently: no exception, no failing test, just a PR
+  // approved against a review nobody read.
+
+  const gateFixture = (checkRuns: (n: number) => { stdout: string; exitCode: number; stderr?: string }) => {
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 };
+    const reviewCalls: string[][] = [];
+    let probes = 0;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ head: { sha: "deadbeef" } }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("commits/deadbeef/check-runs"))) {
+        // Only the wait loop's paginated read counts as a probe. findFailingCiChecks re-reads
+        // the same endpoint once after the wait settles; replay the last probe to it.
+        if (args.includes("--paginate")) probes++;
+        return checkRuns(probes);
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) {
+        reviewCalls.push(args);
+        return { stdout: "[]", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    return { ghSpawn, reviewCalls, probes: () => probes, reviewerOutput };
+  };
+  const runGate = async (f: ReturnType<typeof gateFixture>, maxIterations = 1) => {
+    const invoke = vi.fn(async () => (structuredReviewResult(f.reviewerOutput)));
+    return postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations, ghSpawn: f.ghSpawn,
+        gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: vi.fn(async () => undefined),
+        reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      { report: vi.fn(async () => undefined) },
+    );
+  };
+  const runs = (r: Array<{ name: string; status: string; conclusion: string | null }>) =>
+    ({ stdout: JSON.stringify({ check_runs: r }), exitCode: 0 });
+
+  it("does not approve when the check-runs probe cannot be read", async () => {
+    // A failed `gh api` used to map to "absent", which the caller fails OPEN on — so one
+    // transient API failure auto-approved. A probe we could not read is not evidence that
+    // no reviewer exists.
+    //
+    // "unreadable" never settles, so this is the state that runs to the full timeout by design
+    // — the one where the warn bound matters most. A real outage does not repeat one error
+    // string, so the stderr moves between probes: that is what makes this a test of the
+    // CONDITION key rather than of the message text.
+    const errors = ["HTTP 502", "error connecting to api.github.com", "HTTP 503"];
+    const f = gateFixture((n) => ({ stdout: "", exitCode: 1, stderr: errors[n % errors.length] }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let out, warnings;
+    try {
+      out = await runGate(f);
+      warnings = warn.mock.calls.map((c) => c.join(" ")).filter((l) => l.includes("Could not read check runs"));
+    } finally {
+      warn.mockRestore();
+    }
+    expect(out.approved).toBe(false);
+    // The submitted BODY, not the review event: submitPrReview hard-codes event=COMMENT
+    // (GitHub 422s an APPROVE on your own PR), so asserting on the event can never fail.
+    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this PR")))).toBe(false);
+    expect(f.probes()).toBeGreaterThan(1);   // the condition really did recur
+    expect(warnings).toHaveLength(1);        // ...and was reported once, despite differing text
+  });
+
+  it("paginates the check-runs read and finds a match on a later page", async () => {
+    // A bare per_page=100 truncates on a busy SHA, and a truncated page is indistinguishable
+    // from "no reviewer" — which resolves to "absent" and fails OPEN. Pins both halves: that
+    // pagination is requested, and that the array-of-pages shape --slurp returns is parsed.
+    const f = gateFixture(() => ({
+      stdout: JSON.stringify([
+        { check_runs: [{ name: "build", status: "completed", conclusion: "success" }] },
+        { check_runs: [{ name: "claude-review", status: "completed", conclusion: "success" }] },
+      ]),
+      exitCode: 0,
+    }));
+    const out = await runGate(f);
+    const probeArgs = f.ghSpawn.mock.calls.map((c) => c[0] as string[])
+      .find((a) => a.some((x) => x.includes("check-runs")))!;
+    expect(probeArgs).toContain("--paginate");
+    expect(probeArgs).toContain("--slurp");
+    // The reviewer is on page 2, so a truncated read would have reported absence.
+    expect(out.approved).toBe(true);
+  });
+
+  it("recovers when the PR metadata read fails once and then succeeds", async () => {
+    // The point of moving the head-SHA read inside the loop is that a TRANSIENT failure
+    // recovers. Pins the retry itself, not only the permanent-failure path.
+    let headReads = 0;
+    // Two probes, not one: the second is what makes the exact count below load-bearing. The
+    // read is cached once it succeeds, so the third loop pass must NOT read again — dropping
+    // the `if (!headSha)` guard costs one API call per probe and nothing else observable.
+    const f = gateFixture((n) => runs([
+      { name: "claude-review", status: n === 1 ? "in_progress" : "completed", conclusion: n === 1 ? null : "success" },
+    ]));
+    const inner = f.ghSpawn.getMockImplementation()!;
+    f.ghSpawn.mockImplementation((args: string[]) => {
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        headReads++;
+        if (headReads === 1) return { stdout: "", exitCode: 1, stderr: "HTTP 502" };
+      }
+      return inner(args);
+    });
+    const out = await runGate(f);
+    expect(headReads).toBe(2);   // fail, recover, then cached across the remaining probes
+    expect(f.probes()).toBe(2);
+    expect(out.approved).toBe(true);
+  });
+
+  it("treats an answered-but-headless PR payload as absent", async () => {
+    // The load-bearing distinction: null means the call failed, "" means it answered without a
+    // head.sha. Only the fixture fallthrough covered this, which is the coverage shape that
+    // hides a regression.
+    const f = gateFixture(() => runs([]));
+    const inner = f.ghSpawn.getMockImplementation()!;
+    f.ghSpawn.mockImplementation((args: string[]) => {
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: JSON.stringify({ number: 42 }), exitCode: 0 };
+      }
+      return inner(args);
+    });
+    const out = await runGate(f);
+    expect(out.approved).toBe(true); // absent => fail open, unchanged
+    // Resolved in ONE pass: an answered-but-headless payload is information, so the loop returns
+    // without ever reaching the check-runs endpoint. Folding "" into the null retry path would
+    // spin to the timeout instead, and probes would still be 0 — so assert the head read too.
+    expect(f.probes()).toBe(0);
+    expect(f.ghSpawn.mock.calls.filter((c) => (c[0] as string[]).some((a) => a === "repos/:owner/:repo/pulls/42")).length).toBe(1);
+  });
+
+  it("warns once per condition per wait, and does not carry that state between waits", async () => {
+    // Two failure modes in one assertion, because they pull in opposite directions.
+    //
+    // Warn-per-probe: the loop polls up to timeoutMs/pollMs times, so one sustained condition
+    // becomes sixty identical lines. This fixture drives the unbounded shape specifically — a
+    // matching run on the first probe sets sawMatching, which downgrades every later "absent"
+    // to "unreadable", and "unreadable" never settles, so the loop runs to the full timeout.
+    //
+    // Module-level warn state: dedupe that outlives one wait suppresses the SECOND run's
+    // warning entirely, which in a test file where every fixture shares the SHA `deadbeef`
+    // presents as an unrelated test breaking whenever the order changes. Running the gate
+    // twice pins it here.
+    // The non-matching set GROWS between probes, which is the ordinary case on a busy repo:
+    // unrelated CI checks appear and conclude while the gate waits. Every probe therefore
+    // renders a DIFFERENT message for the SAME condition, so a dedupe keyed on message text
+    // re-warns each time and only a dedupe keyed on the condition holds the bound.
+    const runOnce = async () => {
+      const f = gateFixture((n) => n === 1
+        ? runs([{ name: "claude-review", status: "in_progress", conclusion: null }])
+        : runs(Array.from({ length: n }, (_, i) => (
+          { name: `ci-${i}`, status: "completed", conclusion: "success" }
+        ))));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const out = await runGate(f);
+        const matched = warn.mock.calls
+          .map((call) => call.join(" "))
+          .filter((line) => line.includes("No external review check matched"));
+        return { probes: f.probes(), warnings: matched.length, approved: out.approved };
+      } finally {
+        warn.mockRestore();
+      }
+    };
+
+    const first = await runOnce();
+    expect(first.probes).toBeGreaterThan(2);   // the condition really did recur
+    expect(first.warnings).toBe(1);            // ...and was reported once
+    expect(first.approved).toBe(false);        // never settles => times out => fails closed
+
+    const second = await runOnce();
+    expect(second.warnings).toBe(1);           // a fresh wait warns again
+  });
+
+  it("does not approve when the PR metadata read fails", async () => {
+    // The same hole as the unreadable check-runs probe, one gh call earlier — and the likelier
+    // one, since the installation token can expire during the review pass that precedes this.
+    // A failed read used to short-circuit to "absent" (fail OPEN) before the loop, so none of
+    // the hardening could act. A successful read carrying no head.sha still means "absent".
+    const reviewerOutput = { approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 };
+    let checkProbes = 0;
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
+        return { stdout: "", exitCode: 1, stderr: "HTTP 502" };
+      }
+      if (args[0] === "api" && args.some((a) => a.includes("check-runs"))) {
+        checkProbes++;
+        return { stdout: JSON.stringify({ check_runs: [{ name: "code-review-plugin", status: "in_progress", conclusion: null }] }), exitCode: 0 };
+      }
+      if (args[0] === "api" && args.includes("repos/:owner/:repo/pulls/42/reviews")) return { stdout: "[]", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => (structuredReviewResult(reviewerOutput)));
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 1, ghSpawn,
+        gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), sleep: vi.fn(async () => undefined),
+        reviewWaitPollMs: 1000, reviewWaitTimeoutMs: 3000 },
+      { report: vi.fn(async () => undefined) },
+    );
+    expect(out.approved).toBe(false);
+    // This counter is the ONLY thing that pins the `headSha ? probe : "unreadable"` ternary.
+    // Probing with an empty SHA queries `commits//check-runs`, which 404s in production — but
+    // this fixture matches on `includes("check-runs")`, so the empty-SHA URL still hits it,
+    // returns in_progress, and the loop times out to "running" with approved === false. The
+    // assertion above survives that mutation; this one does not.
+    expect(checkProbes).toBe(0);
+  });
+
+  it("does not fail closed when a matching check appears only on the second probe", async () => {
+    // The cancel-in-progress gap: probe 1 sees a cancelled run, its replacement is created a
+    // moment later. Returning on the first sighting ignores the real review.
+    const f = gateFixture((n) =>
+      n === 1 ? runs([{ name: "claude-review", status: "completed", conclusion: "cancelled" }])
+      : n === 2 ? runs([{ name: "claude-review", status: "completed", conclusion: "cancelled" },
+                        { name: "claude-review", status: "in_progress", conclusion: null }])
+      : runs([{ name: "claude-review", status: "completed", conclusion: "cancelled" },
+              { name: "claude-review", status: "completed", conclusion: "success" }]));
+    const out = await runGate(f);
+    expect(f.probes()).toBeGreaterThanOrEqual(3);
+    expect(out.approved).toBe(true);
+  });
+
+  it("treats a later absent as an artefact after a no-real-verdict sighting too", async () => {
+    // Pins the `no-real-verdict` term of sawMatching, which a mutation showed was unpinned:
+    // the guard below starts from `in_progress` and so only covers the `running` term. This is
+    // the sequence that actually happens under cancel-in-progress — a cancelled run seen
+    // first, then a read that comes back empty.
+    const f = gateFixture((n) =>
+      n === 1 ? runs([{ name: "claude-review", status: "completed", conclusion: "cancelled" }])
+              : runs([]));
+    const out = await runGate(f);
+    expect(out.approved).toBe(false);
+    // The submitted BODY, not the review event: submitPrReview hard-codes event=COMMENT
+    // (GitHub 422s an APPROVE on your own PR), so asserting on the event can never fail.
+    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this PR")))).toBe(false);
+  });
+
+  it("restarts the confirmation when the run set changes between sightings", async () => {
+    // The reset is what makes it "two CONSECUTIVE probes" rather than "two ever". Without it,
+    // no-real-verdict -> running -> no-real-verdict settles on the second sighting and never
+    // sees the real verdict that lands after it.
+    const f = gateFixture((n) =>
+      n === 1 ? runs([{ name: "claude-review", status: "completed", conclusion: "cancelled" }])
+      : n === 2 ? runs([{ name: "claude-review", status: "in_progress", conclusion: null }])
+      : n === 3 ? runs([{ name: "claude-review", status: "completed", conclusion: "cancelled" }])
+      : runs([{ name: "claude-review", status: "completed", conclusion: "success" }]));
+    const out = await runGate(f);
+    expect(f.probes()).toBeGreaterThanOrEqual(4);
+    expect(out.approved).toBe(true);
+  });
+
+  it("does not downgrade to absent after matching runs have been seen", async () => {
+    // Check runs are never removed from a SHA, so a later empty read is an artefact. Letting
+    // it resolve to "absent" fails OPEN on exactly the SHA we already know has a reviewer.
+    // Probe 1 must be IN_PROGRESS, not terminal: a terminal first probe short-circuits
+    // before the second read, so the scenario would pass for the wrong reason.
+    const f = gateFixture((n) =>
+      n === 1 ? runs([{ name: "claude-review", status: "in_progress", conclusion: null }])
+              : runs([]));
+    const out = await runGate(f);
+    expect(out.approved).toBe(false);
+    // The submitted BODY, not the review event: submitPrReview hard-codes event=COMMENT
+    // (GitHub 422s an APPROVE on your own PR), so asserting on the event can never fail.
+    expect(f.reviewCalls.some((c) => c.some((arg) => arg.includes("approved this PR")))).toBe(false);
+  });
+
   it("fails open and approves when no external review check exists for the head SHA", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], feedback: "Internal reviewer approves.", score: 9, progress_delta: 0 };
     const sleep = vi.fn(async () => undefined);
@@ -2064,10 +2333,14 @@ describe("postPushReviewStep", () => {
 
     expect(out.approved).toBe(true);
     expect(checkRunsQueried).toBe(true);
-    expect(sleep).not.toHaveBeenCalled();
+    // "absent" is the only state that fails OPEN, and a probe fired before GitHub has created
+    // any check run — the normal case right after a push — sees zero matching runs. A second
+    // consecutive absent probe is required before settling. The fail-open OUTCOME asserted
+    // above is unchanged for a repo that genuinely has no reviewer; only the timing is.
+    expect(sleep).toHaveBeenCalledTimes(1);
   });
 
-  it("does not satisfy the gate when the only matching check concluded 'skipped' (fails closed immediately)", async () => {
+  it("does not satisfy the gate when the only matching check concluded 'skipped' (fails closed)", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
     const sleep = vi.fn(async () => undefined);
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
@@ -2097,8 +2370,12 @@ describe("postPushReviewStep", () => {
 
     // A skipped check is not a completed review — the gate must fail closed, not auto-approve.
     expect(out.approved).toBe(false);
-    // Must fail closed immediately (no-real-verdict path), not after polling to timeout.
-    expect(sleep).not.toHaveBeenCalled();
+    // Must fail closed on the no-real-verdict path, not after polling to timeout.
+    // no-real-verdict must survive one poll interval before settling, because a runner push
+    // cancels the in-flight review and its replacement's check run appears a moment later —
+    // settling on the first sighting reports "manual review required" on the normal sequence.
+    // The outcome asserted above is unchanged; only the timing is.
+    expect(sleep).toHaveBeenCalledTimes(1);
   });
 
   it("recognizes 'claude-code-review' as the external review gate by default", async () => {
@@ -2195,17 +2472,21 @@ describe("postPushReviewStep", () => {
       { report: vi.fn(async () => undefined) },
     );
 
-    // A cancelled check is not a completed review — the gate must fail closed immediately.
+    // A cancelled check is not a completed review — the gate must fail closed.
     expect(out.approved).toBe(false);
-    expect(sleep).not.toHaveBeenCalled();
+    // no-real-verdict must survive one poll interval before settling, because a runner push
+    // cancels the in-flight review and its replacement's check run appears a moment later —
+    // settling on the first sighting reports "manual review required" on the normal sequence.
+    // The outcome asserted above is unchanged; only the timing is.
+    expect(sleep).toHaveBeenCalledTimes(1);
   });
 
   it("does not satisfy the gate when matching checks concluded 'timed_out' or 'action_required'", async () => {
     const reviewerOutput = { approved: true, blocking_issues: [], feedback: "ok", score: 9, progress_delta: 0 };
-    const sleep = vi.fn(async () => undefined);
     const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
 
     for (const conclusion of ["timed_out", "action_required"]) {
+      const sleep = vi.fn(async () => undefined);
       const ghSpawn = vi.fn((args: string[]) => {
         if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
         if (args[0] === "api" && args.some((a) => a === "repos/:owner/:repo/pulls/42")) {
@@ -2230,7 +2511,11 @@ describe("postPushReviewStep", () => {
       );
 
       expect(out.approved).toBe(false);
-      expect(sleep).not.toHaveBeenCalled();
+      // no-real-verdict must survive one poll interval before settling, because a runner push
+      // cancels the in-flight review and its replacement's check run appears a moment later —
+      // settling on the first sighting reports "manual review required" on the normal sequence.
+      // The outcome asserted above is unchanged; only the timing is.
+      expect(sleep).toHaveBeenCalledTimes(1);
     }
   });
 
@@ -2263,7 +2548,11 @@ describe("postPushReviewStep", () => {
 
     // Unknown conclusions must fail closed, not approve.
     expect(out.approved).toBe(false);
-    expect(sleep).not.toHaveBeenCalled();
+    // no-real-verdict must survive one poll interval before settling, because a runner push
+    // cancels the in-flight review and its replacement's check run appears a moment later —
+    // settling on the first sighting reports "manual review required" on the normal sequence.
+    // The outcome asserted above is unchanged; only the timing is.
+    expect(sleep).toHaveBeenCalledTimes(1);
   });
 
   it("satisfies the gate when a matching check concluded 'failure'", async () => {
@@ -2912,10 +3201,14 @@ describe("postPushReviewStep", () => {
     expect(invoke).toHaveBeenCalledOnce();
   });
 
-  it("continues normally when gh api call fails (fail-open)", async () => {
+  it("continues normally when the PR state read fails (fail-open)", async () => {
+    // assertPrWritable fails open on a transient `gh pr view` error — a network blip must not
+    // cancel the run. Only that read fails here: a failed `GET /pulls/{n}` would instead hit
+    // the review gate's head-SHA read, which retries until its wait budget is exhausted and
+    // fails CLOSED (see "does not approve when the PR metadata read fails").
     const reviewerOutput = { approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" };
     const ghSpawn = vi.fn((args: string[]) => {
-      if (args[0] === "api" && args[1]?.includes("/pulls/")) {
+      if (args[0] === "pr" && args[1] === "view") {
         return { stdout: "", exitCode: 1 };
       }
       if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
