@@ -1368,6 +1368,53 @@ describe("kg-refresh", () => {
       expect(s.running).toBe(false);
     });
 
+    it("a real (non-dry-run) KG_SNAPSHOT_TRACKER_REGRESSION failure sets partTable and a detail naming the part and sizes (AII-638)", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", {
+        failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+        failureReason: "KG_SNAPSHOT_TRACKER_REGRESSION: content regression detected — comment.nt: shrank from 9995 to 3793 lines (below 50% threshold)",
+        partTable: [{ part: "comment.nt", prev: "9995", new: "3793" }],
+      });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.running).toBe(false);
+      expect(s.lastRefresh?.ok).toBe(false);
+      expect(s.lastRefresh?.partTable).toEqual([{ part: "comment.nt", prev: "9995", new: "3793" }]);
+      expect(s.lastRefresh?.detail).toContain("comment.nt");
+      expect(s.lastRefresh?.detail).toContain("9995");
+      expect(s.lastRefresh?.detail).toContain("3793");
+      expect(s.lastRefresh?.detail).toMatch(/^ingest runner failed: /);
+    });
+
+    it("a real failure with a different failure code keeps the bare-code detail and does not set partTable", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", { failureCode: "KG_SNAPSHOT_MISSING", failureReason: "no parts found" });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.lastRefresh?.partTable).toBeUndefined();
+      expect(s.lastRefresh?.detail).toBe("ingest runner failed: KG_SNAPSHOT_MISSING");
+    });
+
+    it("a real KG_SNAPSHOT_TRACKER_REGRESSION failure with no partTable does not throw and leaves partTable unset", async () => {
+      buildDispatch();
+      await handle.trigger();
+      await waitForStage("ingest-running");
+      handle.onRunnerComplete("failure", {
+        failureCode: "KG_SNAPSHOT_TRACKER_REGRESSION",
+        failureReason: "KG_SNAPSHOT_TRACKER_REGRESSION: content regression detected — comment.nt: missing (was 9995 lines)",
+      });
+      await waitDone();
+      const s = await handle.status();
+      expect(s.stage).toBe("failed");
+      expect(s.lastRefresh?.partTable).toBeUndefined();
+    });
+
     it("onRunnerComplete success with snapshotCommit verifies commit then runs rail", async () => {
       buildDispatch();
       await handle.trigger();
