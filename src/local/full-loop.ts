@@ -19,7 +19,8 @@ export type LocalExitClassification =
   | "review_error"
   | "iterations_exhausted"
   | "max_turns_exhausted"
-  | "verification_failed";
+  | "verification_failed"
+  | "provider_unavailable";
 
 export interface LocalFullLoopOptions {
   workspaceDir: string;
@@ -123,6 +124,12 @@ export async function runLocalFullLoop(
 
   if (implResult.terminationReason === "verify_failed") {
     classification = "verification_failed";
+    exitCode = 1;
+  } else if (implResult.terminationReason === "provider_unavailable") {
+    // A provider outage during implement or review is a transient run-level
+    // failure, not a review rejection — classify it distinctly so a caller
+    // doesn't read it as "the reviewer didn't approve".
+    classification = "provider_unavailable";
     exitCode = 1;
   } else if (implResult.exitCode !== 0) {
     classification = "implementation_failed";

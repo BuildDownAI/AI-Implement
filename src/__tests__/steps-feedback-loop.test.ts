@@ -19,13 +19,29 @@ vi.mock("../pipeline/steps/review.js", async (importOriginal) => {
   };
 });
 
+// Wraps the real implementation so its RETURN VALUE stays authentic (backoff math,
+// jitter and all) while still being a spy — lets a test assert sleep() was invoked
+// with exactly what computeBackoffMs produced, without needing to know that value
+// in advance (BAC-27134).
+vi.mock("../pipeline/retry-backoff.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../pipeline/retry-backoff.js")>();
+  return { ...actual, computeBackoffMs: vi.fn(actual.computeBackoffMs) };
+});
+
 import { spawnSync } from "node:child_process";
 import { implementStep } from "../pipeline/steps/implement.js";
 import { reviewStep } from "../pipeline/steps/review.js";
 import { feedbackLoopStep } from "../pipeline/steps/feedback-loop.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { DEFAULT_RETRY_POLICY, computeBackoffMs } from "../pipeline/retry-backoff.js";
 import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
+
+/** No-op sleep so a retry test never actually waits out the real backoff delay. */
+const NO_SLEEP = async () => {};
+
+/** A message classifyThrown recognises as PROVIDER_OVERLOADED (transient). */
+const TRANSIENT_ERROR_MESSAGE = "upstream returned 529 overloaded_error";
 
 const APPROVED_REVIEW = {
   approved: true,
@@ -74,15 +90,21 @@ const BASE_INPUTS = {
   issueDescription: "Add feature X to the codebase",
 };
 
+/** Every non-"status" git call returns `diff`; `git status --porcelain` always reports a
+ *  clean tree (BAC-27134: dirty tests override this to distinguish clean from dirty). */
 function mockDiff(diff = "diff --git a/foo.ts\n+added line") {
-  vi.mocked(spawnSync).mockReturnValue({
-    status: 0,
-    stdout: Buffer.from(diff),
-    stderr: Buffer.from(""),
-    pid: 0,
-    output: [],
-    signal: null,
-    error: undefined,
+  vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+    const argv = (args ?? []) as string[];
+    const isStatus = argv[0] === "status";
+    return {
+      status: 0,
+      stdout: Buffer.from(isStatus ? "" : diff),
+      stderr: Buffer.from(""),
+      pid: 0,
+      output: [],
+      signal: null,
+      error: undefined,
+    };
   });
 }
 
@@ -353,11 +375,23 @@ describe("feedbackLoopStep", () => {
       }),
     };
 
-    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter);
+    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter);
 
     const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "review");
     expect(failedStep).toBeDefined();
     expect((failedStep?.outputs as { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
+    expect(outputs.passes[0]!.reviewCostUsd).toBe(0.02);
+  });
+
+  it("sets reviewCostUsd from the review outputs' telemetry on a successful pass", async () => {
+    vi.mocked(reviewStep.run).mockResolvedValueOnce({
+      ...APPROVED_REVIEW,
+      telemetry: { outcome: "success", numTurns: 3, durationMs: 500, costUsd: 0.05, tokensIn: 10, tokensOut: 5 },
+    });
+
+    const outputs = await feedbackLoopStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+
+    expect(outputs.passes[0]!.reviewCostUsd).toBe(0.05);
   });
 
   it("does not throw when the review step fails, so the pipeline can still push", async () => {
@@ -666,7 +700,7 @@ describe("feedbackLoopStep termination reasons", () => {
     expect(outputs.terminationReason).toBe("approved");
     expect(outputs.passes).toEqual([
       {
-        iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true,
+        iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewCostUsd: null, reviewApproved: true,
         tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null, attempts: 1, reviewAttempts: 1,
       },
     ]);
@@ -709,6 +743,25 @@ describe("feedbackLoopStep termination reasons", () => {
     expect(call.tools).toEqual(["Read", "Glob", "Grep", "Bash(curl *)"]);
     expect(call.maxTurns).toBe(15);
     expect(call.prompt).toContain("Bash npm test"); // tool trace embedded
+  });
+
+  it("reports telemetry on the post-mortem sub-step so report-card can price it (BAC-27201)", async () => {
+    vi.mocked(implementStep.run).mockResolvedValue({ ...IMPLEMENT_OUTPUTS, telemetry: MAX_TURNS_TELEMETRY });
+    const postMortemTelemetry = { outcome: "success" as const, numTurns: 8, durationMs: 4000, costUsd: 0.42, tokensIn: 1, tokensOut: 1 };
+    const invoke = vi.fn().mockResolvedValue({
+      stdout: "## Post-mortem\nRan out of turns wiring X.",
+      exitCode: 0,
+      tokensUsed: 10,
+      telemetry: postMortemTelemetry,
+    });
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = { report: vi.fn(async (step) => { reportedSteps.push({ ...step }); }) };
+
+    await feedbackLoopStep.run(makeContextWithExecutor(invoke), BASE_INPUTS, reporter);
+
+    const postMortemStep = reportedSteps.find((s) => s.id === "post-mortem.1" && s.status === "passed");
+    expect(postMortemStep).toBeDefined();
+    expect((postMortemStep!.outputs as { telemetry?: unknown }).telemetry).toEqual(postMortemTelemetry);
   });
 
   it("proceeds to review when a SUCCESSFUL pass reports numTurns above the configured cap", async () => {
@@ -838,5 +891,383 @@ describe("feedbackLoopStep — reviewRubric forwarding", () => {
 
     const reviewCall = vi.mocked(reviewStep.run).mock.calls[0];
     expect(reviewCall[1].reviewRubric).toBeUndefined();
+  });
+});
+
+describe("feedbackLoopStep stage-level retry (BAC-27134)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(implementStep.run).mockResolvedValue(IMPLEMENT_OUTPUTS);
+    mockDiff();
+  });
+
+  it("implement succeeds, review transient once then approves: one PR, reviewAttempts=2, implement ran once", async () => {
+    vi.mocked(reviewStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(true);
+    expect(outputs.terminationReason).toBe("approved");
+    expect(outputs.passes[0]!.reviewAttempts).toBe(2);
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).toHaveBeenCalledTimes(2);
+  });
+
+  it("review transient on every attempt with stageRetries=1: two review attempts, terminationReason=provider_unavailable", async () => {
+    vi.mocked(reviewStep.run).mockRejectedValue(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.failure?.stage).toBe("review");
+    expect(outputs.failure?.retryable).toBe(false);
+    expect(reviewStep.run).toHaveBeenCalledTimes(2);
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("implement transient after partial edits: the second attempt receives the continuation prefix", async () => {
+    // git status --porcelain reports the partial edit the interrupted run left behind
+    // for the whole run (BAC-27134: dirty is evaluated against runStartHead, not a
+    // per-pass snapshot) — every other git call returns diff content.
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      const isStatus = argv[0] === "status";
+      const stdout = isStatus ? "M src/foo.ts\n" : "diff --git a/foo.ts\n+added line";
+      return {
+        status: 0,
+        stdout: Buffer.from(stdout),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(implementStep.run).toHaveBeenCalledTimes(2);
+    const secondCall = vi.mocked(implementStep.run).mock.calls[1];
+    expect(secondCall[1].prompt).toContain(
+      "A previous attempt was interrupted by a provider error. The working tree contains its partial changes. Continue from the current state; do not revert it.",
+    );
+    // No reset/checkout/clean was ever issued — the partial edit is never discarded.
+    const destructiveGitCalls = vi.mocked(spawnSync).mock.calls.filter(([cmd, args]) => {
+      const argv = (args ?? []) as string[];
+      return cmd === "git" && ["reset", "checkout", "clean"].includes(argv[0]);
+    });
+    expect(destructiveGitCalls).toHaveLength(0);
+  });
+
+  it("implement transient with stageRetries left and a clean tree: retries with the same prompt, no continuation note", async () => {
+    // git status --porcelain is empty on every read — the failed attempt left
+    // nothing behind, so the retry must reuse the original prompt verbatim.
+    mockDiff();
+
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    await feedbackLoopStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(implementStep.run).toHaveBeenCalledTimes(2);
+    const firstCall = vi.mocked(implementStep.run).mock.calls[0];
+    const secondCall = vi.mocked(implementStep.run).mock.calls[1];
+    expect(secondCall[1].prompt).toBe(firstCall[1].prompt);
+    expect(secondCall[1].prompt).not.toContain("A previous attempt was interrupted");
+  });
+
+  it("implement transient, exhausted, dirty tree: stops without throwing, terminationReason=provider_unavailable, draft-eligible", async () => {
+    // git status --porcelain reports the partial edit the interrupted run left behind —
+    // with stageRetries=0 there is no retry left, so the loop must preserve it rather
+    // than throw (the BAC-26878 scenario).
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      const isStatus = argv[0] === "status";
+      const stdout = isStatus ? "M src/foo.ts\n" : "diff --git a/foo.ts\n+added line";
+      return {
+        status: 0,
+        stdout: Buffer.from(stdout),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    vi.mocked(implementStep.run).mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.failure?.stage).toBe("implement");
+    expect(outputs.failure?.retryable).toBe(false);
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+    // No reset/checkout/clean was ever issued — the partial edit is never discarded.
+    const destructiveGitCalls = vi.mocked(spawnSync).mock.calls.filter(([cmd, args]) => {
+      const argv = (args ?? []) as string[];
+      return cmd === "git" && ["reset", "checkout", "clean"].includes(argv[0]);
+    });
+    expect(destructiveGitCalls).toHaveLength(0);
+  });
+
+  it("implement transient with a clean tree and stageRetries=0: PROVIDER_UNAVAILABLE, no PR", async () => {
+    vi.mocked(implementStep.run).mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const thrown = await feedbackLoopStep
+      .run(
+        makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+        { ...BASE_INPUTS, sleep: NO_SLEEP },
+        new NoopStepReporter(),
+      )
+      .catch((e: unknown) => e);
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error & { failure?: { code?: string; stage?: string } }).failure?.code).toBe(
+      "PROVIDER_UNAVAILABLE",
+    );
+    expect((thrown as Error & { failure?: { code?: string; stage?: string } }).failure?.stage).toBe("implement");
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+  });
+
+  it("iteration-2 transient failure with no new edits but iteration-1 work present: draft PR with PROVIDER_UNAVAILABLE (BAC-27134)", async () => {
+    // git status --porcelain reports iteration 1's leftover uncommitted changes for the
+    // WHOLE run — iteration 2's implement call fails before making any edit of its own.
+    // A per-pass snapshot would compare this reading against itself (captured fresh at the
+    // top of iteration 2, already showing iteration 1's files) and see no difference,
+    // misreading the tree as clean and discarding iteration 1's work; the whole-run
+    // runStartHead comparison must not make that mistake.
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      const isStatus = argv[0] === "status";
+      return {
+        status: 0,
+        stdout: Buffer.from(isStatus ? "M src/foo.ts\n" : "diff --git a/foo.ts\n+added line"),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    vi.mocked(implementStep.run)
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(REJECTED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.failure?.stage).toBe("implement");
+    expect(implementStep.run).toHaveBeenCalledTimes(2);
+    expect(reviewStep.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("agent-committed work with a clean tree: draft PR (HEAD moved past runStartHead) (BAC-27134)", async () => {
+    // git status --porcelain is clean throughout, but git rev-parse HEAD reports a
+    // different SHA once the agent's own commit (e.g. a hook or the agent itself)
+    // has landed — a hook/template committing on its own must not be misread as "no
+    // work to preserve" just because the working tree itself is clean.
+    let headCalls = 0;
+    vi.mocked(spawnSync).mockImplementation((_cmd: unknown, args?: readonly string[] | null) => {
+      const argv = (args ?? []) as string[];
+      if (argv[0] === "status") {
+        return {
+          status: 0,
+          stdout: Buffer.from(""),
+          stderr: Buffer.from(""),
+          pid: 0,
+          output: [],
+          signal: null,
+          error: undefined,
+        };
+      }
+      if (argv[0] === "rev-parse" && argv[1] === "HEAD") {
+        headCalls++;
+        return {
+          status: 0,
+          stdout: Buffer.from(headCalls === 1 ? "sha1\n" : "sha2\n"),
+          stderr: Buffer.from(""),
+          pid: 0,
+          output: [],
+          signal: null,
+          error: undefined,
+        };
+      }
+      return {
+        status: 0,
+        stdout: Buffer.from("diff --git a/foo.ts\n+added line"),
+        stderr: Buffer.from(""),
+        pid: 0,
+        output: [],
+        signal: null,
+        error: undefined,
+      };
+    });
+
+    vi.mocked(implementStep.run).mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE));
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.approved).toBe(false);
+    expect(outputs.terminationReason).toBe("provider_unavailable");
+    expect(outputs.failure?.code).toBe("PROVIDER_UNAVAILABLE");
+    expect(outputs.failure?.stage).toBe("implement");
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
+  });
+
+  it("keeps every attempt's evidence: a retried attempt reports under its own id, not the canonical row (BAC-27134)", async () => {
+    mockDiff();
+    const transientErrWithTelemetry = Object.assign(new Error(TRANSIENT_ERROR_MESSAGE), {
+      telemetry: { outcome: "error", numTurns: 5, costUsd: 1.23 },
+    });
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(transientErrWithTelemetry)
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      reporter,
+    );
+
+    const implementSteps = reportedSteps.filter((s) => s.type === "implement");
+    const ids = new Set(implementSteps.map((s) => s.id));
+    expect(ids).toEqual(new Set(["implement.1", "implement.1.retry1"]));
+
+    const retryRow = implementSteps.find((s) => s.id === "implement.1.retry1");
+    expect(retryRow?.status).toBe("failed");
+    expect((retryRow?.outputs as { failure?: { category?: string } }).failure?.category).toBe("transient");
+    expect((retryRow?.outputs as { telemetry?: unknown }).telemetry).toEqual(transientErrWithTelemetry.telemetry);
+
+    // The canonical row's only terminal report is the final, successful attempt.
+    const canonicalTerminal = implementSteps.filter((s) => s.id === "implement.1" && s.status !== "running");
+    expect(canonicalTerminal).toHaveLength(1);
+    expect(canonicalTerminal[0]!.status).toBe("passed");
+  });
+
+  it("sums a superseded retry attempt's cost into extraCostUsd, not into the pass itself (BAC-27201)", async () => {
+    mockDiff();
+    const transientErrWithTelemetry = Object.assign(new Error(TRANSIENT_ERROR_MESSAGE), {
+      telemetry: { outcome: "error", numTurns: 5, costUsd: 1.23 },
+    });
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(transientErrWithTelemetry)
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const outputs = await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      { ...BASE_INPUTS, sleep: NO_SLEEP },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.extraCostUsd).toBeCloseTo(1.23);
+    // The pass itself only ever reflects the attempt that actually succeeded.
+    expect(outputs.passes[0]!.costUsd).toBeNull();
+  });
+
+  it("calls the injected sleep with exactly the value computeBackoffMs returns", async () => {
+    mockDiff();
+    vi.mocked(implementStep.run)
+      .mockRejectedValueOnce(new Error(TRANSIENT_ERROR_MESSAGE))
+      .mockResolvedValueOnce(IMPLEMENT_OUTPUTS);
+    vi.mocked(reviewStep.run).mockResolvedValueOnce(APPROVED_REVIEW);
+
+    const sleep = vi.fn(async () => {});
+
+    await feedbackLoopStep.run(
+      makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      { ...BASE_INPUTS, sleep },
+      new NoopStepReporter(),
+    );
+
+    expect(computeBackoffMs).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(vi.mocked(computeBackoffMs).mock.results[0]!.value);
+  });
+
+  it("a non-transient implement failure is not retried, even with stage retries available", async () => {
+    mockDiff();
+    const nonTransientErr = Object.assign(new Error("boom"), {
+      failure: {
+        category: "crash" as const,
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 1,
+        retryable: false,
+        message: "boom",
+        evidence: { truncated: false },
+      },
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(nonTransientErr);
+
+    const thrown = await feedbackLoopStep
+      .run(
+        makeContext({ retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+        { ...BASE_INPUTS, sleep: NO_SLEEP },
+        new NoopStepReporter(),
+      )
+      .catch((e: unknown) => e);
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe("boom");
+    expect(implementStep.run).toHaveBeenCalledTimes(1);
+    expect(reviewStep.run).not.toHaveBeenCalled();
   });
 });

@@ -1061,6 +1061,72 @@ describe("pushStep draft PRs", () => {
     expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
   });
 
+  it("heads a provider_unavailable draft PR as a provider outage, not a review rejection", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true, status: 201,
+      json: async () => ({ html_url: "https://github.com/acme/app/pull/9", number: 9 }),
+      text: async () => "",
+    } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      { ...BASE_INPUTS, draft: true, reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "provider_unavailable", finalFeedback: "Model provider was unavailable during implementation after 2 attempt(s); partial changes were preserved.", postMortem: undefined } },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(true);
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+    expect(body.draft).toBe(true);
+    expect(body.body).toContain("The model provider was unavailable during this run");
+    expect(body.body).not.toContain("Automated review did not approve");
+    expect(body.body).not.toContain("Reviewer's final feedback");
+    expect(body.body).not.toContain("unapproved run");
+    expect(body.body).toContain("Run notes");
+    expect(body.body).toContain("partial changes were preserved");
+    // The column is specifically the implement call's spawn attempts (not review's).
+    expect(body.body).toContain("| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |");
+    // The test-plan line must not read as a review rejection on a provider outage — the
+    // reviewer may never have run at all (BAC-27201).
+    expect(body.body).toContain("- [ ] Automated verification was skipped — the model provider was unavailable and the run was interrupted.");
+    expect(body.body).not.toContain("the review loop did not approve this change");
+    expect(body.body).not.toContain("Automated verification was run by the AI-Implement pipeline before opening this PR.");
+  });
+
+  it("titles a provider_unavailable 422 non-draft fallback as an interruption, not an unapproved rejection", async () => {
+    mockGitSuccess("abc123");
+    vi.mocked(fetch)
+      // draft create → 422
+      .mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}), text: async () => "draft not supported" } as Response)
+      // list open PRs → none
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => [], text: async () => "" } as Response)
+      // retry without draft → created
+      .mockResolvedValueOnce({
+        ok: true, status: 201,
+        json: async () => ({ html_url: "https://github.com/acme/app/pull/10", number: 10 }),
+        text: async () => "",
+      } as Response);
+
+    const outputs = await pushStep.run(
+      makeContext(),
+      {
+        ...BASE_INPUTS,
+        prTitle: "ENG-42: Test",
+        draft: true,
+        reviewSummary: { ...REVIEW_SUMMARY, terminationReason: "provider_unavailable" },
+      },
+      new NoopStepReporter(),
+    );
+
+    expect(outputs.draft).toBe(false);
+    expect(outputs.prNumber).toBe(10);
+    const [, retryInit] = vi.mocked(fetch).mock.calls[2];
+    const retryBody = JSON.parse(String(retryInit?.body));
+    expect(retryBody.draft).toBeUndefined();
+    expect(retryBody.title).toBe("[INTERRUPTED — provider outage] ENG-42: Test");
+  });
+
   it("falls back to a titled normal PR when the draft flag is rejected (422, no existing PR)", async () => {
     mockGitSuccess("abc123");
     vi.mocked(fetch)

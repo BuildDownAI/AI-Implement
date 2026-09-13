@@ -2,10 +2,11 @@ import { describe, it, expect, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { postPushReviewStep } from "../pipeline/steps/post-push-review.js";
 import { OperatorCancelledError, PrMergedError } from "../pipeline/operator-cancelled.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 
-function makeCtx(execMock: any) {
+function makeCtx(execMock: any, dataOverrides: Record<string, unknown> = {}) {
   return {
-    data: { issueIdentifier: "AII-200", issueTitle: "X", issueDescription: "Y", model: "claude-sonnet-4-6" },
+    data: { issueIdentifier: "AII-200", issueTitle: "X", issueDescription: "Y", model: "claude-sonnet-4-6", ...dataOverrides },
     llmExecutor: { invoke: execMock },
     getOutputs: () => ({}),
     setOutputs: () => {},
@@ -225,7 +226,7 @@ describe("postPushReviewStep", () => {
     expect(ctx.llmExecutor.invoke).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
-        maxTurns: 12,
+        maxTurns: 30,
         tools: ["Read", "Glob", "Grep", "Bash(curl *)"],
       }),
     );
@@ -235,6 +236,25 @@ describe("postPushReviewStep", () => {
     );
   });
 
+  it("passes context.data.retryPolicy.reviewMaxTurns as the reviewer's maxTurns", async () => {
+    const reviewerOutput = { approved: true, blocking_issues: [], score: 9, progress_delta: 0, feedback: "lgtm" };
+    const invoke = vi.fn(async () => structuredReviewResult(reviewerOutput));
+    const ctx = makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, reviewMaxTurns: 45 } });
+
+    await postPushReviewStep.run(
+      ctx,
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 1,
+        ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+        gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ maxTurns: 45 }));
+  });
   it("defaults to two fix passes plus a final review", async () => {
     const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 };
     const ghComments: string[] = [];
@@ -381,7 +401,6 @@ describe("postPushReviewStep", () => {
   it.each([
     ["missing terminal", { terminalStatus: undefined }, "terminal result event"],
     ["non-success subtype", { terminalStatus: { subtype: "error_max_turns", isError: false } }, "error_max_turns"],
-    ["failed telemetry", { telemetry: { outcome: "max_turns" } }, "max_turns"],
   ])("rejects structured approval with %s", async (_name, overrides, message) => {
     const invoke = vi.fn(async () => ({
       ...structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" }),
@@ -395,6 +414,399 @@ describe("postPushReviewStep", () => {
     expect(out.terminationReason).toBe("review_failed");
     expect(out.finalFeedback).toContain(message);
     expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a reviewer terminal-error message with the telemetry summary line and classified code", async () => {
+    // BAC-27115: "any other reviewer failure" must never render a bare exit code — the
+    // ticket-facing message needs the [claude] result=... summary line plus the classified
+    // FailureRecord code, even when the failure is a structural one (no exit != 0 involved).
+    const invoke = vi.fn(async () => ({
+      ...structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" }),
+      terminalStatus: { subtype: "error_during_execution", isError: true },
+      telemetry: { outcome: "error" as const, numTurns: 6, durationMs: 12_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
+    }));
+    const out = await postPushReviewStep.run(makeCtx(invoke), {
+      prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, reviewProviders: [],
+      ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+      gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+    }, { report: vi.fn(async () => undefined) });
+    expect(out.terminationReason).toBe("review_failed");
+    expect(out.finalFeedback).toContain("result=error");
+    expect(out.finalFeedback).toContain("turns=6");
+    expect(out.finalFeedback).toContain("invalid_output/LLM_TERMINAL_ERROR");
+    expect(out.finalFeedback).not.toBe("exit 1");
+  });
+  it("reports a reviewer that ran out of turns as REVIEWER_TURNS_EXHAUSTED, once", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const report = vi.fn(async () => undefined);
+    const invoke = vi.fn(async () => ({
+      ...structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" }),
+      terminalStatus: { subtype: "error_max_turns", isError: true },
+      telemetry: { outcome: "max_turns" as const, numTurns: 30, durationMs: 60_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
+    }));
+
+    const out = await postPushReviewStep.run(makeCtx(invoke), {
+      prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [],
+      ghSpawn, gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+    }, { report });
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("reviewer_turns_exhausted");
+    expect(out.failure).toEqual(expect.objectContaining({
+      category: "invalid_output",
+      code: "REVIEWER_TURNS_EXHAUSTED",
+      retryable: false,
+    }));
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(report).toHaveBeenCalledWith(expect.objectContaining({
+      id: "post-push-review.1",
+      status: "failed",
+      outputs: expect.objectContaining({
+        failure: expect.objectContaining({ code: "REVIEWER_TURNS_EXHAUSTED" }),
+      }),
+    }));
+    expect(ghComments.some((c) => c.includes("reviewer-turns-exhausted") && c.includes("ran out of turns") && c.includes("(30)"))).toBe(true);
+  });
+  it("routes a success-subtype max_turns telemetry outcome to REVIEWER_TURNS_EXHAUSTED, not LLM_OUTCOME_MISMATCH", async () => {
+    const report = vi.fn(async () => undefined);
+    const invoke = vi.fn(async () => ({
+      ...structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" }),
+      terminalStatus: { subtype: "success", isError: false },
+      telemetry: { outcome: "max_turns" as const, numTurns: 30, durationMs: 60_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
+    }));
+
+    const out = await postPushReviewStep.run(makeCtx(invoke), {
+      prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [],
+      ghSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })), gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+    }, { report });
+
+    expect(out.terminationReason).toBe("reviewer_turns_exhausted");
+    expect(out.failure).toEqual(expect.objectContaining({ code: "REVIEWER_TURNS_EXHAUSTED" }));
+    expect(out.failure?.code).not.toBe("LLM_OUTCOME_MISMATCH");
+  });
+  it("carries the prior iteration's blockers and fix-revision count forward when the reviewer exhausts its turn cap on iteration >= 2", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "feature-branch", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "deadbeef refs/heads/feature-branch", exitCode: 0 };
+      if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const reports: Array<{ outputs: Record<string, unknown> }> = [];
+    const report = vi.fn(async (step) => { reports.push(step as { outputs: Record<string, unknown> }); });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage === "post-push-review/review-1") {
+        return structuredReviewResult({
+          approved: false,
+          blocking_issues: [
+            { title: "Missing null check", location: "src/x.ts:10", problem: "Crashes on null", required_fix: "Add a guard" },
+            { title: "Unhandled promise rejection", location: "src/y.ts:5", problem: "Swallows errors", required_fix: "Add a catch" },
+            { title: "Off-by-one in loop", location: "src/z.ts:22", problem: "Skips the last item", required_fix: "Fix the bound" },
+          ],
+          score: 40,
+          progress_delta: 10,
+          feedback: "Needs a fix",
+        });
+      }
+      if (params.stage === "post-push-review/fix-1") {
+        return { stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["ran tests"], notes: "" }), exitCode: 0 };
+      }
+      if (params.stage === "post-push-review/review-2") {
+        return {
+          ...structuredReviewResult({ approved: true, blocking_issues: [], score: 90, progress_delta: 100, feedback: "ok" }),
+          terminalStatus: { subtype: "error_max_turns", isError: true },
+          telemetry: { outcome: "max_turns" as const, numTurns: 30, durationMs: 60_000, costUsd: null, tokensIn: 10, tokensOut: 20 },
+        };
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
+
+    const out = await postPushReviewStep.run(makeCtx(invoke), {
+      prNumber: "42", workspaceDir: "/tmp", maxIterations: 3, reviewProviders: [],
+      ghSpawn, gitSpawn,
+    }, { report });
+
+    expect(out.terminationReason).toBe("reviewer_turns_exhausted");
+    expect(out.iterations).toBe(2);
+    expect(out.forcePushedRevisions).toBe(1);
+    expect(out.finalFeedback).toContain("Missing null check");
+    expect(out.finalFeedback).toContain("1 automated fix revision(s) were pushed and not re-reviewed.");
+    // The fix-revision line comes BEFORE the (potentially long) carried-blockers block, so
+    // it survives run-autonomous.ts's 500-character slice of this same finalFeedback text
+    // regardless of how many blockers are carried forward.
+    expect(out.finalFeedback.indexOf("1 automated fix revision(s)")).toBeLessThan(
+      out.finalFeedback.indexOf("Missing null check"),
+    );
+    // Labelled as historical: this reviewer did not re-examine these, it ran out of turns
+    // before it could.
+    expect(out.finalFeedback).toContain("Blocking issues from the previous review:");
+
+    const exhaustedComment = ghComments.find((c) => c.includes("reviewer-turns-exhausted"));
+    expect(exhaustedComment).toContain("the latest revision was not reviewed");
+    expect(exhaustedComment).toContain("Blocking issues from the previous review:");
+    expect(exhaustedComment).toContain("Missing null check");
+    expect(exhaustedComment).toContain("Unhandled promise rejection");
+    expect(exhaustedComment).toContain("Off-by-one in loop");
+    expect(exhaustedComment).toContain("1 automated fix revision(s) were pushed and not re-reviewed.");
+    expect(exhaustedComment!.indexOf("1 automated fix revision(s)")).toBeLessThan(
+      exhaustedComment!.indexOf("Missing null check"),
+    );
+
+    // The sub-step report for the exhausted iteration carries the explanatory text in
+    // `feedback` only — `issues`/`blockingIssues` stay empty rather than packing the whole
+    // multi-line feedback into one synthetic blocking issue.
+    const exhaustedReport = reports.find((r) => r.outputs.failure);
+    expect(exhaustedReport?.outputs.issues).toEqual([]);
+    expect(exhaustedReport?.outputs.blockingIssues).toEqual([]);
+  });
+  it("retries the reviewer once on a transient failure and uses the second verdict (BAC-27134)", async () => {
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi
+      .fn()
+      .mockResolvedValueOnce({
+        stdout: "",
+        stderr: "upstream returned 529 overloaded_error",
+        exitCode: 1,
+        tokensUsed: 0,
+      })
+      .mockResolvedValueOnce(
+        structuredReviewResult({ approved: true, blocking_issues: [], score: 95, progress_delta: 100, feedback: "ok" }),
+      );
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 2,
+        reviewProviders: [],
+        ghSpawn,
+        gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+        sleep: async () => {},
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(true);
+    expect(out.terminationReason).toBe("approved");
+    // Two review invocations (the transient failure, then the retry); the verdict is the
+    // second call's — the reviewer never entered the fix loop.
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+  it("reports provider_unavailable when the reviewer fails transiently on every attempt (stageRetries=1)", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async () => ({
+      stdout: "",
+      stderr: "upstream returned 529 overloaded_error",
+      exitCode: 1,
+      tokensUsed: 0,
+    }));
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 1 } }),
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 2,
+        reviewProviders: [],
+        ghSpawn,
+        gitSpawn: vi.fn(() => ({ stdout: "", exitCode: 0 })),
+        sleep: async () => {},
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.approved).toBe(false);
+    expect(out.terminationReason).toBe("provider_unavailable");
+    expect(out.failure).toEqual(expect.objectContaining({ code: "PROVIDER_UNAVAILABLE", stage: "post-push-review" }));
+    // 1 initial + 1 retry (stageRetries=1), then exhausted.
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(ghComments.some((c) => c.includes("provider was unavailable during review") && c.includes("not reviewed"))).toBe(true);
+    expect(ghComments.every((c) => !c.includes("did not approve"))).toBe(true);
+  });
+  it("carries the prior iteration's blockers and fix-revision count forward when the provider is unavailable on iteration >= 2 (BAC-27134)", async () => {
+    const ghComments: string[] = [];
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      if (args[0] === "pr" && args[1] === "comment") {
+        ghComments.push(args[args.indexOf("--body") + 1]);
+        return { stdout: "", exitCode: 0 };
+      }
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "feature-branch", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "deadbeef refs/heads/feature-branch", exitCode: 0 };
+      if (args[0] === "status") return { stdout: "M file.ts", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const invoke = vi.fn(async (params: any) => {
+      if (params.stage === "post-push-review/review-1") {
+        return structuredReviewResult({
+          approved: false,
+          blocking_issues: [
+            { title: "Missing null check", location: "src/x.ts:10", problem: "Crashes on null", required_fix: "Add a guard" },
+          ],
+          score: 40,
+          progress_delta: 10,
+          feedback: "Needs a fix",
+        });
+      }
+      if (params.stage === "post-push-review/fix-1") {
+        return { stdout: JSON.stringify({ fixed: ["Added null guard"], testing: ["ran tests"], notes: "" }), exitCode: 0 };
+      }
+      if (params.stage === "post-push-review/review-2") {
+        return { stdout: "", stderr: "upstream returned 529 overloaded_error", exitCode: 1, tokensUsed: 0 };
+      }
+      throw new Error(`unexpected stage ${params.stage}`);
+    });
+
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke, { retryPolicy: { ...DEFAULT_RETRY_POLICY, stageRetries: 0 } }),
+      {
+        prNumber: "42",
+        workspaceDir: "/tmp",
+        maxIterations: 3,
+        reviewProviders: [],
+        ghSpawn,
+        gitSpawn,
+        sleep: async () => {},
+      },
+      { report: vi.fn(async () => undefined) },
+    );
+
+    expect(out.terminationReason).toBe("provider_unavailable");
+    expect(out.iterations).toBe(2);
+    expect(out.forcePushedRevisions).toBe(1);
+    expect(out.finalFeedback).toContain("1 automated fix revision(s) were pushed and not re-reviewed.");
+    expect(out.finalFeedback).toContain("Blocking issues from the previous review:");
+    expect(out.finalFeedback).toContain("Missing null check");
+
+    const providerComment = ghComments.find((c) => c.includes("provider-unavailable"));
+    expect(providerComment).toContain("the latest revision was not reviewed");
+    expect(providerComment).toContain("1 automated fix revision(s) were pushed and not re-reviewed.");
+    expect(providerComment).toContain("Blocking issues from the previous review:");
+    expect(providerComment).toContain("Missing null check");
+  });
+  it("carries telemetry on every post-push-review and fix-pass sub-step report so report-card can price the run (BAC-27201)", async () => {
+    const notApproved = { approved: false, blocking_issues: [{ title: "bug", problem: "bug", required_fix: "bug" }], feedback: "fix the bug", score: 4, progress_delta: 0 };
+    const approved = { approved: true, blocking_issues: [], feedback: "lgtm", score: 90, progress_delta: 100 };
+
+    const reviewResult1 = { ...structuredReviewResult(notApproved), telemetry: { outcome: "success" as const, numTurns: 3, durationMs: 10, costUsd: 0.30, tokensIn: 1, tokensOut: 1 } };
+    const fixResult1 = { stdout: '{"fixed":["fixed the bug"],"testing":[],"notes":""}', exitCode: 0, tokensUsed: 0, telemetry: { outcome: "success" as const, numTurns: 2, durationMs: 5, costUsd: 0.15, tokensIn: 1, tokensOut: 1 } };
+    const reviewResult2 = { ...structuredReviewResult(approved), telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 5, costUsd: 0.05, tokensIn: 1, tokensOut: 1 } };
+
+    const invoke = vi.fn()
+      .mockResolvedValueOnce(reviewResult1)
+      .mockResolvedValueOnce(fixResult1)
+      .mockResolvedValueOnce(reviewResult2);
+
+    const gitSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "status") return { stdout: "M file.ts\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--short") return { stdout: "abc1234\n", exitCode: 0 };
+      if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") return { stdout: "ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "ls-remote") return { stdout: "beadfeed\trefs/heads/ai-implement/aii-200-x\n", exitCode: 0 };
+      if (args[0] === "show") return { stdout: "M\tfile.ts\n", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+
+    const report = vi.fn(async () => undefined);
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn },
+      { report },
+    );
+
+    expect(out.approved).toBe(true);
+    const calls = report.mock.calls.map((c: any) => c[0]);
+    const review1 = calls.find((s: any) => s.id === "post-push-review.1");
+    const fix1 = calls.find((s: any) => s.id === "post-push-review.fix-1");
+    const review2 = calls.find((s: any) => s.id === "post-push-review.2");
+    expect(review1).toBeDefined();
+    expect(fix1).toBeDefined();
+    expect(review2).toBeDefined();
+    expect(review1.outputs.telemetry?.costUsd).toBeCloseTo(0.30);
+    expect(fix1.outputs.telemetry?.costUsd).toBeCloseTo(0.15);
+    expect(review2.outputs.telemetry?.costUsd).toBeCloseTo(0.05);
+    // 0.30 (review 1) + 0.15 (fix 1) + 0.05 (review 2) — every invocation this step ran.
+    expect(out.costUsd).toBeCloseTo(0.50);
+  });
+  it("reports a transient review attempt superseded by a retry as its own row, and sums both attempts' cost (BAC-27201)", async () => {
+    const approved = { approved: true, blocking_issues: [], feedback: "lgtm", score: 90, progress_delta: 100 };
+    const transientResult = {
+      stdout: "",
+      stderr: "upstream returned 529 overloaded_error",
+      exitCode: 1,
+      tokensUsed: 0,
+      telemetry: { outcome: "error" as const, numTurns: 1, durationMs: 10, costUsd: 0.20, tokensIn: 1, tokensOut: 1 },
+    };
+    const successResult = {
+      ...structuredReviewResult(approved),
+      telemetry: { outcome: "success" as const, numTurns: 1, durationMs: 5, costUsd: 0.05, tokensIn: 1, tokensOut: 1 },
+    };
+
+    const invoke = vi.fn()
+      .mockResolvedValueOnce(transientResult)
+      .mockResolvedValueOnce(successResult);
+
+    const ghSpawn = vi.fn((args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") return { stdout: "diff", exitCode: 0 };
+      return { stdout: "", exitCode: 0 };
+    });
+    const gitSpawn = vi.fn(() => ({ stdout: "", exitCode: 0 }));
+
+    const report = vi.fn(async () => undefined);
+    const out = await postPushReviewStep.run(
+      makeCtx(invoke),
+      { prNumber: "42", workspaceDir: "/tmp", maxIterations: 2, ghSpawn, gitSpawn, sleep: async () => {} },
+      { report },
+    );
+
+    expect(out.approved).toBe(true);
+    const calls = report.mock.calls.map((c: any) => c[0]);
+    const retryRow = calls.find((s: any) => s.id === "post-push-review.1.retry1");
+    const finalRow = calls.find((s: any) => s.id === "post-push-review.1" && s.status === "passed");
+    expect(retryRow).toBeDefined();
+    expect(retryRow.status).toBe("failed");
+    expect(retryRow.outputs.failure?.code).toBe("PROVIDER_OVERLOADED");
+    expect(retryRow.outputs.telemetry?.costUsd).toBeCloseTo(0.20);
+    expect(finalRow).toBeDefined();
+    // Only two rows for this iteration's review — the retried attempt and the final one.
+    expect(calls.filter((s: any) => String(s.id).startsWith("post-push-review.1"))).toHaveLength(2);
+    expect(out.costUsd).toBeCloseTo(0.25);
   });
 
   it("fails closed when structured output includes legacy verdict aliases", async () => {

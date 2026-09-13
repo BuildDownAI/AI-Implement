@@ -94,7 +94,8 @@ export interface PipelineContextData {
   /** Autonomous runner: retry/backoff policy and reviewer turn cap, from the run_config
    *  envelope's retryPolicy or DEFAULT_RETRY_POLICY when absent. The implement/review
    *  steps pass this to the executor as `retry` for pre-tool-use request retries
-   *  (BAC-27114); BAC-27115 adds the whole-stage retry rail on top. */
+   *  (BAC-27114); `retryPolicy.stageRetries` also bounds the whole-stage retry rail on
+   *  top, read directly by feedback-loop.ts and post-push-review.ts (BAC-27134). */
   retryPolicy?: RetryPolicy;
   /** kg-refresh dev-harness: when true, kg-snapshot-push prints the guard table but skips commit and push. */
   kgDryRun?: boolean;

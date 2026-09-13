@@ -9,7 +9,8 @@ import { reviewStep } from "./review.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
-import { classifyThrown } from "../failure-classification.js";
+import { classifyThrown, type FailureRecord } from "../failure-classification.js";
+import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-5";
@@ -82,15 +83,23 @@ interface FeedbackLoopInputs extends Record<string, unknown> {
   parentStepId?: string;
   /** Optional reviewer rubric appended to review prompts (e.g. kg-refresh-specific approval criteria). */
   reviewRubric?: string;
+  /** Injectable backoff sleep for tests; defaults to a real timer-based wait. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
-export type TerminationReason = "approved" | "iterations_exhausted" | "review_error" | "max_turns";
+export type TerminationReason =
+  | "approved"
+  | "iterations_exhausted"
+  | "review_error"
+  | "max_turns"
+  | "provider_unavailable";
 
 export interface PassStat extends Record<string, unknown> {
   iteration: number;
   implementTurns: number | null;
   implementOutcome: string;   // RunTelemetry outcome or "unknown"
   costUsd: number | null;
+  reviewCostUsd: number | null; // null when review never ran, or ran without telemetry, on this pass
   reviewApproved: boolean | null; // null when review never ran on this pass
   tokensIn?: number | null;
   tokensOut?: number | null;
@@ -109,6 +118,19 @@ interface FeedbackLoopOutputs extends Record<string, unknown> {
   terminationReason: TerminationReason;
   passes: PassStat[];
   postMortem?: string;
+  /** Set only for terminationReason "provider_unavailable" — the classified failure the
+   *  runner callback reports through `postRunnerResult`/`formatFailureComment`. */
+  failure?: FailureRecord;
+  /** Sum of every superseded implement/review retry attempt's cost — never reflected in
+   *  `passes`, which only carries the attempt that ultimately settled each stage. Mirrors
+   *  report-card.ts's extraCostUsd `.retry` rows so the ticket-facing total (run-autonomous.ts)
+   *  can agree with the report card (BAC-27201). */
+  extraCostUsd: number | null;
+}
+
+function addExtraCost(a: number | null, b: number | null | undefined): number | null {
+  if (a == null && b == null) return null;
+  return (a ?? 0) + (b ?? 0);
 }
 
 function buildImplementPrompt(
@@ -241,6 +263,48 @@ export function getDiff(workspaceDir: string): string {
   }
 }
 
+/**
+ * `git status --porcelain` snapshot, used by `isRunDirty` to detect uncommitted
+ * changes (BAC-27134). Returns "" on a spawn failure — the same fail-safe
+ * getDiff uses — since misreading a dirty tree as clean (the exhausted-and-throw
+ * path) is the safer misclassification than fabricating a dirty tree that isn't there.
+ */
+function gitStatusSnapshot(workspaceDir: string): string {
+  const result = spawnSync("git", ["status", "--porcelain"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 ? result.stdout.toString() : "";
+}
+
+/** `git rev-parse HEAD`, used by `isRunDirty` to detect a hook/template commit
+ *  (BAC-27134). Returns "" on a spawn failure, the same fail-safe as gitStatusSnapshot. */
+function resolveHeadSha(workspaceDir: string): string {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: workspaceDir,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 ? result.stdout.toString().trim() : "";
+}
+
+/**
+ * True when the working tree has uncommitted changes, OR HEAD has moved since
+ * `runStartHead` was captured at the start of the run (BAC-27134): a hook or
+ * template that commits on its own leaves a clean tree with real work behind it.
+ * Evaluated against the WHOLE run rather than a per-pass snapshot — comparing
+ * against a per-pass snapshot let iteration 2's provider failure (before any
+ * edit of its own) match a snapshot that already listed iteration 1's files,
+ * silently losing iteration 1's work. Lockfile-only churn counting as dirty is
+ * acceptable.
+ */
+function isRunDirty(workspaceDir: string, runStartHead: string): boolean {
+  if (gitStatusSnapshot(workspaceDir).trim().length > 0) return true;
+  return resolveHeadSha(workspaceDir) !== runStartHead;
+}
+
+const IMPLEMENT_CONTINUATION_NOTE =
+  "A previous attempt was interrupted by a provider error. The working tree contains its partial changes. Continue from the current state; do not revert it.";
+
 const POST_MORTEM_MAX_TURNS = 15;
 
 function buildPostMortemPrompt(params: {
@@ -292,8 +356,9 @@ async function runPostMortem(
     logs_url: null,
   };
   await reporter.report(subStep);
+  let result: Awaited<ReturnType<typeof context.llmExecutor.invoke>> | undefined;
   try {
-    const result = await context.llmExecutor.invoke({
+    result = await context.llmExecutor.invoke({
       prompt: buildPostMortemPrompt(params),
       model: params.model,
       maxTurns: POST_MORTEM_MAX_TURNS,
@@ -306,13 +371,19 @@ async function runPostMortem(
     }
     subStep.status = "passed";
     subStep.ended_at = new Date().toISOString();
-    subStep.outputs = { length: result.stdout.length };
+    // telemetry (BAC-27201): this is real spend against a turn cap — report-card.ts's
+    // extraCostUsd must be able to price it the same way it prices a retry attempt or a
+    // post-push-review sub-step.
+    subStep.outputs = { length: result.stdout.length, telemetry: result.telemetry };
     await reporter.report(subStep);
     return result.stdout.trim();
   } catch (err) {
     subStep.status = "failed";
     subStep.ended_at = new Date().toISOString();
-    subStep.outputs = { error: String(err) };
+    // A spawn-level rejection never reaches the `result =` assignment above, so telemetry may
+    // genuinely be unavailable here — but when invoke() DID settle (e.g. the exitCode/empty-
+    // stdout throw just above), its cost must not be lost from the failed report.
+    subStep.outputs = { error: String(err), ...(result?.telemetry ? { telemetry: result.telemetry } : {}) };
     await reporter.report(subStep);
     console.warn(`[feedback-loop] post-mortem failed (non-fatal): ${String(err)}`);
     return null;
@@ -358,6 +429,17 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
     let terminationReason: TerminationReason = "iterations_exhausted";
     const passes: PassStat[] = [];
     let postMortem: string | undefined;
+    let failureForOutputs: FailureRecord | undefined;
+    // Sum of every superseded implement/review retry attempt's cost — real spend that a
+    // pass's own costUsd/reviewCostUsd never carries, since those reflect only the attempt
+    // that ultimately settled the stage. Mirrors report-card.ts's extraCostUsd `.retry` rows
+    // so the ticket-facing total can agree with the report card (BAC-27201).
+    let extraCostUsd: number | null = null;
+    const retryPolicy = normalizeRetryPolicy(context.data.retryPolicy);
+    const sleep =
+      inputs.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    // Captured once for the whole run (BAC-27134), not per-pass — see isRunDirty.
+    const runStartHead = resolveHeadSha(String(inputs.workspaceDir));
 
     const rawPlanningContext =
       inputs.planningContext !== undefined ? String(inputs.planningContext) : undefined;
@@ -387,75 +469,162 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         inputs.implementationPrompt !== undefined ? String(inputs.implementationPrompt) : undefined,
       );
 
-      // --- implement sub-step ---
-      const implementSubStep: Step = {
-        id: `implement.${iteration}`,
-        type: "implement",
-        status: "running",
-        started_at: new Date().toISOString(),
-        ended_at: null,
-        parent_step_id: parentStepId,
-        inputs: {
-          workspaceDir: inputs.workspaceDir,
-          prompt: implementPrompt,
-          model: resolvedImplementModel,
-          maxTurns: effectiveMaxTurns,
-          planningContext: implementPlanningContext,
-          referenceRepoResults: inputs.referenceRepoResults,
-        },
-        outputs: {},
-        logs_url: null,
-      };
-      await reporter.report(implementSubStep);
+      // --- implement sub-step (stage-level retry on a transient failure, BAC-27134) ---
+      let currentImplementPrompt = implementPrompt;
+      let implementStageAttempt = 0;
+      let implementAttemptsTotal = 0;
+      let implementOutputs: Awaited<ReturnType<typeof implementStep.run>> | undefined;
+      let implementProviderUnavailable: FailureRecord | undefined;
+      let implementProviderUnavailableTelemetry: RunTelemetry | undefined;
 
-      let implementOutputs: Awaited<ReturnType<typeof implementStep.run>>;
-      try {
-        implementOutputs = await implementStep.run(
-          context,
-          {
-            workspaceDir: String(inputs.workspaceDir),
-            prompt: implementPrompt,
+      for (;;) {
+        implementStageAttempt++;
+        const implementSubStep: Step = {
+          id: `implement.${iteration}`,
+          type: "implement",
+          status: "running",
+          started_at: new Date().toISOString(),
+          ended_at: null,
+          parent_step_id: parentStepId,
+          inputs: {
+            workspaceDir: inputs.workspaceDir,
+            prompt: currentImplementPrompt,
             model: resolvedImplementModel,
             maxTurns: effectiveMaxTurns,
             planningContext: implementPlanningContext,
             referenceRepoResults: inputs.referenceRepoResults,
           },
-          reporter,
-        );
-        implementSubStep.status = "passed";
-        implementSubStep.ended_at = new Date().toISOString();
-        implementSubStep.outputs = implementOutputs;
-        await reporter.report(implementSubStep);
-      } catch (err) {
-        implementSubStep.status = "failed";
-        implementSubStep.ended_at = new Date().toISOString();
-        const implementStage = `feedback-loop/implement-${iteration}`;
-        // Re-stamp `stage`: classifyThrown() passes an already-attached record
-        // (from the executor's classifyLlmResult, surfaced onto the thrown error by
-        // implementStep) through unchanged, which would otherwise leave the
-        // iteration-qualified stage never applied.
-        const implementFailure = { ...classifyThrown(err, { stage: implementStage, attempt: 1 }), stage: implementStage };
-        // implement.ts (and the executor, for a spawn-level rejection) stamps
-        // `err.telemetry` when every attempt fails — surface it on the failed
-        // sub-step report too, or the tokens/cost that attempt burned are lost
-        // from the run's evidence entirely rather than merely absent from PassStat.
-        const implementErrTelemetry =
-          typeof err === "object" && err !== null ? (err as { telemetry?: RunTelemetry }).telemetry : undefined;
-        implementSubStep.outputs = {
-          error: String(err),
-          failure: implementFailure,
-          ...(implementErrTelemetry ? { telemetry: implementErrTelemetry } : {}),
+          outputs: {},
+          logs_url: null,
         };
         await reporter.report(implementSubStep);
-        if (typeof err === "object" && err !== null) {
-          try {
-            (err as Record<string, unknown>).failure = implementFailure;
-          } catch {
-            // err may be frozen/non-extensible — losing the attached record here
-            // must not turn this catch path itself into a thrown TypeError.
+
+        try {
+          const outputs = await implementStep.run(
+            context,
+            {
+              workspaceDir: String(inputs.workspaceDir),
+              prompt: currentImplementPrompt,
+              model: resolvedImplementModel,
+              maxTurns: effectiveMaxTurns,
+              planningContext: implementPlanningContext,
+              referenceRepoResults: inputs.referenceRepoResults,
+            },
+            reporter,
+          );
+          implementSubStep.status = "passed";
+          implementSubStep.ended_at = new Date().toISOString();
+          implementSubStep.outputs = outputs;
+          await reporter.report(implementSubStep);
+          implementAttemptsTotal += outputs.attempts ?? 1;
+          implementOutputs = outputs;
+          break;
+        } catch (err) {
+          implementSubStep.status = "failed";
+          implementSubStep.ended_at = new Date().toISOString();
+          const implementStage = `feedback-loop/implement-${iteration}`;
+          // Re-stamp `stage`: classifyThrown() passes an already-attached record
+          // (from the executor's classifyLlmResult, surfaced onto the thrown error by
+          // implementStep) through unchanged, which would otherwise leave the
+          // iteration-qualified stage never applied.
+          const implementFailure = { ...classifyThrown(err, { stage: implementStage, attempt: 1 }), stage: implementStage };
+          // implement.ts (and the executor, for a spawn-level rejection) stamps
+          // `err.telemetry` when every attempt fails — surface it on the failed
+          // sub-step report too, or the tokens/cost that attempt burned are lost
+          // from the run's evidence entirely rather than merely absent from PassStat.
+          const implementErrTelemetry =
+            typeof err === "object" && err !== null ? (err as { telemetry?: RunTelemetry }).telemetry : undefined;
+          const isTransient = implementFailure.category === "transient";
+          const willRetryImplement = isTransient && implementStageAttempt <= retryPolicy.stageRetries;
+          // A retried attempt's failure must not overwrite the canonical `implement.{iteration}`
+          // row — that id is reserved for the final attempt (BAC-27134's "keep every attempt's
+          // evidence"), so a retried attempt's failure record and telemetry are preserved under
+          // their own id instead of being clobbered by the next attempt's "running" report.
+          if (willRetryImplement) {
+            implementSubStep.id = `implement.${iteration}.retry${implementStageAttempt}`;
+            extraCostUsd = addExtraCost(extraCostUsd, implementErrTelemetry?.costUsd);
           }
+          implementSubStep.outputs = {
+            error: String(err),
+            failure: implementFailure,
+            ...(implementErrTelemetry ? { telemetry: implementErrTelemetry } : {}),
+          };
+          await reporter.report(implementSubStep);
+          if (typeof err === "object" && err !== null) {
+            try {
+              (err as Record<string, unknown>).failure = implementFailure;
+            } catch {
+              // err may be frozen/non-extensible — losing the attached record here
+              // must not turn this catch path itself into a thrown TypeError.
+            }
+          }
+          implementAttemptsTotal += implementFailure.attempt;
+
+          if (willRetryImplement) {
+            const dirtyForRetry = isRunDirty(String(inputs.workspaceDir), runStartHead);
+            await sleep(computeBackoffMs(implementStageAttempt, retryPolicy));
+            currentImplementPrompt = dirtyForRetry
+              ? `${implementPrompt}\n\n${IMPLEMENT_CONTINUATION_NOTE}`
+              : implementPrompt;
+            continue;
+          }
+
+          if (isTransient) {
+            const providerUnavailableFailure: FailureRecord = {
+              ...implementFailure,
+              stage: "implement",
+              code: "PROVIDER_UNAVAILABLE",
+              // Exhausted the stage-retry budget: this record is terminal, matching the
+              // convention push.ts's GIT_PUSH_RETRIES_EXHAUSTED states — an orchestrator
+              // rail keying off `retryable` must not re-dispatch a run that already spent
+              // its whole stage-retry budget.
+              retryable: false,
+            };
+            const dirtyFinal = isRunDirty(String(inputs.workspaceDir), runStartHead);
+            if (dirtyFinal) {
+              // Partial work survives: stop the loop and let the pipeline push it as a
+              // draft PR rather than throwing it away.
+              implementProviderUnavailable = providerUnavailableFailure;
+              implementProviderUnavailableTelemetry = implementErrTelemetry;
+              break;
+            }
+            // Clean tree: nothing to preserve — fail the run with PROVIDER_UNAVAILABLE.
+            if (typeof err === "object" && err !== null) {
+              try {
+                (err as Record<string, unknown>).failure = providerUnavailableFailure;
+              } catch {
+                // err may be frozen/non-extensible
+              }
+            }
+            throw err;
+          }
+
+          throw err;
         }
-        throw err;
+      }
+
+      if (implementProviderUnavailable) {
+        terminationReason = "provider_unavailable";
+        feedback = `Model provider was unavailable during implementation after ${implementStageAttempt} attempt(s); partial changes were preserved. ${implementProviderUnavailable.message}`;
+        failureForOutputs = implementProviderUnavailable;
+        passes.push({
+          iteration,
+          implementTurns: implementProviderUnavailableTelemetry?.numTurns ?? null,
+          implementOutcome: "error",
+          costUsd: implementProviderUnavailableTelemetry?.costUsd ?? null,
+          reviewCostUsd: null,
+          reviewApproved: null,
+          tokensIn: implementProviderUnavailableTelemetry?.tokensIn ?? null,
+          tokensOut: implementProviderUnavailableTelemetry?.tokensOut ?? null,
+          cacheReadTokens: implementProviderUnavailableTelemetry?.cacheReadTokens ?? null,
+          cacheCreationTokens: implementProviderUnavailableTelemetry?.cacheCreationTokens ?? null,
+          attempts: implementAttemptsTotal,
+        });
+        break;
+      }
+
+      if (!implementOutputs) {
+        throw new Error("[feedback-loop] implement stage ended without outputs or a provider-unavailable failure");
       }
 
       const implementTelemetry = implementOutputs.telemetry as RunTelemetry | undefined;
@@ -464,12 +633,13 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         implementTurns: implementTelemetry?.numTurns ?? null,
         implementOutcome: implementTelemetry?.outcome ?? "unknown",
         costUsd: implementTelemetry?.costUsd ?? null,
+        reviewCostUsd: null,
         reviewApproved: null,
         tokensIn: implementTelemetry?.tokensIn ?? null,
         tokensOut: implementTelemetry?.tokensOut ?? null,
         cacheReadTokens: implementTelemetry?.cacheReadTokens ?? null,
         cacheCreationTokens: implementTelemetry?.cacheCreationTokens ?? null,
-        attempts: implementOutputs.attempts,
+        attempts: implementAttemptsTotal,
       };
       passes.push(pass);
 
@@ -507,84 +677,127 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         break;
       }
 
-      // --- review sub-step ---
+      // --- review sub-step (stage-level retry on a transient failure, BAC-27134) ---
       const reviewRubric = inputs.reviewRubric !== undefined ? String(inputs.reviewRubric) : undefined;
-      const reviewSubStep: Step = {
-        id: `review.${iteration}`,
-        type: "review",
-        status: "running",
-        started_at: new Date().toISOString(),
-        ended_at: null,
-        parent_step_id: parentStepId,
-        inputs: {
-          model: resolvedReviewModel,
-          diff,
-          iteration,
-          issueTitle: inputs.issueTitle,
-          issueDescription: inputs.issueDescription,
-          acceptanceBar,
-          ...(reviewRubric ? { reviewRubric } : {}),
-        },
-        outputs: {},
-        logs_url: null,
-      };
-      await reporter.report(reviewSubStep);
+      let reviewStageAttempt = 0;
+      let reviewAttemptsTotal = 0;
+      let reviewStageFailed = false;
 
-      try {
-        const reviewOutputs = await reviewStep.run(
-          context,
-          {
+      for (;;) {
+        reviewStageAttempt++;
+        const reviewSubStep: Step = {
+          id: `review.${iteration}`,
+          type: "review",
+          status: "running",
+          started_at: new Date().toISOString(),
+          ended_at: null,
+          parent_step_id: parentStepId,
+          inputs: {
             model: resolvedReviewModel,
             diff,
             iteration,
-            issueTitle: inputs.issueTitle !== undefined ? String(inputs.issueTitle) : undefined,
-            issueDescription:
-              inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
+            issueTitle: inputs.issueTitle,
+            issueDescription: inputs.issueDescription,
             acceptanceBar,
-            reviewRubric,
+            ...(reviewRubric ? { reviewRubric } : {}),
           },
-          reporter,
-        );
-        reviewSubStep.status = "passed";
-        reviewSubStep.ended_at = new Date().toISOString();
-        reviewSubStep.outputs = reviewOutputs;
-        await reporter.report(reviewSubStep);
-
-        approved = reviewOutputs.approved;
-        feedback = reviewOutputs.feedback;
-        reviewIssues = [...reviewOutputs.issues];
-        pass.reviewApproved = reviewOutputs.approved;
-        pass.reviewAttempts = reviewOutputs.attempts;
-        if (approved) terminationReason = "approved";
-      } catch (err) {
-        // A review failure (e.g. "Prompt is too long", a transient API error)
-        // is NOT actionable feedback and must not discard a successful
-        // implementation. Record the failure, stop the loop, and let the
-        // pipeline push the working tree — retrying implementation would only
-        // burn another pass producing the same un-reviewable diff.
-        reviewSubStep.status = "failed";
-        reviewSubStep.ended_at = new Date().toISOString();
-        const reviewStage = `feedback-loop/review-${iteration}`;
-        // Re-stamp `stage`: classifyThrown() passes an already-attached record
-        // (from the executor's classifyLlmResult, surfaced onto the thrown error by
-        // reviewStep) through unchanged, which would otherwise leave the
-        // iteration-qualified stage never applied.
-        const reviewErrTelemetry =
-          typeof err === "object" && err !== null ? (err as { telemetry?: RunTelemetry }).telemetry : undefined;
-        reviewSubStep.outputs = {
-          error: String(err),
-          failure: { ...classifyThrown(err, { stage: reviewStage, attempt: 1 }), stage: reviewStage },
-          ...(reviewErrTelemetry ? { telemetry: reviewErrTelemetry } : {}),
+          outputs: {},
+          logs_url: null,
         };
         await reporter.report(reviewSubStep);
-        console.warn(
-          `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
-        );
-        approved = false;
-        feedback = `Review step failed and was skipped: ${String(err)}`;
-        terminationReason = "review_error";
-        break;
+
+        try {
+          const reviewOutputs = await reviewStep.run(
+            context,
+            {
+              model: resolvedReviewModel,
+              diff,
+              iteration,
+              issueTitle: inputs.issueTitle !== undefined ? String(inputs.issueTitle) : undefined,
+              issueDescription:
+                inputs.issueDescription !== undefined ? String(inputs.issueDescription) : undefined,
+              acceptanceBar,
+              reviewRubric,
+            },
+            reporter,
+          );
+          reviewSubStep.status = "passed";
+          reviewSubStep.ended_at = new Date().toISOString();
+          reviewSubStep.outputs = reviewOutputs;
+          await reporter.report(reviewSubStep);
+
+          reviewAttemptsTotal += reviewOutputs.attempts ?? 1;
+          approved = reviewOutputs.approved;
+          feedback = reviewOutputs.feedback;
+          reviewIssues = [...reviewOutputs.issues];
+          pass.reviewApproved = reviewOutputs.approved;
+          pass.reviewAttempts = reviewAttemptsTotal;
+          pass.reviewCostUsd = reviewOutputs.telemetry?.costUsd ?? null;
+          if (approved) terminationReason = "approved";
+          break;
+        } catch (err) {
+          // A review failure (e.g. "Prompt is too long", a transient API error)
+          // is NOT actionable feedback and must not discard a successful
+          // implementation. Record the failure, stop the loop, and let the
+          // pipeline push the working tree — retrying implementation would only
+          // burn another pass producing the same un-reviewable diff.
+          reviewSubStep.status = "failed";
+          reviewSubStep.ended_at = new Date().toISOString();
+          const reviewStage = `feedback-loop/review-${iteration}`;
+          // Re-stamp `stage`: classifyThrown() passes an already-attached record
+          // (from the executor's classifyLlmResult, surfaced onto the thrown error by
+          // reviewStep) through unchanged, which would otherwise leave the
+          // iteration-qualified stage never applied.
+          const reviewFailure = { ...classifyThrown(err, { stage: reviewStage, attempt: 1 }), stage: reviewStage };
+          const reviewErrTelemetry =
+            typeof err === "object" && err !== null ? (err as { telemetry?: RunTelemetry }).telemetry : undefined;
+          const isTransient = reviewFailure.category === "transient";
+          const willRetryReview = isTransient && reviewStageAttempt <= retryPolicy.stageRetries;
+          // A retried attempt's failure must not overwrite the canonical `review.{iteration}`
+          // row — see the matching implement-stage comment above (BAC-27134).
+          if (willRetryReview) {
+            reviewSubStep.id = `review.${iteration}.retry${reviewStageAttempt}`;
+            extraCostUsd = addExtraCost(extraCostUsd, reviewErrTelemetry?.costUsd);
+          }
+          reviewSubStep.outputs = {
+            error: String(err),
+            failure: reviewFailure,
+            ...(reviewErrTelemetry ? { telemetry: reviewErrTelemetry } : {}),
+          };
+          await reporter.report(reviewSubStep);
+          reviewAttemptsTotal += reviewFailure.attempt;
+
+          if (willRetryReview) {
+            await sleep(computeBackoffMs(reviewStageAttempt, retryPolicy));
+            continue;
+          }
+
+          approved = false;
+          pass.reviewCostUsd = reviewErrTelemetry?.costUsd ?? null;
+          pass.reviewAttempts = reviewAttemptsTotal;
+          reviewStageFailed = true;
+
+          if (isTransient) {
+            console.warn(
+              `[feedback-loop] Review step remained transiently unavailable after ${reviewStageAttempt} attempt(s) on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
+            );
+            terminationReason = "provider_unavailable";
+            // Terminal: the stage-retry budget is spent (matches push.ts's
+            // GIT_PUSH_RETRIES_EXHAUSTED convention) — never retryable.
+            failureForOutputs = { ...reviewFailure, stage: "review", code: "PROVIDER_UNAVAILABLE", retryable: false };
+            feedback = `Model provider was unavailable during review after ${reviewStageAttempt} attempt(s). ${reviewFailure.message}`;
+          } else {
+            console.warn(
+              `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,
+            );
+            feedback = `Review step failed and was skipped: ${String(err)}`;
+            terminationReason = "review_error";
+          }
+          break;
+        }
       }
+
+      if (reviewStageFailed) break;
     }
 
     if (!approved) {
@@ -603,6 +816,15 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       }
     }
 
-    return { approved, iterations: iteration, finalFeedback: feedback, terminationReason, passes, ...(postMortem ? { postMortem } : {}) };
+    return {
+      approved,
+      iterations: iteration,
+      finalFeedback: feedback,
+      terminationReason,
+      passes,
+      extraCostUsd,
+      ...(postMortem ? { postMortem } : {}),
+      ...(failureForOutputs ? { failure: failureForOutputs } : {}),
+    };
   },
 };

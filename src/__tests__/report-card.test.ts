@@ -97,7 +97,7 @@ function insertFeedbackLoopStep(
     approved: boolean;
     iterations: number;
     terminationReason: string;
-    passes: Array<{ iteration: number; costUsd: number | null; implementOutcome: string; reviewApproved: boolean | null }>;
+    passes: Array<{ iteration: number; costUsd: number | null; reviewCostUsd?: number | null; implementOutcome: string; reviewApproved: boolean | null }>;
   },
 ): void {
   dedup.getDb()
@@ -208,6 +208,60 @@ describe("getIssueReportCard", () => {
       const card = rc.getIssueReportCard("AII-2MX");
       expect(card!.runs[0]!.maxTurnsHits).toBe(2);
     });
+
+    it("excludes .retry rows from iterations and approval, but includes their cost (BAC-27201)", () => {
+      const jobId = insertDispatch({ issueId: "issue-2rt", issueIdentifier: "AII-2RT", repo: "org/repo" });
+      insertSubStep(jobId, "implement.1", "implement", {
+        telemetry: { costUsd: 0.10, numTurns: 20, outcome: "success" },
+      });
+      insertSubStep(jobId, "review.1.retry1", "review", { approved: false, telemetry: { costUsd: 1.00 } });
+      insertSubStep(jobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.05 } });
+
+      const card = rc.getIssueReportCard("AII-2RT");
+      // The retry row is a real, failed attempt — never a pass of its own and never the
+      // approval verdict, so iterations/passes/approved are unaffected by it.
+      expect(card!.runs[0]!.iterations).toBe(1);
+      expect(card!.totals.passes).toBe(1);
+      expect(card!.runs[0]!.approved).toBe(true);
+      expect(card!.approved).toBe(true);
+      // 0.10 (implement) + 1.00 (the retried, failed review.1 attempt) + 0.05 (review.1) —
+      // the retry row's cost is real spend and now sums in, unlike its pass/approval effect.
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(1.15);
+    });
+
+    it("includes post-push-review custom sub-step cost — review and fix passes — in the total (BAC-27201)", () => {
+      const jobId = insertDispatch({ issueId: "issue-2ppr", issueIdentifier: "AII-2PPR", repo: "org/repo" });
+      insertSubStep(jobId, "implement.1", "implement", {
+        telemetry: { costUsd: 0.10, numTurns: 20, outcome: "success" },
+      });
+      insertSubStep(jobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.05 } });
+      // The post-push reviewer's own review and fix sub-steps report as `custom`, never
+      // `implement`/`review` — they must not affect iterations/approval, only cost.
+      insertSubStep(jobId, "post-push-review.1", "custom", { approved: false, telemetry: { costUsd: 0.30 } });
+      insertSubStep(jobId, "post-push-review.fix-1", "custom", { telemetry: { costUsd: 0.15 } });
+
+      const card = rc.getIssueReportCard("AII-2PPR");
+      expect(card!.runs[0]!.iterations).toBe(1);
+      expect(card!.totals.passes).toBe(1);
+      expect(card!.runs[0]!.approved).toBe(true);
+      // 0.10 (implement) + 0.05 (in-loop review) + 0.30 (post-push review) + 0.15 (fix pass)
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.60);
+    });
+
+    it("includes post-mortem custom sub-step cost in the total (BAC-27201)", () => {
+      const jobId = insertDispatch({ issueId: "issue-2pm", issueIdentifier: "AII-2PM", repo: "org/repo" });
+      insertSubStep(jobId, "implement.1", "implement", {
+        telemetry: { costUsd: 0.10, numTurns: 50, outcome: "max_turns" },
+      });
+      // The post-mortem sub-step reports as `custom`, never `implement`/`review` — it must not
+      // affect iterations/approval, only cost.
+      insertSubStep(jobId, "post-mortem.1", "custom", { length: 500, telemetry: { costUsd: 0.42 } });
+
+      const card = rc.getIssueReportCard("AII-2PM");
+      expect(card!.runs[0]!.iterations).toBe(1);
+      // 0.10 (implement) + 0.42 (post-mortem)
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.52);
+    });
   });
 
   describe("era 3 — full feedback-loop outputs", () => {
@@ -228,6 +282,62 @@ describe("getIssueReportCard", () => {
       expect(card!.runs[0]!.terminationReason).toBe("approved");
       expect(card!.runs[0]!.costUsd).toBeCloseTo(0.20);
       expect(card!.runs[0]!.maxTurnsHits).toBe(0);
+    });
+
+    it("adds post-push-review sub-step cost on top of feedback-loop outputs (BAC-27201)", () => {
+      const jobId = insertDispatch({
+        issueId: "issue-3ppr", issueIdentifier: "AII-3PPR", repo: "org/repo", status: "completed",
+      });
+      insertFeedbackLoopStep(jobId, {
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.20, reviewCostUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+      });
+      // feedback-loop's own outputs.passes never carries the post-push reviewer's cost — that
+      // stage runs afterward, as its own step. Its custom sub-steps must still be added on top.
+      insertSubStep(jobId, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.40 } });
+
+      const card = rc.getIssueReportCard("AII-3PPR");
+      expect(card!.runs[0]!.iterations).toBe(1);
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.65);
+    });
+
+    it("agrees with formatRunStats' ticket-facing total for the same run (BAC-27201)", async () => {
+      const { formatRunStats } = await import("../run-autopsy.js");
+      const jobId = insertDispatch({
+        issueId: "issue-3parity", issueIdentifier: "AII-3PARITY", repo: "org/repo", status: "completed",
+      });
+      insertFeedbackLoopStep(jobId, {
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.20, reviewCostUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+      });
+      // A superseded review retry attempt — real spend feedback-loop's own outputs.passes
+      // never carries (BAC-27134/BAC-27201) — plus the post-push reviewer's review and fix
+      // sub-steps, which run as their own step entirely outside feedback-loop.
+      insertSubStep(jobId, "review.1.retry1", "review", { approved: false, telemetry: { costUsd: 0.10 } });
+      insertSubStep(jobId, "post-push-review.1", "custom", { approved: false, telemetry: { costUsd: 0.30 } });
+      insertSubStep(jobId, "post-push-review.fix-1", "custom", { telemetry: { costUsd: 0.15 } });
+
+      const card = rc.getIssueReportCard("AII-3PARITY");
+      // 0.20 + 0.05 (pass) + 0.10 (review retry) + 0.30 + 0.15 (post-push review + fix)
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.80);
+
+      // run-autonomous.ts derives the ticket-facing RunStats from the exact same sources: the
+      // feedback-loop pass, plus feedback-loop's own extraCostUsd (retry cost) and the
+      // post-push reviewer's own costUsd (review+fix cost) — see the wiring in run-autonomous.ts.
+      const md = formatRunStats({
+        issueIdentifier: "AII-3PARITY",
+        passes: [{ iteration: 1, implementTurns: 1, implementOutcome: "success", costUsd: 0.20, reviewCostUsd: 0.05, reviewApproved: true }],
+        plannedFiles: [],
+        filesChanged: null,
+        extraCostUsd: 0.10 + 0.30 + 0.15,
+      });
+      const totalLine = md.split("\n").find((l) => l.startsWith("**Total cost:**"));
+      const ticketTotal = Number(totalLine!.replace("**Total cost:** $", ""));
+      expect(ticketTotal).toBeCloseTo(card!.runs[0]!.costUsd!);
     });
 
     it("counts maxTurnsHits from passes with implementOutcome=max_turns", () => {
@@ -262,6 +372,37 @@ describe("getIssueReportCard", () => {
       const card = rc.getIssueReportCard("AII-3C");
       // Only the non-null pass contributes
       expect(card!.runs[0]!.costUsd).toBeCloseTo(0.30);
+    });
+
+    it("sums reviewCostUsd alongside costUsd per pass, matching the sub-step fallback for equivalent data", () => {
+      const jobId = insertDispatch({
+        issueId: "issue-3d", issueIdentifier: "AII-3D", repo: "org/rcost2", status: "completed",
+      });
+      insertFeedbackLoopStep(jobId, {
+        approved: true,
+        iterations: 1,
+        terminationReason: "approved",
+        passes: [{ iteration: 1, costUsd: 0.10, reviewCostUsd: 0.20, implementOutcome: "success", reviewApproved: true }],
+      });
+
+      const card = rc.getIssueReportCard("AII-3D");
+      expect(card!.runs[0]!.costUsd).toBeCloseTo(0.30);
+      expect(card!.totals.costUsd).toBeCloseTo(0.30);
+
+      const report = rc.getFleetReport({ days: 365 });
+      const r = report.byRepo.find((x) => x.repo === "org/rcost2");
+      expect(r!.costUsd).toBeCloseTo(0.30);
+
+      // Equivalent sub-step rows for the same job shape must compute the same total —
+      // the fallback and the primary feedback-loop path must never disagree.
+      const fallbackJobId = insertDispatch({
+        issueId: "issue-3d-fallback", issueIdentifier: "AII-3D-FALLBACK", repo: "org/rcost2fb", status: "completed",
+      });
+      insertSubStep(fallbackJobId, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+      insertSubStep(fallbackJobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.20 } });
+      const fallbackReport = rc.getFleetReport({ days: 365 });
+      const fallbackR = fallbackReport.byRepo.find((x) => x.repo === "org/rcost2fb");
+      expect(fallbackR!.costUsd).toBeCloseTo(r!.costUsd!);
     });
   });
 
@@ -468,6 +609,74 @@ describe("getFleetReport", () => {
     expect(r!.issues).toBe(2);
     expect(r!.completed).toBe(1);
     expect(r!.failed).toBe(1);
+  });
+
+  it("sums review sub-step cost alongside implement cost in the per-repo total (sub-step fallback path)", () => {
+    const jobId = insertDispatch({
+      issueId: "issue-cost", issueIdentifier: "AII-COST", repo: "org/rcost", status: "completed",
+    });
+    insertSubStep(jobId, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+    insertSubStep(jobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.20 } });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rcost");
+    expect(r!.costUsd).toBeCloseTo(0.30);
+  });
+
+  it("includes post-push-review custom sub-step cost in the fleet total, unaffected pass count (BAC-27201)", () => {
+    const jobId = insertDispatch({
+      issueId: "issue-ppr-fleet", issueIdentifier: "AII-PPR-FLEET", repo: "org/rppr", status: "completed",
+    });
+    insertSubStep(jobId, "implement.1", "implement", { telemetry: { costUsd: 0.10, outcome: "success" } });
+    insertSubStep(jobId, "review.1", "review", { approved: true, telemetry: { costUsd: 0.05 } });
+    insertSubStep(jobId, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.40 } });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rppr");
+    expect(r!.costUsd).toBeCloseTo(0.55);
+    expect(r!.avgPasses).toBeCloseTo(1);
+  });
+
+  it("counts a job with only post-push-review sub-steps (no feedback-loop or implement/review rows at all) toward the fleet cost total (BAC-27201)", () => {
+    const jobId = insertDispatch({
+      issueId: "issue-ppr-only", issueIdentifier: "AII-PPR-ONLY", repo: "org/rppronly", status: "completed",
+    });
+    // No feedback-loop row and no implement/review sub-steps — jobPassStats' sub-step
+    // fallback query returns zero rows. Its cost must still reach the fleet total instead of
+    // being dropped by an early `return null` that ran before `extra` was applied.
+    insertSubStep(jobId, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.40 } });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rppronly");
+    expect(r!.costUsd).toBeCloseTo(0.40);
+    // The synthetic fallback's placeholder `passes: 0` must not count toward avgPasses —
+    // with no other job in this repo, the denominator stays at zero (null), not 0 (BAC-27201 round 2).
+    expect(r!.avgPasses).toBeNull();
+  });
+
+  it("does not dilute avgPasses or undercount eventualPct with a post-push-review-only approved job alongside a normal 1-pass job (BAC-27201 round 2)", () => {
+    const normalJob = insertDispatch({
+      issueId: "issue-normal", issueIdentifier: "AII-NORMAL", repo: "org/rmixed", status: "completed",
+    });
+    insertFeedbackLoopStep(normalJob, {
+      approved: true,
+      iterations: 1,
+      terminationReason: "approved",
+      passes: [{ iteration: 1, costUsd: 0.10, reviewCostUsd: 0.05, implementOutcome: "success", reviewApproved: true }],
+    });
+
+    const pprOnlyJob = insertDispatch({
+      issueId: "issue-ppr-mixed", issueIdentifier: "AII-PPR-MIXED", repo: "org/rmixed", status: "completed",
+    });
+    // No feedback-loop row and no implement/review sub-steps — only a post-push-review pass
+    // that the reviewer itself approved. jobPassStats' synthetic fallback must not report this
+    // as 0 passes counted toward avgPasses, nor as unapproved for eventualPct.
+    insertSubStep(pprOnlyJob, "post-push-review.1", "custom", { approved: true, telemetry: { costUsd: 0.40 } });
+
+    const report = rc.getFleetReport({ days: 365 });
+    const r = report.byRepo.find((x) => x.repo === "org/rmixed");
+    expect(r!.avgPasses).toBeCloseTo(1);
+    expect(report.eventualPct).toBeCloseTo(1.0);
   });
 
   describe("one-shot percentage", () => {

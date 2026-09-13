@@ -88,6 +88,7 @@ interface FeedbackLoopOutputs {
   terminationReason?: string;
   passes?: Array<{
     costUsd?: number | null;
+    reviewCostUsd?: number | null;
     implementOutcome?: string;
     reviewApproved?: boolean | null;
   }>;
@@ -95,6 +96,7 @@ interface FeedbackLoopOutputs {
 
 interface ReviewOutputs {
   approved?: boolean;
+  telemetry?: { costUsd?: number | null };
 }
 
 interface ImplementOutputs {
@@ -113,12 +115,61 @@ interface DerivedRunStats {
   maxTurnsHits: number;
 }
 
+/**
+ * Cost that lives outside the ordinary implement/review pass accounting:
+ *   - `implement.N.retryM` / `review.N.retryM` rows — a failed stage-retry attempt that got
+ *     superseded by a later attempt at the same iteration. Real spend, but never a pass of
+ *     its own and never the review verdict, so it must add to cost only.
+ *   - `post-push-review.*` rows (`step_type = 'custom'`) — the post-push reviewer's own
+ *     review and fix passes, including its own superseded retry attempts (same `.retry`
+ *     shape as above — the `%` in the LIKE pattern already covers it). These run as a
+ *     separate step after feedback-loop entirely, so neither the feedback-loop-outputs fast
+ *     path nor the implement/review sub-step fallback ever sees them.
+ *   - `post-mortem.*` rows (`step_type = 'custom'`) — the read-only post-mortem invocation run
+ *     when an implement pass hits its turn cap. Also outside both paths above: it isn't a
+ *     pass of its own and isn't `implement`/`review`.
+ * Added on top of whatever base costUsd the caller already derived (BAC-27201).
+ */
+function extraCostUsd(db: Db, jobId: number): number | null {
+  let rows: Array<{ outputs_json: string }> = [];
+  try {
+    rows = db
+      .prepare(
+        `SELECT outputs_json FROM step_log
+         WHERE job_id = ?
+           AND (
+             (step_type IN ('implement', 'review') AND step_id LIKE '%.retry%')
+             OR (step_type = 'custom' AND step_id LIKE 'post-push-review.%')
+             OR (step_type = 'custom' AND step_id LIKE 'post-mortem.%')
+           )`,
+      )
+      .all(jobId) as typeof rows;
+  } catch {
+    // step_log table may not exist in older deployments
+  }
+  let costUsd: number | null = null;
+  for (const row of rows) {
+    try {
+      const out = JSON.parse(row.outputs_json) as { telemetry?: { costUsd?: number | null } };
+      const c = out.telemetry?.costUsd;
+      if (c != null) costUsd = (costUsd ?? 0) + c;
+    } catch { /* malformed JSON */ }
+  }
+  return costUsd;
+}
+
+function addCost(a: number | null, b: number | null): number | null {
+  if (a == null && b == null) return null;
+  return (a ?? 0) + (b ?? 0);
+}
+
 function statsFromFeedbackLoop(outputs: FeedbackLoopOutputs): DerivedRunStats {
   const passes = outputs.passes ?? [];
   let costUsd: number | null = null;
   let maxTurnsHits = 0;
   for (const p of passes) {
     if (p.costUsd != null) costUsd = (costUsd ?? 0) + p.costUsd;
+    if (p.reviewCostUsd != null) costUsd = (costUsd ?? 0) + p.reviewCostUsd;
     if (p.implementOutcome === "max_turns") maxTurnsHits++;
   }
   return {
@@ -137,6 +188,7 @@ function statsFromSubSteps(db: Db, jobId: number): DerivedRunStats {
       .prepare(
         `SELECT step_type, outputs_json FROM step_log
          WHERE job_id = ? AND step_type IN ('implement', 'review')
+           AND step_id NOT LIKE '%.retry%'
          ORDER BY id ASC`,
       )
       .all(jobId) as typeof rows;
@@ -157,7 +209,10 @@ function statsFromSubSteps(db: Db, jobId: number): DerivedRunStats {
         if (c != null) costUsd = (costUsd ?? 0) + c;
         if (out.telemetry?.outcome === "max_turns") maxTurnsHits++;
       } else {
-        approved = (JSON.parse(row.outputs_json) as ReviewOutputs).approved ?? false;
+        const out = JSON.parse(row.outputs_json) as ReviewOutputs;
+        approved = out.approved ?? false;
+        const c = out.telemetry?.costUsd;
+        if (c != null) costUsd = (costUsd ?? 0) + c;
       }
     } catch { /* malformed JSON */ }
   }
@@ -178,12 +233,18 @@ function derivedStatsForJob(db: Db, jobId: number): DerivedRunStats {
       .get(jobId) as typeof flRow;
   } catch { /* step_log may not exist */ }
 
+  let base: DerivedRunStats | undefined;
   if (flRow) {
     try {
-      return statsFromFeedbackLoop(JSON.parse(flRow.outputs_json) as FeedbackLoopOutputs);
+      base = statsFromFeedbackLoop(JSON.parse(flRow.outputs_json) as FeedbackLoopOutputs);
     } catch { /* fallthrough */ }
   }
-  return statsFromSubSteps(db, jobId);
+  if (!base) base = statsFromSubSteps(db, jobId);
+  // Neither path above sees retry-attempt or post-push-review cost — the former reports
+  // only from feedback-loop's own outputs.passes (which never carries retry cost) or from
+  // implement/review sub-steps with retry rows explicitly excluded; add it on top here so
+  // every job's total agrees regardless of which path derived the base figures.
+  return { ...base, costUsd: addCost(base.costUsd, extraCostUsd(db, jobId)) };
 }
 
 // ---- getIssueReportCard ----
@@ -319,6 +380,35 @@ interface JobPassStats {
   oneShot: boolean | null;
   costUsd: number | null;
   approved: boolean;
+  /** False only for the post-push-review-only synthetic fallback below, where `passes` is a
+   *  placeholder 0 rather than real pass data. Callers must exclude such a job from the
+   *  avgPasses numerator/denominator the same way `oneShot: null` is already excluded from the
+   *  one-shot denominator — otherwise a job that never ran a feedback-loop/implement/review
+   *  step silently drags avgPasses toward zero (BAC-27201 round 2). */
+  passesKnown: boolean;
+}
+
+/** The most recent non-retry post-push-review.N sub-step's own `approved` output, for the
+ *  synthetic fallback below where no implement/review/feedback-loop row exists to derive
+ *  `approved` from otherwise. Mirrors the sub-step fallback's `lastApproved` derivation. */
+function postPushReviewOnlyApproved(db: Db, jobId: number): boolean {
+  let row: { outputs_json: string } | undefined;
+  try {
+    row = db
+      .prepare(
+        `SELECT outputs_json FROM step_log
+         WHERE job_id = ? AND step_type = 'custom' AND step_id LIKE 'post-push-review.%'
+           AND step_id NOT LIKE '%.retry%'
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(jobId) as typeof row;
+  } catch { /* step_log absent */ }
+  if (!row) return false;
+  try {
+    return (JSON.parse(row.outputs_json) as { approved?: boolean }).approved === true;
+  } catch {
+    return false;
+  }
 }
 
 function jobPassStats(db: Db, jobId: number): JobPassStats | null {
@@ -335,6 +425,10 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
       .get(jobId) as typeof flRow;
   } catch { /* step_log absent */ }
 
+  // Neither path below sees retry-attempt or post-push-review cost — add it on top of
+  // whichever base figures get derived, so every job's total agrees (BAC-27201).
+  const extra = extraCostUsd(db, jobId);
+
   if (flRow) {
     try {
       const out = JSON.parse(flRow.outputs_json) as FeedbackLoopOutputs;
@@ -342,7 +436,9 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
       let costUsd: number | null = null;
       for (const p of passes) {
         if (p.costUsd != null) costUsd = (costUsd ?? 0) + p.costUsd;
+        if (p.reviewCostUsd != null) costUsd = (costUsd ?? 0) + p.reviewCostUsd;
       }
+      costUsd = addCost(costUsd, extra);
       const iterations = out.iterations ?? passes.length;
       const approved = out.approved ?? false;
 
@@ -365,7 +461,7 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
         oneShot = review1Approved;
       }
 
-      return { passes: iterations, oneShot, costUsd, approved };
+      return { passes: iterations, oneShot, costUsd, approved, passesKnown: true };
     } catch { /* fallthrough */ }
   }
 
@@ -376,12 +472,24 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
       .prepare(
         `SELECT step_id, step_type, outputs_json FROM step_log
          WHERE job_id = ? AND step_type IN ('implement', 'review')
+           AND step_id NOT LIKE '%.retry%'
          ORDER BY id ASC`,
       )
       .all(jobId) as typeof rows;
   } catch { /* absent */ }
 
-  if (rows.length === 0) return null;
+  // A job can carry only post-push-review/post-mortem cost and no implement/review sub-step
+  // at all (e.g. post-push-review costs on a job whose feedback-loop row is otherwise absent
+  // from step_log) — returning null here would drop `extra` on the floor and leave it out of
+  // the fleet total entirely, rather than merely uncounted towards passes/oneShot (BAC-27201).
+  // `passesKnown: false` keeps that same cost contribution while telling callers this job's
+  // `passes: 0` is a placeholder, not real pass data, and `approved` is derived from the
+  // post-push-review step's own outcome rather than hardcoded (BAC-27201 round 2).
+  if (rows.length === 0) {
+    return extra != null
+      ? { passes: 0, oneShot: null, costUsd: extra, approved: postPushReviewOnlyApproved(db, jobId), passesKnown: false }
+      : null;
+  }
 
   let iterations = 0;
   let lastApproved = false;
@@ -399,10 +507,18 @@ function jobPassStats(db: Db, jobId: number): JobPassStats | null {
         if (row.step_id === "review.1") {
           firstPassApproved = reviewOut.approved ?? null;
         }
+        const c = reviewOut.telemetry?.costUsd;
+        if (c != null) costUsd = (costUsd ?? 0) + c;
       }
     } catch { /* skip */ }
   }
-  return { passes: iterations, oneShot: firstPassApproved, costUsd, approved: lastApproved };
+  return {
+    passes: iterations,
+    oneShot: firstPassApproved,
+    costUsd: addCost(costUsd, extra),
+    approved: lastApproved,
+    passesKnown: true,
+  };
 }
 
 // ---- getFleetReport ----
@@ -466,8 +582,13 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
     if (!agg) continue;
     const stats = jobPassStats(db, d.id);
     if (stats) {
-      agg.totalPasses += stats.passes;
-      agg.passCount++;
+      // passesKnown: false is the post-push-review-only synthetic fallback's placeholder
+      // passes: 0 — excluded here the same way oneShot: null is excluded from its own
+      // denominator below, so it doesn't drag avgPasses toward zero (BAC-27201 round 2).
+      if (stats.passesKnown) {
+        agg.totalPasses += stats.passes;
+        agg.passCount++;
+      }
       if (stats.costUsd != null) agg.costUsd = (agg.costUsd ?? 0) + stats.costUsd;
     }
   }
@@ -553,6 +674,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
   function cohortFor(planned: boolean): PlanningCohort {
     let jobs = 0;
     let eligibleJobs = 0;
+    let passEligibleJobs = 0;
     let oneShotEligibleJobs = 0;
     let oneShotC = 0;
     let totalPassesC = 0;
@@ -569,7 +691,14 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
       const stats = jobPassStats(db, d.id);
       if (stats) {
         eligibleJobs++;
-        totalPassesC += stats.passes;
+        // passesKnown: false is the post-push-review-only synthetic fallback's placeholder
+        // passes: 0 — excluded from avgPasses the same way oneShot: null is excluded from
+        // its own denominator just below (BAC-27201 round 2). avgCostUsd's denominator
+        // (eligibleJobs) is deliberately unaffected: that job's cost is real.
+        if (stats.passesKnown) {
+          passEligibleJobs++;
+          totalPassesC += stats.passes;
+        }
         if (stats.costUsd != null) totalCostC = (totalCostC ?? 0) + stats.costUsd;
         // Only count in one-shot denominator when first-pass approval is determinable.
         if (stats.oneShot !== null) {
@@ -592,7 +721,7 @@ export function getFleetReport(opts: { days?: number; repo?: string } = {}): Fle
     return {
       jobs,
       oneShotPct: oneShotEligibleJobs > 0 ? oneShotC / oneShotEligibleJobs : null,
-      avgPasses: eligibleJobs > 0 ? totalPassesC / eligibleJobs : null,
+      avgPasses: passEligibleJobs > 0 ? totalPassesC / passEligibleJobs : null,
       avgCostUsd: eligibleJobs > 0 && totalCostC != null ? totalCostC / eligibleJobs : null,
       mergedPct: cohortIssues.size > 0 ? mergedC / cohortIssues.size : null,
     };

@@ -15,7 +15,7 @@ import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
-import { classifyThrown } from "./pipeline/failure-classification.js";
+import { classifyThrown, isFailureRecord } from "./pipeline/failure-classification.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
@@ -30,6 +30,8 @@ type RunAutopsyPasses = Array<{
   implementOutcome: string;
   costUsd: number | null;
   reviewApproved: boolean | null;
+  attempts?: number;
+  reviewCostUsd?: number | null;
 }>;
 
 export interface RunAutonomousOptions {
@@ -597,11 +599,23 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       // For new runs prUrl is set and branch is the base — compare committed diff.
       // For gap-fill and mounted runs there is no prUrl; skip the comparison.
       const filesChanged = prUrl ? getCommittedFiles(workspaceDir, branch) : [];
+      // Cost outside `passes` itself — superseded implement/review retry attempts (feedback-
+      // loop.ts) plus, when the post-push reviewer ran, its own review/fix invocations. Mirrors
+      // report-card.ts's extraCostUsd so the ticket-facing "Total cost" agrees with the report
+      // card for the same run (BAC-27201).
+      const fbExtraCostUsd = typeof fbOutputs.extraCostUsd === "number" ? fbOutputs.extraCostUsd : null;
+      const postPushReviewCostUsd = postPushReviewRequired && typeof postPushReviewOutputs.costUsd === "number"
+        ? postPushReviewOutputs.costUsd
+        : null;
+      const extraCostUsd = fbExtraCostUsd == null && postPushReviewCostUsd == null
+        ? null
+        : (fbExtraCostUsd ?? 0) + (postPushReviewCostUsd ?? 0);
       writeRunStats(workspaceDir, {
         issueIdentifier,
         passes: statPasses,
         plannedFiles: prUrl ? (planningBlock?.files ?? []) : [],
         filesChanged,
+        extraCostUsd,
       });
       const iterations = typeof fbOutputs.iterations === "number" ? fbOutputs.iterations : "?";
       disposition = prUrl
@@ -641,16 +655,48 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     const finalFeedback = typeof authoritativeReviewOutputs.finalFeedback === "string"
       ? authoritativeReviewOutputs.finalFeedback
       : "";
-    const failureCode = terminationReason === "max_turns" ? "MAX_TURNS_EXHAUSTED" : "REVIEW_UNAPPROVED";
-    const failureReason =
-      `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
-      finalFeedback.slice(0, 500);
+    // The post-push reviewer ran out of its configured turn cap and produced no verdict —
+    // a classified, inconclusive review, never a "did not approve" rejection. Reported with
+    // its own failureCode and the FailureRecord post-push-review.ts attached to its outputs,
+    // rather than folded into the generic REVIEW_UNAPPROVED/MAX_TURNS_EXHAUSTED wording below.
+    const reviewerTurnsExhausted = terminationReason === "reviewer_turns_exhausted";
+    // A transient provider outage that outlasted the stage-retry budget: never a
+    // rejection, so it gets its own failureCode/wording instead of REVIEW_UNAPPROVED's
+    // "did not approve" — the reviewer never ran to a verdict, or the implementer's
+    // partial work was preserved as a draft, either way not the code being turned down.
+    const providerUnavailable = terminationReason === "provider_unavailable";
+    const reviewerFailure = isFailureRecord(authoritativeReviewOutputs.failure)
+      ? authoritativeReviewOutputs.failure
+      : undefined;
+    const failureCode = reviewerTurnsExhausted
+      ? "REVIEWER_TURNS_EXHAUSTED"
+      : providerUnavailable
+        ? "PROVIDER_UNAVAILABLE"
+        : terminationReason === "max_turns"
+          ? "MAX_TURNS_EXHAUSTED"
+          : "REVIEW_UNAPPROVED";
+    const reviewMaxTurns = retryPolicy.reviewMaxTurns ?? DEFAULT_RETRY_POLICY.reviewMaxTurns;
+    // Iteration 1 never carried forward blockers from a prior review, so "the code was not
+    // reviewed" is accurate; iteration >= 2 means a previous review DID run and a fix pass
+    // acted on it — only the latest revision went unreviewed. Matches the PR comment's own
+    // iteration-aware phrase (post-push-review.ts).
+    const notReviewedPhrase = iterations >= 2 ? "the latest revision was not reviewed" : "the code was not reviewed";
+    const failureReason = reviewerTurnsExhausted
+      ? `🟠 The post-push reviewer ran out of turns at the configured cap (${reviewMaxTurns}); ${notReviewedPhrase}.\n\n${finalFeedback.slice(0, 500)}\n\nThe in-loop reviewer approved.`
+      : providerUnavailable
+        ? finalFeedback || "The model provider was unavailable and the run could not complete."
+        : `Automated review did not approve (${terminationReason} after ${iterations} iteration(s)). ` +
+          finalFeedback.slice(0, 500);
 
     const prKind = pushOutputs.draft === true ? "draft PR" : "PR";
     const prDisposition = prUrl
       ? `${prKind} ${prUrl}`
       : "no PR";
-    disposition = `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
+    disposition = reviewerTurnsExhausted
+      ? `${prDisposition} — reviewer ran out of turns at the cap after ${iterations} iteration(s) (${terminationReason})`
+      : providerUnavailable
+        ? `${prDisposition} — provider unavailable after ${iterations} iteration(s) (${terminationReason})`
+        : `${prDisposition} — review unapproved after ${iterations} iteration(s) (${terminationReason})`;
 
     writeRunAutopsy(workspaceDir, {
       issueIdentifier,
@@ -660,10 +706,18 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       passes: Array.isArray(fbOutputs.passes) ? (fbOutputs.passes as RunAutopsyPasses) : [],
       postMortem: typeof fbOutputs.postMortem === "string" ? fbOutputs.postMortem : undefined,
       prUrl,
+      reviewMaxTurns: reviewerTurnsExhausted ? reviewMaxTurns : undefined,
+      failure: reviewerFailure,
     });
     console.warn(
-      `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
-        (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
+      reviewerTurnsExhausted
+        ? `::warning::AI-Implement: post-push reviewer ran out of turns at the cap after ${iterations} iteration(s) (${terminationReason}) — ` +
+          (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
+        : providerUnavailable
+          ? `::warning::AI-Implement: model provider was unavailable after ${iterations} iteration(s) (${terminationReason}) — ` +
+            (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened")
+          : `::warning::AI-Implement: review did not approve after ${iterations} iteration(s) (${terminationReason}) — ` +
+            (prUrl ? `${prKind} opened: ${prUrl}` : "no PR opened"),
     );
     await postRunnerResult({
       workspaceDir,
@@ -671,6 +725,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       outcome: "failure",
       failureCode,
       failureReason,
+      failure: reviewerFailure,
       prUrl,
       referenceRepoResults,
       callbackUrl,
@@ -785,6 +840,7 @@ export interface RunLocalAutonomousResult {
     tokensOut?: number | null;
     cacheReadTokens?: number | null;
     cacheCreationTokens?: number | null;
+    reviewCostUsd?: number | null;
   }>;
   finalFeedback: string;
   effectiveMaxTurns: number;
@@ -803,6 +859,9 @@ function buildTokenSummary(
   let cacheCreationTokens: number | null = null;
   for (const p of passes) {
     if (typeof p.costUsd === "number") costUsd = (costUsd ?? 0) + p.costUsd;
+    // Pattern anchor: statsFromFeedbackLoop (src/report-card.ts) — a pass's cost is
+    // implement + in-loop review, not implement alone (BAC-27201).
+    if (typeof p.reviewCostUsd === "number") costUsd = (costUsd ?? 0) + p.reviewCostUsd;
     if (typeof p.tokensIn === "number") tokensIn = (tokensIn ?? 0) + p.tokensIn;
     if (typeof p.tokensOut === "number") tokensOut = (tokensOut ?? 0) + p.tokensOut;
     if (typeof p.cacheReadTokens === "number") cacheReadTokens = (cacheReadTokens ?? 0) + p.cacheReadTokens;

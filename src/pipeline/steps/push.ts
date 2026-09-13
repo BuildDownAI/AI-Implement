@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import type { PipelineContext, StepModule, StepReporter } from "../types.js";
-import { formatGitNameStatusSummary, openOrFindPullRequest, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
+import { formatGitNameStatusSummary, openOrFindPullRequest, PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX } from "../step-utils.js";
 import { span } from "../timing.js";
 import { findSensitiveFiles, SensitiveFilesError } from "../sensitive-files.js";
 import { refreshRunnerGithubCredentials } from "../../runner-token.js";
@@ -11,13 +11,22 @@ import { computeBackoffMs, normalizeRetryPolicy } from "../retry-backoff.js";
 const LS_REMOTE_MAX_ATTEMPTS = 3;
 const LS_REMOTE_RETRY_DELAYS_MS = [250, 1000];
 
-export { UNAPPROVED_TITLE_PREFIX };
+export { PROVIDER_OUTAGE_TITLE_PREFIX, UNAPPROVED_TITLE_PREFIX };
 
 export interface ReviewSummary extends Record<string, unknown> {
   terminationReason: string;
   iterations: number;
   finalFeedback: string;
-  passes: Array<{ iteration: number; implementTurns: number | null; implementOutcome: string; costUsd: number | null; reviewApproved: boolean | null }>;
+  passes: Array<{
+    iteration: number;
+    implementTurns: number | null;
+    implementOutcome: string;
+    costUsd: number | null;
+    reviewApproved: boolean | null;
+    attempts?: number;
+    reviewAttempts?: number;
+    reviewCostUsd?: number | null;
+  }>;
   postMortem?: string;
 }
 
@@ -513,10 +522,11 @@ export const pushStep: StepModule<PushInputs, PushOutputs> = {
     }
 
     const draft = inputs.draft === true;
+    const providerUnavailable = inputs.reviewSummary?.terminationReason === "provider_unavailable";
     // Span covers the POST and the 422 list-open-PRs fallback so re-runs (which
     // hit 422 and pay an extra round-trip) are timed in full, not just the POST.
     const pr = await span("pr-create", async () =>
-      openOrFindPullRequest({ repoOwner, repoRepo, githubToken: pushToken, prTitle, branchName, baseBranch, prBody, draft }),
+      openOrFindPullRequest({ repoOwner, repoRepo, githubToken: pushToken, prTitle, branchName, baseBranch, prBody, draft, providerUnavailable }),
     );
     return {
       prUrl: pr.url,
@@ -572,13 +582,18 @@ function buildPullRequestBody(
     stringValue(inputs.implementationSummary) ??
     `Implemented the requested work for ${issueIdentifier}: ${title}.`;
   const explicitTestsSummary = stringValue(inputs.testsSummary) ?? stringValue(preflightOutputs.summary);
+  // A provider outage is not a review verdict — the reviewer may never have run, so this
+  // fallback must not claim the review loop rejected the change (BAC-27201).
+  const providerUnavailableForTestsSummary = inputs.reviewSummary?.terminationReason === "provider_unavailable";
   // No explicit/preflight summary to fall back on: say what actually happened. An unapproved
   // run (reviewSummary present) skipped preflight/verify entirely — claiming verification ran
   // would contradict the "Automated review did not approve" section above it.
   const testsSummary =
     explicitTestsSummary ??
     (inputs.reviewSummary
-      ? "Automated verification was skipped — the review loop did not approve this change."
+      ? providerUnavailableForTestsSummary
+        ? "Automated verification was skipped — the model provider was unavailable and the run was interrupted."
+        : "Automated verification was skipped — the review loop did not approve this change."
       : "Automated verification was run by the AI-Implement pipeline before opening this PR.");
   const testsSummaryChecked = explicitTestsSummary != null || !inputs.reviewSummary;
 
@@ -608,28 +623,36 @@ function buildUnapprovedSection(summary: ReviewSummary | undefined, draft: boole
   if (!summary) return null;
   const passRows = summary.passes
     .map((p) => {
-      const cost = p.costUsd != null ? `$${p.costUsd.toFixed(2)}` : "—";
+      // Pattern anchor: statsFromFeedbackLoop (src/report-card.ts) — a pass's cost is
+      // implement + in-loop review, not implement alone (BAC-27201).
+      const passCost = p.costUsd != null || p.reviewCostUsd != null ? (p.costUsd ?? 0) + (p.reviewCostUsd ?? 0) : null;
+      const cost = passCost != null ? `$${passCost.toFixed(2)}` : "—";
       const review = p.reviewApproved == null ? "not run" : p.reviewApproved ? "approved" : "rejected";
-      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${cost} | ${review} |`;
+      return `| ${p.iteration} | ${p.implementOutcome} | ${p.implementTurns ?? "?"} | ${p.attempts ?? 1} | ${cost} | ${review} |`;
     })
     .join("\n");
+  // A provider outage is not a review verdict: the reviewer may never have run, so the
+  // heading, the sentence and the feedback label must not claim it rejected anything.
+  const providerUnavailable = summary.terminationReason === "provider_unavailable";
   return [
-    "## ⚠️ Automated review did not approve",
+    providerUnavailable ? "## 🟠 The model provider was unavailable during this run" : "## ⚠️ Automated review did not approve",
     "",
-    `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
+    providerUnavailable
+      ? `This PR was opened ${draft ? "as a draft" : "for human review"} because the model provider was unavailable and the AI-Implement loop stopped after ${summary.iterations} iteration(s); the work completed so far is preserved here and was not reviewed.`
+      : `This PR was opened ${draft ? "as a draft" : "for human review"} because the AI-Implement review loop ended without approval (reason: \`${summary.terminationReason}\` after ${summary.iterations} iteration(s)).`,
     "",
-    "**Reviewer's final feedback:**",
+    providerUnavailable ? "**Run notes:**" : "**Reviewer's final feedback:**",
     "",
     ...summary.finalFeedback.split("\n").map((l) => `> ${l}`),
     "",
     "**Run stats:**",
     "",
-    "| Pass | Implement outcome | Turns | Cost | Review |",
-    "|---|---|---|---|---|",
+    "| Pass | Implement outcome | Turns | Implement attempts | Cost | Review |",
+    "|---|---|---|---|---|---|",
     passRows,
     ...(summary.postMortem ? ["", "<details><summary><strong>Post-mortem</strong></summary>", "", summary.postMortem, "", "</details>"] : []),
     "",
-    "_Preflight and verify hooks were skipped for this unapproved run._",
+    providerUnavailable ? "_Preflight and verify hooks were skipped because the run was interrupted._" : "_Preflight and verify hooks were skipped for this unapproved run._",
   ].join("\n");
 }
 
