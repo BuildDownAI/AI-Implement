@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { implementStep } from "../pipeline/steps/implement.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
 
@@ -105,11 +106,45 @@ describe("implementStep", () => {
     ).rejects.toThrow("exit code 1");
   });
 
-  it("classifies a non-zero exit with unrecognised stderr as crash/PROCESS_EXIT_NONZERO, not invalid_output", async () => {
-    // implement never requests structured output, so a plain crash must not be
-    // misclassified as invalid_output/LLM_NO_STRUCTURED_OUTPUT just because
-    // structuredOutput happens to be undefined.
+  it("falls back to classifying the failure itself when a custom executor's non-zero exit carries no pre-computed failure record", async () => {
+    // Round-four review follow-up (BAC-27114): a custom LLMExecutor (this test's
+    // own opts.llmExecutor-style seam) may settle a non-zero exit without ever
+    // attaching `result.failure` — implementStep must not leave failure_json empty
+    // in that case, so it derives one via classifyLlmResult itself.
     const executor = makeExecutor({ exitCode: 1, stderr: "boom, nothing recognisable here" });
+    const ctx = makeContext(executor);
+
+    const err = await implementStep
+      .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const failure = (err as Error & { failure?: { category?: string; code?: string; stage?: string } }).failure;
+    expect(failure?.category).toBe("crash");
+    expect(failure?.code).toBe("PROCESS_EXIT_NONZERO");
+    expect(failure?.stage).toBe("implement");
+  });
+
+  it("surfaces the executor's pre-computed failure record on the thrown error (crash, not invalid_output)", async () => {
+    // The executor — not implementStep — classifies the failure now (BAC-27114
+    // follow-up): implement never requests structured output, so a plain crash
+    // must not be misclassified as invalid_output/LLM_NO_STRUCTURED_OUTPUT just
+    // because structuredOutput happens to be undefined. That classification logic
+    // is covered directly in failure-classification.test.ts and executor.test.ts;
+    // this only checks that implementStep passes `result.failure` through as-is.
+    const executor = makeExecutor({
+      exitCode: 1,
+      stderr: "boom, nothing recognisable here",
+      failure: {
+        category: "crash",
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 1,
+        retryable: false,
+        message: "boom, nothing recognisable here",
+        evidence: { truncated: false },
+      },
+    });
     const ctx = makeContext(executor);
 
     const err = await implementStep
@@ -122,11 +157,21 @@ describe("implementStep", () => {
     expect(failure?.code).toBe("PROCESS_EXIT_NONZERO");
   });
 
-  it("populates the failure record's elapsedMs from the executor's telemetry.durationMs", async () => {
+  it("surfaces the executor's failure.elapsedMs on the thrown error", async () => {
     const executor = makeExecutor({
       exitCode: 1,
       stderr: "boom",
       telemetry: { outcome: "error", numTurns: 2, durationMs: 4200, costUsd: null, tokensIn: null, tokensOut: null },
+      failure: {
+        category: "crash",
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 1,
+        retryable: false,
+        elapsedMs: 4200,
+        message: "boom",
+        evidence: { truncated: false },
+      },
     });
     const ctx = makeContext(executor);
 
@@ -136,6 +181,46 @@ describe("implementStep", () => {
 
     const failure = (err as Error & { failure?: { elapsedMs?: number } }).failure;
     expect(failure?.elapsedMs).toBe(4200);
+  });
+
+  it("forwards context.data.retryPolicy as retry with the implement-specific flags", async () => {
+    const executor = makeExecutor();
+    const ctx = new DefaultPipelineContext(
+      {
+        jobId: 1,
+        issueId: "issue-1",
+        issueIdentifier: "ENG-1",
+        issueTitle: "Test",
+        issueDescription: "Description",
+        nonce: "nonce",
+        orchestratorUrl: "http://localhost:8080",
+        retryPolicy: DEFAULT_RETRY_POLICY,
+      },
+      executor,
+    );
+
+    await implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+
+    expect(executor.invoke).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: "implement",
+        expectsStructuredOutput: false,
+        retry: {
+          policy: DEFAULT_RETRY_POLICY,
+          toolUseIsSafe: false,
+        },
+      }),
+    );
+  });
+
+  it("omits retry when context.data.retryPolicy is absent", async () => {
+    const executor = makeExecutor();
+    const ctx = makeContext(executor);
+
+    await implementStep.run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.retry).toBeUndefined();
   });
 
   it("propagates executor rejection", async () => {

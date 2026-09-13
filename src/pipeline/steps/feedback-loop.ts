@@ -96,6 +96,10 @@ export interface PassStat extends Record<string, unknown> {
   tokensOut?: number | null;
   cacheReadTokens?: number | null;
   cacheCreationTokens?: number | null;
+  /** Spawn attempts the implement call made for this pass (>1 only under a retried transient failure). */
+  attempts?: number;
+  /** Spawn attempts the review call made for this pass, when review ran (>1 only under a retried transient failure). */
+  reviewAttempts?: number;
 }
 
 interface FeedbackLoopOutputs extends Record<string, unknown> {
@@ -294,6 +298,8 @@ async function runPostMortem(
       model: params.model,
       maxTurns: POST_MORTEM_MAX_TURNS,
       tools: READ_ONLY_ALLOWED_TOOLS,
+      stage: `feedback-loop/post-mortem-${params.iteration}`,
+      expectsStructuredOutput: false,
     });
     if (result.exitCode !== 0 || !result.stdout.trim()) {
       throw new Error(`post-mortem invocation exited ${result.exitCode}`);
@@ -425,10 +431,21 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         implementSubStep.ended_at = new Date().toISOString();
         const implementStage = `feedback-loop/implement-${iteration}`;
         // Re-stamp `stage`: classifyThrown() passes an already-attached record
-        // (from implementStep's classifyLlmResult) through unchanged, which would
-        // otherwise leave the iteration-qualified stage never applied.
+        // (from the executor's classifyLlmResult, surfaced onto the thrown error by
+        // implementStep) through unchanged, which would otherwise leave the
+        // iteration-qualified stage never applied.
         const implementFailure = { ...classifyThrown(err, { stage: implementStage, attempt: 1 }), stage: implementStage };
-        implementSubStep.outputs = { error: String(err), failure: implementFailure };
+        // implement.ts (and the executor, for a spawn-level rejection) stamps
+        // `err.telemetry` when every attempt fails — surface it on the failed
+        // sub-step report too, or the tokens/cost that attempt burned are lost
+        // from the run's evidence entirely rather than merely absent from PassStat.
+        const implementErrTelemetry =
+          typeof err === "object" && err !== null ? (err as { telemetry?: RunTelemetry }).telemetry : undefined;
+        implementSubStep.outputs = {
+          error: String(err),
+          failure: implementFailure,
+          ...(implementErrTelemetry ? { telemetry: implementErrTelemetry } : {}),
+        };
         await reporter.report(implementSubStep);
         if (typeof err === "object" && err !== null) {
           try {
@@ -452,6 +469,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         tokensOut: implementTelemetry?.tokensOut ?? null,
         cacheReadTokens: implementTelemetry?.cacheReadTokens ?? null,
         cacheCreationTokens: implementTelemetry?.cacheCreationTokens ?? null,
+        attempts: implementOutputs.attempts,
       };
       passes.push(pass);
 
@@ -536,6 +554,7 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         feedback = reviewOutputs.feedback;
         reviewIssues = [...reviewOutputs.issues];
         pass.reviewApproved = reviewOutputs.approved;
+        pass.reviewAttempts = reviewOutputs.attempts;
         if (approved) terminationReason = "approved";
       } catch (err) {
         // A review failure (e.g. "Prompt is too long", a transient API error)
@@ -547,11 +566,15 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         reviewSubStep.ended_at = new Date().toISOString();
         const reviewStage = `feedback-loop/review-${iteration}`;
         // Re-stamp `stage`: classifyThrown() passes an already-attached record
-        // (from reviewStep's classifyLlmResult) through unchanged, which would
-        // otherwise leave the iteration-qualified stage never applied.
+        // (from the executor's classifyLlmResult, surfaced onto the thrown error by
+        // reviewStep) through unchanged, which would otherwise leave the
+        // iteration-qualified stage never applied.
+        const reviewErrTelemetry =
+          typeof err === "object" && err !== null ? (err as { telemetry?: RunTelemetry }).telemetry : undefined;
         reviewSubStep.outputs = {
           error: String(err),
           failure: { ...classifyThrown(err, { stage: reviewStage, attempt: 1 }), stage: reviewStage },
+          ...(reviewErrTelemetry ? { telemetry: reviewErrTelemetry } : {}),
         };
         await reporter.report(reviewSubStep);
         console.warn(

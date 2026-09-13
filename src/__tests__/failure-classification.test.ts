@@ -20,6 +20,7 @@ function llmResult(overrides: Partial<LLMResult> = {}): LLMResult {
     stderr: "",
     exitCode: 0,
     tokensUsed: 0,
+    attempts: 1,
     ...overrides,
   };
 }

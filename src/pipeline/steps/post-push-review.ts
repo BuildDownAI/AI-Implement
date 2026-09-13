@@ -961,6 +961,8 @@ Output ONLY valid JSON: {"approved": bool, "blocking_issues": [{"title": "string
         maxTurns: REVIEW_MAX_TURNS,
         tools: READ_ONLY_ALLOWED_TOOLS,
         jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
+        stage: `post-push-review/review-${iteration}`,
+        expectsStructuredOutput: true,
       });
       const reviewFailure = reviewFailureMessage(reviewResult);
       if (reviewFailure) {
@@ -1177,7 +1179,13 @@ ${feedback}
 ${externalReviewFindingsBlock(externalFindings)}
 </reviewer_feedback>`;
 
-      const fixResult = await context.llmExecutor.invoke({ prompt: fixPrompt, model, maxTurns: FIX_MAX_TURNS });
+      const fixResult = await context.llmExecutor.invoke({
+        prompt: fixPrompt,
+        model,
+        maxTurns: FIX_MAX_TURNS,
+        stage: `post-push-review/fix-${iteration}`,
+        expectsStructuredOutput: false,
+      });
       if (fixResult.exitCode !== 0) {
         priorLlmFailure = true;
         terminationReason = "fix_failed";

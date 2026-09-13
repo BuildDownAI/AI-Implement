@@ -41,6 +41,7 @@ const IMPLEMENT_SUCCESS = {
   exitCode: 0,
   subagentCount: 0,
   telemetry: { outcome: "success" as const, numTurns: 5, costUsd: 0.01, durationMs: 1000, tokensIn: 100, tokensOut: 50 },
+  attempts: 1,
 };
 
 const REVIEW_APPROVED = {
@@ -50,6 +51,7 @@ const REVIEW_APPROVED = {
   progressDelta: 10,
   feedback: "looks good",
   tokensUsed: 100,
+  attempts: 1,
 };
 
 const REVIEW_REJECTED = {
@@ -59,6 +61,7 @@ const REVIEW_REJECTED = {
   progressDelta: 50,
   feedback: "not done yet",
   tokensUsed: 50,
+  attempts: 1,
 };
 
 const NEW_FORMAT_CONTEXT = [
