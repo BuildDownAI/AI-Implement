@@ -301,15 +301,21 @@ the PR.
 The `accept-baseline` label changes only what the comment says, never what the guard decides: applying
 it to a PR whose dry run refused a tracker-file shrink changes the report's wording to "refused,
 accepted by label" (and, symmetrically, the commit status to success) without re-running anything —
-a `labeled` webhook event just re-posts the last computed verdict. The label is **report-only**. It
+a `labeled` webhook event just re-posts the last computed verdict. Removing the label (`unlabeled`,
+AII-640) re-posts the same verdict with the plain refusal wording and the status back to failure;
+the check forces `acceptBaseline: false` on `unlabeled` rather than reading the payload's `labels`
+array, which GitHub does not guarantee to reflect the removal by delivery time. Both events act only
+on the `accept-baseline` label itself. The label is **report-only**. It
 is a distinct mechanism from an admin accepting a new baseline at refresh time (AII-628): a real
 refresh against that same source still refuses the shrink unless that refresh-time acceptance has
 happened. Treat the label as "we've seen this and it's expected," not as a bypass.
 
 Outcomes are stored per PR, keyed by `repo#prNumber` and pinned to the head sha they ran against
 (AII-636), so a `labeled` re-report can only ever surface that PR's own verdict — never another PR's
-— and is a no-op once a new push supersedes the stored sha. The cache is bounded (`MAX_TRACKED_PRS`)
-and evicted immediately on PR close. A webhook head queued behind a 409 is woken by
+— and is a no-op once a new push supersedes the stored sha. The cache is bounded (`MAX_TRACKED_PRS`),
+evicted immediately on PR close, and persisted as one JSON blob under the `kg_refresh_dry_run_outcomes`
+settings key on every record and eviction, so a restart between a dry run and a later `labeled` /
+`unlabeled` event still finds the outcome (AII-640). A webhook head queued behind a 409 is woken by
 `onRefreshSettled` on every `running → false` transition, not only a dry-run's — a real refresh, a
 failure, a revert, TTL expiry, or a deploy hold clearing all wake it.
 
