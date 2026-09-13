@@ -328,7 +328,8 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     const failureReason = err instanceof Error ? err.message : String(err);
     console.error(`[kg-refresh] run failed: ${failureCode ?? "unknown"} — ${failureReason}`);
     // A guard refusal from kg-snapshot-push carries its per-part table on the error
-    // itself (AII-632) so a dry-run refusal still reports the table via get_kg_status.
+    // itself (AII-632) so both dry-run and real refusals report the table via
+    // get_kg_status (AII-638).
     const guardPartTable = isTrackerRegression
       ? (err as KgSnapshotTrackerRegressionError).partTable
       : undefined;
@@ -338,7 +339,7 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       outcome: "failure",
       failureReason: failureReason.slice(-4000),
       ...(failureCode ? { failureCode } : {}),
-      ...(kgDryRun && guardPartTable ? { guardVerdict: "refused" as const, partTable: guardPartTable } : {}),
+      ...(guardPartTable ? { guardVerdict: "refused" as const, partTable: guardPartTable } : {}),
       callbackUrl,
       fetchImpl: opts.fetchImpl,
     });
