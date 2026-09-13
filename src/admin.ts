@@ -339,7 +339,7 @@ export interface AdminDeps {
   selfDeployTarget?: SelfDeployTarget | null;
   /** The KG refresh rail (AII-426). Absent when no KG source repo is configured. */
   kgRefresh?: {
-    trigger(opts?: { dryRun?: boolean }): Promise<{ status: number; body: Record<string, unknown> }>;
+    trigger(opts?: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
     status(): Promise<KgRefreshStatus>;
     /** Called by the operator-cancel path to close the ingest chain cleanly. */
     onMachineLost(opts?: { failureCode?: string }): void;
@@ -442,22 +442,35 @@ export function handleAdminRequest(
       // (AII-632): same runner job, push skipped, guard table on the status. No body,
       // or `dryRun: false`, is the unchanged real refresh. The response echoes `dryRun`
       // beside the trigger's own fields so the caller can tell which mode ran.
+      // AII-628: `{ acceptNewBaseline?: boolean }` carries the one-shot content-guard
+      // override through to the dispatched runner, tagged with this session's identity
+      // for the guard-override log line and the refresh PR's ### Baseline section.
       const kgRefresh = deps.kgRefresh;
       readBody(req).then(
         (raw) => {
           let dryRun = false;
+          let acceptNewBaseline = false;
           if (raw.trim()) {
             try {
-              const parsed = JSON.parse(raw) as { dryRun?: unknown };
+              const parsed = JSON.parse(raw) as { dryRun?: unknown; acceptNewBaseline?: unknown };
               dryRun = parsed.dryRun === true;
+              acceptNewBaseline = parsed.acceptNewBaseline === true;
             } catch {
               json(res, 400, { error: "Invalid JSON body" });
               return;
             }
           }
-          const pending = dryRun ? kgRefresh.trigger({ dryRun: true }) : kgRefresh.trigger();
+          const opts: { dryRun?: boolean; acceptNewBaseline?: boolean; actorEmail?: string } = {};
+          if (dryRun) opts.dryRun = true;
+          if (acceptNewBaseline) {
+            opts.acceptNewBaseline = true;
+            // An access-code session has no email; name it so the log line and the
+            // ### Baseline section never read "unknown" for a real press.
+            opts.actorEmail = gate.identity?.email ?? "access-code session";
+          }
+          const pending = (dryRun || acceptNewBaseline) ? kgRefresh.trigger(opts) : kgRefresh.trigger();
           return pending.then(
-            (r) => json(res, r.status, { ...r.body, dryRun }),
+            (r) => json(res, r.status, { ...r.body, dryRun, acceptNewBaseline }),
             (err) => json(res, 500, { error: String(err) }),
           );
         },

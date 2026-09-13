@@ -206,8 +206,13 @@ export interface KgRefreshHandle {
    * run the rail against a PR's head. opts.report (AII-633), when set, posts the
    * dry-run's verdict to that PR (sticky comment always; commit status only when
    * the App has `statuses: write` on the PR's repo) once the dispatch completes.
+   * opts.acceptNewBaseline (AII-628) carries through to the dispatched runner's envelope
+   * so kg-snapshot-push treats the zero-shrink/50% content guards as warnings for this
+   * one dispatch and pushes anyway; opts.actorEmail rides along for the guard-override
+   * log line and the refresh PR's ### Baseline section. Neither flag is persisted —
+   * it applies to exactly the one dispatch this call makes.
    */
-  trigger(opts?: { dryRun?: boolean; ref?: string; report?: KgDryRunReportTarget }): Promise<{ status: number; body: Record<string, unknown> }>;
+  trigger(opts?: { dryRun?: boolean; ref?: string; report?: KgDryRunReportTarget; acceptNewBaseline?: boolean; actorEmail?: string }): Promise<{ status: number; body: Record<string, unknown> }>;
   /** GET /api/kg/status behind admin auth. */
   status(): Promise<KgRefreshStatus>;
   /**
@@ -1240,7 +1245,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   }
 
   return {
-    async trigger(opts?: { dryRun?: boolean; ref?: string; report?: KgDryRunReportTarget }) {
+    async trigger(opts?: { dryRun?: boolean; ref?: string; report?: KgDryRunReportTarget; acceptNewBaseline?: boolean; actorEmail?: string }) {
       // Self-heal: if a dispatched runner never reported back and the TTL has elapsed
       // in the live process, expire the lock so the operator can trigger a new refresh.
       if (running && stage === "ingest-running" && ingestStartedAt !== null &&
@@ -1389,6 +1394,9 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
               ...(kgDependencyTokenScope != null ? { dependencyTokenScope: kgDependencyTokenScope } : {}),
               ...(opts?.dryRun ? { kgDryRun: true as const } : {}),
               ...(opts?.ref ? { kgSourceRef: opts.ref } : {}),
+              ...(opts?.acceptNewBaseline
+                ? { kgAcceptNewBaseline: true as const, ...(opts.actorEmail ? { kgBaselineActor: opts.actorEmail } : {}) }
+                : {}),
             };
 
             // Write the row before starting the machine so waitForQuiet cannot

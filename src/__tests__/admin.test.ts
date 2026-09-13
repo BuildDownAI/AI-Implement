@@ -1571,6 +1571,9 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     kgRefreshDeps.trigger.mockClear();
   });
 
+  // The listed SSO admin the suite seeds (see adminConfig): an identity-bearing session.
+  const ssoAdmin = { email: "ada@eudoxus.ai", sub: "google|123", provider: "google" };
+
   async function kgRequest(
     url: string,
     method: string,
@@ -1624,6 +1627,30 @@ describe("admin kg refresh dry-run (AII-635)", () => {
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toBe("Invalid JSON body");
     expect(kgRefreshDeps.trigger).not.toHaveBeenCalled();
+  });
+
+  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an SSO session reaches the trigger with the session's email as actor (AII-628)", async () => {
+    const token = adminSession.createSession(ssoAdmin);
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
+    expect(res.statusCode).toBe(202);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledTimes(1);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
+    expect(JSON.parse(res.body)).toMatchObject({ accepted: true, dryRun: false, acceptNewBaseline: true });
+  });
+
+  it("POST /api/kg/refresh with { acceptNewBaseline: true } from an access-code session names the actor 'access-code session' (AII-628)", async () => {
+    const token = await login("secret");
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { acceptNewBaseline: true });
+    expect(res.statusCode).toBe(202);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ acceptNewBaseline: true, actorEmail: "access-code session" });
+  });
+
+  it("POST /api/kg/refresh with { dryRun: true, acceptNewBaseline: true } passes both through (AII-628)", async () => {
+    const token = adminSession.createSession(ssoAdmin);
+    const res = await kgRequest("/api/kg/refresh", "POST", token, { dryRun: true, acceptNewBaseline: true });
+    expect(res.statusCode).toBe(202);
+    expect(kgRefreshDeps.trigger).toHaveBeenCalledWith({ dryRun: true, acceptNewBaseline: true, actorEmail: "ada@eudoxus.ai" });
+    expect(JSON.parse(res.body)).toMatchObject({ dryRun: true, acceptNewBaseline: true });
   });
 
   it("the Deployments page carries the Dry-run refresh button and the last-dry-run block", async () => {

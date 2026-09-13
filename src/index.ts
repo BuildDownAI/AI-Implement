@@ -3876,7 +3876,8 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
           })
         : undefined;
       const getKgStatusFn = () => kgRefresh.status();
-      const triggerKgRefreshFn = (dryRun?: boolean) => kgRefresh.trigger({ dryRun });
+      const triggerKgRefreshFn = (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) =>
+        kgRefresh.trigger({ dryRun, acceptNewBaseline, actorEmail });
       // Same AdminConfig shape the /admin routes build (line ~3908) — the five write
       // tools below reuse the admin route's own action functions.
       const mcpAdminConfig: AdminConfig = {

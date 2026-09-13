@@ -245,7 +245,7 @@ async function callMcp(
   providerDiagnostic?: string | null,
   runKgRefreshPreflight?: () => Promise<PreflightCheckResult>,
   getKgStatus?: () => Promise<KgRefreshStatus>,
-  triggerKgRefresh?: (dryRun?: boolean) => Promise<{ status: number; body: Record<string, unknown> }>,
+  triggerKgRefresh?: (dryRun?: boolean, acceptNewBaseline?: boolean, actorEmail?: string) => Promise<{ status: number; body: Record<string, unknown> }>,
   writeContext?: McpWriteContext,
 ): Promise<{ statusCode: number; body: string; responseHeaders: Record<string, string> }> {
   (mcpOauth.verifyMcpToken as ReturnType<typeof vi.fn>).mockReturnValue(
@@ -1435,7 +1435,7 @@ describe("handleMcpRequest", () => {
       expect(result.statusCode).toBe(200);
       const parsed = JSON.parse(result.body);
       expect(parsed.result.isError).not.toBe(true);
-      expect(triggerMock).toHaveBeenCalledWith(true);
+      expect(triggerMock).toHaveBeenCalledWith(true, false, "user@example.com");
     });
 
     it("as admin, omitting dryRun passes false through to triggerKgRefresh", async () => {
@@ -1455,7 +1455,7 @@ describe("handleMcpRequest", () => {
         triggerMock,
       );
 
-      expect(triggerMock).toHaveBeenCalledWith(false);
+      expect(triggerMock).toHaveBeenCalledWith(false, false, "user@example.com");
     });
 
     it("as user, dryRun:true is still refused and triggerKgRefresh is never called (AII-632)", async () => {
@@ -1469,6 +1469,87 @@ describe("handleMcpRequest", () => {
         BASE_URL,
         "POST",
         JSON.stringify({ jsonrpc: "2.0", id: 47, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { dryRun: true } } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).toBe(true);
+      expect(parsed.result.content[0].text).toBe("forbidden: trigger_kg_refresh requires the admin role");
+      expect(triggerMock).not.toHaveBeenCalled();
+    });
+
+    it("trigger_kg_refresh's inputSchema declares an optional acceptNewBaseline boolean (AII-628)", async () => {
+      mockRole("admin");
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        '{"jsonrpc":"2.0","id":48,"method":"tools/list","params":{}}',
+      );
+      const tool = JSON.parse(result.body).result.tools.find((t: { name: string }) => t.name === "trigger_kg_refresh");
+      expect(tool.inputSchema.properties.acceptNewBaseline.type).toBe("boolean");
+    });
+
+    it("as admin, acceptNewBaseline:true is passed through to triggerKgRefresh with the actor's email (AII-628)", async () => {
+      mockRole("admin");
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 49, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { acceptNewBaseline: true } } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(result.statusCode).toBe(200);
+      const parsed = JSON.parse(result.body);
+      expect(parsed.result.isError).not.toBe(true);
+      expect(triggerMock).toHaveBeenCalledWith(false, true, "user@example.com");
+    });
+
+    it("as admin, omitting acceptNewBaseline passes false through to triggerKgRefresh", async () => {
+      mockRole("admin");
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+
+      await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 50, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: {} } }),
+        undefined,
+        undefined,
+        undefined,
+        triggerMock,
+      );
+
+      expect(triggerMock).toHaveBeenCalledWith(false, false, "user@example.com");
+    });
+
+    it("as user, acceptNewBaseline:true is refused and triggerKgRefresh is never called (AII-628)", async () => {
+      mockRole("user");
+      const triggerMock = vi.fn(async () => ({ status: 202, body: { accepted: true } }));
+
+      const result = await callMcp(
+        { authorization: "Bearer tok" },
+        true,
+        null,
+        BASE_URL,
+        "POST",
+        JSON.stringify({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "trigger_kg_refresh", arguments: { acceptNewBaseline: true } } }),
         undefined,
         undefined,
         undefined,

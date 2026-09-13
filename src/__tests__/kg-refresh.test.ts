@@ -1306,6 +1306,57 @@ describe("kg-refresh", () => {
       });
     });
 
+    describe("accept-new-baseline trigger (AII-628)", () => {
+      it("runConfig envelope carries kgAcceptNewBaseline and kgBaselineActor when trigger({ acceptNewBaseline: true, actorEmail }) is called", async () => {
+        buildDispatch();
+        await handle.trigger({ acceptNewBaseline: true, actorEmail: "operator@example.com" });
+        await waitForStage("ingest-running");
+        const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+        const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+        expect(decoded.kgAcceptNewBaseline).toBe(true);
+        expect(decoded.kgBaselineActor).toBe("operator@example.com");
+      });
+
+      it("runConfig envelope omits kgAcceptNewBaseline/kgBaselineActor for a plain trigger() call", async () => {
+        buildDispatch();
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+        const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+        expect(decoded).not.toHaveProperty("kgAcceptNewBaseline");
+        expect(decoded).not.toHaveProperty("kgBaselineActor");
+      });
+
+      it("runConfig envelope omits kgBaselineActor when acceptNewBaseline is set without an actorEmail", async () => {
+        buildDispatch();
+        await handle.trigger({ acceptNewBaseline: true });
+        await waitForStage("ingest-running");
+        const call = dispatchRun.mock.calls[0][0] as { runConfig: string };
+        const decoded = JSON.parse(Buffer.from(call.runConfig, "base64").toString("utf-8")) as Record<string, unknown>;
+        expect(decoded.kgAcceptNewBaseline).toBe(true);
+        expect(decoded).not.toHaveProperty("kgBaselineActor");
+      });
+
+      it("does not persist acceptNewBaseline in the stage envelope (unlike dryRun)", async () => {
+        const persistStageCapture = vi.fn();
+        buildDispatch({ persistStage: persistStageCapture, loadStage: () => null });
+        await handle.trigger({ acceptNewBaseline: true, actorEmail: "operator@example.com" });
+        await waitForStage("ingest-running");
+        const ingestRunningCall = persistStageCapture.mock.calls.find((c) => c[0] === "ingest-running");
+        expect(ingestRunningCall).toBeTruthy();
+        const envelope = ingestRunningCall![2] as Record<string, unknown>;
+        expect(envelope).not.toHaveProperty("acceptNewBaseline");
+      });
+
+      it("does not bypass the callback-unconfigured precondition", async () => {
+        buildDispatch({ runnerCallbackBaseUrl: null });
+        const r = await handle.trigger({ acceptNewBaseline: true });
+        expect(r.status).toBe(422);
+        expect((r.body as { precondition?: string }).precondition).toBe("callback-unconfigured");
+        expect(dispatchRun).not.toHaveBeenCalled();
+      });
+    });
+
     it("onRunnerComplete failure sets stage to failed and clears running", async () => {
       buildDispatch();
       await handle.trigger();
