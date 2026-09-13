@@ -9,6 +9,12 @@ const RUNNER_CREDENTIAL_KEYS = [
   "RUN_TOKEN",
 ] as const;
 
+// Install-step credentials. NPM_TOKEN normally arrives through the forwarded-
+// secrets rail and is stripped by name below, but it is also stripped here so
+// a token injected outside that rail (e.g. an app-wide Fly secret or a local
+// Docker env) still never reaches the model.
+const INSTALL_CREDENTIAL_KEYS = ["NPM_TOKEN"] as const;
+
 export const GITHUB_WRITE_CREDENTIAL_KEYS = [
   "GITHUB_TOKEN",
   "GH_TOKEN",
@@ -53,7 +59,8 @@ export function repoProcessEnv(): NodeJS.ProcessEnv {
  * always stripped. GitHub write tokens are stripped unless allowRepositoryWrites
  * is true (gap-fill sessions that own their existing PR branch). Forwarded
  * secrets named in AI_IMPLEMENT_FORWARDED_SECRETS are also stripped — they are
- * available to hooks but must never reach the model process.
+ * available to hooks but must never reach the model process — as is the
+ * install step's NPM_TOKEN regardless of how it was injected.
  */
 export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -64,6 +71,7 @@ export function modelProcessEnv(allowRepositoryWrites: boolean): NodeJS.ProcessE
   if (!allowRepositoryWrites) {
     for (const key of GITHUB_WRITE_CREDENTIAL_KEYS) delete env[key];
   }
+  for (const key of INSTALL_CREDENTIAL_KEYS) delete env[key];
   for (const key of parseForwardedSecrets()) delete env[key];
   // The list variable itself must not reach the model — it names what was hidden
   delete env.AI_IMPLEMENT_FORWARDED_SECRETS;

@@ -82,6 +82,8 @@ Two producers set `AI_IMPLEMENT_FORWARDED_SECRETS`:
 
 One consumer: `src/pipeline/process-env.ts`. `parseForwardedSecrets()` reads the list; `modelProcessEnv()` deletes each named key before Claude Code starts. `repoProcessEnv()` — used for hooks and dependency install — leaves forwarded secrets in place.
 
+The built-in `install` step is the one step that reads a forwarded secret by a fixed name: when `NPM_TOKEN` and the `AI_IMPLEMENT_NPM_REGISTRY` variable are both present it writes a per-run npm user config for the install command and removes it afterwards, so a private registry can be authenticated before any hook runs — see [private-npm-registry.md](private-npm-registry.md).
+
 ## How steps get their inputs
 
 This is the least obvious part of the design, and the easiest thing to get wrong when extending it.
