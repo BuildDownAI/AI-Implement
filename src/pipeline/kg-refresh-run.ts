@@ -161,6 +161,8 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   maxTurns: number | undefined;
   dependencyTokenScope: "installation" | undefined;
   kgDryRun: boolean;
+  kgAcceptNewBaseline: boolean;
+  kgBaselineActor: string | undefined;
 } {
   const rawConfig = env.AI_IMPLEMENT_RUN_CONFIG;
   let issueId = "";
@@ -171,6 +173,8 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
   let maxTurns: number | undefined;
   let dependencyTokenScope: "installation" | undefined;
   let kgDryRun = false;
+  let kgAcceptNewBaseline = false;
+  let kgBaselineActor: string | undefined;
 
   if (rawConfig) {
     try {
@@ -185,6 +189,8 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
       }
       dependencyTokenScope = cfg.dependencyTokenScope;
       kgDryRun = cfg.kgDryRun === true;
+      kgAcceptNewBaseline = cfg.kgAcceptNewBaseline === true;
+      kgBaselineActor = cfg.kgBaselineActor;
     } catch (err) {
       console.warn("[kg-refresh] Could not decode run_config envelope; using env fallbacks:", err);
     }
@@ -213,6 +219,8 @@ function resolveKgRefreshInputs(env: NodeJS.ProcessEnv): {
     maxTurns,
     dependencyTokenScope,
     kgDryRun,
+    kgAcceptNewBaseline,
+    kgBaselineActor,
   };
 }
 
@@ -234,6 +242,8 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
     maxTurns,
     dependencyTokenScope,
     kgDryRun: kgDryRunFromConfig,
+    kgAcceptNewBaseline,
+    kgBaselineActor,
   } = resolveKgRefreshInputs(process.env);
 
   // The env var stays as the dev-harness path (AII-586); the envelope field is the
@@ -263,6 +273,8 @@ export async function runKgRefresh(opts: RunKgRefreshOptions = {}): Promise<RunK
       callbackUrl: callbackUrl ?? undefined,
       dependencyTokenScope,
       kgDryRun,
+      kgAcceptNewBaseline,
+      kgBaselineActor,
     },
     opts.llmExecutor ?? new ClaudeCliExecutor(workspaceDir, resolveLogLevel(process.env.AI_IMPLEMENT_LOG_LEVEL)),
   );

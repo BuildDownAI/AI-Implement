@@ -401,6 +401,44 @@ pre-dispatch stage are written into the same persisted stage envelope as `dispat
 kept only in memory), so a callback arriving after an orchestrator restart mid-`ingest-running` is
 still recognized and handled as a dry run instead of falling through to the real staging rail.
 
+### Accept-new-baseline plumbing (AII-628)
+
+`trigger_kg_refresh { acceptNewBaseline: true }` (the MCP tool, admin role), `POST /api/kg/refresh`
+with body `{ "acceptNewBaseline": true }`, and the Deployments page's **Accept new baseline &
+refresh** button (a separate, confirm-gated control beside **Refresh graph now** and **Dry-run
+refresh** — deliberately not a third argument to the existing refresh button, so accepting a shrink
+is always a distinct, deliberate click after reading the guard table, never the default path) all
+carry the same flag through the same envelope path `dryRun` already established: `trigger(opts)`
+sets `kgAcceptNewBaseline: true` on the `RunConfigV1` it builds, along with `kgBaselineActor` (the
+caller's email — from `identity.email` on the MCP path, from the admin session on the REST path) —
+`resolveKgRefreshInputs` in `kg-refresh-run.ts` decodes both back out and puts them on
+`PipelineContextData` as `kgAcceptNewBaseline`/`kgBaselineActor`, and `pipeline-loader.ts` forwards
+them into `kg-snapshot-push`'s `acceptNewBaseline`/`baselineActor` inputs, the same shape as
+`kgDryRun`/`dryRun`.
+
+**The actor rides the envelope because the guard runs inside the runner, not the orchestrator.**
+`dryRun` never needed to attribute anything to a person; this flag does, and the code that decides
+whether to push (and writes the refresh PR body) runs in the dispatched container, a separate
+process from whichever door the operator called.
+
+Inside `kg-snapshot-push.ts`, guard 0b's regressions split into two classes: a part missing
+entirely is a **hard regression** and always refuses, flag or not; a part shrinking (the zero-shrink
+rule or the general 50% rule) is a **soft regression** — when `acceptNewBaseline` is set, these are
+logged (`[kg-refresh] baseline accepted by <email>`) and the run proceeds instead of throwing. The
+per-part table already prints unconditionally before either check fires, so an accepted run's table
+looks identical to a refused one; only the guard verdict and the new `### Baseline` section in the
+refresh report (which becomes the PR body on a real push, or is printed on a dry run) distinguish
+them. Guard 0 (the `fetched=false` tracker-regression check, a different failure — the tracker
+fetch itself failed, not a content reclassification) is never overridden by this flag.
+
+**The flag is never persisted** (unlike `dryRun`, which is written into the same stage envelope as
+`dispatchId`/`jobId` so a callback arriving after an orchestrator restart is still recognized as a
+dry run). `acceptNewBaseline` only changes runner-side guard evaluation inside the one dispatched
+job; there is no "callback arrives after restart and needs reclassifying" case for it, because the
+orchestrator's own handling of the callback (success or failure) does not change based on whether a
+shrink was accepted — only the pushed content and the PR body do, and those are already decided by
+the time the callback lands.
+
 ### The `index.ts` budget
 
 Full separation from `index.ts` is not achievable, because reuse forbids it: admin auth reaches
@@ -483,6 +521,12 @@ following hold:
 | Missing part | A part file present in the previous snapshot is absent from the working tree |
 | General shrink | Any part file's line count is below `PART_SHRINK_THRESHOLD` (50 %) of its previous count |
 | `issue.nt` / `comment.nt` zero-shrink | `issue.nt` or `comment.nt` shrinks by any amount when the `kg-tracker-data` step reported a non-zero `issueCount` |
+
+The general-shrink and zero-shrink rules — but never the missing-part rule, nor the separate
+`fetched=false` tracker guard above them — can be overridden for one dispatch with
+`acceptNewBaseline` (AII-628, below): an intentional change in what the ingest emits (a base-repo
+classification change, for example) also shrinks these files, and the guard has no way to
+distinguish that from data loss on its own.
 
 One log line listing all parts with `prev=` and `new=` counts is emitted on every push attempt,
 pass or fail. The `fetched=false` flag check (which guards against a docs-only push replacing a

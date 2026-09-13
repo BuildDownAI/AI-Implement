@@ -442,6 +442,8 @@ function applyWiring(step: YamlStep): StepDefinition {
             clonedRef: ctx.getOutputs("clone").clonedRef,
             defaultBranch: ctx.data.branch,
             dryRun: ctx.data.kgDryRun === true,
+            acceptNewBaseline: ctx.data.kgAcceptNewBaseline === true,
+            baselineActor: ctx.data.kgBaselineActor,
             repoOwner: ctx.getOutputs("clone").repoOwner,
             repoRepo: ctx.getOutputs("clone").repoRepo,
             orchestratorUrl: ctx.data.orchestratorUrl,

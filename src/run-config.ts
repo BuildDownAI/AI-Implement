@@ -17,6 +17,11 @@ export interface RunConfigV1 {
   kgSourceRepo?: string;
   /** True when this kg-refresh dispatch should run kg-snapshot-push in dry-run mode (AII-632). */
   kgDryRun?: true;
+  /** True when this kg-refresh dispatch should downgrade the zero-shrink/50% push guards to
+   *  warnings and push anyway (AII-628). Applies to exactly this one dispatch — never persisted. */
+  kgAcceptNewBaseline?: true;
+  /** Email of the admin who set kgAcceptNewBaseline, for the guard-override log line and the refresh PR's ### Baseline section. */
+  kgBaselineActor?: string;
   branchPrefix?: string;
   skillsRepo?: string;
   runnerCallbackUrl?: string;
@@ -100,7 +105,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
-    kgDryRun, referenceRepos } = cfg;
+    kgDryRun, kgAcceptNewBaseline, kgBaselineActor, referenceRepos } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -118,6 +123,8 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (dependencyTokenScope !== undefined) out.dependencyTokenScope = dependencyTokenScope;
   if (kgSourceRepo !== undefined) out.kgSourceRepo = kgSourceRepo;
   if (kgDryRun !== undefined) out.kgDryRun = kgDryRun;
+  if (kgAcceptNewBaseline !== undefined) out.kgAcceptNewBaseline = kgAcceptNewBaseline;
+  if (kgBaselineActor !== undefined) out.kgBaselineActor = kgBaselineActor;
   if (referenceRepos !== undefined) out.referenceRepos = referenceRepos;
   return out;
 }

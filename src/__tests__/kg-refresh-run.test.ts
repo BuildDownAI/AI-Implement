@@ -1018,6 +1018,251 @@ describe("kgSnapshotPushStep — content-based regression guard", () => {
   });
 });
 
+describe("kgSnapshotPushStep — acceptNewBaseline flag (AII-628)", () => {
+  let tmpDir: string;
+  let bareDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "kgpush-baseline-"));
+    bareDir = mkdtempSync(join(tmpdir(), "kgpush-baseline-bare-"));
+    execSync("git init --bare", { cwd: bareDir, stdio: "ignore" });
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(bareDir, { recursive: true, force: true });
+    delete process.env.AI_IMPLEMENT_WORKSPACE_MODE;
+    vi.unstubAllGlobals();
+  });
+
+  function makeLines(n: number): string {
+    return "<s> <p> <o> .\n".repeat(n);
+  }
+
+  function commitPreviousSnapshot(partsContent: Record<string, string>, stamp = "2026-01-01T00:00:00Z"): void {
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    for (const [name, content] of Object.entries(partsContent)) {
+      writeFileSync(join(tmpDir, "snapshot", "parts", name), content);
+    }
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), stamp);
+    execSync("git add snapshot/", { cwd: tmpDir, stdio: "ignore" });
+    execSync("git commit -m 'prev snapshot'", { cwd: tmpDir, stdio: "ignore" });
+  }
+
+  function writeWorkingTree(partsContent: Record<string, string>, stamp = "2026-09-12T10:00:00Z"): void {
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    for (const [name, content] of Object.entries(partsContent)) {
+      writeFileSync(join(tmpDir, "snapshot", "parts", name), content);
+    }
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), stamp);
+  }
+
+  function redirectGithubRemote(): void {
+    execSync(
+      `git config url."${bareDir}".insteadOf "https://x-access-token:fake-token@github.com/acme/kg-repo.git"`,
+      { cwd: tmpDir, stdio: "ignore" },
+    );
+  }
+
+  function stubPrCreate(number: number, url: string): void {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({ html_url: url, number }),
+      text: async () => "",
+    } as Response);
+  }
+
+  function makeInputs(overrides: Record<string, unknown> = {}) {
+    return {
+      workspaceDir: tmpDir,
+      githubToken: "fake-token",
+      defaultBranch: "main",
+      clonedRef: resolveHead(tmpDir),
+      repoOwner: "acme",
+      repoRepo: "kg-repo",
+      ...overrides,
+    };
+  }
+
+  it("without the flag, a shrinking comment.nt still refuses exactly as today", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
+    const clonedRef = resolveHead(tmpDir);
+    writeWorkingTree({ "comment.nt": makeLines(3793) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
+    const err = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter).catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("comment.nt");
+  });
+
+  it("with acceptNewBaseline, a shrinking comment.nt does not throw and the push proceeds", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+    writeWorkingTree({ "comment.nt": makeLines(3793) });
+    stubPrCreate(21, "https://github.com/acme/kg-repo/pull/21");
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
+    const result = await kgSnapshotPushStep.run(
+      ctx,
+      makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
+      noopReporter,
+    );
+    expect(result.snapshotPushed).toBe(true);
+    expect(result.prNumber).toBe(21);
+  });
+
+  it("with acceptNewBaseline, a general (non-tracker) 50% shrink also does not throw", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "doc.nt": makeLines(100) });
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+    writeWorkingTree({ "doc.nt": makeLines(10) });
+    stubPrCreate(22, "https://github.com/acme/kg-repo/pull/22");
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 5 });
+    const result = await kgSnapshotPushStep.run(
+      ctx,
+      makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
+      noopReporter,
+    );
+    expect(result.snapshotPushed).toBe(true);
+  });
+
+  it("acceptNewBaseline never overrides a missing-part regression", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "issue.nt": makeLines(100) });
+    const clonedRef = resolveHead(tmpDir);
+    rmSync(join(tmpDir, "snapshot", "parts", "issue.nt"));
+    writeWorkingTree({ "doc.nt": makeLines(50) });
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 100 });
+    const err = await kgSnapshotPushStep
+      .run(ctx, makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }), noopReporter)
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(KgSnapshotTrackerRegressionError);
+    expect(err.message).toContain("missing");
+  });
+
+  it("acceptNewBaseline is a no-op when nothing actually shrank — no log line, no Baseline section", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "doc.nt": makeLines(100) });
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+      redirectGithubRemote();
+      writeWorkingTree({ "doc.nt": makeLines(110) });
+      stubPrCreate(23, "https://github.com/acme/kg-repo/pull/23");
+
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 5 });
+      const result = await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
+        noopReporter,
+      );
+      expect(result.snapshotPushed).toBe(true);
+      const acceptedCall = logSpy.mock.calls.find((c) => String(c[0]).includes("baseline accepted"));
+      expect(acceptedCall).toBeUndefined();
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("logs '[kg-refresh] baseline accepted by <email>' exactly once when a shrink is accepted", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      initGitRepo(tmpDir);
+      commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
+      execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+      execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+      const clonedRef = resolveHead(tmpDir);
+      redirectGithubRemote();
+      writeWorkingTree({ "comment.nt": makeLines(3793) });
+      stubPrCreate(24, "https://github.com/acme/kg-repo/pull/24");
+
+      const ctx = makeContext();
+      ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
+      await kgSnapshotPushStep.run(
+        ctx,
+        makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
+        noopReporter,
+      );
+      const acceptedCalls = logSpy.mock.calls.filter((c) => String(c[0]).includes("baseline accepted"));
+      expect(acceptedCalls).toHaveLength(1);
+      expect(String(acceptedCalls[0][0])).toBe("[kg-refresh] baseline accepted by operator@example.com");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("the refresh PR body carries a ### Baseline section naming the actor and the shrunk part", async () => {
+    initGitRepo(tmpDir);
+    commitPreviousSnapshot({ "comment.nt": makeLines(9995) });
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+    writeWorkingTree({ "comment.nt": makeLines(3793) });
+    stubPrCreate(25, "https://github.com/acme/kg-repo/pull/25");
+
+    const ctx = makeContext();
+    ctx.setOutputs("kg-tracker-data", { fetched: true, issueCount: 744 });
+    await kgSnapshotPushStep.run(
+      ctx,
+      makeInputs({ clonedRef, acceptNewBaseline: true, baselineActor: "operator@example.com" }),
+      noopReporter,
+    );
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [, req] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse((req as RequestInit).body as string);
+    expect(body.body).toContain("### Baseline");
+    expect(body.body).toContain("operator@example.com");
+    expect(body.body).toContain("comment.nt");
+    expect(body.body).toContain("**Guard verdict:** clean (baseline accepted)");
+  });
+
+  it("without acceptNewBaseline, the refresh PR body carries no ### Baseline section", async () => {
+    initGitRepo(tmpDir);
+    execSync(`git remote add origin "${bareDir}"`, { cwd: tmpDir, stdio: "ignore" });
+    execSync("git push origin HEAD:refs/heads/main", { cwd: tmpDir, stdio: "ignore" });
+    const clonedRef = resolveHead(tmpDir);
+    redirectGithubRemote();
+    mkdirSync(join(tmpDir, "snapshot", "parts"), { recursive: true });
+    writeFileSync(join(tmpDir, "snapshot", "parts", "docs.nt"), makeLines(1));
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.npz"), "binary");
+    writeFileSync(join(tmpDir, "snapshot", "embeddings.stamp"), "2026-09-12T10:00:00Z");
+    stubPrCreate(26, "https://github.com/acme/kg-repo/pull/26");
+
+    const ctx = makeContext();
+    const result = await kgSnapshotPushStep.run(ctx, makeInputs({ clonedRef }), noopReporter);
+    expect(result.snapshotPushed).toBe(true);
+
+    const [, req] = vi.mocked(fetch).mock.calls[0];
+    const body = JSON.parse((req as RequestInit).body as string);
+    expect(body.body).not.toContain("### Baseline");
+    expect(body.body).toContain("**Guard verdict:** clean");
+  });
+});
+
 // ── kgTrackerDataStep ─────────────────────────────────────────────────────────
 
 describe("kgTrackerDataStep", () => {
@@ -1853,6 +2098,36 @@ describe("applyWiring for kg-snapshot-push", () => {
     expect(inputs.defaultBranch).toBe("main");
     expect(inputs.repoOwner).toBe("org");
     expect(inputs.repoRepo).toBe("repo");
+  });
+
+  it("wires acceptNewBaseline and baselineActor from context (AII-628)", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-snapshot-push");
+    const ctx = makeContext({ branch: "main", kgAcceptNewBaseline: true, kgBaselineActor: "operator@example.com" });
+    ctx.setOutputs("clone", { workspaceDir: "/ws" });
+
+    const inputs = ctx.resolveInputs(step!.inputs) as { acceptNewBaseline: boolean; baselineActor: string };
+    expect(inputs.acceptNewBaseline).toBe(true);
+    expect(inputs.baselineActor).toBe("operator@example.com");
+  });
+
+  it("defaults acceptNewBaseline to false and baselineActor to undefined when absent from context", () => {
+    const pipeline = loadPipelineDefinition("pipelines/kg-refresh.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: () => KG_REFRESH_PIPELINE_YAML,
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "kg-snapshot-push");
+    const ctx = makeContext({ branch: "main" });
+    ctx.setOutputs("clone", { workspaceDir: "/ws" });
+
+    const inputs = ctx.resolveInputs(step!.inputs) as { acceptNewBaseline: boolean; baselineActor: string | undefined };
+    expect(inputs.acceptNewBaseline).toBe(false);
+    expect(inputs.baselineActor).toBeUndefined();
   });
 
   it("wires scope from kg-scope-reconcile outputs", () => {
