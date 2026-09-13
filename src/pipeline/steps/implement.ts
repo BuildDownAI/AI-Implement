@@ -19,6 +19,7 @@ interface ImplementOutputs extends Record<string, unknown> {
   exitCode: number;
   subagentCount: number;
   telemetry?: RunTelemetry;
+  attempts: number;
 }
 
 function buildReferenceReposSection(results: ReferenceRepoResult[]): string {
@@ -69,10 +70,14 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       fullPrompt += `\n\n${buildReferenceReposSection(referenceRepoResults)}`;
     }
 
+    const { retryPolicy } = context.data;
     const result = await context.llmExecutor.invoke({
       prompt: fullPrompt,
       model: model ?? "claude-sonnet-5",
       maxTurns,
+      stage: "implement",
+      expectsStructuredOutput: false,
+      retry: retryPolicy ? { policy: retryPolicy, toolUseIsSafe: false } : undefined,
     });
 
     // A max_turns termination is a completed-but-capped pass, not an invocation
@@ -81,13 +86,25 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
     if (result.exitCode !== 0 && result.telemetry?.outcome !== "max_turns") {
       const err = new Error(
         `LLM invocation failed with exit code ${result.exitCode}${formatLlmResultDetail(result)}`,
-      ) as Error & { failure?: FailureRecord };
-      err.failure = classifyLlmResult(result, {
-        stage: "implement",
-        attempt: 1,
-        expectsStructuredOutput: false,
-        elapsedMs: result.telemetry?.durationMs ?? undefined,
-      });
+      ) as Error & { failure?: FailureRecord; telemetry?: RunTelemetry };
+      // The executor already classified this failure (with the correct
+      // expectsStructuredOutput/attempt/elapsedMs) when deciding whether to retry.
+      // A custom LLMExecutor (e.g. a test seam) may settle a non-zero exit without
+      // attaching one at all — fall back to classifying it here so failure_json is
+      // never empty just because the executor that produced this result didn't.
+      err.failure =
+        result.failure ??
+        classifyLlmResult(result, {
+          stage: "implement",
+          attempt: result.attempts ?? 1,
+          expectsStructuredOutput: false,
+          elapsedMs: result.telemetry?.durationMs ?? undefined,
+        });
+      // Carry whatever telemetry this settled (but failing) attempt reported —
+      // a spawn-level rejection already stamps this on the executor's own thrown
+      // error, but a settled LLMResult never did; without it the failed sub-step
+      // report built from this error would lose the tokens/cost this attempt burned.
+      err.telemetry = result.telemetry;
       throw err;
     }
 
@@ -97,6 +114,7 @@ export const implementStep: StepModule<ImplementInputs, ImplementOutputs> = {
       exitCode: result.exitCode,
       subagentCount: 0,
       telemetry: result.telemetry,
+      attempts: result.attempts ?? 1,
     };
   },
 };

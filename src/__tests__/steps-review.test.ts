@@ -2,11 +2,19 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { reviewStep } from "../pipeline/steps/review.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
+import { DEFAULT_RETRY_POLICY } from "../pipeline/retry-backoff.js";
 import type { LLMExecutor, LLMResult } from "../pipeline/types.js";
 
 function makeExecutor(structuredOutput: unknown = undefined, exitCode = 0, tokensUsed = 0, stdout = "Review complete"): LLMExecutor {
   return {
-    invoke: vi.fn().mockResolvedValue({ stdout, exitCode, tokensUsed, structuredOutput, terminalStatus: { subtype: "success", isError: false } } satisfies LLMResult),
+    invoke: vi.fn().mockResolvedValue({
+      stdout,
+      exitCode,
+      tokensUsed,
+      attempts: 1,
+      structuredOutput,
+      terminalStatus: { subtype: "success", isError: false },
+    } satisfies LLMResult),
   };
 }
 
@@ -55,6 +63,35 @@ describe("reviewStep", () => {
       .rejects.toThrow("approved=false requires at least one blocking_issues entry");
   });
 
+  it("attaches a classified failure and telemetry to a negative verdict with no blocking issues (BAC-27201)", async () => {
+    const telemetry = { outcome: "success" as const, numTurns: 4, durationMs: 500, costUsd: 0.07, tokensIn: 10, tokensOut: 20 };
+    const executor: LLMExecutor = {
+      invoke: vi.fn().mockResolvedValue({
+        stdout: "Review complete",
+        exitCode: 0,
+        tokensUsed: 0,
+        attempts: 1,
+        structuredOutput: { ...APPROVED_VERDICT, approved: false },
+        terminalStatus: { subtype: "success", isError: false },
+        telemetry,
+      } satisfies LLMResult),
+    };
+
+    const err = await reviewStep
+      .run(makeContext(executor), {}, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const failure = (err as Error & { failure?: { category?: string; code?: string; message?: string } }).failure;
+    expect(failure).toBeDefined();
+    expect(failure?.category).toBe("invalid_output");
+    expect(failure?.code).toBe("INVALID_STRUCTURED_OUTPUT");
+    expect(failure?.message).toContain("approved=false requires at least one blocking_issues entry");
+    // reviewCostUsd (feedback-loop.ts) is read straight off this attached telemetry — a
+    // malformed verdict must not leave it null just because the throw was a bare Error.
+    expect((err as Error & { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
+  });
+
   it.each([
     ["missing terminal event", { terminalStatus: undefined }, "did not return a terminal result event"],
     ["error terminal event", { terminalStatus: { subtype: "success", isError: true } }, "error terminal result"],
@@ -71,6 +108,44 @@ describe("reviewStep", () => {
     };
     await expect(reviewStep.run(makeContext(executor), {}, new NoopStepReporter()))
       .rejects.toThrow(message);
+  });
+
+  it("throws (never returns an approved verdict) when telemetry.outcome mismatches despite a parseable approved verdict, and surfaces the executor's LLM_OUTCOME_MISMATCH failure", async () => {
+    // exit 0, terminal event says success, and structured_output parses to an
+    // approved verdict — but the run's own telemetry outcome disagrees (e.g.
+    // max_turns). The executor would classify this as invalid_output/
+    // LLM_OUTCOME_MISMATCH and attach it to `result.failure`; reviewStep must
+    // throw on it rather than returning the parsed approval, and must pass the
+    // executor's failure record through rather than dropping it.
+    const executor: LLMExecutor = {
+      invoke: vi.fn().mockResolvedValue({
+        stdout: "",
+        exitCode: 0,
+        tokensUsed: 0,
+        attempts: 1,
+        structuredOutput: APPROVED_VERDICT,
+        terminalStatus: { subtype: "success", isError: false },
+        telemetry: { outcome: "max_turns", numTurns: 50, durationMs: null, costUsd: null, tokensIn: null, tokensOut: null },
+        failure: {
+          category: "invalid_output",
+          code: "LLM_OUTCOME_MISMATCH",
+          stage: "review",
+          attempt: 1,
+          retryable: false,
+          message: "m",
+          evidence: { truncated: false },
+        },
+      } satisfies LLMResult),
+    };
+
+    const err = await reviewStep
+      .run(makeContext(executor), {}, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const failure = (err as Error & { failure?: { category?: string; code?: string } }).failure;
+    expect(failure?.category).toBe("invalid_output");
+    expect(failure?.code).toBe("LLM_OUTCOME_MISMATCH");
   });
 
   it("parses approved=true from structured JSON response", async () => {
@@ -125,6 +200,38 @@ describe("reviewStep", () => {
     const executor = makeExecutor("not valid json at all");
     await expect(reviewStep.run(makeContext(executor), {}, new NoopStepReporter()))
       .rejects.toThrow("structured review output");
+  });
+
+  it("attaches a classified failure and telemetry when parseReviewVerdict itself throws (BAC-27201)", async () => {
+    const telemetry = { outcome: "success" as const, numTurns: 2, durationMs: 250, costUsd: 0.03, tokensIn: 5, tokensOut: 8 };
+    const executor: LLMExecutor = {
+      invoke: vi.fn().mockResolvedValue({
+        stdout: "Review complete",
+        exitCode: 0,
+        tokensUsed: 0,
+        attempts: 1,
+        structuredOutput: "not valid json at all",
+        terminalStatus: { subtype: "success", isError: false },
+        telemetry,
+      } satisfies LLMResult),
+    };
+
+    const err = await reviewStep
+      .run(makeContext(executor), {}, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain("structured review output");
+    const failure = (err as Error & { failure?: { category?: string; code?: string; message?: string } }).failure;
+    expect(failure).toBeDefined();
+    // A malformed verdict has a concrete, known cause — the parser's own message — so it must
+    // not fall back to classifyLlmResult's generic "unknown"/"UNKNOWN" (with the reviewer's raw
+    // prose as the message), which is what an exit-0, schema-valid result would otherwise
+    // classify as (BAC-27201).
+    expect(failure!.category).toBe("invalid_output");
+    expect(failure!.code).toBe("INVALID_STRUCTURED_OUTPUT");
+    expect(failure!.message).toContain("expected structured review output to be an object");
+    expect((err as Error & { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
   });
 
   it("includes diff in prompt when provided", async () => {
@@ -194,14 +301,54 @@ describe("reviewStep", () => {
     ).rejects.toThrow("exit code 1");
   });
 
-  it("classifies a terminal-error result (exit 0, terminalStatus.isError) as invalid_output/LLM_TERMINAL_ERROR", async () => {
+  it("falls back to classifying the failure itself when a custom executor's non-zero exit carries no pre-computed failure record", async () => {
+    // Round-four review follow-up (BAC-27114): a custom LLMExecutor (this test's
+    // own opts.llmExecutor-style seam) may settle a non-zero exit without ever
+    // attaching `result.failure` — reviewStep must not leave failure_json empty
+    // in that case, so it derives one via classifyLlmResult itself.
+    const executor: LLMExecutor = {
+      invoke: vi.fn().mockResolvedValue({
+        stdout: "",
+        stderr: "boom, nothing recognisable here",
+        exitCode: 1,
+        tokensUsed: 0,
+        attempts: 1,
+      } satisfies LLMResult),
+    };
+
+    const err = await reviewStep
+      .run(makeContext(executor), {}, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const failure = (err as Error & { failure?: { category?: string; code?: string; stage?: string } }).failure;
+    expect(failure?.category).toBe("crash");
+    expect(failure?.code).toBe("PROCESS_EXIT_NONZERO");
+    expect(failure?.stage).toBe("review");
+  });
+
+  it("surfaces the executor's pre-computed failure record on the thrown error (terminal error)", async () => {
+    // The executor — not reviewStep — classifies the failure now (BAC-27114 follow-up):
+    // that classification logic is covered directly in failure-classification.test.ts
+    // and executor.test.ts; this only checks that reviewStep passes `result.failure`
+    // through as-is rather than re-deriving it.
     const executor: LLMExecutor = {
       invoke: vi.fn().mockResolvedValue({
         stdout: "",
         exitCode: 0,
         tokensUsed: 0,
+        attempts: 1,
         structuredOutput: undefined,
         terminalStatus: { subtype: "error_during_execution", isError: true },
+        failure: {
+          category: "invalid_output",
+          code: "LLM_TERMINAL_ERROR",
+          stage: "review",
+          attempt: 1,
+          retryable: false,
+          message: "m",
+          evidence: { truncated: false },
+        },
       } satisfies LLMResult),
     };
 
@@ -215,15 +362,26 @@ describe("reviewStep", () => {
     expect(failure?.code).toBe("LLM_TERMINAL_ERROR");
   });
 
-  it("populates the failure record's elapsedMs from the executor's telemetry.durationMs", async () => {
+  it("surfaces the executor's failure.elapsedMs on the thrown error", async () => {
     const executor: LLMExecutor = {
       invoke: vi.fn().mockResolvedValue({
         stdout: "",
         exitCode: 0,
         tokensUsed: 0,
+        attempts: 1,
         structuredOutput: undefined,
         terminalStatus: { subtype: "error_during_execution", isError: true },
         telemetry: { outcome: "error", numTurns: 1, durationMs: 7500, costUsd: null, tokensIn: null, tokensOut: null },
+        failure: {
+          category: "invalid_output",
+          code: "LLM_TERMINAL_ERROR",
+          stage: "review",
+          attempt: 1,
+          retryable: false,
+          elapsedMs: 7500,
+          message: "m",
+          evidence: { truncated: false },
+        },
       } satisfies LLMResult),
     };
 
@@ -233,6 +391,45 @@ describe("reviewStep", () => {
 
     const failure = (err as Error & { failure?: { elapsedMs?: number } }).failure;
     expect(failure?.elapsedMs).toBe(7500);
+  });
+
+  it("forwards context.data.retryPolicy as retry with the review-specific flags", async () => {
+    const executor = makeExecutor(APPROVED_VERDICT);
+    const ctx = new DefaultPipelineContext(
+      {
+        jobId: 1,
+        issueId: "issue-1",
+        issueIdentifier: "ENG-1",
+        issueTitle: "Test",
+        issueDescription: "Description",
+        nonce: "nonce",
+        orchestratorUrl: "http://localhost:8080",
+        retryPolicy: DEFAULT_RETRY_POLICY,
+      },
+      executor,
+    );
+
+    await reviewStep.run(ctx, {}, new NoopStepReporter());
+
+    expect(executor.invoke).toHaveBeenCalledWith(
+      expect.objectContaining({
+        stage: "review",
+        expectsStructuredOutput: true,
+        retry: {
+          policy: DEFAULT_RETRY_POLICY,
+          toolUseIsSafe: true,
+        },
+      }),
+    );
+  });
+
+  it("omits retry when context.data.retryPolicy is absent", async () => {
+    const executor = makeExecutor(APPROVED_VERDICT);
+
+    await reviewStep.run(makeContext(executor), {}, new NoopStepReporter());
+
+    const call = vi.mocked(executor.invoke).mock.calls[0][0];
+    expect(call.retry).toBeUndefined();
   });
 
   it("returns tokensUsed from executor", async () => {
@@ -294,7 +491,6 @@ describe("reviewStep", () => {
     expect(outputs.approved).toBe(true);
     expect(outputs.score).toBe(95);
   });
-
   it("appends reviewRubric to prompt when supplied", async () => {
     const executor = makeExecutor(APPROVED_VERDICT);
     await reviewStep.run(

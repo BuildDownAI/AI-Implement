@@ -1,9 +1,9 @@
-import type { PipelineContext, StepModule, StepReporter } from "../types.js";
+import type { PipelineContext, StepModule, StepReporter, RunTelemetry } from "../types.js";
 import { formatLlmResultDetail, terminalResultFailureMessage } from "../step-utils.js";
 import { REVIEW_VERDICT_JSON_SCHEMA, parseReviewVerdict, plainIssueText } from "../review-verdict.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
-import { classifyLlmResult, type FailureRecord } from "../failure-classification.js";
+import { classifyLlmResult, envSecrets, oneLinerMessage, type FailureRecord } from "../failure-classification.js";
 
 interface ReviewInputs extends Record<string, unknown> {
   model?: string;
@@ -22,6 +22,8 @@ interface ReviewOutputs extends Record<string, unknown> {
   progressDelta: number;
   feedback: string;
   tokensUsed: number;
+  attempts: number;
+  telemetry?: RunTelemetry;
 }
 
 /**
@@ -92,21 +94,37 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
 
     const prompt = REVIEW_PROMPT(issueTitle, issueDescription, diff, iteration, acceptanceBar, rubric);
 
+    const { retryPolicy } = context.data;
     const result = await context.llmExecutor.invoke({
       prompt,
       model: model ?? "claude-sonnet-5",
       tools: READ_ONLY_ALLOWED_TOOLS,
       jsonSchema: REVIEW_VERDICT_JSON_SCHEMA,
+      stage: "review",
+      expectsStructuredOutput: true,
+      retry: retryPolicy ? { policy: retryPolicy, toolUseIsSafe: true } : undefined,
     });
 
-    const attachReviewFailure = (err: Error): Error & { failure?: FailureRecord } => {
-      (err as Error & { failure?: FailureRecord }).failure = classifyLlmResult(result, {
-        stage: "review",
-        attempt: 1,
-        expectsStructuredOutput: true,
-        elapsedMs: result.telemetry?.durationMs ?? undefined,
-      });
-      return err;
+    // The executor already classified this failure (with the correct
+    // expectsStructuredOutput/attempt/elapsedMs) when deciding whether to retry.
+    // A custom LLMExecutor (e.g. a test seam) may settle a failure without
+    // attaching one at all — fall back to classifying it here so failure_json is
+    // never empty just because the executor that produced this result didn't.
+    const attachReviewFailure = (err: Error): Error & { failure?: FailureRecord; telemetry?: RunTelemetry } => {
+      const withFailure = err as Error & { failure?: FailureRecord; telemetry?: RunTelemetry };
+      withFailure.failure =
+        result.failure ??
+        classifyLlmResult(result, {
+          stage: "review",
+          attempt: result.attempts ?? 1,
+          expectsStructuredOutput: true,
+          elapsedMs: result.telemetry?.durationMs ?? undefined,
+        });
+      // See implement.ts's identical note: a settled (but failing) LLMResult never
+      // had telemetry stamped onto a thrown error the way a spawn-level rejection
+      // does, so the failed sub-step report would otherwise lose it.
+      withFailure.telemetry = result.telemetry;
+      return withFailure;
     };
 
     if (result.exitCode !== 0) {
@@ -122,9 +140,49 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
       );
     }
 
-    const verdict = parseReviewVerdict(result.structuredOutput);
+    // A malformed verdict has a concrete, known cause — the parser's own message, or the
+    // approved=false-with-no-issues contradiction — unlike the checks above, which have nothing
+    // to go on but the raw LLMResult. Do NOT route these through attachReviewFailure:
+    // classifyLlmResult only sees an exit-0, schema-valid result and falls back to category
+    // "unknown"/code "UNKNOWN" with the reviewer's raw prose as `message`, discarding the actual
+    // reason. Build the record from the reason directly instead, so the ticket and report-card
+    // say why the verdict was rejected rather than what the model said (BAC-27201).
+    const invalidVerdictError = (err: unknown): Error & { failure?: FailureRecord; telemetry?: RunTelemetry } => {
+      const message = err instanceof Error ? err.message : String(err);
+      const failure: FailureRecord = {
+        category: "invalid_output",
+        code: "INVALID_STRUCTURED_OUTPUT",
+        stage: "review",
+        attempt: result.attempts ?? 1,
+        retryable: false,
+        exitCode: result.exitCode,
+        signal: result.signal ?? null,
+        elapsedMs: result.telemetry?.durationMs ?? undefined,
+        message: oneLinerMessage(message, envSecrets()),
+        evidence: {
+          truncated: false,
+          llmOutcome: result.telemetry?.outcome ?? null,
+          llmSubtype: result.terminalStatus?.subtype ?? null,
+          llmIsError: result.terminalStatus?.isError ?? null,
+        },
+      };
+      const wrapped = (err instanceof Error ? err : new Error(message)) as Error & {
+        failure?: FailureRecord;
+        telemetry?: RunTelemetry;
+      };
+      wrapped.failure = failure;
+      wrapped.telemetry = result.telemetry;
+      return wrapped;
+    };
+
+    let verdict;
+    try {
+      verdict = parseReviewVerdict(result.structuredOutput);
+    } catch (err) {
+      throw invalidVerdictError(err);
+    }
     if (!verdict.approved && verdict.blockingIssues.length === 0) {
-      throw new Error("approved=false requires at least one blocking_issues entry");
+      throw invalidVerdictError(new Error("approved=false requires at least one blocking_issues entry"));
     }
 
     return {
@@ -134,6 +192,8 @@ export const reviewStep: StepModule<ReviewInputs, ReviewOutputs> = {
       progressDelta: verdict.progressDelta,
       feedback: verdict.feedback,
       tokensUsed: result.tokensUsed,
+      attempts: result.attempts ?? 1,
+      telemetry: result.telemetry,
     };
   },
 };

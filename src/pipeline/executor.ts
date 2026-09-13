@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import type { LLMExecutor, LLMResult, LogLevel } from "./types.js";
+import type { InvokeParams, LLMExecutor, LLMResult, LogLevel, RunTelemetry } from "./types.js";
 import {
   parseLine,
   formatEvent,
@@ -9,9 +9,214 @@ import {
   extractTerminalStatus,
   extractTelemetry,
   summaryLine,
+  sawToolUse,
+  sawUnsafeToolUse,
   type StreamEvent,
 } from "./claude-stream.js";
+import { classifyLlmResult, classifySpawnError, isLlmResultFailure, type FailureRecord } from "./failure-classification.js";
+import { computeBackoffMs, type RetryPolicy } from "./retry-backoff.js";
 import { modelProcessEnv, parseForwardedSecrets } from "./process-env.js";
+
+interface AttemptResult extends Omit<LLMResult, "attempts"> {
+  sawToolUse: boolean;
+  sawUnsafeToolUse: boolean;
+}
+
+/** Decision inputs shared by the two retry sites in `invoke` (a completed attempt, and a spawn-level rejection). */
+interface RetryDecisionInput {
+  failure: FailureRecord;
+  attempt: number;
+  /**
+   * Whether this attempt made a tool call that must block a retry. Already
+   * scoped by the caller via `effectiveSawToolUse`: for a `toolUseIsSafe`
+   * (review) session this reflects only the unsafe subset (a Bash-prefixed
+   * tool, e.g. `Bash(curl *)`, which can still write files or POST despite
+   * the read-only allowlist); for implement it reflects any tool use at all.
+   */
+  attemptSawToolUse: boolean;
+  policy: RetryPolicy;
+  /** Sum of backoff sleeps already spent in this `invoke` call. */
+  totalSleptMs: number;
+}
+
+/**
+ * Whether this attempt's tool use should block a retry, given the call site's
+ * `toolUseIsSafe` flag (true for review's read-only sessions). A retry is a
+ * fresh session with no memory of the first attempt, so once a tool has run
+ * that could have mutated the workspace, re-spawning risks duplicating or
+ * undoing that work. `toolUseIsSafe` sessions are restricted to read-only
+ * tools, EXCEPT `Bash(curl *)` — curl can still write files or POST — so only
+ * that unsafe subset is checked there; every other tool_use still blocks a
+ * non-toolUseIsSafe (implement) retry.
+ */
+function effectiveSawToolUse(toolUseIsSafe: boolean, sawAnyToolUse: boolean, sawUnsafe: boolean): boolean {
+  return toolUseIsSafe ? sawUnsafe : sawAnyToolUse;
+}
+
+/**
+ * Whether a classified failure should be retried, and if so how long to sleep
+ * first. Only a transient failure is ever retried, and never one where
+ * `attemptSawToolUse` is true (see `effectiveSawToolUse`). The total backoff
+ * spent across every retry in one `invoke` call is capped at
+ * `policy.backoffMaxMs * 2` — `requestRetries` up to 10 at a 300s cap could
+ * otherwise sleep for tens of minutes inside a bounded job.
+ */
+function decideRetry(input: RetryDecisionInput): { retry: boolean; backoffMs: number } {
+  if (input.failure.category !== "transient" || input.attemptSawToolUse || input.attempt > input.policy.requestRetries) {
+    return { retry: false, backoffMs: 0 };
+  }
+  const backoffMs = computeBackoffMs(input.attempt, input.policy);
+  const sleepBudgetMs = input.policy.backoffMaxMs * 2;
+  if (input.totalSleptMs + backoffMs > sleepBudgetMs) {
+    console.log(
+      `[claude] retry sleep budget (${sleepBudgetMs} ms) would be exceeded (already slept ${input.totalSleptMs} ms, next backoff ${backoffMs} ms); giving up after attempt ${input.attempt}`,
+    );
+    return { retry: false, backoffMs: 0 };
+  }
+  return { retry: true, backoffMs };
+}
+
+/**
+ * Sums telemetry across every attempt in one `invoke` call so a retried spawn's
+ * cost/tokens/turns/cache-usage aren't dropped, and replaces `durationMs` with
+ * the total wall clock of the whole `invoke` call (including backoff sleeps)
+ * rather than the final attempt's own reported duration. A no-op when there
+ * was only one attempt.
+ */
+function aggregateTelemetry(
+  latest: RunTelemetry | undefined,
+  running: {
+    tokensIn: number;
+    tokensOut: number;
+    costUsd: number;
+    numTurns: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+  },
+  attempt: number,
+  invokeStartedAt: number,
+): RunTelemetry | undefined {
+  if (!latest) {
+    // Nothing accumulated yet — genuinely nothing to report.
+    if (attempt === 1) return latest;
+    // A later attempt reported no telemetry of its own, but earlier attempts
+    // did — surface their accumulated totals rather than discarding them.
+    return {
+      outcome: "unknown",
+      numTurns: running.numTurns,
+      durationMs: Date.now() - invokeStartedAt,
+      costUsd: running.costUsd,
+      tokensIn: running.tokensIn,
+      tokensOut: running.tokensOut,
+      cacheReadTokens: running.cacheReadTokens,
+      cacheCreationTokens: running.cacheCreationTokens,
+      toolTrace: [],
+    };
+  }
+  if (latest.tokensIn != null) running.tokensIn += latest.tokensIn;
+  if (latest.tokensOut != null) running.tokensOut += latest.tokensOut;
+  if (latest.costUsd != null) running.costUsd += latest.costUsd;
+  if (latest.numTurns != null) running.numTurns += latest.numTurns;
+  if (latest.cacheReadTokens != null) running.cacheReadTokens += latest.cacheReadTokens;
+  if (latest.cacheCreationTokens != null) running.cacheCreationTokens += latest.cacheCreationTokens;
+  if (attempt === 1) return latest;
+  return {
+    ...latest,
+    tokensIn: running.tokensIn,
+    tokensOut: running.tokensOut,
+    costUsd: running.costUsd,
+    numTurns: running.numTurns,
+    cacheReadTokens: running.cacheReadTokens,
+    cacheCreationTokens: running.cacheCreationTokens,
+    durationMs: Date.now() - invokeStartedAt,
+  };
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Reads a boolean flag stamped on a rejected spawn error (see `spawnOnce`), defaulting to false. */
+function readBoolFlag(err: unknown, key: "sawToolUse" | "sawUnsafeToolUse"): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const value = (err as Record<string, unknown>)[key];
+  return typeof value === "boolean" ? value : false;
+}
+
+/** Reads the termination signal stamped on a rejected spawn error (see `spawnOnce`'s stdin-failure path), null when absent. */
+function readSignalFlag(err: unknown): string | null {
+  if (typeof err !== "object" || err === null) return null;
+  const value = (err as Record<string, unknown>).signal;
+  return typeof value === "string" ? value : null;
+}
+
+/** Reads the telemetry stamped on a rejected stdin-EPIPE error (see `spawnOnce`'s `close` handler), undefined when absent. Exported for direct unit testing — like its sibling readers, it is never called with attacker-controlled input in production. */
+export function readTelemetryFlag(err: unknown): RunTelemetry | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const value = (err as Record<string, unknown>).telemetry;
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as RunTelemetry) : undefined;
+}
+
+const UNRESPONSIVE_MESSAGE = "Process did not exit within 5s of SIGKILL after a stdin failure";
+
+/** Marks a rejection produced when `close` never arrived within the bounded wait after a
+ *  SIGKILL escalation (see `spawnOnce`). `telemetry` — this dying attempt's own usage, not yet
+ *  folded into the cross-attempt running totals — is optional so a caller with nothing to
+ *  report (e.g. a test constructing the error directly) doesn't have to invent an empty one. */
+function markUnresponsive(telemetry?: RunTelemetry): Error & { unresponsive: true; telemetry?: RunTelemetry } {
+  return Object.assign(new Error(UNRESPONSIVE_MESSAGE), {
+    unresponsive: true as const,
+    ...(telemetry ? { telemetry } : {}),
+  });
+}
+
+function isUnresponsive(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as Record<string, unknown>).unresponsive === true;
+}
+
+/**
+ * Signals the CLI's whole process group (spawned with `detached: true`), not
+ * only the CLI process itself — the CLI may fork subprocesses (e.g. a build
+ * tool it shells out to) that would otherwise survive a plain `proc.kill()`
+ * and keep the workspace dirty (or the container alive) after this attempt
+ * gives up on it. Falls back to signalling just the CLI process on ANY
+ * failure from `process.kill(-pid, ...)` — not only `ESRCH` (the group leader
+ * already gone, e.g. a fake process in tests with no real `pid`, or a process
+ * group that already exited on its own) — because signalling the CLI alone is
+ * strictly better than signalling nothing at all, whatever the failure reason.
+ */
+function killProcessGroup(proc: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
+  const pid = proc.pid;
+  if (typeof pid !== "number") {
+    try {
+      proc.kill(signal);
+    } catch {
+      // best-effort — the process may already be gone
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      proc.kill(signal);
+    } catch {
+      // best-effort — the process may already be gone
+    }
+  }
+}
+
+/**
+ * Marks an error as not representing a process-spawn failure — the credential
+ * suspend/restore step around each spawn can throw before or after the CLI
+ * ran, but never because the CLI itself failed to start, so `invoke` must
+ * never route it through `classifySpawnError` (which would misreport it as
+ * `PROCESS_SPAWN_FAILED`).
+ */
+function markNotASpawnFailure(err: unknown): Error & { notASpawnFailure: true } {
+  const errOut = err instanceof Error ? err : new Error(String(err));
+  return Object.assign(errOut, { notASpawnFailure: true as const });
+}
 
 function suspendOriginWriteCredential(workspaceDir: string): (() => void) | null {
   const current = spawnSync("git", ["remote", "get-url", "origin"], {
@@ -64,23 +269,181 @@ export class ClaudeCliExecutor implements LLMExecutor {
     private readonly workspaceDir: string,
     private readonly logLevel: LogLevel = "summary",
     private readonly allowRepositoryWrites = false,
-    /** Injectable spawn for testing. */
     private readonly spawnImpl: typeof spawn = spawn,
+    private readonly sleepImpl: (ms: number) => Promise<void> = defaultSleep,
   ) {}
 
-  invoke(params: {
-    prompt: string;
-    model: string;
-    maxTurns?: number;
-    tools?: string[];
-    jsonSchema?: Record<string, unknown>;
-  }): Promise<LLMResult> {
+  async invoke(params: InvokeParams): Promise<LLMResult> {
+    let attempt = 1;
+    let totalSleptMs = 0;
+    const invokeStartedAt = Date.now();
+    const runningTelemetry = { tokensIn: 0, tokensOut: 0, costUsd: 0, numTurns: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+
+    // Builds an error carrying both the classified `failure` and the telemetry
+    // accumulated across every attempt so far — used at every spawn-level give-up
+    // point below, so a caller that only ever sees a rejected `invoke()` (every
+    // attempt EPIPE'd, or ENOENT on the only attempt) doesn't lose the tokens/cost
+    // those attempts actually burned just because none of them produced a settled
+    // LLMResult to carry it on.
+    const spawnFailureError = (err: unknown, failure: FailureRecord): Error & { failure: FailureRecord; telemetry: RunTelemetry } => {
+      const errOut = err instanceof Error ? err : new Error(String(err));
+      return Object.assign(errOut, {
+        failure,
+        telemetry: {
+          outcome: "unknown" as const,
+          numTurns: runningTelemetry.numTurns,
+          durationMs: Date.now() - invokeStartedAt,
+          costUsd: runningTelemetry.costUsd,
+          tokensIn: runningTelemetry.tokensIn,
+          tokensOut: runningTelemetry.tokensOut,
+          cacheReadTokens: runningTelemetry.cacheReadTokens,
+          cacheCreationTokens: runningTelemetry.cacheCreationTokens,
+          toolTrace: [],
+        },
+      });
+    };
+
+    for (;;) {
+      let attemptResult: AttemptResult;
+      try {
+        attemptResult = await this.spawnOnce(params);
+      } catch (err) {
+        // A spawn-level failure (ENOENT/EAGAIN/ENOMEM from proc.on("error"), or the
+        // stdin EPIPE handler) never produced an LLMResult, but it is by construction
+        // a pre-tool-use failure — apply the same retry rail rather than letting it
+        // bypass the rail entirely. `notASpawnFailure` errors (the credential-suspend
+        // step, which can throw before the CLI starts or while restoring afterward)
+        // are excluded from this rail entirely — they never represent the CLI failing
+        // to start.
+        if (err instanceof Error && (err as Error & { notASpawnFailure?: boolean }).notASpawnFailure) {
+          throw err;
+        }
+        // The stdin-EPIPE path stamps whatever telemetry the dying attempt reported
+        // (see readTelemetryFlag) — fold it into the running totals now so a
+        // subsequent successful attempt's aggregateTelemetry call carries it forward,
+        // regardless of whether this attempt goes on to retry or exhausts its budget.
+        const attemptTelemetry = readTelemetryFlag(err);
+        if (attemptTelemetry) aggregateTelemetry(attemptTelemetry, runningTelemetry, attempt, invokeStartedAt);
+        const stage = params.stage ?? "unknown";
+
+        if (isUnresponsive(err)) {
+          // The child never exited even after the SIGKILL escalation below — settle
+          // as a non-retryable crash rather than waiting indefinitely for a `close`
+          // that may never come. Checked ahead of the signal/spawn-error classification
+          // below since this attempt never produced a `close` event to read a signal from.
+          const failure: FailureRecord = {
+            category: "crash",
+            code: "PROCESS_UNRESPONSIVE",
+            stage,
+            attempt,
+            retryable: false,
+            message: UNRESPONSIVE_MESSAGE,
+            evidence: { truncated: false, llmSubtype: null, llmIsError: null, llmOutcome: null },
+          };
+          throw spawnFailureError(err, failure);
+        }
+
+        const signal = readSignalFlag(err);
+        // A signal here takes precedence over classifySpawnError, mirroring
+        // classifyLlmResult's own signal-first rule. The stdin-failure path (see
+        // spawnOnce's `close` handler) stamps a signal only when it doesn't match
+        // any signal we ourselves have sent (selfKillSignals) — our own kill is
+        // dropped rather than misclassified as an external cancellation, while a
+        // genuinely different signal (e.g. an external SIGKILL landing in the same
+        // window) still reaches here as `cancelled`. `proc.on("error")` never
+        // carries one.
+        const failure: FailureRecord = signal
+          ? {
+              category: "cancelled",
+              code: "PROCESS_SIGNALLED",
+              stage,
+              attempt,
+              retryable: false,
+              signal,
+              message: `Process terminated by ${signal} before completing the request`,
+              evidence: { truncated: false, llmSubtype: null, llmIsError: null, llmOutcome: null },
+            }
+          : classifySpawnError(err, { stage, attempt });
+
+        // Classify on every invocation, not only when `retry` is supplied — the dev
+        // harness and any other bare `invoke()` caller should still get a `failure`
+        // record on the thrown error, mirroring the settled-LLMResult path below.
+        if (!params.retry) {
+          throw spawnFailureError(err, failure);
+        }
+
+        const { policy, toolUseIsSafe } = params.retry;
+        // Both spawn-error paths attach sawToolUse/sawUnsafeToolUse via
+        // attachToolUseFlags (see spawnOnce). proc.on("error") fires when the
+        // process never started, so `events` is empty and both flags evaluate to
+        // false — a real pre-tool-use failure, hence the unconditional retry. The
+        // stdin EPIPE handler reflects real tool use, since that process did start
+        // and may have used a tool before dying.
+        const errSawAnyToolUse = readBoolFlag(err, "sawToolUse");
+        const errSawUnsafeToolUse = readBoolFlag(err, "sawUnsafeToolUse");
+        const attemptSawToolUse = effectiveSawToolUse(toolUseIsSafe, errSawAnyToolUse, errSawUnsafeToolUse);
+        const decision = decideRetry({ failure, attempt, attemptSawToolUse, policy, totalSleptMs });
+        if (!decision.retry) {
+          throw spawnFailureError(err, failure);
+        }
+        console.log(
+          `[claude] transient spawn failure (${failure.code}) on attempt ${attempt}; retrying in ${decision.backoffMs} ms`,
+        );
+        totalSleptMs += decision.backoffMs;
+        await this.sleepImpl(decision.backoffMs);
+        attempt++;
+        continue;
+      }
+
+      const { sawToolUse: attemptSawAnyToolUse, sawUnsafeToolUse: attemptSawUnsafeToolUse, ...result } = attemptResult;
+      const telemetry = aggregateTelemetry(result.telemetry, runningTelemetry, attempt, invokeStartedAt);
+      const tokensUsed = telemetry ? (telemetry.tokensIn ?? 0) + (telemetry.tokensOut ?? 0) : result.tokensUsed;
+      const settled: LLMResult = { ...result, telemetry, tokensUsed, attempts: attempt };
+
+      // Classify on every invocation, not only when `retry` is supplied — the dev
+      // harness and any other bare `invoke()` caller should still get a `failure`
+      // record on the returned result when one applies.
+      const expectsStructuredOutput = params.expectsStructuredOutput ?? false;
+      if (!isLlmResultFailure(settled, expectsStructuredOutput)) {
+        return settled;
+      }
+
+      const failure = classifyLlmResult(settled, {
+        stage: params.stage ?? "unknown",
+        attempt,
+        expectsStructuredOutput,
+        elapsedMs: settled.telemetry?.durationMs ?? undefined,
+      });
+
+      if (!params.retry) {
+        return { ...settled, failure };
+      }
+
+      const { policy, toolUseIsSafe } = params.retry;
+      const attemptSawToolUse = effectiveSawToolUse(toolUseIsSafe, attemptSawAnyToolUse, attemptSawUnsafeToolUse);
+      const decision = decideRetry({ failure, attempt, attemptSawToolUse, policy, totalSleptMs });
+
+      if (!decision.retry) {
+        return { ...settled, failure };
+      }
+
+      console.log(`[claude] transient failure (${failure.code}) on attempt ${attempt}; retrying in ${decision.backoffMs} ms`);
+      totalSleptMs += decision.backoffMs;
+      await this.sleepImpl(decision.backoffMs);
+      attempt++;
+    }
+  }
+
+  private spawnOnce(params: InvokeParams): Promise<AttemptResult> {
     let restoreOrigin: (() => void) | null = null;
     if (!this.allowRepositoryWrites) {
       try {
         restoreOrigin = suspendOriginWriteCredential(this.workspaceDir);
       } catch (err) {
-        return Promise.reject(err);
+        // Not a process-spawn failure — the CLI never had a chance to start. Marked
+        // so `invoke` doesn't route it through the spawn-error retry rail, which is
+        // scoped to proc.on("error")/stdin EPIPE below.
+        return Promise.reject(Object.assign(err instanceof Error ? err : new Error(String(err)), { notASpawnFailure: true }));
       }
     }
 
@@ -122,13 +485,23 @@ export class ClaudeCliExecutor implements LLMExecutor {
           cwd: this.workspaceDir,
           stdio: ["pipe", "pipe", "pipe"],
           env: modelProcessEnv(this.allowRepositoryWrites),
+          // Makes the CLI its own process-group leader, which is what makes
+          // `process.kill(-pid, …)` in killProcessGroup address the CLI and every
+          // subprocess it forks, not just the CLI itself. Side effect: a SIGTERM/SIGINT
+          // delivered to the *runner's own* process group (e.g. an interactive Ctrl-C)
+          // no longer propagates to the CLI, since it is no longer a member of that
+          // group — moot inside the container this actually runs in, which has no
+          // interactive job control to deliver such a signal in the first place. The
+          // executor's own SIGTERM→SIGKILL escalation (see the stdin-EPIPE handler
+          // below) is what cancels the CLI in every real deployment.
+          detached: true,
         }) as ChildProcessWithoutNullStreams;
       } catch (err) {
         try {
           restoreProtectedOrigin();
           reject(err);
         } catch (restoreErr) {
-          reject(restoreErr);
+          reject(markNotASpawnFailure(restoreErr));
         }
         return;
       }
@@ -137,18 +510,99 @@ export class ClaudeCliExecutor implements LLMExecutor {
       const stderrChunks: Buffer[] = [];
       let buf = "";
       let settled = false;
+      let stdinFailure: Error | null = null;
+      const selfKillSignals = new Set<string>();
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      let unresponsiveTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const attachToolUseFlags = <E extends Error>(
+        err: E,
+        signal?: string | null,
+      ): E & { sawToolUse: boolean; sawUnsafeToolUse: boolean; signal?: string | null } =>
+        Object.assign(err, {
+          sawToolUse: sawToolUse(events),
+          sawUnsafeToolUse: sawUnsafeToolUse(events),
+          ...(signal ? { signal } : {}),
+        });
 
       proc.stdin.on("error", (err) => {
-        // EPIPE means the child exited before consuming the prompt — let the
-        // close event settle the promise with the child's actual exit code.
-        if ((err as NodeJS.ErrnoException).code === "EPIPE") return;
-        settled = true;
-        try {
-          restoreProtectedOrigin();
-          reject(err);
-        } catch (restoreErr) {
-          reject(restoreErr);
-        }
+        // EPIPE here means the child exited (or is exiting) before consuming the
+        // prompt — but the child may still be alive at this instant. Kill it and
+        // wait for `close` before rejecting (escalating to SIGKILL after 5s if it
+        // hasn't exited), so `invoke`'s retry rail never spawns a second `claude`
+        // into the same workspace while this one is still running.
+        //
+        // Guarded on `settled` too: if `close` or `proc.on("error")` already settled
+        // this attempt (e.g. both fire for the same underlying failure), this handler
+        // must not call `proc.kill()` or arm a SIGKILL timer that nothing will ever
+        // clear — `close` has already fired and won't fire again to clear it.
+        if (settled || stdinFailure) return;
+        stdinFailure = err instanceof Error ? err : new Error(String(err));
+        // Record the signal we're about to send so the `close` handler below can
+        // tell our own kill apart from an external one landing in the same window
+        // (see that handler for the residual ambiguity this can't resolve). Accumulated
+        // rather than overwritten, so a `close` reporting our first SIGTERM after we've
+        // already escalated to SIGKILL is still recognized as our own kill.
+        selfKillSignals.add("SIGTERM");
+        // Arm the SIGKILL-escalation timer BEFORE sending the signal below.
+        // `process.kill(-pid, …)` (the negative-pid call inside killProcessGroup)
+        // only ever throws synchronously — it never emits `error` on `proc`. But
+        // killProcessGroup's fallback, `proc.kill()`, is a real ChildProcess method
+        // whose failure Node reports by emitting `error` on `proc`, and it can do so
+        // synchronously; that handler needs `killTimer` already set so it can clear
+        // it rather than leaving an escalation armed against a process this attempt
+        // has already given up on.
+        killTimer = setTimeout(() => {
+          killTimer = null;
+          selfKillSignals.add("SIGKILL");
+          // Arm the unresponsive-escalation timer BEFORE sending SIGKILL below, for
+          // the same reason as the killTimer arming above: killProcessGroup's
+          // `proc.kill()` fallback can emit `error` on `proc` synchronously, and that
+          // handler needs `unresponsiveTimer` already set so it can clear it.
+          //
+          // Bound the wait for `close` after the SIGKILL escalation too — a child
+          // stuck in uninterruptible I/O can ignore even SIGKILL for a while (or
+          // the process table entry can otherwise never report an exit). Rather
+          // than hang the invocation indefinitely, settle this attempt as a
+          // non-retryable crash once this second window also elapses.
+          unresponsiveTimer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            // The child is known not to have exited even after the SIGKILL escalation —
+            // it may still be alive. Restoring the write credential here would hand a
+            // possibly-live agent process the ability to push. Leave the protected
+            // (credential-stripped) origin in place and let the container's exit clean
+            // up rather than calling `restoreProtectedOrigin()`.
+            console.log("[claude] origin left protected: child unresponsive after SIGKILL");
+            // Flush a trailing partial line first, mirroring the normal `close` path —
+            // this is the last chance to fold a `result` event that arrived without a
+            // trailing newline into `events` before telemetry is extracted below.
+            if (buf.trim()) handleLine(buf);
+            // This attempt's own usage before it was given up on — never folded into a
+            // settled LLMResult since `close` never arrived, but still real usage the
+            // cross-attempt sums in `invoke` must not silently drop (see `aggregateTelemetry`).
+            const telemetry = extractTelemetry(events);
+            // Destroy (not just unlisten) the stdio handles, then unref the process
+            // handle, so a container whose only remaining work was this invocation
+            // can still exit — the process may never report `close`, and a merely
+            // unlistened-to pipe still holds its underlying handle ref'd, which would
+            // keep the event loop (and the container) alive waiting on a child this
+            // attempt has given up on. Guarded and optionally-chained: a custom/
+            // spawn wrapper's streams may not implement destroy() at all, and this
+            // settle must reach `reject` regardless of whether teardown throws.
+            try {
+              proc.stdout?.destroy?.();
+              proc.stderr?.destroy?.();
+              proc.stdin?.destroy?.();
+              proc.unref?.();
+            } catch {
+              // best-effort teardown — see above
+            }
+            reject(markUnresponsive(telemetry));
+          }, 5000);
+          killProcessGroup(proc, "SIGKILL");
+        }, 5000);
+        killProcessGroup(proc, "SIGTERM");
       });
       proc.stdin.end(params.prompt);
 
@@ -172,9 +626,50 @@ export class ClaudeCliExecutor implements LLMExecutor {
       });
       proc.stderr.on("data", (d: Buffer) => stderrChunks.push(d));
 
-      proc.on("close", (code) => {
+      proc.on("close", (code, signal) => {
         if (settled) return;
         settled = true;
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = null;
+        }
+        if (unresponsiveTimer) {
+          clearTimeout(unresponsiveTimer);
+          unresponsiveTimer = null;
+        }
+        if (stdinFailure) {
+          try {
+            restoreProtectedOrigin();
+          } catch (err) {
+            reject(markNotASpawnFailure(err));
+            return;
+          }
+          // Flush a trailing partial line first, matching the normal `close` path below —
+          // a `result` event that arrived without a trailing newline right before the
+          // EPIPE would otherwise never reach `events` and be dropped from telemetry.
+          if (buf.trim()) handleLine(buf);
+          // Extract whatever telemetry this attempt reported before it broke, so a
+          // retried attempt's tokens/cost/turns aren't dropped from the cross-attempt
+          // sums `invoke` maintains (see `aggregateTelemetry`) — the events collected
+          // up to the EPIPE are still real usage even though the attempt never settled.
+          const telemetry = extractTelemetry(events);
+          // A `close` signal matching any signal we've sent so far (selfKillSignals)
+          // is our own kill, not an external cancellation, and is dropped so the
+          // documented EPIPE retry stays reachable rather than being shadowed by a
+          // "cancelled" misclassification of our own kill; any other signal (e.g. an
+          // external SIGKILL) still classifies as cancelled below. Checking the whole
+          // set (not just the most recent signal) is what lets a `close` reporting our
+          // first SIGTERM after we've already escalated to SIGKILL still be recognized
+          // as ours. Residual ambiguity: an external SIGTERM delivered in the same
+          // window as our own first kill attempt is indistinguishable from it and is
+          // dropped too.
+          reject(
+            Object.assign(attachToolUseFlags(stdinFailure, signal && selfKillSignals.has(signal) ? null : signal), {
+              telemetry,
+            }),
+          );
+          return;
+        }
         if (buf.trim()) handleLine(buf); // flush trailing partial line
         const stderr = Buffer.concat(stderrChunks).toString();
         // Surface CLI stderr (auth failures, bad model IDs, rate limits) — it is
@@ -185,7 +680,7 @@ export class ClaudeCliExecutor implements LLMExecutor {
         try {
           restoreProtectedOrigin();
         } catch (err) {
-          reject(err);
+          reject(markNotASpawnFailure(err));
           return;
         }
         resolve({
@@ -196,16 +691,66 @@ export class ClaudeCliExecutor implements LLMExecutor {
           telemetry,
           structuredOutput: finalStructuredOutput(events),
           terminalStatus: extractTerminalStatus(events),
+          signal: signal ?? null,
+          sawToolUse: sawToolUse(events),
+          sawUnsafeToolUse: sawUnsafeToolUse(events),
         });
       });
 
       proc.on("error", (err) => {
+        // A late `error` arriving after this attempt already settled (via `close`,
+        // the unresponsive timeout, or an earlier `error`) must be a no-op — in
+        // particular it must never re-restore (or newly restore) a credential a
+        // prior settle deliberately withheld because the child may still be alive.
+        if (settled) return;
         settled = true;
+        if (killTimer) {
+          clearTimeout(killTimer);
+          killTimer = null;
+        }
+        if (unresponsiveTimer) {
+          clearTimeout(unresponsiveTimer);
+          unresponsiveTimer = null;
+        }
+        if (selfKillSignals.size > 0) {
+          // This attempt already tried to kill the child (the stdin-EPIPE path)
+          // before this `error` arrived. `process.kill(-pid, …)` itself only ever
+          // throws, synchronously — it never emits `error` on `proc`; it is
+          // killProcessGroup's `proc.kill()` fallback whose failure Node reports by
+          // emitting `error` on `proc`, possibly while the child is still alive, so
+          // the write credential must stay withheld exactly as the unresponsive path
+          // does, rather than being restored here. The child may still be alive, so
+          // escalate to SIGKILL before giving up on it — otherwise withholding the
+          // credential is the only thing this attempt does, and the child is simply
+          // abandoned rather than actually killed.
+          console.log("[claude] origin left protected: kill() failed while the child may still be alive");
+          // `settled` is already true on this path, so `close` (which is what reads
+          // selfKillSignals) will no-op on arrival — recording the signal here would be
+          // purely documentary, so it is skipped rather than left inert.
+          killProcessGroup(proc, "SIGKILL");
+          // Mirror the unresponsive path's teardown: flush the trailing partial line,
+          // stamp this dying attempt's own telemetry (never folded into a settled
+          // LLMResult, since `close` will not fire again after this settle), then
+          // destroy the stdio handles and unref the process so a container whose only
+          // remaining work was this invocation can still exit.
+          if (buf.trim()) handleLine(buf);
+          const telemetry = extractTelemetry(events);
+          try {
+            proc.stdout?.destroy?.();
+            proc.stderr?.destroy?.();
+            proc.stdin?.destroy?.();
+            proc.unref?.();
+          } catch {
+            // best-effort teardown — see above
+          }
+          reject(Object.assign(attachToolUseFlags(err), { telemetry }));
+          return;
+        }
         try {
           restoreProtectedOrigin();
-          reject(err);
+          reject(attachToolUseFlags(err));
         } catch (restoreErr) {
-          reject(restoreErr);
+          reject(markNotASpawnFailure(restoreErr));
         }
       });
     });

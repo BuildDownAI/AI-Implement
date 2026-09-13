@@ -25,7 +25,7 @@ import { reviewStep } from "../pipeline/steps/review.js";
 import { feedbackLoopStep } from "../pipeline/steps/feedback-loop.js";
 import { DefaultPipelineContext } from "../pipeline/context.js";
 import { NoopStepReporter } from "../pipeline/reporter.js";
-import type { Step, StepReporter } from "../pipeline/types.js";
+import type { LLMExecutor, Step, StepReporter } from "../pipeline/types.js";
 
 const APPROVED_REVIEW = {
   approved: true,
@@ -34,6 +34,7 @@ const APPROVED_REVIEW = {
   progressDelta: 100,
   feedback: "Looks good",
   tokensUsed: 0,
+  attempts: 1,
 };
 
 const REJECTED_REVIEW = {
@@ -43,6 +44,7 @@ const REJECTED_REVIEW = {
   progressDelta: 50,
   feedback: "Needs improvement",
   tokensUsed: 0,
+  attempts: 1,
 };
 
 const IMPLEMENT_OUTPUTS = {
@@ -50,6 +52,7 @@ const IMPLEMENT_OUTPUTS = {
   tokensUsed: 100,
   exitCode: 0,
   subagentCount: 0,
+  attempts: 1,
 };
 
 function makeContext(overrides: Record<string, unknown> = {}): DefaultPipelineContext {
@@ -284,6 +287,77 @@ describe("feedbackLoopStep", () => {
     expect((thrown as Error & { failure?: { stage?: string } }).failure?.stage).toBe(
       "feedback-loop/implement-1",
     );
+  });
+
+  it("carries telemetry stamped on a rejected implement error onto the failed sub-step report (BAC-27136)", async () => {
+    // The executor (a spawn-level rejection where every attempt fails) and
+    // implement.ts (a settled-but-failing LLMResult) both stamp `err.telemetry`
+    // now — feedback-loop must surface it on the failed implement sub-step's
+    // outputs, not just the failure record, or the tokens/cost that attempt
+    // burned are lost from the run's evidence.
+    const telemetry = {
+      outcome: "unknown" as const,
+      numTurns: 3,
+      durationMs: 1500,
+      costUsd: 0.05,
+      tokensIn: 60,
+      tokensOut: 6,
+    };
+    const err = Object.assign(new Error("LLM invocation failed with exit code 1"), {
+      failure: {
+        category: "crash" as const,
+        code: "PROCESS_EXIT_NONZERO",
+        stage: "implement",
+        attempt: 3,
+        retryable: false,
+        message: "boom",
+        evidence: { truncated: false },
+      },
+      telemetry,
+    });
+    vi.mocked(implementStep.run).mockRejectedValueOnce(err);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter).catch((e: unknown) => e);
+
+    const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "implement");
+    expect(failedStep).toBeDefined();
+    expect((failedStep?.outputs as { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
+  });
+
+  it("carries telemetry stamped on a rejected review error onto the failed sub-step report (BAC-27136)", async () => {
+    // Mirrors the implement-side test above: the executor stamps `err.telemetry`
+    // on every give-up rejection, including a review call — feedback-loop must
+    // surface it on the failed review sub-step's outputs too.
+    const telemetry = {
+      outcome: "unknown" as const,
+      numTurns: 2,
+      durationMs: 900,
+      costUsd: 0.02,
+      tokensIn: 30,
+      tokensOut: 4,
+    };
+    const err = Object.assign(new Error("Prompt is too long"), { telemetry });
+    vi.mocked(reviewStep.run).mockRejectedValueOnce(err);
+
+    const reportedSteps: Step[] = [];
+    const reporter: StepReporter = {
+      report: vi.fn(async (step) => {
+        reportedSteps.push({ ...step });
+      }),
+    };
+
+    await feedbackLoopStep.run(makeContext(), BASE_INPUTS, reporter);
+
+    const failedStep = reportedSteps.find((s) => s.status === "failed" && s.type === "review");
+    expect(failedStep).toBeDefined();
+    expect((failedStep?.outputs as { telemetry?: typeof telemetry }).telemetry).toEqual(telemetry);
   });
 
   it("does not throw when the review step fails, so the pipeline can still push", async () => {
@@ -563,7 +637,7 @@ const MAX_TURNS_TELEMETRY = {
   toolTrace: ["Bash npm test", "Read /src/app.ts"],
 };
 
-function makeContextWithExecutor(invoke: ReturnType<typeof vi.fn>): DefaultPipelineContext {
+function makeContextWithExecutor(invoke: LLMExecutor["invoke"]): DefaultPipelineContext {
   return new DefaultPipelineContext(
     {
       jobId: 1, issueId: "issue-1", issueIdentifier: "ENG-1", issueTitle: "Test",
@@ -591,7 +665,10 @@ describe("feedbackLoopStep termination reasons", () => {
 
     expect(outputs.terminationReason).toBe("approved");
     expect(outputs.passes).toEqual([
-      { iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true, tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null },
+      {
+        iteration: 1, implementTurns: 12, implementOutcome: "success", costUsd: 0.3, reviewApproved: true,
+        tokensIn: 1, tokensOut: 1, cacheReadTokens: null, cacheCreationTokens: null, attempts: 1, reviewAttempts: 1,
+      },
     ]);
   });
 
