@@ -6,6 +6,8 @@ The orchestrator serves one MCP endpoint, `/mcp`, so a Claude session (and every
 
 `/mcp` is a JSON-RPC endpoint. Two methods matter: `tools/list` and `tools/call`. A request carries a bearer token minted by the MCP OAuth flow; nothing else is accepted, and an admin-UI session or an access code never reaches `/mcp`.
 
+The handshake methods `initialize` and `ping` are answered by the orchestrator itself and `notifications/initialized` is acknowledged with an empty 202 — none of the three touch the memory provider, so a client can connect and list the orchestrator-native tools on a sidecar-less boot; only a `kg_*` tool call still needs one.
+
 Tools come from two places and are merged into one list:
 
 * **Orchestrator-native tools**, defined in `src/mcp.ts` (`DIAG_TOOLS` for reads, `WRITE_TOOLS` for writes) and served by the orchestrator process itself. They need no sidecar, so they answer on a sidecar-less image.
