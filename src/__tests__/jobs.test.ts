@@ -556,6 +556,39 @@ describe("schema migration", () => {
   });
 });
 
+describe("listLog evidence stripping", () => {
+  it("strips evidence tails in listLog() but keeps them on a single-job read", () => {
+    const dispatchId = "dispatch-evidence-1";
+    const jobId = log.appendLog({ issueId: "issue-evidence", dispatchId });
+    log.updateJobFailure(jobId, {
+      category: "crash",
+      code: "PROCESS_EXIT_NONZERO",
+      stage: "push",
+      attempt: 1,
+      retryable: false,
+      message: "boom",
+      evidence: {
+        stdoutTail: "a".repeat(100),
+        stderrTail: "b".repeat(100),
+        truncated: false,
+        llmSubtype: null,
+        llmIsError: null,
+      },
+    });
+
+    const listed = log.listLog().find((j) => j.id === jobId);
+    expect(listed?.failure?.category).toBe("crash");
+    expect(listed?.failure?.code).toBe("PROCESS_EXIT_NONZERO");
+    expect(listed?.failure?.stage).toBe("push");
+    expect(listed?.failure?.evidence.stdoutTail).toBeUndefined();
+    expect(listed?.failure?.evidence.stderrTail).toBeUndefined();
+
+    const single = log.getJobByDispatchId(dispatchId);
+    expect(single?.failure?.evidence.stdoutTail).toBe("a".repeat(100));
+    expect(single?.failure?.evidence.stderrTail).toBe("b".repeat(100));
+  });
+});
+
 describe("getJobById", () => {
   it("returns the inserted row by id", () => {
     const id = log.appendLog({

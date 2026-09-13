@@ -238,3 +238,26 @@ describe("completeOrphanedPlanningJobs", () => {
     expect(log.completeOrphanedPlanningJobs("nope")).toBe(0);
   });
 });
+
+describe("listLog strips evidence tails", () => {
+  it("marks a list row's evidence truncated:true even when the persisted record was untruncated", () => {
+    const id = log.appendLog({ issueId: "i5", executionMode: "github-actions" });
+    log.updateJobFailure(id, {
+      category: "unknown",
+      code: "UNKNOWN",
+      stage: "implement",
+      attempt: 1,
+      retryable: false,
+      message: "m",
+      evidence: { truncated: false, stdoutTail: "full tail, not actually truncated" },
+    });
+
+    const [row] = log.listLog({ limit: 10 });
+    expect(row?.failure?.evidence.stdoutTail).toBeUndefined();
+    expect(row?.failure?.evidence.truncated).toBe(true);
+
+    // The single-job read keeps the full record, untouched.
+    expect(log.getJobById(id)?.failure?.evidence.truncated).toBe(false);
+    expect(log.getJobById(id)?.failure?.evidence.stdoutTail).toBe("full tail, not actually truncated");
+  });
+});

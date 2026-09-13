@@ -9,6 +9,7 @@ import { reviewStep } from "./review.js";
 import { READ_ONLY_ALLOWED_TOOLS } from "./read-only-tools.js";
 import { capDiff } from "./review.js";
 import { wrapWithPlanningGuard } from "../../planning-context-assembly.js";
+import { classifyThrown } from "../failure-classification.js";
 
 const DEFAULT_MAX_ITERATIONS = 3;
 const DEFAULT_MODEL = "claude-sonnet-5";
@@ -426,8 +427,21 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
       } catch (err) {
         implementSubStep.status = "failed";
         implementSubStep.ended_at = new Date().toISOString();
-        implementSubStep.outputs = { error: String(err) };
+        const implementStage = `feedback-loop/implement-${iteration}`;
+        // Re-stamp `stage`: classifyThrown() passes an already-attached record
+        // (from implementStep's classifyLlmResult) through unchanged, which would
+        // otherwise leave the iteration-qualified stage never applied.
+        const implementFailure = { ...classifyThrown(err, { stage: implementStage, attempt: 1 }), stage: implementStage };
+        implementSubStep.outputs = { error: String(err), failure: implementFailure };
         await reporter.report(implementSubStep);
+        if (typeof err === "object" && err !== null) {
+          try {
+            (err as Record<string, unknown>).failure = implementFailure;
+          } catch {
+            // err may be frozen/non-extensible — losing the attached record here
+            // must not turn this catch path itself into a thrown TypeError.
+          }
+        }
         throw err;
       }
 
@@ -530,7 +544,14 @@ export const feedbackLoopStep: StepModule<FeedbackLoopInputs, FeedbackLoopOutput
         // burn another pass producing the same un-reviewable diff.
         reviewSubStep.status = "failed";
         reviewSubStep.ended_at = new Date().toISOString();
-        reviewSubStep.outputs = { error: String(err) };
+        const reviewStage = `feedback-loop/review-${iteration}`;
+        // Re-stamp `stage`: classifyThrown() passes an already-attached record
+        // (from reviewStep's classifyLlmResult) through unchanged, which would
+        // otherwise leave the iteration-qualified stage never applied.
+        reviewSubStep.outputs = {
+          error: String(err),
+          failure: { ...classifyThrown(err, { stage: reviewStage, attempt: 1 }), stage: reviewStage },
+        };
         await reporter.report(reviewSubStep);
         console.warn(
           `[feedback-loop] Review step failed on iteration ${iteration}; stopping the loop — the pipeline will push the working tree as a draft PR: ${String(err)}`,

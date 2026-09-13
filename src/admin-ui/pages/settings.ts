@@ -3,7 +3,7 @@ export const settingsHtml = `
   <header class="page-header">
     <div class="page-header-left">
       <h1 class="page-title">Settings</h1>
-      <div class="page-subtitle">Sessions app, region, and global machine secrets</div>
+      <div class="page-subtitle">Sessions app, region, retry policy, and global machine secrets</div>
     </div>
   </header>
   <div class="page-body">
@@ -55,6 +55,46 @@ export const settingsHtml = `
     </div>
 
     <div class="card">
+      <div class="card-header"><h2 class="card-title">Retry Policy</h2></div>
+      <div class="card-body">
+        <p class="text-secondary" style="margin-bottom:12px">Global retry/backoff policy and reviewer turn cap, applied to every implementation run. Blank fields fall back to the default shown as a placeholder.</p>
+        <div class="field">
+          <label>Request Retries <span class="text-tertiary">(re-spawns of one Claude invocation)</span></label>
+          <input class="input" id="rp-requestRetries" type="number" min="0" max="10" step="1">
+        </div>
+        <div class="field">
+          <label>Stage Retries <span class="text-tertiary">(re-runs of a whole implement/review stage)</span></label>
+          <input class="input" id="rp-stageRetries" type="number" min="0" max="10" step="1">
+        </div>
+        <div class="field">
+          <label>Push Retries</label>
+          <input class="input" id="rp-pushRetries" type="number" min="0" max="10" step="1">
+        </div>
+        <div class="field">
+          <label>Backoff Initial (ms)</label>
+          <input class="input" id="rp-backoffInitialMs" type="number" min="1000" max="600000" step="1">
+        </div>
+        <div class="field">
+          <label>Backoff Max (ms)</label>
+          <input class="input" id="rp-backoffMaxMs" type="number" min="1000" step="1">
+        </div>
+        <div class="field">
+          <label>Backoff Jitter <span class="text-tertiary">(fraction subtracted, 0 = none, 1 = up to &minus;100%)</span></label>
+          <input class="input" id="rp-backoffJitter" type="number" min="0" max="1" step="0.05">
+        </div>
+        <div class="field">
+          <label>Review Max Turns <span class="text-tertiary">(in-loop and post-push reviewer)</span></label>
+          <input class="input" id="rp-reviewMaxTurns" type="number" min="5" max="200" step="1">
+        </div>
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <button class="btn btn-primary btn-sm" onclick="saveRetryPolicy()">Save</button>
+          <button class="btn btn-sm" onclick="resetRetryPolicy()">Reset to defaults</button>
+        </div>
+        <div id="retry-policy-error" class="error hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="card-header"><h2 class="card-title">Global Machine Secrets</h2></div>
       <div class="card-body">
         <p class="text-secondary" style="margin-bottom:12px">Secrets stored on the Fly sessions app and injected into every machine as environment variables. Values are write-only &#x2014; set them here instead of using the Fly CLI.</p>
@@ -84,6 +124,17 @@ export const settingsHtml = `
 
 export const settingsScript = `
 (function () {
+  var RETRY_POLICY_FIELDS = ['requestRetries', 'stageRetries', 'pushRetries', 'backoffInitialMs', 'backoffMaxMs', 'backoffJitter', 'reviewMaxTurns'];
+
+  function populateRetryPolicy(policy, defaults) {
+    RETRY_POLICY_FIELDS.forEach(function (field) {
+      var input = document.getElementById('rp-' + field);
+      if (!input) return;
+      input.placeholder = String(defaults[field]);
+      input.value = policy && policy[field] !== defaults[field] ? policy[field] : '';
+    });
+  }
+
   async function loadSettings() {
     try {
       const res = await window.api('/api/settings');
@@ -106,10 +157,33 @@ export const settingsScript = `
         ? ('Active: ' + window.esc(appInfo.runtimeValue) + (appInfo.overriddenByEnv ? ' (from env var)' : ' (from DB)'))
         : 'Not configured — add a sessions app name to enable Fly dispatch';
       sourceEl.textContent = srcText;
+      populateRetryPolicy(data.retryPolicy, data.retryPolicyDefaults);
     } catch (err) {
       console.error('loadSettings failed:', err);
     }
   }
+
+  async function saveRetryPolicy() {
+    const errEl = document.getElementById('retry-policy-error');
+    errEl.classList.add('hidden');
+    const patch = {};
+    for (const field of RETRY_POLICY_FIELDS) {
+      const raw = document.getElementById('rp-' + field).value.trim();
+      if (raw === '') continue;
+      const num = Number(raw);
+      if (!Number.isFinite(num)) { errEl.textContent = field + ' must be a number.'; errEl.classList.remove('hidden'); return; }
+      patch[field] = num;
+    }
+    await saveSettings({ retryPolicy: patch }, errEl);
+  }
+  window.saveRetryPolicy = saveRetryPolicy;
+
+  async function resetRetryPolicy() {
+    const errEl = document.getElementById('retry-policy-error');
+    errEl.classList.add('hidden');
+    await saveSettings({ retryPolicy: null }, errEl);
+  }
+  window.resetRetryPolicy = resetRetryPolicy;
 
   async function saveSessionsApp() {
     const val = document.getElementById('settings-sessions-app').value.trim() || null;
@@ -155,8 +229,8 @@ export const settingsScript = `
   }
   window.saveKgBaseRepo = saveKgBaseRepo;
 
-  async function saveSettings(payload) {
-    const errEl = document.getElementById('settings-error');
+  async function saveSettings(payload, errEl) {
+    errEl = errEl || document.getElementById('settings-error');
     errEl.classList.add('hidden');
     try {
       const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify(payload) });

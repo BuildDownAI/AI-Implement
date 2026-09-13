@@ -1,5 +1,6 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import type { FailureRecord } from "./pipeline/failure-classification.js";
 import type { ReferenceRepoResult } from "./reference-repos.js";
 
 export function collectRunnerComments(workspaceDir: string): Array<{ body: string }> {
@@ -45,8 +46,14 @@ export async function postRunnerResult(params: {
   outcome: "success" | "failure";
   prUrl?: string;
   failureReason?: string;
-  /** Machine-readable code set when a known guardrail trips (e.g. "SENSITIVE_FILES_BLOCKED"). */
+  /**
+   * Machine-readable code. Set either when a known guardrail trips
+   * (e.g. "SENSITIVE_FILES_BLOCKED") or, for a classified terminal failure,
+   * to `failure.code` — it is not guardrail-only.
+   */
   failureCode?: string;
+  /** Structured failure record for the terminal error, classified by src/pipeline/failure-classification.ts. */
+  failure?: FailureRecord;
   /** True when a grouping-parent run produced no changes; skips prUrl requirement on the callback. */
   noWork?: boolean;
   /** Reference repository clone outcomes, present only when the run declared entries. */
@@ -82,6 +89,7 @@ export async function postRunnerResult(params: {
   if (params.prUrl) body.prUrl = params.prUrl;
   if (params.failureReason) body.failureReason = params.failureReason;
   if (params.failureCode) body.failureCode = params.failureCode;
+  if (params.failure) body.failure = params.failure;
   if (params.noWork) body.noWork = params.noWork;
   if (params.referenceRepoResults && params.referenceRepoResults.length > 0) {
     body.referenceRepoResults = params.referenceRepoResults;

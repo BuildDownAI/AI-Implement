@@ -10,8 +10,9 @@ import type * as StepLogModule from "../step-log.js";
 import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
-import { formatFailureComment } from "../runner-callback.js";
+import { formatFailureComment, boundStatusText } from "../runner-callback.js";
 import { FakeProvider } from "./providers/fake.js";
+import { STUCK_JOB_MAX_ATTEMPTS } from "../stuck-watchdog.js";
 import type { TicketingProvider } from "../providers/types.js";
 import type { Step } from "../pipeline/types.js";
 import type { ReferenceRepoResult } from "../reference-repos.js";
@@ -411,6 +412,93 @@ describe("handleRunnerResult — implementation", () => {
     expect(
       calls.find((c) => c.method === "markImplementationFailed")?.args,
     ).toEqual(["i", "ENG", "tests fail"]);
+  });
+
+  const VALID_FAILURE = {
+    category: "transient",
+    code: "PROVIDER_OVERLOADED",
+    stage: "implement",
+    attempt: 1,
+    retryable: true,
+    message: "overloaded",
+    evidence: { truncated: false },
+  };
+
+  it("drops a malformed failure record but still posts comments and transitions the issue, persisting no failure_json", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+    const fake = new FakeProvider({ recordCalls: true });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "boom",
+        comments: [{ body: "a comment" }],
+        failure: { ...VALID_FAILURE, category: "bogus" },
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(fake),
+    });
+
+    expect(res.status).toBe(200);
+    const calls = fake.recordedCalls();
+    expect(calls.find((c) => c.method === "postComment")).toBeTruthy();
+    expect(calls.find((c) => c.method === "markImplementationFailed")).toBeTruthy();
+    expect(log.getJobById(jobId)?.failure).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(dispatchId));
+    warnSpy.mockRestore();
+  });
+
+  it("persists a valid failure record on the job, retrievable via getJobById", async () => {
+    const { token, dispatchId } = runnerTokens.mintRunToken({
+      issueId: "i",
+      mappingTeamKey: "ENG",
+      phase: "implementation",
+      ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+      secret: SECRET,
+    });
+    const jobId = log.appendLog({
+      issueId: "i",
+      issueIdentifier: "ENG-1",
+      issueTitle: "Implement it",
+      teamKey: "ENG",
+      repo: "o/r",
+      dispatchId,
+      executionMode: "github-actions",
+    });
+
+    const res = await runnerCallback.handleRunnerResult({
+      authorization: `Bearer ${token}`,
+      body: {
+        phase: "implementation",
+        outcome: "failure",
+        failureReason: "provider overloaded",
+        comments: [],
+        failure: VALID_FAILURE,
+      } as unknown as RunnerCallbackModule.RunnerResultBody,
+      secret: SECRET,
+      resolveProvider: makeResolve(new FakeProvider()),
+    });
+
+    expect(res.status).toBe(200);
+    expect(log.getJobById(jobId)?.failure).toEqual(VALID_FAILURE);
   });
 
   it("calls clearWorkingState and marks job operator_cancelled on OPERATOR_CANCELLED failureCode", async () => {
@@ -1657,6 +1745,24 @@ describe("unapproved-run failure codes", () => {
   });
 });
 
+describe("boundStatusText", () => {
+  it("takes only the first line", () => {
+    expect(boundStatusText("first line\nsecond line\nthird line")).toBe("first line");
+  });
+
+  it("caps a long first line at 200 characters with an ellipsis", () => {
+    const long = "x".repeat(250);
+    const bounded = boundStatusText(long);
+    expect(bounded.length).toBe(201);
+    expect(bounded.endsWith("…")).toBe(true);
+    expect(bounded.startsWith("x".repeat(200))).toBe(true);
+  });
+
+  it("leaves a short single-line string untouched", () => {
+    expect(boundStatusText("short")).toBe("short");
+  });
+});
+
 describe("watchdogConfig — remediateFailedJob gating", () => {
   const watchdogConfig = {
     githubAppId: "app-id",
@@ -1741,6 +1847,59 @@ describe("watchdogConfig — remediateFailedJob gating", () => {
     expect(res.status).toBe(200);
     const clearCall = fake.recordedCalls().find((c) => c.method === "clearWorkingState");
     expect(clearCall).toBeDefined();
+  });
+
+  it("bounds a multi-line, oversized failureReason before it reaches the stuck-watchdog give-up comment", async () => {
+    const fake = new FakeProvider({ recordCalls: true });
+    const longFirstLine = "x".repeat(250);
+    const failureReason = `${longFirstLine}\nsecond line must not leak into the give-up comment`;
+
+    // Drive attempts past STUCK_JOB_MAX_ATTEMPTS so boundedCleanup takes the give-up
+    // path (postComment with the markdown table), which is where the unbounded
+    // multi-line text would otherwise break the "Last run status" table cell.
+    for (let i = 0; i < STUCK_JOB_MAX_ATTEMPTS + 1; i++) {
+      const { token, dispatchId } = runnerTokens.mintRunToken({
+        issueId: "i",
+        mappingTeamKey: "ENG",
+        phase: "implementation",
+        ttlSeconds: runnerTokens.IMPLEMENTATION_TTL_SECONDS,
+        secret: SECRET,
+      });
+      log.appendLog({
+        issueId: "i",
+        issueIdentifier: "ENG-1",
+        issueTitle: "t",
+        teamKey: "ENG",
+        repo: "o/r",
+        dispatchId,
+        executionMode: "github-actions",
+      });
+
+      const res = await runnerCallback.handleRunnerResult({
+        authorization: `Bearer ${token}`,
+        body: {
+          phase: "implementation",
+          outcome: "failure",
+          failureReason,
+          comments: [],
+        },
+        secret: SECRET,
+        resolveProvider: makeResolve(fake),
+        watchdogConfig,
+      });
+      expect(res.status).toBe(200);
+    }
+
+    const postComments = fake.recordedCalls().filter((c) => c.method === "postComment");
+    const giveUpBody = postComments[postComments.length - 1]?.args[1] as string;
+    expect(giveUpBody).toContain("Last run status");
+    expect(giveUpBody).not.toContain("second line must not leak");
+
+    const statusLine = giveUpBody.split("\n").find((l) => l.includes("Last run status"));
+    expect(statusLine).toBeDefined();
+    const cell = statusLine!.match(/`([^`]*)`/);
+    expect(cell).toBeTruthy();
+    expect(cell![1].length).toBeLessThanOrEqual(201);
   });
 });
 

@@ -399,22 +399,23 @@ describe("buildEnvelopeDispatchInputs", () => {
   const baseIssue = { id: "uuid-1", identifier: "AII-1", title: "T", description: "D" };
 
   it("carries profiles in run_config when non-empty", () => {
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: ["backend", "webapp"] }, { runnerPhase: "implementation" });
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: ["backend", "webapp"] }, { runnerPhase: "implementation", retryPolicy: null });
     const cfg = decodeRunConfig(inputs.run_config as string);
     expect(cfg.profiles).toEqual(["backend", "webapp"]);
   });
 
   it("omits profiles from run_config when absent or empty", () => {
-    const noProfiles = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "implementation" });
+    const noProfiles = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "implementation", retryPolicy: null });
     expect(decodeRunConfig(noProfiles.run_config as string).profiles).toBeUndefined();
 
-    const emptyProfiles = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: [] }, { runnerPhase: "implementation" });
+    const emptyProfiles = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: [] }, { runnerPhase: "implementation", retryPolicy: null });
     expect(decodeRunConfig(emptyProfiles.run_config as string).profiles).toBeUndefined();
   });
 
   it("carries planningContext in run_config when provided", () => {
     const ctx = { parent: "- AII-0: parent", siblings: "None", dependencies: "None" };
     const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, {
+      retryPolicy: null,
       runnerPhase: "planning",
       planningContext: ctx,
     });
@@ -423,12 +424,12 @@ describe("buildEnvelopeDispatchInputs", () => {
   });
 
   it("omits planningContext from run_config when not provided", () => {
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning" });
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning", retryPolicy: null });
     expect(decodeRunConfig(inputs.run_config as string).planningContext).toBeUndefined();
   });
 
   it("implementation dispatch carries profiles but no planningContext", () => {
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: ["backend"] }, { runnerPhase: "implementation" });
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: ["backend"] }, { runnerPhase: "implementation", retryPolicy: null });
     const cfg = decodeRunConfig(inputs.run_config as string);
     expect(cfg.profiles).toEqual(["backend"]);
     expect(cfg.planningContext).toBeUndefined();
@@ -436,7 +437,7 @@ describe("buildEnvelopeDispatchInputs", () => {
 
   it("planning dispatch with context but no profiles", () => {
     const ctx = { parent: "- AII-0: parent", siblings: "None", dependencies: "None" };
-    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning", planningContext: ctx });
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "planning", planningContext: ctx, retryPolicy: null });
     const cfg = decodeRunConfig(inputs.run_config as string);
     expect(cfg.profiles).toBeUndefined();
     expect(cfg.planningContext).toEqual(ctx);
@@ -444,31 +445,31 @@ describe("buildEnvelopeDispatchInputs", () => {
 
   it("implementation dispatch carries referenceRepos when mapping has entries", () => {
     const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
-    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "implementation" });
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "implementation", retryPolicy: null });
     const cfg = decodeRunConfig(inputs.run_config as string);
     expect(cfg.referenceRepos).toEqual(repos);
   });
 
   it("implementation dispatch omits referenceRepos when mapping has none", () => {
-    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: null }), baseIssue, { runnerPhase: "implementation" });
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: null }), baseIssue, { runnerPhase: "implementation", retryPolicy: null });
     expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
   });
 
   it("planning dispatch omits referenceRepos even when mapping has entries", () => {
     const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
-    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "planning" });
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "planning", retryPolicy: null });
     expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
   });
 
   it("kg-refresh dispatch omits referenceRepos even when mapping has entries", () => {
     const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
-    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "kg-refresh" });
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "kg-refresh", retryPolicy: null });
     expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toBeUndefined();
   });
 
   it("gap-analysis dispatch carries referenceRepos when mapping has entries", () => {
     const repos = [{ repo: "https://github.com/org/ref-repo", path: "refs/repo-a" }];
-    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "gap-analysis" });
+    const inputs = buildEnvelopeDispatchInputs(makeMapping({ referenceRepos: repos }), baseIssue, { runnerPhase: "gap-analysis", retryPolicy: null });
     expect(decodeRunConfig(inputs.run_config as string).referenceRepos).toEqual(repos);
   });
 

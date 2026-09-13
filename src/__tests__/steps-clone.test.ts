@@ -127,6 +127,39 @@ describe("cloneStep", () => {
     expect(thrownMessage).not.toContain("secret-token");
   });
 
+  it("attaches an auth/GIT_AUTH failure record when clone fails with an authentication error", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    mockSpawn([
+      { status: 128, stderr: "fatal: Authentication failed for 'https://github.com/acme/app.git/'" },
+    ]);
+
+    let failure: unknown;
+    try {
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      failure = (err as { failure?: unknown }).failure;
+    }
+    expect(failure).toMatchObject({ category: "auth", code: "GIT_AUTH" });
+  });
+
+  it("attaches a transient/GIT_REMOTE_TRANSIENT failure record when an incremental fetch times out reading from the remote", async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    mockSpawn([
+      {
+        status: 128,
+        stderr: "error: RPC failed; curl 56\nfatal: could not read from remote repository, timeout while accessing",
+      },
+    ]);
+
+    let failure: unknown;
+    try {
+      await cloneStep.run(makeContext(), BASE_INPUTS, new NoopStepReporter());
+    } catch (err) {
+      failure = (err as { failure?: unknown }).failure;
+    }
+    expect(failure).toMatchObject({ category: "transient", code: "GIT_REMOTE_TRANSIENT" });
+  });
+
   it("throws when rev-parse fails", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
     // clone, config user.name, config user.email, rev-parse (fails)

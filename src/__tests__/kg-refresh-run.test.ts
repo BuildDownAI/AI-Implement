@@ -102,6 +102,7 @@ describe("RunConfigV1 kg-refresh fields", () => {
 describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
   it("sets runnerPhase to kg-refresh inside run_config", () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
       runnerPhase: "kg-refresh",
       runToken: "run-tok",
     });
@@ -111,6 +112,7 @@ describe("buildEnvelopeDispatchInputs — kg-refresh phase", () => {
 
   it("never includes a publication token for kg-refresh", () => {
     const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, {
+      retryPolicy: null,
       runnerPhase: "kg-refresh",
       runToken: "run-tok",
       runPublicationToken: "must-not-leak",
@@ -3446,12 +3448,12 @@ describe("GHA kg-refresh dispatch — inputs shape contract", () => {
 
 describe("buildEnvelopeDispatchInputs — implement dispatch byte-identity", () => {
   it("implement dispatch inputs have no runner_phase key", () => {
-    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { runnerPhase: "implementation", runToken: "tok" });
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { runnerPhase: "implementation", runToken: "tok", retryPolicy: null });
     expect("runner_phase" in inputs).toBe(false);
   });
 
   it("implement dispatch inputs have no runner_callback_url key", () => {
-    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { runnerPhase: "implementation", runToken: "tok" });
+    const inputs = buildEnvelopeDispatchInputs(makeMapping(), baseIssue, { runnerPhase: "implementation", runToken: "tok", retryPolicy: null });
     expect("runner_callback_url" in inputs).toBe(false);
   });
 });

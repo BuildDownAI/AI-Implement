@@ -15,7 +15,9 @@ import { parseWorkflowMd } from "./workflow-md.js";
 import { fetchPlanningContextFromOrchestrator, postRunnerResult } from "./runner-result.js";
 import { SensitiveFilesError } from "./pipeline/sensitive-files.js";
 import { OperatorCancelledError } from "./pipeline/operator-cancelled.js";
+import { classifyThrown } from "./pipeline/failure-classification.js";
 import { decodeRunConfig, type RunConfigV1 } from "./run-config.js";
+import { DEFAULT_RETRY_POLICY, normalizeRetryPolicy, type RetryPolicy } from "./pipeline/retry-backoff.js";
 import { writeRunAutopsy, writeRunStats } from "./run-autopsy.js";
 import { parsePlanningBlock } from "./planning-block.js";
 import type { LocalRunTokenSummary } from "./local/run-result.js";
@@ -228,6 +230,11 @@ export interface ResolvedRunnerInputs {
   /** True when this is a grouping parent's own closing-work run (from run_config.groupingParent
    *  or AI_IMPLEMENT_GROUPING_PARENT env var). Lets push.ts finalize cleanly with no PR. */
   groupingParent: boolean;
+  /** Retry/backoff policy and reviewer turn cap (from run_config.retryPolicy), run through
+   *  normalizeRetryPolicy — the envelope is orchestrator-authored but decodeRunConfig does
+   *  not validate it, so this is the runner-side guard. Defaults to DEFAULT_RETRY_POLICY
+   *  when absent or invalid — there is no legacy-env equivalent. */
+  retryPolicy: RetryPolicy;
 }
 
 function parseEnvInt(raw: string | undefined, name: string): number | undefined {
@@ -293,6 +300,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     claudeModel: env.CLAUDE_MODEL?.trim() || undefined,
     logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
     groupingParent: cfg.groupingParent === true,
+    retryPolicy: normalizeRetryPolicy(cfg.retryPolicy),
   };
 }
 
@@ -369,6 +377,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     claudeModel: env.CLAUDE_MODEL?.trim() || undefined,
     logLevel: resolveLogLevel(env.AI_IMPLEMENT_LOG_LEVEL),
     groupingParent: env.AI_IMPLEMENT_GROUPING_PARENT === "true",
+    retryPolicy: { ...DEFAULT_RETRY_POLICY },
   };
 }
 
@@ -405,6 +414,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     provider,
     claudeModel,
     groupingParent,
+    retryPolicy,
   } = resolveRunnerInputs(process.env);
   const branch = resolveBranch(workspaceDir, baseBranch, prNumber);
 
@@ -502,6 +512,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       referenceRepos,
       profiles,
       groupingParent,
+      retryPolicy,
       callbackUrl: callbackUrl ?? undefined,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },
     },
@@ -664,6 +675,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     console.error(`Pipeline failed: ${err}`);
     disposition = `failed: ${err instanceof Error ? err.message : String(err)}`;
     referenceRepoResults = readReferenceRepoResults();
+    const failure = classifyThrown(err, { stage: "pipeline", attempt: 1 });
     await postRunnerResult({
       workspaceDir,
       phase: runnerPhase,
@@ -671,7 +683,8 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       failureReason: err instanceof Error ? err.message : String(err),
       failureCode: err instanceof SensitiveFilesError ? err.code
         : err instanceof OperatorCancelledError ? err.code
-        : undefined,
+        : failure.code,
+      failure,
       referenceRepoResults,
       callbackUrl,
       fetchImpl: opts.fetchImpl,

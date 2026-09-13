@@ -105,6 +105,39 @@ describe("implementStep", () => {
     ).rejects.toThrow("exit code 1");
   });
 
+  it("classifies a non-zero exit with unrecognised stderr as crash/PROCESS_EXIT_NONZERO, not invalid_output", async () => {
+    // implement never requests structured output, so a plain crash must not be
+    // misclassified as invalid_output/LLM_NO_STRUCTURED_OUTPUT just because
+    // structuredOutput happens to be undefined.
+    const executor = makeExecutor({ exitCode: 1, stderr: "boom, nothing recognisable here" });
+    const ctx = makeContext(executor);
+
+    const err = await implementStep
+      .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    const failure = (err as Error & { failure?: { category?: string; code?: string } }).failure;
+    expect(failure?.category).toBe("crash");
+    expect(failure?.code).toBe("PROCESS_EXIT_NONZERO");
+  });
+
+  it("populates the failure record's elapsedMs from the executor's telemetry.durationMs", async () => {
+    const executor = makeExecutor({
+      exitCode: 1,
+      stderr: "boom",
+      telemetry: { outcome: "error", numTurns: 2, durationMs: 4200, costUsd: null, tokensIn: null, tokensOut: null },
+    });
+    const ctx = makeContext(executor);
+
+    const err = await implementStep
+      .run(ctx, { workspaceDir: "/tmp/test", prompt: "Do it" }, new NoopStepReporter())
+      .catch((e: unknown) => e);
+
+    const failure = (err as Error & { failure?: { elapsedMs?: number } }).failure;
+    expect(failure?.elapsedMs).toBe(4200);
+  });
+
   it("propagates executor rejection", async () => {
     const executor: LLMExecutor = {
       invoke: vi.fn().mockRejectedValue(new Error("network error")),

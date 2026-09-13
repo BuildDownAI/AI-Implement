@@ -887,12 +887,17 @@ describe("runAutonomous", () => {
       phase: string;
       outcome: string;
       failureReason: string;
+      failure?: { stage?: string };
     };
     expect(body).toMatchObject({
       phase: "implementation",
       outcome: "failure",
       failureReason: "push failed",
     });
+    // PipelineRunner attaches the classified record (stage = the failing
+    // step's id) onto the rethrown error; without that, this would read
+    // back stage: "pipeline" instead of the actual failing step.
+    expect(body.failure?.stage).toBe("push");
   });
 
   it("posts gap-analysis callback phase for PR_NUMBER runs", async () => {

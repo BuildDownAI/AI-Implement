@@ -1944,6 +1944,78 @@ describe("admin settings", () => {
       expect(res.statusCode).toBe(400);
     }
   });
+
+  it("GET /api/settings returns retryPolicy and retryPolicyDefaults", async () => {
+    const token = await login("secret");
+    const res = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.retryPolicy).toEqual(body.retryPolicyDefaults);
+    expect(body.retryPolicyDefaults).toMatchObject({
+      requestRetries: 2,
+      stageRetries: 1,
+      pushRetries: 2,
+      backoffInitialMs: 30_000,
+      backoffMaxMs: 300_000,
+      backoffJitter: 0.2,
+      reviewMaxTurns: 30,
+    });
+  });
+
+  it("POST /api/settings with retryPolicy.backoffInitialMs = 5 returns 400 and writes nothing", async () => {
+    const token = await login("secret");
+    const res = await request("/api/settings", "POST", "secret", { retryPolicy: { backoffInitialMs: 5 } }, token);
+    expect(res.statusCode).toBe(400);
+    const after = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(JSON.parse(after.body).retryPolicy).toEqual(JSON.parse(after.body).retryPolicyDefaults);
+  });
+
+  it("POST /api/settings with retryPolicy.reviewMaxTurns = 2 returns 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/settings", "POST", "secret", { retryPolicy: { reviewMaxTurns: 2 } }, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("POST /api/settings with retryPolicy.reviewMaxTurns = 60 persists and is returned by GET", async () => {
+    const token = await login("secret");
+    const res = await request("/api/settings", "POST", "secret", { retryPolicy: { reviewMaxTurns: 60 } }, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).retryPolicy.reviewMaxTurns).toBe(60);
+    const after = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(JSON.parse(after.body).retryPolicy.reviewMaxTurns).toBe(60);
+  });
+
+  it("POST /api/settings with retryPolicy: null resets to defaults", async () => {
+    const token = await login("secret");
+    await request("/api/settings", "POST", "secret", { retryPolicy: { reviewMaxTurns: 60 } }, token);
+    const res = await request("/api/settings", "POST", "secret", { retryPolicy: null }, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).retryPolicy).toEqual(JSON.parse(res.body).retryPolicyDefaults);
+  });
+
+  it("POST /api/settings with an unknown retryPolicy key returns 400 and writes nothing", async () => {
+    const token = await login("secret");
+    const res = await request("/api/settings", "POST", "secret", { retryPolicy: { reviewMaxTurns: 60, junk: "x" } }, token);
+    expect(res.statusCode).toBe(400);
+    const after = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(JSON.parse(after.body).retryPolicy).toEqual(JSON.parse(after.body).retryPolicyDefaults);
+  });
+
+  it("POST /api/settings with retryPolicy.backoffMaxMs = 1e12 returns 400", async () => {
+    const token = await login("secret");
+    const res = await request("/api/settings", "POST", "secret", { retryPolicy: { backoffMaxMs: 1_000_000_000_000 } }, token);
+    expect(res.statusCode).toBe(400);
+  });
+
+  it("saving {} after reviewMaxTurns was set to 60 resets it to the default of 30", async () => {
+    const token = await login("secret");
+    await request("/api/settings", "POST", "secret", { retryPolicy: { reviewMaxTurns: 60 } }, token);
+    const res = await request("/api/settings", "POST", "secret", { retryPolicy: {} }, token);
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).retryPolicy.reviewMaxTurns).toBe(30);
+    const after = await request("/api/settings", "GET", "secret", undefined, token);
+    expect(JSON.parse(after.body).retryPolicy.reviewMaxTurns).toBe(30);
+  });
 });
 
 describe("admin global secrets", () => {

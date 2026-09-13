@@ -1,5 +1,6 @@
 import { getDb } from "./dedup.js";
 import { markCommentGapfillRunTerminal } from "./comment-gapfill-queue.js";
+import { isFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -44,6 +45,9 @@ export interface Job {
   /** Durable approval mark set by stampJobApproved; survives any subsequent updateJobStatus
    *  call from the GHA monitor or watchdog that may overwrite conclusion with 'success'. */
   approved: boolean;
+  /** Structured terminal failure reported by the runner callback, or null when the job
+   *  hasn't failed (or failed before this field existed). */
+  failure: FailureRecord | null;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -135,6 +139,9 @@ function ensureLogColumns(): void {
   }
   if (!names.has("approved")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN approved INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!names.has("failure_json")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_json TEXT");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_run_id ON dispatch_log(run_id)");
 
@@ -507,11 +514,21 @@ export function listLog(opts: { since?: number; until?: number; limit?: number }
   if (until !== undefined) { conditions.push("dispatched_at <= ?"); params.push(until); }
   const where = conditions.length ? " WHERE " + conditions.join(" AND ") : "";
   params.push(limit);
-  return mapRows(
+  const jobs = mapRows(
     getDb()
       .prepare("SELECT * FROM dispatch_log" + where + " ORDER BY dispatched_at DESC LIMIT ?")
       .all(...params) as RawRow[],
   );
+  // List responses drop the (potentially 8 KB-per-side) evidence tails — a
+  // single job read (getJobByDispatchId, etc.) keeps the full record.
+  return jobs.map((job) => (job.failure ? { ...job, failure: stripEvidenceTails(job.failure) } : job));
+}
+
+function stripEvidenceTails(failure: FailureRecord): FailureRecord {
+  const { llmSubtype, llmIsError, llmOutcome, captureError } = failure.evidence;
+  // Always true here, regardless of the original value: the tails themselves are
+  // dropped below, so a list row must never read as if it held the full evidence.
+  return { ...failure, evidence: { truncated: true, llmSubtype, llmIsError, llmOutcome, captureError } };
 }
 
 export function getJobByDispatchId(dispatchId: string): Job | null {
@@ -618,6 +635,7 @@ interface RawRow {
   trigger: string | null;
   grouping_parent: number | null;
   approved: number | null;
+  failure_json: string | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -647,7 +665,26 @@ function mapRows(rows: RawRow[]): Job[] {
     contract: row.contract ?? null,
     groupingParent: row.grouping_parent === 1,
     approved: row.approved === 1,
+    failure: parseFailureJson(row.failure_json),
   }));
+}
+
+/** Best-effort parse: a malformed or pre-migration row reads as "no failure" rather than throwing. */
+function parseFailureJson(raw: string | null): FailureRecord | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isFailureRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persists the structured terminal failure reported by the runner callback. */
+export function updateJobFailure(jobId: number, failure: FailureRecord): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET failure_json = ? WHERE id = ?")
+    .run(JSON.stringify(failure), jobId);
 }
 
 export interface PullSummary {
