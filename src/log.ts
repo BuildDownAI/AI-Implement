@@ -48,6 +48,22 @@ export interface Job {
   /** Structured terminal failure reported by the runner callback, or null when the job
    *  hasn't failed (or failed before this field existed). */
   failure: FailureRecord | null;
+  /** Stamped by `markJobFailureCommented` once the runner callback's own failure comment
+   *  (`markPlanningFailed`/`markImplementationFailed`) has actually posted — this is the
+   *  monitor's dedup key (BAC-27112 follow-up). Deliberately stamped only AFTER the provider
+   *  call resolves `true`, not pre-claimed before it: an orchestrator process death between
+   *  the write and the (awaited, network-bound) provider call is a real failure mode (the
+   *  callback's token is one-time-use, so there is no retry), and pre-claiming would leave
+   *  such a job with no ticket comment at all — silently worse than the narrow monitor-tick
+   *  double-post window a pre-claim would have closed. This covers a coded unapproved run
+   *  (REVIEW_UNAPPROVED/MAX_TURNS_EXHAUSTED) too: the callback still calls
+   *  `markImplementationFailed` for those and stamps this field even though the job's exit
+   *  code is 0 and its terminal status ends up "review_failed" rather than "failed" — so the
+   *  monitor's own review_failed classification is suppressed the same way a real failure's
+   *  would be, and the ticket doesn't get a second, less useful comment behind the callback's
+   *  🟡 one. Distinct from `failure`, which is persisted for every phase (including
+   *  gap-analysis, which the callback never comments for and so never stamps this field). */
+  failureCommentedAt: number | null;
 }
 
 // Keep old name exported for backwards compat with admin.ts
@@ -142,6 +158,9 @@ function ensureLogColumns(): void {
   }
   if (!names.has("failure_json")) {
     db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_json TEXT");
+  }
+  if (!names.has("failure_commented_at")) {
+    db.exec("ALTER TABLE dispatch_log ADD COLUMN failure_commented_at INTEGER");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_dispatch_log_run_id ON dispatch_log(run_id)");
 
@@ -563,6 +582,21 @@ export function getLatestDispatchForPr(owner: string, repo: string, prNumber: nu
   return mapRows([row])[0];
 }
 
+/** Latest dispatch for an issue in a repo, matched case-insensitively on the tracker
+ *  identifier. Recovery path for PRs the orchestrator opened WITHOUT a dispatch —
+ *  a grouping roll-up PR encodes its feature-node parent's key in the head branch,
+ *  and that parent's own past dispatches carry the tracker identity the comment
+ *  gap-fill rail needs. */
+export function getLatestDispatchForIssueIdentifier(owner: string, repo: string, identifier: string): Job | null {
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dispatch_log WHERE repo = ? AND issue_identifier = ? COLLATE NOCASE ORDER BY dispatched_at DESC LIMIT 1",
+    )
+    .get(`${owner}/${repo}`, identifier) as RawRow | undefined;
+  if (!row) return null;
+  return mapRows([row])[0];
+}
+
 /**
  * Returns the latest identifier, title, and repo recorded in dispatch_log for a
  * given issue+phase, or null fields when no log entry exists. Used to enrich
@@ -636,6 +670,7 @@ interface RawRow {
   grouping_parent: number | null;
   approved: number | null;
   failure_json: string | null;
+  failure_commented_at: number | null;
 }
 
 function mapRows(rows: RawRow[]): Job[] {
@@ -666,6 +701,7 @@ function mapRows(rows: RawRow[]): Job[] {
     groupingParent: row.grouping_parent === 1,
     approved: row.approved === 1,
     failure: parseFailureJson(row.failure_json),
+    failureCommentedAt: row.failure_commented_at ?? null,
   }));
 }
 
@@ -685,6 +721,20 @@ export function updateJobFailure(jobId: number, failure: FailureRecord): void {
   getDb()
     .prepare("UPDATE dispatch_log SET failure_json = ? WHERE id = ?")
     .run(JSON.stringify(failure), jobId);
+}
+
+/**
+ * Stamps `failure_commented_at` after the runner callback's own failure comment
+ * (`markPlanningFailed`/`markImplementationFailed`) has actually posted — never before the
+ * provider call resolves. See the field's doc comment on `Job` for why this is post-success
+ * only: a pre-claim would leave a job with no ticket comment at all if the orchestrator died
+ * between the claim and the provider call resolving, since the callback's token is
+ * one-time-use and there is no retry.
+ */
+export function markJobFailureCommented(jobId: number): void {
+  getDb()
+    .prepare("UPDATE dispatch_log SET failure_commented_at = ? WHERE id = ?")
+    .run(Date.now(), jobId);
 }
 
 export interface PullSummary {

@@ -1,13 +1,30 @@
-import { claimJobRunId, getJobByDispatchId, stampJobApproved, updateJobFailure, updateJobPrUrl, updateJobStatus } from "./log.js";
+import {
+  claimJobRunId,
+  getJobByDispatchId,
+  markJobFailureCommented,
+  stampJobApproved,
+  updateJobFailure,
+  updateJobPrUrl,
+  updateJobStatus,
+} from "./log.js";
 import type { Step } from "./pipeline/types.js";
 import { describeReferenceRepoCause, type ReferenceRepoResult } from "./reference-repos.js";
 import type { TicketingProvider } from "./providers/types.js";
 import { remediateFailedJob, type StuckWatchdogConfig } from "./stuck-watchdog.js";
 import { verifyAndConsumeRunToken, verifyRunToken } from "./runner-tokens.js";
-import { upsertStepRecord } from "./step-log.js";
+import { getStepsByJobId, upsertStepRecord } from "./step-log.js";
 import { getReviewFixDispatchSnapshot } from "./review-fix-queue.js";
 import { markReviewFindingsResolvedByIds, markReviewFindingsResolvedForPrSeenBefore } from "./review-ledger-store.js";
-import { renderClassification, TROUBLESHOOTING_URL, type Classification } from "./completion-classification.js";
+import {
+  renderClassification,
+  renderFailureRecord,
+  buildRunUrl,
+  deriveLastSuccessfulStage,
+  redactedGuardrailReason,
+  sensitiveFilesGuardrailClassification,
+  TROUBLESHOOTING_URL,
+  type Classification,
+} from "./completion-classification.js";
 import { isLinearAuthConfigured, withLinearToken } from "./linear-app-auth.js";
 import { isFailureRecord, projectFailureRecord, type FailureRecord } from "./pipeline/failure-classification.js";
 
@@ -86,9 +103,9 @@ export interface RunnerResultBody {
   snapshotPr?: number;
   /** The `kg-refresh/<stamp>` branch behind snapshotPr; deleted by the orchestrator after merge or close. */
   snapshotBranch?: string;
-  /** Guard verdict from kg-snapshot-push, present only for a kg-refresh dry-run (AII-632). */
+  /** Guard verdict from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
   guardVerdict?: "clean" | "refused";
-  /** Per-part {part, prev, new} table from kg-snapshot-push, present only for a kg-refresh dry-run (AII-632). */
+  /** Per-part {part, prev, new} table from kg-snapshot-push, present for a kg-refresh dry-run (AII-632) or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638). */
   partTable?: Array<{ part: string; prev: string; new: string }>;
   /** Reference repository clone outcomes, present only when the run declared entries. */
   referenceRepoResults?: ReferenceRepoResult[];
@@ -160,20 +177,37 @@ export function boundStatusText(text: string): string {
  * Renders a failure using the helper function that's shared with Slack/Teams notifications.
  * When the runner reports a known `failureCode`, makes use of the helper's structured description so the ticket reader has actionable context.
  * Passes along the raw `failureReason` string for all other failures.
+ *
+ * SENSITIVE_FILES_BLOCKED, REVIEW_UNAPPROVED and MAX_TURNS_EXHAUSTED are not part of the
+ * BAC-27111 failure taxonomy (they are guardrail/policy outcomes, not classified failures),
+ * so they are checked first and keep their existing wording regardless of `failure`.
+ * Further coded outcomes that need wording of their own (the stage-retry rail's
+ * REVIEWER_TURNS_EXHAUSTED and PROVIDER_UNAVAILABLE) slot in as additional `else if`
+ * branches here, ahead of the structured-record fallthrough below.
+ * Otherwise, a structured `failure` record (BAC-27112) renders the full evidence comment;
+ * `classifyCompletion` builds the identical body for a monitor-detected terminal job via
+ * the same `classificationForFailure` helper.
  */
 export function formatFailureComment(
   failureCode: string | undefined,
   failureReason: string | undefined,
-  prUrl?: string,
+  options: {
+    prUrl?: string;
+    failure?: FailureRecord;
+    runUrl?: string | null;
+    lastSuccessfulStage?: string | null;
+    /** See `classificationForFailure` — omit/true for an initial run, false for gap-fill/re-dispatch. */
+    isInitialRun?: boolean;
+  } = {},
 ): string {
+  const { prUrl, failure, runUrl, lastSuccessfulStage, isInitialRun } = options;
   let c: Classification;
   if (failureCode === "SENSITIVE_FILES_BLOCKED") {
-    c = {
-      summary: "🔒 Blocked by security guardrail.",
-      detail: failureReason ?? "Sensitive files detected in staged changes.",
-      remediation: "Remove or .gitignore the flagged files, then re-run.",
-      docsUrl: TROUBLESHOOTING_URL,
-    };
+    // Pushed through the same redact/cap `classifyCompletion` applies to a persisted
+    // FailureRecord's `message` (BAC-27112 follow-up) — otherwise a raw, secret-bearing
+    // `failureReason` would render differently here than the byte-identical guardrail
+    // trip reported through the FailureRecord path.
+    c = sensitiveFilesGuardrailClassification(redactedGuardrailReason(failureReason));
   } else if (failureCode === "REVIEW_UNAPPROVED" || failureCode === "MAX_TURNS_EXHAUSTED") {
     const cause =
       failureCode === "MAX_TURNS_EXHAUSTED"
@@ -183,7 +217,9 @@ export function formatFailureComment(
       summary: `🟡 Implementation finished without review approval — ${cause}.`,
       detail: [
         prUrl
-          ? `The work so far is preserved in a draft PR: ${prUrl}`
+          ? isInitialRun === false
+            ? "The existing PR is unchanged by this run."
+            : `The work so far is preserved in a draft PR: ${prUrl}`
           : "No PR could be opened (no code changes were produced).",
         failureReason ?? "",
       ]
@@ -193,6 +229,8 @@ export function formatFailureComment(
         "Review the draft PR and the run autopsy comment. Likely causes: over-broad issue scope, missing prerequisites, or thin context — split the ticket or add context, then re-dispatch.",
       docsUrl: TROUBLESHOOTING_URL,
     };
+  } else if (failure) {
+    return renderFailureRecord(failure, prUrl, runUrl, lastSuccessfulStage, isInitialRun);
   } else {
     c = { summary: failureReason ?? "Unspecified failure." };
   }
@@ -385,17 +423,26 @@ export async function handleRunnerResult(
   }
 
   if (input.body.outcome === "failure") {
-    if (failure) {
-      const failedJob = getJobByDispatchId(claims.dispatchId);
-      if (failedJob) updateJobFailure(failedJob.id, failure);
-    }
+    const job = getJobByDispatchId(claims.dispatchId);
+    const isInitialRun = !job?.prUrl;
+    // Persisted unconditionally and up front for every phase, including gap-analysis (which
+    // the callback never comments for — failure_commented_at is left for the monitor
+    // backstop to find unset in that case). `failure_commented_at` itself is stamped only
+    // after the provider call below actually posts, never pre-claimed: see the field's doc
+    // comment on `Job`.
+    if (failure && job) updateJobFailure(job.id, failure);
     if (input.body.phase === "planning") {
+      const lastSuccessfulStage =
+        failure && job ? deriveLastSuccessfulStage(getStepsByJobId(job.id), failure.stage) : null;
+      // Planning has no PR concept, so `renderFailureRecord` gets no prUrl — a persisted
+      // record renders the same evidence/remediation the implementation path does (BAC-27112
+      // follow-up); a runner that never classified the failure keeps the raw reason.
+      const reason = failure
+        ? renderFailureRecord(failure, undefined, buildRunUrl(job), lastSuccessfulStage)
+        : input.body.failureReason ?? "unspecified";
       try {
-        await provider.markPlanningFailed(
-          claims.issueId,
-          mappingTeamKey,
-          input.body.failureReason ?? "unspecified",
-        );
+        const commented = await provider.markPlanningFailed(claims.issueId, mappingTeamKey, reason);
+        if (job && commented) markJobFailureCommented(job.id);
       } catch (err) {
         warn("markPlanningFailed", err);
       }
@@ -412,7 +459,6 @@ export async function handleRunnerResult(
         } catch (err) {
           warn("clearWorkingState(operator_cancelled)", err);
         }
-        const job = getJobByDispatchId(claims.dispatchId);
         if (job) {
           updateJobStatus(job.id, "failed", "operator_cancelled");
           console.log(
@@ -420,16 +466,24 @@ export async function handleRunnerResult(
           );
         }
       } else {
+        const lastSuccessfulStage =
+          failure && job ? deriveLastSuccessfulStage(getStepsByJobId(job.id), failure.stage) : null;
         try {
-          await provider.markImplementationFailed(
+          const commented = await provider.markImplementationFailed(
             claims.issueId,
             mappingTeamKey,
-            formatFailureComment(input.body.failureCode, input.body.failureReason, input.body.prUrl),
+            formatFailureComment(input.body.failureCode, input.body.failureReason, {
+              prUrl: input.body.prUrl,
+              failure,
+              runUrl: buildRunUrl(job),
+              lastSuccessfulStage,
+              isInitialRun,
+            }),
           );
+          if (job && commented) markJobFailureCommented(job.id);
         } catch (err) {
           warn("markImplementationFailed", err);
         }
-        const job = getJobByDispatchId(claims.dispatchId);
         if (job) {
           // A coded unapproved failure still carries a draft PR — link it on the
           // job row so the admin UI and merge-detection can see it.

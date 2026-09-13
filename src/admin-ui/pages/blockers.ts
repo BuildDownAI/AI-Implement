@@ -69,7 +69,7 @@ export const blockersScript = `
         + '<td><span class="mono">' + window.esc(b.teamKey) + '</span></td>'
         + '<td>' + reasonBadge(b.reason) + '</td>'
         + '<td class="col-grow"><span class="text-secondary">' + window.esc(b.detail) + '</span></td>'
-        + '<td><a class="text-accent" href="https://linear.app/issue/' + window.escAttr(b.issueIdentifier) + '" target="_blank">Open ↗</a></td>';
+        + '<td>' + (b.issueUrl ? '<a class="text-accent" href="' + window.safeUrl(b.issueUrl) + '" target="_blank">Open \u2197</a>' : '<span class="text-tertiary">\u2014</span>') + '</td>';
       tbody.appendChild(tr);
     }
   }

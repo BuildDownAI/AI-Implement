@@ -1,10 +1,10 @@
 import type { RepoMapping } from "./config.js";
 import type { DispatchFailureContext } from "./dispatch-failure.js";
 import { claimPendingCommentGapfills, markCommentGapfillProcessed } from "./comment-gapfill-queue.js";
-import { getLatestDispatchForPr, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications } from "./log.js";
+import { getLatestDispatchForPr, getLatestDispatchForIssueIdentifier, appendLog, countPriorDispatches, updateJobPrUrl, suppressStaleNotifications, type Job } from "./log.js";
 import { resolveExecutionPath, getFlySecretsMinVersion, getFlyProcessLevelSecrets, type RunnerMode } from "./runner-mode.js";
 import { mintRunToken, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
-import { buildEnvelopeDispatchInputs, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv } from "./github.js";
+import { buildEnvelopeDispatchInputs, providerDispatchFields, capDispatchFields, skillsRepoDispatchFields, capRunnerEnv, branchPrefixRunnerEnv, skillsRepoRunnerEnv, getPullRequestState } from "./github.js";
 import { encodeRunConfig, type RunConfigV1 } from "./run-config.js";
 import { getRetryPolicy } from "./orchestrator-settings.js";
 import { createMachine, listAppSecrets, generateSessionToken, generateMachineNonce, buildSessionMachineConfig } from "./fly-machines.js";
@@ -35,6 +35,47 @@ export interface DrainCommentGapfillsInput {
   anthropicApiKey: string | null;
   claudeOAuthToken: string | null;
   sessionImage: string;
+}
+
+/** Grouping branch → the feature-node parent's identifier slug, or null for any other
+ *  branch shape. `buildGroupingBranchName` emits ai-implement/<mode>/<slugified-key>;
+ *  tracker keys (`ABC-123`) slugify losslessly to lowercase, so the slug IS the
+ *  identifier up to case. */
+export function parseGroupingBranchIdentifier(headRef: string | null): string | null {
+  if (!headRef) return null;
+  const m = /^ai-implement\/(?:feature|multi-issue)\/([A-Za-z0-9_-]+)$/.exec(headRef);
+  return m ? m[1] : null;
+}
+
+/** Recover tracker identity for a grouping roll-up PR from its feature-node parent's
+ *  latest dispatch. Best-effort: any failure resolves to null and the caller refuses
+ *  exactly as before. */
+async function resolveRollUpParentDispatch(
+  opts: DrainCommentGapfillsInput,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<Job | null> {
+  try {
+    const ghToken = await opts.getInstallationToken(owner);
+    const pr = await getPullRequestState(ghToken, owner, repo, prNumber);
+    const identifier = parseGroupingBranchIdentifier(pr?.headRef ?? null);
+    if (!identifier) return null;
+    const parentLog = getLatestDispatchForIssueIdentifier(owner, repo, identifier);
+    if (!parentLog) {
+      console.warn(
+        `[comment-gapfill] PR #${prNumber} is a roll-up for ${identifier}, but no dispatch of that issue is in the log`,
+      );
+      return null;
+    }
+    console.log(
+      `[comment-gapfill] PR #${prNumber} has no dispatch row; recovered identity from roll-up parent ${parentLog.issueIdentifier} (branch ${pr?.headRef})`,
+    );
+    return parentLog;
+  } catch (err) {
+    console.warn(`[comment-gapfill] roll-up fallback failed for PR #${prNumber}:`, err);
+    return null;
+  }
 }
 
 function normalizeContractProbeResult(result: ContractProbeResult): WorkflowCapabilities {
@@ -73,7 +114,15 @@ export async function drainCommentGapfillQueue(opts: DrainCommentGapfillsInput):
         continue;
       }
 
-      const prLog = getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
+      let prLog = getLatestDispatchForPr(item.owner, item.repo, item.prNumber);
+      if (!prLog) {
+        // Roll-up fallback: the top-of-tree feature→base PR is opened by merge-up, not
+        // by a dispatch, so it has no row of its own — but its head branch encodes the
+        // feature-node parent's key (ai-implement/<mode>/<key-slug>), and that parent's
+        // own past dispatches carry the tracker identity this rail needs. The gap-fill
+        // then runs against the roll-up PR's branch and reports against the parent.
+        prLog = await resolveRollUpParentDispatch(opts, item.owner, item.repo, item.prNumber);
+      }
       if (!prLog) {
         console.warn(`[comment-gapfill] No dispatch log for ${fullRepo} PR #${item.prNumber}`);
         const ghToken = await opts.getInstallationToken(item.owner);

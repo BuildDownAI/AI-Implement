@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles } from "../github.js";
 import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -305,11 +305,11 @@ describe("getPullRequestState", () => {
   afterEach(() => vi.unstubAllGlobals());
   it("returns merged=true for a merged PR", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ merged: true, state: "closed" }) })));
-    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: true, state: "closed" });
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: true, state: "closed", headRef: null });
   });
   it("returns merged=false for a closed-unmerged PR", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ merged: false, state: "closed" }) })));
-    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "closed" });
+    expect(await getPullRequestState("t", "o", "r", 7)).toEqual({ merged: false, state: "closed", headRef: null });
   });
   it("returns null on a non-OK response", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 })));
@@ -395,6 +395,18 @@ describe("profilesRunnerEnv", () => {
   });
 });
 
+describe("assigneeRunnerEnv", () => {
+  it("returns empty object when the issue has no assignee", () => {
+    expect(assigneeRunnerEnv({})).toEqual({});
+  });
+
+  it("includes AI_IMPLEMENT_ASSIGNEE_NAME when present", () => {
+    expect(assigneeRunnerEnv({ assigneeName: "Paz" })).toEqual({
+      AI_IMPLEMENT_ASSIGNEE_NAME: "Paz",
+    });
+  });
+});
+
 describe("buildEnvelopeDispatchInputs", () => {
   const baseIssue = { id: "uuid-1", identifier: "AII-1", title: "T", description: "D" };
 
@@ -410,6 +422,16 @@ describe("buildEnvelopeDispatchInputs", () => {
 
     const emptyProfiles = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: [] }, { runnerPhase: "implementation", retryPolicy: null });
     expect(decodeRunConfig(emptyProfiles.run_config as string).profiles).toBeUndefined();
+  });
+
+  it("carries assigneeName in run_config when present", () => {
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, assigneeName: "Paz" }, { runnerPhase: "implementation" });
+    expect(decodeRunConfig(inputs.run_config as string).assigneeName).toBe("Paz");
+  });
+
+  it("omits assigneeName from run_config when absent", () => {
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "implementation" });
+    expect(decodeRunConfig(inputs.run_config as string).assigneeName).toBeUndefined();
   });
 
   it("carries planningContext in run_config when provided", () => {
@@ -538,30 +560,30 @@ describe("findPullRequestByBranches", () => {
   it("returns merged PR when merged_at is set", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
-      json: async () => [{ number: 5, html_url: "https://gh/pr/5", state: "closed", merged_at: "2026-06-30T12:00:00Z" }],
+      json: async () => [{ number: 5, html_url: "https://gh/pr/5", state: "closed", merged_at: "2026-06-30T12:00:00Z", head: { sha: "sha-5" } }],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "head-branch", "base-branch")).toEqual({
-      number: 5, url: "https://gh/pr/5", state: "closed", merged: true,
+      number: 5, url: "https://gh/pr/5", state: "closed", merged: true, headSha: "sha-5",
     });
   });
 
   it("returns open PR with merged=false", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
-      json: async () => [{ number: 3, html_url: "https://gh/pr/3", state: "open", merged_at: null }],
+      json: async () => [{ number: 3, html_url: "https://gh/pr/3", state: "open", merged_at: null, head: { sha: "sha-3" } }],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 3, url: "https://gh/pr/3", state: "open", merged: false,
+      number: 3, url: "https://gh/pr/3", state: "open", merged: false, headSha: "sha-3",
     });
   });
 
   it("returns closed-unmerged PR with merged=false", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
-      json: async () => [{ number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null }],
+      json: async () => [{ number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, head: { sha: "sha-2" } }],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+      number: 2, url: "https://gh/pr/2", state: "closed", merged: false, headSha: "sha-2",
     });
   });
 
@@ -574,24 +596,24 @@ describe("findPullRequestByBranches", () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       json: async () => [
-        { number: 9, html_url: "https://gh/pr/9", state: "closed", merged_at: null },
-        { number: 8, html_url: "https://gh/pr/8", state: "closed", merged_at: "2026-06-30T12:00:00Z" },
+        { number: 9, html_url: "https://gh/pr/9", state: "closed", merged_at: null, head: { sha: "sha-9" } },
+        { number: 8, html_url: "https://gh/pr/8", state: "closed", merged_at: "2026-06-30T12:00:00Z", head: { sha: "sha-8" } },
       ],
     })));
     const result = await findPullRequestByBranches("tok", "owner", "repo", "h", "b");
-    expect(result).toMatchObject({ number: 8, merged: true });
+    expect(result).toMatchObject({ number: 8, merged: true, headSha: "sha-8" });
   });
 
   it("prefers an open PR over a newer closed-unmerged one (reopened PRs keep their created date)", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       json: async () => [
-        { number: 12, html_url: "https://gh/pr/12", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
-        { number: 7, html_url: "https://gh/pr/7", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z" },
+        { number: 12, html_url: "https://gh/pr/12", state: "closed", merged_at: null, updated_at: "2026-07-02T09:00:00Z", head: { sha: "sha-12" } },
+        { number: 7, html_url: "https://gh/pr/7", state: "open", merged_at: null, updated_at: "2026-07-01T08:00:00Z", head: { sha: "sha-7" } },
       ],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 7, url: "https://gh/pr/7", state: "open", merged: false,
+      number: 7, url: "https://gh/pr/7", state: "open", merged: false, headSha: "sha-7",
     });
   });
 
@@ -599,12 +621,12 @@ describe("findPullRequestByBranches", () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       json: async () => [
-        { number: 12, html_url: "https://gh/pr/12", state: "open", merged_at: null, updated_at: "2026-07-02T09:00:00Z" },
-        { number: 7, html_url: "https://gh/pr/7", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z" },
+        { number: 12, html_url: "https://gh/pr/12", state: "open", merged_at: null, updated_at: "2026-07-02T09:00:00Z", head: { sha: "sha-12" } },
+        { number: 7, html_url: "https://gh/pr/7", state: "closed", merged_at: "2026-06-30T12:00:00Z", updated_at: "2026-06-30T12:00:00Z", head: { sha: "sha-7" } },
       ],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 7, url: "https://gh/pr/7", state: "closed", merged: true,
+      number: 7, url: "https://gh/pr/7", state: "closed", merged: true, headSha: "sha-7",
     });
   });
 
@@ -612,13 +634,13 @@ describe("findPullRequestByBranches", () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({
       ok: true,
       json: async () => [
-        { number: 4, html_url: "https://gh/pr/4", state: "closed", merged_at: null, updated_at: "2026-06-20T10:00:00Z" },
-        { number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, updated_at: "2026-07-05T10:00:00Z" },
-        { number: 3, html_url: "https://gh/pr/3", state: "closed", merged_at: null, updated_at: "2026-06-28T10:00:00Z" },
+        { number: 4, html_url: "https://gh/pr/4", state: "closed", merged_at: null, updated_at: "2026-06-20T10:00:00Z", head: { sha: "sha-4" } },
+        { number: 2, html_url: "https://gh/pr/2", state: "closed", merged_at: null, updated_at: "2026-07-05T10:00:00Z", head: { sha: "sha-2" } },
+        { number: 3, html_url: "https://gh/pr/3", state: "closed", merged_at: null, updated_at: "2026-06-28T10:00:00Z", head: { sha: "sha-3" } },
       ],
     })));
     expect(await findPullRequestByBranches("tok", "owner", "repo", "h", "b")).toEqual({
-      number: 2, url: "https://gh/pr/2", state: "closed", merged: false,
+      number: 2, url: "https://gh/pr/2", state: "closed", merged: false, headSha: "sha-2",
     });
   });
 

@@ -36,9 +36,14 @@ export const drawerScript = `
 (function () {
   const DRAWER_REFRESH_MS = 5000;
   let currentJobId = null;
+  let currentJobTerminal = false;
   let mappingsCache = null;
   let drawerRefreshTimer = null;
   let drawerRefreshInFlightFor = null;
+
+  function isTerminalJobStatus(status) {
+    return status === 'completed' || status === 'failed' || status === 'timed_out' || status === 'review_failed' || status === 'dispatch-failed';
+  }
 
   async function ensureMappings() {
     if (!mappingsCache) {
@@ -189,9 +194,58 @@ export const drawerScript = `
     timelineEl.innerHTML = html;
   }
 
+  function parseStepOutputs(step) {
+    try {
+      return JSON.parse(step.outputsJson || '{}');
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function captureOpenEvidenceIds() {
+    const ids = [];
+    const stepsEl = document.getElementById('drawer-steps');
+    if (!stepsEl) return ids;
+    const open = stepsEl.querySelectorAll('details.failure-evidence[open]');
+    for (let i = 0; i < open.length; i++) {
+      if (open[i].id) ids.push(open[i].id);
+    }
+    return ids;
+  }
+
+  function restoreOpenEvidenceIds(ids) {
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (el) el.setAttribute('open', '');
+    }
+  }
+
+  function captureEvidenceScrollPositions() {
+    const positions = {};
+    const stepsEl = document.getElementById('drawer-steps');
+    if (!stepsEl) return positions;
+    const pres = stepsEl.querySelectorAll('pre[id]');
+    for (let i = 0; i < pres.length; i++) {
+      positions[pres[i].id] = pres[i].scrollTop;
+    }
+    return positions;
+  }
+
+  function restoreEvidenceScrollPositions(positions) {
+    for (const id in positions) {
+      const el = document.getElementById(id);
+      if (el) el.scrollTop = positions[id];
+    }
+  }
+
   function renderSteps(steps) {
     const stepsEl = document.getElementById('drawer-steps');
     const countEl = document.getElementById('drawer-step-count');
+    // A 5s auto-refresh replaces this element's innerHTML wholesale; without capturing
+    // and re-applying which <details> were open, every re-render silently collapses
+    // whatever evidence panel the reader had open (and resets its scroll/selection).
+    const openIds = captureOpenEvidenceIds();
+    const scrollPositions = captureEvidenceScrollPositions();
     if (!steps || steps.length === 0) {
       stepsEl.innerHTML = '<div style="font-size:12px;color:var(--fg-tertiary);padding:8px 0">No step records</div>';
       countEl.textContent = 'no step records';
@@ -199,6 +253,9 @@ export const drawerScript = `
     }
     countEl.textContent = steps.length + ' step' + (steps.length === 1 ? '' : 's');
     let html = '';
+    // Raw process output (stderrTail/stdoutTail) must land via textContent, never innerHTML —
+    // collected here and assigned onto the <pre> placeholders below after stepsEl.innerHTML is set.
+    const evidenceTails = [];
     for (const step of steps) {
       let badgeKind;
       if (step.status === 'running') badgeKind = 'running';
@@ -218,8 +275,51 @@ export const drawerScript = `
         + '<span class="badge ' + badgeKind + '"><span class="dot"></span>' + window.esc(step.status) + '</span>'
         + '</div>'
         + '</div>';
+
+      const failure = parseStepOutputs(step).failure;
+      if (step.status === 'failed' && failure && typeof failure.category === 'string') {
+        const summaryBits = window.esc(failure.category)
+          + (failure.code ? '/' + window.esc(failure.code) : '')
+          + (failure.attempt != null ? ' · attempt ' + window.esc(String(failure.attempt)) : '');
+        html += '<details id="failure-evidence-' + window.escAttr(step.stepId) + '" class="failure-evidence" style="margin:-2px 0 10px;padding:6px 0;border-bottom:1px solid var(--border-subtle)">'
+          + '<summary style="cursor:pointer;font-size:11.5px;color:var(--fg-tertiary)">Failure evidence · '
+          + summaryBits
+          + '</summary>'
+          + '<div style="padding:8px 4px;font-size:12px">'
+          + (failure.code === 'SENSITIVE_FILES_BLOCKED'
+            ? '<div><strong>Message:</strong><pre class="mono" style="white-space:pre-wrap;font-size:11px;margin:4px 0 0;max-height:240px;overflow:auto">' + window.esc(failure.message || '') + '</pre></div>'
+            : '<div><strong>Message:</strong> ' + window.esc(failure.message || '') + '</div>')
+          + (failure.exitCode != null ? '<div><strong>Exit code:</strong> ' + window.esc(String(failure.exitCode)) + '</div>' : '')
+          + (failure.signal ? '<div><strong>Signal:</strong> ' + window.esc(failure.signal) + '</div>' : '')
+          + (failure.evidence && failure.evidence.truncated ? '<div class="text-tertiary">evidence truncated</div>' : '')
+          + (failure.evidence && failure.evidence.stderrTail
+            ? '<div class="text-tertiary" style="margin-top:6px">stderr</div><pre id="failure-stderr-' + window.escAttr(step.stepId) + '" class="mono" style="white-space:pre-wrap;font-size:11px;max-height:240px;overflow:auto"></pre>'
+            : '')
+          + (failure.evidence && failure.evidence.stdoutTail
+            ? '<div class="text-tertiary" style="margin-top:6px">stdout</div><pre id="failure-stdout-' + window.escAttr(step.stepId) + '" class="mono" style="white-space:pre-wrap;font-size:11px;max-height:240px;overflow:auto"></pre>'
+            : '')
+          + '</div>'
+          + '</details>';
+        evidenceTails.push({
+          stepId: step.stepId,
+          stderrTail: failure.evidence ? failure.evidence.stderrTail : undefined,
+          stdoutTail: failure.evidence ? failure.evidence.stdoutTail : undefined,
+        });
+      }
     }
     stepsEl.innerHTML = html;
+    for (const tail of evidenceTails) {
+      if (tail.stderrTail) {
+        const el = document.getElementById('failure-stderr-' + tail.stepId);
+        if (el) el.textContent = tail.stderrTail;
+      }
+      if (tail.stdoutTail) {
+        const el = document.getElementById('failure-stdout-' + tail.stepId);
+        if (el) el.textContent = tail.stdoutTail;
+      }
+    }
+    restoreOpenEvidenceIds(openIds);
+    restoreEvidenceScrollPositions(scrollPositions);
   }
 
   function renderContext(job, mappings) {
@@ -230,17 +330,11 @@ export const drawerScript = `
     const repoParts = repoPartsForJob(job, mapping);
 
     if (job.issueIdentifier) {
-      const ticketingProvider = mapping ? mapping.ticketingProvider : 'linear';
-      const jiraSiteUrl = (window.jiraSiteUrl || '');
-      let valueHtml;
-      if (ticketingProvider === 'jira' && jiraSiteUrl) {
-        valueHtml = '<a class="text-accent" href="' + window.safeUrl(jiraSiteUrl) + '/browse/' + window.escAttr(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
-      } else if (ticketingProvider === 'jira') {
-        // Jira but we don't know the site URL — show plain text.
-        valueHtml = window.esc(job.issueIdentifier);
-      } else {
-        valueHtml = '<a class="text-accent" href="https://linear.app/issue/' + window.escAttr(job.issueIdentifier) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>';
-      }
+      // The server resolves issueUrl through the mapping's ticketing provider, so the
+      // drawer never has to know which tracker (or which Jira site) a project uses.
+      const valueHtml = job.issueUrl
+        ? '<a class="text-accent" href="' + window.safeUrl(job.issueUrl) + '" target="_blank">' + window.esc(job.issueIdentifier) + ' &#8599;</a>'
+        : window.esc(job.issueIdentifier);
       fields.push({ label: 'Issue', value: valueHtml });
     }
 
@@ -374,6 +468,10 @@ export const drawerScript = `
       const json = await res.json();
       if (currentJobId !== id) return;
       renderDrawer(json.job, json.steps, mappings);
+      // A finished job's steps cannot change — stop polling instead of collapsing
+      // an open evidence panel and resetting scroll every 5s for no reason.
+      currentJobTerminal = isTerminalJobStatus(json.job.status);
+      if (currentJobTerminal) stopDrawerAutoRefresh();
     } catch (err) {
       console.error('Failed to fetch job steps:', err);
       if (!background && currentJobId === id) document.getElementById('drawer-title').textContent = 'Failed to load job';
@@ -385,13 +483,17 @@ export const drawerScript = `
   async function openJobDrawer(id) {
     stopDrawerAutoRefresh();
     currentJobId = id;
+    // Only refreshJobDrawer's success path updates this — reset it here too, or a
+    // terminal job followed by a running job whose first fetch fails leaves auto-refresh
+    // permanently off, stuck on the previous job's stale value.
+    currentJobTerminal = false;
     const wrap = document.getElementById('job-drawer-wrap');
     resetDrawerContent();
     wrap.removeAttribute('hidden');
     document.body.style.overflow = 'hidden';
 
     await refreshJobDrawer(id, { background: false });
-    if (currentJobId === id) startDrawerAutoRefresh(id);
+    if (currentJobId === id && !currentJobTerminal) startDrawerAutoRefresh(id);
   }
 
   function closeJobDrawer() {
@@ -411,5 +513,7 @@ export const drawerScript = `
 
   window.openJobDrawer = openJobDrawer;
   window.closeJobDrawer = closeJobDrawer;
+  // Exposed for the test harness to trigger a refresh directly, without a live timer.
+  window.refreshJobDrawer = refreshJobDrawer;
 })();
 `;

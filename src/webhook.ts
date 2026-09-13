@@ -201,7 +201,14 @@ async function handleKgPrCheckWebhook(
   kgPrCheck: KgPrCheckConfig | undefined,
 ): Promise<boolean> {
   if (!kgPrCheck) return false;
-  if (payload.action !== "opened" && payload.action !== "synchronize" && payload.action !== "labeled") return false;
+  if (
+    payload.action !== "opened" &&
+    payload.action !== "synchronize" &&
+    payload.action !== "labeled" &&
+    payload.action !== "unlabeled"
+  ) {
+    return false;
+  }
 
   const repoFullName = payload.repository?.full_name;
   const prNumber = payload.pull_request?.number;
@@ -212,7 +219,7 @@ async function handleKgPrCheckWebhook(
   const headRef = payload.pull_request?.head?.ref;
 
   // AII-639: this check owns the HTTP response only for events nothing else handles
-  // (`opened`, `labeled`). On `synchronize` it runs as a side effect and returns false,
+  // (`opened`, `labeled`, `unlabeled`). On `synchronize` it runs as a side effect and returns false,
   // so the existing pull_request handling (gap-fill matching via findMatchingDispatch,
   // merge reconciliation) still runs for the KG repos — they are ordinary onboarded
   // projects too. Outcomes on `synchronize` go to the log instead of the response.
@@ -227,7 +234,7 @@ async function handleKgPrCheckWebhook(
     return owns;
   };
 
-  if (payload.action === "labeled") {
+  if (payload.action === "labeled" || payload.action === "unlabeled") {
     // Only the accept-baseline label re-reports anything — any other label on any
     // other PR must never touch the check (AII-636: a stray label on an unrelated
     // PR previously re-posted whatever the process had last computed, for any PR).
@@ -243,7 +250,11 @@ async function handleKgPrCheckWebhook(
       repo: repoFullName,
       prNumber,
       sha: sha ?? "",
-      acceptBaseline: hasAcceptBaselineLabel(payload),
+      // `unlabeled` forces acceptBaseline:false regardless of what the payload's
+      // (now-stale) `labels` array might say (AII-640) — removing the label must
+      // always revert the comment/status to plain-refusal wording, not depend on
+      // GitHub having already dropped it from `pull_request.labels` by delivery time.
+      acceptBaseline: payload.action === "labeled" ? hasAcceptBaselineLabel(payload) : false,
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
@@ -481,9 +492,15 @@ export async function handleGitHubWebhook(
     return;
   }
 
-  if (payload.action === "opened" || payload.action === "synchronize" || payload.action === "labeled") {
-    // The KG PR check owns `opened` and `labeled` responses; on `synchronize` it runs as a
-    // side effect and returns false so handlePullRequestSynchronize below still runs (AII-639).
+  if (
+    payload.action === "opened" ||
+    payload.action === "synchronize" ||
+    payload.action === "labeled" ||
+    payload.action === "unlabeled"
+  ) {
+    // The KG PR check owns `opened`, `labeled`, and `unlabeled` responses; on `synchronize`
+    // it runs as a side effect and returns false so handlePullRequestSynchronize below
+    // still runs (AII-639).
     const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck);
     if (handled) return;
   }

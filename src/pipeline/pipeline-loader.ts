@@ -245,7 +245,9 @@ function applyWiring(step: YamlStep): StepDefinition {
             existingPrNumber,
             baseBranch: checkedOutBranch,
             baseRef: cloneOutputs.clonedRef,
-            prTitle: `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
+            prTitle: ctx.data.assigneeName
+              ? `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle} (${ctx.data.assigneeName})`
+              : `${ctx.data.issueIdentifier}: ${ctx.data.issueTitle}`,
             sensitiveFiles: ctx.data.sensitiveFiles,
             groupingParent: ctx.data.groupingParent,
             draft: !approved,

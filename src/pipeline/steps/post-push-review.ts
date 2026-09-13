@@ -403,9 +403,12 @@ function isExternalReviewCheckName(name: string, configured: string[] | undefine
     || (normalized.includes("claude") && normalized.includes("review"));
 }
 
-function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): string {
+/** The PR's head SHA, or "" when the API answered but carried no head.sha, or null when the
+ *  call itself failed. The distinction matters: "" is information, null is the ABSENCE of
+ *  information and must never be read as "this PR has no reviewer". */
+function resolvePrHeadSha(ghSpawn: (args: string[]) => SpawnResult, prNumber: string): string | null {
   const res = ghSpawn(["api", `repos/:owner/:repo/pulls/${prNumber}`]);
-  if (res.exitCode !== 0) return "";
+  if (res.exitCode !== 0) return null;
   try {
     const head = recordProp(asRecord(JSON.parse(res.stdout)), "head");
     return stringProp(head, "sha");
@@ -439,25 +442,75 @@ function parseCheckRuns(stdout: string): { name: string; status: string; conclus
   return runs;
 }
 
+/** Emits the first warning seen for a condition key, and drops every repeat of that key. */
+type WarnOnce = (key: string, message: string) => void;
+
+/**
+ * One wait's worth of warn-once state.
+ *
+ * The wait loop runs up to timeoutMs/pollMs times (60 at the defaults) per review iteration, and
+ * up to maxIterations of those per run, so an unconditional warn describes one sustained outage
+ * in sixty identical lines.
+ *
+ * The key is the CONDITION, not the rendered message. Two of the three messages interpolate
+ * something that moves during a wait — the gh stderr, and the joined names of every check run
+ * on the SHA — so keying on the text makes "one line per condition" contingent on those values
+ * holding still. They do not: an unrelated CI check appearing or concluding rewrites the name
+ * list, which is exactly the sustained-outage window where the bound has to hold. The cost is
+ * deliberate: a later change in WHICH checks are present is no longer reported, only the first
+ * sighting. The gate outcome does not depend on it, and the first line already names them.
+ *
+ * Create one per wait. Warn state that describes a single wait must not outlive it.
+ *
+ * The `:<sha>` / `:<pr>` suffixes on the keys are inert today — the head SHA is cached for
+ * the wait's lifetime and the PR number is fixed, so no two keys within one instance can
+ * differ by them. They are kept so the key is correct rather than merely sufficient: a change
+ * that ever resolves more than one SHA per wait would otherwise start collapsing distinct
+ * conditions silently.
+ */
+function createWarnOnce(): WarnOnce {
+  const seen = new Set<string>();
+  return (key, message) => {
+    if (seen.has(key)) return;
+    seen.add(key);
+    console.warn(message);
+  };
+}
+
 function probeExternalReviewCheck(
   ghSpawn: (args: string[]) => SpawnResult,
   headSha: string,
   configuredCheckNames: string[] | undefined,
-): "absent" | "running" | "completed" | "no-real-verdict" {
-  const res = ghSpawn(["api", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
-  // If we cannot read check state, fail open rather than stall the loop indefinitely.
-  if (res.exitCode !== 0) return "absent";
+  warnOnce: WarnOnce,
+): "absent" | "running" | "completed" | "no-real-verdict" | "unreadable" {
+  // --paginate --slurp, not a bare per_page=100: on a busy SHA the review check can fall
+  // outside the first page, and a truncated page is indistinguishable from "no reviewer" —
+  // which resolves to "absent" and fails OPEN. parseCheckRuns already accepts the array-of-
+  // pages shape --slurp produces.
+  const res = ghSpawn(["api", "--paginate", "--slurp", `repos/:owner/:repo/commits/${headSha}/check-runs?per_page=100`]);
+  // A probe we could not READ is not evidence that no reviewer exists. Mapping a failed
+  // `gh api` to "absent" — which the caller fails OPEN on — lets one transient failure
+  // auto-approve a PR nobody reviewed. Report it distinctly and let the wait loop keep
+  // trying; the existing timeout still bounds it, and running out of budget fails CLOSED.
+  if (res.exitCode !== 0) {
+    warnOnce(`unreadable:${headSha}`, `[post-push-review] Could not read check runs at ${headSha}: ${res.stderr || `exit ${res.exitCode}`}`);
+    return "unreadable";
+  }
   const allRuns = parseCheckRuns(res.stdout);
   const matching = allRuns.filter((run) => isExternalReviewCheckName(run.name, configuredCheckNames));
   if (matching.length === 0) {
-    // Warn unconditionally: "no runs at all" and "runs present but none matched" are both worth
-    // surfacing, since they are the two most common causes of silent fail-open.
+    // Both shapes are worth surfacing — "no runs at all" and "runs present but none matched" are
+    // the two most common causes of a silent fail-open — but once each, not once per probe. This
+    // branch is the unbounded one: the sawMatching downgrade below turns a repeat "absent" into
+    // "unreadable", which never settles, so warning here per probe runs to the full timeout.
+    // Hence the separate condition keys: the two shapes are distinct diagnoses, but a growing
+    // present-names list within one shape is the same diagnosis reported twice.
     if (allRuns.length === 0) {
-      console.warn(`[post-push-review] No check runs present at ${headSha}`);
+      warnOnce(`no-runs:${headSha}`, `[post-push-review] No check runs present at ${headSha}`);
     } else {
       const presentNames = allRuns.map((r) => r.name).join(", ");
       const expected = (configuredCheckNames && configuredCheckNames.length > 0) ? configuredCheckNames : DEFAULT_REVIEW_CHECK_NAMES;
-      console.warn(`[post-push-review] No external review check matched; present: ${presentNames}; expected one of: ${expected.join(", ")}`);
+      warnOnce(`no-match:${headSha}`, `[post-push-review] No external review check matched; present: ${presentNames}; expected one of: ${expected.join(", ")}`);
     }
     return "absent";
   }
@@ -478,9 +531,13 @@ function probeExternalReviewCheck(
  * external verdict instead of the empty snapshot that exists when both reviews start.
  *
  * - "completed": the external check finished with a real verdict — read findings and gate normally.
- * - "absent": no external review check exists for this SHA — fail open (repo has none).
- * - "running": the check is still in flight or concluded without a real verdict (cancelled, skipped,
- *   etc.) — both cases fail closed; "no-real-verdict" is mapped to "running" immediately.
+ * - "absent": no external review check exists for this SHA — fail open (repo has none). Settled
+ *   only after two consecutive probes agree, since it is the one state that fails open.
+ * - "running": the check is still in flight, concluded without a real verdict (cancelled, skipped,
+ *   etc.) on two consecutive probes, or could not be read before the wait budget ran out — all
+ *   three fail closed.
+ *
+ * `headSha` is "" when the wait ended before the PR's head SHA could be resolved.
  */
 async function waitForExternalReviewCompletion(
   ghSpawn: (args: string[]) => SpawnResult,
@@ -492,16 +549,72 @@ async function waitForExternalReviewCompletion(
     configuredCheckNames: string[] | undefined;
   },
 ): Promise<{ state: ExternalReviewState; headSha: string }> {
-  const headSha = resolvePrHeadSha(ghSpawn, prNumber);
-  if (!headSha) return { state: "absent", headSha: "" };
-
+  // The head-SHA read is retried inside the loop, not resolved once above it. A failed read
+  // used to short-circuit to "absent" — the fail-OPEN state — BEFORE the loop, so none of the
+  // hardening below could act. That is the same defect the "unreadable" probe state fixes, one
+  // gh call earlier, and it is the likelier one: the installation token can expire during the
+  // multi-minute review pass that precedes this, and token expiry, secondary rate limiting and
+  // 5xx all hit GET /pulls/{n} first.
+  let headSha = "";
   let elapsed = 0;
+  // "no-real-verdict" is final for the runs seen in ONE probe, not for the SHA: check runs are
+  // created asynchronously, which is the race this loop exists to tolerate. Returning on the
+  // first sighting lets a probe land in the gap between a run going completed/cancelled and its
+  // cancel-in-progress replacement being created — the replacement then posts a real review
+  // nobody reads. Require the state to survive one poll interval: two probes, not sixty, and
+  // without assuming the run set is closed.
+  let pendingSettle: "absent" | "no-real-verdict" | null = null;
+  // Warn on the first occurrence of each distinct condition only, for this wait only. Shared
+  // with probeExternalReviewCheck so both halves of the read path warn on the same terms —
+  // see createWarnOnce.
+  const warnOnce = createWarnOnce();
+  // Check runs are never removed from a SHA, so once matching runs exist, a later "absent" is a
+  // read artefact rather than evidence. Without this, one bad probe after a real sighting
+  // downgrades to "absent" and fails OPEN.
+  let sawMatching = false;
   for (;;) {
-    const state = probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames);
-    // "no-real-verdict": every matching check is completed but none produced a reviewer verdict
-    // (e.g. cancelled, skipped, timed_out). Fail closed immediately — a cancelled run is not a review.
-    if (state === "no-real-verdict") return { state: "running", headSha };
-    if (state !== "running") return { state, headSha };
+    if (!headSha) {
+      const read = resolvePrHeadSha(ghSpawn, prNumber);
+      if (read === null) {
+        warnOnce(`head-unreadable:${prNumber}`, `[post-push-review] Could not read PR #${prNumber} to resolve its head SHA; retrying until the wait budget is exhausted`);
+      } else if (read === "") {
+        // The API answered and the PR genuinely carries no head SHA. That IS information, and
+        // it is the pre-existing meaning of "absent" — unchanged.
+        return { state: "absent", headSha: "" };
+      } else {
+        headSha = read;
+      }
+    }
+
+    const state = headSha
+      ? probeExternalReviewCheck(ghSpawn, headSha, opts.configuredCheckNames, warnOnce)
+      : "unreadable";
+    if (state === "running" || state === "completed" || state === "no-real-verdict") sawMatching = true;
+
+    // Once matching runs have been seen, a later "absent" is a read artefact: check runs are
+    // never removed from a SHA.
+    const observed = state === "absent" && sawMatching ? "unreadable" : state;
+
+    // Both settling states must be seen on two CONSECUTIVE probes. "no-real-verdict" needs it
+    // because a cancelled run's replacement appears a moment later. "absent" needs it because
+    // it is the only state that fails OPEN, so a single bad reading auto-approves.
+    // Anything else resets the count, so an interleaving like NRV -> running -> NRV restarts
+    // the confirmation instead of settling on a stale pair.
+    //
+    // Be clear about what this does NOT buy. It is one poll interval — 5s by default — which
+    // is far less than GitHub takes to queue a workflow and materialise its check run, so it
+    // is NOT what covers "probed before the check run existed". What covers that is upstream
+    // of here: this function is called only after the internal review pass has returned
+    // parsed output, minutes later, by which time the run exists. That assumption is not
+    // local to this code, and nothing fails if it stops holding — a cached verdict, an early
+    // exit, or a cheap review model would quietly narrow the real protection to these 5s.
+    if (observed === "absent" || observed === "no-real-verdict") {
+      if (pendingSettle === observed) return { state: observed === "absent" ? "absent" : "running", headSha };
+      pendingSettle = observed;
+    } else {
+      pendingSettle = null;
+      if (observed !== "running" && observed !== "unreadable") return { state: observed, headSha };
+    }
     if (elapsed >= opts.timeoutMs) return { state: "running", headSha };
     await opts.sleep(opts.pollMs);
     elapsed += opts.pollMs;

@@ -64,6 +64,9 @@ const KG_SNAPSHOT_SHA_SETTINGS_KEY = "kg_refresh_snapshot_sha";
 /** DB settings key for persisting the last terminal refresh outcome across restarts. */
 const KG_LAST_REFRESH_SETTINGS_KEY = "kg_refresh_last_refresh";
 
+/** DB settings key for persisting per-PR dry-run outcomes across restarts (AII-640). */
+const KG_DRY_RUN_OUTCOMES_SETTINGS_KEY = "kg_refresh_dry_run_outcomes";
+
 /**
  * Default bound on the per-PR caches tracking KG PR-check state — this module's
  * `dryRunOutcomesByPr` and webhook.ts's `kgDryRunLastSha`/`kgDryRunPending` (AII-636).
@@ -90,7 +93,7 @@ export interface RefreshOutcome {
   stampAfter: string | null;
   /** True for a dry-run outcome (AII-632): the local rail never ran and `stage` was restored, not advanced. */
   dryRun?: boolean;
-  /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome when the runner reported one. */
+  /** Per-part {part, prev, new} rows from the push guard. Present on a dry-run outcome or a real `KG_SNAPSHOT_TRACKER_REGRESSION` refusal (AII-638) when the runner reported one. */
   partTable?: Array<{ part: string; prev: string; new: string }>;
 }
 
@@ -106,6 +109,9 @@ export interface KgDryRunReportTarget {
   sha: string;
   acceptBaseline?: boolean;
 }
+
+/** One entry of the persisted `dryRunOutcomesByPr` cache — `[repo#prNumber, {sha, outcome}]` (AII-640). */
+export type DryRunOutcomeEntry = [string, { sha: string; outcome: RefreshOutcome }];
 
 /** Heading prefix used to find and update the sticky dry-run PR comment across pushes (AII-633). */
 export const KG_DRY_RUN_COMMENT_MARKER = "## kg-refresh dry-run";
@@ -397,6 +403,14 @@ interface KgRefreshInput {
   persistLastRefresh?: (outcome: RefreshOutcome) => void;
   /** Load the last persisted terminal refresh outcome. Injectable for tests; returns null when absent. */
   loadLastRefresh?: () => RefreshOutcome | null;
+  /**
+   * Persist the per-PR dry-run outcome cache across restarts (AII-640). Injectable for
+   * tests. Called with the full, already-capped entry list on every record/evict so the
+   * persisted blob never lags `dryRunOutcomesByPr`. Default: writes to the DB settings table.
+   */
+  persistDryRunOutcomes?: (entries: DryRunOutcomeEntry[]) => void;
+  /** Load the persisted per-PR dry-run outcome cache. Injectable for tests; returns null when absent. */
+  loadDryRunOutcomes?: () => DryRunOutcomeEntry[] | null;
 
   /** Probe a (token, slug, grant) for the credential preflight. Injectable for tests; defaults to GitHub REST calls. */
   probeRepo?: (token: string, slug: string, grant: "contents" | "pull_requests") => Promise<{ ok: boolean; status: number }>;
@@ -768,6 +782,8 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
   const loadStageFn = input.loadStage ?? defaultLoadStage;
   const persistLastRefreshFn = input.persistLastRefresh ?? defaultPersistLastRefresh;
   const loadLastRefreshFn = input.loadLastRefresh ?? defaultLoadLastRefresh;
+  const persistDryRunOutcomesFn = input.persistDryRunOutcomes ?? defaultPersistDryRunOutcomes;
+  const loadDryRunOutcomesFn = input.loadDryRunOutcomes ?? defaultLoadDryRunOutcomes;
   const fetchWorkflowFile = input.fetchWorkflowFile ?? defaultFetchWorkflowFile;
   const fetchCompare = input.fetchCompare ?? defaultFetchCompare;
 
@@ -811,6 +827,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
       const oldestKey = dryRunOutcomesByPr.keys().next().value;
       if (oldestKey !== undefined) dryRunOutcomesByPr.delete(oldestKey);
     }
+    persistDryRunOutcomesFn(Array.from(dryRunOutcomesByPr.entries()));
   }
 
   /** Fires every registered onRefreshSettled listener; a listener's own error never stops the others. */
@@ -826,6 +843,16 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
   // Restore persisted state on construction (crash recovery).
   lastRefresh = loadLastRefreshFn();
+  // Guarded like the other boot-time restores: an injected loader returning a wrong shape
+  // must not abort makeKgRefresh() (it runs synchronously from startServer()).
+  try {
+    const persistedDryRunOutcomes = loadDryRunOutcomesFn();
+    if (Array.isArray(persistedDryRunOutcomes)) {
+      for (const [key, value] of persistedDryRunOutcomes) dryRunOutcomesByPr.set(key, value);
+    }
+  } catch (err) {
+    console.warn("[kg-refresh] ignoring unreadable persisted dry-run outcomes:", err);
+  }
   const persisted = loadStageFn();
   if (persisted && persisted.stage === "ingest-running") {
     const ageMs = Date.now() - persisted.startedAt;
@@ -1587,7 +1614,12 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           return;
         }
 
-        const detail = data.failureCode ?? data.failureReason ?? "runner reported failure";
+        // A tracker-regression refusal carries a part-naming message on failureReason
+        // (AII-638) — prefer its first line over the bare code so the ticket/status
+        // names the part and sizes, mirroring the dry-run branch above.
+        const detail = data.failureCode === "KG_SNAPSHOT_TRACKER_REGRESSION"
+          ? (data.failureReason ?? data.failureCode ?? "runner reported failure").split("\n")[0]
+          : (data.failureCode ?? data.failureReason ?? "runner reported failure");
         lastRefresh = {
           ok: false,
           at: Date.now(),
@@ -1595,6 +1627,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
           detail: `ingest runner failed: ${detail}`,
           stampBefore: null,
           stampAfter: null,
+          ...(data.failureCode === "KG_SNAPSHOT_TRACKER_REGRESSION" && data.partTable ? { partTable: data.partTable } : {}),
         };
         persistLastRefreshFn(lastRefresh);
         running = false;
@@ -1787,6 +1820,7 @@ export function makeKgRefresh(input: KgRefreshInput): KgRefreshHandle {
 
     forgetPr(repo: string, prNumber: number): void {
       dryRunOutcomesByPr.delete(`${repo}#${prNumber}`);
+      persistDryRunOutcomesFn(Array.from(dryRunOutcomesByPr.entries()));
     },
 
     onRefreshSettled(cb: () => void): () => void {
@@ -1944,6 +1978,36 @@ function defaultLoadLastRefresh(): RefreshOutcome | null {
       .get(KG_LAST_REFRESH_SETTINGS_KEY) as { value: string } | undefined;
     if (!row) return null;
     return JSON.parse(row.value) as RefreshOutcome;
+  } catch {
+    return null;
+  }
+}
+
+function defaultPersistDryRunOutcomes(entries: DryRunOutcomeEntry[]): void {
+  try {
+    getDb()
+      .prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+      .run(KG_DRY_RUN_OUTCOMES_SETTINGS_KEY, JSON.stringify(entries));
+  } catch {
+    // DB unavailable — the dry-run outcome cache will be lost on restart, which is acceptable.
+  }
+}
+
+function defaultLoadDryRunOutcomes(): DryRunOutcomeEntry[] | null {
+  try {
+    const row = getDb()
+      .prepare("SELECT value FROM settings WHERE key = ?")
+      .get(KG_DRY_RUN_OUTCOMES_SETTINGS_KEY) as { value: string } | undefined;
+    if (!row) return null;
+    const parsed: unknown = JSON.parse(row.value);
+    // A blob that is valid JSON but not the persisted shape (roll-up #538 review): treat it
+    // like every other bad persisted blob in this module — acceptable to lose, never a boot
+    // failure. The restore loop below iterates entries, so a bare object would throw there.
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter(
+      (e): e is DryRunOutcomeEntry =>
+        Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && e[1] !== null && typeof e[1] === "object",
+    );
   } catch {
     return null;
   }
