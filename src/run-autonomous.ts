@@ -219,6 +219,7 @@ export interface ResolvedRunnerInputs {
   referenceRepos: ReferenceRepo[] | undefined;
   baseBranch: string | undefined;
   profiles: string[];
+  assigneeName: string | undefined;
   githubOwner: string;
   githubRepo: string;
   githubToken: string;
@@ -286,6 +287,7 @@ function inputsFromConfig(cfg: RunConfigV1, env: NodeJS.ProcessEnv): ResolvedRun
     profiles: cfg.profiles
       ? cfg.profiles
       : (env.AI_IMPLEMENT_PROFILES ?? "").split(",").map((p) => p.trim()).filter(Boolean),
+    assigneeName: cfg.assigneeName ?? (env.AI_IMPLEMENT_ASSIGNEE_NAME?.trim() || undefined),
     githubOwner,
     githubRepo,
     githubToken,
@@ -343,6 +345,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     .split(",")
     .map((p) => p.trim())
     .filter(Boolean);
+  const assigneeName = env.AI_IMPLEMENT_ASSIGNEE_NAME?.trim() || undefined;
   return {
     issueId,
     issueIdentifier,
@@ -362,6 +365,7 @@ export function resolveRunnerInputs(env: NodeJS.ProcessEnv): ResolvedRunnerInput
     referenceRepos,
     baseBranch: undefined,
     profiles,
+    assigneeName,
     githubOwner,
     githubRepo,
     githubToken,
@@ -401,6 +405,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
     referenceRepos,
     baseBranch,
     profiles,
+    assigneeName,
     logLevel,
     provider,
     claudeModel,
@@ -501,6 +506,7 @@ export async function runAutonomous(opts: RunAutonomousOptions = {}): Promise<Ru
       dependencyTokenScope,
       referenceRepos,
       profiles,
+      assigneeName,
       groupingParent,
       callbackUrl: callbackUrl ?? undefined,
       hooks: { setup: setupHook, verify: verifyHook, teardown: teardownHook },

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, assigneeRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles } from "../github.js";
 import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -395,6 +395,18 @@ describe("profilesRunnerEnv", () => {
   });
 });
 
+describe("assigneeRunnerEnv", () => {
+  it("returns empty object when the issue has no assignee", () => {
+    expect(assigneeRunnerEnv({})).toEqual({});
+  });
+
+  it("includes AI_IMPLEMENT_ASSIGNEE_NAME when present", () => {
+    expect(assigneeRunnerEnv({ assigneeName: "Paz" })).toEqual({
+      AI_IMPLEMENT_ASSIGNEE_NAME: "Paz",
+    });
+  });
+});
+
 describe("buildEnvelopeDispatchInputs", () => {
   const baseIssue = { id: "uuid-1", identifier: "AII-1", title: "T", description: "D" };
 
@@ -410,6 +422,16 @@ describe("buildEnvelopeDispatchInputs", () => {
 
     const emptyProfiles = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, profiles: [] }, { runnerPhase: "implementation" });
     expect(decodeRunConfig(emptyProfiles.run_config as string).profiles).toBeUndefined();
+  });
+
+  it("carries assigneeName in run_config when present", () => {
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, { ...baseIssue, assigneeName: "Paz" }, { runnerPhase: "implementation" });
+    expect(decodeRunConfig(inputs.run_config as string).assigneeName).toBe("Paz");
+  });
+
+  it("omits assigneeName from run_config when absent", () => {
+    const inputs = buildEnvelopeDispatchInputs(mockMapping, baseIssue, { runnerPhase: "implementation" });
+    expect(decodeRunConfig(inputs.run_config as string).assigneeName).toBeUndefined();
   });
 
   it("carries planningContext in run_config when provided", () => {

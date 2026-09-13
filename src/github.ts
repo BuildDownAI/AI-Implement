@@ -196,6 +196,19 @@ export function profilesRunnerEnv(issue: { profiles?: string[] }): Record<string
     : {};
 }
 
+/**
+ * Assignee-name env var for the runner process (Fly/local execution modes),
+ * where the value arrives via container env rather than a workflow input.
+ * Envelope-only otherwise: `assignee` has never existed as a workflow_dispatch
+ * input in any synced version of claude-implement.yml (unlike `profiles`, which
+ * predates the envelope), so there is no legacy-contract dispatch field for it —
+ * adding one would 422 every legacy-contract dispatch for an assigned ticket,
+ * which is the common case.
+ */
+export function assigneeRunnerEnv(issue: { assigneeName?: string }): Record<string, string> {
+  return issue.assigneeName ? { AI_IMPLEMENT_ASSIGNEE_NAME: issue.assigneeName } : {};
+}
+
 export interface EnvelopeDispatchOpts {
   runnerPhase: "implementation" | "gap-analysis" | "planning" | "kg-refresh";
   baseBranch?: string;
@@ -224,7 +237,7 @@ export interface EnvelopeDispatchOpts {
  */
 export function buildEnvelopeDispatchInputs(
   mapping: RepoMapping,
-  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[] },
+  issue: { id: string; identifier: string; title: string; description?: string | null; profiles?: string[]; assigneeName?: string },
   opts: EnvelopeDispatchOpts,
 ): DispatchInputs {
   const runConfig: RunConfigV1 = {
@@ -250,6 +263,7 @@ export function buildEnvelopeDispatchInputs(
     ...(mapping.dependencyTokenScope != null && opts.runnerPhase !== "planning" ? { dependencyTokenScope: mapping.dependencyTokenScope } : {}),
     ...(mapping.referenceRepos != null && opts.runnerPhase !== "planning" && opts.runnerPhase !== "kg-refresh" ? { referenceRepos: mapping.referenceRepos } : {}),
     ...(issue.profiles && issue.profiles.length > 0 ? { profiles: issue.profiles } : {}),
+    ...(issue.assigneeName ? { assigneeName: issue.assigneeName } : {}),
     ...(opts.planningContext ? { planningContext: opts.planningContext } : {}),
     ...(opts.groupingParent ? { groupingParent: true } : {}),
   };

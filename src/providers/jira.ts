@@ -316,6 +316,7 @@ export class JiraProvider implements TicketingProvider {
         "description",
         "issuelinks",
         "parent",
+        "assignee",
         fieldIds.statusFieldId,
         fieldIds.repoFieldId,
         ...(fieldIds.epicLinkFieldId ? [fieldIds.epicLinkFieldId] : []),
@@ -450,6 +451,7 @@ export class JiraProvider implements TicketingProvider {
     const baseBranch = fieldIds.baseBranchFieldId
       ? readBaseBranchValue(raw.fields[fieldIds.baseBranchFieldId])
       : undefined;
+    const assigneeName = (raw.fields.assignee as { displayName?: string } | null)?.displayName?.trim() || undefined;
     return {
       id: raw.id,
       identifier: raw.key,
@@ -459,6 +461,7 @@ export class JiraProvider implements TicketingProvider {
       nativeStatus: statusOption?.value ?? "",
       ...(profiles.length > 0 ? { profiles } : {}),
       ...(baseBranch ? { baseBranch } : {}),
+      ...(assigneeName ? { assigneeName } : {}),
     };
   }
   /**

@@ -52,6 +52,7 @@ interface RunConfigV1 {
   commentInstruction?: string;
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   profiles?: string[];
+  assigneeName?: string;
   planningContext?: { parent?: string; siblings?: string; dependencies?: string };
   groupingParent?: boolean;
   dependencyTokenScope?: "installation";
@@ -70,6 +71,7 @@ Field notes:
 | `sensitiveFiles.add` | Glob patterns extending the built-in sensitive-file blocklist |
 | `sensitiveFiles.allow` | Glob patterns that override the blocklist; allow wins over both built-in and add patterns |
 | `profiles` | Jira AI-Implement Profiles field values (comma-split strings) |
+| `assigneeName` | Jira issue assignee display name; absent for Linear or unassigned Jira issues. `push.ts` appends it as `(Name)` to the opened PR's title. Fly/local mirror it as `AI_IMPLEMENT_ASSIGNEE_NAME`. Envelope-only — unlike `profiles`, `assignee` was never a legacy workflow_dispatch input, so it is not forwarded on the legacy GHA contract. |
 | `planningContext` | Populated for child issues in a feature tree; carries parent and sibling summaries |
 | `groupingParent` | True when this dispatch is a grouping parent's own closing-work run |
 | `dependencyTokenScope` | `"installation"` enables the dependency token step in the runner; absent or null disables it. The runner fetches a read-only token covering all App-installation repos and injects it as a git credential helper and `COMPOSER_AUTH`. Requires a publicly reachable orchestrator (`RUNNER_CALLBACK_BASE_URL` + `RUNNER_TOKEN_SECRET`). |
