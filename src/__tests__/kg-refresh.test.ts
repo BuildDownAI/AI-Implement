@@ -1134,6 +1134,176 @@ describe("kg-refresh", () => {
         expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
         expect(setCommitStatusFn).not.toHaveBeenCalled();
       });
+
+      it("reportDryRun() never re-posts another PR's dry-run outcome (AII-636)", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-a-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        postOrUpdateStickyCommentFn.mockClear();
+        setCommitStatusFn.mockClear();
+
+        // PR B (a different PR number) never ran a dry-run — must never receive PR A's verdict.
+        await handle.reportDryRun({ repo: REPORT.repo, prNumber: 99, sha: "sha-for-pr-b" });
+        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+        expect(setCommitStatusFn).not.toHaveBeenCalled();
+
+        // PR A's own report still works.
+        await handle.reportDryRun(REPORT);
+        expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(1);
+      });
+
+      it("reportDryRun() is a no-op when the stored outcome ran against a different sha", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        postOrUpdateStickyCommentFn.mockClear();
+        setCommitStatusFn.mockClear();
+
+        // A label applied after a new push superseded the stored outcome's sha.
+        await handle.reportDryRun({ ...REPORT, sha: "a-newer-sha" });
+        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+        expect(setCommitStatusFn).not.toHaveBeenCalled();
+      });
+
+      it("reportDryRun() logs a debug line and posts nothing when no outcome is stored for the PR", async () => {
+        buildDispatch();
+        const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+        try {
+          await handle.reportDryRun({ repo: "TestOrg/test-kg", prNumber: 999, sha: "nope" });
+          expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+          expect(setCommitStatusFn).not.toHaveBeenCalled();
+          expect(debugSpy).toHaveBeenCalledWith(
+            "[kg-refresh] dry-run report skipped: no outcome for TestOrg/test-kg#999",
+          );
+        } finally {
+          debugSpy.mockRestore();
+        }
+      });
+
+      it("dryRunOutcomesByPr evicts the oldest entry once more than the configured cap accumulates", async () => {
+        buildDispatch({
+          dryRunOutcomeCap: 2,
+          fetchSnapshotCommitSha: vi.fn().mockResolvedValue(SNAPSHOT_SHA),
+        });
+        const reports = [
+          { repo: "TestOrg/test-kg", prNumber: 1, sha: "sha-1" },
+          { repo: "TestOrg/test-kg", prNumber: 2, sha: "sha-2" },
+          { repo: "TestOrg/test-kg", prNumber: 3, sha: "sha-3" },
+        ];
+        for (const report of reports) {
+          await handle.trigger({ dryRun: true, ref: "pr-head-branch", report });
+          await waitForStage("ingest-running");
+          handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+          await waitDone();
+        }
+        postOrUpdateStickyCommentFn.mockClear();
+
+        // Cap is 2 — PR 1's entry was evicted once PR 3's was recorded.
+        await handle.reportDryRun(reports[0]!);
+        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+
+        // PR 2 and PR 3 are still within the cap.
+        await handle.reportDryRun(reports[1]!);
+        await handle.reportDryRun(reports[2]!);
+        expect(postOrUpdateStickyCommentFn).toHaveBeenCalledTimes(2);
+      });
+
+      it("reportDryRun() resolves true when it posts and false on a no-op (AII-636)", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        postOrUpdateStickyCommentFn.mockClear();
+
+        await expect(handle.reportDryRun(REPORT)).resolves.toBe(true);
+        await expect(handle.reportDryRun({ repo: REPORT.repo, prNumber: 999, sha: "nope" })).resolves.toBe(false);
+      });
+
+      it("forgetPr() evicts a PR's stored outcome, so a later reportDryRun() for it is a no-op (AII-636)", async () => {
+        buildDispatch();
+        await handle.trigger({ dryRun: true, ref: "pr-head-branch", report: REPORT });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        postOrUpdateStickyCommentFn.mockClear();
+
+        handle.forgetPr(REPORT.repo, REPORT.prNumber);
+
+        await handle.reportDryRun(REPORT);
+        expect(postOrUpdateStickyCommentFn).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("onRefreshSettled (AII-636)", () => {
+      it("fires when a real (non-dry-run) refresh completes successfully", async () => {
+        buildDispatch();
+        const listener = vi.fn();
+        handle.onRefreshSettled(listener);
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", {});
+        await waitDone();
+        expect(listener).toHaveBeenCalledTimes(1);
+      });
+
+      it("fires when a real (non-dry-run) refresh fails", async () => {
+        buildDispatch();
+        const listener = vi.fn();
+        handle.onRefreshSettled(listener);
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("failure", { failureCode: "TIMEOUT", failureReason: "job timed out" });
+        await waitDone();
+        expect(listener).toHaveBeenCalledTimes(1);
+      });
+
+      it("fires when a dry-run dispatch settles (regression: this is the original AII-633 firing path)", async () => {
+        buildDispatch();
+        const listener = vi.fn();
+        handle.onRefreshSettled(listener);
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        expect(listener).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not fire a registered listener while a dispatch is still in flight", async () => {
+        buildDispatch();
+        const listener = vi.fn();
+        await handle.trigger({ dryRun: true });
+        await waitForStage("ingest-running");
+        handle.onRefreshSettled(listener);
+        expect(listener).not.toHaveBeenCalled();
+        handle.onRunnerComplete("success", { guardVerdict: "clean", partTable: [] });
+        await waitDone();
+        expect(listener).toHaveBeenCalledTimes(1);
+      });
+
+      it("fireRefreshSettled() fires registered listeners directly — the deploy-hold-clearing path, which has no `running` transition of its own", async () => {
+        buildDispatch();
+        const listener = vi.fn();
+        handle.onRefreshSettled(listener);
+        handle.fireRefreshSettled();
+        expect(listener).toHaveBeenCalledTimes(1);
+      });
+
+      it("an unregistered listener does not fire on a later settle", async () => {
+        buildDispatch();
+        const listener = vi.fn();
+        const unregister = handle.onRefreshSettled(listener);
+        unregister();
+        await handle.trigger();
+        await waitForStage("ingest-running");
+        handle.onRunnerComplete("success", {});
+        await waitDone();
+        expect(listener).not.toHaveBeenCalled();
+      });
     });
 
     it("onRunnerComplete failure sets stage to failed and clears running", async () => {

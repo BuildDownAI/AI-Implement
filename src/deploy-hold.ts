@@ -41,6 +41,23 @@ export function setDeployHold(): void {
   }
 }
 
+/** Listeners registered via onDeployHoldCleared(), fired when clearDeployHold() actually clears a held lock (AII-636). */
+const deployHoldClearedListeners: Array<() => void> = [];
+
+/**
+ * Registers a listener fired every time clearDeployHold() transitions the hold from
+ * held to clear. Used to wake work that was refused while the hold was set (e.g. a
+ * kg-refresh dispatch queued behind a deploy-hold 409) without that work needing to
+ * poll isDeployHeld() itself. Returns an unregister function.
+ */
+export function onDeployHoldCleared(cb: () => void): () => void {
+  deployHoldClearedListeners.push(cb);
+  return () => {
+    const idx = deployHoldClearedListeners.indexOf(cb);
+    if (idx !== -1) deployHoldClearedListeners.splice(idx, 1);
+  };
+}
+
 /**
  * Clears the hold. Returns whether one was set — at boot that means the previous
  * process died mid-deploy, which is the only place the distinction is observable.
@@ -50,5 +67,14 @@ export function clearDeployHold(): boolean {
   getDb()
     .prepare("DELETE FROM settings WHERE key IN (?, ?)")
     .run(DEPLOY_HOLD_KEY, DEPLOY_STARTED_AT_KEY);
+  if (held) {
+    for (const cb of [...deployHoldClearedListeners]) {
+      try {
+        cb();
+      } catch (err) {
+        console.error("[deploy-hold] onDeployHoldCleared listener failed:", err);
+      }
+    }
+  }
   return held;
 }

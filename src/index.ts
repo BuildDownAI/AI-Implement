@@ -16,7 +16,7 @@ import { notify, notifyCompletion, notifyText, notifyKgRefreshOutcome } from "./
 import type { KgRefreshOutcomeNotification } from "./notify.js";
 import { isKgDegraded, postAvailableNotice, postBootNotice, postShutdownNotice, recordDeployOutcome, recordShutdown } from "./deploy-notify.js";
 import { refreshAvailability, readStampedTarget, resolveDeployTarget, type SelfDeployTarget, getAvailability } from "./deploy-availability.js";
-import { clearDeployHold, isDeployHeld } from "./deploy-hold.js";
+import { clearDeployHold, isDeployHeld, onDeployHoldCleared } from "./deploy-hold.js";
 import { decideAvailabilityAction, getDeployPolicy, getLastActedCommit, setLastActedCommit } from "./deploy-policy.js";
 import { canSelfDeploy, makeStartDeploy, readKgSourceRepo, parseKgSourceRepo } from "./deploy.js";
 import { remediateStuckJob, remediateFailedJob } from "./stuck-watchdog.js";
@@ -3392,6 +3392,10 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     },
   });
   activeKgRefresh = kgRefresh;
+  // A deploy hold clearing is not a `running` transition inside kgRefresh (trigger()'s
+  // deployHeld() check answers 409 before running is ever set) — wake any webhook head
+  // queued behind that refusal explicitly (AII-636).
+  onDeployHoldCleared(() => activeKgRefresh?.fireRefreshSettled());
   const memoryProvider = resolveMemoryProvider(config.kgSidecarUrl, config.memoryProviderId);
   const memoryProviderDiagnostic = providerUnconfiguredReason(config.kgSidecarUrl, config.memoryProviderId);
 
@@ -3611,7 +3615,8 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         githubAppPrivateKey: config.githubAppPrivateKey,
         trigger: (opts) => kgRefresh.trigger(opts),
         reportDryRun: (report) => kgRefresh.reportDryRun(report),
-        onDryRunSettled: (cb) => kgRefresh.onDryRunSettled(cb),
+        onRefreshSettled: (cb) => kgRefresh.onRefreshSettled(cb),
+        forgetKgPr: (repo, prNumber) => kgRefresh.forgetPr(repo, prNumber),
       }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {

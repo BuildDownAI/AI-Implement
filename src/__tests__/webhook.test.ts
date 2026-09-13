@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { execSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -12,7 +13,8 @@ import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type { RepoMapping } from "../config.js";
-import type { KgPrCheckConfig } from "../webhook.js";
+import type { KgPrCheckConfig, KgDryRunReportTarget } from "../webhook.js";
+import { makeKgRefresh, type KgRefreshHandle } from "../kg-refresh.js";
 
 // ---------- Hoisted mocks for /ai-implement path ----------
 
@@ -309,7 +311,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       githubAppId: "app-id",
       githubAppPrivateKey: "app-key",
       trigger: vi.fn().mockResolvedValue({ status: 202, body: {} }),
-      reportDryRun: vi.fn().mockResolvedValue(undefined),
+      reportDryRun: vi.fn().mockResolvedValue(true),
       ...overrides,
     };
   }
@@ -333,6 +335,8 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
     sha: string;
     repo: string;
     labels?: string[];
+    /** The single label GitHub reports as added on a `labeled` action (distinct from the cumulative `labels` list). */
+    label?: string;
   }) {
     return {
       action: opts.action,
@@ -342,8 +346,90 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
         head: { ref: opts.ref, sha: opts.sha },
         labels: (opts.labels ?? []).map((name) => ({ name })),
       },
+      ...(opts.label !== undefined ? { label: { name: opts.label } } : {}),
       repository: { full_name: opts.repo },
     };
+  }
+
+  /** A minimal `sources.yml`-only tarball, sufficient for kg-refresh's preflight and fetch steps to read a namespace and fail cleanly past that (no `out/` to materialize from). */
+  function makeMinimalKgTarball(): Buffer {
+    const wrap = fs.mkdtempSync(path.join(os.tmpdir(), "kg-webhook-tar-"));
+    const top = path.join(wrap, "repo");
+    fs.mkdirSync(top, { recursive: true });
+    fs.writeFileSync(path.join(top, "sources.yml"), "namespace: https://kg.test.example/\n");
+    fs.mkdirSync(path.join(top, "snapshot"), { recursive: true });
+    const out = path.join(wrap, "src.tar.gz");
+    execSync(`tar -czf ${out} -C ${wrap} repo`);
+    return fs.readFileSync(out) as Buffer;
+  }
+
+  /**
+   * Builds a real (non-mocked) KgRefreshHandle wired the same way index.ts wires one,
+   * with every network/filesystem-touching dependency injected so the handle can
+   * dispatch and settle real (non-dry-run) and dry-run refreshes without hitting the
+   * network. Used to prove the webhook's queue wakes on a real settle, not a hand-fired
+   * mock callback (AII-636).
+   */
+  function makeRealKgRefreshHandle(): { handle: KgRefreshHandle; dispatchRun: ReturnType<typeof vi.fn> } {
+    const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kg-webhook-root-"));
+    const tarball = makeMinimalKgTarball();
+    let stageStore: { stage: string; startedAt: number } | null = null;
+    const dispatchRun = vi.fn(async () => ({ machineNonce: "nonce" }));
+    const mintRunTokenFn = vi.fn()
+      .mockReturnValueOnce({ token: "run-tok", dispatchId: "disp-1" })
+      .mockReturnValue({ token: "progress-tok", dispatchId: "disp-1" });
+    // fetchSnapshotCommitSha() drives which gate runRefresh() takes on each call:
+    // the 1st (initial real trigger()) and 3rd (queued dry-run redispatch) calls
+    // match the recorded SHA below, so trigger() takes the "ingest-needed" gate and
+    // dispatches instead of running the local rail synchronously; the 2nd call
+    // (runRefreshAndSettle()'s rail, after the real runner's callback) returns a
+    // different SHA, so the rail actually runs — and fails cleanly at the
+    // materialize step, since this fixture has no `out/` directory to stage from.
+    const RECORDED_SHA = "abc123def456abc123def456abc123def456abc1";
+    const fetchSnapshotCommitSha = vi.fn()
+      .mockResolvedValueOnce(RECORDED_SHA)
+      .mockResolvedValueOnce("999newsha000999newsha000999newsha000999n")
+      .mockResolvedValue(RECORDED_SHA);
+    const handle = makeKgRefresh({
+      sidecar: { restart: vi.fn(async () => {}) },
+      githubAppId: "1",
+      githubAppPrivateKey: "key",
+      kgSourceRepo: KG_SOURCE_REPO,
+      dataRoot,
+      kgDir: "/nonexistent-kg",
+      sidecarMcpUrl: "http://127.0.0.1:1/mcp",
+      minFreeBytes: 1000,
+      deployHeld: () => false,
+      freeBytes: () => 10_000_000,
+      mintToken: vi.fn(async () => ({ token: "tok", expiresAt: "" })) as never,
+      fetchTarball: vi.fn(async () => tarball) as never,
+      fetchDefaultBranch: vi.fn(async () => "main") as never,
+      fetchWorkflowFile: vi.fn(async () => ({
+        status: 200,
+        content: "on:\n  workflow_dispatch:\n    inputs:\n      runner_phase:\n        required: false\n",
+      })) as never,
+      fetchSnapshotCommitSha: fetchSnapshotCommitSha as never,
+      persistSnapshotSha: vi.fn() as never,
+      loadSnapshotSha: vi.fn(() => RECORDED_SHA) as never,
+      materialize: vi.fn(async () => {}) as never,
+      mcpToolCall: vi.fn(async () => { throw new Error("no sidecar in this test"); }) as never,
+      canaryDeadlineMs: 50,
+      canaryRetryMs: 10,
+      runnerCallbackBaseUrl: "http://localhost:8080",
+      runnerTokenSecret: "secret",
+      resolveMappingTeamKey: () => ({ teamKey: "KGA", dependencyTokenScope: null }),
+      mintRunTokenFn: mintRunTokenFn as never,
+      dispatchRun: dispatchRun as never,
+      fetchCommitVisible: vi.fn(async () => true) as never,
+      snapshotCommitRetryMs: 0,
+      persistStage: (s, t) => { stageStore = { stage: s, startedAt: t } as never; },
+      loadStage: () => stageStore as never,
+      persistLastRefresh: vi.fn() as never,
+      loadLastRefresh: vi.fn(() => null) as never,
+      postOrUpdateStickyCommentFn: vi.fn(async () => {}) as never,
+      setCommitStatusFn: vi.fn(async () => {}) as never,
+    });
+    return { handle, dispatchRun };
   }
 
   it("dispatches a dry-run when a KG source repo PR touches kg_ingest/", async () => {
@@ -415,7 +501,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
 
   it("re-reports without re-triggering when the accept-baseline label is applied", async () => {
     const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
-    const reportDryRun = vi.fn().mockResolvedValue(undefined);
+    const reportDryRun = vi.fn().mockResolvedValue(true);
     const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
 
     const { req, res } = makeRequest(
@@ -428,6 +514,7 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
         sha: "sha-8",
         repo: KG_SOURCE_REPO,
         labels: ["accept-baseline"],
+        label: "accept-baseline",
       }),
     );
     webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
@@ -442,6 +529,96 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       acceptBaseline: true,
     });
     expect(JSON.parse(res.body)).toEqual({ reported: true });
+  });
+
+  it("an accept-baseline label on a PR with no stored dry-run outcome answers ignored, not reported (AII-636)", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const reportDryRun = vi.fn().mockResolvedValue(false);
+    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "labeled",
+        number: 9,
+        ref: "feature/never-ran",
+        sha: "sha-9",
+        repo: KG_SOURCE_REPO,
+        labels: ["accept-baseline"],
+        label: "accept-baseline",
+      }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(reportDryRun).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "no_dry_run_outcome" });
+  });
+
+  it("a non-accept-baseline label is ignored, even on a PR that never ran a dry-run (AII-636)", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const reportDryRun = vi.fn().mockResolvedValue(undefined);
+    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "labeled",
+        number: 99,
+        ref: "feature/never-ran",
+        sha: "sha-99",
+        repo: KG_SOURCE_REPO,
+        labels: ["bug"],
+        label: "bug",
+      }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(reportDryRun).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "not_accept_baseline_label" });
+  });
+
+  it("a transient listPullRequestFiles failure is reported distinctly from a genuine no-guard-relevant-change ignore", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockFetch.mockImplementation((url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/files")) return Promise.resolve(new Response("", { status: 500 }));
+      return Promise.resolve(new Response("", { status: 404 }));
+    });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 60, ref: "feature/flaky", sha: "sha-60", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ ignored: true, reason: "files_fetch_failed" });
+  });
+
+  it("a branch-pattern match still dispatches when the files fetch fails, since the branch alone is guard-relevant", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockFetch.mockImplementation(() => Promise.resolve(new Response("", { status: 500 })));
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 61, ref: "kg-upstream/2026-09-13", sha: "sha-61", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(res.statusCode).toBe(202);
   });
 
   it("ignores a redelivery carrying the same head sha and does not re-trigger", async () => {
@@ -494,11 +671,11 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } })
       .mockResolvedValueOnce({ status: 202, body: {} });
     let settledCb: (() => void) | undefined;
-    const onDryRunSettled = vi.fn((cb: () => void) => {
+    const onRefreshSettled = vi.fn((cb: () => void) => {
       settledCb = cb;
       return vi.fn();
     });
-    const kgPrCheck = makeKgPrCheck({ trigger, onDryRunSettled });
+    const kgPrCheck = makeKgPrCheck({ trigger, onRefreshSettled });
     mockPrFiles(["kg_ingest/loader.py"]);
 
     const first = makeRequest(
@@ -548,11 +725,11 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       .mockResolvedValueOnce({ status: 409, body: {} })
       .mockResolvedValueOnce({ status: 202, body: {} });
     const settledCbs: Array<() => void> = [];
-    const onDryRunSettled = vi.fn((cb: () => void) => {
+    const onRefreshSettled = vi.fn((cb: () => void) => {
       settledCbs.push(cb);
       return vi.fn();
     });
-    const kgPrCheck = makeKgPrCheck({ trigger, onDryRunSettled });
+    const kgPrCheck = makeKgPrCheck({ trigger, onRefreshSettled });
     mockPrFiles(["kg_ingest/loader.py"]);
 
     const heads = [
@@ -589,6 +766,105 @@ describe("KG PR-triggered dry-run (AII-633)", () => {
       ref: "br3",
       report: { repo: KG_SOURCE_REPO, prNumber: 30, sha: "sha-3", acceptBaseline: false },
     });
+  });
+
+  it("a 409 from a real (non-dry-run) refresh queues the head, and a real onRunnerComplete settle dispatches it — not a hand-fired mock (AII-636)", async () => {
+    const { handle, dispatchRun } = makeRealKgRefreshHandle();
+    const kgPrCheck: KgPrCheckConfig = {
+      kgSourceRepo: KG_SOURCE_REPO,
+      kgBaseRepo: KG_BASE_REPO,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "app-key",
+      trigger: (opts) => handle.trigger(opts),
+      reportDryRun: (report) => handle.reportDryRun(report),
+      onRefreshSettled: (cb) => handle.onRefreshSettled(cb),
+    };
+    mockPrFiles(["kg_ingest/loader.py"]);
+
+    // A real (non-dry-run, non-webhook) refresh is already dispatched and running.
+    const realTrigger = await handle.trigger();
+    expect(realTrigger.status).toBe(202);
+    await vi.waitFor(async () => {
+      expect((await handle.status()).stage).toBe("ingest-running");
+    });
+    expect(dispatchRun).toHaveBeenCalledTimes(1);
+
+    // A guard-relevant PR event arrives while that real refresh (not a dry-run) is
+    // running — trigger() 409s, so the webhook queues the head.
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 50, ref: "feature/real", sha: "sha-real", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+    expect(res.statusCode).toBe(202);
+    expect(JSON.parse(res.body)).toEqual({ queued: true });
+    expect(dispatchRun).toHaveBeenCalledTimes(1); // still only the real refresh
+
+    // The real refresh settles (successfully or not — here it fails cleanly, since
+    // the fixture tarball has no `out/` to materialize from). Before AII-636, only
+    // a dry-run completion fired the settled listeners, so this would never wake
+    // the queued head.
+    handle.onRunnerComplete("success", {});
+
+    // The queued head now dispatches through the real listener wiring end to end —
+    // webhook.ts's queue, kg-refresh.ts's broadened settled firing, and trigger()
+    // itself all wired together, not a hand-fired mock callback.
+    await vi.waitFor(() => {
+      expect(dispatchRun).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("a closed event evicts this PR's stored dry-run state, so a later accept-baseline label finds nothing to re-report (AII-636)", async () => {
+    const outcomeStore = new Set<string>();
+    const storeKey = (repo: string, prNumber: number) => `${repo}#${prNumber}`;
+    outcomeStore.add(storeKey(KG_SOURCE_REPO, 55));
+
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const forgetKgPr = vi.fn((repo: string, prNumber: number) => {
+      outcomeStore.delete(storeKey(repo, prNumber));
+    });
+    const reportDryRun = vi.fn((report: KgDryRunReportTarget) =>
+      Promise.resolve(outcomeStore.has(storeKey(report.repo, report.prNumber))),
+    );
+    const kgPrCheck = makeKgPrCheck({ trigger, forgetKgPr, reportDryRun });
+
+    const closed = makeRequest(SECRET, "pull_request", {
+      action: "closed",
+      pull_request: {
+        number: 55,
+        merged: false,
+        html_url: `https://github.com/${KG_SOURCE_REPO}/pull/55`,
+        head: { ref: "feature/a" },
+        merge_commit_sha: null,
+      },
+      repository: { full_name: KG_SOURCE_REPO },
+    });
+    webhook.handleGitHubWebhook(closed.req as never, closed.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await closed.res.done;
+
+    expect(forgetKgPr).toHaveBeenCalledWith(KG_SOURCE_REPO, 55);
+    expect(outcomeStore.has(storeKey(KG_SOURCE_REPO, 55))).toBe(false);
+
+    const labeled = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "labeled",
+        number: 55,
+        ref: "feature/a",
+        sha: "sha-55",
+        repo: KG_SOURCE_REPO,
+        labels: ["accept-baseline"],
+        label: "accept-baseline",
+      }),
+    );
+    webhook.handleGitHubWebhook(labeled.req as never, labeled.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await labeled.res.done;
+
+    expect(reportDryRun).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(labeled.res.body)).toEqual({ ignored: true, reason: "no_dry_run_outcome" });
   });
 });
 
