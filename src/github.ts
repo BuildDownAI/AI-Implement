@@ -417,11 +417,9 @@ export async function setCommitStatus(
 }
 
 /**
- * Lists the file paths changed by a PR (first 100 — sufficient for the guard-path
- * match; a KG PR touching more than 100 files would already be dispatch-worthy on
- * its first page of matches). Throws on a non-2xx response so a transient GitHub
- * failure is distinguishable from a PR that genuinely touches no files — a caller
- * that treated `[]` as "no guard-relevant files" could not tell the two apart.
+ * Lists the changed file paths of a PR, following `Link: rel="next"` across pages (AII-639)
+ * so a guard-relevant path past the first 100 files is still seen. Throws on a non-OK page so
+ * the webhook can report `files_fetch_failed` rather than treating it as "no change".
  */
 export async function listPullRequestFiles(
   token: string,
