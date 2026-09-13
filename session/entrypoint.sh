@@ -62,10 +62,8 @@ if [ -z "${GITHUB_DEFAULT_BRANCH:-}" ]; then
   fi
 fi
 export GITHUB_DEFAULT_BRANCH
-if [ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ]; then
-  _rb="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.baseBranch||"")}catch(e){}' 2>/dev/null||true)"
-  if [ -n "$_rb" ]; then log "run_config.baseBranch=${_rb}"; GITHUB_DEFAULT_BRANCH="$_rb"; fi
-fi
+[ -n "${_kg_r:-}" ] && _kg_ref="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.kgSourceRef||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_kg_ref" ] && { log "run_config.kgSourceRef=${_kg_ref}"; GITHUB_DEFAULT_BRANCH="$_kg_ref"; export GITHUB_DEFAULT_BRANCH; }
+[ -z "${PR_NUMBER:-}" ] && [ -n "${AI_IMPLEMENT_RUN_CONFIG:-}" ] && _rb="$(node -e 'try{const c=JSON.parse(Buffer.from(process.env.AI_IMPLEMENT_RUN_CONFIG,"base64").toString());process.stdout.write(c.baseBranch||"")}catch(e){}' 2>/dev/null||true)" && [ -n "$_rb" ] && { log "run_config.baseBranch=${_rb}"; GITHUB_DEFAULT_BRANCH="$_rb"; }
 git config --global user.name "ai-implement-bot"
 git config --global user.email "ai-implement-bot@users.noreply.github.com"
 git config --global init.defaultBranch "$GITHUB_DEFAULT_BRANCH"

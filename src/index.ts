@@ -56,7 +56,7 @@ import { enqueueReconciliation, hasReconciliationForPr, initReconciliationTable 
 import { runReconciliations } from "./reconcile-merged.js";
 import { resolveSessionImage, resolveDefaultRunnerImage, resolveRunnerImageForDispatch, type SessionImageStatus } from "./repo-image.js";
 import { getStepRecord, initStepLogTable } from "./step-log.js";
-import { getOrchestratorSettings } from "./orchestrator-settings.js";
+import { getOrchestratorSettings, seedKgBaseRepoFromEnv } from "./orchestrator-settings.js";
 import { handleRunnerPlanningContext, handleRunnerProgress, handleRunnerResult, handleKgTrackerDataRequest, handleKgScopeRequest, planningDispatchBlockReason } from "./runner-callback.js";
 import type { RunnerProgressBody, RunnerResultBody } from "./runner-callback.js";
 import { mintRunToken, PLANNING_TTL_SECONDS, IMPLEMENTATION_TTL_SECONDS } from "./runner-tokens.js";
@@ -85,7 +85,7 @@ import {
 import { clearPrNotFoundGrace, decideCleanExitOutcome, shouldSkipCompletionNotice, workflowFileForJob } from "./monitor-status.js";
 import type { RunPrCandidate, RunPrMatch } from "./monitor-status.js";
 import { pickPrForRun } from "./monitor-status.js";
-import { type RunConfigV1, encodeRunConfig } from "./run-config.js";
+import { type RunConfigV1, encodeRunConfig, decodeRunConfig } from "./run-config.js";
 import { resolveBaseBranch, findOpenRollUpPr } from "./feature-branch.js";
 import { validateIssueBaseBranch, postBranchComment } from "./base-branch.js";
 import { runMergeUps, clearRollUpHandledMarkersByIdentifier } from "./merge-up.js";
@@ -3182,6 +3182,9 @@ async function dispatchKgRefreshRun(
   const repo = parseKgSourceRepo(config.kgSourceRepo);
   const ghToken = await getInstallationToken(config.githubAppId, config.githubAppPrivateKey, repo.owner);
   const defaultBranch = (await getRepoDefaultBranch(ghToken, repo.owner, repo.repo)) ?? "main";
+  // A PR-triggered dry-run (AII-633) carries kgSourceRef — the PR's head branch — so the
+  // GHA dispatch runs against that ref instead of the default branch. Absent = unchanged.
+  const dispatchRef = decodeRunConfig(opts.runConfig).kgSourceRef ?? defaultBranch;
 
   // Use the execution path resolved once by resolveExecutionMode in trigger() when
   // available. Falling back to an independent resolution is only a safety net for
@@ -3205,7 +3208,7 @@ async function dispatchKgRefreshRun(
       runnerImageExplicit: config.runnerImageExplicit,
     });
     const runnerCallbackUrl = config.runnerCallbackBaseUrl ?? undefined;
-    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: defaultBranch, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240" });
+    const dispatchBody = buildKgRefreshGhaDispatchBody({ ref: dispatchRef, runConfig: opts.runConfig, runToken: opts.runToken, runProgressToken: opts.runProgressToken, runnerImage, runnerCallbackUrl, runnerPhase: "kg-refresh", jobTimeoutMinutes: "240" });
     const dispatchedAt = Date.now();
     const dispatchRes = await fetch(dispatchUrl, {
       method: "POST",
@@ -3239,7 +3242,7 @@ async function dispatchKgRefreshRun(
       owner: repo.owner,
       repo: repo.repo,
       workflowFile: KG_REFRESH_WORKFLOW_FILE,
-      branch: defaultBranch,
+      branch: dispatchRef,
       dispatchTime,
     });
     if (!workflowRunId) {
@@ -3343,6 +3346,7 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     githubAppId: config.githubAppId,
     githubAppPrivateKey: config.githubAppPrivateKey,
     kgSourceRepo: config.kgSourceRepo,
+    getKgBaseRepo: () => getOrchestratorSettings().kgBaseRepo,
     runnerCallbackBaseUrl: config.runnerCallbackBaseUrl,
     runnerTokenSecret: config.runnerTokenSecret,
     resolveMappingTeamKey: (ownerRepo) => {
@@ -3600,7 +3604,15 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
         res.end(JSON.stringify({ error: "Webhook endpoint not configured: GITHUB_WEBHOOK_SECRET is not set" }));
         return;
       }
-      handleGitHubWebhook(req, res, config.githubWebhookSecret, config.githubAppId, config.githubAppPrivateKey, config.selfDeployTarget ?? undefined).catch((err) => {
+      handleGitHubWebhook(req, res, config.githubWebhookSecret, config.githubAppId, config.githubAppPrivateKey, config.selfDeployTarget ?? undefined, {
+        kgSourceRepo: config.kgSourceRepo,
+        kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
+        githubAppId: config.githubAppId,
+        githubAppPrivateKey: config.githubAppPrivateKey,
+        trigger: (opts) => kgRefresh.trigger(opts),
+        reportDryRun: (report) => kgRefresh.reportDryRun(report),
+        onDryRunSettled: (cb) => kgRefresh.onDryRunSettled(cb),
+      }).catch((err) => {
         console.error("[webhook] Unhandled error:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -3851,7 +3863,12 @@ function startServer(config: AppConfig, registry: ProviderRegistry, sidecar: KgS
     // MCP endpoint — OAuth bearer token authenticated
     if (pathname === "/mcp") {
       const kgPreflightFn = config.kgSourceRepo
-        ? () => runKgRefreshPreflight({ githubAppId: config.githubAppId, githubAppPrivateKey: config.githubAppPrivateKey, kgSourceRepo: config.kgSourceRepo! })
+        ? () => runKgRefreshPreflight({
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            kgSourceRepo: config.kgSourceRepo!,
+            kgBaseRepo: getOrchestratorSettings().kgBaseRepo,
+          })
         : undefined;
       const getKgStatusFn = () => kgRefresh.status();
       const triggerKgRefreshFn = (dryRun?: boolean) => kgRefresh.trigger({ dryRun });
@@ -3989,6 +4006,7 @@ async function main(): Promise<void> {
   initDispatchBreakerTable();
   sweepOrphanedGapfillRows(); // AII-279: heal rows wedged before the AII-277 terminal hook existed
   initSettingsTable();
+  seedKgBaseRepoFromEnv(process.env.KG_BASE_REPO); // AII-633: seeds once, inert thereafter
   initAccessEntriesTable();
   initReconciliationTable();
   initStepLogTable();

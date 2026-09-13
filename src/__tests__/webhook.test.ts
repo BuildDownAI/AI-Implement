@@ -12,6 +12,7 @@ import type * as ReviewLedgerStoreModule from "../review-ledger-store.js";
 import type * as ReviewFixQueueModule from "../review-fix-queue.js";
 import type * as CommentGapfillQueueModule from "../comment-gapfill-queue.js";
 import type { RepoMapping } from "../config.js";
+import type { KgPrCheckConfig } from "../webhook.js";
 
 // ---------- Hoisted mocks for /ai-implement path ----------
 
@@ -292,6 +293,302 @@ describe("non-AI PR matching", () => {
     await res.done;
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).ignored).toBe(true);
+  });
+});
+
+// ---------- KG PR-triggered dry-run rail (AII-633) ----------
+
+describe("KG PR-triggered dry-run (AII-633)", () => {
+  const KG_SOURCE_REPO = "org/kg-source";
+  const KG_BASE_REPO = "org/kg-base";
+
+  function makeKgPrCheck(overrides: Partial<KgPrCheckConfig> = {}): KgPrCheckConfig {
+    return {
+      kgSourceRepo: KG_SOURCE_REPO,
+      kgBaseRepo: KG_BASE_REPO,
+      githubAppId: "app-id",
+      githubAppPrivateKey: "app-key",
+      trigger: vi.fn().mockResolvedValue({ status: 202, body: {} }),
+      reportDryRun: vi.fn().mockResolvedValue(undefined),
+      ...overrides,
+    };
+  }
+
+  function mockPrFiles(files: string[]): void {
+    mockFetch.mockImplementation((url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/files")) {
+        return Promise.resolve(
+          new Response(JSON.stringify(files.map((filename) => ({ filename }))), { status: 200 }),
+        );
+      }
+      return Promise.resolve(new Response("", { status: 404 }));
+    });
+  }
+
+  function prPayload(opts: {
+    action: string;
+    number: number;
+    ref: string;
+    sha: string;
+    repo: string;
+    labels?: string[];
+  }) {
+    return {
+      action: opts.action,
+      pull_request: {
+        number: opts.number,
+        html_url: `https://github.com/${opts.repo}/pull/${opts.number}`,
+        head: { ref: opts.ref, sha: opts.sha },
+        labels: (opts.labels ?? []).map((name) => ({ name })),
+      },
+      repository: { full_name: opts.repo },
+    };
+  }
+
+  it("dispatches a dry-run when a KG source repo PR touches kg_ingest/", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockPrFiles(["kg_ingest/loader.py"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "opened", number: 42, ref: "feature/x", sha: "sha-42", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveBeenCalledWith({
+      dryRun: true,
+      ref: "feature/x",
+      report: { repo: KG_SOURCE_REPO, prNumber: 42, sha: "sha-42", acceptBaseline: false },
+    });
+    expect(res.statusCode).toBe(202);
+  });
+
+  it("dispatches on the base template repo when the head branch matches an upstream-merge pattern, even with no guard-path change", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockPrFiles(["README.md"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "opened",
+        number: 5,
+        ref: "kg-upstream/2026-09-13",
+        sha: "sha-5",
+        repo: KG_BASE_REPO,
+      }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(trigger).toHaveBeenCalledWith({
+      dryRun: true,
+      ref: "kg-upstream/2026-09-13",
+      report: { repo: KG_BASE_REPO, prNumber: 5, sha: "sha-5", acceptBaseline: false },
+    });
+    expect(res.statusCode).toBe(202);
+  });
+
+  it("does not trigger a synchronize touching only unrelated files", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockPrFiles(["docs/README.md"]);
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 6, ref: "docs-update", sha: "sha-6", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body).ignored).toBe(true);
+  });
+
+  it("re-reports without re-triggering when the accept-baseline label is applied", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const reportDryRun = vi.fn().mockResolvedValue(undefined);
+    const kgPrCheck = makeKgPrCheck({ trigger, reportDryRun });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({
+        action: "labeled",
+        number: 8,
+        ref: "feature/y",
+        sha: "sha-8",
+        repo: KG_SOURCE_REPO,
+        labels: ["accept-baseline"],
+      }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(reportDryRun).toHaveBeenCalledTimes(1);
+    expect(reportDryRun).toHaveBeenCalledWith({
+      repo: KG_SOURCE_REPO,
+      prNumber: 8,
+      sha: "sha-8",
+      acceptBaseline: true,
+    });
+    expect(JSON.parse(res.body)).toEqual({ reported: true });
+  });
+
+  it("ignores a redelivery carrying the same head sha and does not re-trigger", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+    mockPrFiles(["sources.yml"]);
+    const payload = prPayload({
+      action: "synchronize",
+      number: 7,
+      ref: "feature/z",
+      sha: "sha-dup",
+      repo: KG_SOURCE_REPO,
+    });
+
+    const first = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await first.res.done;
+
+    const second = makeRequest(SECRET, "pull_request", payload);
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await second.res.done;
+
+    expect(trigger).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(second.res.body)).toEqual({ ignored: true, reason: "duplicate_sha" });
+  });
+
+  it("falls through to the existing pull_request handling for a repo that is neither the KG source nor base repo", async () => {
+    const trigger = vi.fn().mockResolvedValue({ status: 202, body: {} });
+    const kgPrCheck = makeKgPrCheck({ trigger });
+
+    const { req, res } = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 11, ref: "feature/w", sha: "sha-11", repo: "org/unrelated-repo" }),
+    );
+    webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await res.done;
+
+    expect(trigger).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.ignored).toBe(true);
+    expect(body.reason).toBe("no matching dispatch");
+  });
+
+  it("queues a superseding head when trigger reports 409 (a refresh is already running), and dispatches it exactly once on completion", async () => {
+    const trigger = vi
+      .fn()
+      .mockResolvedValueOnce({ status: 202, body: {} })
+      .mockResolvedValueOnce({ status: 409, body: { error: "refresh-in-progress" } })
+      .mockResolvedValueOnce({ status: 202, body: {} });
+    let settledCb: (() => void) | undefined;
+    const onDryRunSettled = vi.fn((cb: () => void) => {
+      settledCb = cb;
+      return vi.fn();
+    });
+    const kgPrCheck = makeKgPrCheck({ trigger, onDryRunSettled });
+    mockPrFiles(["kg_ingest/loader.py"]);
+
+    const first = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 20, ref: "br1", sha: "sha-1", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(first.req as never, first.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await first.res.done;
+    expect(first.res.statusCode).toBe(202);
+
+    const second = makeRequest(
+      SECRET,
+      "pull_request",
+      prPayload({ action: "synchronize", number: 20, ref: "br2", sha: "sha-2", repo: KG_SOURCE_REPO }),
+    );
+    webhook.handleGitHubWebhook(second.req as never, second.res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+    await second.res.done;
+
+    expect(second.res.statusCode).toBe(202);
+    expect(JSON.parse(second.res.body)).toEqual({ queued: true });
+    expect(trigger).toHaveBeenCalledTimes(2);
+    expect(settledCb).toBeTypeOf("function");
+
+    // The in-flight dry-run settles — the queued (newer) head dispatches exactly once.
+    settledCb!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(trigger).toHaveBeenCalledTimes(3);
+    expect(trigger).toHaveBeenNthCalledWith(3, {
+      dryRun: true,
+      ref: "br2",
+      report: { repo: KG_SOURCE_REPO, prNumber: 20, sha: "sha-2", acceptBaseline: false },
+    });
+
+    // Firing the (already-consumed) listener again must not double-dispatch.
+    settledCb!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(trigger).toHaveBeenCalledTimes(3);
+  });
+
+  it("supersedes an already-queued head with a newer one arriving before completion — only the newest dispatches", async () => {
+    const trigger = vi
+      .fn()
+      .mockResolvedValueOnce({ status: 202, body: {} })
+      .mockResolvedValueOnce({ status: 409, body: {} })
+      .mockResolvedValueOnce({ status: 409, body: {} })
+      .mockResolvedValueOnce({ status: 202, body: {} });
+    const settledCbs: Array<() => void> = [];
+    const onDryRunSettled = vi.fn((cb: () => void) => {
+      settledCbs.push(cb);
+      return vi.fn();
+    });
+    const kgPrCheck = makeKgPrCheck({ trigger, onDryRunSettled });
+    mockPrFiles(["kg_ingest/loader.py"]);
+
+    const heads = [
+      { ref: "br1", sha: "sha-1" },
+      { ref: "br2", sha: "sha-2" },
+      { ref: "br3", sha: "sha-3" },
+    ];
+    const responses = [];
+    for (const head of heads) {
+      const { req, res } = makeRequest(
+        SECRET,
+        "pull_request",
+        prPayload({ action: "synchronize", number: 30, ref: head.ref, sha: head.sha, repo: KG_SOURCE_REPO }),
+      );
+      webhook.handleGitHubWebhook(req as never, res as never, SECRET, undefined, undefined, undefined, kgPrCheck);
+      await res.done;
+      responses.push(res);
+    }
+
+    expect(responses[0]!.statusCode).toBe(202);
+    expect(JSON.parse(responses[1]!.body)).toEqual({ queued: true });
+    expect(JSON.parse(responses[2]!.body)).toEqual({ queued: true });
+    expect(trigger).toHaveBeenCalledTimes(3);
+    expect(settledCbs.length).toBe(2);
+
+    // Both listeners fire for the single dry-run completion; only the latest queued
+    // head (br3) may dispatch, and only once.
+    settledCbs.forEach((cb) => cb());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(trigger).toHaveBeenCalledTimes(4);
+    expect(trigger).toHaveBeenNthCalledWith(4, {
+      dryRun: true,
+      ref: "br3",
+      report: { repo: KG_SOURCE_REPO, prNumber: 30, sha: "sha-3", acceptBaseline: false },
+    });
   });
 });
 

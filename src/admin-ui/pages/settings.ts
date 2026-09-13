@@ -42,6 +42,14 @@ export const settingsHtml = `
           </div>
           <div class="text-tertiary" style="font-size:11px;margin-top:3px">Linear issue identifier that receives a comment on each kg-refresh failure. Leave blank to skip the comment.</div>
         </div>
+        <div class="field">
+          <label>Base template repo</label>
+          <div style="display:flex;gap:6px">
+            <input class="input" id="settings-kg-base-repo" placeholder="e.g. BuildDownAI/bd-knowledge-graph-base" style="flex:1">
+            <button class="btn btn-primary btn-sm" onclick="saveKgBaseRepo()">Save</button>
+          </div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:3px">owner/repo watched by the PR-triggered kg-refresh dry-run check, alongside the bound KG source repo. Leave blank to check only the KG source repo.</div>
+        </div>
         <div id="settings-kg-error" class="error hidden"></div>
       </div>
     </div>
@@ -90,6 +98,8 @@ export const settingsScript = `
       regionInput.value = regionInfo.dbValue || '';
       const kgReportInput = document.getElementById('settings-kg-report-issue');
       kgReportInput.value = (data.kgRefreshReportIssue && data.kgRefreshReportIssue.value) || '';
+      const kgBaseRepoInput = document.getElementById('settings-kg-base-repo');
+      kgBaseRepoInput.value = (data.kgBaseRepo && data.kgBaseRepo.value) || '';
       const overridden = appInfo.overriddenByEnv || regionInfo.overriddenByEnv;
       envWarn.classList.toggle('hidden', !overridden);
       const srcText = appInfo.runtimeValue
@@ -128,6 +138,22 @@ export const settingsScript = `
     }
   }
   window.saveKgRefreshReportIssue = saveKgRefreshReportIssue;
+
+  async function saveKgBaseRepo() {
+    const val = document.getElementById('settings-kg-base-repo').value.trim() || null;
+    const errEl = document.getElementById('settings-kg-error');
+    errEl.classList.add('hidden');
+    try {
+      const res = await window.api('/api/settings', { method: 'POST', body: JSON.stringify({ kgBaseRepo: val }) });
+      const data = await res.json();
+      if (!res.ok) { errEl.textContent = data.error || 'Failed to save setting.'; errEl.classList.remove('hidden'); return; }
+      await loadSettings();
+    } catch (err) {
+      errEl.textContent = String(err);
+      errEl.classList.remove('hidden');
+    }
+  }
+  window.saveKgBaseRepo = saveKgBaseRepo;
 
   async function saveSettings(payload) {
     const errEl = document.getElementById('settings-error');

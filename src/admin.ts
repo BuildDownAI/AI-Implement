@@ -1670,6 +1670,9 @@ function handleGetSettings(
     kgRefreshReportIssue: {
       value: dbSettings.kgRefreshReportIssue,
     },
+    kgBaseRepo: {
+      value: dbSettings.kgBaseRepo,
+    },
   });
 }
 
@@ -1678,7 +1681,7 @@ async function handlePostSettings(
   res: http.ServerResponse,
   config: AdminConfig,
 ): Promise<void> {
-  let body: { flySessionsApp?: string | null; flySessionsRegion?: string | null; kgRefreshReportIssue?: string | null };
+  let body: { flySessionsApp?: string | null; flySessionsRegion?: string | null; kgRefreshReportIssue?: string | null; kgBaseRepo?: string | null };
   try {
     const parsed = JSON.parse(await readBody(req));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -1709,6 +1712,12 @@ async function handlePostSettings(
       : null;
     setOrchestratorSetting("kgRefreshReportIssue", val);
   }
+  if ("kgBaseRepo" in body) {
+    const val = typeof body.kgBaseRepo === "string" && body.kgBaseRepo.trim()
+      ? body.kgBaseRepo.trim()
+      : null;
+    setOrchestratorSetting("kgBaseRepo", val);
+  }
 
   const dbSettings = getOrchestratorSettings();
   const envApp = process.env.FLY_SESSIONS_APP || null;
@@ -1733,6 +1742,9 @@ async function handlePostSettings(
     },
     kgRefreshReportIssue: {
       value: dbSettings.kgRefreshReportIssue,
+    },
+    kgBaseRepo: {
+      value: dbSettings.kgBaseRepo,
     },
     restartRequired,
   });

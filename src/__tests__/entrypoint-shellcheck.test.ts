@@ -263,6 +263,19 @@ describe("session/entrypoint.sh", () => {
     expect(content).not.toContain("GITHUB_DEFAULT_BRANCH:-main");
   });
 
+  it("gates the kgSourceRef envelope override on _kg_r (AII-633)", () => {
+    const content = readFileSync("session/entrypoint.sh", "utf-8");
+    // Decode line must extract kgSourceRef from the envelope JSON.
+    expect(content).toMatch(/node -e.*c\.kgSourceRef/);
+    // The kgSourceRef decode/override must be gated on _kg_r being set — this is what
+    // distinguishes a kg-refresh run from an ordinary implementation run reusing the
+    // same envelope decode path (see _kg_r assignment from c.kgSourceRepo above it).
+    const kgRefIdx = content.indexOf("c.kgSourceRef");
+    expect(kgRefIdx).toBeGreaterThan(-1);
+    const line = content.slice(content.lastIndexOf("\n", kgRefIdx) + 1, content.indexOf("\n", kgRefIdx));
+    expect(line).toMatch(/^\[ -n "\$\{_kg_r:-\}" \]/);
+  });
+
   it("preserves the checked-out gap-fill PR branch for the TS clone step", () => {
     const content = readFileSync("session/entrypoint.sh", "utf-8");
     expect(content).toMatch(/gh pr checkout "\$PR_NUMBER"/);

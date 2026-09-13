@@ -17,6 +17,8 @@ export interface RunConfigV1 {
   kgSourceRepo?: string;
   /** True when this kg-refresh dispatch should run kg-snapshot-push in dry-run mode (AII-632). */
   kgDryRun?: true;
+  /** Branch to check out instead of the KG source repo's default branch (AII-633 PR-triggered dry-run). Absent = unchanged default-branch clone. */
+  kgSourceRef?: string;
   branchPrefix?: string;
   skillsRepo?: string;
   runnerCallbackUrl?: string;
@@ -100,7 +102,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
     profiles, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
-    kgDryRun, referenceRepos } = cfg;
+    kgDryRun, kgSourceRef, referenceRepos } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
   if (baseBranch !== undefined) out.baseBranch = baseBranch;
@@ -118,6 +120,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (dependencyTokenScope !== undefined) out.dependencyTokenScope = dependencyTokenScope;
   if (kgSourceRepo !== undefined) out.kgSourceRepo = kgSourceRepo;
   if (kgDryRun !== undefined) out.kgDryRun = kgDryRun;
+  if (kgSourceRef !== undefined) out.kgSourceRef = kgSourceRef;
   if (referenceRepos !== undefined) out.referenceRepos = referenceRepos;
   return out;
 }

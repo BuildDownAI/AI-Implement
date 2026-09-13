@@ -276,6 +276,59 @@ the rail alone.
 Steps 5 to 7 exist entirely because of the monolith. In a two-service design the data would be
 reloadable on its own; here it rides a release, so the release has to be sequenced and verified.
 
+### PR check (AII-633)
+
+A PR that touches `kg_ingest/**`, `sources.yml`, `ontology/**`, or `snapshot/**` on the bound KG
+source repo (`kg.source_repo`) or the configured base template repo (Settings → KG Refresh · "Base
+template repo", seeded once from `KG_BASE_REPO`), or whose head branch matches `kg-upstream/*` or
+`sync/upstream-*` (an upstream merge, guard-relevant regardless of which files it happens to touch),
+gets the same dry run described above run against the PR's head instead of the default branch: the
+webhook (`opened` / `synchronize`) dispatches `trigger({ dryRun: true, ref: <head branch>, report })`,
+which runs `kg-snapshot-push`'s guards without committing or pushing, exactly as a manual dry run
+does. A PR that changes nothing guard-relevant — docs, an unrelated code path — gets no dispatch at
+all.
+
+The verdict always lands as a sticky PR comment headed `## kg-refresh dry-run — <sha>`, updated in
+place (not duplicated) on every subsequent push, carrying the same per-part line-count table
+`get_kg_status` shows for a manual dry run. A `kg-refresh/dry-run` **commit status** is set alongside
+it, but only when the GitHub App has been granted `statuses: write` on the PR's repo — see "Manual
+step" below. Losing that grant degrades the check to comment-only; it never blocks the dispatch or
+the PR.
+
+The `accept-baseline` label changes only what the comment says, never what the guard decides: applying
+it to a PR whose dry run refused a tracker-file shrink changes the report's wording to "refused,
+accepted by label" (and, symmetrically, the commit status to success) without re-running anything —
+a `labeled` webhook event just re-posts the last computed verdict. The label is **report-only**. It
+is a distinct mechanism from an admin accepting a new baseline at refresh time (AII-628): a real
+refresh against that same source still refuses the shrink unless that refresh-time acceptance has
+happened. Treat the label as "we've seen this and it's expected," not as a bypass.
+
+**Manual step — granting the status.** The GitHub App needs `statuses: write` granted on the KG
+source repo and on the base template repo for the commit status to appear — this is not requestable
+through code, and there is no way to detect the gap from inside the PR itself. Grant it via the
+GitHub App's permissions page for each repo's installation. Until granted, the sticky comment is the
+only signal; nothing errors or blocks in the meantime. The preflight's `statuses:write` rows probe
+this grant against the same two repos the webhook actually posts to — the KG source repo, and
+whichever repo is configured as "Base template repo" (see the note on the two "base repo" notions
+below), not sources.yml's `base_repo:`.
+
+**Manual step — making the check required.** Setting `statuses: write` only lets the status *appear*;
+by itself it is advisory and a PR can be merged straight through it regardless of the guard's verdict.
+The ticket's "required check" only exists once a repo admin adds `kg-refresh/dry-run` as a required
+context in that repo's branch protection settings (Settings → Branches → Branch protection rule →
+"Require status checks to pass" → add `kg-refresh/dry-run`), on both the KG source repo and the base
+template repo. Nothing in this codebase calls GitHub's branch-protection API to do this automatically
+— it stays a one-time, per-repo manual step alongside granting `statuses: write`. Until that step is
+done on a given repo, `kg-refresh/dry-run` is informational only there, no matter how the guard votes.
+
+**Two notions of "base repo."** The "Base template repo" Settings field (`kgBaseRepo`, seeded once
+from `KG_BASE_REPO`) is what this webhook check uses to decide whether an incoming PR's repository
+should be treated as a base-template PR — a global, admin-configured value. It is a distinct thing
+from sources.yml's own `base_repo:` field, which the advisory `base:drift` preflight row (AII-598)
+reads to compare a derivative KG repo against its template. The two should normally agree, but they
+are read from different places and are not reconciled automatically; a `statuses:write` preflight row
+for the base repo reflects the Settings value, while `base:drift` reflects sources.yml's.
+
 ### Scope contract
 
 The orchestrator's project mappings are the scope for `sources.yml`. The `kg-scope-reconcile`
