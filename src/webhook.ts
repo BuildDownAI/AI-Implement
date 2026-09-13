@@ -211,6 +211,22 @@ async function handleKgPrCheckWebhook(
   const sha = payload.pull_request?.head?.sha;
   const headRef = payload.pull_request?.head?.ref;
 
+  // AII-639: this check owns the HTTP response only for events nothing else handles
+  // (`opened`, `labeled`). On `synchronize` it runs as a side effect and returns false,
+  // so the existing pull_request handling (gap-fill matching via findMatchingDispatch,
+  // merge reconciliation) still runs for the KG repos — they are ordinary onboarded
+  // projects too. Outcomes on `synchronize` go to the log instead of the response.
+  const owns = payload.action !== "synchronize";
+  const answer = (status: number, body: Record<string, unknown>, note: string): boolean => {
+    if (owns) {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    } else {
+      console.log(`[webhook] kg-refresh dry-run: ${note} for ${repoFullName}#${prNumber} (falling through to pull_request handling)`);
+    }
+    return owns;
+  };
+
   if (payload.action === "labeled") {
     // Only the accept-baseline label re-reports anything — any other label on any
     // other PR must never touch the check (AII-636: a stray label on an unrelated
@@ -239,22 +255,16 @@ async function handleKgPrCheckWebhook(
   }
 
   if (!sha || !headRef) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true, reason: "missing_pr_fields" }));
-    return true;
+    return answer(200, { ignored: true, reason: "missing_pr_fields" }, "missing PR fields");
   }
 
   const key = `${repoFullName}#${prNumber}`;
   if (kgDryRunLastSha.get(key) === sha) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true, reason: "duplicate_sha" }));
-    return true;
+    return answer(200, { ignored: true, reason: "duplicate_sha" }, "duplicate sha");
   }
 
   if (!kgPrCheck.githubAppId || !kgPrCheck.githubAppPrivateKey) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true, reason: "no_app_credentials" }));
-    return true;
+    return answer(200, { ignored: true, reason: "no_app_credentials" }, "no App credentials");
   }
 
   const slashIdx = repoFullName.indexOf("/");
@@ -271,16 +281,12 @@ async function handleKgPrCheckWebhook(
       files = await listPullRequestFiles(token, owner, repo, prNumber);
     } catch (err) {
       console.warn(`[webhook] kg-refresh dry-run: failed to fetch changed files for ${repoFullName}#${prNumber}:`, err);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ignored: true, reason: "files_fetch_failed" }));
-      return true;
+      return answer(200, { ignored: true, reason: "files_fetch_failed" }, "files fetch failed");
     }
   }
 
   if (!matchesKgGuard(files, headRef)) {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ignored: true, reason: "no_guard_relevant_change" }));
-    return true;
+    return answer(200, { ignored: true, reason: "no_guard_relevant_change" }, "no guard-relevant change");
   }
 
   // Record before dispatch (not after) so a burst of redeliveries for the same sha
@@ -308,15 +314,11 @@ async function handleKgPrCheckWebhook(
     // A refresh is already running — supersede any previously queued head for this
     // PR with this one and dispatch it once the in-flight dry-run completes.
     queueKgDryRun(kgPrCheck, key, { ref: headRef, report });
-    res.writeHead(202, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ queued: true }));
-    return true;
+    return answer(202, { queued: true }, "queued behind the running refresh");
   }
 
   console.log(`[kg-refresh] dry-run for ${repoFullName}@${sha}`);
-  res.writeHead(result.status === 202 ? 202 : 200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ triggered: result.status === 202, status: result.status }));
-  return true;
+  return answer(result.status === 202 ? 202 : 200, { triggered: result.status === 202, status: result.status }, `dispatched (status ${result.status})`);
 }
 
 interface ReviewPayload {
@@ -480,6 +482,8 @@ export async function handleGitHubWebhook(
   }
 
   if (payload.action === "opened" || payload.action === "synchronize" || payload.action === "labeled") {
+    // The KG PR check owns `opened` and `labeled` responses; on `synchronize` it runs as a
+    // side effect and returns false so handlePullRequestSynchronize below still runs (AII-639).
     const handled = await handleKgPrCheckWebhook(payload, res, kgPrCheck);
     if (handled) return;
   }

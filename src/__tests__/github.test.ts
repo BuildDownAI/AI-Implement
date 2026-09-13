@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags } from "../github.js";
+import { dispatchWorkflow, providerDispatchFields, getBranchSha, fetchRepoTarball, ensureBranchExists, capDispatchFields, capRunnerEnv, branchPrefixDispatchFields, branchPrefixRunnerEnv, skillsRepoDispatchFields, skillsRepoRunnerEnv, profilesDispatchFields, profilesRunnerEnv, buildEnvelopeDispatchInputs, cancelWorkflowRun, getPullRequestState, deleteBranch, findPullRequestByBranches, mergePullRequest, getCombinedChecksState, parseLinkNext, listRepoBranchesAndTags, listPullRequestFiles } from "../github.js";
 import { decodeRunConfig, encodeRunConfig } from "../run-config.js";
 import type { RepoMapping } from "../config.js";
 
@@ -727,6 +727,31 @@ describe("fetchRepoTarball", () => {
     // Returning empty bytes would extract to an empty build context and fail much later.
     vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 404 } as Response);
     await expect(fetchRepoTarball("tok", "Owner", "Repo", "nope")).rejects.toThrow(/HTTP 404/);
+  });
+});
+
+describe("listPullRequestFiles (AII-639)", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+
+  it("follows Link rel=\"next\" so a guard-relevant file past the first page is still returned", async () => {
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ filename: `docs/page-${i}.md` }));
+    const page2 = [{ filename: "sources.yml" }];
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify(page1), {
+        status: 200,
+        headers: { link: '<https://api.github.com/repos/o/r/pulls/7/files?per_page=100&page=2>; rel="next"' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(page2), { status: 200 }));
+    const files = await listPullRequestFiles("tok", "o", "r", 7);
+    expect(files).toHaveLength(101);
+    expect(files).toContain("sources.yml");
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    expect(String(vi.mocked(fetch).mock.calls[1][0])).toContain("page=2");
+  });
+
+  it("throws on a non-OK page so the caller can report files_fetch_failed instead of treating it as no change", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response("nope", { status: 502 }));
+    await expect(listPullRequestFiles("tok", "o", "r", 7)).rejects.toThrow(/listPullRequestFiles failed: HTTP 502/);
   });
 });
 

@@ -429,14 +429,21 @@ export async function listPullRequestFiles(
   repo: string,
   prNumber: number,
 ): Promise<string[]> {
-  const url = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`;
-  const res = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`listPullRequestFiles failed: HTTP ${res.status}: ${text}`);
+  // Follows `Link: rel="next"` like listPrComments (AII-639): a guard-relevant file past the
+  // first 100 must not be treated as "no guard-relevant change".
+  const files: string[] = [];
+  let url: string | null = `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100`;
+  while (url) {
+    const res: Response = await fetch(url, { headers: ghHeaders(token), signal: defaultFetchSignal() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`listPullRequestFiles failed: HTTP ${res.status}: ${text}`);
+    }
+    const data = (await res.json()) as Array<{ filename?: string }>;
+    files.push(...data.map((f) => f.filename).filter((f): f is string => typeof f === "string"));
+    url = parseLinkNext(res.headers.get("link"));
   }
-  const data = (await res.json()) as Array<{ filename?: string }>;
-  return data.map((f) => f.filename).filter((f): f is string => typeof f === "string");
+  return files;
 }
 
 /**
