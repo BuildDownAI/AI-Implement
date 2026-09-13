@@ -313,6 +313,26 @@ describe("loadPipelineDefinition", () => {
     expect(inputs.prTitle).toBe("ENG-42: Add profile page");
   });
 
+  it("appends the assignee name in parentheses to the PR title when present", () => {
+    const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
+      existsSyncImpl: () => false,
+      readFileSyncImpl: (_path, _enc) => BUILTIN_PIPELINE_YAML,
+    });
+
+    const ctx = makeContext({ issueIdentifier: "ENG-42", issueTitle: "Add profile page", assigneeName: "Paz" });
+    ctx.setOutputs("clone", {
+      workspaceDir: "/tmp/repo",
+      repoOwner: "acme",
+      repoRepo: "api",
+      githubToken: "tok",
+      branch: "main",
+    });
+
+    const step = pipeline.steps.find((s) => s.id === "push")!;
+    const inputs = ctx.resolveInputs(step.inputs);
+    expect(inputs.prTitle).toBe("ENG-42: Add profile page (Paz)");
+  });
+
   it("applies post-push-review input wiring from clone and push outputs", () => {
     const pipeline = loadPipelineDefinition("pipelines/autonomous.yml", {
       existsSyncImpl: () => false,

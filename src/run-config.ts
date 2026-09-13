@@ -32,6 +32,8 @@ export interface RunConfigV1 {
   commentInstruction?: string;
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   profiles?: string[];
+  /** Issue assignee display name (Jira), used to attribute the opened PR's title. */
+  assigneeName?: string;
   planningContext?: { parent?: string; siblings?: string; dependencies?: string };
   /** True when this dispatch is a grouping parent's own closing-work run. The runner uses
    *  this to finalize cleanly when the agent produces no changes (Case B). */
@@ -106,7 +108,7 @@ export function runConfigFromTaskDocument(params: TaskDocumentParams, issueId: s
 function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   const { v, issue, prNumber, baseBranch, runnerPhase, branchPrefix, skillsRepo,
     runnerCallbackUrl, maxTurns, maxIterations, commentInstruction, sensitiveFiles,
-    profiles, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
+    profiles, assigneeName, planningContext, groupingParent, dependencyTokenScope, kgSourceRepo,
     kgDryRun, kgSourceRef, kgAcceptNewBaseline, kgBaselineActor, referenceRepos } = cfg;
   const out: RunConfigV1 = { v, issue };
   if (prNumber !== undefined) out.prNumber = prNumber;
@@ -120,6 +122,7 @@ function pickKnownKeys(cfg: RunConfigV1): RunConfigV1 {
   if (commentInstruction !== undefined) out.commentInstruction = commentInstruction;
   if (sensitiveFiles !== undefined) out.sensitiveFiles = sensitiveFiles;
   if (profiles !== undefined) out.profiles = profiles;
+  if (assigneeName !== undefined) out.assigneeName = assigneeName;
   if (planningContext !== undefined) out.planningContext = planningContext;
   if (groupingParent !== undefined) out.groupingParent = groupingParent;
   if (dependencyTokenScope !== undefined) out.dependencyTokenScope = dependencyTokenScope;

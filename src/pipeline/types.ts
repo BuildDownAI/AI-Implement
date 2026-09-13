@@ -66,6 +66,9 @@ export interface PipelineContextData {
    *  Always set by run-autonomous ([] when the env var is absent). No built-in step reads
    *  it — it is the contract surface for image-baked custom/ steps. */
   profiles?: string[];
+  /** Autonomous runner: issue assignee display name (Jira), from the run_config envelope or
+   *  AI_IMPLEMENT_ASSIGNEE_NAME env. Used by push.ts to attribute the opened PR's title. */
+  assigneeName?: string;
   /** Autonomous runner: per-project sensitive-file add/allow globs from the run_config envelope. */
   sensitiveFiles?: { add?: string[]; allow?: string[] };
   /** Autonomous runner: true when this is a grouping parent's own closing-work run. Push.ts

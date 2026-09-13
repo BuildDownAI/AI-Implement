@@ -271,6 +271,36 @@ describe("legacy dispatch shape regression pin (case b)", () => {
     expect("profiles" in legacyInputs).toBe(false);
   });
 
+  it("never forwards assignee on the legacy contract, even for an assigned issue", () => {
+    // Regression pin: `assignee` has never existed as a workflow_dispatch input in any
+    // synced version of claude-implement.yml (unlike `profiles`, which predates the
+    // envelope) — see docs/workflow-envelope.md. Forwarding it on the legacy contract
+    // would 422 every dispatch for an assigned ticket, the common case. Mirrors the
+    // inline assembly in dispatchGitHubActions for legacy mode.
+    const mapping = makeMapping();
+    const issue = { ...baseIssue, profiles: [] as string[], assigneeName: "Paz" };
+    const baseBranch = "main"; // same as defaultBranch
+
+    const legacyInputs = {
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      issue_title: issue.title,
+      issue_description: issue.description || issue.title,
+      runner_phase: "implementation" as const,
+      ...providerDispatchFields(mapping),
+      ...(baseBranch !== mapping.defaultBranch ? { base_branch: baseBranch } : {}),
+      ...capDispatchFields(mapping),
+      ...branchPrefixDispatchFields(mapping),
+      ...skillsRepoDispatchFields(mapping),
+      ...profilesDispatchFields(issue),
+      runner_callback_url: "",
+      run_token: "",
+      run_progress_token: "",
+    };
+
+    expect("assignee" in legacyInputs).toBe(false);
+  });
+
   it("conditionally includes base_branch only when it differs from defaultBranch", () => {
     const mapping = makeMapping();
     const featureBranch = "ai-implement/feature/AII-5";

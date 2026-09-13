@@ -1690,6 +1690,60 @@ describe("JiraProvider.fetchAIImplementSnapshot — profiles field", () => {
   });
 });
 
+describe("JiraProvider.fetchAIImplementSnapshot — assignee field", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    clearFieldCache();
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  const searchOk = (issues: unknown[]): Response =>
+    ({ ok: true, json: async () => ({ issues }) }) as Response;
+
+  const assigneeIssue = (assignee: unknown) => ({
+    id: "10001", key: "P-1",
+    fields: {
+      summary: "P-1",
+      description: null,
+      customfield_10100: { value: "Ready" },
+      customfield_10101: { value: "acme/x" },
+      assignee,
+    },
+  });
+
+  it("maps the assignee displayName to issue.assigneeName", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([assigneeIssue({ displayName: "Paz" })]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-assignee" }),
+      cacheScope: "c-assignee", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].assigneeName).toBe("Paz");
+  });
+
+  it("leaves assigneeName absent when the issue is unassigned", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(FIELDS_RESPONSE)
+      .mockResolvedValueOnce(searchOk([assigneeIssue(null)]))
+      .mockResolvedValueOnce(searchOk([]))
+      .mockResolvedValueOnce(searchOk([]));
+
+    const p = new JiraProvider({
+      client: new JiraClient({ token: "t", cloudId: "c-assignee-null" }),
+      cacheScope: "c-assignee-null", siteUrl: "https://x",
+      getMappings: () => ({ "acme/x": jiraMapping() }),
+    });
+    const snap = await p.fetchAIImplementSnapshot();
+    expect(snap.needsPlanning[0].assigneeName).toBeUndefined();
+  });
+});
+
 describe("validateTicketingConfig — profilesFieldOverride passthrough", () => {
   it("passes through profilesFieldOverride as a string when provided", () => {
     const result = validateTicketingConfig("jira", {

@@ -51,6 +51,9 @@ export interface TicketIssue {
    *  field, the field is unset, or the field has an unexpected shape. Nonblank strings
    *  remain present until dispatch validation can refuse invalid refs. */
   baseBranch?: string;
+  /** Assignee display name, used to attribute the opened PR's title. Jira-only; absent for
+   *  Linear issues and for Jira issues with no assignee set. */
+  assigneeName?: string;
 }
 
 export interface AIImplementSnapshot {
