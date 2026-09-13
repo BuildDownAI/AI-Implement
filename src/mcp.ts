@@ -581,6 +581,15 @@ export async function handleMcpRequest(
   if (rpc?.method === "tools/list") {
     // Merge native diagnostic tools with kg_* tools from the provider. Hiding a write tool the
     // caller's role cannot use is a courtesy — the check in tools/call below is the boundary.
+    //
+    // kg_* tools are omitted here entirely when there is no provider, rather than listed with
+    // an isError response on tools/call: unlike get_tenant_health's `kgDegraded` flag — which
+    // surfaces a *partially* working KG (search still answers, just lexical-only) so a client
+    // knows the capability exists but is degraded — an unset KG_SIDECAR_URL means the capability
+    // doesn't exist at all for this session. Listing tools a client can never successfully call
+    // would be misleading; omitting them lets tools/list reflect what's actually usable, while
+    // the 503 below still carries the "no memory provider is configured" detail for a client
+    // that calls one anyway (e.g. from a stale tool list) (AII-641).
     const kgTools = provider ? await provider.listTools(body, req.headers) : [];
     json(res, 200, {
       jsonrpc: "2.0",
