@@ -20,8 +20,8 @@ not fail boot; it fails the feature that needs it, late and quietly (a 4xx insid
 | Workflows | Read and write | the publication token used to push workflow-carrying commits from a run |
 | Commit statuses | Read and write | the `kg-refresh/dry-run` commit status set by the PR-triggered KG dry-run check (AII-633); without it the check is comment-only |
 | Actions | Read and write | `workflow_dispatch` of the planning/implementation/kg-refresh workflows on the GitHub Actions runner path, and reading run status |
-| Checks | Read-only | reading check runs on a PR head (`…/commits/{sha}/check-runs`) for the post-push review's external-review wait gate and the roll-up gate. **Not granted on the testing App as of 2026-09-13** — the calls run with the App's grants; confirm they succeed or grant it |
-| Issues | Read and write | issue comments and labels on GitHub-tracker projects (Linear projects do not use it) |
+| Checks | Read-only | reading check runs on a PR head (`…/commits/{sha}/check-runs`) for the post-push review's external-review wait gate and the roll-up gate |
+| Issues | Read and write | PR comments go through GitHub's issue-comment endpoints: `postPrComment` / `updatePrComment` / `postOrUpdateStickyComment` (gap analysis, refresh PR, review verdicts, KG dry-run comment) and `addCommentReaction` on the `/ai-implement` comment rail — for every provider, on every envelope repo |
 | Metadata | Read-only | granted to every App automatically |
 
 Plus whatever the runner's own GitHub Actions workflows need on each project repo (those are
